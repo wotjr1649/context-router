@@ -28,8 +28,10 @@ type Store struct {
 const pragmas = "?_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)&_pragma=busy_timeout(5000)&_pragma=foreign_keys(ON)"
 
 func Open(dir string, readOnly bool) (*Store, error) {
-	if err := os.MkdirAll(filepath.Join(dir, "artifacts"), 0o755); err != nil {
-		return nil, fmt.Errorf("store open: %w", err)
+	if !readOnly {
+		if err := os.MkdirAll(filepath.Join(dir, "artifacts"), 0o755); err != nil {
+			return nil, fmt.Errorf("store open: %w", err)
+		}
 	}
 	dsn := "file:" + filepath.ToSlash(filepath.Join(dir, "content.db")) + pragmas
 	if readOnly {
@@ -73,7 +75,7 @@ func (s *Store) migrate() error {
 	}
 	switch {
 	case v == 0:
-		if _, err := s.writer.Exec(schemaV1); err != nil {
+		if err := s.applySchemaV1(); err != nil {
 			return fmt.Errorf("store migrate: %w", err)
 		}
 		return nil
@@ -87,28 +89,28 @@ func (s *Store) migrate() error {
 }
 
 const schemaV1 = `
-CREATE TABLE artifacts(
+CREATE TABLE IF NOT EXISTS artifacts(
   id INTEGER PRIMARY KEY, content_hash TEXT NOT NULL UNIQUE, media_type TEXT NOT NULL,
   byte_length INTEGER NOT NULL, redaction TEXT NOT NULL DEFAULT 'none', created_at INTEGER NOT NULL);
-CREATE TABLE sources(
+CREATE TABLE IF NOT EXISTS sources(
   uri TEXT PRIMARY KEY, artifact_id INTEGER NOT NULL REFERENCES artifacts(id),
   source_kind TEXT NOT NULL, src_size INTEGER, src_mtime_ns INTEGER, src_hash TEXT,
   raw_blob_hash TEXT, extraction TEXT, indexed_at INTEGER NOT NULL);
-CREATE TABLE chunks(
+CREATE TABLE IF NOT EXISTS chunks(
   id INTEGER PRIMARY KEY, artifact_id INTEGER NOT NULL REFERENCES artifacts(id) ON DELETE CASCADE,
   ordinal INTEGER NOT NULL, byte_start INTEGER, byte_end INTEGER, line_start INTEGER, line_end INTEGER,
   title TEXT, text TEXT NOT NULL, UNIQUE(artifact_id, ordinal));
-CREATE VIRTUAL TABLE fts_porter  USING fts5(title, text, content='chunks', content_rowid='id', tokenize='porter unicode61');
-CREATE VIRTUAL TABLE fts_trigram USING fts5(title, text, content='chunks', content_rowid='id', tokenize='trigram');
-CREATE TRIGGER chunks_ai AFTER INSERT ON chunks BEGIN
+CREATE VIRTUAL TABLE IF NOT EXISTS fts_porter  USING fts5(title, text, content='chunks', content_rowid='id', tokenize='porter unicode61');
+CREATE VIRTUAL TABLE IF NOT EXISTS fts_trigram USING fts5(title, text, content='chunks', content_rowid='id', tokenize='trigram');
+CREATE TRIGGER IF NOT EXISTS chunks_ai AFTER INSERT ON chunks BEGIN
   INSERT INTO fts_porter(rowid, title, text) VALUES (new.id, new.title, new.text);
   INSERT INTO fts_trigram(rowid, title, text) VALUES (new.id, new.title, new.text);
 END;
-CREATE TRIGGER chunks_ad AFTER DELETE ON chunks BEGIN
+CREATE TRIGGER IF NOT EXISTS chunks_ad AFTER DELETE ON chunks BEGIN
   INSERT INTO fts_porter(fts_porter, rowid, title, text) VALUES ('delete', old.id, old.title, old.text);
   INSERT INTO fts_trigram(fts_trigram, rowid, title, text) VALUES ('delete', old.id, old.title, old.text);
 END;
-CREATE TRIGGER chunks_au AFTER UPDATE ON chunks BEGIN
+CREATE TRIGGER IF NOT EXISTS chunks_au AFTER UPDATE ON chunks BEGIN
   INSERT INTO fts_porter(fts_porter, rowid, title, text) VALUES ('delete', old.id, old.title, old.text);
   INSERT INTO fts_porter(rowid, title, text) VALUES (new.id, new.title, new.text);
   INSERT INTO fts_trigram(fts_trigram, rowid, title, text) VALUES ('delete', old.id, old.title, old.text);
@@ -116,11 +118,29 @@ CREATE TRIGGER chunks_au AFTER UPDATE ON chunks BEGIN
 END;
 PRAGMA user_version = 1;`
 
+// applySchemaV1 executes schemaV1 inside an explicit transaction so a mid-script
+// failure can't leave user_version=0 with only some objects created (partial-schema
+// lockout). schemaV1 statements are all idempotent (IF NOT EXISTS) so a retry after
+// a rollback — or after a failure under a driver that rejects multi-statement Exec
+// inside a Tx — heals cleanly either way.
+func (s *Store) applySchemaV1() error {
+	tx, err := s.writer.Begin()
+	if err != nil {
+		return err
+	}
+	if _, err := tx.Exec(schemaV1); err != nil {
+		tx.Rollback()
+		return err
+	}
+	return tx.Commit()
+}
+
 func (s *Store) Close() error {
 	if s.ledger != nil {
-		s.ledger.Close()
+		s.ledger.Close() // best-effort: 보조 DB, Store 계약에 미포함
 	}
-	s.writer.Exec("PRAGMA wal_checkpoint(TRUNCATE)")
-	s.reader.Close()
-	return s.writer.Close()
+	_, checkpointErr := s.writer.Exec("PRAGMA wal_checkpoint(TRUNCATE)")
+	readerErr := s.reader.Close()
+	writerErr := s.writer.Close()
+	return errors.Join(checkpointErr, readerErr, writerErr)
 }
