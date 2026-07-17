@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/wotjr1649/context-router/internal/ingest"
 	"github.com/wotjr1649/context-router/internal/store"
@@ -160,6 +161,42 @@ func TestQuery_SnippetWindowCentersOnMatch(t *testing.T) {
 	}
 }
 
+// TestSnippetWindow_FoldExpandingRuneNoPanic: 'Ⱥ'(U+023A, lower가 3B로 확장)가 매치 앞에
+// 쌓이면 케이스폴딩 idx가 원본보다 앞서 드리프트 — 구버전은 슬라이스 out-of-range panic.
+func TestSnippetWindow_FoldExpandingRuneNoPanic(t *testing.T) {
+	text := strings.Repeat("Ⱥ", 300) + " NEEDLE " + strings.Repeat("x", 100)
+	tok := firstMatchToken("needle", text)
+	snip := snippetWindow(text, tok)
+	if !strings.Contains(snip, "NEEDLE") {
+		t.Fatalf("want snippet contain NEEDLE, got %q", snip)
+	}
+}
+
+// TestSnippetWindow_FoldShrinkingRuneValidUTF8: 'K'(U+212A 켈빈 사인, lower가 1B로 축소)가
+// 매치 앞에 쌓이면 idx가 원본보다 뒤로 드리프트 — 구버전은 룬 중간을 잘라 무효 UTF-8.
+func TestSnippetWindow_FoldShrinkingRuneValidUTF8(t *testing.T) {
+	text := strings.Repeat("K", 300) + " NEEDLE " + strings.Repeat("x", 100)
+	tok := firstMatchToken("needle", text)
+	snip := snippetWindow(text, tok)
+	if !utf8.ValidString(snip) {
+		t.Fatalf("want valid UTF-8 snippet, got %q", snip)
+	}
+}
+
+// TestSnippetWindow_CJKNoSpaceValidUTF8: 공백 없는 CJK 장문 — 창 경계 공백 스냅이 실패해도
+// 마지막 룬 경계 보정이 항상 걸려야 무효 UTF-8이 나오지 않는다(Codex P2).
+func TestSnippetWindow_CJKNoSpaceValidUTF8(t *testing.T) {
+	text := strings.Repeat("가", 400) + "NEEDLE" + strings.Repeat("나", 400)
+	tok := firstMatchToken("NEEDLE", text)
+	snip := snippetWindow(text, tok)
+	if !utf8.ValidString(snip) {
+		t.Fatalf("want valid UTF-8 snippet, got %q", snip)
+	}
+	if !strings.Contains(snip, "NEEDLE") {
+		t.Fatalf("want snippet contain NEEDLE, got %q", snip)
+	}
+}
+
 func TestQuery_StaleDetectsModifiedFile(t *testing.T) {
 	st, err := store.Open(t.TempDir(), false)
 	if err != nil {
@@ -200,6 +237,47 @@ func TestQuery_StaleDetectsModifiedFile(t *testing.T) {
 	}
 }
 
+// TestQuery_ReindexOrphanDoesNotFailQuery: 같은 uri 재색인 시 구 artifact/chunk가
+// orphan으로 남는다(sources.artifact_id만 갱신). orphan이 후보로 잡혀도 Query 전체가
+// 오류로 죽지 않아야 한다(Fix D).
+func TestQuery_ReindexOrphanDoesNotFailQuery(t *testing.T) {
+	st, err := store.Open(t.TempDir(), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	root := t.TempDir()
+	file := filepath.Join(root, "doc.txt")
+	if err := os.WriteFile(file, []byte("oldwordunique content here"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ingest.Run(t.Context(), st, root, nil, ingest.Request{Path: file}); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(file, []byte("newwordunique content here"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ingest.Run(t.Context(), st, root, nil, ingest.Request{Path: file}); err != nil {
+		t.Fatal(err)
+	}
+
+	oldRes, err := Query(t.Context(), st, []string{"oldwordunique"}, 10, 0)
+	if err != nil {
+		t.Fatalf("want no error querying orphaned term, got %v", err)
+	}
+	if len(oldRes[0].Hits) != 0 {
+		t.Fatalf("want 0 hits for orphaned-only term, got %+v", oldRes[0].Hits)
+	}
+
+	newRes, err := Query(t.Context(), st, []string{"newwordunique"}, 10, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(newRes[0].Hits) == 0 || !strings.Contains(newRes[0].Hits[0].Snippet, "newwordunique") {
+		t.Fatalf("want new content hit, got %+v", newRes[0].Hits)
+	}
+}
+
 func TestQuery_RRFRanksDualMatchTop(t *testing.T) {
 	st := seedT(t)
 	res, err := Query(t.Context(), st, []string{"caching useEffect"}, 10, 0)
@@ -209,5 +287,23 @@ func TestQuery_RRFRanksDualMatchTop(t *testing.T) {
 	hits := res[0].Hits
 	if len(hits) == 0 || hits[0].Source != "c.txt" {
 		t.Fatalf("want c.txt(porter+trigram 동시매치) top hit, got %+v", hits)
+	}
+}
+
+// TestQuery_RawInputsNoFTSInjectionError: FTS5 MATCH 구문 특수문자·인젝션성 원시 입력이
+// normalizeQuery의 토큰별 이중따옴표 이스케이프를 통과해 오류 없이 반환되는지 확인한다
+// (Fix G, hits 유무는 무관).
+func TestQuery_RawInputsNoFTSInjectionError(t *testing.T) {
+	st := seedT(t)
+	inputs := []string{
+		`" OR 1; DROP TABLE x --`,
+		"NEAR(",
+		"*",
+		`한글"질의`,
+	}
+	for _, q := range inputs {
+		if _, err := Query(t.Context(), st, []string{q}, 10, 0); err != nil {
+			t.Fatalf("want no error for input %q, got %v", q, err)
+		}
 	}
 }

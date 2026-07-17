@@ -6,11 +6,13 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
+	"unicode"
 	"unicode/utf8"
 
 	"github.com/wotjr1649/context-router/internal/store"
@@ -163,13 +165,43 @@ const (
 // firstMatchToken: q의 공백 토큰 중 text에 대소문자 무시 부분문자열로 존재하는 첫 토큰을
 // 반환한다(없으면 "").
 func firstMatchToken(q, text string) string {
-	lower := strings.ToLower(text)
 	for _, tok := range strings.Fields(q) {
-		if strings.Contains(lower, strings.ToLower(tok)) {
+		if foldIndex(text, tok) >= 0 {
 			return tok
 		}
 	}
 	return ""
+}
+
+// foldIndex: text에서 token을 대소문자 무시로 찾아 원본 text 기준 바이트 오프셋을
+// 반환한다(없으면 -1). strings.ToLower(text) 사본에서 구한 idx를 원본에 그대로 쓰면
+// 케이스폴딩 시 바이트 길이가 바뀌는 룬(U+023A 확장/U+212A 축소 등)에서 오프셋이
+// 어긋나 panic이나 무효 UTF-8을 낼 수 있어, 룬 단위로 직접 비교해 원본 오프셋을
+// 보존한다.
+func foldIndex(text, token string) int {
+	if token == "" {
+		return -1
+	}
+	tr := []rune(strings.ToLower(token))
+	for i := 0; i < len(text); {
+		r, sz := utf8.DecodeRuneInString(text[i:])
+		if unicode.ToLower(r) == tr[0] {
+			j, k := i, 0
+			for k < len(tr) {
+				rr, s2 := utf8.DecodeRuneInString(text[j:])
+				if s2 == 0 || unicode.ToLower(rr) != tr[k] {
+					break
+				}
+				j += s2
+				k++
+			}
+			if k == len(tr) {
+				return i
+			}
+		}
+		i += sz
+	}
+	return -1
 }
 
 // capBytes: s를 최대 n바이트로 자르되 UTF-8 룬 경계에서 멈춘다(store.snapUTF8과 동형 —
@@ -184,14 +216,15 @@ func capBytes(s string, n int) string {
 	return s[:n]
 }
 
-// snippetWindow: tok의 text 내 첫 출현 위치(대소문자 무시) 중심 ±snippetHalf 바이트 창을
-// 반환하고, 창 경계가 단어 중간이면 안쪽으로 스냅한다. 공백/개행은 항상 1바이트 ASCII라
-// 스냅 결과는 자동으로 UTF-8 경계다. tok==""나 미발견이면 앞 500B(UTF-8 안전 절단).
+// snippetWindow: tok의 text 내 첫 출현 위치(대소문자 무시, foldIndex — 원본 오프셋 보존)
+// 중심 ±snippetHalf 바이트 창을 반환하고, 창 경계가 단어 중간이면 안쪽으로 스냅한다.
+// 공백/개행이 없어 스냅이 실패해도(예: 공백 없는 CJK 장문) 마지막에 항상 룬 경계로
+// 보정하므로 무효 UTF-8이 나오지 않는다. tok==""나 미발견이면 앞 500B(UTF-8 안전 절단).
 func snippetWindow(text, tok string) string {
 	if tok == "" {
 		return capBytes(text, snippetFallback)
 	}
-	idx := strings.Index(strings.ToLower(text), strings.ToLower(tok))
+	idx := foldIndex(text, tok)
 	if idx < 0 {
 		return capBytes(text, snippetFallback)
 	}
@@ -206,7 +239,26 @@ func snippetWindow(text, tok string) string {
 	} else if i := strings.LastIndexAny(text[idx:end], " \n"); i >= 0 {
 		end = idx + i // 뒤쪽 잘린 단어 제외
 	}
+	start, end = snapWindow(text, start, end) // 공백 스냅 성공 여부와 무관하게 항상 룬 경계 보정
 	return text[start:end]
+}
+
+// snapWindow: store.snapUTF8과 동형(문자열판) — [start,end)를 UTF-8 룬 경계로 스냅한다.
+// search는 별도 패키지라 로컬로 재구현(capBytes와 동일 사유). start는 RuneStart까지
+// 후퇴하고, 그 지점부터 룬을 전진 소비하며 end를 넘지 않는 지점에서 멈춘다.
+func snapWindow(s string, start, end int) (int, int) {
+	for start > 0 && start < len(s) && !utf8.RuneStart(s[start]) {
+		start--
+	}
+	pos := start
+	for pos < end {
+		r, size := utf8.DecodeRuneInString(s[pos:])
+		if size == 0 || (r == utf8.RuneError && size <= 1) || pos+size > end {
+			break
+		}
+		pos += size
+	}
+	return start, pos
 }
 
 // isStale: source_kind!="file"이면 항상 false(설계 §3.6). file이면 os.Stat으로 size/mtime_ns를
@@ -265,6 +317,9 @@ func Query(ctx context.Context, st *store.Store, queries []string, limit, budget
 		hits := make([]Hit, 0, len(top))
 		for _, sc := range top {
 			h, err := loadHit(ctx, db, sc.id, sc.score, q, staleCache)
+			if errors.Is(err, sql.ErrNoRows) {
+				continue // 재색인 orphan(구 chunk — sources.artifact_id가 신규를 가리켜 no-row): skip, limit*4 후보 폭이 보충
+			}
 			if err != nil {
 				return nil, err
 			}
