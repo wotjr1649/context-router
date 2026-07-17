@@ -57,6 +57,7 @@ func FuzzRedact(f *testing.F) {
 	} {
 		f.Add([]byte(s))
 	}
+	f.Add([]byte(`{"k":"gh` + string(rune(92)) + `u0070_abcdefghijklmnopqrstuvwxyz012345"}`))
 	f.Fuzz(func(t *testing.T, b []byte) {
 		out, spans := Redact(b)
 		if spans < 0 {
@@ -75,6 +76,23 @@ func TestRedact_DoesNotMutateInput(t *testing.T) {
 	}
 	if bytes.Contains(out, []byte("AKIAIOSFODNN7EXAMPLE")) {
 		t.Fatal("비밀 잔존")
+	}
+}
+
+// TestRedact_UnicodeEscapedSecret: unescapeJSONBytes의 \uXXXX 디코드 분기(실전 은닉의
+// 주 벡터) 실증 — json-escaped-real(Fix Round 1)은 default 분기(\p→p)만 거쳤다.
+func TestRedact_UnicodeEscapedSecret(t *testing.T) {
+	esc := string(rune(92)) + "u0070" // 백슬래시(92)+"u0070" == p('p')
+	in := []byte(`{"k":"gh` + esc + `_abcdefghijklmnopqrstuvwxyz012345"}`)
+	if bytes.Contains(in, []byte("ghp_")) {
+		t.Fatal("입력에 평문 ghp_ 존재 — \\u 디코드 경로 미검증")
+	}
+	out, spans := Redact(in)
+	if bytes.Contains(out, []byte("abcdefghijklmnopqrstuvwxyz012345")) {
+		t.Fatalf("누출: %s", out)
+	}
+	if spans < 1 {
+		t.Fatal("spans<1")
 	}
 }
 
