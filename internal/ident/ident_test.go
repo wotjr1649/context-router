@@ -52,6 +52,43 @@ func TestCanonicalize_GitDirAndWorktreeFile(t *testing.T) {
 	}
 }
 
+func TestCanonicalize_BrokenWorktreeCommondirFails(t *testing.T) {
+	repo := t.TempDir()
+	os.MkdirAll(filepath.Join(repo, ".git", "worktrees", "wt1"), 0o755)
+	os.WriteFile(filepath.Join(repo, ".git", "worktrees", "wt1", "commondir"),
+		[]byte("../../this-does-not-exist\n"), 0o644)
+	wt := t.TempDir()
+	os.WriteFile(filepath.Join(wt, ".git"),
+		[]byte("gitdir: "+filepath.Join(repo, ".git", "worktrees", "wt1")+"\n"), 0o644)
+	if _, err := Canonicalize(wt); err == nil {
+		t.Fatal("손상된 worktree인데 오류가 없음 — 침묵 fallback 금지")
+	}
+}
+
+func TestCanonicalize_SubmoduleUsesOwnRoot(t *testing.T) {
+	super := t.TempDir()
+	os.MkdirAll(filepath.Join(super, ".git", "modules", "sub"), 0o755)
+	sub := filepath.Join(super, "sub")
+	os.MkdirAll(sub, 0o755)
+	os.WriteFile(filepath.Join(sub, ".git"),
+		[]byte("gitdir: "+filepath.Join(super, ".git", "modules", "sub")+"\n"), 0o644)
+	c, err := Canonicalize(sub)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.ProjectRoot != Fold(mustReal(t, sub)) {
+		t.Fatalf("submodule projectRoot=%q want %q", c.ProjectRoot, Fold(mustReal(t, sub)))
+	}
+}
+
+func TestFold_ExtendedUNC(t *testing.T) {
+	a := Fold(`\\?\UNC\Server\Share\p`)
+	b := Fold(`\\Server\Share\p`)
+	if a != b {
+		t.Fatalf("동일 경로 다른 fold: %q vs %q", a, b)
+	}
+}
+
 func TestFold_OSRule(t *testing.T) {
 	got := Fold(`C:\Some\Dir`)
 	if runtime.GOOS == "windows" || runtime.GOOS == "darwin" {
@@ -76,5 +113,6 @@ func FuzzFold(f *testing.F) {
 	f.Add(`C:\a\..\b`)
 	f.Add(`\\?\C:\x`)
 	f.Add("//server/share/p")
+	f.Add(`\\?\UNC\server\share\x`)
 	f.Fuzz(func(t *testing.T, p string) { _ = Fold(p) }) // 불변식: panic 없음
 }
