@@ -25,6 +25,9 @@ func TestParseFlags(t *testing.T) {
 			if err == nil && strings.Join(got.Profile, ",") != strings.Join(tt.want.Profile, ",") {
 				t.Fatalf("profile=%v want %v", got.Profile, tt.want.Profile)
 			}
+			if err == nil && strings.Join(got.Enable, ",") != strings.Join(tt.want.Enable, ",") {
+				t.Fatalf("enable=%v want %v", got.Enable, tt.want.Enable)
+			}
 		})
 	}
 }
@@ -35,5 +38,11 @@ func TestBanner(t *testing.T) {
 	want := "[ctr] v" + version + " profile=search,fetch,transform ingest=off net=off root=C:/proj"
 	if got != want {
 		t.Fatalf("banner=%q want %q", got, want)
+	}
+	f2 := serverFlags{Profile: []string{"search"}, Enable: []string{"ingest"}, LogLevel: "info"}
+	got2 := banner(f2, "/p")
+	want2 := "[ctr] v" + version + " profile=search ingest=on net=off root=/p"
+	if got2 != want2 {
+		t.Fatalf("banner on-branch=%q want %q", got2, want2)
 	}
 }

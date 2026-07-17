@@ -15,7 +15,7 @@ import (
 const version = "0.0.1-dev"
 
 type serverFlags struct {
-	Root, StoreRoot, LogLevel string
+	Root, StoreRoot, LogLevel   string
 	Profile, Enable, AllowPaths []string
 }
 
