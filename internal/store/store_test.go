@@ -1,10 +1,15 @@
 package store
 
 import (
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync"
 	"testing"
 	"unicode/utf8"
 )
@@ -173,6 +178,83 @@ func TestReadRange_Selectors(t *testing.T) {
 	}
 	if _, err := s.ReadRange(t.Context(), 9999, Selector{Kind: "chunk", ChunkID: 1}); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("want ErrNotFound, got %v", err)
+	}
+}
+
+func TestReadRange_IOErrorHidesPath(t *testing.T) {
+	s := openT(t)
+	id, err := s.Register(t.Context(), Registration{StoredBytes: []byte("alpha\nbravo\n"), MediaType: "text/plain",
+		Source: SourceMeta{URI: "/p.txt", Kind: "file", SrcHash: "hp"},
+		Chunks: []Chunk{{Ordinal: 0, Text: "alpha\nbravo\n"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var ch string
+	s.reader.QueryRow("SELECT content_hash FROM artifacts WHERE id=?", id).Scan(&ch)
+	if err := os.Remove(filepath.Join(s.dir, "artifacts", ch[:2], ch)); err != nil {
+		t.Fatal(err)
+	}
+	_, err = s.ReadRange(t.Context(), id, Selector{Kind: "line", LineStart: 1, LineEnd: 1})
+	if err == nil {
+		t.Fatal("want error, got nil")
+	}
+	if strings.Contains(err.Error(), s.dir) {
+		t.Fatalf("오류에 경로 노출: %v", err)
+	}
+}
+
+func TestRegister_ConcurrentDistinctBlobsNoTmpLeftover(t *testing.T) {
+	s := openT(t)
+	const n = 8
+	var wg sync.WaitGroup
+	errs := make([]error, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			body := fmt.Sprintf("content-%d-unique-payload", i)
+			_, err := s.Register(t.Context(), Registration{StoredBytes: []byte(body), MediaType: "text/plain",
+				Source: SourceMeta{URI: fmt.Sprintf("/c%d.txt", i), Kind: "file", SrcHash: fmt.Sprintf("h%d", i)},
+				Chunks: []Chunk{{Ordinal: 0, Text: body}}})
+			errs[i] = err
+		}(i)
+	}
+	wg.Wait()
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("goroutine %d: %v", i, err)
+		}
+	}
+	for i := 0; i < n; i++ {
+		body := fmt.Sprintf("content-%d-unique-payload", i)
+		sum := sha256.Sum256([]byte(body))
+		hash := hex.EncodeToString(sum[:])
+		b, err := os.ReadFile(filepath.Join(s.dir, "artifacts", hash[:2], hash))
+		if err != nil || string(b) != body {
+			t.Fatalf("blob %d mismatch: %v %q", i, err, b)
+		}
+	}
+	leftover, _ := filepath.Glob(filepath.Join(s.dir, "artifacts", "*", "*.tmp*"))
+	if len(leftover) != 0 {
+		t.Fatalf("임시파일 잔존: %v", leftover)
+	}
+}
+
+func TestReadRange_LineInvalidRangeRejected(t *testing.T) {
+	s := openT(t)
+	id, err := s.Register(t.Context(), Registration{StoredBytes: []byte("a\nb\nc\n"), MediaType: "text/plain",
+		Source: SourceMeta{URI: "/x.txt", Kind: "file", SrcHash: "hx"},
+		Chunks: []Chunk{{Ordinal: 0, Text: "a\nb\nc\n"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, sel := range []Selector{
+		{Kind: "line", LineStart: 3, LineEnd: 1},
+		{Kind: "line", LineStart: 1, LineEnd: 0},
+	} {
+		if _, err := s.ReadRange(t.Context(), id, sel); !errors.Is(err, ErrInvalidSelector) {
+			t.Fatalf("sel=%+v: want ErrInvalidSelector, got %v (no panic expected)", sel, err)
+		}
 	}
 }
 

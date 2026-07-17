@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
@@ -207,30 +208,43 @@ func nullIfEmpty(v string) any {
 	return v
 }
 
+// sanitizeIOErr — PathError/LinkError의 경로를 벗겨 syscall 원인만 wrap (§5.5: 오류에 절대경로 금지)
+func sanitizeIOErr(op string, err error) error {
+	var pe *os.PathError
+	if errors.As(err, &pe) {
+		return fmt.Errorf("store: %s: %w", op, pe.Err)
+	}
+	var le *os.LinkError // os.Rename은 PathError가 아닌 LinkError(Old/New 경로 포함)를 반환
+	if errors.As(err, &le) {
+		return fmt.Errorf("store: %s: %w", op, le.Err)
+	}
+	return fmt.Errorf("store: %s: %w", op, err)
+}
+
+var tmpSeq atomic.Uint64 // writeBlob 임시파일명 유일성(동시 Register 충돌 방지)
+
 // writeBlob: artifacts/<h[:2]>/<h>에 원자적으로 기록 — 임시파일→fsync→rename.
 // 대상이 이미 존재해도 os.Rename이 덮어써 no-op처럼 동작(동일 content_hash라 내용은 항상 동일).
-// ponytail: 임시파일명이 pid 기반이라 동일 프로세스 내 동시 Register(같은 content)엔 유일성이 없음 —
-// 필요해지면 goroutine-safe 카운터를 덧붙인다.
 func (s *Store) writeBlob(hash string, data []byte) error {
 	dir := filepath.Join(s.dir, "artifacts", hash[:2])
 	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return fmt.Errorf("store writeBlob: %w", err)
+		return sanitizeIOErr("blob mkdir", err)
 	}
-	tmp := filepath.Join(dir, fmt.Sprintf(".tmp%d", os.Getpid()))
+	tmp := filepath.Join(dir, fmt.Sprintf("%s.tmp.%d.%d", hash, os.Getpid(), tmpSeq.Add(1)))
 	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
 	if err != nil {
-		return fmt.Errorf("store writeBlob: %w", err)
+		return sanitizeIOErr("blob write", err)
 	}
 	_, werr := f.Write(data)
 	serr := f.Sync()
 	cerr := f.Close()
 	if werr != nil || serr != nil || cerr != nil {
 		os.Remove(tmp)
-		return fmt.Errorf("store writeBlob: %w", errors.Join(werr, serr, cerr))
+		return sanitizeIOErr("blob write", errors.Join(werr, serr, cerr))
 	}
 	if err := os.Rename(tmp, filepath.Join(dir, hash)); err != nil {
 		os.Remove(tmp)
-		return fmt.Errorf("store writeBlob: %w", err)
+		return sanitizeIOErr("blob rename", err)
 	}
 	return nil
 }
@@ -240,7 +254,7 @@ func (s *Store) writeBlob(hash string, data []byte) error {
 func (s *Store) readBlob(hash string) ([]byte, error) {
 	b, err := os.ReadFile(filepath.Join(s.dir, "artifacts", hash[:2], hash))
 	if err != nil {
-		return nil, fmt.Errorf("store readBlob: %w", err)
+		return nil, sanitizeIOErr("blob read", err)
 	}
 	return b, nil
 }
@@ -292,6 +306,7 @@ func isBusy(err error) bool {
 func (s *Store) Register(ctx context.Context, reg Registration) (int64, error) {
 	sum := sha256.Sum256(reg.StoredBytes)
 	contentHash := hex.EncodeToString(sum[:])
+	// 롤백 시 blob은 남을 수 있음 — 콘텐츠 주소라 무해하며 purge --gc가 정리 (설계 §3.3)
 	if err := s.writeBlob(contentHash, reg.StoredBytes); err != nil { // DB 커밋 전 배치 (§3.5)
 		return 0, err
 	}
@@ -390,6 +405,9 @@ func lineByteRange(data []byte, lineStart, lineEnd int) (int64, int64) {
 	if lineEnd < len(starts) {
 		end = starts[lineEnd]
 	}
+	if end < begin { // 방어: 역전 방지(slice panic 회피)
+		end = begin
+	}
 	return begin, end
 }
 
@@ -406,6 +424,7 @@ func (s *Store) readChunk(res *RangeResult, artifactID, chunkID int64) error {
 		return fmt.Errorf("store ReadRange: %w", err)
 	}
 	res.LineStart, res.LineEnd = int(ls.Int64), int(le.Int64)
+	// 좌표 미상 chunk: ByteStart=0은 실제 오프셋이 아님 (text 폴백 경로)
 	if !bs.Valid || !be.Valid {
 		res.Text = []byte(text)
 		res.ByteEnd = int64(len(res.Text))
@@ -424,7 +443,11 @@ func (s *Store) readChunk(res *RangeResult, artifactID, chunkID int64) error {
 // 구간 중 하나를 읽는다 (설계 §3.5).
 func (s *Store) ReadRange(ctx context.Context, artifactID int64, sel Selector) (RangeResult, error) {
 	switch sel.Kind {
-	case "chunk", "line", "byte":
+	case "chunk", "byte":
+	case "line":
+		if sel.LineStart < 1 || sel.LineEnd < sel.LineStart {
+			return RangeResult{}, fmt.Errorf("store ReadRange: line 범위 잘못됨 start=%d end=%d: %w", sel.LineStart, sel.LineEnd, ErrInvalidSelector)
+		}
 	default:
 		return RangeResult{}, fmt.Errorf("store ReadRange: kind=%q: %w", sel.Kind, ErrInvalidSelector)
 	}
