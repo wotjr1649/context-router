@@ -63,7 +63,7 @@ context-router는 AI 코딩 에이전트 세션에서 발생하는 대형 원문
 | `transform` | `ctr_transform` (신규, §5) | ON | 저장된 artifact/인덱스 데이터 대상 **순수 변환** — 파일·env·네트워크·프로세스 접근 없음 |
 | `ingest` | `ctr_index` | OFF (옵트인 플래그) | 명시적 수집. 비밀정보 필터 통과 후 저장 |
 | `net-ingest` | `ctr_fetch_and_index` | OFF (옵트인 플래그) | SSRF/사설망/redirect/크기 정책 필수 (Q8) |
-| `exec` | `ctr_execute`, `ctr_execute_file`, `ctr_batch_execute` | **v0.0.1 미노출** (구현+fixture 검증만) | 노출은 v0.2+에서 실질 격리(Job Object/landlock/sandbox-exec)와 HANDOFF §8.3 실행 계약(env allowlist, cwd 고정, timeout+tree-kill, output cap, background 금지, 출력 자동 영구색인 금지) + 호스트 ask/prompt와 함께 |
+| `exec` | `ctr_execute`, `ctr_execute_file`, `ctr_batch_execute` | **v0.2로 구현째 이전 (D10 확정)** | 구현·fixture·노출 모두 v0.2 — 실질 격리(Job Object/landlock/sandbox-exec)와 HANDOFF §8.3 실행 계약(env allowlist, cwd 고정, timeout+tree-kill, output cap, background 금지, 출력 자동 영구색인 금지) + 호스트 ask/prompt와 함께 |
 | `global` | `ctr_global_search` (`ctr-global` 별도 등록) | OFF (선택 설치) | 프로젝트 allowlist + 호출별 승인. execute와 절대 동거 금지 |
 | (CLI) | `context-router doctor / stats / upgrade / purge` | CLI 전용 | purge는 이중 확인. stats는 두 ledger 출력 |
 
@@ -124,9 +124,9 @@ context-router는 AI 코딩 에이전트 세션에서 발생하는 대형 원문
 | 단계 | 내용 | 게이트 |
 |---|---|---|
 | M0 설계서 | 12질문 전부 답하는 설계문서 + golden fixtures 목록 | 사용자 승인 |
-| v0.0.1 | 10개 계약 구현(exec 3종은 구현·fixture까지, 미노출) + 프로필 노출 + 1-S 저장 + `ctx_transform`(starlark) + CLI admin | HANDOFF §14 acceptance gate 전체. 전 범위 완료 전 태그 금지(확정) |
-| v0.1 | 세션 이벤트/복구(`context_record_event`·`session_summary` 상당) + SessionEvent v1 export | 설계 기준서 Part A MVP 기준 |
-| v0.2 | Claude Code/Codex 훅·플러그인 패키징 — 패시브 인덱싱(Shadow Recall), large-read guard 등 **강제 채널** 활성화 (T1의 본론) + `exec` 프로필 최초 노출(실질 격리 + §8.3 계약) | provider usage 기반 무작위 A/B 측정 |
+| v0.0.1 | **재정의 계약(D10)**: `ctr_search`/`ctr_fetch`/`ctr_transform` 기본 + `ctr_index`/`ctr_fetch_and_index` 옵트인 + `ctr_global_search` 별도 등록 + CLI 4종(doctor/stats/purge/upgrade) + 1-S 저장 | HANDOFF §14 acceptance gate(재정의 범위 적용). 전 범위 완료 전 태그 금지 |
+| v0.1 | 세션 이벤트/복구(`ctr_record_event`·`ctr_session_summary`·`ctr_export_events`) — 피치는 "무손실 복원" | 설계 기준서 Part A MVP 기준 |
+| v0.2 | Claude Code/Codex 훅·플러그인 패키징 — 패시브 인덱싱(Shadow Recall), large-read guard 등 **강제 채널** 활성화 (T1의 본론) + exec 3종 구현·fixture·노출(실질 격리 + §8.3 계약, D10) | provider usage 기반 무작위 A/B 측정 |
 | v0.3+ | OS 샌드박스 재평가, global search UX, graph-engine 연동(ContextPack 소비) | 별도 결정 |
 
 핵심: **v0.0.1은 "코어 표면", v0.2가 "실제 절약이 발생하는 강제 채널"**이다. ADR-0008이 증명했듯 훅 없는 MCP 단독은 자발 채택의 한계(3.82%)에 갇힌다. 이 사실을 로드맵에 정직하게 반영한다.
@@ -215,6 +215,7 @@ Codex(GPT 계열)가 두 문서를 독립적으로 읽고 낸 의견. 자문이�
 | D7 | 이름 | **확정 (2026-07-17)**: `context-router` 유지 + 네임스페이스 선점(GitHub 리포·Go module path; npm은 v0.2 플러그인 배포 시점 검토). 도구 접두사 `ctr_*`(D4)로 이미 차별화. git init + docs 초기 커밋 실행 | §8.2 |
 | D8 | Go 스택 | **확정 (2026-07-17)**: go-sdk v1.6.1 + modernc v1.54.0/libc v1.74.1 + starlark-go + x/sys. cobra·yaml·ORM·DI·로깅 프레임워크 미사용 (stdlib flag/slog/testing), goreleaser CGO_ENABLED=0 6타깃 | §8.3 |
 | D9 | SQLite PRAGMA 계약 | **확정 (2026-07-17)**: 전체 NORMAL 세트 (§6 PRAGMA 계약 참조) | Q6 |
+| D10 | v0.0.1 계약 재정의 — "oracle 10개 동등" → 도구 감사 문서 §2.2 인벤토리(코어 5 MCP + global + CLI 4 + 신규 fetch/transform, exec 3종 구현째 v0.2) | **확정 (2026-07-17)** — 근거: `context-router-tool-audit-ko.md` | HANDOFF 확정 변경 (사용자 승인) |
 
 ## 10. HANDOFF 12질문 매핑
 
