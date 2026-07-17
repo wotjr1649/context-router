@@ -146,6 +146,8 @@ func (s *Store) applySchemaV1() error {
 	return tx.Commit()
 }
 
+func (s *Store) Reader() *sql.DB { return s.reader }
+
 func (s *Store) Close() error {
 	if s.ledger != nil {
 		s.ledger.Close() // best-effort: 보조 DB, Store 계약에 미포함
