@@ -280,6 +280,12 @@ const chunkTargetBytes = 4096
 // 우선하며 각 청크의 Title에 직전 헤딩 텍스트를 채운다. 청크 간 1라인 오버랩(단,
 // 청크가 정확히 1줄이면 오버랩 시 무한 루프이므로 생략). 좌표는 text(저장본)
 // 기준 — ByteEnd는 반개구간 끝, LineStart/LineEnd는 1-기반 포함 구간.
+//
+// 진전 불변식(일반 규칙): 모든 청크는 오버랩이 아닌 신규 라인을 최소 1개
+// 포함한다. 예산 초과나 헤딩 경계로 절단하려는 시점에 현재 청크가 오버랩
+// 라인뿐이면(hasNewLine==false) 절단을 보류하고 그 라인을 강제 포함(예산/헤딩
+// 우선권 초과 허용)한 뒤 다음 라인부터 절단 판정을 재개한다 — 오버랩 라인만
+// 담긴 채 재절단되어 ByteEnd가 진전하지 않는 퇴화 청크를 막는다.
 func ChunkText(text string, isMarkdown bool) []store.Chunk {
 	if text == "" {
 		return nil
@@ -288,29 +294,36 @@ func ChunkText(text string, isMarkdown bool) []store.Chunk {
 	var chunks []store.Chunk
 	lastTitle := ""
 	ordinal := 0
+	overlapStart := false // 이번 청크의 첫 라인이 직전 청크와 공유하는 오버랩 라인인지
 	for i := 0; i < len(lines); {
 		start := i
 		titleAtStart := lastTitle
 		curBytes := 0
 		j := i
 		headingBreak := false
+		hasNewLine := !overlapStart // 오버랩 라인만으론 "신규 라인 1개" 요건 미충족
 		for j < len(lines) {
 			if isMarkdown {
 				if h, ok := headingText(lines[j]); ok {
 					if j == start {
 						titleAtStart = h
 						lastTitle = h
-					} else {
+					} else if hasNewLine {
 						headingBreak = true
 						break // 헤딩 경계 — 다음 청크가 여기서 시작
+					} else {
+						lastTitle = h // 진전 불변식으로 강제 포함되는 헤딩 — 다음 청크 제목으로 승계
 					}
 				}
 			}
 			lineLen := len(lines[j])
-			if curBytes > 0 && curBytes+lineLen > chunkTargetBytes {
+			if curBytes > 0 && curBytes+lineLen > chunkTargetBytes && hasNewLine {
 				break
 			}
 			curBytes += lineLen
+			if j > start {
+				hasNewLine = true
+			}
 			j++
 		}
 		if j <= start { // 방어적 안전망 — 위 루프 구조상 도달하지 않음(무한 루프 차단)
@@ -332,8 +345,10 @@ func ChunkText(text string, isMarkdown bool) []store.Chunk {
 		if !headingBreak && end-start > 1 {
 			i = end - 1 // 1라인 오버랩 — 헤딩 경계에서는 생략(직전 절 마지막 줄이 다음
 			// 청크 머리에서 중복+ByteEnd 미증가하는 퇴화 청크를 막는다)
+			overlapStart = true
 		} else {
 			i = end
+			overlapStart = false
 		}
 	}
 	return chunks

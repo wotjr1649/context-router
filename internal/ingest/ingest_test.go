@@ -14,6 +14,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/wotjr1649/context-router/internal/ident"
 	"github.com/wotjr1649/context-router/internal/store"
 )
 
@@ -225,12 +226,45 @@ func TestChunkText_Invariants_Synthetic(t *testing.T) {
 	}
 }
 
+// TestChunkText_OverlapOnlyChunk_Regression: 리뷰어 반례(500B/500B/4090B/10B) —
+// 오버랩 생략이 headingBreak에만 조건화되면 예산 절단 시점에 현재 청크가
+// 오버랩 라인만 담은 채 재절단되어 ByteEnd 비단조(퇴화 청크)가 발생했다.
+// assertChunkInvariants(이미 ByteEnd 단조 검사 포함)에 더해 인접 쌍 ByteEnd
+// 엄격 증가를 명시적으로도 재확인한다.
+func TestChunkText_OverlapOnlyChunk_Regression(t *testing.T) {
+	text := strings.Repeat("a", 499) + "\n" +
+		strings.Repeat("b", 499) + "\n" +
+		strings.Repeat("c", 4089) + "\n" +
+		strings.Repeat("d", 9) + "\n"
+	cases := []struct {
+		name       string
+		isMarkdown bool
+	}{
+		{"plain", false},
+		{"markdown-no-heading", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			chunks := ChunkText(text, tc.isMarkdown)
+			assertChunkInvariants(t, text, chunks)
+			for i := 1; i < len(chunks); i++ {
+				if chunks[i].ByteEnd <= chunks[i-1].ByteEnd {
+					t.Fatalf("chunk[%d].ByteEnd=%d 가 chunk[%d].ByteEnd=%d 이하 — 오버랩 전용 퇴화 청크(진전 불변식 위반)",
+						i, chunks[i].ByteEnd, i-1, chunks[i-1].ByteEnd)
+				}
+			}
+		})
+	}
+}
+
 func FuzzChunkText(f *testing.F) {
 	f.Add("hello\nworld\n", true)
 	f.Add("# H\nbody\n## H2\nmore body here\n", true)
 	f.Add(strings.Repeat("line filler text\n", 400), false)
 	f.Add("", false)
 	f.Add("no newline at all", false)
+	// 리뷰어 반례(500B/500B/4090B/10B) — 오버랩 전용 퇴화 청크 회귀 시드.
+	f.Add(strings.Repeat("a", 499)+"\n"+strings.Repeat("b", 499)+"\n"+strings.Repeat("c", 4089)+"\n"+strings.Repeat("d", 9)+"\n", false)
 	f.Fuzz(func(t *testing.T, text string, isMarkdown bool) {
 		chunks := ChunkText(text, isMarkdown)
 		assertChunkInvariants(t, text, chunks)
@@ -303,8 +337,11 @@ func TestRun_DirectoryPipeline(t *testing.T) {
 	reasons := map[string]int{}
 	for _, s := range rep.Skipped {
 		reasons[s.Reason]++
-		if strings.ContainsAny(s.Path, `\/`) && filepath.IsAbs(s.Path) {
+		if filepath.IsAbs(s.Path) {
 			t.Fatalf("SkipEntry.Path가 절대경로: %s", s.Path)
+		}
+		if strings.Contains(s.Path, root) || strings.Contains(s.Path, ident.Fold(root)) {
+			t.Fatalf("SkipEntry.Path에 프로젝트 루트 노출: %s (root=%s)", s.Path, root)
 		}
 	}
 	if reasons["secret-denylist"] != 1 || reasons["too-large"] != 1 {
