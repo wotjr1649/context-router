@@ -2,19 +2,25 @@
 package store
 
 import (
+	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"time"
+	"unicode/utf8"
 
-	_ "modernc.org/sqlite" // 유일하게 허용되는 blank import (규약 §10)
+	"modernc.org/sqlite" // driver(§10 규약상 blank import 예외) + Error.Code() BUSY/LOCKED 판별에 사용
 )
 
 var (
-	ErrNotFound    = errors.New("store: not found")
-	ErrUnavailable = errors.New("store: unavailable")
-	ErrConflict    = errors.New("store: conflict")
+	ErrNotFound        = errors.New("store: not found")
+	ErrUnavailable     = errors.New("store: unavailable")
+	ErrConflict        = errors.New("store: conflict")
+	ErrInvalidSelector = errors.New("store: invalid selector")
 )
 
 const SchemaVersion = 1
@@ -34,10 +40,14 @@ func Open(dir string, readOnly bool) (*Store, error) {
 		}
 	}
 	dsn := "file:" + filepath.ToSlash(filepath.Join(dir, "content.db")) + pragmas
+	wdsn := dsn
 	if readOnly {
 		dsn += "&mode=ro&_pragma=query_only(ON)"
+		wdsn = dsn
+	} else {
+		wdsn += "&_txlock=immediate" // Register: Begin()/BeginTx()가 BEGIN IMMEDIATE로 즉시 쓰기 락 (설계 §3.5)
 	}
-	w, err := sql.Open("sqlite", dsn)
+	w, err := sql.Open("sqlite", wdsn)
 	if err != nil {
 		return nil, fmt.Errorf("store open: %w", err)
 	}
@@ -143,4 +153,321 @@ func (s *Store) Close() error {
 	readerErr := s.reader.Close()
 	writerErr := s.writer.Close()
 	return errors.Join(checkpointErr, readerErr, writerErr)
+}
+
+// --- Register / ReadRange 계약 타입 (설계 §3.5, §4.2) ---
+
+type SourceMeta struct {
+	URI, Kind                        string
+	Size, MtimeNS                    int64
+	SrcHash, RawBlobHash, Extraction string
+}
+
+type Chunk struct {
+	Ordinal            int
+	ByteStart, ByteEnd int64
+	LineStart, LineEnd int
+	Title, Text        string
+}
+
+type Registration struct {
+	StoredBytes          []byte
+	MediaType, Redaction string
+	Source               SourceMeta
+	Chunks               []Chunk
+	ExpectedOldSrcHash   string // ""=신규 허용, 그 외=CAS 조건 (§3.5)
+}
+
+// Selector.Kind: "chunk"|"line"|"byte"
+type Selector struct {
+	ChunkID            int64
+	LineStart, LineEnd int
+	ByteStart, ByteEnd int64
+	Kind               string
+}
+
+type RangeResult struct {
+	Text               []byte
+	ByteStart, ByteEnd int64
+	LineStart, LineEnd int
+	Artifact           ArtifactMeta
+}
+
+type ArtifactMeta struct {
+	ID                                int64
+	ContentHash, MediaType, Redaction string
+	ByteLength                        int64
+	CreatedAt                         int64
+}
+
+func nullIfEmpty(v string) any {
+	if v == "" {
+		return nil
+	}
+	return v
+}
+
+// writeBlob: artifacts/<h[:2]>/<h>에 원자적으로 기록 — 임시파일→fsync→rename.
+// 대상이 이미 존재해도 os.Rename이 덮어써 no-op처럼 동작(동일 content_hash라 내용은 항상 동일).
+// ponytail: 임시파일명이 pid 기반이라 동일 프로세스 내 동시 Register(같은 content)엔 유일성이 없음 —
+// 필요해지면 goroutine-safe 카운터를 덧붙인다.
+func (s *Store) writeBlob(hash string, data []byte) error {
+	dir := filepath.Join(s.dir, "artifacts", hash[:2])
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return fmt.Errorf("store writeBlob: %w", err)
+	}
+	tmp := filepath.Join(dir, fmt.Sprintf(".tmp%d", os.Getpid()))
+	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+	if err != nil {
+		return fmt.Errorf("store writeBlob: %w", err)
+	}
+	_, werr := f.Write(data)
+	serr := f.Sync()
+	cerr := f.Close()
+	if werr != nil || serr != nil || cerr != nil {
+		os.Remove(tmp)
+		return fmt.Errorf("store writeBlob: %w", errors.Join(werr, serr, cerr))
+	}
+	if err := os.Rename(tmp, filepath.Join(dir, hash)); err != nil {
+		os.Remove(tmp)
+		return fmt.Errorf("store writeBlob: %w", err)
+	}
+	return nil
+}
+
+// readBlob: content_hash 전체를 메모리로 로드.
+// ponytail: 부분 읽기(os.File.ReadAt) 없이 전체 로드 — blob이 커져 문제되면 그때 스트리밍으로 바꾼다.
+func (s *Store) readBlob(hash string) ([]byte, error) {
+	b, err := os.ReadFile(filepath.Join(s.dir, "artifacts", hash[:2], hash))
+	if err != nil {
+		return nil, fmt.Errorf("store readBlob: %w", err)
+	}
+	return b, nil
+}
+
+// txRetry: BEGIN IMMEDIATE(§3.5, DSN _txlock=immediate) 트랜잭션 1개로 fn 실행.
+// BUSY/LOCKED면 트랜잭션 전체를 지수 백오프(50/200/800ms, ctx 존중)로 최대 3회 재시도.
+func (s *Store) txRetry(ctx context.Context, fn func(tx *sql.Tx) error) error {
+	delays := [3]time.Duration{50 * time.Millisecond, 200 * time.Millisecond, 800 * time.Millisecond}
+	for attempt := 0; ; attempt++ {
+		err := s.runTx(ctx, fn)
+		if err == nil || !isBusy(err) {
+			return err
+		}
+		if attempt >= len(delays) {
+			return fmt.Errorf("store txRetry: 재시도 소진: %w", ErrUnavailable)
+		}
+		select {
+		case <-time.After(delays[attempt]):
+		case <-ctx.Done():
+			return fmt.Errorf("store txRetry: %w", ctx.Err())
+		}
+	}
+}
+
+func (s *Store) runTx(ctx context.Context, fn func(tx *sql.Tx) error) error {
+	tx, err := s.writer.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	if err := fn(tx); err != nil {
+		tx.Rollback()
+		return err
+	}
+	return tx.Commit()
+}
+
+// isBusy: SQLITE_BUSY(5)/SQLITE_LOCKED(6) 여부 — 확장 코드는 하위 8비트가 기본 코드와 같다(SQLite 불변식).
+func isBusy(err error) bool {
+	var se *sqlite.Error
+	if !errors.As(err, &se) {
+		return false
+	}
+	code := se.Code() & 0xff
+	return code == 5 || code == 6
+}
+
+// Register: blob을 먼저 원자 배치(DB 커밋 전)한 뒤 BEGIN IMMEDIATE 단일 트랜잭션으로
+// artifact SELECT-or-INSERT → chunks 전량 INSERT → sources CAS/upsert (설계 §3.5).
+func (s *Store) Register(ctx context.Context, reg Registration) (int64, error) {
+	sum := sha256.Sum256(reg.StoredBytes)
+	contentHash := hex.EncodeToString(sum[:])
+	if err := s.writeBlob(contentHash, reg.StoredBytes); err != nil { // DB 커밋 전 배치 (§3.5)
+		return 0, err
+	}
+	var artID int64
+	err := s.txRetry(ctx, func(tx *sql.Tx) error {
+		if err := tx.QueryRow("SELECT id FROM artifacts WHERE content_hash=?", contentHash).Scan(&artID); err == sql.ErrNoRows {
+			res, err := tx.Exec("INSERT INTO artifacts(content_hash,media_type,byte_length,redaction,created_at) VALUES(?,?,?,?,?)",
+				contentHash, reg.MediaType, len(reg.StoredBytes), reg.Redaction, time.Now().Unix())
+			if err != nil {
+				return err
+			}
+			artID, _ = res.LastInsertId()
+			for _, c := range reg.Chunks {
+				if _, err := tx.Exec(`INSERT INTO chunks(artifact_id,ordinal,byte_start,byte_end,line_start,line_end,title,text)
+					VALUES(?,?,?,?,?,?,?,?)`, artID, c.Ordinal, c.ByteStart, c.ByteEnd, c.LineStart, c.LineEnd, c.Title, c.Text); err != nil {
+					return err
+				}
+			}
+		} else if err != nil {
+			return err
+		}
+		// sources CAS upsert (§3.5)
+		if reg.ExpectedOldSrcHash != "" {
+			res, err := tx.Exec(`UPDATE sources SET artifact_id=?,source_kind=?,src_size=?,src_mtime_ns=?,src_hash=?,raw_blob_hash=?,extraction=?,indexed_at=?
+				WHERE uri=? AND src_hash=?`,
+				artID, reg.Source.Kind, reg.Source.Size, reg.Source.MtimeNS, reg.Source.SrcHash,
+				nullIfEmpty(reg.Source.RawBlobHash), nullIfEmpty(reg.Source.Extraction), time.Now().Unix(),
+				reg.Source.URI, reg.ExpectedOldSrcHash)
+			if err != nil {
+				return err
+			}
+			if n, _ := res.RowsAffected(); n == 0 {
+				return fmt.Errorf("register %s: CAS 불일치: %w", reg.Source.Kind, ErrConflict)
+			}
+			return nil
+		}
+		_, err := tx.Exec(`INSERT INTO sources(uri,artifact_id,source_kind,src_size,src_mtime_ns,src_hash,raw_blob_hash,extraction,indexed_at)
+			VALUES(?,?,?,?,?,?,?,?,?)
+			ON CONFLICT(uri) DO UPDATE SET artifact_id=excluded.artifact_id,src_size=excluded.src_size,
+			  src_mtime_ns=excluded.src_mtime_ns,src_hash=excluded.src_hash,indexed_at=excluded.indexed_at`,
+			reg.Source.URI, artID, reg.Source.Kind, reg.Source.Size, reg.Source.MtimeNS, reg.Source.SrcHash,
+			nullIfEmpty(reg.Source.RawBlobHash), nullIfEmpty(reg.Source.Extraction), time.Now().Unix())
+		return err
+	})
+	return artID, err
+}
+
+// snapUTF8: [start,end)을 UTF-8 문자 경계로 스냅한다. start는 RuneStart까지 후퇴하고,
+// 그 지점부터 유효한 룬을 하나씩 전진 소비하며 end를 넘지 않는 지점에서 멈춘다 — 잘린
+// 멀티바이트나 손상된 바이트를 절대 포함하지 않으므로 임의 바이트 입력에도 panic 없이
+// 항상 유효한 UTF-8 부분열을 반환한다(FuzzSnapUTF8 불변식).
+func snapUTF8(data []byte, start, end int64) (int64, int64) {
+	n := int64(len(data))
+	if start < 0 {
+		start = 0
+	} else if start > n {
+		start = n
+	}
+	if end < start {
+		end = start
+	} else if end > n {
+		end = n
+	}
+	for start > 0 && start < n && !utf8.RuneStart(data[start]) {
+		start--
+	}
+	pos := start
+	for pos < end {
+		r, size := utf8.DecodeRune(data[pos:])
+		if size == 0 || (r == utf8.RuneError && size <= 1) || pos+int64(size) > end {
+			break
+		}
+		pos += int64(size)
+	}
+	return start, pos
+}
+
+// lineByteRange: 1-based [lineStart,lineEnd] 줄 구간의 바이트 범위. 각 줄은 자신의 개행문자를
+// 포함하며(마지막 줄에 개행이 없으면 데이터 끝까지), 범위를 벗어나면 빈 구간을 반환한다.
+func lineByteRange(data []byte, lineStart, lineEnd int) (int64, int64) {
+	starts := []int64{0}
+	for i, b := range data {
+		if b == '\n' {
+			starts = append(starts, int64(i+1))
+		}
+	}
+	lo := lineStart - 1
+	if lo < 0 {
+		lo = 0
+	}
+	if lo >= len(starts) {
+		return int64(len(data)), int64(len(data))
+	}
+	begin := starts[lo]
+	end := int64(len(data))
+	if lineEnd < len(starts) {
+		end = starts[lineEnd]
+	}
+	return begin, end
+}
+
+// readChunk: chunk 저장 좌표로 blob을 읽는다. 좌표가 없으면 chunks.text로 대체한다 (§3.5).
+func (s *Store) readChunk(res *RangeResult, artifactID, chunkID int64) error {
+	var bs, be, ls, le sql.NullInt64
+	var text string
+	err := s.reader.QueryRow(`SELECT byte_start,byte_end,line_start,line_end,text FROM chunks WHERE id=? AND artifact_id=?`,
+		chunkID, artifactID).Scan(&bs, &be, &ls, &le, &text)
+	if errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("store ReadRange: chunk 없음: %w", ErrNotFound)
+	}
+	if err != nil {
+		return fmt.Errorf("store ReadRange: %w", err)
+	}
+	res.LineStart, res.LineEnd = int(ls.Int64), int(le.Int64)
+	if !bs.Valid || !be.Valid {
+		res.Text = []byte(text)
+		res.ByteEnd = int64(len(res.Text))
+		return nil
+	}
+	blob, err := s.readBlob(res.Artifact.ContentHash)
+	if err != nil {
+		return err
+	}
+	res.ByteStart, res.ByteEnd = bs.Int64, be.Int64
+	res.Text = blob[res.ByteStart:res.ByteEnd]
+	return nil
+}
+
+// ReadRange: Selector.Kind 하나로 chunk 저장 좌표, blob 라인 스캔, blob UTF-8 스냅 바이트
+// 구간 중 하나를 읽는다 (설계 §3.5).
+func (s *Store) ReadRange(ctx context.Context, artifactID int64, sel Selector) (RangeResult, error) {
+	switch sel.Kind {
+	case "chunk", "line", "byte":
+	default:
+		return RangeResult{}, fmt.Errorf("store ReadRange: kind=%q: %w", sel.Kind, ErrInvalidSelector)
+	}
+	var meta ArtifactMeta
+	err := s.reader.QueryRowContext(ctx, `SELECT id,content_hash,media_type,redaction,byte_length,created_at
+		FROM artifacts WHERE id=?`, artifactID).
+		Scan(&meta.ID, &meta.ContentHash, &meta.MediaType, &meta.Redaction, &meta.ByteLength, &meta.CreatedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return RangeResult{}, fmt.Errorf("store ReadRange: artifact 없음: %w", ErrNotFound)
+	}
+	if err != nil {
+		return RangeResult{}, fmt.Errorf("store ReadRange: %w", err)
+	}
+	res := RangeResult{Artifact: meta}
+	switch sel.Kind {
+	case "chunk":
+		if err := s.readChunk(&res, artifactID, sel.ChunkID); err != nil {
+			return RangeResult{}, err
+		}
+	case "line":
+		blob, err := s.readBlob(meta.ContentHash)
+		if err != nil {
+			return RangeResult{}, err
+		}
+		res.ByteStart, res.ByteEnd = lineByteRange(blob, sel.LineStart, sel.LineEnd)
+		res.Text = blob[res.ByteStart:res.ByteEnd]
+		res.LineStart, res.LineEnd = sel.LineStart, sel.LineEnd
+	case "byte":
+		blob, err := s.readBlob(meta.ContentHash)
+		if err != nil {
+			return RangeResult{}, err
+		}
+		res.ByteStart, res.ByteEnd = snapUTF8(blob, sel.ByteStart, sel.ByteEnd)
+		res.Text = blob[res.ByteStart:res.ByteEnd]
+	}
+	return res, nil
+}
+
+// LedgerAppend: best-effort 사용량 기록 — ledger 없음/오류는 무시(§3.5).
+func (s *Store) LedgerAppend(tool string, stored, returned, ms int64) {
+	if s.ledger == nil {
+		return
+	}
+	_, _ = s.ledger.Exec(`INSERT INTO ledger(ts,tool,bytes_stored,bytes_returned,duration_ms) VALUES(?,?,?,?,?)`,
+		time.Now().Unix(), tool, stored, returned, ms)
 }
