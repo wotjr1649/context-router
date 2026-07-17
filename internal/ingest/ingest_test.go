@@ -1,6 +1,7 @@
 package ingest
 
 import (
+	"bytes"
 	"strings"
 	"testing"
 )
@@ -15,9 +16,16 @@ func TestRedact_Canaries(t *testing.T) {
 		{"docker-auth", `{"auths":{"r.io":{"auth":"dXNlcjpwYXNzd29yZDEyMw=="}}}`, "dXNlcjpwYXNzd29yZDEyMw"},
 		{"json-escaped", `{"t":"ghp_abcdefghijklmnopqrstuvwxyz012345"}`, "abcdefghijklmnopqrstuvwxyz012345"},
 		{"password-kv", "password=hunter2xx;db=x", "hunter2xx"},
+		// ghp_ — raw 바이트에 "ghp_"가 없음(아래 가드로 실증). unescape 뷰만 잡을 수 있음.
+		{"json-escaped-real", `{"k":"gh\p_abcdefghijklmnopqrstuvwxyz012345"}`, "abcdefghijklmnopqrstuvwxyz012345"},
+		{"jwt-bare", `{"token":"eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV"}`, "SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV"},
+		{"slack", "hook xoxb-123456789012-abcdefghijklmnop end", "xoxb-123456789012-abcdefghijklmnop"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			if tt.name == "json-escaped-real" && strings.Contains(tt.in, "ghp_") {
+				t.Fatal("입력에 평문 ghp_ 존재 — 2뷰(unescape) 경로 미검증")
+			}
 			out, spans := Redact([]byte(tt.in))
 			if strings.Contains(string(out), tt.mustGone) {
 				t.Fatalf("누출: %q 가 남음\n%s", tt.mustGone, out)
@@ -44,6 +52,8 @@ func FuzzRedact(f *testing.F) {
 		`{"auths":{"r.io":{"auth":"dXNlcjpwYXNzd29yZDEyMw=="}}}`,
 		`{"t":"ghp_abcdefghijklmnopqrstuvwxyz012345"}`,
 		"password=hunter2xx;db=x",
+		`{"k":"gh\p_abcdefghijklmnopqrstuvwxyz012345"}`,
+		`{"token":"eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV"}`,
 	} {
 		f.Add([]byte(s))
 	}
@@ -54,6 +64,18 @@ func FuzzRedact(f *testing.F) {
 		}
 		_ = out
 	})
+}
+
+func TestRedact_DoesNotMutateInput(t *testing.T) {
+	in := []byte("key=AKIAIOSFODNN7EXAMPLE ok")
+	orig := append([]byte(nil), in...)
+	out, _ := Redact(in)
+	if !bytes.Equal(in, orig) {
+		t.Fatal("입력이 변조됨")
+	}
+	if bytes.Contains(out, []byte("AKIAIOSFODNN7EXAMPLE")) {
+		t.Fatal("비밀 잔존")
+	}
 }
 
 func TestDeniedFilename(t *testing.T) {
