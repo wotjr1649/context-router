@@ -1,0 +1,29 @@
+[
+  {
+    "Ordinal": 0,
+    "ByteStart": 0,
+    "ByteEnd": 351,
+    "LineStart": 1,
+    "LineEnd": 8,
+    "Title": "Introduction",
+    "Text": "# Introduction\n\nThis document explains the golden fixture used by ChunkText tests. It has\nenough body text under each heading to exercise line-block accumulation\nand to prove that headings mark a new chunk when Markdown mode is on.\nEvery paragraph repeats similar filler sentences so the byte length is\npredictable across edits to this fixture file.\n\n"
+  },
+  {
+    "Ordinal": 1,
+    "ByteStart": 351,
+    "ByteEnd": 631,
+    "LineStart": 9,
+    "LineEnd": 15,
+    "Title": "Background",
+    "Text": "## Background\n\nSome background text goes here so this section is not trivially short.\nThe chunker should record this heading as the Title for any chunk that\nstarts inside this section, including chunks reached purely by the 4KB\nbyte-budget cut rather than by a heading boundary.\n\n"
+  },
+  {
+    "Ordinal": 2,
+    "ByteStart": 631,
+    "ByteEnd": 827,
+    "LineStart": 16,
+    "LineEnd": 20,
+    "Title": "Details",
+    "Text": "### Details\n\nDeeper heading level three. This section closes out the document and\nprovides a third heading so the golden test can assert on three distinct\nTitle values across the produced chunks.\n"
+  }
+]
