@@ -218,6 +218,7 @@ Codex(GPT 계열)가 두 문서를 독립적으로 읽고 낸 의견. 자문이�
 | D10 | v0.0.1 계약 재정의 — "oracle 10개 동등" → 도구 감사 문서 §2.2 인벤토리(코어 5 MCP + global + CLI 4 + 신규 fetch/transform, exec 3종 구현째 v0.2) | **확정 (2026-07-17)** — 근거: `context-router-tool-audit-ko.md` | HANDOFF 확정 변경 (사용자 승인) |
 | D11 | MCP SDK 방침 | **확정 (2026-07-17)**: 현행 go-sdk v1.6.1(spec 2025-11-25)로 구현 진행. 차기 스펙 정식 출시 + go-sdk 안정판 시 별도 업그레이드 마일스톤 — RC 대기로 지연하지 않음 | §8.1 |
 | D12 | fetch 저장 파이프라인 개선 — 참조 구현은 Turndown으로 전체 페이지 변환(본문 추출 없음 → boilerplate 오염 확인) | **확정 (2026-07-17, 적대 검증 반영)**: readeck/go-readability(go-shiori는 deprecated 확인) → DOM 비교 충실도 판정(fail-open: <500자·텍스트<30%·pre/code<50%) → html-to-markdown v2(+table). 원문 HTML은 비색인 source blob 보존. D8 의존성 7개로 수정 | 설계서 §4.5 |
+| D13 | 파일 반파편화 규약 — 패키지당 소스 1~2파일 시작, 분리는 ①OS build tag ②~1,000줄 초과+응집 이음새 ③생성물/embed 3경우만. 타입별 1파일·doc.go 단독·utils.go 금지. 선호 밴드 300~1,000줄, v0.0.1 목표 ≈12~15 소스 파일 | **확정 (2026-07-17)** — 사용자 지시. 구현 규약 문서에 성문화 | 유지보수 |
 
 ## 10. HANDOFF 12질문 매핑
 
