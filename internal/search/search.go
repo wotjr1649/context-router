@@ -38,17 +38,73 @@ const rrfK = 60
 // normalizeQuery splits q into whitespace 토큰으로 나눠 porter/trigram 각각의 FTS5
 // MATCH 식을 만든다. 토큰마다 이중따옴표로 감싸(내부 "는 ""로 이스케이프) 하이픈·콜론
 // 등 FTS5 특수문자를 리터럴로 취급시키고 " AND "로 묶는다. trigram 토크나이저는
-// 3자 미만 질의를 거부하므로 그런 토큰은 trigram 식에서 제외한다.
-func normalizeQuery(q string) (porter, trigram string) {
+// 3자 미만 질의를 거부하므로 그런 토큰은 trigram 식에서 제외하고 shortToks(원문 그대로)로
+// 반환한다 — 호출자가 trigram 후보를 그 토큰들의 리터럴 존재로 재필터링해 AND 계약을
+// 지키는 데 쓴다(Fix E).
+func normalizeQuery(q string) (porter, trigram string, shortToks []string) {
 	var pt, tt []string
 	for _, tok := range strings.Fields(q) {
 		esc := `"` + strings.ReplaceAll(tok, `"`, `""`) + `"`
 		pt = append(pt, esc)
 		if utf8.RuneCountInString(tok) >= 3 {
 			tt = append(tt, esc)
+		} else {
+			shortToks = append(shortToks, tok)
 		}
 	}
-	return strings.Join(pt, " AND "), strings.Join(tt, " AND ")
+	return strings.Join(pt, " AND "), strings.Join(tt, " AND "), shortToks
+}
+
+// filterShortTokenCandidates: trigram 후보(ids, 순위 순서 유지) 중 shortToks(<3자라
+// trigram 식에서 빠진 토큰)가 하나라도 chunk.text에 리터럴로 없는 후보를 버린다 — trigram
+// 식이 짧은 토큰을 누락해 AND 계약이 깨지는 것을 막는다(Fix E). porter 후보는 이미 모든
+// 토큰을 AND로 포함하므로 이 필터를 거치지 않는다.
+func filterShortTokenCandidates(ctx context.Context, db *sql.DB, ids []int64, shortToks []string) ([]int64, error) {
+	if len(shortToks) == 0 || len(ids) == 0 {
+		return ids, nil
+	}
+	placeholders := make([]string, len(ids))
+	args := make([]any, len(ids))
+	for i, id := range ids {
+		placeholders[i] = "?"
+		args[i] = id
+	}
+	rows, err := db.QueryContext(ctx,
+		"SELECT id, text FROM chunks WHERE id IN ("+strings.Join(placeholders, ",")+")", args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	texts := make(map[int64]string, len(ids))
+	for rows.Next() {
+		var id int64
+		var text string
+		if err := rows.Scan(&id, &text); err != nil {
+			return nil, err
+		}
+		texts[id] = text
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	kept := make([]int64, 0, len(ids))
+	for _, id := range ids {
+		text, ok := texts[id]
+		if !ok {
+			continue // orphan id(재색인 등) — loadHit 단계와 동일하게 skip
+		}
+		all := true
+		for _, tok := range shortToks {
+			if foldIndex(text, tok) < 0 {
+				all = false
+				break
+			}
+		}
+		if all {
+			kept = append(kept, id)
+		}
+	}
+	return kept, nil
 }
 
 // bm25Rank: table(패키지 상수만 전달되는 fts_porter/fts_trigram — 사용자 입력 아님,
@@ -116,39 +172,51 @@ func topN(scores map[int64]float64, n int) []scoredID {
 // 여러 개면 LIMIT 1이 임의 1행을 고른다(브리프: "다중 소스면 아무 1행" — JOIN 형태는
 // 단순 우선).
 const hitQuery = `SELECT c.artifact_id, c.line_start, c.line_end, c.text, a.redaction, s.uri, s.source_kind,
-	s.src_size, s.src_mtime_ns, s.src_hash
+	s.src_size, s.src_mtime_ns, s.src_hash, s.extraction
 	FROM chunks c JOIN artifacts a ON a.id = c.artifact_id JOIN sources s ON s.artifact_id = a.id
 	WHERE c.id = ? LIMIT 1`
 
-// loadHit: chunkID 1건을 Hit으로 채운다. q는 스니펫 매치 토큰 탐색에, staleCache는 Query
-// 호출 1회 내 uri별 stale 판정 캐시(§3.6 "같은 uri는 1회만 검사")에 쓰인다.
-func loadHit(ctx context.Context, db *sql.DB, chunkID int64, score float64, q string, staleCache map[string]bool) (Hit, error) {
+// loadHit: chunkID 1건을 Hit으로 채운다. q는 스니펫 매치 토큰 탐색에, projectRoot는 Source
+// project-relative 계산에, staleCache는 Query 호출 1회 내 uri별 stale 판정 캐시(§3.6 "같은
+// uri는 1회만 검사")에 쓰인다.
+func loadHit(ctx context.Context, db *sql.DB, chunkID int64, score float64, q, projectRoot string, staleCache map[string]bool) (Hit, error) {
 	var h Hit
 	var text, redaction, uri, kind string
 	var srcSize, srcMtimeNS sql.NullInt64
-	var srcHash sql.NullString
+	var srcHash, extraction sql.NullString
 	err := db.QueryRowContext(ctx, hitQuery, chunkID).
-		Scan(&h.ArtifactID, &h.LineStart, &h.LineEnd, &text, &redaction, &uri, &kind, &srcSize, &srcMtimeNS, &srcHash)
+		Scan(&h.ArtifactID, &h.LineStart, &h.LineEnd, &text, &redaction, &uri, &kind, &srcSize, &srcMtimeNS, &srcHash, &extraction)
 	if err != nil {
 		return Hit{}, fmt.Errorf("search: load chunk %d: %w", chunkID, err)
 	}
 	h.ChunkID = chunkID
 	h.Score = score
-	h.Source = relativizeSource(uri)
+	h.Source = relativizeSource(uri, projectRoot)
 	h.Snippet = snippetWindow(text, firstMatchToken(q, text))
 	h.Redacted = redaction == "spans"
-	h.SourceCoordsExact = redaction == "none" && kind == "file"
+	// SourceCoordsExact: file/inline은 저장된 좌표가 원문을 그대로 가리켜 정확하다. web처럼
+	// 변환을 거친 kind는 extraction 유무와 무관하게 항상 false(원문 좌표 자체가 없음).
+	h.SourceCoordsExact = redaction == "none" && extraction.String == "" && (kind == "file" || kind == "inline")
 	h.Stale = isStale(uri, kind, srcSize.Int64, srcMtimeNS.Int64, srcHash.String, staleCache)
 	return h, nil
 }
 
-// relativizeSource: uri(Fold된 절대경로 또는 inline:제목)에서 절대 접두(드라이브/루트/UNC
-// 선행 빈 세그먼트)를 걷어내고 마지막 3개 '/' 세그먼트만 남긴다. Query는 projectRoot를 모르는
-// 채로 호출되므로 완전한 project-relative 경로 대신 근사치다(설계 §4.1 source(project-relative);
-// 절대경로 전체 노출 금지가 계약).
-func relativizeSource(uri string) string {
+// relativizeSource: uri(ident.Fold된 절대경로 또는 inline:제목)를 projectRoot(ident.Fold된
+// canonical project root) 기준 project-relative 경로로 바꾼다(설계 §4.1 source(project-relative);
+// 절대경로 전체 노출 금지가 계약). uri가 projectRoot+"/"로 시작하면 그 접두를 잘라낸 진짜
+// 상대경로를 반환한다. 아니면(프로젝트 밖 uri, projectRoot 불명 등) fallback: 선행 "/" 제거,
+// 드라이브 세그먼트("c:" 등) 제거 후 마지막 최대 3개 '/' 세그먼트만 남기는 근사치.
+func relativizeSource(uri, projectRoot string) string {
+	if projectRoot != "" {
+		if rel, ok := strings.CutPrefix(uri, projectRoot+"/"); ok {
+			return rel
+		}
+	}
 	parts := strings.Split(uri, "/")
 	for len(parts) > 0 && parts[0] == "" {
+		parts = parts[1:]
+	}
+	if len(parts) > 0 && isDriveSeg(parts[0]) {
 		parts = parts[1:]
 	}
 	if len(parts) > 3 {
@@ -157,20 +225,49 @@ func relativizeSource(uri string) string {
 	return strings.Join(parts, "/")
 }
 
+// isDriveSeg: Windows 드라이브 세그먼트("c:" 등, 정규식 ^[a-z]:$와 동형)인지 검사한다.
+// ident.Fold가 드라이브 문자를 소문자화하므로 소문자만 확인한다.
+func isDriveSeg(s string) bool {
+	return len(s) == 2 && s[1] == ':' && s[0] >= 'a' && s[0] <= 'z'
+}
+
 const (
 	snippetHalf     = 250
 	snippetFallback = 500
 )
 
 // firstMatchToken: q의 공백 토큰 중 text에 대소문자 무시 부분문자열로 존재하는 첫 토큰을
-// 반환한다(없으면 "").
+// 반환한다. 리터럴 매치가 하나도 없으면(예: 쿼리 "caching"·본문 "cached" — porter 스템만
+// 일치) 각 토큰의 접두(max(4, len-3)룬)로 재시도해 어간 근사 매치를 찾는다. 그래도 없으면
+// ""(snippetWindow가 앞 500B로 폴백).
+// ponytail: 어간 근사 — FTS5 snippet() 도입 시 대체.
 func firstMatchToken(q, text string) string {
-	for _, tok := range strings.Fields(q) {
+	toks := strings.Fields(q)
+	for _, tok := range toks {
 		if foldIndex(text, tok) >= 0 {
 			return tok
 		}
 	}
+	for _, tok := range toks {
+		p := tokenPrefix(tok)
+		if p != "" && foldIndex(text, p) >= 0 {
+			return p
+		}
+	}
 	return ""
+}
+
+// tokenPrefix: tok 앞 max(4, len-3)룬(스템 근사 접두). tok가 그보다 짧으면 tok 전체.
+func tokenPrefix(tok string) string {
+	r := []rune(tok)
+	n := len(r) - 3
+	if n < 4 {
+		n = 4
+	}
+	if n > len(r) {
+		n = len(r)
+	}
+	return string(r[:n])
 }
 
 // foldIndex: text에서 token을 대소문자 무시로 찾아 원본 text 기준 바이트 오프셋을
@@ -297,14 +394,15 @@ func statStale(uri string, size, mtimeNS int64, srcHash string) bool {
 // Query: queries 각각에 대해 fts_porter+fts_trigram을 병행 질의하고 상위 limit×4개씩을
 // RRF(k=60)로 병합해 상위 limit개 Hit를 반환한다. budgetBytes>0이면 쿼리 수로 균등 분할해
 // 스니펫 바이트 예산을 배분하고 미사용분은 다음 쿼리로 이월한다(설계 §4.1). budgetBytes<=0은
-// 무제한.
-func Query(ctx context.Context, st *store.Store, queries []string, limit, budgetBytes int) ([]QueryResult, error) {
+// 무제한. projectRoot는 ident.Fold된 canonical project root — Hit.Source의 project-relative
+// 계산 기준(Fix B).
+func Query(ctx context.Context, st *store.Store, projectRoot string, queries []string, limit, budgetBytes int) ([]QueryResult, error) {
 	db := st.Reader()
 	results := make([]QueryResult, 0, len(queries))
 	staleCache := make(map[string]bool)
 	avail := budgetBytes
 	for i, q := range queries {
-		porter, trigram := normalizeQuery(q)
+		porter, trigram, shortToks := normalizeQuery(q)
 		pIDs, err := bm25Rank(ctx, db, "fts_porter", porter, limit*4)
 		if err != nil {
 			return nil, err
@@ -313,10 +411,14 @@ func Query(ctx context.Context, st *store.Store, queries []string, limit, budget
 		if err != nil {
 			return nil, err
 		}
+		tIDs, err = filterShortTokenCandidates(ctx, db, tIDs, shortToks)
+		if err != nil {
+			return nil, err
+		}
 		top := topN(rrfMerge(pIDs, tIDs), limit)
 		hits := make([]Hit, 0, len(top))
 		for _, sc := range top {
-			h, err := loadHit(ctx, db, sc.id, sc.score, q, staleCache)
+			h, err := loadHit(ctx, db, sc.id, sc.score, q, projectRoot, staleCache)
 			if errors.Is(err, sql.ErrNoRows) {
 				continue // 재색인 orphan(구 chunk — sources.artifact_id가 신규를 가리켜 no-row): skip, limit*4 후보 폭이 보충
 			}

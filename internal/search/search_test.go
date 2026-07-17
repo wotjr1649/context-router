@@ -50,7 +50,7 @@ func hasSource(hits []Hit, base string) bool {
 
 func TestQuery_PorterStemsMatch(t *testing.T) {
 	st := seedT(t)
-	res, err := Query(t.Context(), st, []string{"caching"}, 10, 0)
+	res, err := Query(t.Context(), st, "", []string{"caching"}, 10, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -65,7 +65,7 @@ func TestQuery_PorterStemsMatch(t *testing.T) {
 
 func TestQuery_TrigramSubstringMatch(t *testing.T) {
 	st := seedT(t)
-	res, err := Query(t.Context(), st, []string{"useEff"}, 10, 0)
+	res, err := Query(t.Context(), st, "", []string{"useEff"}, 10, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -103,7 +103,7 @@ func TestQuery_BudgetSplitsAndTruncatesIndependently(t *testing.T) {
 	regOne(t, st, "/big.txt", "hbig", big)
 	regOne(t, st, "/small.txt", "hsmall", "useEffect cleanup")
 
-	res, err := Query(t.Context(), st, []string{"caching", "useEff"}, 10, 600)
+	res, err := Query(t.Context(), st, "", []string{"caching", "useEff"}, 10, 600)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -114,7 +114,7 @@ func TestQuery_BudgetSplitsAndTruncatesIndependently(t *testing.T) {
 		t.Fatalf("want useEff 쿼리 미truncated(독립적+이월로 여유), got truncated=%v hits=%+v", res[1].Truncated, res[1].Hits)
 	}
 
-	unl, err := Query(t.Context(), st, []string{"caching", "useEff"}, 10, 0)
+	unl, err := Query(t.Context(), st, "", []string{"caching", "useEff"}, 10, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -141,7 +141,7 @@ func TestQuery_SnippetWindowCentersOnMatch(t *testing.T) {
 	text := b.String()
 	regOne(t, st, "/needle.txt", "hneedle", text)
 
-	res, err := Query(t.Context(), st, []string{"NEEDLE-SNIPPET-TARGET"}, 10, 0)
+	res, err := Query(t.Context(), st, "", []string{"NEEDLE-SNIPPET-TARGET"}, 10, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -212,7 +212,7 @@ func TestQuery_StaleDetectsModifiedFile(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	before, err := Query(t.Context(), st, []string{"caching"}, 10, 0)
+	before, err := Query(t.Context(), st, "", []string{"caching"}, 10, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -228,7 +228,7 @@ func TestQuery_StaleDetectsModifiedFile(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	after, err := Query(t.Context(), st, []string{"caching"}, 10, 0)
+	after, err := Query(t.Context(), st, "", []string{"caching"}, 10, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -261,7 +261,7 @@ func TestQuery_ReindexOrphanDoesNotFailQuery(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	oldRes, err := Query(t.Context(), st, []string{"oldwordunique"}, 10, 0)
+	oldRes, err := Query(t.Context(), st, "", []string{"oldwordunique"}, 10, 0)
 	if err != nil {
 		t.Fatalf("want no error querying orphaned term, got %v", err)
 	}
@@ -269,7 +269,7 @@ func TestQuery_ReindexOrphanDoesNotFailQuery(t *testing.T) {
 		t.Fatalf("want 0 hits for orphaned-only term, got %+v", oldRes[0].Hits)
 	}
 
-	newRes, err := Query(t.Context(), st, []string{"newwordunique"}, 10, 0)
+	newRes, err := Query(t.Context(), st, "", []string{"newwordunique"}, 10, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -280,7 +280,7 @@ func TestQuery_ReindexOrphanDoesNotFailQuery(t *testing.T) {
 
 func TestQuery_RRFRanksDualMatchTop(t *testing.T) {
 	st := seedT(t)
-	res, err := Query(t.Context(), st, []string{"caching useEffect"}, 10, 0)
+	res, err := Query(t.Context(), st, "", []string{"caching useEffect"}, 10, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -302,8 +302,150 @@ func TestQuery_RawInputsNoFTSInjectionError(t *testing.T) {
 		`한글"질의`,
 	}
 	for _, q := range inputs {
-		if _, err := Query(t.Context(), st, []string{q}, 10, 0); err != nil {
+		if _, err := Query(t.Context(), st, "", []string{q}, 10, 0); err != nil {
 			t.Fatalf("want no error for input %q, got %v", q, err)
 		}
+	}
+}
+
+// TestRelativizeSource_ProjectRelativeInvariants: Fix B — Source가 진짜 project-relative
+// 경로여야 한다(설계 §4.1). projectRoot 하위는 TrimPrefix로 진짜 상대경로, 밖(또는 불명)은
+// fallback(선행 "/"·드라이브 세그먼트 제거 후 마지막 <=3 세그먼트)으로 근사한다.
+func TestRelativizeSource_ProjectRelativeInvariants(t *testing.T) {
+	cases := []struct{ name, uri, root, want string }{
+		{"deep under root", "c:/repo/sub/dir/file.go", "c:/repo", "sub/dir/file.go"},
+		{"direct child of root", "c:/repo/a.txt", "c:/repo", "a.txt"},
+		{"outside root fallback", "c:/other/a/b/c/d/file.go", "c:/repo", "c/d/file.go"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := relativizeSource(c.uri, c.root)
+			if got != c.want {
+				t.Fatalf("relativizeSource(%q,%q) = %q, want %q", c.uri, c.root, got, c.want)
+			}
+			if filepath.IsAbs(got) {
+				t.Fatalf("want !IsAbs, got %q", got)
+			}
+			if len(got) >= 2 && got[0] >= 'a' && got[0] <= 'z' && got[1] == ':' {
+				t.Fatalf("want no drive prefix, got %q", got)
+			}
+			if strings.HasPrefix(got, "/") {
+				t.Fatalf("want no leading slash, got %q", got)
+			}
+		})
+	}
+}
+
+// TestQuery_SourceCoordsExact: Fix C — inline 원문(redaction 없음)은 좌표가 정확해 true,
+// redaction spans가 있는 file은 false(kind만으로 결정하던 구버전은 inline을 오탐 false 처리).
+func TestQuery_SourceCoordsExact(t *testing.T) {
+	st, err := store.Open(t.TempDir(), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	inline := "caching notes inline"
+	if _, err := st.Register(t.Context(), store.Registration{
+		StoredBytes: []byte(inline), MediaType: "text/plain", Redaction: "none",
+		Source: store.SourceMeta{URI: "inline:notes", Kind: "inline", SrcHash: "hi"},
+		Chunks: []store.Chunk{{Ordinal: 0, ByteStart: 0, ByteEnd: int64(len(inline)),
+			LineStart: 1, LineEnd: 1, Text: inline}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	secret := "caching password hunter2 redacted"
+	if _, err := st.Register(t.Context(), store.Registration{
+		StoredBytes: []byte(secret), MediaType: "text/plain", Redaction: "spans",
+		Source: store.SourceMeta{URI: "/secret.txt", Kind: "file", SrcHash: "hs"},
+		Chunks: []store.Chunk{{Ordinal: 0, ByteStart: 0, ByteEnd: int64(len(secret)),
+			LineStart: 1, LineEnd: 1, Text: secret}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	res, err := Query(t.Context(), st, "", []string{"caching"}, 10, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var gotInline, gotSecret bool
+	for _, h := range res[0].Hits {
+		switch h.Source {
+		case "inline:notes":
+			gotInline = true
+			if !h.SourceCoordsExact {
+				t.Fatalf("want inline SourceCoordsExact=true, got %+v", h)
+			}
+		case "secret.txt":
+			gotSecret = true
+			if h.SourceCoordsExact {
+				t.Fatalf("want redacted file SourceCoordsExact=false, got %+v", h)
+			}
+		}
+	}
+	if !gotInline || !gotSecret {
+		t.Fatalf("want both inline+secret hits, got %+v", res[0].Hits)
+	}
+}
+
+// TestQuery_TrigramShortTokenAND: Fix E — trigram 후보 중 normalizeQuery가 <3자라 제외한
+// 토큰("go")이 chunk.text에 리터럴로 없는 후보(rust 문서)는 버려야 한다. 쿼리를 "go cachin"
+// (porter 스템 불일치라 porter 경로는 무력화됨)으로 줘 trigram 경로만으로 AND 계약을 검증한다.
+func TestQuery_TrigramShortTokenAND(t *testing.T) {
+	st, err := store.Open(t.TempDir(), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	regOne(t, st, "/go.txt", "hgo", "caching guide for go services")
+	regOne(t, st, "/rust.txt", "hrust", "caching guide for rust services")
+
+	res, err := Query(t.Context(), st, "", []string{"go cachin"}, 10, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hits := res[0].Hits
+	if hasSource(hits, "rust.txt") {
+		t.Fatalf("want rust.txt(no literal 'go') excluded, got %+v", hits)
+	}
+	if !hasSource(hits, "go.txt") {
+		t.Fatalf("want go.txt(trigram 'cachin' + literal 'go') present, got %+v", hits)
+	}
+}
+
+// TestQuery_SnippetStemPrefixFallback: Fix F — 쿼리 "caching"·본문 "cached"(porter 스템 매치,
+// 리터럴 불일치)에서 앵커 탐색이 접두(prefix) 폴백으로 실제 매치 지점을 찾아야 한다(구버전은
+// 앞 500B로 폴백해 무관 스니펫을 냈다).
+func TestQuery_SnippetStemPrefixFallback(t *testing.T) {
+	st, err := store.Open(t.TempDir(), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	line := "filler line of text padding out the document body\n"
+	var b strings.Builder
+	for i := 0; i < 100; i++ {
+		b.WriteString(line)
+	}
+	b.WriteString("cached\n")
+	for i := 0; i < 100; i++ {
+		b.WriteString(line)
+	}
+	text := b.String()
+	regOne(t, st, "/stem.txt", "hstem", text)
+
+	res, err := Query(t.Context(), st, "", []string{"caching"}, 10, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hits := res[0].Hits
+	if len(hits) == 0 {
+		t.Fatal("want >=1 hit(porter stem match)")
+	}
+	snip := hits[0].Snippet
+	if !strings.Contains(snip, "cached") {
+		t.Fatalf("want snippet contain 'cached'(stem-prefix fallback), got %q", snip)
+	}
+	if snip == text[:500] {
+		t.Fatalf("want snippet != 앞 500B fallback(증명: 중반 배치), got equal")
 	}
 }
