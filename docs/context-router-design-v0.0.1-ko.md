@@ -3,8 +3,8 @@
 > 문서 상태: 설계서 초안 — 사용자 검토 대상, 승인 후 구현 계획(writing-plans)으로 이행
 > 작성일: 2026-07-17
 > 계약 기준: 도구 감사 문서 §2.2 인벤토리 (D10 확정)
-> 준수: HANDOFF `확정`·`차단`·`폐기`, 결정 D1~D10, 비전 제안서 테제 T1~T4·라우팅 §5.3
-> freeze 조건: MCP 스펙 2026-07-28 RC 확인 후 최종 확정 (그 전까지 "초안")
+> 준수: HANDOFF `확정`·`차단`·`폐기`, 결정 D1~D12, 비전 제안서 테제 T1~T4·라우팅 §5.3
+> SDK 방침(D11 확정): 현행 go-sdk v1.6.1(spec 2025-11-25)로 구현을 진행한다. 차기 MCP 스펙이 정식 출시되고 go-sdk 안정판(v1.7+)이 나오면 별도 업그레이드 마일스톤으로 반영 — RC 대기로 구현을 지연하지 않는다.
 
 ## 0. 결정 이력 요약
 
@@ -54,7 +54,10 @@
  ├─ MCP 등록 "ctr"        = context-router [--enable ingest,net] (stdio)
  │    tools/list: ctr_search, ctr_fetch, ctr_transform
  │                (+ ctr_index, ctr_fetch_and_index — 플래그 시)
- │    쓰기: 프로젝트당 이 프로세스 1개만 (WAL 단일 writer)
+ │    쓰기: 등록 구조상 호스트당 이 프로세스 1개 (옵션 B의 프로필별 다중 writer 회피)
+ │         두 호스트(Claude Code+Codex)를 같은 프로젝트에 동시 사용하면 프로세스 2개가
+ │         같은 DB를 연다 — SQLite 파일 잠금이 직렬화하고 busy_timeout+bounded retry(§3.5)로
+ │         흡수하며, §12 게이트 7의 다중 프로세스 시나리오로 검증한다
  └─ MCP 등록 "ctr-global" = context-router --profile global-search --projects <목록>  (선택 설치)
       tools/list: ctr_global_search (전 DB read-only 연결)
 
@@ -139,6 +142,8 @@ CREATE TABLE artifacts(
   source_uri    TEXT,                        -- 파일 절대경로 또는 URL (반환 시엔 project-relative 표시)
   src_size      INTEGER,                     -- file staleness probe
   src_mtime_ns  INTEGER,
+  src_hash      TEXT,                        -- 원본 바이트 sha256 (redaction/변환 전) — staleness 대조용.
+                                             -- content_hash는 저장본(변환·redaction 후) 주소이므로 원본 대조에 쓰지 않는다
   redaction     TEXT NOT NULL DEFAULT 'none',-- none | spans
   created_at    INTEGER NOT NULL
 );
@@ -188,7 +193,7 @@ CREATE TABLE ledger(                         -- local bytes ledger (§6)
 
 ### 3.6 staleness
 
-file-backed artifact는 조회 시 `src_size/src_mtime_ns` 비교(불일치 시 hash 재확인)로 `stale` 플래그를 계산해 **모든 반환에 포함**한다. stale 항목은 결과에서 제외하지 않는다(회수 판단은 호출자 몫) — 단 명시 표기.
+file-backed artifact는 조회 시 `src_size/src_mtime_ns` 비교(불일치 시 원본 재해시 → `src_hash` 대조)로 `stale` 플래그를 계산해 **모든 반환에 포함**한다. stale 항목은 결과에서 제외하지 않는다(회수 판단은 호출자 몫) — 단 명시 표기. `content_hash`(저장본 주소)와 `src_hash`(원본 지문)는 redaction·html 변환이 있는 artifact에서 서로 다르다.
 
 ## 4. MCP 도구 계약 (Q1)
 
@@ -251,10 +256,15 @@ predeclared: inputs[i].text() / .lines() / .json(), args, emit(x)  (emit 누적�
 
 ```text
 입력: url: string · max_bytes?: int(기본 10MB)
-정책: §5.2 SSRF 계약 전체 적용. text/html은 markdown 변환 후 저장(원문 HTML은 미보존),
-      text/*·application/json·application/xml은 원문 저장
-출력: artifact_id · title · byte_length · indexed_chunks · 첫 스니펫(≤1KB)
+정책: §5.2 SSRF 계약 전체 적용.
+      text/html 파이프라인(D12): 본문 추출(readability) → markdown 변환 → 저장.
+        추출 실패·비기사형 페이지는 전체 markdown 변환으로 fail-open + extraction:"full" 표기.
+        코드 블록·표는 변환에서 보존(라이브러리 선정 게이트).
+      text/*·application/json·application/xml은 원문 저장. 원문 HTML 미보존(원본 대조는 src_hash).
+출력: artifact_id · title · byte_length · extraction · indexed_chunks · 첫 스니펫(≤1KB)
 ```
+
+배경(D12): 참조 구현은 Turndown으로 **페이지 전체**를 markdown화해 boilerplate(네비·푸터·배너)가 저장소·FTS를 오염시켰다 — retrieval 병목 경고(감사 문서 §4.2)와 직결되는 실재 비효율. 본문 추출 선행이 개선안이며, 후보 라이브러리(go-shiori/go-readability + JohannesKaufmann/html-to-markdown v2, 신규 의존성 2건 — D8 수정)는 적대 검증·자문 결과로 확정한다.
 
 ### 4.6 `ctr_global_search` (Q4)
 
@@ -377,7 +387,7 @@ context-router/
 4. **secret canary**: denylist 파일 미색인 + span redaction 후 search/fetch 양 경로에서 canary 미회수.
 5. **SSRF matrix**: 사설/link-local/메타데이터/rebinding/redirect/크기 초과 차단.
 6. **FTS 동등성**: porter/trigram/BM25+RRF 스모크 + 5,000 doc 성능 스모크.
-7. **DB 내구성**: writer 1+reader 4 동시성, 쓰기 중 kill 후 무결성/재구축 경로 — 3 OS.
+7. **DB 내구성**: writer 1+reader 4 동시성 + **프로세스 2개 동시 쓰기**(Claude Code·Codex 양 호스트 동시 등록 시나리오) 무결성, 쓰기 중 kill 후 무결성/재구축 경로 — 3 OS.
 8. **transform 상한**: 스텝/메모리/출력/timeout 초과 시 오류 코드 + 프로세스 생존.
 9. **프로토콜 위생**: stdout 오염 0, Claude Code·Codex 실 등록 스모크(tools/list·호출·cancellation).
 10. **빌드**: `CGO_ENABLED=0` 6타깃 크로스빌드 + 크기 기록; memory-capped CI(전역 test-guard 규율).

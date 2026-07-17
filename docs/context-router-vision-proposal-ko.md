@@ -216,6 +216,8 @@ Codex(GPT 계열)가 두 문서를 독립적으로 읽고 낸 의견. 자문이�
 | D8 | Go 스택 | **확정 (2026-07-17)**: go-sdk v1.6.1 + modernc v1.54.0/libc v1.74.1 + starlark-go + x/sys. cobra·yaml·ORM·DI·로깅 프레임워크 미사용 (stdlib flag/slog/testing), goreleaser CGO_ENABLED=0 6타깃 | §8.3 |
 | D9 | SQLite PRAGMA 계약 | **확정 (2026-07-17)**: 전체 NORMAL 세트 (§6 PRAGMA 계약 참조) | Q6 |
 | D10 | v0.0.1 계약 재정의 — "oracle 10개 동등" → 도구 감사 문서 §2.2 인벤토리(코어 5 MCP + global + CLI 4 + 신규 fetch/transform, exec 3종 구현째 v0.2) | **확정 (2026-07-17)** — 근거: `context-router-tool-audit-ko.md` | HANDOFF 확정 변경 (사용자 승인) |
+| D11 | MCP SDK 방침 | **확정 (2026-07-17)**: 현행 go-sdk v1.6.1(spec 2025-11-25)로 구현 진행. 차기 스펙 정식 출시 + go-sdk 안정판 시 별도 업그레이드 마일스톤 — RC 대기로 지연하지 않음 | §8.1 |
+| D12 | fetch 저장 파이프라인 개선 — 참조 구현은 Turndown으로 전체 페이지 변환(본문 추출 없음 → boilerplate 오염 확인). 개선: readability 본문 추출 → markdown 변환, 실패 시 전체 변환 fail-open | 제안 (적대 검증·자문 결과로 확정; 신규 의존성 2건은 D8 수정 수반) | 설계서 §4.5 |
 
 ## 10. HANDOFF 12질문 매핑
 
