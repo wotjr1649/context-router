@@ -1,6 +1,7 @@
 package netfetch
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"net"
@@ -8,6 +9,7 @@ import (
 	"net/http/httptest"
 	"net/netip"
 	"net/url"
+	"os"
 	"strconv"
 	"strings"
 	"testing"
@@ -214,5 +216,100 @@ func TestFetch_SchemeAndPortDenied(t *testing.T) {
 	_, err = Fetch(context.Background(), Config{AllowLocal: true, Timeout: time.Second}, "http://127.0.0.1:8080/")
 	if !errors.Is(err, ErrDenied) {
 		t.Fatalf("disallowed port: want ErrDenied, got %v", err)
+	}
+}
+
+// fetchHTMLFixture: testdata/html/name을 text/html로 서빙하고 Fetch, RawHTML 원문 보존을 검증.
+func fetchHTMLFixture(t *testing.T, name string) Result {
+	t.Helper()
+	body, err := os.ReadFile("testdata/html/" + name)
+	if err != nil {
+		t.Fatalf("read testdata %s: %v", name, err)
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Write(body)
+	}))
+	defer srv.Close()
+	cfg := Config{AllowLocal: true, ExtraPorts: []int{srvPort(t, srv.URL)}, Timeout: 5 * time.Second}
+	res, err := Fetch(context.Background(), cfg, srv.URL)
+	if err != nil {
+		t.Fatalf("Fetch %s: %v", name, err)
+	}
+	if !bytes.Equal(res.RawHTML, body) {
+		t.Fatalf("%s: RawHTML not preserved as original bytes", name)
+	}
+	return res
+}
+
+// TestFetch_HTML_DocWithCodeAndTable: 설계 §4.5 D12 — 코드펜스·표 파이프 보존, nav/footer 제거.
+func TestFetch_HTML_DocWithCodeAndTable(t *testing.T) {
+	res := fetchHTMLFixture(t, "doc-with-code-table.html")
+	if res.Extraction != "readability" {
+		t.Fatalf("Extraction = %q, want readability", res.Extraction)
+	}
+	if res.MediaType != "text/markdown" {
+		t.Fatalf("MediaType = %q, want text/markdown", res.MediaType)
+	}
+	md := string(res.Body)
+	if !strings.Contains(md, "```") {
+		t.Errorf("markdown missing code fence:\n%s", md)
+	}
+	if !strings.Contains(md, "|") {
+		t.Errorf("markdown missing table pipe:\n%s", md)
+	}
+	if strings.Contains(md, "Copyright 2026 Example Corp") || strings.Contains(md, "Privacy Policy") {
+		t.Errorf("markdown retained nav/footer boilerplate:\n%s", md)
+	}
+}
+
+func TestFetch_HTML_ArticleProse(t *testing.T) {
+	res := fetchHTMLFixture(t, "article-prose.html")
+	if res.Extraction != "readability" {
+		t.Fatalf("Extraction = %q, want readability", res.Extraction)
+	}
+}
+
+// TestFetch_HTML_ShortNonArticle: 추출 텍스트 <500자 → full 전환.
+func TestFetch_HTML_ShortNonArticle(t *testing.T) {
+	res := fetchHTMLFixture(t, "short-nonarticle.html")
+	if res.Extraction != "full" {
+		t.Fatalf("Extraction = %q, want full (short content)", res.Extraction)
+	}
+}
+
+// TestFetch_HTML_CodeHeavyStripped: pre/code 보존율 <50% → full 전환(길이·비율 조건은 통과하는
+// 픽스처라 이 조건만 단독으로 검증).
+func TestFetch_HTML_CodeHeavyStripped(t *testing.T) {
+	res := fetchHTMLFixture(t, "code-heavy-stripped.html")
+	if res.Extraction != "full" {
+		t.Fatalf("Extraction = %q, want full (pre/code preservation ratio)", res.Extraction)
+	}
+}
+
+// TestFetch_NonHTML_Passthrough: text/html이 아니면 T4 그대로 — Body=원문, Extraction="", 무변환.
+func TestFetch_NonHTML_Passthrough(t *testing.T) {
+	payload := []byte(`{"key":"value"}`)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write(payload)
+	}))
+	defer srv.Close()
+	cfg := Config{AllowLocal: true, ExtraPorts: []int{srvPort(t, srv.URL)}, Timeout: 2 * time.Second}
+	res, err := Fetch(context.Background(), cfg, srv.URL)
+	if err != nil {
+		t.Fatalf("Fetch: %v", err)
+	}
+	if !bytes.Equal(res.Body, payload) {
+		t.Fatalf("Body = %q, want unchanged %q", res.Body, payload)
+	}
+	if res.Extraction != "" {
+		t.Fatalf("Extraction = %q, want empty for non-HTML", res.Extraction)
+	}
+	if res.RawHTML != nil {
+		t.Fatalf("RawHTML should be nil for non-HTML, got %d bytes", len(res.RawHTML))
+	}
+	if res.MediaType != "application/json" {
+		t.Fatalf("MediaType = %q, want application/json", res.MediaType)
 	}
 }

@@ -2,6 +2,7 @@
 package netfetch
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -12,7 +13,15 @@ import (
 	"net/netip"
 	"net/url"
 	"strconv"
+	"strings"
 	"time"
+
+	readability "codeberg.org/readeck/go-readability"
+	"github.com/JohannesKaufmann/html-to-markdown/v2/converter"
+	"github.com/JohannesKaufmann/html-to-markdown/v2/plugin/base"
+	"github.com/JohannesKaufmann/html-to-markdown/v2/plugin/commonmark"
+	"github.com/JohannesKaufmann/html-to-markdown/v2/plugin/table"
+	"golang.org/x/net/html"
 )
 
 // Config: Fetch 정책. 값 0/nil = 기본값(Timeout=30s, MaxBytes<=0 → 기본 10MB 상한).
@@ -23,8 +32,10 @@ type Config struct {
 	Timeout    time.Duration
 }
 
-// Result: T4에서는 Extraction=""·Body=원문 그대로(변환은 T5). RawHTML은 text/html일 때만
-// Body와 동일 바이트로 채운다(그 외 미설정) — T5가 readability/html→md로 확장.
+// Result: text/html일 때만 D12 파이프라인 적용(설계 §4.5, T5) — RawHTML=원문 보존,
+// Body=markdown(추출 성공 시 readability 결과, 실패/저충실도 시 원문 전체를 변환),
+// Extraction="readability"|"full", MediaType="text/markdown"으로 갱신. 그 외 미디어는
+// T4 그대로 Body=원문·Extraction=""·MediaType=원본.
 type Result struct {
 	RawHTML    []byte
 	Body       []byte
@@ -245,6 +256,13 @@ func Fetch(ctx context.Context, cfg Config, rawURL string) (Result, error) {
 		result := Result{Body: body, MediaType: mediaType, FinalURL: current}
 		if mediaType == "text/html" {
 			result.RawHTML = body
+			md, extraction, err := convertToMarkdown(body, u)
+			if err != nil {
+				return Result{}, err
+			}
+			result.Body = md
+			result.Extraction = extraction
+			result.MediaType = "text/markdown"
 		}
 		return result, nil
 	}
@@ -264,4 +282,105 @@ func readBody(resp *http.Response, maxBytes int64) ([]byte, error) {
 		return nil, ErrBodyTooLarge
 	}
 	return data, nil
+}
+
+// fidelityMinChars/fidelityMinTextRatio/fidelityMinPreCodeRatio: 설계 §4.5 D12 충실도
+// 판정 임계값 — 넷 중 하나라도 위반하면 readability 추출을 버리고 원문 전체를 쓴다(fail-open).
+const (
+	fidelityMinChars        = 500
+	fidelityMinTextRatio    = 0.30
+	fidelityMinPreCodeRatio = 0.50
+)
+
+// convertToMarkdown: D12 파이프라인 — readability 추출 → 충실도 판정 → html-to-markdown 변환.
+// pageURL은 readability가 상대 링크를 절대화하는 데 사용.
+func convertToMarkdown(rawHTML []byte, pageURL *url.URL) ([]byte, string, error) {
+	contentHTML := string(rawHTML)
+	extraction := "full"
+	if article, err := readability.FromReader(bytes.NewReader(rawHTML), pageURL); err == nil && fidelityOK(rawHTML, article) {
+		contentHTML = article.Content
+		extraction = "readability"
+	}
+	md, err := htmlToMarkdown(contentHTML)
+	if err != nil {
+		return nil, "", fmt.Errorf("netfetch: html to markdown: %w", err)
+	}
+	return md, extraction, nil
+}
+
+// fidelityOK: 설계 §4.5 D12 — 아래 중 하나라도 참이면 false(=full 전환):
+// 빈 추출·<500자·가시 텍스트 비율<30%·pre+code 보존율<50%.
+func fidelityOK(rawHTML []byte, article readability.Article) bool {
+	text := strings.TrimSpace(article.TextContent)
+	if text == "" || len([]rune(text)) < fidelityMinChars {
+		return false
+	}
+	origDoc, err := html.Parse(bytes.NewReader(rawHTML))
+	if err != nil {
+		return true // 원문 재파싱 실패 — 이미 Fetch가 받은 바이트이므로 사실상 발생하지 않음.
+	}
+	if origVisible := visibleTextLen(origDoc); origVisible > 0 {
+		if float64(len([]rune(text)))/float64(origVisible) < fidelityMinTextRatio {
+			return false
+		}
+	}
+	if origPreCode := countPreCode(origDoc); origPreCode > 0 {
+		if float64(countPreCode(article.Node))/float64(origPreCode) < fidelityMinPreCodeRatio {
+			return false
+		}
+	}
+	return true
+}
+
+// visibleTextLen: script/style 제외 텍스트 노드 rune 길이 합(node별 trim, 공백전용 노드는 0).
+func visibleTextLen(n *html.Node) int {
+	total := 0
+	var walk func(*html.Node)
+	walk = func(n *html.Node) {
+		if n.Type == html.ElementNode && (n.Data == "script" || n.Data == "style") {
+			return
+		}
+		if n.Type == html.TextNode {
+			total += len([]rune(strings.TrimSpace(n.Data)))
+		}
+		for c := n.FirstChild; c != nil; c = c.NextSibling {
+			walk(c)
+		}
+	}
+	walk(n)
+	return total
+}
+
+// countPreCode: <pre>+<code> 엘리먼트 노드 수(중첩된 <pre><code>는 2개로 카운트 — 원문/추출
+// 양쪽에 동일 규칙 적용이므로 보존율 비교엔 무관).
+func countPreCode(n *html.Node) int {
+	if n == nil {
+		return 0
+	}
+	count := 0
+	var walk func(*html.Node)
+	walk = func(n *html.Node) {
+		if n.Type == html.ElementNode && (n.Data == "pre" || n.Data == "code") {
+			count++
+		}
+		for c := n.FirstChild; c != nil; c = c.NextSibling {
+			walk(c)
+		}
+	}
+	walk(n)
+	return count
+}
+
+// htmlToMarkdown: base+commonmark+table 플러그인 — GFM 표(파이프)·코드펜스 보존.
+func htmlToMarkdown(htmlContent string) ([]byte, error) {
+	conv := converter.NewConverter(converter.WithPlugins(
+		base.NewBasePlugin(),
+		commonmark.NewCommonmarkPlugin(),
+		table.NewTablePlugin(),
+	))
+	md, err := conv.ConvertString(htmlContent)
+	if err != nil {
+		return nil, err
+	}
+	return []byte(md), nil
 }
