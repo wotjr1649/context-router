@@ -4,6 +4,7 @@ go 1.26.5
 
 require (
 	github.com/modelcontextprotocol/go-sdk v1.6.1
+	go.starlark.net v0.0.0-20260708150628-5395d018f003
 	modernc.org/sqlite v1.54.0
 )
 
