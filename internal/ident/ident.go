@@ -63,7 +63,7 @@ func findGitProjectRoot(start string) (string, bool, error) {
 			}
 			b, err := os.ReadFile(g)
 			if err != nil {
-				return "", false, err
+				return "", false, fmt.Errorf("canonicalize: %w", err)
 			}
 			gd := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(string(b)), "gitdir:"))
 			if !filepath.IsAbs(gd) {

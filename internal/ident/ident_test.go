@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"strings"
 	"testing"
 )
 
@@ -78,6 +79,30 @@ func TestCanonicalize_SubmoduleUsesOwnRoot(t *testing.T) {
 	}
 	if c.ProjectRoot != Fold(mustReal(t, sub)) {
 		t.Fatalf("submodule projectRoot=%q want %q", c.ProjectRoot, Fold(mustReal(t, sub)))
+	}
+}
+
+// TestFindGitProjectRoot_ReadFailureWrapped: α5 — .git 파일 읽기 실패는 raw 전파가 아니라
+// "canonicalize:" 로 wrap되어야 한다(§5.5류 오류 일관성). unix perm으로만 결정적 재현 가능.
+func TestFindGitProjectRoot_ReadFailureWrapped(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("unix perm bit로만 결정적 재현 가능")
+	}
+	repo := t.TempDir()
+	gitFile := filepath.Join(repo, ".git")
+	if err := os.WriteFile(gitFile, []byte("gitdir: somewhere\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(gitFile, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chmod(gitFile, 0o644) // t.TempDir 정리 허용
+	_, err := Canonicalize(repo)
+	if err == nil {
+		t.Fatal("want error(.git 읽기 실패), got nil")
+	}
+	if !strings.HasPrefix(err.Error(), "canonicalize:") {
+		t.Fatalf("want wrapped with canonicalize: prefix, got %v", err)
 	}
 }
 

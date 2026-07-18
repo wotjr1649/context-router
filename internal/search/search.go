@@ -106,12 +106,16 @@ func filterShortTokenCandidates(ctx context.Context, db *sql.DB, ids []int64, sh
 // bm25Rank: table(패키지 상수만 전달되는 fts_porter/fts_trigram — 사용자 입력 아님,
 // 식별자 연결이 안전) MATCH match 결과를 bm25() 오름차순(=관련도 높은 순)으로 상위
 // n개 chunk id 반환. match==""면(모든 토큰이 trigram 제외 등) 질의 자체를 생략한다.
+// orphan(재색인으로 sources가 더는 가리키지 않는 구 chunk)은 LIMIT 적용 전에 SQL에서
+// 제외해 LIMIT 슬롯을 선점 못 하게 한다(α1) — loadHit의 no-row skip은 방어망으로 유지.
 func bm25Rank(ctx context.Context, db *sql.DB, table, match string, n int) ([]int64, error) {
 	if match == "" {
 		return nil, nil
 	}
 	rows, err := db.QueryContext(ctx,
-		"SELECT rowid FROM "+table+" WHERE "+table+" MATCH ? ORDER BY bm25("+table+") LIMIT ?", match, n)
+		"SELECT rowid FROM "+table+" WHERE "+table+" MATCH ? AND rowid IN "+
+			"(SELECT c.id FROM chunks c WHERE EXISTS(SELECT 1 FROM sources s WHERE s.artifact_id=c.artifact_id)) "+
+			"ORDER BY bm25("+table+") LIMIT ?", match, n)
 	if err != nil {
 		return nil, fmt.Errorf("search: %s match: %w", table, err)
 	}
@@ -165,12 +169,12 @@ func topN(scores map[int64]float64, n int) []scoredID {
 }
 
 // hitQuery: chunks→artifacts→sources를 artifact_id로 조인한다. 한 artifact에 소스가
-// 여러 개면 LIMIT 1이 임의 1행을 고른다(브리프: "다중 소스면 아무 1행" — JOIN 형태는
-// 단순 우선).
+// 여러 개면 uri 오름차순 첫 행을 결정적으로 고른다 — store.sourceOf와 동일 순서(α6,
+// 다중 소스 artifact에서 search/fetch 표시 일치).
 const hitQuery = `SELECT c.artifact_id, c.line_start, c.line_end, c.text, a.redaction, s.uri, s.source_kind,
 	s.src_size, s.src_mtime_ns, s.src_hash, s.extraction
 	FROM chunks c JOIN artifacts a ON a.id = c.artifact_id JOIN sources s ON s.artifact_id = a.id
-	WHERE c.id = ? LIMIT 1`
+	WHERE c.id = ? ORDER BY s.uri ASC LIMIT 1`
 
 // loadHit: chunkID 1건을 Hit으로 채운다. q는 스니펫 매치 토큰 탐색에, projectRoot는 Source
 // project-relative 계산에, staleCache는 Query 호출 1회 내 uri별 stale 판정 캐시(§3.6 "같은

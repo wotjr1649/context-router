@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -47,6 +48,45 @@ func TestOpen_PragmasAndSchema(t *testing.T) {
 		if _, err := s.writer.Exec("INSERT INTO " + fts + "(" + fts + ") VALUES('integrity-check')"); err != nil {
 			t.Fatalf("%s integrity: %v", fts, err)
 		}
+	}
+}
+
+// TestOpen_UnixPermissions: α4 — store 루트·artifacts·blob 해시프리픽스 디렉터리는 0700,
+// blob 파일은 0600(민감 콘텐츠 소유자 전용). Windows는 perm bit 미지원이라 skip.
+func TestOpen_UnixPermissions(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("unix perm bit만 검증 — windows는 무시됨")
+	}
+	base := t.TempDir()
+	storeRoot := filepath.Join(base, "store") // Open이 직접 생성해야 검증 가능(기존 dir는 대상 아님)
+	s, err := Open(storeRoot, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	for _, p := range []string{storeRoot, filepath.Join(storeRoot, "artifacts")} {
+		fi, err := os.Stat(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if fi.Mode().Perm() != 0o700 {
+			t.Fatalf("%s mode=%v want 0700", p, fi.Mode().Perm())
+		}
+	}
+	body := []byte("perm test")
+	if _, err := s.Register(t.Context(), Registration{StoredBytes: body, MediaType: "text/plain",
+		Source: SourceMeta{URI: "/perm.txt", Kind: "file", SrcHash: "hperm"},
+		Chunks: []Chunk{{Ordinal: 0, Text: string(body)}}}); err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256(body)
+	hash := hex.EncodeToString(sum[:])
+	blobDir := filepath.Join(storeRoot, "artifacts", hash[:2])
+	if fi, err := os.Stat(blobDir); err != nil || fi.Mode().Perm() != 0o700 {
+		t.Fatalf("blobDir mode=%v err=%v want 0700", fi.Mode().Perm(), err)
+	}
+	if fi, err := os.Stat(filepath.Join(blobDir, hash)); err != nil || fi.Mode().Perm() != 0o600 {
+		t.Fatalf("blob file mode=%v err=%v want 0600", fi.Mode().Perm(), err)
 	}
 }
 
@@ -129,6 +169,53 @@ func TestRegister_DedupTwoSourcesOneArtifact(t *testing.T) {
 	b, err := os.ReadFile(filepath.Join(s.dir, "artifacts", ch[:2], ch))
 	if err != nil || string(b) != "same body\nline2\n" {
 		t.Fatalf("blob: %v %q", err, b)
+	}
+}
+
+// TestRegister_DedupRespectsMediaType: α3 — 같은 바이트를 다른 media_type으로 등록하면
+// dedup이 (content_hash, media_type) 기준이라 별개 artifact가 되어야 한다(같은 바이트가
+// .txt/.md로 색인될 때 두 번째가 첫 artifact를 재사용해 md 청킹을 잃는 문제 방지).
+// blob 파일은 content_hash 주소라 여전히 1개만 공유된다.
+func TestRegister_DedupRespectsMediaType(t *testing.T) {
+	s := openT(t)
+	body := []byte("same bytes different representation")
+	reg := Registration{StoredBytes: body, MediaType: "text/plain",
+		Source: SourceMeta{URI: "/x.txt", Kind: "file", SrcHash: "hx"},
+		Chunks: []Chunk{{Ordinal: 0, ByteStart: 0, ByteEnd: int64(len(body)), Text: string(body)}}}
+	id1, err := s.Register(t.Context(), reg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reg2 := reg
+	reg2.MediaType = "text/markdown"
+	reg2.Source = SourceMeta{URI: "/x.md", Kind: "file", SrcHash: "hmd"}
+	id2, err := s.Register(t.Context(), reg2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if id1 == id2 {
+		t.Fatalf("want 별개 artifact(media_type 다름), got 동일 id=%d", id1)
+	}
+	var n int
+	s.reader.QueryRow("SELECT count(*) FROM artifacts").Scan(&n)
+	if n != 2 {
+		t.Fatalf("artifacts=%d want 2", n)
+	}
+	var c1, c2 int
+	s.reader.QueryRow("SELECT count(*) FROM chunks WHERE artifact_id=?", id1).Scan(&c1)
+	s.reader.QueryRow("SELECT count(*) FROM chunks WHERE artifact_id=?", id2).Scan(&c2)
+	if c1 != 1 || c2 != 1 {
+		t.Fatalf("want 각자 청크 1개, got c1=%d c2=%d", c1, c2)
+	}
+	var ch1, ch2 string
+	s.reader.QueryRow("SELECT content_hash FROM artifacts WHERE id=?", id1).Scan(&ch1)
+	s.reader.QueryRow("SELECT content_hash FROM artifacts WHERE id=?", id2).Scan(&ch2)
+	if ch1 != ch2 {
+		t.Fatalf("want 동일 content_hash(같은 바이트), got %q vs %q", ch1, ch2)
+	}
+	blobs, _ := filepath.Glob(filepath.Join(s.dir, "artifacts", ch1[:2], ch1))
+	if len(blobs) != 1 {
+		t.Fatalf("want blob 파일 1개(공유), got %v", blobs)
 	}
 }
 
@@ -252,10 +339,76 @@ func TestReadRange_LineInvalidRangeRejected(t *testing.T) {
 	for _, sel := range []Selector{
 		{Kind: "line", LineStart: 3, LineEnd: 1},
 		{Kind: "line", LineStart: 1, LineEnd: 0},
+		{Kind: "line", LineStart: 4, LineEnd: 4}, // α2: 실제 줄 수(3) 초과 — 관대 클램프 금지
+		{Kind: "line", LineStart: 1, LineEnd: 4}, // α2: LineEnd만 초과해도 거부
 	} {
 		if _, err := s.ReadRange(t.Context(), id, sel); !errors.Is(err, ErrInvalidSelector) {
 			t.Fatalf("sel=%+v: want ErrInvalidSelector, got %v (no panic expected)", sel, err)
 		}
+	}
+	// 힌트에 실제 줄 수(3) 포함 — 경로·원문 없이 숫자만 (α2)
+	_, err = s.ReadRange(t.Context(), id, Selector{Kind: "line", LineStart: 4, LineEnd: 4})
+	if err == nil || !strings.Contains(err.Error(), "1..3") {
+		t.Fatalf("want hint 1..3, got %v", err)
+	}
+}
+
+// TestReadRange_ByteOutOfRangeRejected: α2 — byte 선택자가 blob 길이를 벗어나면(음수·
+// 역전·시작이 끝이상·끝이 길이초과) 관대 클램프 없이 ErrInvalidSelector, 힌트에 실제
+// 길이가 숫자로만 포함된다.
+func TestReadRange_ByteOutOfRangeRejected(t *testing.T) {
+	s := openT(t)
+	body := "abcde" // len=5
+	id, err := s.Register(t.Context(), Registration{StoredBytes: []byte(body), MediaType: "text/plain",
+		Source: SourceMeta{URI: "/b.txt", Kind: "file", SrcHash: "hb"},
+		Chunks: []Chunk{{Ordinal: 0, Text: body}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, sel := range []Selector{
+		{Kind: "byte", ByteStart: -1, ByteEnd: 3},
+		{Kind: "byte", ByteStart: 2, ByteEnd: 2},
+		{Kind: "byte", ByteStart: 5, ByteEnd: 5}, // ByteStart>=len
+		{Kind: "byte", ByteStart: 0, ByteEnd: 6}, // ByteEnd>len — 초과분 클램프 금지
+	} {
+		if _, err := s.ReadRange(t.Context(), id, sel); !errors.Is(err, ErrInvalidSelector) {
+			t.Fatalf("sel=%+v: want ErrInvalidSelector, got %v", sel, err)
+		}
+	}
+	_, err = s.ReadRange(t.Context(), id, Selector{Kind: "byte", ByteStart: 0, ByteEnd: 6})
+	if err == nil || !strings.Contains(err.Error(), "0..5") {
+		t.Fatalf("want hint 0..5, got %v", err)
+	}
+}
+
+// TestReadRange_ChunkWrongArtifactRejected: α2 — chunk_id가 실재하되 요청한 artifact
+// 소속이 아니면 ErrNotFound가 아닌 ErrInvalidSelector.
+func TestReadRange_ChunkWrongArtifactRejected(t *testing.T) {
+	s := openT(t)
+	idA, err := s.Register(t.Context(), Registration{StoredBytes: []byte("artifact A body"), MediaType: "text/plain",
+		Source: SourceMeta{URI: "/a2.txt", Kind: "file", SrcHash: "ha2"},
+		Chunks: []Chunk{{Ordinal: 0, Text: "artifact A body"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	idB, err := s.Register(t.Context(), Registration{StoredBytes: []byte("artifact B body"), MediaType: "text/plain",
+		Source: SourceMeta{URI: "/b2.txt", Kind: "file", SrcHash: "hb2"},
+		Chunks: []Chunk{{Ordinal: 0, Text: "artifact B body"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var chunkIDofB int64
+	if err := s.reader.QueryRow("SELECT id FROM chunks WHERE artifact_id=?", idB).Scan(&chunkIDofB); err != nil {
+		t.Fatal(err)
+	}
+	_, err = s.ReadRange(t.Context(), idA, Selector{Kind: "chunk", ChunkID: chunkIDofB})
+	if !errors.Is(err, ErrInvalidSelector) {
+		t.Fatalf("want ErrInvalidSelector(chunk 실재·타 artifact), got %v", err)
+	}
+	// 진짜 미존재 chunk_id는 여전히 ErrNotFound
+	_, err = s.ReadRange(t.Context(), idA, Selector{Kind: "chunk", ChunkID: 99999})
+	if !errors.Is(err, ErrNotFound) {
+		t.Fatalf("want ErrNotFound(진짜 미존재), got %v", err)
 	}
 }
 

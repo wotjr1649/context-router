@@ -36,7 +36,9 @@ const pragmas = "?_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)&_pragma=
 
 func Open(dir string, readOnly bool) (*Store, error) {
 	if !readOnly {
-		if err := os.MkdirAll(filepath.Join(dir, "artifacts"), 0o755); err != nil {
+		// 0o700: store 루트+artifacts 모두 이 한 호출로 생성(MkdirAll이 만드는 모든 중간
+		// 디렉터리에 동일 perm 적용) — Windows는 Unix perm bit 무시(§10 no-op, 주석만).
+		if err := os.MkdirAll(filepath.Join(dir, "artifacts"), 0o700); err != nil {
 			return nil, fmt.Errorf("store open: %w", err)
 		}
 	}
@@ -101,8 +103,9 @@ func (s *Store) migrate() error {
 
 const schemaV1 = `
 CREATE TABLE IF NOT EXISTS artifacts(
-  id INTEGER PRIMARY KEY, content_hash TEXT NOT NULL UNIQUE, media_type TEXT NOT NULL,
-  byte_length INTEGER NOT NULL, redaction TEXT NOT NULL DEFAULT 'none', created_at INTEGER NOT NULL);
+  id INTEGER PRIMARY KEY, content_hash TEXT NOT NULL, media_type TEXT NOT NULL,
+  byte_length INTEGER NOT NULL, redaction TEXT NOT NULL DEFAULT 'none', created_at INTEGER NOT NULL,
+  UNIQUE(content_hash, media_type));
 CREATE TABLE IF NOT EXISTS sources(
   uri TEXT PRIMARY KEY, artifact_id INTEGER NOT NULL REFERENCES artifacts(id),
   source_kind TEXT NOT NULL, src_size INTEGER, src_mtime_ns INTEGER, src_hash TEXT,
@@ -239,11 +242,11 @@ var tmpSeq atomic.Uint64 // writeBlob 임시파일명 유일성(동시 Register 
 // 대상이 이미 존재해도 os.Rename이 덮어써 no-op처럼 동작(동일 content_hash라 내용은 항상 동일).
 func (s *Store) writeBlob(hash string, data []byte) error {
 	dir := filepath.Join(s.dir, "artifacts", hash[:2])
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	if err := os.MkdirAll(dir, 0o700); err != nil { // Windows: perm bit 무시(no-op)
 		return sanitizeIOErr("blob mkdir", err)
 	}
 	tmp := filepath.Join(dir, fmt.Sprintf("%s.tmp.%d.%d", hash, os.Getpid(), tmpSeq.Add(1)))
-	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
 	if err != nil {
 		return sanitizeIOErr("blob write", err)
 	}
@@ -324,7 +327,7 @@ func (s *Store) Register(ctx context.Context, reg Registration) (int64, error) {
 	}
 	var artID int64
 	err := s.txRetry(ctx, func(tx *sql.Tx) error {
-		if err := tx.QueryRow("SELECT id FROM artifacts WHERE content_hash=?", contentHash).Scan(&artID); err == sql.ErrNoRows {
+		if err := tx.QueryRow("SELECT id FROM artifacts WHERE content_hash=? AND media_type=?", contentHash, reg.MediaType).Scan(&artID); err == sql.ErrNoRows {
 			res, err := tx.Exec("INSERT INTO artifacts(content_hash,media_type,byte_length,redaction,created_at) VALUES(?,?,?,?,?)",
 				contentHash, reg.MediaType, len(reg.StoredBytes), reg.Redaction, time.Now().Unix())
 			if err != nil {
@@ -396,8 +399,27 @@ func snapUTF8(data []byte, start, end int64) (int64, int64) {
 	return start, pos
 }
 
+// countLines: data의 실제 줄 수(마지막 줄이 개행으로 끝나도 그 뒤의 빈 phantom 줄은
+// 세지 않는다 — "abc\n"은 1줄, "abc"도 1줄, ""은 0줄).
+func countLines(data []byte) int {
+	if len(data) == 0 {
+		return 0
+	}
+	n := 1
+	for _, b := range data {
+		if b == '\n' {
+			n++
+		}
+	}
+	if data[len(data)-1] == '\n' {
+		n--
+	}
+	return n
+}
+
 // lineByteRange: 1-based [lineStart,lineEnd] 줄 구간의 바이트 범위. 각 줄은 자신의 개행문자를
 // 포함하며(마지막 줄에 개행이 없으면 데이터 끝까지), 범위를 벗어나면 빈 구간을 반환한다.
+// 호출 전 ReadRange가 countLines로 범위를 엄격 검증하므로(α2) 여기서는 방어적으로만 clamp한다.
 func lineByteRange(data []byte, lineStart, lineEnd int) (int64, int64) {
 	starts := []int64{0}
 	for i, b := range data {
@@ -424,16 +446,21 @@ func lineByteRange(data []byte, lineStart, lineEnd int) (int64, int64) {
 }
 
 // readChunk: chunk 저장 좌표로 blob을 읽는다. 좌표가 없으면 chunks.text로 대체한다 (§3.5).
+// chunk_id 자체가 없으면 ErrNotFound, 있지만 다른 artifact 소속이면 ErrInvalidSelector(α2).
 func (s *Store) readChunk(res *RangeResult, artifactID, chunkID int64) error {
+	var gotArtifactID int64
 	var bs, be, ls, le sql.NullInt64
 	var text string
-	err := s.reader.QueryRow(`SELECT byte_start,byte_end,line_start,line_end,text FROM chunks WHERE id=? AND artifact_id=?`,
-		chunkID, artifactID).Scan(&bs, &be, &ls, &le, &text)
+	err := s.reader.QueryRow(`SELECT artifact_id,byte_start,byte_end,line_start,line_end,text FROM chunks WHERE id=?`,
+		chunkID).Scan(&gotArtifactID, &bs, &be, &ls, &le, &text)
 	if errors.Is(err, sql.ErrNoRows) {
 		return fmt.Errorf("store ReadRange: chunk 없음: %w", ErrNotFound)
 	}
 	if err != nil {
 		return fmt.Errorf("store ReadRange: %w", err)
+	}
+	if gotArtifactID != artifactID {
+		return fmt.Errorf("store ReadRange: chunk %d은 artifact %d 소속 아님: %w", chunkID, artifactID, ErrInvalidSelector)
 	}
 	res.LineStart, res.LineEnd = int(ls.Int64), int(le.Int64)
 	// 좌표 미상 chunk: ByteStart=0은 실제 오프셋이 아님 (text 폴백 경로)
@@ -495,11 +522,7 @@ func StaleOf(info SourceInfo) bool {
 // 구간 중 하나를 읽는다 (설계 §3.5).
 func (s *Store) ReadRange(ctx context.Context, artifactID int64, sel Selector) (RangeResult, error) {
 	switch sel.Kind {
-	case "chunk", "byte":
-	case "line":
-		if sel.LineStart < 1 || sel.LineEnd < sel.LineStart {
-			return RangeResult{}, fmt.Errorf("store ReadRange: line 범위 잘못됨 start=%d end=%d: %w", sel.LineStart, sel.LineEnd, ErrInvalidSelector)
-		}
+	case "chunk", "byte", "line":
 	default:
 		return RangeResult{}, fmt.Errorf("store ReadRange: kind=%q: %w", sel.Kind, ErrInvalidSelector)
 	}
@@ -524,6 +547,11 @@ func (s *Store) ReadRange(ctx context.Context, artifactID int64, sel Selector) (
 		if err != nil {
 			return RangeResult{}, err
 		}
+		lc := countLines(blob)
+		if sel.LineStart < 1 || sel.LineEnd < sel.LineStart || sel.LineStart > lc || sel.LineEnd > lc {
+			return RangeResult{}, fmt.Errorf("store ReadRange: line 범위 잘못됨 start=%d end=%d (valid: 1..%d): %w",
+				sel.LineStart, sel.LineEnd, lc, ErrInvalidSelector)
+		}
 		res.ByteStart, res.ByteEnd = lineByteRange(blob, sel.LineStart, sel.LineEnd)
 		res.Text = blob[res.ByteStart:res.ByteEnd]
 		res.LineStart, res.LineEnd = sel.LineStart, sel.LineEnd
@@ -531,6 +559,11 @@ func (s *Store) ReadRange(ctx context.Context, artifactID int64, sel Selector) (
 		blob, err := s.readBlob(meta.ContentHash)
 		if err != nil {
 			return RangeResult{}, err
+		}
+		n := int64(len(blob))
+		if sel.ByteStart < 0 || sel.ByteEnd <= sel.ByteStart || sel.ByteStart >= n || sel.ByteEnd > n {
+			return RangeResult{}, fmt.Errorf("store ReadRange: byte 범위 잘못됨 start=%d end=%d (valid: 0..%d): %w",
+				sel.ByteStart, sel.ByteEnd, n, ErrInvalidSelector)
 		}
 		res.ByteStart, res.ByteEnd = snapUTF8(blob, sel.ByteStart, sel.ByteEnd)
 		res.Text = blob[res.ByteStart:res.ByteEnd]

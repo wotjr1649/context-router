@@ -1,6 +1,7 @@
 package search
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -278,6 +279,31 @@ func TestQuery_ReindexOrphanDoesNotFailQuery(t *testing.T) {
 	}
 }
 
+// TestQuery_OrphanDoesNotPreemptLimit: α1 — orphan 후보(bm25 상 더 유리하게 만들어 재현
+// 확실화)가 limit*4 후보 슬롯을 선점해 현재 artifact hit이 사라지면 안 된다. 같은 uri를
+// 5회 재색인(직전 버전마다 orphan 발생)한 뒤 작은 limit으로 질의한다.
+func TestQuery_OrphanDoesNotPreemptLimit(t *testing.T) {
+	st, err := store.Open(t.TempDir(), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	for i := 0; i < 5; i++ {
+		body := strings.Repeat("sharedneedle ", 5) + fmt.Sprintf("orphanunique%d", i)
+		regOne(t, st, "/doc.txt", fmt.Sprintf("horphan%d", i), body)
+	}
+	regOne(t, st, "/doc.txt", "hcurrent", "sharedneedle currentunique")
+
+	res, err := Query(t.Context(), st, "", []string{"sharedneedle"}, 1, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hits := res[0].Hits
+	if len(hits) == 0 || !strings.Contains(hits[0].Snippet, "currentunique") {
+		t.Fatalf("want current artifact hit(orphan이 LIMIT 선점하면 안 됨), got %+v", hits)
+	}
+}
+
 func TestQuery_RRFRanksDualMatchTop(t *testing.T) {
 	st := seedT(t)
 	res, err := Query(t.Context(), st, "", []string{"caching useEffect"}, 10, 0)
@@ -415,6 +441,37 @@ func TestQuery_TrigramShortTokenAND(t *testing.T) {
 // TestQuery_SnippetStemPrefixFallback: Fix F — 쿼리 "caching"·본문 "cached"(porter 스템 매치,
 // 리터럴 불일치)에서 앵커 탐색이 접두(prefix) 폴백으로 실제 매치 지점을 찾아야 한다(구버전은
 // 앞 500B로 폴백해 무관 스니펫을 냈다).
+// TestQuery_HitSourceDeterministicMultiSource: α6 — 다중 소스가 같은 artifact를 가리킬 때
+// hitQuery도 store.sourceOf와 동일하게 uri 오름차순 첫 행을 결정적으로 고른다. 알파벳
+// 역순으로 등록해(z 먼저, a 나중) 삽입순 우연 일치를 배제한다.
+func TestQuery_HitSourceDeterministicMultiSource(t *testing.T) {
+	st, err := store.Open(t.TempDir(), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	body := "sharedbody multisource marker text"
+	reg := store.Registration{StoredBytes: []byte(body), MediaType: "text/plain",
+		Source: store.SourceMeta{URI: "/z-later.txt", Kind: "file", SrcHash: "hz"},
+		Chunks: []store.Chunk{{Ordinal: 0, ByteStart: 0, ByteEnd: int64(len(body)), LineStart: 1, LineEnd: 1, Text: body}}}
+	if _, err := st.Register(t.Context(), reg); err != nil {
+		t.Fatal(err)
+	}
+	reg.Source = store.SourceMeta{URI: "/a-first.txt", Kind: "file", SrcHash: "ha"}
+	if _, err := st.Register(t.Context(), reg); err != nil {
+		t.Fatal(err)
+	}
+
+	res, err := Query(t.Context(), st, "", []string{"multisource"}, 10, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hits := res[0].Hits
+	if len(hits) != 1 || hits[0].Source != "a-first.txt" {
+		t.Fatalf("want 결정적 a-first.txt(uri ASC, store.sourceOf와 일치), got %+v", hits)
+	}
+}
+
 func TestQuery_SnippetStemPrefixFallback(t *testing.T) {
 	st, err := store.Open(t.TempDir(), false)
 	if err != nil {
