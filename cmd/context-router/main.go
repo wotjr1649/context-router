@@ -337,8 +337,10 @@ var cliSubcommands = map[string]bool{"doctor": true, "stats": true, "purge": tru
 // 없어 항상 "flag provided but not defined"로 실패했다(Task4 리뷰 지적, 설계 §7 계약 —
 // `context-router stats --provider <path>`가 실제로 동작해야 한다). 나머지 플래그의 유효성
 // 검사는 여기서 하지 않는다 — 각 서브커맨드가 소유한 cli 쪽 flagset이 미지 플래그를 오류로
-// 낸다.
-func prescanRootFlags(args []string) (root, storeRoot string, rest []string) {
+// 낸다. "--f v" 형태에서 다음 토큰이 없거나 "-"로 시작하면(다른 플래그처럼 보이면) 값으로
+// 삼키지 않고 오류를 반환한다 — 그렇지 않으면 `stats --root --provider p` 같은 오타가
+// --provider를 --root의 값으로 조용히 삼켜버린다(리뷰 Fix Round 2, Important-1).
+func prescanRootFlags(args []string) (root, storeRoot string, rest []string, err error) {
 	rest = make([]string, 0, len(args))
 	for i := 0; i < len(args); i++ {
 		a := args[i]
@@ -359,15 +361,16 @@ func prescanRootFlags(args []string) (root, storeRoot string, rest []string) {
 			continue
 		}
 		if hasEq {
-			*target = val
+			*target = val // ponytail: "--root=" 빈 값은 의도적으로 미지정과 동일하게 동작(아래 root=="" 분기가 cwd로 채움)
 			continue
 		}
-		if i+1 < len(args) {
-			*target = args[i+1]
-			i++
+		if i+1 >= len(args) || strings.HasPrefix(args[i+1], "-") {
+			return "", "", nil, fmt.Errorf("ctr: --%s: 값 누락", key)
 		}
+		*target = args[i+1]
+		i++
 	}
-	return root, storeRoot, rest
+	return root, storeRoot, rest, nil
 }
 
 // dispatchCLI: args[1](=os.Args[1])이 cli 서브커맨드 4개 중 하나면 storeRoot·projectRoot를
@@ -382,7 +385,10 @@ func dispatchCLI(ctx context.Context, args []string) (handled bool, err error) {
 	sub := args[1]
 	subArgs := args[2:]
 
-	root, storeRootRaw, rest := prescanRootFlags(subArgs)
+	root, storeRootRaw, rest, err := prescanRootFlags(subArgs)
+	if err != nil {
+		return true, err
+	}
 	if root == "" {
 		if root, err = os.Getwd(); err != nil {
 			return true, err

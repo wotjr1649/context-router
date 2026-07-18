@@ -296,12 +296,84 @@ func TestRunStats_Provider(t *testing.T) {
 	}
 }
 
-// TestRunStats_Provider_FileMissing: --provider 경로가 없으면 오류를 반환해야 한다(침묵 무시 금지).
+// TestRunStats_Provider_FileMissing: --provider 경로가 없으면 오류를 반환해야 한다(침묵 무시
+// 금지). 반환 오류 문구에 그 경로 자체가 섞여선 안 된다(§12 canary, 리뷰 Fix Round 2 Critical
+// (a) — os.Open이 반환하는 *fs.PathError는 절대경로를 담는다).
 func TestRunStats_Provider_FileMissing(t *testing.T) {
 	var out, errOut bytes.Buffer
-	args := []string{"--provider", filepath.Join(t.TempDir(), "missing.jsonl")}
+	missing := filepath.Join(t.TempDir(), "missing.jsonl")
+	args := []string{"--provider", missing}
 	err := Run(context.Background(), "stats", args, t.TempDir(), t.TempDir(), "0.0.1-dev", &out, &errOut)
 	if err == nil {
 		t.Fatal("want error for missing --provider file, got nil")
+	}
+	if strings.Contains(err.Error(), missing) {
+		t.Fatalf("error must not leak the path: %v", err)
+	}
+}
+
+// TestRunStats_Local_ProjectIdentifyFailure: projectRoot가 존재하지 않아 ident.Canonicalize가
+// 실패하는 경우도 오류를 반환해야 하고, 그 오류 문구에 projectRoot 경로가 섞여선 안 된다
+// (§12 canary, 리뷰 Fix Round 2 Critical (b) — Canonicalize의 원인은 *fs.PathError).
+func TestRunStats_Local_ProjectIdentifyFailure(t *testing.T) {
+	storeRoot := t.TempDir()
+	missingProject := filepath.Join(t.TempDir(), "does-not-exist")
+
+	var out, errOut bytes.Buffer
+	err := Run(context.Background(), "stats", nil, storeRoot, missingProject, "0.0.1-dev", &out, &errOut)
+	if err == nil {
+		t.Fatal("want error for nonexistent project root, got nil")
+	}
+	if strings.Contains(err.Error(), missingProject) {
+		t.Fatalf("error must not leak the path: %v", err)
+	}
+}
+
+// TestRunStats_Provider_OversizedLine: 10MB(maxProviderLine) 상한을 넘는 한 줄이 있어도 명령
+// 전체가 중단되면 안 된다 — 그 줄만 skipped로 세고 그 앞뒤 정상 줄은 계속 합산해야 한다(리뷰
+// Fix Round 2, Important-3 — 예전 bufio.Scanner 고정버퍼 구현은 이 경우 Scan() 자체가
+// 실패해 명령 전체가 오류로 끝났다). 긴 줄은 strings.Repeat로 생성한다(리터럴 금지).
+func TestRunStats_Provider_OversizedLine(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "transcript.jsonl")
+
+	huge := `{"message":{"usage":{"input_tokens":1,"padding":"` + strings.Repeat("x", 11<<20) + `"}}}`
+	lines := []string{
+		`{"message":{"usage":{"input_tokens":9,"output_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}`,
+		huge,
+	}
+	if err := os.WriteFile(path, []byte(strings.Join(lines, "\n")+"\n"), 0o600); err != nil {
+		t.Fatalf("write transcript: %v", err)
+	}
+
+	var out, errOut bytes.Buffer
+	args := []string{"--provider", path}
+	if err := Run(context.Background(), "stats", args, t.TempDir(), t.TempDir(), "0.0.1-dev", &out, &errOut); err != nil {
+		t.Fatalf("Run stats --provider err=%v out=%s", err, out.String())
+	}
+	got := out.String()
+	for _, want := range []string{"input_tokens: 9", "output_tokens: 1", "usage records: 1", "skipped: 1"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("out missing %q: %s", want, got)
+		}
+	}
+}
+
+// TestRunDoctor_UnexpectedArgs / TestRunUpgrade_UnexpectedArgs: doctor·upgrade는 args를
+// 소비하지 않으므로 잔여 인자를 침묵 수용하면 안 된다(리뷰 Fix Round 2, Important-2) —
+// 미지 인자가 있으면 명시적으로 오류여야 한다.
+func TestRunDoctor_UnexpectedArgs(t *testing.T) {
+	var out, errOut bytes.Buffer
+	err := Run(context.Background(), "doctor", []string{"--bogus"}, t.TempDir(), t.TempDir(), "0.0.1-dev", &out, &errOut)
+	if err == nil {
+		t.Fatal("want error for unexpected doctor args, got nil")
+	}
+}
+
+func TestRunUpgrade_UnexpectedArgs(t *testing.T) {
+	var out, errOut bytes.Buffer
+	err := Run(context.Background(), "upgrade", []string{"--bogus"}, t.TempDir(), t.TempDir(), "0.0.1-dev", &out, &errOut)
+	if err == nil {
+		t.Fatal("want error for unexpected upgrade args, got nil")
 	}
 }

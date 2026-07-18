@@ -212,22 +212,38 @@ func TestMainDispatch_NotHandled(t *testing.T) {
 // TestPrescanRootFlags: dispatchCLI가 서버 전체 flagset(parseFlags) 재사용을 그만두고 쓰는
 // 경량 프리스캔 — "--f v"/"--f=v"/"-f v" 세 형태 모두에서 --root/--store-root만 뽑고
 // 나머지(서브커맨드 전용 플래그, 예: --provider)는 손대지 않아야 한다(Task4 Fix Round 1).
+// missing_value_looks_like_flag/missing_value_at_end: "--f v" 형태에서 다음 토큰이 없거나
+// 다른 플래그처럼 보이면(- 접두사) 값으로 삼키지 않고 오류를 반환해야 한다 — 그렇지 않으면
+// `stats --root --provider p` 오타가 --provider를 --root의 값으로 조용히 삼킨다(리뷰 Fix
+// Round 2, Important-1).
 func TestPrescanRootFlags(t *testing.T) {
 	tests := []struct {
 		name                    string
 		args                    []string
 		wantRoot, wantStoreRoot string
 		wantRest                []string
+		wantErr                 bool
 	}{
-		{"space_form", []string{"--root", "R", "--store-root", "S"}, "R", "S", []string{}},
-		{"eq_form", []string{"--root=R", "--store-root=S", "--provider", "p"}, "R", "S", []string{"--provider", "p"}},
-		{"single_dash", []string{"-root", "R"}, "R", "", []string{}},
-		{"no_root_flags", []string{"--provider", "p"}, "", "", []string{"--provider", "p"}},
-		{"root_flags_interleaved", []string{"--provider", "p", "--root", "R"}, "R", "", []string{"--provider", "p"}},
+		{"space_form", []string{"--root", "R", "--store-root", "S"}, "R", "S", []string{}, false},
+		{"eq_form", []string{"--root=R", "--store-root=S", "--provider", "p"}, "R", "S", []string{"--provider", "p"}, false},
+		{"single_dash", []string{"-root", "R"}, "R", "", []string{}, false},
+		{"no_root_flags", []string{"--provider", "p"}, "", "", []string{"--provider", "p"}, false},
+		{"root_flags_interleaved", []string{"--provider", "p", "--root", "R"}, "R", "", []string{"--provider", "p"}, false},
+		{"missing_value_looks_like_flag", []string{"--root", "--provider", "p"}, "", "", nil, true},
+		{"missing_value_at_end", []string{"--root"}, "", "", nil, true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			root, storeRoot, rest := prescanRootFlags(tt.args)
+			root, storeRoot, rest, err := prescanRootFlags(tt.args)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("want error, got nil (root=%q storeRoot=%q rest=%v)", root, storeRoot, rest)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected err=%v", err)
+			}
 			if root != tt.wantRoot || storeRoot != tt.wantStoreRoot {
 				t.Fatalf("root=%q storeRoot=%q want %q/%q", root, storeRoot, tt.wantRoot, tt.wantStoreRoot)
 			}

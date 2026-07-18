@@ -3,9 +3,11 @@ package cli
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -31,8 +33,14 @@ const releaseURL = "https://api.github.com/repos/wotjr1649/context-router/releas
 func Run(ctx context.Context, sub string, args []string, storeRoot, projectRoot, version string, stdout, stderr io.Writer) error {
 	switch sub {
 	case "doctor":
+		if len(args) > 0 {
+			return fmt.Errorf("cli: doctor: 예상치 않은 인자: %v", args)
+		}
 		return runDoctor(ctx, stdout, storeRoot, projectRoot)
 	case "upgrade":
+		if len(args) > 0 {
+			return fmt.Errorf("cli: upgrade: 예상치 않은 인자: %v", args)
+		}
 		client := &http.Client{Timeout: 10 * time.Second}
 		return runUpgrade(stdout, client, releaseURL, version)
 	case "stats":
@@ -100,7 +108,10 @@ func runStats(w io.Writer, args []string, storeRoot, projectRoot string) error {
 func runStatsLocal(w io.Writer, storeRoot, projectRoot string) error {
 	canon, err := ident.Canonicalize(projectRoot)
 	if err != nil {
-		return fmt.Errorf("stats: 프로젝트 식별 실패: %w", err)
+		// 원인(err)을 감싸지 않는다 — Canonicalize의 오류는 filepath.Abs/EvalSymlinks발
+		// *fs.PathError라 절대경로를 담고 있다(§12 canary). runDoctor([2] 분기)와 동일하게
+		// 반환 오류에는 경로 없는 정적 메시지만 남긴다(리뷰 Fix Round 2, Critical).
+		return errors.New("stats: 프로젝트 식별 실패")
 	}
 	projDir := filepath.Join(storeRoot, "projects", canon.ProjectID)
 	stats, err := store.LedgerStats(projDir)
@@ -135,36 +146,80 @@ type providerUsageLine struct {
 	} `json:"message"`
 }
 
+// maxProviderLine: transcript 한 줄의 상한(설계 §6 — 파일 크기와 무관하게 10MB). 이 상한을
+// 넘는 한 줄은 파싱을 포기하고 드레인만 한다(readTranscriptLine) — bufio.Scanner의 고정
+// 버퍼 방식(예전 구현)은 이 상한을 넘는 줄 하나가 나오면 Scan() 자체가 실패해 그 뒤 정상
+// 줄까지 전부 못 읽고 명령 전체가 중단됐다(리뷰 Fix Round 2, Important-3).
+const maxProviderLine = 10 << 20
+
+// readTranscriptLine: br에서 개행(\n) 단위로 한 줄을 읽는다. 누적 길이가 max를 넘으면 그
+// 순간부터 line을 비우고(메모리에 쌓지 않음) 다음 개행까지 그냥 흘려보낸다(truncated=true로
+// 표시) — 호출자는 그 줄을 skipped로 세고 다음 줄로 진행하면 된다. 마지막 줄(개행 없이
+// EOF)도 처리한다(err=io.EOF와 함께 그때까지 읽은 조각을 반환).
+func readTranscriptLine(br *bufio.Reader, max int) (line []byte, truncated bool, err error) {
+	for {
+		frag, ferr := br.ReadSlice('\n')
+		if !truncated && len(line)+len(frag) > max {
+			truncated = true
+			line = nil
+		}
+		if !truncated {
+			line = append(line, frag...)
+		}
+		switch ferr {
+		case nil:
+			return line, truncated, nil
+		case bufio.ErrBufferFull:
+			continue // 델리미터를 아직 못 찾음(버퍼 한 채가 다 참) — 계속 이어붙이거나 드레인
+		default:
+			return line, truncated, ferr
+		}
+	}
+}
+
 // runStatsProvider: path의 Claude Code transcript JSONL을 한 줄씩 스캔해 message.usage의 4개
 // 토큰 필드를 합산하고 usage 보유 레코드 수를 센다(설계 §6). 파싱 불가 줄·message.usage 없는
-// 줄은 로그 없이 skipped 카운트만 올린다. 실측 합계만 출력한다 — 절약 주장·비교 문구 없음.
-// 파일 크기와 무관하게 큰 버퍼(10MB)의 bufio.Scanner를 쓴다(transcript 한 줄이 클 수 있음).
+// 줄·maxProviderLine을 넘는 줄은 로그 없이 skipped 카운트만 올린다(마지막 경우는 명령을
+// 중단시키지 않고 계속 진행). 실측 합계만 출력한다 — 절약 주장·비교 문구 없음.
 func runStatsProvider(w io.Writer, path string) error {
 	f, err := os.Open(path)
 	if err != nil {
-		return fmt.Errorf("stats provider: 파일 열기 실패: %w", err)
+		// *fs.PathError는 경로를 담는다(§12 canary) — errors.Is로 원인 종류만 남기고
+		// 경로는 반환 오류에서 제거한다(리뷰 Fix Round 2, Critical). os.ErrNotExist의
+		// Error() 문구 자체는 정적("file does not exist")이라 경로가 섞이지 않는다.
+		if errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("stats provider: 파일이 없습니다: %w", os.ErrNotExist)
+		}
+		return errors.New("stats provider: 파일 열기 실패")
 	}
 	defer f.Close()
 
-	scanner := bufio.NewScanner(f)
-	scanner.Buffer(make([]byte, 0, 64*1024), 10<<20)
-
 	var input, output, cacheRead, cacheCreate, records, skipped int64
-	for scanner.Scan() {
-		var line providerUsageLine
-		if err := json.Unmarshal(scanner.Bytes(), &line); err != nil || line.Message.Usage == nil {
+	br := bufio.NewReaderSize(f, 64*1024)
+	for {
+		raw, truncated, ferr := readTranscriptLine(br, maxProviderLine)
+		switch {
+		case truncated:
 			skipped++
-			continue
+		case len(raw) > 0:
+			var line providerUsageLine
+			if jsonErr := json.Unmarshal(bytes.TrimRight(raw, "\r\n"), &line); jsonErr != nil || line.Message.Usage == nil {
+				skipped++
+			} else {
+				u := line.Message.Usage
+				input += u.InputTokens
+				output += u.OutputTokens
+				cacheRead += u.CacheReadInputTokens
+				cacheCreate += u.CacheCreationInputTokens
+				records++
+			}
 		}
-		u := line.Message.Usage
-		input += u.InputTokens
-		output += u.OutputTokens
-		cacheRead += u.CacheReadInputTokens
-		cacheCreate += u.CacheCreationInputTokens
-		records++
-	}
-	if err := scanner.Err(); err != nil {
-		return fmt.Errorf("stats provider: 스캔 실패: %w", err)
+		if ferr != nil {
+			if errors.Is(ferr, io.EOF) {
+				break
+			}
+			return errors.New("stats provider: 스캔 실패")
+		}
 	}
 
 	fmt.Fprintf(w, "input_tokens: %d\n", input)
