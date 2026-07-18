@@ -2,13 +2,18 @@
 package transform
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"os/exec"
 	"regexp"
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"go.starlark.net/starlark"
 	"go.starlark.net/syntax"
@@ -40,24 +45,32 @@ type Result struct {
 	StepsUsed int64
 	Truncated bool
 	ErrKind   string
+	// ErrSummary: ErrKind!=""일 때 원인 첫 줄 요약(위치/종류만). 스크립트 원문·입력 데이터는
+	// 포함하지 않는다(승계 계약 T1→T2 (a)).
+	ErrSummary string
 }
 
 // ErrBudget/ErrOutputLimit: T3 toToolError 매핑용 sentinel. Eval 자체는 ErrKind로 표현한다.
 var (
 	ErrBudget      = errors.New("transform: step budget exceeded")
 	ErrOutputLimit = errors.New("transform: output limit exceeded")
+
+	// ErrNoIsolation: OS 메모리 상한을 적용할 수 없는 환경 — transform 도구 비활성 신호
+	// (in-process fallback 금지, 설계 §4.3/§5.3).
+	ErrNoIsolation = errors.New("transform: OS memory isolation unavailable")
 )
 
 const (
 	defaultMaxSteps       = 5_000_000
 	defaultMaxOutputBytes = 32768
+	defaultMemLimitBytes  = 256 * 1024 * 1024 // 설계 §4.3 기본 상한 256MB
 )
 
 // Eval: 순수 함수 — 파일·네트워크·env·시계·난수 접근 없음. panic 없이 항상 Result를 반환한다.
 func Eval(req Request) (result Result) {
 	defer func() {
 		if r := recover(); r != nil {
-			result = Result{ErrKind: "script"}
+			result = Result{ErrKind: "script", ErrSummary: firstLine("script error: " + fmt.Sprint(r))}
 		}
 	}()
 
@@ -118,13 +131,87 @@ func Eval(req Request) (result Result) {
 	case err == nil:
 	case budgetHit:
 		res.ErrKind = "budget"
+		res.ErrSummary = ErrBudget.Error()
 	case outputHit:
 		res.ErrKind = "output_limit"
 		res.Truncated = true
+		res.ErrSummary = ErrOutputLimit.Error()
 	default:
 		res.ErrKind = "script"
+		res.ErrSummary = firstLine("script error: " + err.Error())
 	}
 	return res
+}
+
+// firstLine: 오류 메시지의 첫 줄만 취한다 — starlark 오류는 위치·종류만 담고 스크립트
+// 원문/입력 데이터를 포함하지 않으므로 이대로 노출해도 안전하다.
+func firstLine(msg string) string {
+	if i := strings.IndexByte(msg, '\n'); i >= 0 {
+		msg = msg[:i]
+	}
+	return msg
+}
+
+// workerSem: worker 프로세스 동시 실행 ≤2 (설계 §4.3). 패키지 레벨 — 이 프로세스 내 모든
+// Spawn 호출이 공유하는 세마포어.
+var workerSem = make(chan struct{}, 2)
+
+// RunWorker: worker 프로세스(자기 재실행, "__transform-worker") 측 entrypoint. stdin에서
+// Request JSON 1건을 읽어 Eval을 실행하고 Result JSON 1건을 stdout에 쓴다. 호출자(main)는
+// 이 함수 전후로 배너·로그를 stdout에 출력해서는 안 된다(stdout은 JSON 1건이어야 한다).
+func RunWorker(r io.Reader, w io.Writer) error {
+	selfApplyMemLimit() // unix: CTR_WORKER_MEM 있으면 self Setrlimit. windows: no-op(부모가 Job으로 이미 제한).
+	var req Request
+	if err := json.NewDecoder(r).Decode(&req); err != nil {
+		return fmt.Errorf("transform: request 디코딩: %w", err)
+	}
+	res := Eval(req)
+	if err := json.NewEncoder(w).Encode(res); err != nil {
+		return fmt.Errorf("transform: result 인코딩: %w", err)
+	}
+	return nil
+}
+
+// Spawn: selfExe(자기 바이너리 경로)를 "__transform-worker" 인자로 재실행해 req를 격리
+// 평가한다. 동시 실행 ≤2(workerSem), OS 메모리 상한(applyMemLimit, 실패 시 ErrNoIsolation),
+// ctx 취소/timeout 시 트리킬(applyMemLimit이 설정하는 cmd.Cancel). worker가 상한·timeout으로
+// 죽어도(exit code 비정상·부분 출력) 이 함수는 error를 반환하지 않고 합성 Result를 반환한다
+// — 부모 프로세스는 절대 죽지 않는다. error 반환은 "실행 자체를 시작 못함" 케이스뿐이다:
+// ctx가 세마포어 대기 중 취소, Request 인코딩 실패, ErrNoIsolation.
+func Spawn(ctx context.Context, selfExe string, req Request) (Result, error) {
+	select {
+	case workerSem <- struct{}{}:
+	case <-ctx.Done():
+		return Result{}, ctx.Err()
+	}
+	defer func() { <-workerSem }()
+
+	payload, err := json.Marshal(req)
+	if err != nil {
+		return Result{}, fmt.Errorf("transform: request 인코딩: %w", err)
+	}
+
+	cmd := exec.CommandContext(ctx, selfExe, "__transform-worker")
+	cmd.Stdin = bytes.NewReader(payload)
+	var stdout bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.WaitDelay = 2 * time.Second
+
+	cleanup, err := applyMemLimit(cmd, defaultMemLimitBytes)
+	if err != nil {
+		return Result{}, ErrNoIsolation
+	}
+	defer cleanup()
+
+	waitErr := cmd.Wait()
+	var res Result
+	if waitErr != nil {
+		return Result{ErrKind: "script", ErrSummary: "worker killed (memory/time limit)"}, nil
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &res); err != nil {
+		return Result{ErrKind: "script", ErrSummary: "worker killed (memory/time limit)"}, nil
+	}
+	return res, nil
 }
 
 // displayString: emit()의 str() 대응 — 문자열은 따옴표 없이, 그 외는 starlark 기본 표현.

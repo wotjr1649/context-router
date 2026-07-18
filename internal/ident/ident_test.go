@@ -114,6 +114,16 @@ func TestFold_ExtendedUNC(t *testing.T) {
 	}
 }
 
+// TestFold_ExtendedUNC_SlashVariant: 계획2 Task2 이월 — 확장 UNC 접두의 슬래시 변형
+// (`//?/UNC/...`)도 백슬래시 변형(`\\?\UNC\...`)과 동일하게 fold되어야 한다.
+func TestFold_ExtendedUNC_SlashVariant(t *testing.T) {
+	a := Fold(`//?/UNC/Server/Share/p`)
+	b := Fold(`\\Server\Share\p`)
+	if a != b {
+		t.Fatalf("동일 경로 다른 fold: %q vs %q", a, b)
+	}
+}
+
 func TestFold_OSRule(t *testing.T) {
 	got := Fold(`C:\Some\Dir`)
 	if runtime.GOOS == "windows" || runtime.GOOS == "darwin" {

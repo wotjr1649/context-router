@@ -15,9 +15,14 @@ import (
 type Canon struct{ ProjectRoot, WorktreeRoot, ProjectID, WorktreeID string }
 
 func Fold(p string) string {
-	p = strings.TrimPrefix(p, `\\?\`)
+	switch {
+	case strings.HasPrefix(p, `\\?\`):
+		p = p[4:]
+	case strings.HasPrefix(p, `//?/`): // 슬래시 변형(계획2 Task2 이월)
+		p = p[4:]
+	}
 	if strings.HasPrefix(p, `UNC\`) || strings.HasPrefix(p, `UNC/`) {
-		p = `\\` + p[4:] // \\?\UNC\server\share → \\server\share
+		p = `\\` + p[4:] // (\\?\|//?/)UNC\server\share → \\server\share
 	}
 	p = filepath.ToSlash(p)
 	if runtime.GOOS == "windows" || runtime.GOOS == "darwin" {

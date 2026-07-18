@@ -19,6 +19,7 @@ import (
 	"github.com/wotjr1649/context-router/internal/ident"
 	"github.com/wotjr1649/context-router/internal/mcp"
 	"github.com/wotjr1649/context-router/internal/store"
+	"github.com/wotjr1649/context-router/internal/transform"
 )
 
 const version = "0.0.1-dev"
@@ -212,7 +213,19 @@ func run(ctx context.Context, args []string, stderr io.Writer) error {
 	})
 }
 
+// transformWorkerArg: worker 프로세스 재실행 숨김 모드 인자(설계 §4.3). 플래그 파싱보다
+// 먼저 분기해야 한다 — stdout은 Result JSON 1건이어야 하고 배너·로그가 섞이면 안 된다.
+const transformWorkerArg = "__transform-worker"
+
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == transformWorkerArg {
+		if err := transform.RunWorker(os.Stdin, os.Stdout); err != nil {
+			fmt.Fprintln(os.Stderr, "ctr:", err)
+			os.Exit(1)
+		}
+		return
+	}
+
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
 	if err := run(ctx, os.Args[1:], os.Stderr); err != nil {

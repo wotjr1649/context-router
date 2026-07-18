@@ -1,6 +1,11 @@
 package transform
 
-import "testing"
+import (
+	"bytes"
+	"encoding/json"
+	"strings"
+	"testing"
+)
 
 func TestBuiltins(t *testing.T) {
 	cases := []struct {
@@ -126,6 +131,81 @@ func TestForbiddenAccess(t *testing.T) {
 		if r.ErrKind != "script" {
 			t.Fatalf("script=%q ErrKind=%q want script", s, r.ErrKind)
 		}
+	}
+}
+
+// TestErrSummary_Script: 승계 계약 T1→T2 (a) — script 오류는 ErrSummary가 비어있지 않고,
+// 스크립트 원문(고유 리터럴 "MARKER_LITERAL_TOKEN")과 입력 데이터를 포함하지 않아야 한다.
+func TestErrSummary_Script(t *testing.T) {
+	const marker = "MARKER_LITERAL_TOKEN"
+	req := Request{
+		// marker는 참조되지 않는 문자열 리터럴로 심는다 — "undefined: <식별자명>"처럼 오류에
+		// 자연히 등장하는 식별자명(과제 예시 "script error: undefined: foo")과 달리, 이
+		// 리터럴은 오류 메시지 어디에도 나타나서는 안 된다(스크립트 원문 비유출 검증).
+		Script: `x = "` + marker + `" + undefined_name_zzz`,
+		Inputs: []Input{{ID: 1, Text: "secret-input-data"}},
+	}
+	r := Eval(req)
+	if r.ErrKind != "script" {
+		t.Fatalf("ErrKind=%q want script", r.ErrKind)
+	}
+	if r.ErrSummary == "" {
+		t.Fatal("ErrSummary empty, want non-empty")
+	}
+	if strings.Contains(r.ErrSummary, marker) {
+		t.Fatalf("ErrSummary=%q leaks script source marker", r.ErrSummary)
+	}
+	if strings.Contains(r.ErrSummary, "secret-input-data") {
+		t.Fatalf("ErrSummary=%q leaks input data", r.ErrSummary)
+	}
+	if strings.Contains(r.ErrSummary, "\n") {
+		t.Fatalf("ErrSummary=%q must be a single line", r.ErrSummary)
+	}
+}
+
+// TestErrSummary_BudgetAndOutputLimit: budget/output_limit도 ErrSummary가 채워진다.
+func TestErrSummary_BudgetAndOutputLimit(t *testing.T) {
+	budget := Eval(Request{
+		Script: "def f():\n\tfor i in range(100000000):\n\t\tpass\n\nf()\n",
+		Caps:   Caps{MaxSteps: 1000},
+	})
+	if budget.ErrSummary == "" {
+		t.Fatal("budget ErrSummary empty")
+	}
+
+	limit := Eval(Request{
+		Script: "def f():\n\tfor i in range(1000):\n\t\temit(\"x\")\n\nf()\n",
+		Caps:   Caps{MaxOutputBytes: 5},
+	})
+	if limit.ErrSummary == "" {
+		t.Fatal("output_limit ErrSummary empty")
+	}
+}
+
+// TestRunWorker_RoundTrip: 프로토콜 round-trip — 프로세스 스폰 없이 파이프(bytes.Buffer)로
+// RunWorker를 직접 호출해 Request JSON→Result JSON 왕복이 Eval과 일치하는지 검증한다.
+func TestRunWorker_RoundTrip(t *testing.T) {
+	req := Request{
+		Script: `emit(",".join(sort(["b", "a", "c"])))`,
+	}
+	reqBytes, err := json.Marshal(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout bytes.Buffer
+	if err := RunWorker(bytes.NewReader(reqBytes), &stdout); err != nil {
+		t.Fatalf("RunWorker error: %v", err)
+	}
+
+	var got Result
+	if err := json.Unmarshal(stdout.Bytes(), &got); err != nil {
+		t.Fatalf("Result JSON 파싱 실패: %v (raw=%q)", err, stdout.String())
+	}
+
+	want := Eval(req)
+	if got != want {
+		t.Fatalf("RunWorker Result=%+v want %+v", got, want)
 	}
 }
 
