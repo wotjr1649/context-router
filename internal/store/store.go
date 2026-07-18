@@ -718,11 +718,18 @@ func hashesFromQuery(ctx context.Context, db *sql.DB, query string) (map[string]
 	return set, rows.Err()
 }
 
+// gcOrphanMinAge: blob 배치→커밋 윈도 보호 — Register는 blob을 DB 커밋 이전에 배치한다
+// (§3.5 원자성 계약). 동시 GC가 "DB 참조 없음+파일 존재"인 등록 진행 중 blob을 고아로
+// 오판해 지우면 커밋 후 DB가 없는 blob을 가리키게 되어 저장소가 손상된다. mtime이 이보다
+// 최근인 파일은 삭제 후보에서 제외한다(git prune --expire 선례와 동일한 발상) — 크래시로
+// 남은 진짜 고아는 다음 GC 실행에서(이 유예 기간이 지난 뒤) 수거된다.
+const gcOrphanMinAge = time.Hour
+
 // GCOrphanBlobs: artifacts/ 아래 blob 파일 중 artifacts.content_hash에도 sources.raw_blob_hash
 // (NULL 아닌 것)에도 없는 해시만 삭제한다(계획2 이월 "과거 raw blob 물리 GC" 해소, 설계 §7).
 // reader로 참조 해시 집합을 모은 뒤 os.ReadDir(artifacts/<prefix>/)로 대조한다. 파일명 길이가
 // sha256 hex(64자)가 아니면 blob이 아니라 writeBlob의 임시파일(hash.tmp.pid.seq)이므로 건드리지
-// 않는다.
+// 않는다. mtime이 gcOrphanMinAge보다 최근인 미참조 파일은 건너뛴다(위 불변식 참조).
 func (s *Store) GCOrphanBlobs(ctx context.Context) (removed int64, err error) {
 	referenced, err := hashesFromQuery(ctx, s.reader, "SELECT content_hash FROM artifacts")
 	if err != nil {
@@ -760,6 +767,16 @@ func (s *Store) GCOrphanBlobs(ctx context.Context) (removed int64, err error) {
 			hash := e.Name()
 			if len(hash) != 64 || referenced[hash] {
 				continue
+			}
+			info, err := e.Info()
+			if err != nil {
+				if errors.Is(err, os.ErrNotExist) { // 대조 시점 사이 이미 사라짐 — 정상
+					continue
+				}
+				return removed, sanitizeIOErr("gc stat", err)
+			}
+			if time.Since(info.ModTime()) < gcOrphanMinAge {
+				continue // age gate: 등록 진행 중일 수 있음(§3.5) — 다음 GC로 미룬다
 			}
 			if err := os.Remove(filepath.Join(dir, hash)); err != nil {
 				return removed, sanitizeIOErr("gc remove", err)

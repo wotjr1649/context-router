@@ -282,12 +282,22 @@ func confirmPurge(in io.Reader, out io.Writer, isTTY bool, force bool, expected 
 	return nil
 }
 
-// purgeProjectID: --project 값(ID 또는 경로)을 ProjectID로 정규화한다. 경로 구분자를
-// 포함하거나 실재하는 디렉터리면 경로로 보고 ident.Canonicalize, 그 외는 ID 문자열 그대로
-// 취급한다 — main.resolveProjectEntry와 동형(설계 §4.6/§7, D13상 서로 다른 패키지라 자체
-// 인터페이스 없이 각자 소유).
-func purgeProjectID(entry string) (string, error) {
-	looksLikePath := strings.ContainsAny(entry, `/\`)
+// purgeProjectID: --project 값(ID 또는 경로)을 ProjectID로 정규화한다. 먼저(리뷰 P2-3,
+// Fix Round 1) 경로 구분자가 없고 <storeRoot>/projects/<entry>가 실재하면 그 자체로 이미
+// store ID이므로 확정하고 경로 해석을 아예 하지 않는다 — 그러지 않으면 cwd에 우연히 동명
+// 디렉터리가 있을 때(예: 현재 작업 디렉터리 하위 우연한 이름 충돌) store ID가 경로로
+// 오인되어 엉뚱한 프로젝트가 가려진다. 그 외에는 기존 로직: 경로 구분자를 포함하거나
+// 실재하는 디렉터리면 경로로 보고 ident.Canonicalize, 그 외는 ID 문자열 그대로 취급한다
+// — main.resolveProjectEntry와 동형(설계 §4.6/§7, D13상 서로 다른 패키지라 자체 인터페이스
+// 없이 각자 소유).
+func purgeProjectID(storeRoot, entry string) (string, error) {
+	hasSep := strings.ContainsAny(entry, `/\`)
+	if !hasSep {
+		if fi, err := os.Stat(filepath.Join(storeRoot, "projects", entry)); err == nil && fi.IsDir() {
+			return entry, nil // 이미 store ID로 확정 — 경로 해석 생략
+		}
+	}
+	looksLikePath := hasSep
 	if !looksLikePath {
 		if fi, err := os.Stat(entry); err == nil && fi.IsDir() {
 			looksLikePath = true
@@ -353,10 +363,13 @@ func runPurge(ctx context.Context, in io.Reader, w io.Writer, storeRoot string, 
 		if err != nil {
 			return err
 		}
+		if len(list) == 0 { // 리뷰 P2-2: 빈 --all은 즉시 오류(무엇을 삭제할지 모호한 채로 진행 금지)
+			return errors.New("purge: 대상 프로젝트 없음")
+		}
 		ids = list
 		expected = fmt.Sprintf("all-%d-projects", len(list))
 	} else {
-		id, err := purgeProjectID(*project)
+		id, err := purgeProjectID(storeRoot, *project)
 		if err != nil {
 			return errors.New("purge: 프로젝트 식별 실패")
 		}
@@ -368,9 +381,11 @@ func runPurge(ctx context.Context, in io.Reader, w io.Writer, storeRoot string, 
 	gcOnly := *gc && !selective
 	var cutoffUnix int64
 	if selective {
+		// 리뷰 P2-1: 파싱 실패 오류는 사용자 입력(*olderThanFlag)을 담은 err를 %w로 감싸지
+		// 않는다(정적 메시지만) — 원문 에코 금지. d<=0(음수·0)도 유효한 기간이 아니므로 거부.
 		d, err := time.ParseDuration(*olderThanFlag)
-		if err != nil {
-			return fmt.Errorf("purge: --older-than 파싱 실패: %w", err)
+		if err != nil || d <= 0 {
+			return errors.New("purge: --older-than 값이 유효한 기간이 아님")
 		}
 		cutoffUnix = time.Now().Add(-d).Unix()
 	}
@@ -386,6 +401,13 @@ func runPurge(ctx context.Context, in io.Reader, w io.Writer, storeRoot string, 
 			return err
 		}
 		projDir := filepath.Join(storeRoot, "projects", id)
+		// 리뷰 P2-2: writable store.Open 전에 대상 존재를 확인한다 — store.Open(dir,false)는
+		// MkdirAll+migrate로 존재하지 않던 프로젝트를 그 자리에서 새로 만들어버리고(phantom
+		// project), 전체 삭제 분기의 os.RemoveAll은 대상이 없어도 조용히 nil을 반환해 오타를
+		// 성공으로 오인시킨다. content.db 존재로 "실재하는 프로젝트"를 판정한다.
+		if _, err := os.Stat(filepath.Join(projDir, "content.db")); err != nil {
+			return errors.New("purge: 대상 프로젝트 없음")
+		}
 
 		if gcOnly {
 			st, err := store.Open(projDir, true) // read-only — GC는 DB 쓰기가 없다

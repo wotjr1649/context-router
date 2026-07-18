@@ -212,6 +212,77 @@ func TestRunPurge_ExactlyOneSelector(t *testing.T) {
 	}
 }
 
+// TestRunPurge_OlderThanRejectsInvalidDuration: 리뷰 P2-1(Fix Round 1) — 파싱 자체가
+// 실패하는 값("abc")뿐 아니라 파싱은 성공하지만 음수·0인 값("-1h","0s")도 거부해야 한다.
+// storeRoot가 비어 있어도(프로젝트 미등록) 이 검증은 프로젝트 존재 확인보다 먼저 걸린다.
+func TestRunPurge_OlderThanRejectsInvalidDuration(t *testing.T) {
+	for _, v := range []string{"-1h", "0s", "abc"} {
+		var out bytes.Buffer
+		args := []string{"--project", "whatever-id", "--force", "--older-than", v}
+		if err := runPurge(context.Background(), failReader{}, &out, t.TempDir(), args, false); err == nil {
+			t.Fatalf("older-than=%q: want error, got nil", v)
+		}
+	}
+}
+
+// TestRunPurge_PhantomProjectRejected: 리뷰 P2-2(Fix Round 1) — 존재하지 않는 프로젝트 ID로
+// --older-than(선택 삭제 경로)을 호출하면 store.Open(dir,false)이 그 자리에서 새 프로젝트를
+// 만들어버리기 전에 오류로 거부해야 하고, projects/ 하위에 그 이름의 디렉터리가 생기면 안
+// 된다(phantom 생성 방지).
+func TestRunPurge_PhantomProjectRejected(t *testing.T) {
+	storeRoot := t.TempDir()
+	var out bytes.Buffer
+	args := []string{"--project", "does-not-exist-id", "--force", "--older-than", "1h"}
+	if err := runPurge(context.Background(), failReader{}, &out, storeRoot, args, false); err == nil {
+		t.Fatal("want error for nonexistent project, got nil")
+	}
+	if _, err := os.Stat(filepath.Join(storeRoot, "projects", "does-not-exist-id")); !os.IsNotExist(err) {
+		t.Fatalf("phantom project directory was created: stat err=%v", err)
+	}
+}
+
+// TestPurgeProjectID_StoreIDNotShadowedByCwdDir: 리뷰 P2-3(Fix Round 1) — cwd에 store
+// ProjectID와 동명의 디렉터리가 우연히 있어도 --project <id>는 store 쪽 프로젝트를 대상으로
+// 삼아야 한다(예전 로직은 "구분자 없고 cwd에 동명 디렉터리 존재"를 경로로 오인해
+// ident.Canonicalize(그 cwd 디렉터리)로 완전히 다른 ID를 계산해버렸다).
+func TestPurgeProjectID_StoreIDNotShadowedByCwdDir(t *testing.T) {
+	storeRoot := t.TempDir()
+	registeredRoot := t.TempDir()
+	canon, err := ident.Canonicalize(registeredRoot)
+	if err != nil {
+		t.Fatalf("canonicalize: %v", err)
+	}
+	id := canon.ProjectID
+	st, err := store.Open(filepath.Join(storeRoot, "projects", id), false)
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	cwdBase := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(cwdBase, id), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	origWD, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(cwdBase); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chdir(origWD) })
+
+	got, err := purgeProjectID(storeRoot, id)
+	if err != nil {
+		t.Fatalf("purgeProjectID: %v", err)
+	}
+	if got != id {
+		t.Fatalf("got=%q want %q (store ID가 cwd 동명 디렉터리에 가려짐)", got, id)
+	}
+}
+
 // failReader: Read 호출 시 즉시 panic — confirmPurge의 force 경로가 실제로 in을 전혀 읽지
 // 않음을 증명하는 용도(읽으면 테스트가 panic으로 즉시 실패한다).
 type failReader struct{}
@@ -383,7 +454,14 @@ func TestRunPurge_E2E_GCOnlyNoConfirm(t *testing.T) {
 	if err := os.MkdirAll(orphanDir, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(orphanDir, orphanHash), []byte("orphan"), 0o600); err != nil {
+	orphanPath := filepath.Join(orphanDir, orphanHash)
+	if err := os.WriteFile(orphanPath, []byte("orphan"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// store.gcOrphanMinAge(1h) age gate를 통과시킨다(리뷰 P1) — 갓 만든 파일은 GC가
+	// 등록 진행 중일 가능성 때문에 건드리지 않는다.
+	old := time.Now().Add(-2 * time.Hour)
+	if err := os.Chtimes(orphanPath, old, old); err != nil {
 		t.Fatal(err)
 	}
 

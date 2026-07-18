@@ -860,9 +860,31 @@ func TestPurgeOlderThan_MismatchLeavesEverything(t *testing.T) {
 	}
 }
 
+// writeAgedOrphanBlob: 테스트용 — dir/artifacts/hash[:2]/hash에 참조되지 않는 blob 파일을
+// 만들고 mtime을 gcOrphanMinAge보다 오래된 시각으로 되돌린다(age gate를 통과해 GC 삭제
+// 대상이 되도록). age gate 자체를 검증하는 TestGCOrphanBlobs_AgeGate는 이 헬퍼를 쓰지
+// 않고 직접 mtime을 다룬다.
+func writeAgedOrphanBlob(t *testing.T, storeDir, hash string) string {
+	t.Helper()
+	dir := filepath.Join(storeDir, "artifacts", hash[:2])
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, hash)
+	if err := os.WriteFile(path, []byte("orphan"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().Add(-2 * gcOrphanMinAge)
+	if err := os.Chtimes(path, old, old); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
 // TestGCOrphanBlobs: 정상 등록된 artifact의 blob(참조됨)과, 등록 없이 artifacts/에 직접
 // 만든 더미 blob 파일(재색인으로 raw_blob_hash가 교체돼 고아가 된 상황을 모사, 설계 §7)을
-// 함께 둔 뒤 GC가 고아만 지우고 참조 blob은 남기는지 확인한다.
+// 함께 둔 뒤 GC가 고아만 지우고 참조 blob은 남기는지 확인한다. 더미 blob은 age gate를
+// 통과하도록 mtime을 오래된 시각으로 만든다(신규 등록 blob과 구분, 리뷰 P1).
 func TestGCOrphanBlobs(t *testing.T) {
 	s := openT(t)
 	body := []byte("referenced content")
@@ -875,13 +897,8 @@ func TestGCOrphanBlobs(t *testing.T) {
 	refHash := hex.EncodeToString(sum[:])
 
 	orphanHash := strings.Repeat("f", 64) // 64자 hex 모양이지만 어디에도 참조되지 않는 더미 해시
-	orphanDir := filepath.Join(s.dir, "artifacts", orphanHash[:2])
-	if err := os.MkdirAll(orphanDir, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(orphanDir, orphanHash), []byte("orphan blob"), 0o600); err != nil {
-		t.Fatal(err)
-	}
+	orphanPath := writeAgedOrphanBlob(t, s.dir, orphanHash)
+	orphanDir := filepath.Dir(orphanPath)
 
 	removed, err := s.GCOrphanBlobs(t.Context())
 	if err != nil {
@@ -914,13 +931,7 @@ func TestGCOrphanBlobs_PreservesRawBlobHash(t *testing.T) {
 	rawHash := hex.EncodeToString(sum[:])
 
 	orphanHash := strings.Repeat("9", 64)
-	orphanDir := filepath.Join(s.dir, "artifacts", orphanHash[:2])
-	if err := os.MkdirAll(orphanDir, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(orphanDir, orphanHash), []byte("orphan"), 0o600); err != nil {
-		t.Fatal(err)
-	}
+	writeAgedOrphanBlob(t, s.dir, orphanHash)
 
 	removed, err := s.GCOrphanBlobs(t.Context())
 	if err != nil {
@@ -931,6 +942,41 @@ func TestGCOrphanBlobs_PreservesRawBlobHash(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(s.dir, "artifacts", rawHash[:2], rawHash)); err != nil {
 		t.Fatalf("raw_blob_hash로만 참조되는 blob이 GC에 삭제됨: %v", err)
+	}
+}
+
+// TestGCOrphanBlobs_AgeGate: 리뷰 P1(Fix Round 1) — Register가 blob을 DB 커밋 이전에
+// 배치하므로(§3.5) 동시 GC가 "막 배치된 미참조 blob"을 고아로 오판해 지우면 저장소가
+// 손상된다. 참조 없는 blob 2개 중 mtime이 최근(now, gcOrphanMinAge 이내)인 것은 건너뛰고
+// 오래된(2시간 전) 것만 삭제해야 한다.
+func TestGCOrphanBlobs_AgeGate(t *testing.T) {
+	s := openT(t)
+
+	recentHash := strings.Repeat("1", 64)
+	recentDir := filepath.Join(s.dir, "artifacts", recentHash[:2])
+	if err := os.MkdirAll(recentDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	recentPath := filepath.Join(recentDir, recentHash)
+	if err := os.WriteFile(recentPath, []byte("recent"), 0o600); err != nil { // mtime=now, 건드리지 않음
+		t.Fatal(err)
+	}
+
+	oldHash := strings.Repeat("2", 64)
+	oldPath := writeAgedOrphanBlob(t, s.dir, oldHash) // mtime=2*gcOrphanMinAge 전
+
+	removed, err := s.GCOrphanBlobs(t.Context())
+	if err != nil {
+		t.Fatalf("GCOrphanBlobs: %v", err)
+	}
+	if removed != 1 {
+		t.Fatalf("removed=%d want 1(오래된 것만)", removed)
+	}
+	if _, err := os.Stat(recentPath); err != nil {
+		t.Fatalf("age gate 실패 — 최근 blob이 삭제됨: %v", err)
+	}
+	if _, err := os.Stat(oldPath); !os.IsNotExist(err) {
+		t.Fatalf("오래된 orphan 잔존: err=%v", err)
 	}
 }
 
