@@ -36,6 +36,10 @@ type Config struct {
 	AllowPaths    []string // 이미 canonicalize된 ctr_index 허용 root (cmd가 검증 — §4.4)
 	NetAllowLocal bool     // --net-allow-local (§4.5, ctr_fetch_and_index)
 	NetPorts      []int    // --net-ports 추가 허용 포트 (§4.5)
+	// TransformTimeout: ctr_transform 핸들러가 Spawn에 씌우는 마감(0이면 NewServer가
+	// 10s로 채운다). transform.go의 defaultWorkerTimeout 안전망(호출자 ctx에 deadline이
+	// 없을 때만 적용)과 별개로, registerTransform은 항상 이 값으로 WithTimeout한다.
+	TransformTimeout time.Duration
 }
 
 // Serve builds the tool server per cfg and runs it over stdio until ctx가 끝나거나
@@ -53,6 +57,9 @@ func NewServer(cfg Config) (*mcp.Server, error) {
 	if cfg.Store == nil {
 		return nil, fmt.Errorf("mcp: nil store")
 	}
+	if cfg.TransformTimeout == 0 {
+		cfg.TransformTimeout = 10 * time.Second
+	}
 	srv := mcp.NewServer(&mcp.Implementation{Name: "context-router", Version: serverVersion}, nil)
 	// 경로 허용(ingest root)·상대화(search/fetch relativize) 기준 = WorktreeRoot — linked git
 	// worktree에서 ProjectRoot(주 checkout)를 쓰면 현재 worktree 파일이 WORKSPACE_VIOLATION이
@@ -64,7 +71,7 @@ func NewServer(cfg Config) (*mcp.Server, error) {
 	if err := transform.ProbeIsolation(cfg.SelfExe); err != nil {
 		slog.Warn("mcp: transform 격리 프로브 실패 — ctr_transform 비활성화", "error", err)
 	} else {
-		registerTransform(srv, cfg.Store, cfg.SelfExe)
+		registerTransform(srv, cfg.Store, cfg.SelfExe, cfg.TransformTimeout)
 	}
 	if slices.Contains(cfg.Enable, "ingest") {
 		registerIndex(srv, cfg.Store, cfg.Canon.WorktreeRoot, cfg.AllowPaths)
@@ -479,13 +486,16 @@ func transformResultErr(res transform.Result) error {
 	return nil
 }
 
-func registerTransform(srv *mcp.Server, st *store.Store, selfExe string) {
+func registerTransform(srv *mcp.Server, st *store.Store, selfExe string, timeout time.Duration) {
 	mcp.AddTool(srv, &mcp.Tool{
 		Name:        "ctr_transform",
 		Description: transformDescription,
 		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true},
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, in TransformInput) (*mcp.CallToolResult, TransformOutput, error) {
 		start := time.Now()
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, timeout)
+		defer cancel()
 		if len(in.Script) > maxTransformScriptBytes {
 			return nil, TransformOutput{}, toolErr(codeInvalidArgument, "script가 상한(64KB)을 초과했습니다")
 		}
@@ -557,7 +567,7 @@ func registerFetchAndIndex(srv *mcp.Server, st *store.Store, allowLocal bool, ex
 		if err != nil {
 			return nil, FetchAndIndexOutput{}, toToolError(err)
 		}
-		rep, err := ingest.RunWeb(ctx, st, res.FinalURL, res.RawHTML, res.Body, res.MediaType, res.Extraction)
+		rep, err := ingest.RunWeb(ctx, st, res.FinalURL, res.RawHTML, res.Body, res.MediaType, res.Extraction, res.Title)
 		if err != nil {
 			return nil, FetchAndIndexOutput{}, toToolError(err)
 		}

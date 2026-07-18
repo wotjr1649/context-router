@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -374,6 +375,11 @@ func TestFetch_HTML_ArticleProse(t *testing.T) {
 	if res.Extraction != "readability" {
 		t.Fatalf("Extraction = %q, want readability", res.Extraction)
 	}
+	// 계획2 §4 이월 (2): Result.Title은 readability Article.Title에서 온다(text/html 경로).
+	const wantTitle = "The Slow Return of the Analog Notebook"
+	if res.Title != wantTitle {
+		t.Fatalf("Title = %q, want %q", res.Title, wantTitle)
+	}
 }
 
 // TestFetch_HTML_ShortNonArticle: 추출 텍스트 <500자 → full 전환.
@@ -417,5 +423,60 @@ func TestFetch_NonHTML_Passthrough(t *testing.T) {
 	}
 	if res.MediaType != "application/json" {
 		t.Fatalf("MediaType = %q, want application/json", res.MediaType)
+	}
+	if res.Title != "" {
+		t.Fatalf("Title = %q, want empty for non-HTML", res.Title)
+	}
+}
+
+// TestRetryableDialErr: hop 루프가 다음 주소로 재시도할지 판단하는 순수 함수 — 연결 계층
+// 오류(dial·handshake, *net.OpError)만 참이어야 한다(계획2 §4 이월 (3)).
+func TestRetryableDialErr(t *testing.T) {
+	dialErr := &net.OpError{Op: "dial", Net: "tcp", Err: errors.New("connection refused")}
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"nil", nil, false},
+		{"plain error", errors.New("boom"), false},
+		{"context deadline exceeded", context.DeadlineExceeded, false},
+		{"net.OpError direct", dialErr, true},
+		{"net.OpError wrapped by fmt.Errorf", fmt.Errorf("netfetch: request %s: %w", "http://x", dialErr), true},
+		{"url.Error wrapping net.OpError (client.Do 실반환 형태)", &url.Error{Op: "Get", URL: "http://x", Err: dialErr}, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := retryableDialErr(tc.err); got != tc.want {
+				t.Fatalf("retryableDialErr(%v) = %v, want %v", tc.err, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestResolveAndValidate_MultiAddress: resolveAndValidate가 (지금은) 전체 검증-통과 주소
+// 목록을 반환하는지, 그리고 "하나라도 거부면 전체 거부" 의미가 여전히 유지되는지 확인한다
+// (계획2 §4 이월 (3) — 실 dial 재시도는 로컬에서 두 주소를 구성하기 어려워 순수 함수
+// 검증으로 대체). localhost는 대개 127.0.0.1/::1 로 로컬 조회되며 실 DNS 왕복이 없다.
+func TestResolveAndValidate_MultiAddress(t *testing.T) {
+	addrs, err := resolveAndValidate(context.Background(), "localhost", Config{AllowLocal: true})
+	if err != nil {
+		t.Fatalf("resolveAndValidate(localhost, AllowLocal=true): %v", err)
+	}
+	if len(addrs) == 0 {
+		t.Fatalf("want at least 1 address, got 0")
+	}
+	for _, a := range addrs {
+		if a != a.Unmap() {
+			t.Fatalf("address not Unmap()ed: %v", a)
+		}
+	}
+
+	// AllowLocal=false면 localhost가 가리키는 loopback 주소는 전부 차단 대상이므로(§ClassifyAddr)
+	// "하나라도 거부면 전체 거부" 의미상 오류가 나야 한다 — 다중 주소 환경에서도 회귀 확인.
+	if _, err := resolveAndValidate(context.Background(), "localhost", Config{}); err == nil {
+		t.Fatalf("want denial for localhost without AllowLocal, got nil error")
+	} else if !errors.Is(err, ErrDenied) {
+		t.Fatalf("want ErrDenied, got %v", err)
 	}
 }

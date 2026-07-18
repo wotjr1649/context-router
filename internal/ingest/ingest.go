@@ -761,7 +761,11 @@ func webSnippet(stored []byte) string {
 // 아닌 원시 인자를 받는다. rawHTML/body/mediaType/extraction은 netfetch.Fetch 결과 그대로:
 // html이면 rawHTML=원문·body=변환된 markdown, 그 외 미디어는 rawHTML 미설정·body=원문.
 // src_hash는 설계 §4.5대로 "원문" 기준 — html은 rawHTML, 그 외는 body(=원문)로 계산한다.
-func RunWeb(ctx context.Context, st *store.Store, url string, rawHTML, body []byte, mediaType, extraction string) (WebReport, error) {
+// 주의: non-html의 src_hash는 원본 바이트가 아니라 디코딩 후(post-decode, netfetch가
+// charset 변환을 마친) 바이트 기준이다 — body가 그 상태로 전달되기 때문.
+// title(netfetch.Result.Title, readability Article.Title)은 헤딩을 못 찾아 Title이 빈
+// 청크의 기본값으로 쓰인다(빈 문자열이면 미적용 — 청크는 그대로 빈 Title 유지).
+func RunWeb(ctx context.Context, st *store.Store, url string, rawHTML, body []byte, mediaType, extraction, title string) (WebReport, error) {
 	if err := ctx.Err(); err != nil {
 		return WebReport{}, err
 	}
@@ -777,6 +781,13 @@ func RunWeb(ctx context.Context, st *store.Store, url string, rawHTML, body []by
 		redaction = "spans"
 	}
 	chunks := ChunkText(string(stored), mediaType == "text/markdown")
+	if title != "" {
+		for i := range chunks {
+			if chunks[i].Title == "" {
+				chunks[i].Title = title
+			}
+		}
+	}
 	artID, err := st.Register(ctx, store.Registration{
 		StoredBytes: stored,
 		MediaType:   mediaType,

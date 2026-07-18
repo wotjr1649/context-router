@@ -43,6 +43,8 @@ type Result struct {
 	MediaType  string
 	Extraction string
 	FinalURL   string
+	// Title: readability Article.Title — text/html 경로에서만 채워진다(그 외 미디어는 "").
+	Title string
 }
 
 // ErrDenied: SSRF 정책(주소/스킴/포트/강등/redirect 목적지) 위반 — 목적지 거부.
@@ -151,39 +153,50 @@ func resolvePort(u *url.URL, cfg Config) (int, error) {
 }
 
 // resolveAndValidate: literal IP 우선(I1), 아니면 전 레코드 조회 후 전부 검증(I2) — 하나라도
-// block이면 거부. fallback resolver 없음(I6) — net.DefaultResolver 1회만.
-func resolveAndValidate(ctx context.Context, host string, cfg Config) (netip.Addr, error) {
+// block이면 전체 거부(의미 불변). fallback resolver 없음(I6) — net.DefaultResolver 1회만.
+// 반환은 검증을 통과한 전체 주소 목록(각 Unmap() 적용) — literal IP는 단일 원소.
+func resolveAndValidate(ctx context.Context, host string, cfg Config) ([]netip.Addr, error) {
 	if lit, err := netip.ParseAddr(host); err == nil {
 		if !allowedAddr(lit, cfg) {
-			return netip.Addr{}, fmt.Errorf("netfetch: address %s denied: %w", host, ErrDenied)
+			return nil, fmt.Errorf("netfetch: address %s denied: %w", host, ErrDenied)
 		}
-		return lit.Unmap(), nil
+		return []netip.Addr{lit.Unmap()}, nil
 	}
 	addrs, err := net.DefaultResolver.LookupNetIP(ctx, "ip", host)
 	if err != nil {
-		return netip.Addr{}, fmt.Errorf("netfetch: resolve %s: %w", host, err)
+		return nil, fmt.Errorf("netfetch: resolve %s: %w", host, err)
 	}
 	if len(addrs) == 0 {
-		return netip.Addr{}, fmt.Errorf("netfetch: %s: no addresses: %w", host, ErrDenied)
+		return nil, fmt.Errorf("netfetch: %s: no addresses: %w", host, ErrDenied)
 	}
-	for _, a := range addrs {
+	out := make([]netip.Addr, len(addrs))
+	for i, a := range addrs {
 		if !allowedAddr(a, cfg) {
-			return netip.Addr{}, fmt.Errorf("netfetch: %s resolves to denied address %s: %w", host, a, ErrDenied)
+			return nil, fmt.Errorf("netfetch: %s resolves to denied address %s: %w", host, a, ErrDenied)
 		}
+		out[i] = a.Unmap()
 	}
-	return addrs[0].Unmap(), nil
+	return out, nil
+}
+
+// retryableDialErr: hop 루프가 다음 주소로 재시도할지 판단 — 연결 계층 오류(dial·TLS
+// handshake, *net.OpError)만 참. client.Do는 HTTP 응답을 받으면 항상 err=nil이므로, 응답
+// 수신 후 오류(상태코드·본문 등)는 애초에 이 함수의 판정 대상이 되지 않는다.
+func retryableDialErr(err error) bool {
+	var opErr *net.OpError
+	return errors.As(err, &opErr)
 }
 
 // buildTransport: dial은 검증된 pinnedIP:port로만(I4) — Transport가 넘기는 addr은 무시하고
-// closure의 pinnedIP:port를 그대로 재사용(hop마다 Transport 재생성이라 항상 addr과 동일값),
-// hostname 재조회 경로 자체가 없다. TLSClientConfig는 미설정 —
+// closure의 pinnedIP:port를 그대로 재사용(hop의 주소 시도마다 Transport를 새로 만들어 넘기므로
+// 항상 addr과 동일값), hostname 재조회 경로 자체가 없다. TLSClientConfig는 미설정 —
 // net/http가 원 요청 URL의 hostname으로 ServerName을 자동 설정하므로 SNI/인증서 검증은
 // 정규화 hostname 기준으로 유지된다(I5). Proxy: nil로 환경 프록시 무시(I6).
 func buildTransport(pinnedIP netip.Addr, port int) *http.Transport {
 	dialer := &net.Dialer{}
 	return &http.Transport{
 		Proxy:             nil,
-		DisableKeepAlives: true, // hop마다 1회용 Transport — 재사용 없음, 유휴 소켓 잔존 방지.
+		DisableKeepAlives: true, // 주소 시도마다 1회용 Transport — 재사용 없음, 유휴 소켓 잔존 방지.
 		DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
 			return dialer.DialContext(ctx, network, net.JoinHostPort(pinnedIP.String(), strconv.Itoa(port)))
 		},
@@ -255,27 +268,37 @@ func Fetch(ctx context.Context, cfg Config, rawURL string) (Result, error) {
 		if err != nil {
 			return Result{}, err
 		}
-		pinnedIP, err := resolveAndValidate(ctx, u.Hostname(), cfg)
+		addrs, err := resolveAndValidate(ctx, u.Hostname(), cfg)
 		if err != nil {
 			return Result{}, err
 		}
 
-		transport := buildTransport(pinnedIP, port)
-		defer transport.CloseIdleConnections() // hop별 1회용 Transport 정리 — 반환/오류 경로 모두.
-		client := &http.Client{
-			Transport: transport,
-			CheckRedirect: func(req *http.Request, via []*http.Request) error {
-				return http.ErrUseLastResponse // 자동 redirect 비활성 — 아래 수동 루프가 처리(I6).
-			},
-		}
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
-		if err != nil {
-			return Result{}, fmt.Errorf("netfetch: build request: %w", err)
-		}
-		req.Header.Set("User-Agent", defaultUserAgent)
+		// 주소별 시도 — 연결 계층 오류(retryableDialErr)일 때만 다음 주소로 넘어간다.
+		// HTTP 응답을 받은 뒤의 오류는 이 루프에 나타나지 않는다(client.Do가 이미 nil을
+		// 반환했을 것이므로) — 재시도 금지 요구사항은 그 사실만으로 자동 충족된다.
+		var resp *http.Response
+		for i, addr := range addrs {
+			transport := buildTransport(addr, port)
+			defer transport.CloseIdleConnections() // 주소 시도별 1회용 Transport 정리 — 반환/오류 경로 모두.
+			client := &http.Client{
+				Transport: transport,
+				CheckRedirect: func(req *http.Request, via []*http.Request) error {
+					return http.ErrUseLastResponse // 자동 redirect 비활성 — 아래 수동 루프가 처리(I6).
+				},
+			}
+			req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+			if err != nil {
+				return Result{}, fmt.Errorf("netfetch: build request: %w", err)
+			}
+			req.Header.Set("User-Agent", defaultUserAgent)
 
-		resp, err := client.Do(req)
-		if err != nil {
+			resp, err = client.Do(req)
+			if err == nil {
+				break
+			}
+			if i < len(addrs)-1 && retryableDialErr(err) {
+				continue
+			}
 			return Result{}, fmt.Errorf("netfetch: request %s: %w", u.Redacted(), err)
 		}
 
@@ -319,13 +342,14 @@ func Fetch(ctx context.Context, cfg Config, rawURL string) (Result, error) {
 		result := Result{Body: decoded, MediaType: mediaType, FinalURL: current}
 		if mediaType == "text/html" {
 			result.RawHTML = body // 원문 바이트(디코딩 전) 보존 — 재처리/감사용.
-			md, extraction, err := convertToMarkdown(decoded, u)
+			md, extraction, title, err := convertToMarkdown(decoded, u)
 			if err != nil {
 				return Result{}, err
 			}
 			result.Body = md
 			result.Extraction = extraction
 			result.MediaType = "text/markdown"
+			result.Title = title
 		}
 		return result, nil
 	}
@@ -356,19 +380,24 @@ const (
 )
 
 // convertToMarkdown: D12 파이프라인 — readability 추출 → 충실도 판정 → html-to-markdown 변환.
-// pageURL은 readability가 상대 링크를 절대화하는 데 사용.
-func convertToMarkdown(rawHTML []byte, pageURL *url.URL) ([]byte, string, error) {
+// pageURL은 readability가 상대 링크를 절대화하는 데 사용. title은 readability가 추출에
+// 성공하면(fidelityOK 결과와 무관하게) article.Title, 실패하면 "".
+func convertToMarkdown(rawHTML []byte, pageURL *url.URL) ([]byte, string, string, error) {
 	contentHTML := string(rawHTML)
 	extraction := "full"
-	if article, err := readability.FromReader(bytes.NewReader(rawHTML), pageURL); err == nil && fidelityOK(rawHTML, article) {
-		contentHTML = article.Content
-		extraction = "readability"
+	title := ""
+	if article, err := readability.FromReader(bytes.NewReader(rawHTML), pageURL); err == nil {
+		title = article.Title
+		if fidelityOK(rawHTML, article) {
+			contentHTML = article.Content
+			extraction = "readability"
+		}
 	}
 	md, err := htmlToMarkdown(contentHTML)
 	if err != nil {
-		return nil, "", fmt.Errorf("netfetch: html to markdown: %w", err)
+		return nil, "", "", fmt.Errorf("netfetch: html to markdown: %w", err)
 	}
-	return md, extraction, nil
+	return md, extraction, title, nil
 }
 
 // fidelityOK: 설계 §4.5 D12 — 아래 중 하나라도 참이면 false(=full 전환):

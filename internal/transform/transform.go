@@ -235,7 +235,10 @@ func Spawn(ctx context.Context, selfExe string, req Request) (Result, error) {
 
 	cleanup, err := applyMemLimit(cmd, defaultMemLimitBytes)
 	if err != nil {
-		return Result{}, ErrNoIsolation
+		// 원인 보존: sentinel(ErrNoIsolation)로 errors.Is 판정은 유지하면서 applyMemLimit의
+		// 실제 실패 사유(OS API 오류 등)를 메시지에 남긴다 — 이전엔 err을 버려 슬로그로도
+		// 진단이 안 됐다.
+		return Result{}, fmt.Errorf("%w: %v", ErrNoIsolation, err)
 	}
 	defer cleanup()
 

@@ -596,7 +596,7 @@ func TestRunWeb_SnippetRedacted(t *testing.T) {
 	canary := "AKIA" + "NOTAREALKEY01234"
 	body := []byte("hello world token=" + canary + " end of body\n")
 
-	rep, err := RunWeb(context.Background(), st, "http://example.invalid/", nil, body, "text/plain", "")
+	rep, err := RunWeb(context.Background(), st, "http://example.invalid/", nil, body, "text/plain", "", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -605,5 +605,25 @@ func TestRunWeb_SnippetRedacted(t *testing.T) {
 	}
 	if len(rep.Snippet) == 0 || len(rep.Snippet) > 1024 {
 		t.Fatalf("bad snippet length=%d", len(rep.Snippet))
+	}
+}
+
+// TestRunWeb_TitleFillsEmptyChunkTitle: title(netfetch.Result.Title 상당)이 전달되면 헤딩을
+// 못 찾아 Title이 빈 청크의 기본값으로 반영돼야 한다(계획2 §4 이월 (2)).
+func TestRunWeb_TitleFillsEmptyChunkTitle(t *testing.T) {
+	st, _ := openStoreT(t)
+	body := []byte("plain body text with no markdown heading\n")
+
+	rep, err := RunWeb(context.Background(), st, "http://example.invalid/", nil, body, "text/plain", "", "Example Page Title")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var title sql.NullString
+	if err := st.Reader().QueryRow(`SELECT title FROM chunks WHERE artifact_id=? ORDER BY ordinal LIMIT 1`, rep.ArtifactID).Scan(&title); err != nil {
+		t.Fatalf("query chunk title: %v", err)
+	}
+	if !title.Valid || title.String != "Example Page Title" {
+		t.Fatalf("chunk title = %+v, want %q", title, "Example Page Title")
 	}
 }

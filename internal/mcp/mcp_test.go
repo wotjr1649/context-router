@@ -552,6 +552,53 @@ func TestCtrTransformRoundTrip(t *testing.T) {
 	}
 }
 
+// TestCtrTransformConfigTimeout: Config.TransformTimeout이 registerTransform 핸들러에
+// context.WithTimeout으로 실제 적용되는지 확인한다(계획2 §4 이월 (1)). 매우 짧은 타임아웃 +
+// 스텝 소모가 큰 루프 스크립트(TestCtrTransformCapsMapping과 동형 패턴)로 실행하면, worker
+// 프로세스 기동(스텝 예산 500만 도달보다 먼저 걸리는 실측)이 타임아웃에 걸려 kill되어야 한다.
+func TestCtrTransformConfigTimeout(t *testing.T) {
+	dir := t.TempDir()
+	canon, err := ident.Canonicalize(dir)
+	if err != nil {
+		t.Fatalf("canonicalize: %v", err)
+	}
+	st, err := store.Open(t.TempDir(), false)
+	if err != nil {
+		t.Fatalf("store open: %v", err)
+	}
+	t.Cleanup(func() { st.Close() })
+
+	srv, err := NewServer(Config{Canon: canon, Store: st, SelfExe: testSelfExe(t), TransformTimeout: 50 * time.Millisecond})
+	if err != nil {
+		t.Fatalf("new server: %v", err)
+	}
+	srvT, cliT := mcp.NewInMemoryTransports()
+	ctx := context.Background()
+	if _, err := srv.Connect(ctx, srvT, nil); err != nil {
+		t.Fatalf("server connect: %v", err)
+	}
+	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "0"}, nil)
+	cs, err := client.Connect(ctx, cliT, nil)
+	if err != nil {
+		t.Fatalf("client connect: %v", err)
+	}
+	t.Cleanup(func() { cs.Close() })
+
+	res, err := cs.CallTool(ctx, &mcp.CallToolParams{Name: "ctr_transform", Arguments: TransformInput{
+		Script: "def f():\n\tfor i in range(100000000):\n\t\tpass\n\nf()\n",
+	}})
+	if err != nil {
+		t.Fatalf("call: %v", err)
+	}
+	if !res.IsError {
+		t.Fatalf("want IsError=true for timed-out script, got %+v", res)
+	}
+	text := res.Content[0].(*mcp.TextContent).Text
+	if !strings.Contains(text, "worker killed") {
+		t.Fatalf("want worker-killed timeout message, got %q", text)
+	}
+}
+
 // TestCtrTransformCapsMapping: budget/output_limit 초과 스크립트가 각각 BUDGET_EXCEEDED/
 // OUTPUT_LIMIT_EXCEEDED로 매핑돼야 한다(T3 TDD 항목 3).
 func TestCtrTransformCapsMapping(t *testing.T) {
@@ -811,6 +858,11 @@ func TestCtrFetchAndIndexRoundTrip(t *testing.T) {
 	remarshal(t, fetchRes3.StructuredContent, &fetchOut3)
 	if strings.Contains(fetchOut3.Content, secretCanary) {
 		t.Fatalf("fetch leaks secret canary: %q", fetchOut3.Content)
+	}
+	// 이월 검증(계획2 §4 (7)): 웹 경로(extraction!="")로 색인한 artifact는 ctr_fetch에서도
+	// source_coords_exact=false여야 한다(mcp.go sourceCoordsExact 분기 직접 실증).
+	if fetchOut3.SourceCoordsExact {
+		t.Fatalf("want SourceCoordsExact=false for web source (extraction=%q): %+v", fiOut.Extraction, fetchOut3)
 	}
 }
 
