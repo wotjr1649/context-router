@@ -1,0 +1,653 @@
+// Package cli — doctor·upgrade·stats·purge 진입점. 설계서 §7.
+package cli
+
+import (
+	"bufio"
+	"bytes"
+	"context"
+	"database/sql"
+	"encoding/json"
+	"errors"
+	"flag"
+	"fmt"
+	"io"
+	"net/http"
+	"os"
+	"path/filepath"
+	"regexp"
+	"strings"
+	"time"
+
+	"github.com/wotjr1649/context-router/internal/ident"
+	"github.com/wotjr1649/context-router/internal/store"
+)
+
+// releaseURL: 컴파일타임 상수 — upgrade가 응답에서 취하는 것은 tag_name 버전 문자열뿐이다.
+// 응답이 제공하는 URL·명령·기타 필드는 절대 출력하지 않는다(위생, 설계 §7).
+const releaseURL = "https://api.github.com/repos/wotjr1649/context-router/releases/latest"
+
+// Run: cli 서브커맨드 단일 진입점. storeRoot·projectRoot는 main이 이미 결정해 넘긴다(cli는
+// 재도출하지 않는다 — 설계서 §7 Produces). sub은 main이 4개 이름 중 하나임을 이미 확인했다.
+// args는 doctor·upgrade에서 미사용, stats가 --provider 고유 플래그 파싱에 쓴다(전용
+// flag.NewFlagSet, 설계 §7 — main의 serverFlags와 별개). stderr는 아직 어떤 서브커맨드도
+// 쓰지 않는다(의도적 미사용, 시그니처는 4개 서브커맨드 공통).
+func Run(ctx context.Context, sub string, args []string, storeRoot, projectRoot, version string, stdout, stderr io.Writer) error {
+	switch sub {
+	case "doctor":
+		if len(args) > 0 {
+			// 사용자 입력(원시 args)을 오류 문구에 에코하지 않는다 — 개수만(규약 §6, 리뷰
+			// Fix Round 3, item 5).
+			return fmt.Errorf("cli: doctor: 예상치 않은 인자 %d개", len(args))
+		}
+		return runDoctor(ctx, stdout, storeRoot, projectRoot)
+	case "upgrade":
+		if len(args) > 0 {
+			return fmt.Errorf("cli: upgrade: 예상치 않은 인자 %d개", len(args))
+		}
+		client := &http.Client{Timeout: 10 * time.Second}
+		return runUpgrade(stdout, client, releaseURL, version)
+	case "stats":
+		return runStats(ctx, stdout, args, storeRoot, projectRoot)
+	case "purge":
+		// TTY 판정은 여기서만 한다(cli.Run 시그니처는 불변 — confirmPurge는 그 결과값만
+		// 받는 순수 함수, 설계 §7). os.Stdin.Stat() 실패는 TTY 아님으로 취급(비대화형 파이프
+		// 등과 동일하게 --force를 요구).
+		isTTY := false
+		if fi, statErr := os.Stdin.Stat(); statErr == nil {
+			isTTY = fi.Mode()&os.ModeCharDevice != 0
+		}
+		return runPurge(ctx, os.Stdin, stdout, storeRoot, args, isTTY)
+	default:
+		return fmt.Errorf("cli: 미지 서브커맨드: %s", sub)
+	}
+}
+
+// tagNameRe: tag_name 위생 검증(설계 §7) — 영숫자·점·플러스·하이픈만, 1~64자.
+var tagNameRe = regexp.MustCompile(`^v?[0-9A-Za-z.+-]{1,64}$`)
+
+// runUpgrade: releaseURL에 GET → JSON tag_name만 취해 current/latest 두 줄 + 설치 안내
+// 1줄을 출력한다. 응답이 제공하는 다른 필드(URL·명령 등)는 절대 읽지도 출력하지도 않는다
+// (§7 위생). 네트워크 실패·타임아웃·비200·파싱실패·tag_name 위생검증 실패는 전부 동일하게
+// "current만 출력하고 nil 반환"으로 수렴한다 — upgrade는 진단 도구가 아니라 안내 도구이므로
+// 이런 실패를 사용자 오류로 다루지 않는다(정상 종료).
+func runUpgrade(w io.Writer, client *http.Client, releaseURL, current string) error {
+	printCurrent := func() { fmt.Fprintf(w, "current: v%s\n", current) }
+
+	resp, err := client.Get(releaseURL)
+	if err != nil {
+		printCurrent()
+		return nil
+	}
+	defer func() { _ = resp.Body.Close() }() // 응답 다 읽은 뒤 정리 — 실패해도 이미 취할 조치 없음
+	if resp.StatusCode != http.StatusOK {
+		printCurrent()
+		return nil
+	}
+	var body struct {
+		TagName string `json:"tag_name"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil || !tagNameRe.MatchString(body.TagName) {
+		printCurrent()
+		return nil
+	}
+	printCurrent()
+	fmt.Fprintf(w, "latest: %s\n", body.TagName)
+	fmt.Fprintln(w, "install: download from the project releases page and replace the binary")
+	return nil
+}
+
+// runStats: local(ledger.db 집계)과 --provider(transcript JSONL 실측)를 분기한다(설계 §6).
+// 두 경로 모두 토큰·달러 환산과 절약률 주장을 출력하지 않는다(§6 차단 항목 — v0.2 A/B
+// 게이트 전까지) — local은 바이트 집계만, provider는 실측 토큰 합계만 보여준다.
+func runStats(ctx context.Context, w io.Writer, args []string, storeRoot, projectRoot string) error {
+	fs := flag.NewFlagSet("stats", flag.ContinueOnError)
+	provider := fs.String("provider", "", "Claude Code transcript JSONL 경로 — 실측 토큰 합계만 출력")
+	if err := fs.Parse(args); err != nil {
+		return fmt.Errorf("stats: 플래그 파싱 실패: %w", err)
+	}
+	if rest := fs.Args(); len(rest) > 0 {
+		// 위치 인자를 침묵 수용하지 않는다(리뷰 Fix Round 3, item 4) — 개수만 밝힌다(item 5와
+		// 동일 원칙, 사용자 입력 원문 에코 금지).
+		return fmt.Errorf("stats: 예상치 않은 인자 %d개", len(rest))
+	}
+	if *provider != "" {
+		return runStatsProvider(ctx, w, *provider)
+	}
+	return runStatsLocal(w, storeRoot, projectRoot)
+}
+
+// runStatsLocal: 현재 프로젝트(<storeRoot>/projects/<ProjectID>)의 ledger.db를
+// store.LedgerStats로 집계해 tool/calls/bytes_stored/bytes_returned/span(RFC3339) 표를
+// 출력한다. 합계 줄 끝에는 고정 문구 "bytes suppressed (local, 진단용)"를 붙인다 — 토큰·달러
+// 환산이나 절약률 주장은 여기 어디에도 없다(설계 §6).
+func runStatsLocal(w io.Writer, storeRoot, projectRoot string) error {
+	canon, err := ident.Canonicalize(projectRoot)
+	if err != nil {
+		// 원인(err)을 감싸지 않는다 — Canonicalize의 오류는 filepath.Abs/EvalSymlinks발
+		// *fs.PathError라 절대경로를 담고 있다(§12 canary). runDoctor([2] 분기)와 동일하게
+		// 반환 오류에는 경로 없는 정적 메시지만 남긴다(리뷰 Fix Round 2, Critical).
+		return errors.New("stats: 프로젝트 식별 실패")
+	}
+	projDir := filepath.Join(storeRoot, "projects", canon.ProjectID)
+	stats, err := store.LedgerStats(projDir)
+	if err != nil {
+		return fmt.Errorf("stats: ledger 집계 실패: %w", err)
+	}
+
+	fmt.Fprintln(w, "tool\tcalls\tbytes_stored\tbytes_returned\tspan")
+	var totalCalls, totalStored, totalReturned int64
+	for _, s := range stats {
+		span := time.Unix(s.FirstTS, 0).UTC().Format(time.RFC3339) + "~" + time.Unix(s.LastTS, 0).UTC().Format(time.RFC3339)
+		fmt.Fprintf(w, "%s\t%d\t%d\t%d\t%s\n", s.Tool, s.Calls, s.BytesStored, s.BytesReturned, span)
+		totalCalls += s.Calls
+		totalStored += s.BytesStored
+		totalReturned += s.BytesReturned
+	}
+	fmt.Fprintf(w, "total\t%d\t%d\t%d\tbytes suppressed (local, 진단용)\n", totalCalls, totalStored, totalReturned)
+	return nil
+}
+
+// providerUsageLine: Claude Code transcript 한 줄 중 관심 필드만 취한다(그 외 필드는 무시,
+// 설계 §6). Usage가 포인터인 이유는 "message.usage 키 자체가 없는 줄"과 "값이 0인 usage"를
+// 구분해 전자를 skipped로 세기 위해서다.
+type providerUsageLine struct {
+	Message struct {
+		Usage *struct {
+			InputTokens              int64 `json:"input_tokens"`
+			OutputTokens             int64 `json:"output_tokens"`
+			CacheReadInputTokens     int64 `json:"cache_read_input_tokens"`
+			CacheCreationInputTokens int64 `json:"cache_creation_input_tokens"`
+		} `json:"usage"`
+	} `json:"message"`
+}
+
+// maxProviderLine: transcript 한 줄의 상한(설계 §6 — 파일 크기와 무관하게 10MB). 이 상한을
+// 넘는 한 줄은 파싱을 포기하고 드레인만 한다(readTranscriptLine) — bufio.Scanner의 고정
+// 버퍼 방식(예전 구현)은 이 상한을 넘는 줄 하나가 나오면 Scan() 자체가 실패해 그 뒤 정상
+// 줄까지 전부 못 읽고 명령 전체가 중단됐다(리뷰 Fix Round 2, Important-3).
+const maxProviderLine = 10 << 20
+
+// readTranscriptLine: br에서 개행(\n) 단위로 한 줄을 읽는다. 누적 길이가 max를 넘으면 그
+// 순간부터 line을 비우고(메모리에 쌓지 않음) 다음 개행까지 그냥 흘려보낸다(truncated=true로
+// 표시) — 호출자는 그 줄을 skipped로 세고 다음 줄로 진행하면 된다. 마지막 줄(개행 없이
+// EOF)도 처리한다(err=io.EOF와 함께 그때까지 읽은 조각을 반환).
+func readTranscriptLine(br *bufio.Reader, max int) (line []byte, truncated bool, err error) {
+	for {
+		frag, ferr := br.ReadSlice('\n')
+		if !truncated && len(line)+len(frag) > max {
+			truncated = true
+			line = nil
+		}
+		if !truncated {
+			line = append(line, frag...)
+		}
+		switch ferr {
+		case nil:
+			return line, truncated, nil
+		case bufio.ErrBufferFull:
+			continue // 델리미터를 아직 못 찾음(버퍼 한 채가 다 참) — 계속 이어붙이거나 드레인
+		default:
+			return line, truncated, ferr
+		}
+	}
+}
+
+// cancelCheckLines: runStatsProvider가 ctx 취소를 확인하는 주기(줄 수) — 리뷰 Fix Round 3
+// item 7. 매 줄마다 ctx.Err()를 호출하지 않는 이유는 순전히 비용 절감이며(취소는 어차피
+// 사람 타임스케일 이벤트), 상한(maxProviderLine)과 무관하게 파일이 아무리 커도 이 주기마다
+// 반드시 취소를 반영한다.
+const cancelCheckLines = 256
+
+// runStatsProvider: path의 Claude Code transcript JSONL을 한 줄씩 스캔해 message.usage의 4개
+// 토큰 필드를 합산하고 usage 보유 레코드 수를 센다(설계 §6). 파싱 불가 줄·message.usage 없는
+// 줄·maxProviderLine을 넘는 줄은 로그 없이 skipped 카운트만 올린다(마지막 경우는 명령을
+// 중단시키지 않고 계속 진행). 실측 합계만 출력한다 — 절약 주장·비교 문구 없음. ctx가 취소되면
+// (cancelCheckLines줄마다 확인) 그 시점까지 읽은 결과를 버리고 오류로 중단한다 — 아주 큰
+// transcript를 스캔하는 동안 상위 호출자가 취소할 길을 남겨둔다.
+func runStatsProvider(ctx context.Context, w io.Writer, path string) error {
+	f, err := os.Open(path)
+	if err != nil {
+		// *fs.PathError는 경로를 담는다(§12 canary) — errors.Is로 원인 종류만 남기고
+		// 경로는 반환 오류에서 제거한다(리뷰 Fix Round 2, Critical). os.ErrNotExist의
+		// Error() 문구 자체는 정적("file does not exist")이라 경로가 섞이지 않는다.
+		if errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("stats provider: 파일이 없습니다: %w", os.ErrNotExist)
+		}
+		return errors.New("stats provider: 파일 열기 실패")
+	}
+	defer func() { _ = f.Close() }() // 읽기 전용 — 닫기 실패해도 데이터 유실 없음
+
+	var input, output, cacheRead, cacheCreate, records, skipped int64
+	br := bufio.NewReaderSize(f, 64*1024)
+	for lineNo := 0; ; lineNo++ {
+		if lineNo%cancelCheckLines == 0 {
+			if cerr := ctx.Err(); cerr != nil {
+				return fmt.Errorf("stats provider: 취소됨: %w", cerr)
+			}
+		}
+		raw, truncated, ferr := readTranscriptLine(br, maxProviderLine)
+		switch {
+		case truncated:
+			skipped++
+		case len(raw) > 0:
+			var line providerUsageLine
+			if jsonErr := json.Unmarshal(bytes.TrimRight(raw, "\r\n"), &line); jsonErr != nil || line.Message.Usage == nil {
+				skipped++
+			} else {
+				u := line.Message.Usage
+				input += u.InputTokens
+				output += u.OutputTokens
+				cacheRead += u.CacheReadInputTokens
+				cacheCreate += u.CacheCreationInputTokens
+				records++
+			}
+		}
+		if ferr != nil {
+			if errors.Is(ferr, io.EOF) {
+				break
+			}
+			return errors.New("stats provider: 스캔 실패")
+		}
+	}
+
+	fmt.Fprintf(w, "input_tokens: %d\n", input)
+	fmt.Fprintf(w, "output_tokens: %d\n", output)
+	fmt.Fprintf(w, "cache_read_input_tokens: %d\n", cacheRead)
+	fmt.Fprintf(w, "cache_creation_input_tokens: %d\n", cacheCreate)
+	fmt.Fprintf(w, "usage records: %d\n", records)
+	fmt.Fprintf(w, "skipped: %d\n", skipped)
+	return nil
+}
+
+// confirmPurge: 삭제 확인 규칙(설계 §7) — TTY면 expected 슬러그를 보여주고 사용자가 그
+// 슬러그를 그대로 입력해야 nil을 반환한다(정적 "yes" 같은 건 없다 — 그냥 문자열 비교라
+// expected와 다르면 무엇을 입력해도 오류). 비TTY면 force가 없으면 즉시 오류(in을 전혀 읽지
+// 않는다), force가 있으면 즉시 nil(역시 in을 읽지 않는다) — 자동화 경로에서 stdin을 소비하지
+// 않기 위함. 순수 함수(설계 §8 규약) — TTY 판정·os.Stdin 소유는 호출자(Run의 purge 분기) 몫.
+func confirmPurge(in io.Reader, out io.Writer, isTTY bool, force bool, expected string) error {
+	if !isTTY {
+		if !force {
+			return errors.New("purge: 비TTY 환경에서는 --force 없이 진행할 수 없습니다")
+		}
+		return nil
+	}
+	fmt.Fprintf(out, "purge: 삭제 대상을 확인합니다. 계속하려면 다음을 그대로 입력하세요: %s\n> ", expected)
+	sc := bufio.NewScanner(in)
+	if !sc.Scan() {
+		return errors.New("purge: 확인 입력을 읽지 못했습니다 — 삭제하지 않았습니다")
+	}
+	if strings.TrimSpace(sc.Text()) != expected {
+		return errors.New("purge: 확인 슬러그가 일치하지 않습니다 — 삭제하지 않았습니다")
+	}
+	return nil
+}
+
+// purgeProjectID: --project 값(ID 또는 경로)을 ProjectID로 정규화한다. 먼저(리뷰 P2-3,
+// Fix Round 1) 경로 구분자가 없고 <storeRoot>/projects/<entry>가 실재하면 그 자체로 이미
+// store ID이므로 확정하고 경로 해석을 아예 하지 않는다 — 그러지 않으면 cwd에 우연히 동명
+// 디렉터리가 있을 때(예: 현재 작업 디렉터리 하위 우연한 이름 충돌) store ID가 경로로
+// 오인되어 엉뚱한 프로젝트가 가려진다. 그 외에는 기존 로직: 경로 구분자를 포함하거나
+// 실재하는 디렉터리면 경로로 보고 ident.Canonicalize, 그 외는 ID 문자열 그대로 취급한다
+// — main.resolveProjectEntry와 동형(설계 §4.6/§7, D13상 서로 다른 패키지라 자체 인터페이스
+// 없이 각자 소유).
+func purgeProjectID(storeRoot, entry string) (string, error) {
+	hasSep := strings.ContainsAny(entry, `/\`)
+	if !hasSep {
+		if fi, err := os.Stat(filepath.Join(storeRoot, "projects", entry)); err == nil && fi.IsDir() {
+			return entry, nil // 이미 store ID로 확정 — 경로 해석 생략
+		}
+	}
+	looksLikePath := hasSep
+	if !looksLikePath {
+		if fi, err := os.Stat(entry); err == nil && fi.IsDir() {
+			looksLikePath = true
+		}
+	}
+	if !looksLikePath {
+		return entry, nil
+	}
+	canon, err := ident.Canonicalize(entry)
+	if err != nil {
+		return "", err
+	}
+	return canon.ProjectID, nil
+}
+
+// listProjectDirs: <storeRoot>/projects/ 하위 디렉터리 이름(=ProjectID) 목록(--all 대상,
+// 설계 §7). projects/ 자체가 없으면(아무 프로젝트도 색인된 적 없음) 빈 목록+nil.
+func listProjectDirs(storeRoot string) ([]string, error) {
+	entries, err := os.ReadDir(filepath.Join(storeRoot, "projects"))
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, nil
+		}
+		return nil, errors.New("purge: 프로젝트 목록 조회 실패")
+	}
+	var ids []string
+	for _, e := range entries {
+		if e.IsDir() {
+			ids = append(ids, e.Name())
+		}
+	}
+	return ids, nil
+}
+
+// runPurge: purge 서브커맨드(설계 §7). --project/--all 중 정확히 하나. --older-than 지정 시
+// 선택 삭제(store.PurgeOlderThan, chunks/FTS 동기+무결성 확인은 store가 책임), 미지정 시
+// 프로젝트 디렉터리 전체 삭제(os.RemoveAll). --gc가 --older-than 없이 단독으로 주어지면
+// ("GC 단독", 설계 §7) 삭제를 전혀 하지 않고 orphan blob GC만 수행하며 확인을 생략한다 —
+// 고아 blob은 정의상 미참조 데이터라 삭제 확인 규칙(데이터 삭제 대상) 밖이다. 그 외 모든
+// 경로는 삭제 전 confirmPurge로 확인해야 하며, --gc가 --older-than과 함께면 확인 후
+// 삭제→GC 순서로 수행한다.
+func runPurge(ctx context.Context, in io.Reader, w io.Writer, storeRoot string, args []string, isTTY bool) error {
+	fs := flag.NewFlagSet("purge", flag.ContinueOnError)
+	project := fs.String("project", "", "purge 대상 프로젝트(ID 또는 경로)")
+	all := fs.Bool("all", false, "storeRoot 하위 전체 프로젝트 대상")
+	olderThanFlag := fs.String("older-than", "", "time.ParseDuration 형식 — 지정 시 선택 삭제, 미지정 시 전체 삭제")
+	gc := fs.Bool("gc", false, "orphan blob GC 수행")
+	force := fs.Bool("force", false, "비TTY 환경에서 확인을 생략(자동화 전용)")
+	if err := fs.Parse(args); err != nil {
+		return fmt.Errorf("purge: 플래그 파싱 실패: %w", err)
+	}
+	if rest := fs.Args(); len(rest) > 0 {
+		return fmt.Errorf("purge: 예상치 않은 인자 %d개", len(rest))
+	}
+	if (*project != "") == *all {
+		return errors.New("purge: --project와 --all 중 정확히 하나를 지정해야 합니다")
+	}
+
+	var ids []string
+	var expected string
+	if *all {
+		list, err := listProjectDirs(storeRoot)
+		if err != nil {
+			return err
+		}
+		if len(list) == 0 { // 리뷰 P2-2: 빈 --all은 즉시 오류(무엇을 삭제할지 모호한 채로 진행 금지)
+			return errors.New("purge: 대상 프로젝트 없음")
+		}
+		ids = list
+		expected = fmt.Sprintf("all-%d-projects", len(list))
+	} else {
+		id, err := purgeProjectID(storeRoot, *project)
+		if err != nil {
+			return errors.New("purge: 프로젝트 식별 실패")
+		}
+		ids = []string{id}
+		expected = id
+	}
+
+	selective := *olderThanFlag != ""
+	gcOnly := *gc && !selective
+	var cutoffUnix int64
+	if selective {
+		// 리뷰 P2-1: 파싱 실패 오류는 사용자 입력(*olderThanFlag)을 담은 err를 %w로 감싸지
+		// 않는다(정적 메시지만) — 원문 에코 금지. d<=0(음수·0)도 유효한 기간이 아니므로 거부.
+		d, err := time.ParseDuration(*olderThanFlag)
+		if err != nil || d <= 0 {
+			return errors.New("purge: --older-than 값이 유효한 기간이 아님")
+		}
+		cutoffUnix = time.Now().Add(-d).Unix()
+	}
+
+	if !gcOnly { // GC 단독은 데이터 삭제가 아니므로 확인 생략(설계 §7)
+		if err := confirmPurge(in, w, isTTY, *force, expected); err != nil {
+			return err
+		}
+	}
+
+	for _, id := range ids {
+		if err := ctx.Err(); err != nil { // --all 다중 순회 취소 전파
+			return err
+		}
+		projDir := filepath.Join(storeRoot, "projects", id)
+		// 리뷰 P2-2: writable store.Open 전에 대상 존재를 확인한다 — store.Open(dir,false)는
+		// MkdirAll+migrate로 존재하지 않던 프로젝트를 그 자리에서 새로 만들어버리고(phantom
+		// project), 전체 삭제 분기의 os.RemoveAll은 대상이 없어도 조용히 nil을 반환해 오타를
+		// 성공으로 오인시킨다. content.db 존재로 "실재하는 프로젝트"를 판정한다. 이 존재 검사는
+		// --project 단일 대상의 오타 방지용이다 — --all은 이미 listProjectDirs가 실재 목록에서
+		// 뽑은 id를 순회하므로 오타일 수 없다.
+		if _, err := os.Stat(filepath.Join(projDir, "content.db")); err != nil {
+			if !*all {
+				return errors.New("purge: 대상 프로젝트 없음")
+			}
+			// 최종리뷰 F3: lock 타임아웃·migrate 실패·크래시가 artifacts/+lock 파일만 남기고
+			// content.db는 없는 부분 생성 디렉터리를 남길 수 있다(설계 §3.1). --all 순회
+			// 도중 이런 디렉터리를 만나도 배치 전체를 fail-stuck시키지 않는다: 전체삭제
+			// 모드(선택 삭제 아님)면 정리 목적에 부합하게 통째로 지운다. 선택 삭제
+			// (--older-than)는 indexed_at 판단 근거(content.db)가 없어 지울 수 없으므로
+			// skip하고 계속 진행한다 — 나머지 정상 프로젝트가 이 하나 때문에 막히면 안 된다.
+			if selective {
+				fmt.Fprintf(w, "purge: skip %s (content.db 없음)\n", id)
+				continue
+			}
+			if err := os.RemoveAll(projDir); err != nil {
+				return errors.New("purge: 손상된 프로젝트 디렉터리 정리 실패")
+			}
+			continue
+		}
+
+		if gcOnly {
+			st, err := store.Open(projDir, true) // read-only — GC는 DB 쓰기가 없다
+			if err != nil {
+				return err
+			}
+			_, gcErr := st.GCOrphanBlobs(ctx)
+			closeErr := st.Close()
+			if gcErr != nil {
+				return gcErr
+			}
+			if closeErr != nil {
+				return closeErr
+			}
+			continue
+		}
+
+		if !selective { // 전체 삭제
+			if err := os.RemoveAll(projDir); err != nil {
+				return errors.New("purge: 프로젝트 삭제 실패")
+			}
+			continue
+		}
+
+		// 선택 삭제 (+ 후속 --gc)
+		st, err := store.Open(projDir, false)
+		if err != nil {
+			return err
+		}
+		_, _, purgeErr := st.PurgeOlderThan(ctx, cutoffUnix)
+		if purgeErr == nil && *gc {
+			_, purgeErr = st.GCOrphanBlobs(ctx)
+		}
+		closeErr := st.Close()
+		if purgeErr != nil {
+			return purgeErr
+		}
+		if closeErr != nil {
+			return closeErr
+		}
+	}
+	return nil
+}
+
+// probeWritable: dir에 임시 파일을 만들고 즉시 지워 쓰기 가능 여부만 확인한다 — dir 자체를
+// 생성하지 않는다(doctor no-create 원칙).
+func probeWritable(dir string) bool {
+	f, err := os.CreateTemp(dir, ".ctr-doctor-*")
+	if err != nil {
+		return false
+	}
+	name := f.Name()
+	_ = f.Close()       // 프로브 전용 임시파일 — 닫기 실패해도 아래 Remove로 정리 시도는 계속한다
+	_ = os.Remove(name) // best-effort 정리 — 실패해도 쓰기 가능 여부 판정(true)에는 영향 없음
+	return true
+}
+
+// nearestExistingDir: path의 조상 중 실제로 존재하는 가장 가까운 항목을 찾는다. 그 항목이
+// 디렉터리면 (경로, true)를 반환해 store.Open의 MkdirAll(path/artifacts, ...)이 거기서부터
+// 중간 디렉터리를 만들 수 있는지(설계 §3.1) probeWritable로 확인하게 한다. 그 항목이
+// 디렉터리가 아닌 일반 파일이면(즉 os.Stat(path)이 ENOTDIR로 실패할 만큼 중간 조상이
+// 비디렉터리인 경우 포함) (경로, false)를 반환한다 — MkdirAll은 그 비디렉터리 조상을 뚫고
+// 지나갈 수 없어 절대 성공하지 못하므로, 그 이상 위로 계속 올라가 엉뚱한 "쓰기 가능한 먼
+// 조상"을 찾아 성공으로 오판하면 안 된다(최종리뷰 F6 — 예전 구현은 `err == nil &&
+// fi.IsDir()`를 종료 조건으로 삼아 비디렉터리 조상을 그냥 지나쳐버렸다). 딱 한 단계 위가
+// 아니라 실제로 존재하는 가장 가까운 조상까지 오르는 이유는 여러 단계가 한꺼번에
+// 미생성인 신규 배치를 다루기 위해서다(리뷰 Fix Round 3, item 2).
+func nearestExistingDir(path string) (dir string, isDir bool) {
+	dir = path
+	for {
+		if fi, err := os.Stat(dir); err == nil {
+			return dir, fi.IsDir()
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir { // 루트 도달 — 더 못 올라감(사실상 발생하지 않음, 방어적 종료)
+			return dir, false
+		}
+		dir = parent
+	}
+}
+
+// probeFTS5: reader(열려있는 content.db 연결)가 있으면 그 reader로, 없으면(content.db
+// 미존재) :memory: 연결로 fts5 모듈 등록 여부를 순수 SELECT로 확인한다. CREATE VIRTUAL
+// TABLE 방식은 채택하지 않는다 — reader는 store.Open(dir,true)의 mode=ro&
+// _pragma=query_only(ON) 연결이라 TEMP 스키마 생성조차 SQLITE_READONLY로 거부되므로,
+// 이미 초기화된 프로젝트에서 doctor가 항상 fts5 불가로 오판했다(리뷰 발견 버그). 순수
+// SELECT는 read-only 연결에서도 항상 동작한다.
+func probeFTS5(ctx context.Context, reader *sql.DB) error {
+	db := reader
+	if db == nil {
+		var err error
+		db, err = sql.Open("sqlite", ":memory:")
+		if err != nil {
+			return fmt.Errorf("fts5 probe: %w", err)
+		}
+		defer func() { _ = db.Close() }() // :memory: 프로브 전용 — 닫기 실패해도 영향 없음
+	}
+	var count int
+	if err := db.QueryRowContext(ctx, "SELECT count(*) FROM pragma_module_list WHERE name='fts5'").Scan(&count); err != nil {
+		return fmt.Errorf("fts5 probe: %w", err)
+	}
+	if count == 0 {
+		return fmt.Errorf("fts5 probe: 모듈 미등록")
+	}
+	return nil
+}
+
+// hostSnippet: doctor 마지막에 출력하는 호스트 등록 안내(설계 §9) — Claude Code(.mcp.json +
+// permissions ask 규칙)와 Codex(config.toml 기본 3-도구 프로필 + approval prompt 권장).
+const hostSnippet = `--- host adapter snippets (설계 §9) ---
+
+## Claude Code (.mcp.json)
+{
+  "mcpServers": {
+    "ctr": { "command": "context-router", "args": [] },
+    "ctr-global": { "command": "context-router", "args": ["--profile", "global-search", "--projects", "<path-or-id,...>"] }
+  }
+}
+permissions (.claude/settings.json 예시 — ingest/net/global은 기본 ask):
+{
+  "permissions": {
+    "ask": ["mcp__ctr__ctr_index", "mcp__ctr__ctr_fetch_and_index", "mcp__ctr-global__*"]
+  }
+}
+
+## Codex (~/.codex/config.toml)
+[mcp_servers.ctr]
+command = "context-router"
+args = []
+enabled_tools = ["ctr_search", "ctr_fetch", "ctr_transform"]
+# ingest/net 활성화 시 권장: default_tools_approval_mode = "prompt"
+`
+
+// runDoctor: 5항목 진단(저장 루트/프로젝트 식별/content.db/FTS5/ledger.db) + 호스트 등록
+// 스니펫을 w에 출력한다. store를 생성하지 않는다(store.Open(dir, true)만 사용, 설계 §7).
+// 실패 항목이 있으면 error를 반환한다(main이 exit 1) — 반환 오류 메시지에는 절대경로를
+// 담지 않는다(§12 canary), 대신 상세는 w의 진단 본문에 있다.
+func runDoctor(ctx context.Context, w io.Writer, storeRoot, projectRoot string) error {
+	var failed []string
+	fmt.Fprintln(w, "context-router doctor")
+	fmt.Fprintln(w)
+
+	// [1] 저장 루트 존재·쓰기 가능. storeRoot 자체는 절대 만들지 않는다(no-create 원칙) —
+	// 이미 존재하는 디렉터리면 그 자신을, 존재하지 않으면 실제로 존재하는 가장 가까운 조상을
+	// 프로브 대상으로 삼는다(nearestExistingDir, 리뷰 Fix Round 3 item 2). 그 경로에
+	// 디렉터리가 아닌 무언가(일반 파일 등)가 이미 있으면 store.Open의 MkdirAll이 절대
+	// 성공할 수 없으므로 프로브 없이 명시 거부한다.
+	exists := false
+	var writable bool
+	if fi, err := os.Stat(storeRoot); err == nil {
+		exists = true
+		if fi.IsDir() {
+			writable = probeWritable(storeRoot)
+		} // else: 디렉터리가 아닌 기존 경로 — writable은 false로 둔다(명시 거부)
+	} else if nearest, isDir := nearestExistingDir(storeRoot); isDir {
+		writable = probeWritable(nearest)
+	} // else: 비디렉터리 조상이 경로를 막고 있음(F6) — MkdirAll이 절대 성공 못 하므로 writable=false 유지
+	fmt.Fprintf(w, "[1] store-root: exists=%v writable=%v\n", exists, writable)
+	if !writable {
+		failed = append(failed, "store-root")
+	}
+
+	// [2] 프로젝트 식별
+	canon, err := ident.Canonicalize(projectRoot)
+	if err != nil {
+		fmt.Fprintf(w, "[2] project: 식별 실패: %v\n", err)
+		failed = append(failed, "project")
+	} else {
+		fmt.Fprintf(w, "[2] project: ProjectID=%s WorktreeRoot=%s\n", canon.ProjectID, canon.WorktreeRoot)
+	}
+
+	var reader *sql.DB // [3]에서 열린 read-only reader — 성공하면 [4]에서 재사용
+	if canon.ProjectID == "" {
+		fmt.Fprintln(w, "[3] content.db: skip (project 식별 실패)")
+		fmt.Fprintln(w, "[5] ledger.db: skip (project 식별 실패)")
+	} else {
+		projDir := filepath.Join(storeRoot, "projects", canon.ProjectID)
+		dbPath := filepath.Join(projDir, "content.db")
+		if fi, err := os.Stat(dbPath); err != nil || fi.IsDir() {
+			fmt.Fprintln(w, "[3] content.db: not initialized")
+		} else {
+			st, err := store.Open(projDir, true) // read-only — 절대 생성하지 않는다
+			if err != nil {
+				fmt.Fprintf(w, "[3] content.db: open 실패: %v\n", err)
+				failed = append(failed, "content.db")
+			} else {
+				defer func() { _ = st.Close() }() // read-only 진단 프로브 — 닫기 실패해도 영향 없음
+				var userVersion int
+				var quickCheck string
+				uvErr := st.Reader().QueryRowContext(ctx, "PRAGMA user_version").Scan(&userVersion)
+				qcErr := st.Reader().QueryRowContext(ctx, "PRAGMA quick_check").Scan(&quickCheck)
+				if uvErr != nil || qcErr != nil || quickCheck != "ok" {
+					fmt.Fprintf(w, "[3] content.db: quick_check 실패 (user_version=%d quick_check=%q)\n", userVersion, quickCheck)
+					failed = append(failed, "content.db")
+				} else {
+					fmt.Fprintf(w, "[3] content.db: user_version=%d quick_check=ok\n", userVersion)
+					reader = st.Reader()
+				}
+			}
+		}
+
+		// [5] ledger.db 존재 여부(정보성 — 실패로 취급하지 않는다, ledger는 best-effort)
+		ledgerExists := false
+		if fi, err := os.Stat(filepath.Join(projDir, "ledger.db")); err == nil && !fi.IsDir() {
+			ledgerExists = true
+		}
+		fmt.Fprintf(w, "[5] ledger.db: exists=%v\n", ledgerExists)
+	}
+
+	// [4] FTS5 가용성
+	if err := probeFTS5(ctx, reader); err != nil {
+		fmt.Fprintf(w, "[4] fts5: 불가 (%v)\n", err)
+		failed = append(failed, "fts5")
+	} else {
+		fmt.Fprintln(w, "[4] fts5: 가능")
+	}
+
+	fmt.Fprintln(w)
+	fmt.Fprint(w, hostSnippet)
+
+	if len(failed) > 0 {
+		return fmt.Errorf("doctor: 진단 실패 항목 %d개", len(failed))
+	}
+	return nil
+}

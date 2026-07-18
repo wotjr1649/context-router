@@ -9,6 +9,7 @@ import (
 	"io/fs"
 	"log/slog"
 	"slices"
+	"sort"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -23,7 +24,7 @@ import (
 	"github.com/wotjr1649/context-router/internal/transform"
 )
 
-const serverVersion = "0.0.1-dev"
+const serverVersion = "0.0.1"
 
 // Config — Serve/NewServer 입력 (설계 §4, §8).
 type Config struct {
@@ -35,6 +36,10 @@ type Config struct {
 	AllowPaths    []string // 이미 canonicalize된 ctr_index 허용 root (cmd가 검증 — §4.4)
 	NetAllowLocal bool     // --net-allow-local (§4.5, ctr_fetch_and_index)
 	NetPorts      []int    // --net-ports 추가 허용 포트 (§4.5)
+	// TransformTimeout: ctr_transform 핸들러가 Spawn에 씌우는 마감(0이면 NewServer가
+	// 10s로 채운다). transform.go의 defaultWorkerTimeout 안전망(호출자 ctx에 deadline이
+	// 없을 때만 적용)과 별개로, registerTransform은 항상 이 값으로 WithTimeout한다.
+	TransformTimeout time.Duration
 }
 
 // Serve builds the tool server per cfg and runs it over stdio until ctx가 끝나거나
@@ -52,6 +57,9 @@ func NewServer(cfg Config) (*mcp.Server, error) {
 	if cfg.Store == nil {
 		return nil, fmt.Errorf("mcp: nil store")
 	}
+	if cfg.TransformTimeout == 0 {
+		cfg.TransformTimeout = 10 * time.Second
+	}
 	srv := mcp.NewServer(&mcp.Implementation{Name: "context-router", Version: serverVersion}, nil)
 	// 경로 허용(ingest root)·상대화(search/fetch relativize) 기준 = WorktreeRoot — linked git
 	// worktree에서 ProjectRoot(주 checkout)를 쓰면 현재 worktree 파일이 WORKSPACE_VIOLATION이
@@ -63,7 +71,7 @@ func NewServer(cfg Config) (*mcp.Server, error) {
 	if err := transform.ProbeIsolation(cfg.SelfExe); err != nil {
 		slog.Warn("mcp: transform 격리 프로브 실패 — ctr_transform 비활성화", "error", err)
 	} else {
-		registerTransform(srv, cfg.Store, cfg.SelfExe)
+		registerTransform(srv, cfg.Store, cfg.SelfExe, cfg.TransformTimeout)
 	}
 	if slices.Contains(cfg.Enable, "ingest") {
 		registerIndex(srv, cfg.Store, cfg.Canon.WorktreeRoot, cfg.AllowPaths)
@@ -478,13 +486,16 @@ func transformResultErr(res transform.Result) error {
 	return nil
 }
 
-func registerTransform(srv *mcp.Server, st *store.Store, selfExe string) {
+func registerTransform(srv *mcp.Server, st *store.Store, selfExe string, timeout time.Duration) {
 	mcp.AddTool(srv, &mcp.Tool{
 		Name:        "ctr_transform",
 		Description: transformDescription,
 		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true},
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, in TransformInput) (*mcp.CallToolResult, TransformOutput, error) {
 		start := time.Now()
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, timeout)
+		defer cancel()
 		if len(in.Script) > maxTransformScriptBytes {
 			return nil, TransformOutput{}, toolErr(codeInvalidArgument, "script가 상한(64KB)을 초과했습니다")
 		}
@@ -556,7 +567,7 @@ func registerFetchAndIndex(srv *mcp.Server, st *store.Store, allowLocal bool, ex
 		if err != nil {
 			return nil, FetchAndIndexOutput{}, toToolError(err)
 		}
-		rep, err := ingest.RunWeb(ctx, st, res.FinalURL, res.RawHTML, res.Body, res.MediaType, res.Extraction)
+		rep, err := ingest.RunWeb(ctx, st, res.FinalURL, res.RawHTML, res.Body, res.MediaType, res.Extraction, res.Title)
 		if err != nil {
 			return nil, FetchAndIndexOutput{}, toToolError(err)
 		}
@@ -568,4 +579,131 @@ func registerFetchAndIndex(srv *mcp.Server, st *store.Store, allowLocal bool, ex
 		st.LedgerAppend("ctr_fetch_and_index", rep.ByteLength, jsonLen(out), time.Since(start).Milliseconds())
 		return nil, out, nil
 	})
+}
+
+// --- ctr_global_search (설계 §4.6, §5.4, global-search 프로필 전용 등록) ---
+
+// GlobalProject: global-search 프로필이 read-only로 여는 프로젝트 1개. Root가 ""면
+// --projects에 경로가 아닌 ID 문자열을 준 경우다 — search.Query에 projectRoot=""를
+// 넘기므로 Hit.Source가 project-relative화되지 못하고 절대경로로 반환된다(도구
+// 설명에 명시, RelativizeSource 참조).
+type GlobalProject struct {
+	ID    string
+	Root  string
+	Store *store.Store
+}
+
+// GlobalConfig — NewGlobalServer/ServeGlobal 입력. store 열기/닫기는 호출자(cmd) 책임.
+type GlobalConfig struct {
+	Projects []GlobalProject
+}
+
+// globalHit: searchHit + project 라벨(설계 §4.6 "반환에 project 라벨 추가"). wire
+// 타입은 mcp 소유(규약 §3) — search.Hit 등 internal 타입에는 태그를 얹지 않는다.
+type globalHit struct {
+	searchHit
+	Project string `json:"project"`
+}
+
+type globalQueryResult struct {
+	Query     string      `json:"query"`
+	Hits      []globalHit `json:"hits"`
+	Truncated bool        `json:"truncated"`
+}
+
+type GlobalSearchOutput struct {
+	Results   []globalQueryResult `json:"results"`
+	Untrusted bool                `json:"untrusted"`
+}
+
+const globalSearchDescription = "여러 프로젝트 색인을 read-only로 동시 검색해 project 라벨을 붙여 " +
+	"병합 반환한다(BM25+RRF, score는 rank 기반이라 프로젝트 간 직접 비교 가능해 병합 정렬에 " +
+	"쓴다). --projects에 경로 대신 ID 문자열로 지정된 프로젝트는 원본 대조·경로 상대화가 " +
+	"불가해 source가 절대경로로 반환된다."
+
+// mergeGlobalHits: 쿼리별로 모든 프로젝트의 hit에 project 라벨을 붙여 RRF score
+// 내림차순(동점이면 project→artifact_id 오름차순, 결정적)으로 병합하고 limit으로
+// 절단한다. truncated는 어느 한 프로젝트의 search.Query truncated거나 이 병합
+// 절단이 발생하면 true(설계 §4.6 병합 계약).
+func mergeGlobalHits(projects []GlobalProject, perProject [][]search.QueryResult, queries []string, limit int) []globalQueryResult {
+	out := make([]globalQueryResult, len(queries))
+	for qi, q := range queries {
+		var hits []globalHit
+		truncated := false
+		for pi, qrs := range perProject {
+			qr := qrs[qi]
+			truncated = truncated || qr.Truncated
+			for _, h := range qr.Hits {
+				hits = append(hits, globalHit{searchHit: toSearchHit(h), Project: projects[pi].ID})
+			}
+		}
+		sort.SliceStable(hits, func(i, j int) bool {
+			if hits[i].Score != hits[j].Score {
+				return hits[i].Score > hits[j].Score
+			}
+			if hits[i].Project != hits[j].Project {
+				return hits[i].Project < hits[j].Project
+			}
+			return hits[i].ArtifactID < hits[j].ArtifactID
+		})
+		if len(hits) > limit {
+			hits = hits[:limit]
+			truncated = true
+		}
+		out[qi] = globalQueryResult{Query: q, Hits: hits, Truncated: truncated}
+	}
+	return out
+}
+
+func registerGlobalSearch(srv *mcp.Server, projects []GlobalProject) {
+	mcp.AddTool(srv, &mcp.Tool{
+		Name:        "ctr_global_search",
+		Description: globalSearchDescription,
+		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true},
+	}, func(ctx context.Context, _ *mcp.CallToolRequest, in SearchInput) (*mcp.CallToolResult, GlobalSearchOutput, error) {
+		if len(in.Queries) < 1 || len(in.Queries) > 8 {
+			return nil, GlobalSearchOutput{}, toolErr(codeInvalidArgument, "queries는 1~8개여야 합니다")
+		}
+		limit := in.Limit
+		if limit <= 0 {
+			limit = 3
+		} else if limit > 10 {
+			limit = 10
+		}
+		budget := in.MaxReturnBytes
+		if budget <= 0 {
+			budget = 8192
+		}
+		perProject := make([][]search.QueryResult, len(projects))
+		for i, p := range projects {
+			qrs, err := search.Query(ctx, p.Store, p.Root, in.Queries, limit, budget)
+			if err != nil {
+				return nil, GlobalSearchOutput{}, toToolError(err)
+			}
+			perProject[i] = qrs
+		}
+		out := GlobalSearchOutput{Untrusted: true, Results: mergeGlobalHits(projects, perProject, in.Queries, limit)}
+		return nil, out, nil
+	})
+}
+
+// NewGlobalServer builds a global-search-only server: cfg.Projects는 이미 read-only로
+// 연 상태로 받아 ctr_global_search 하나만 등록한다(설계 §4.6 금지 조항 — 다른 도구
+// 절대 미등록).
+func NewGlobalServer(cfg GlobalConfig) (*mcp.Server, error) {
+	if len(cfg.Projects) == 0 {
+		return nil, fmt.Errorf("mcp: global-search에는 최소 1개 프로젝트가 필요합니다")
+	}
+	srv := mcp.NewServer(&mcp.Implementation{Name: "ctr-global", Version: serverVersion}, nil)
+	registerGlobalSearch(srv, cfg.Projects)
+	return srv, nil
+}
+
+// ServeGlobal builds the global-search server and runs it over stdio(Serve와 동형, 설계 §4.6).
+func ServeGlobal(ctx context.Context, cfg GlobalConfig) error {
+	srv, err := NewGlobalServer(cfg)
+	if err != nil {
+		return err
+	}
+	return srv.Run(ctx, &mcp.StdioTransport{})
 }

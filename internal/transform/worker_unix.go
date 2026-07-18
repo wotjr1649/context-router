@@ -61,7 +61,20 @@ func selfApplyMemLimit() error {
 	if err != nil {
 		return fmt.Errorf("transform: CTR_WORKER_MEM 파싱 실패: %w", err)
 	}
-	lim := syscall.Rlimit{Cur: n, Max: n}
+	// hard limit(Max)은 기존 값을 그대로 물려받고 soft limit(Cur)만 낮춘다 — Max를 올리는
+	// setrlimit(2) 호출은 POSIX상 비-superuser에게 EPERM일 수 있다(3-OS CI 최초 실측: macOS
+	// 러너에서 Cur=Max=n으로 둘 다 설정하면 매번 실패해 ctr_transform이 자기격리 못 함으로
+	// 전체 비활성됐다 — darwin RLIMIT_AS 슬롯은 RLIMIT_RSS와 공유돼 Linux의 진짜 가상주소공간
+	// 상한과 기존 hard ceiling 취급이 다르다). 자기 자신에게 상한을 씌우는 목적상 Max는
+	// 건드릴 필요가 없다.
+	var existing syscall.Rlimit
+	if err := syscall.Getrlimit(syscall.RLIMIT_AS, &existing); err != nil {
+		return fmt.Errorf("transform: Getrlimit(RLIMIT_AS) 실패: %w", err)
+	}
+	lim := syscall.Rlimit{Cur: n, Max: existing.Max}
+	if lim.Cur > lim.Max { // 기존 hard limit이 요청값보다 낮으면 그 한도까지만
+		lim.Cur = lim.Max
+	}
 	if err := syscall.Setrlimit(syscall.RLIMIT_AS, &lim); err != nil {
 		return fmt.Errorf("transform: Setrlimit(RLIMIT_AS) 실패: %w", err)
 	}

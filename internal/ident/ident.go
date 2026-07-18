@@ -24,7 +24,14 @@ func Fold(p string) string {
 	if strings.HasPrefix(p, `UNC\`) || strings.HasPrefix(p, `UNC/`) {
 		p = `\\` + p[4:] // (\\?\|//?/)UNC\server\share → \\server\share
 	}
-	p = filepath.ToSlash(p)
+	// 구분자 통일은 windows 전용이다 — unix(darwin 포함)는 `\`가 합법 파일명 바이트라
+	// 무조건 치환하면 "/tmp/work\root" 같은 실재 경로를 "/tmp/work/root"로 오염시켜
+	// 경계 판정·ID 계산이 깨진다(Codex 교차리뷰 P1-1, Fix Round 1 — 3-OS CI 최초 실측
+	// 대응 중 반대로 과도 수정했던 것을 원복). filepath.ToSlash와 동일한 의미론을
+	// 케이스폴드 게이트와 같은 형태의 명시 분기로 재현한다.
+	if runtime.GOOS == "windows" {
+		p = strings.ReplaceAll(p, `\`, "/")
+	}
 	if runtime.GOOS == "windows" || runtime.GOOS == "darwin" {
 		p = strings.ToLower(p)
 	}
@@ -36,7 +43,7 @@ func Canonicalize(root string) (Canon, error) {
 	if err != nil {
 		return Canon{}, fmt.Errorf("canonicalize: %w", err)
 	}
-	real, err := filepath.EvalSymlinks(abs)
+	real, err := RealPath(abs)
 	if err != nil {
 		return Canon{}, fmt.Errorf("canonicalize: %w", err) // 존재하지 않으면 시작 거부 (§2.2)
 	}

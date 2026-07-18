@@ -275,6 +275,7 @@ func tokenPrefix(tok string) string {
 // 케이스폴딩 시 바이트 길이가 바뀌는 룬(U+023A 확장/U+212A 축소 등)에서 오프셋이
 // 어긋나 panic이나 무효 UTF-8을 낼 수 있어, 룬 단위로 직접 비교해 원본 오프셋을
 // 보존한다.
+// 한계: ß→ss 같은 1:N 폴딩은 인덱스 사상이 어긋나 미지원(단순 케이스폴드만) — 설계 유보.
 func foldIndex(text, token string) int {
 	if token == "" {
 		return -1

@@ -1,0 +1,18 @@
+{
+  "note": "Shared query set for gate 1 (oracle equivalence) and gate 2 (retrieval recall). See testdata/oracle/README.md.",
+  "oracle_k": 3,
+  "queries": [
+    "jwt token",
+    "bcrypt password",
+    "cache eviction",
+    "cache ttl",
+    "sliding window",
+    "rate limiter",
+    "connection pool",
+    "graceful shutdown",
+    "cors preflight",
+    "prometheus metrics",
+    "health check",
+    "stack trace"
+  ]
+}

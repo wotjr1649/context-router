@@ -3,7 +3,10 @@ package netfetch
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"errors"
+	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -131,7 +134,7 @@ func TestIsDowngrade(t *testing.T) {
 func TestTransportIgnoresEnvProxyAndHasNoRedirectFollow(t *testing.T) {
 	t.Setenv("HTTP_PROXY", "http://example.invalid:8080")
 	t.Setenv("HTTPS_PROXY", "http://example.invalid:8080")
-	tr := buildTransport(netip.MustParseAddr("127.0.0.1"), 80)
+	tr := buildTransport(netip.MustParseAddr("127.0.0.1"), 80, "example.invalid")
 	if tr.Proxy != nil {
 		t.Fatalf("want Transport.Proxy nil (env proxy ignored), got non-nil")
 	}
@@ -140,7 +143,7 @@ func TestTransportIgnoresEnvProxyAndHasNoRedirectFollow(t *testing.T) {
 // TestBuildTransportDisablesKeepAlives: 일회용 hop마다 새 Transport라 커넥션 재사용이 없다 —
 // keep-alive를 켜두면 유휴 소켓만 남으므로 명시적으로 끈다.
 func TestBuildTransportDisablesKeepAlives(t *testing.T) {
-	tr := buildTransport(netip.MustParseAddr("127.0.0.1"), 80)
+	tr := buildTransport(netip.MustParseAddr("127.0.0.1"), 80, "example.invalid")
 	if !tr.DisableKeepAlives {
 		t.Fatalf("want Transport.DisableKeepAlives = true")
 	}
@@ -374,6 +377,11 @@ func TestFetch_HTML_ArticleProse(t *testing.T) {
 	if res.Extraction != "readability" {
 		t.Fatalf("Extraction = %q, want readability", res.Extraction)
 	}
+	// 계획2 §4 이월 (2): Result.Title은 readability Article.Title에서 온다(text/html 경로).
+	const wantTitle = "The Slow Return of the Analog Notebook"
+	if res.Title != wantTitle {
+		t.Fatalf("Title = %q, want %q", res.Title, wantTitle)
+	}
 }
 
 // TestFetch_HTML_ShortNonArticle: 추출 텍스트 <500자 → full 전환.
@@ -417,5 +425,87 @@ func TestFetch_NonHTML_Passthrough(t *testing.T) {
 	}
 	if res.MediaType != "application/json" {
 		t.Fatalf("MediaType = %q, want application/json", res.MediaType)
+	}
+	if res.Title != "" {
+		t.Fatalf("Title = %q, want empty for non-HTML", res.Title)
+	}
+}
+
+// TestRetryableDialErr: hop 루프가 다음 주소로 재시도할지 판단하는 순수 함수 — 연결 계층
+// 오류(dial·TLS handshake)만 참이어야 한다(계획2 §4 이월 (3), Fix Round 1 리뷰 P2-2로
+// TLS/x509 핸드셰이크 오류류 + ctx 취소/데드라인 우선 판정 케이스 추가).
+func TestRetryableDialErr(t *testing.T) {
+	dialErr := &net.OpError{Op: "dial", Net: "tcp", Err: errors.New("connection refused")}
+	cancelViaOpErr := &net.OpError{Op: "dial", Net: "tcp", Err: context.Canceled}
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"nil", nil, false},
+		{"plain error", errors.New("boom"), false},
+		{"context deadline exceeded", context.DeadlineExceeded, false},
+		{"net.OpError wrapping context.Canceled", cancelViaOpErr, false},
+		{"net.OpError direct", dialErr, true},
+		{"net.OpError wrapped by fmt.Errorf", fmt.Errorf("netfetch: request %s: %w", "http://x", dialErr), true},
+		{"url.Error wrapping net.OpError (client.Do 실반환 형태)", &url.Error{Op: "Get", URL: "http://x", Err: dialErr}, true},
+		{"tls.RecordHeaderError", tls.RecordHeaderError{Msg: "first record does not look like a TLS handshake"}, true},
+		{"tls.AlertError", tls.AlertError(0), true},
+		{"x509.HostnameError", x509.HostnameError{Host: "example.invalid"}, true},
+		{"x509.UnknownAuthorityError", x509.UnknownAuthorityError{}, true},
+		{"x509.CertificateInvalidError", x509.CertificateInvalidError{Reason: x509.Expired}, true},
+		// 최종리뷰 F9: 주소별 예산(perAddrConnTimeout) 초과 — 부모 ctx는 살아있음 — 은
+		// context.DeadlineExceeded보다 최우선으로 재시도 대상이어야 한다(내부 dial 오류
+		// 체인이 우연히 context.DeadlineExceeded도 함께 감싸고 있는 경우 포함).
+		{"errAddrTimeout wrapping context.DeadlineExceeded", fmt.Errorf("%w: %w", errAddrTimeout, context.DeadlineExceeded), true},
+		{"errAddrTimeout alone", errAddrTimeout, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := retryableDialErr(tc.err); got != tc.want {
+				t.Fatalf("retryableDialErr(%v) = %v, want %v", tc.err, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestBuildTransport_PerAddrTimeout: dial+handshake가 주소 1건에 fetch 전체 ctx를 소비하지
+// 않도록 상한이 걸려 있는지 확인한다(Fix Round 1 리뷰 P2-3, 최종리뷰 F9로 DialTLSContext
+// 기반 공유 예산 방식으로 재수정 — TLSHandshakeTimeout 필드는 DialTLSContext가 설정되면
+// net/http가 아예 참조하지 않으므로 더는 이 계약의 증거가 될 수 없다).
+func TestBuildTransport_PerAddrTimeout(t *testing.T) {
+	tr := buildTransport(netip.MustParseAddr("127.0.0.1"), 80, "example.invalid")
+	if tr.DialTLSContext == nil {
+		t.Fatal("DialTLSContext가 설정되지 않음 — dial+TLS 공유 예산(F9) 미적용")
+	}
+	if tr.DialContext == nil {
+		t.Fatal("DialContext가 설정되지 않음 — plain-http 경로도 주소별 예산을 공유해야 함")
+	}
+}
+
+// TestResolveAndValidate_MultiAddress: resolveAndValidate가 (지금은) 전체 검증-통과 주소
+// 목록을 반환하는지, 그리고 "하나라도 거부면 전체 거부" 의미가 여전히 유지되는지 확인한다
+// (계획2 §4 이월 (3) — 실 dial 재시도는 로컬에서 두 주소를 구성하기 어려워 순수 함수
+// 검증으로 대체). localhost는 대개 127.0.0.1/::1 로 로컬 조회되며 실 DNS 왕복이 없다.
+func TestResolveAndValidate_MultiAddress(t *testing.T) {
+	addrs, err := resolveAndValidate(context.Background(), "localhost", Config{AllowLocal: true})
+	if err != nil {
+		t.Fatalf("resolveAndValidate(localhost, AllowLocal=true): %v", err)
+	}
+	if len(addrs) == 0 {
+		t.Fatalf("want at least 1 address, got 0")
+	}
+	for _, a := range addrs {
+		if a != a.Unmap() {
+			t.Fatalf("address not Unmap()ed: %v", a)
+		}
+	}
+
+	// AllowLocal=false면 localhost가 가리키는 loopback 주소는 전부 차단 대상이므로(§ClassifyAddr)
+	// "하나라도 거부면 전체 거부" 의미상 오류가 나야 한다 — 다중 주소 환경에서도 회귀 확인.
+	if _, err := resolveAndValidate(context.Background(), "localhost", Config{}); err == nil {
+		t.Fatalf("want denial for localhost without AllowLocal, got nil error")
+	} else if !errors.Is(err, ErrDenied) {
+		t.Fatalf("want ErrDenied, got %v", err)
 	}
 }

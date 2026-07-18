@@ -1,0 +1,80 @@
+{
+  "generated_by": "testdata/oracle/gen-golden.mjs",
+  "oracle": "ctxscribe / context-mode",
+  "oracle_version": "1.3.0",
+  "k": 3,
+  "corpus_files": [
+    "access.log",
+    "api-reference.md",
+    "architecture.md",
+    "auth_handler.go",
+    "cache.py",
+    "caching.md",
+    "config.json",
+    "db_pool.ts",
+    "deployment.md",
+    "monitoring.md",
+    "rate_limiter.js",
+    "security.md",
+    "server-error.log",
+    "troubleshooting.md"
+  ],
+  "results": {
+    "jwt token": [
+      "security.md",
+      "auth_handler.go",
+      "api-reference.md"
+    ],
+    "bcrypt password": [
+      "auth_handler.go",
+      "security.md",
+      "architecture.md"
+    ],
+    "cache eviction": [
+      "cache.py",
+      "caching.md"
+    ],
+    "cache ttl": [
+      "caching.md",
+      "cache.py",
+      "architecture.md"
+    ],
+    "sliding window": [
+      "rate_limiter.js",
+      "config.json",
+      "architecture.md"
+    ],
+    "rate limiter": [
+      "api-reference.md",
+      "architecture.md",
+      "rate_limiter.js"
+    ],
+    "connection pool": [
+      "troubleshooting.md",
+      "deployment.md",
+      "architecture.md"
+    ],
+    "graceful shutdown": [
+      "deployment.md",
+      "config.json",
+      "db_pool.ts"
+    ],
+    "cors preflight": [
+      "api-reference.md",
+      "security.md"
+    ],
+    "prometheus metrics": [
+      "monitoring.md",
+      "caching.md",
+      "architecture.md"
+    ],
+    "health check": [
+      "monitoring.md",
+      "deployment.md"
+    ],
+    "stack trace": [
+      "troubleshooting.md",
+      "api-reference.md"
+    ]
+  }
+}

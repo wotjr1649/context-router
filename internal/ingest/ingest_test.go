@@ -10,7 +10,9 @@ import (
 	"errors"
 	"flag"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -290,7 +292,7 @@ func TestDeniedFilename(t *testing.T) {
 // 접미 규칙은 base name만 받으면 절대 매치되지 않는다(β1-1 사문화) — collect가
 // base 대신 전체 상대경로도 넘기는지 실증.
 func TestRun_DeniedFilename_SubdirPathSuffix(t *testing.T) {
-	root := t.TempDir()
+	root := realDir(t, t.TempDir())
 	p := filepath.Join(root, "x", ".docker", "config.json")
 	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
 		t.Fatal(err)
@@ -312,7 +314,7 @@ func TestRun_DeniedFilename_SubdirPathSuffix(t *testing.T) {
 // 우회할 수 있었다(β1-1) — collect가 canonicalize된 real 경로도 검사하는지 실증.
 // unix 한정(windows는 심링크 생성 권한 부족 시 skip).
 func TestRun_DeniedFilename_SymlinkBypass(t *testing.T) {
-	root := t.TempDir()
+	root := realDir(t, t.TempDir())
 	if err := os.WriteFile(filepath.Join(root, ".env"), []byte("SECRET=1\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -451,10 +453,29 @@ func openStoreT(t *testing.T) (*store.Store, string) {
 	return st, dir
 }
 
+// realDir: t.TempDir()류 경로를 canonicalPath와 동일 기준(Abs+EvalSymlinks)으로
+// 해석한다. Run의 projectRoot/allowPaths 인자는 이미 canonical하다는 게 계약이다(§2.1
+// 런타임 불변 — 인가 루트는 요청마다 재해석하지 않는다, Codex 교차리뷰 P1-2). 운영
+// 경로는 mcp.go가 ident.Canonicalize(→Fold(EvalSymlinks(...)))로 이렇게 넘기므로,
+// 테스트도 raw t.TempDir()가 아니라 이 함수로 미리 해석한 값을 넘겨야 macOS의
+// `/var`→`/private/var` 같은 심링크에서 Run이 실제 운영 계약과 같은 입력을 받는다.
+func realDir(t *testing.T, p string) string {
+	t.Helper()
+	abs, err := filepath.Abs(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	real, err := filepath.EvalSymlinks(abs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return real
+}
+
 // TestRun_DirectoryPipeline: 임시 프로젝트(일반/비밀포함/denylist/6MB초과/서브디렉터리)를
 // 워크해 Report{Indexed,Skipped}와 store 반영(redaction·src_hash≠content_hash)을 검증.
 func TestRun_DirectoryPipeline(t *testing.T) {
-	root := t.TempDir()
+	root := realDir(t, t.TempDir())
 	st, storeDir := openStoreT(t)
 
 	secretContent := "key=AKIAIOSFODNN7EXAMPLE ok\n"
@@ -525,7 +546,7 @@ func TestRun_DirectoryPipeline(t *testing.T) {
 }
 
 func TestRun_PathEscape_Absolute(t *testing.T) {
-	root := t.TempDir()
+	root := realDir(t, t.TempDir())
 	outside := t.TempDir()
 	outsideFile := filepath.Join(outside, "secret.txt")
 	if err := os.WriteFile(outsideFile, []byte("nope\n"), 0o644); err != nil {
@@ -540,7 +561,7 @@ func TestRun_PathEscape_Absolute(t *testing.T) {
 }
 
 func TestRun_PathEscape_Symlink(t *testing.T) {
-	root := t.TempDir()
+	root := realDir(t, t.TempDir())
 	outside := t.TempDir()
 	outsideFile := filepath.Join(outside, "real.txt")
 	if err := os.WriteFile(outsideFile, []byte("nope\n"), 0o644); err != nil {
@@ -558,8 +579,69 @@ func TestRun_PathEscape_Symlink(t *testing.T) {
 	}
 }
 
+// TestRun_JunctionProjectAllowsLegitimatePath: 최종리뷰 F1(windows 전용) — 프로젝트 루트
+// 자체가 NTFS junction(mklink /J) 경유일 때, junction 안의 정당한 파일 색인이
+// WORKSPACE_VIOLATION으로 오탐되면 안 된다. root(=projectRoot)는 운영 배선과 동일하게
+// ident.Canonicalize(junction).WorktreeRoot를 쓴다(mcp.go가 실제로 이렇게 넘긴다) — 이 값은
+// junction을 이미 실경로로 해석한 상태라, canonicalPath(내부에서 ident.RealPath 사용, F1)가
+// 되돌리는 real과 반드시 같은 문자열이어야 withinAny가 정당 경로를 통과시킨다. F1 수정 전엔
+// canonicalPath가 filepath.EvalSymlinks만 써 junction을 못 풀어 이 테스트가 실패했다.
+func TestRun_JunctionProjectAllowsLegitimatePath(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("NTFS junction은 windows 전용")
+	}
+	target := t.TempDir()
+	junction := filepath.Join(t.TempDir(), "junc-project")
+	if out, err := exec.Command("cmd", "/c", "mklink", "/J", junction, target).CombinedOutput(); err != nil {
+		t.Fatalf("mklink /J: %v: %s", err, out)
+	}
+	canon, err := ident.Canonicalize(junction)
+	if err != nil {
+		t.Fatalf("canonicalize junction: %v", err)
+	}
+	root := canon.WorktreeRoot
+
+	if err := os.WriteFile(filepath.Join(junction, "note.txt"), []byte("hello via junction\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	st, _ := openStoreT(t)
+
+	rep, err := Run(context.Background(), st, root, nil, Request{Path: junction})
+	if err != nil {
+		t.Fatalf("Run: %v (F1 회귀 — junction 경유 프로젝트에서 정당 경로가 WORKSPACE_VIOLATION)", err)
+	}
+	if rep.Indexed != 1 {
+		t.Fatalf("Indexed=%d want 1: skipped=%+v", rep.Indexed, rep.Skipped)
+	}
+}
+
+// TestRun_JunctionEscapesWorkspace: 최종리뷰 F1(windows 전용) — 프로젝트 내부에 있는
+// junction이 프로젝트 밖을 가리키면(TestRun_PathEscape_Symlink의 junction판) 그 경유
+// 색인은 여전히 ErrWorkspace로 거부돼야 한다. F1 수정 전엔 canonicalPath가 junction을 못
+// 풀어(원본 문자열 그대로 root 하위로 보임) 경계 우회가 가능했다.
+func TestRun_JunctionEscapesWorkspace(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("NTFS junction은 windows 전용")
+	}
+	root := realDir(t, t.TempDir())
+	outside := t.TempDir()
+	if err := os.WriteFile(filepath.Join(outside, "secret.txt"), []byte("nope\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	junction := filepath.Join(root, "escape-junc")
+	if out, err := exec.Command("cmd", "/c", "mklink", "/J", junction, outside).CombinedOutput(); err != nil {
+		t.Fatalf("mklink /J: %v: %s", err, out)
+	}
+	st, _ := openStoreT(t)
+
+	_, err := Run(context.Background(), st, root, nil, Request{Path: filepath.Join(junction, "secret.txt")})
+	if !errors.Is(err, ErrWorkspace) {
+		t.Fatalf("err=%v want ErrWorkspace(junction 경유 경계 우회가 차단되지 않음, F1 회귀)", err)
+	}
+}
+
 func TestRun_SingleFile(t *testing.T) {
-	root := t.TempDir()
+	root := realDir(t, t.TempDir())
 	f := filepath.Join(root, "one.md")
 	if err := os.WriteFile(f, []byte("# Solo\nbody\n"), 0o644); err != nil {
 		t.Fatal(err)
@@ -596,7 +678,7 @@ func TestRunWeb_SnippetRedacted(t *testing.T) {
 	canary := "AKIA" + "NOTAREALKEY01234"
 	body := []byte("hello world token=" + canary + " end of body\n")
 
-	rep, err := RunWeb(context.Background(), st, "http://example.invalid/", nil, body, "text/plain", "")
+	rep, err := RunWeb(context.Background(), st, "http://example.invalid/", nil, body, "text/plain", "", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -605,5 +687,81 @@ func TestRunWeb_SnippetRedacted(t *testing.T) {
 	}
 	if len(rep.Snippet) == 0 || len(rep.Snippet) > 1024 {
 		t.Fatalf("bad snippet length=%d", len(rep.Snippet))
+	}
+}
+
+// TestRunWeb_TitleFillsEmptyChunkTitle: title(netfetch.Result.Title 상당)이 전달되면 헤딩을
+// 못 찾아 Title이 빈 청크의 기본값으로 반영돼야 한다(계획2 §4 이월 (2)).
+func TestRunWeb_TitleFillsEmptyChunkTitle(t *testing.T) {
+	st, _ := openStoreT(t)
+	body := []byte("plain body text with no markdown heading\n")
+
+	rep, err := RunWeb(context.Background(), st, "http://example.invalid/", nil, body, "text/plain", "", "Example Page Title")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var title sql.NullString
+	if err := st.Reader().QueryRow(`SELECT title FROM chunks WHERE artifact_id=? ORDER BY ordinal LIMIT 1`, rep.ArtifactID).Scan(&title); err != nil {
+		t.Fatalf("query chunk title: %v", err)
+	}
+	if !title.Valid || title.String != "Example Page Title" {
+		t.Fatalf("chunk title = %+v, want %q", title, "Example Page Title")
+	}
+}
+
+// TestRunWeb_TitleRedacted: title에 secret 캐너리가 있으면 body와 동일하게 Redact가
+// 적용돼 청크 title이 마커로 치환되고 artifacts.redaction="spans"가 반영되며, 검색으로
+// 원문 캐너리가 회수되지 않아야 한다(Fix Round 1 리뷰 P1-1 — §12 canary 계약).
+func TestRunWeb_TitleRedacted(t *testing.T) {
+	st, _ := openStoreT(t)
+	// 런타임 분할 리터럴 — 소스에 연속 secret 토큰 금지(규약 §8).
+	canary := "xox" + "b-1234567890ABCDEF"
+	title := "Leaked token: " + canary
+	body := []byte("plain body text with no markdown heading\n")
+
+	rep, err := RunWeb(context.Background(), st, "http://example.invalid/", nil, body, "text/plain", "", title)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var gotTitle sql.NullString
+	if err := st.Reader().QueryRow(`SELECT title FROM chunks WHERE artifact_id=? ORDER BY ordinal LIMIT 1`, rep.ArtifactID).Scan(&gotTitle); err != nil {
+		t.Fatalf("query chunk title: %v", err)
+	}
+	if strings.Contains(gotTitle.String, canary) {
+		t.Fatalf("chunk title leaks canary: %q", gotTitle.String)
+	}
+	if !strings.Contains(gotTitle.String, "REDACTED") {
+		t.Fatalf("chunk title missing redaction marker: %q", gotTitle.String)
+	}
+
+	var redaction string
+	if err := st.Reader().QueryRow(`SELECT redaction FROM artifacts WHERE id=?`, rep.ArtifactID).Scan(&redaction); err != nil {
+		t.Fatalf("query artifacts.redaction: %v", err)
+	}
+	if redaction != "spans" {
+		t.Fatalf("artifacts.redaction = %q, want spans", redaction)
+	}
+}
+
+// TestRunWeb_TitleCapped: 1MB급 title이 저장 청크 title에 512B 상한으로 절단돼야 한다
+// (Fix Round 1 리뷰 P1-2 — 무제한이면 청크마다·FTS 양쪽에 실체화돼 응답이 증폭된다).
+func TestRunWeb_TitleCapped(t *testing.T) {
+	st, _ := openStoreT(t)
+	bigTitle := strings.Repeat("A", 1<<20) // 1MB
+	body := []byte("plain body text with no markdown heading\n")
+
+	rep, err := RunWeb(context.Background(), st, "http://example.invalid/", nil, body, "text/plain", "", bigTitle)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var gotTitle sql.NullString
+	if err := st.Reader().QueryRow(`SELECT title FROM chunks WHERE artifact_id=? ORDER BY ordinal LIMIT 1`, rep.ArtifactID).Scan(&gotTitle); err != nil {
+		t.Fatalf("query chunk title: %v", err)
+	}
+	if len(gotTitle.String) > maxWebTitleBytes {
+		t.Fatalf("stored title = %d bytes, want <= %d", len(gotTitle.String), maxWebTitleBytes)
 	}
 }

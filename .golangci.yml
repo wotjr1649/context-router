@@ -1,0 +1,23 @@
+version: "2"
+
+run:
+  timeout: 5m
+
+linters:
+  default: standard
+  enable:
+    - misspell
+  exclusions:
+    presets:
+      # 공식 유지보수 프리셋 — Fprintf/Fprintln/Close/Flush/os.Remove(All) 등 "체크해도
+      # 실질 이득이 없는 표준 관용구"를 텍스트 패턴으로 커버한다(3-OS CI lint 최초 실행 실측:
+      # cli.go의 진단 출력 함수들, store.go/netfetch.go/ingest.go의 best-effort defer Close류).
+      - std-error-handling
+    rules:
+      # 테스트 파일의 os.MkdirAll/os.WriteFile/os.Chmod/os.Chdir/(*sql.Row).Scan 같은
+      # 셋업·헬퍼 호출은 실패하면 뒤이은 테스트 본문 자체가 명확한 원인으로 실패한다 —
+      # std-error-handling이 잡지 않는 나머지도 여기서 함께 처리한다(3-OS CI lint 최초 실행
+      # 실측 — errcheck 매 셋업 줄 강제 체크는 안전성 이득 없이 잡음만 늘린다).
+      - path: _test\.go
+        linters:
+          - errcheck

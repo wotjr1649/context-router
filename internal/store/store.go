@@ -34,6 +34,47 @@ type Store struct {
 
 const pragmas = "?_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)&_pragma=busy_timeout(5000)&_pragma=foreign_keys(ON)"
 
+const lockFileName = "content.db.rebuild.lock"
+
+// errLockBusy: tryLockFile(build-tag별 unix/windows 구현)의 논블로킹 시도가 다른 프로세스
+// 보유로 실패했음을 나타내는 내부 신호(lockStore 재시도 대상) — 권한 오류 등 그 외 실패와
+// 구분해 후자는 즉시 반환한다(무한 재시도 방지).
+var errLockBusy = errors.New("store: lock busy")
+
+// lockStore: writable Open()을 프로세스 간 직렬화한다. 신규 DB 최초 WAL 전환 시 SQLite의
+// wal-index recovery 락 경로(WAL_RECOVER_LOCK)는 busy handler를 거치지 않고 SQLITE_BUSY를
+// 즉시 반환한다(SQLite 정본 동작, modernc.org/sqlite v1.54.0 동일 — DSN _pragma 순서는
+// applyQueryParams가 busy_timeout을 자체 우선정렬해 no-op이라 근본 수정이 못 된다). 이
+// 구간은 busy_timeout으로 못 덮으므로 OS advisory lock으로 대신 직렬화한다(설계 §3.5의
+// 배타 잠금 파일 경로를 store 생명주기 잠금으로 재사용). tryLockFile은 unix(flock)/
+// windows(LockFileEx) 각각 store_lock_unix.go/store_lock_windows.go에 구현.
+//
+// 논블로킹 시도를 10→20→40→80→160ms(이후 160ms 유지) 지수 백오프로 재시도하며 총 5초
+// 초과 시 ErrUnavailable로 포기한다(보유 프로세스 hang 시 무한대기 방지). 실패 모드: 보유
+// 프로세스 크래시 → 커널이 잠금 자동 해제(stale lock 없음) / 마이그레이션 중 크래시 →
+// 다음 프로세스가 멱등 스키마 재실행. 잠금 해제 후 파일 자체는 삭제하지 않는다.
+func lockStore(dir string) (func(), error) {
+	path := filepath.Join(dir, lockFileName)
+	deadline := time.Now().Add(5 * time.Second)
+	delay := 10 * time.Millisecond
+	for {
+		release, err := tryLockFile(path)
+		if err == nil {
+			return release, nil
+		}
+		if !errors.Is(err, errLockBusy) {
+			return nil, fmt.Errorf("store open: 잠금 획득 실패: %w", err)
+		}
+		if time.Now().After(deadline) {
+			return nil, fmt.Errorf("store open: 잠금 대기 초과: %w", ErrUnavailable)
+		}
+		time.Sleep(delay)
+		if delay < 160*time.Millisecond {
+			delay *= 2
+		}
+	}
+}
+
 func Open(dir string, readOnly bool) (*Store, error) {
 	if !readOnly {
 		// 0o700: store 루트+artifacts 모두 이 한 호출로 생성(MkdirAll이 만드는 모든 중간
@@ -41,6 +82,12 @@ func Open(dir string, readOnly bool) (*Store, error) {
 		if err := os.MkdirAll(filepath.Join(dir, "artifacts"), 0o700); err != nil {
 			return nil, sanitizeIOErr("open mkdir", err)
 		}
+		// migrate()·ledger.db DDL까지 포함해 Open 반환 시점(defer)까지 보유 — 아래 lockStore 주석 참조.
+		release, err := lockStore(dir)
+		if err != nil {
+			return nil, err
+		}
+		defer release()
 	}
 	dsn := "file:" + filepath.ToSlash(filepath.Join(dir, "content.db")) + pragmas
 	wdsn := dsn
@@ -71,7 +118,9 @@ func Open(dir string, readOnly bool) (*Store, error) {
 		l, err := sql.Open("sqlite", "file:"+filepath.ToSlash(filepath.Join(dir, "ledger.db"))+pragmas)
 		if err == nil {
 			l.SetMaxOpenConns(1)
-			l.Exec(`CREATE TABLE IF NOT EXISTS ledger(
+			// ledger는 best-effort 보조 DB(Store 계약 미포함, Close와 동일 취급) — 테이블 생성
+			// 실패해도 이후 ledger insert들이 그냥 계속 실패할 뿐 Store 본체 동작에는 영향 없다.
+			_, _ = l.Exec(`CREATE TABLE IF NOT EXISTS ledger(
 				id INTEGER PRIMARY KEY, ts INTEGER NOT NULL, tool TEXT NOT NULL,
 				bytes_stored INTEGER NOT NULL DEFAULT 0, bytes_returned INTEGER NOT NULL DEFAULT 0,
 				duration_ms INTEGER NOT NULL DEFAULT 0)`)
@@ -143,7 +192,7 @@ func (s *Store) applySchemaV1() error {
 		return err
 	}
 	if _, err := tx.Exec(schemaV1); err != nil {
-		tx.Rollback()
+		_ = tx.Rollback() // 커밋 전이라 무해 — 원 오류(err)만 반환
 		return err
 	}
 	return tx.Commit()
@@ -301,7 +350,7 @@ func (s *Store) runTx(ctx context.Context, fn func(tx *sql.Tx) error) error {
 		return err
 	}
 	if err := fn(tx); err != nil {
-		tx.Rollback()
+		_ = tx.Rollback() // 커밋 전이라 무해 — 원 오류(err)만 반환
 		return err
 	}
 	return tx.Commit()
@@ -609,6 +658,154 @@ func (s *Store) ReadRange(ctx context.Context, artifactID int64, sel Selector) (
 	return res, nil
 }
 
+// PurgeOlderThan: sources.indexed_at < cutoffUnix인 행을 삭제하고, 그 결과 어떤 source도
+// 참조하지 않게 된 artifacts와 그 chunks를 같은 트랜잭션(txRetry)에서 삭제한다 — chunks를
+// artifacts보다 먼저 명시적으로 지워 AFTER DELETE 트리거가 정상 발화해 FTS를 동기화한다
+// (설계 §7 purge 선택 삭제). 커밋 후 fts_porter/fts_trigram 양쪽에 integrity-check를 실행해
+// 실패하면 오류로 보고한다(게이트 6) — 이 시점에는 이미 커밋된 뒤라 롤백은 없다.
+func (s *Store) PurgeOlderThan(ctx context.Context, cutoffUnix int64) (sources, artifacts int64, err error) {
+	err = s.txRetry(ctx, func(tx *sql.Tx) error {
+		res, txErr := tx.ExecContext(ctx, "DELETE FROM sources WHERE indexed_at < ?", cutoffUnix)
+		if txErr != nil {
+			return txErr
+		}
+		sources, _ = res.RowsAffected()
+		if _, txErr = tx.ExecContext(ctx, `DELETE FROM chunks WHERE artifact_id IN
+			(SELECT id FROM artifacts WHERE id NOT IN (SELECT artifact_id FROM sources))`); txErr != nil {
+			return txErr
+		}
+		res, txErr = tx.ExecContext(ctx, `DELETE FROM artifacts WHERE id NOT IN (SELECT artifact_id FROM sources)`)
+		if txErr != nil {
+			return txErr
+		}
+		artifacts, _ = res.RowsAffected()
+		return nil
+	})
+	if err != nil {
+		return 0, 0, err
+	}
+	if err := s.checkFTSIntegrity(ctx); err != nil {
+		return sources, artifacts, err
+	}
+	return sources, artifacts, nil
+}
+
+// checkFTSIntegrity: fts_porter/fts_trigram 양쪽에 SQLite FTS5 integrity-check 특수 명령을
+// 실행한다(게이트 6) — chunks와 FTS 인덱스가 어긋나면 실패한다. rank=1을 넘긴다(최종리뷰
+// F7) — rank 생략(=0)은 FTS5 내부 구조만 자기검사하고 external-content table(chunks)과의
+// 대조는 하지 않는다. rank가 0이 아니면 SQLite가 그 대조까지 수행해 chunks↔인덱스 행/토큰
+// 드리프트(예: 트리거 누락으로 인덱스만 갱신 안 된 경우)도 잡아낸다.
+func (s *Store) checkFTSIntegrity(ctx context.Context) error {
+	for _, fts := range [2]string{"fts_porter", "fts_trigram"} {
+		if _, err := s.writer.ExecContext(ctx, "INSERT INTO "+fts+"("+fts+", rank) VALUES('integrity-check', 1)"); err != nil {
+			return fmt.Errorf("store: %s integrity-check 실패: %w", fts, err)
+		}
+	}
+	return nil
+}
+
+// hashesFromQuery: query가 반환하는 문자열 컬럼 1개를 집합으로 모은다(GCOrphanBlobs 전용
+// 소소한 헬퍼 — content_hash/raw_blob_hash 두 조회에 재사용).
+func hashesFromQuery(ctx context.Context, db *sql.DB, query string) (map[string]bool, error) {
+	rows, err := db.QueryContext(ctx, query)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	set := map[string]bool{}
+	for rows.Next() {
+		var h string
+		if err := rows.Scan(&h); err != nil {
+			return nil, err
+		}
+		set[h] = true
+	}
+	return set, rows.Err()
+}
+
+// gcOrphanMinAge: blob 배치→커밋 윈도 보호 — Register는 blob을 DB 커밋 이전에 배치한다
+// (§3.5 원자성 계약). 동시 GC가 "DB 참조 없음+파일 존재"인 등록 진행 중 blob을 고아로
+// 오판해 지우면 커밋 후 DB가 없는 blob을 가리키게 되어 저장소가 손상된다. mtime이 이보다
+// 최근인 파일은 삭제 후보에서 제외한다(git prune --expire 선례와 동일한 발상) — 크래시로
+// 남은 진짜 고아는 다음 GC 실행에서(이 유예 기간이 지난 뒤) 수거된다.
+const gcOrphanMinAge = time.Hour
+
+// GCOrphanBlobs: artifacts/ 아래 blob 파일 중 artifacts.content_hash에도 sources.raw_blob_hash
+// (NULL 아닌 것)에도 없는 해시만 삭제한다(계획2 이월 "과거 raw blob 물리 GC" 해소, 설계 §7).
+// reader로 참조 해시 집합을 모은 뒤 os.ReadDir(artifacts/<prefix>/)로 대조한다. 파일명 길이가
+// sha256 hex(64자)가 아니면 blob이 아니라 writeBlob의 임시파일(hash.tmp.pid.seq)이므로 건드리지
+// 않는다. mtime이 gcOrphanMinAge보다 최근인 미참조 파일은 건너뛴다(위 불변식 참조).
+//
+// 삭제 수행 전 lockStore(s.dir)를 획득한다(최종리뷰 F2) — age gate(1h)는 크래시로 남은 고아를
+// 늦게 수거할 뿐, Register가 blob을 배치(writeBlob)하고 커밋하는 그 짧은 창과 GC가 우연히
+// 겹치는 경우까지는 못 막는다: GC가 "DB 참조 없음"으로 읽은 직후 Register가 커밋해버리면 GC는
+// 방금 참조된 blob을 여전히 고아로 보고 지울 수 있어(파일 삭제는 트랜잭션 밖) DB가 없는 blob을
+// 가리키는 손상이 생긴다. Register 자체의 쓰기 트랜잭션은 writer 직렬화(SetMaxOpenConns(1))로
+// 보호되지만 blob 물리 삭제는 그 보호 밖이므로, GC와 blob 배치를 같은 프로세스간 잠금
+// (lockStore)으로 직렬화하는 것이 근본 폐쇄다. age gate는 이중방어로 그대로 유지한다.
+func (s *Store) GCOrphanBlobs(ctx context.Context) (removed int64, err error) {
+	release, err := lockStore(s.dir)
+	if err != nil {
+		return 0, fmt.Errorf("store GCOrphanBlobs: %w", err)
+	}
+	defer release()
+
+	referenced, err := hashesFromQuery(ctx, s.reader, "SELECT content_hash FROM artifacts")
+	if err != nil {
+		return 0, fmt.Errorf("store GCOrphanBlobs: %w", err)
+	}
+	rawReferenced, err := hashesFromQuery(ctx, s.reader, "SELECT raw_blob_hash FROM sources WHERE raw_blob_hash IS NOT NULL")
+	if err != nil {
+		return 0, fmt.Errorf("store GCOrphanBlobs: %w", err)
+	}
+	for h := range rawReferenced {
+		referenced[h] = true
+	}
+
+	blobRoot := filepath.Join(s.dir, "artifacts")
+	prefixes, err := os.ReadDir(blobRoot)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return 0, nil
+		}
+		return 0, sanitizeIOErr("gc readdir", err)
+	}
+	for _, p := range prefixes {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return removed, ctxErr
+		}
+		if !p.IsDir() {
+			continue
+		}
+		dir := filepath.Join(blobRoot, p.Name())
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			return removed, sanitizeIOErr("gc readdir", err)
+		}
+		for _, e := range entries {
+			hash := e.Name()
+			if len(hash) != 64 || referenced[hash] {
+				continue
+			}
+			info, err := e.Info()
+			if err != nil {
+				if errors.Is(err, os.ErrNotExist) { // 대조 시점 사이 이미 사라짐 — 정상
+					continue
+				}
+				return removed, sanitizeIOErr("gc stat", err)
+			}
+			if time.Since(info.ModTime()) < gcOrphanMinAge {
+				continue // age gate: 등록 진행 중일 수 있음(§3.5) — 다음 GC로 미룬다
+			}
+			if err := os.Remove(filepath.Join(dir, hash)); err != nil {
+				return removed, sanitizeIOErr("gc remove", err)
+			}
+			removed++
+		}
+	}
+	return removed, nil
+}
+
 // LedgerAppend: best-effort 사용량 기록 — ledger 없음/오류는 무시(§3.5).
 func (s *Store) LedgerAppend(tool string, stored, returned, ms int64) {
 	if s.ledger == nil {
@@ -616,4 +813,53 @@ func (s *Store) LedgerAppend(tool string, stored, returned, ms int64) {
 	}
 	_, _ = s.ledger.Exec(`INSERT INTO ledger(ts,tool,bytes_stored,bytes_returned,duration_ms) VALUES(?,?,?,?,?)`,
 		time.Now().Unix(), tool, stored, returned, ms)
+}
+
+// ToolStat: ledger.db 도구별 집계 1행(설계 §6 stats local 계약). FirstTS/LastTS는
+// LedgerAppend가 기록하는 unix 초 단위(time.Now().Unix())다.
+type ToolStat struct {
+	Tool                       string
+	Calls                      int64
+	BytesStored, BytesReturned int64
+	FirstTS, LastTS            int64
+}
+
+// LedgerStats: dir/ledger.db를 read-only로 열어 도구별 사용량을 집계한 뒤 닫는다(설계 §6). ledger.db
+// 미존재(os.ErrNotExist — io/fs.ErrNotExist와 동일값)는 오류가 아니다 — LedgerAppend와 동일하게
+// ledger를 best-effort 보조 산출물로 취급해 빈 슬라이스+nil을 반환한다(os.Stat 선판정, 없는
+// 파일을 sql.Open이 새로 만들지 않도록). 그 외 os.Stat 오류(권한 등)는 진짜 문제이므로 삼키지
+// 않고 반환한다 — sanitizeIOErr로 절대경로는 벗기고 원인만 남긴다(리뷰 Fix Round 3, item 3).
+func LedgerStats(dir string) ([]ToolStat, error) {
+	path := filepath.Join(dir, "ledger.db")
+	if _, err := os.Stat(path); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, nil
+		}
+		return nil, sanitizeIOErr("ledger stat", err)
+	}
+	db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(path)+"?mode=ro&_pragma=busy_timeout(5000)")
+	if err != nil {
+		return nil, fmt.Errorf("store LedgerStats: %w", err)
+	}
+	defer db.Close()
+
+	rows, err := db.Query(`SELECT tool, COUNT(*), SUM(bytes_stored), SUM(bytes_returned), MIN(ts), MAX(ts)
+		FROM ledger GROUP BY tool ORDER BY tool`)
+	if err != nil {
+		return nil, fmt.Errorf("store LedgerStats: %w", err)
+	}
+	defer rows.Close()
+
+	var out []ToolStat
+	for rows.Next() {
+		var st ToolStat
+		if err := rows.Scan(&st.Tool, &st.Calls, &st.BytesStored, &st.BytesReturned, &st.FirstTS, &st.LastTS); err != nil {
+			return nil, fmt.Errorf("store LedgerStats: %w", err)
+		}
+		out = append(out, st)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("store LedgerStats: %w", err)
+	}
+	return out, nil
 }

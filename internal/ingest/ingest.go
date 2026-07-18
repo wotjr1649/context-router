@@ -375,13 +375,19 @@ func isBinary(b []byte) bool {
 	return !utf8.Valid(b)
 }
 
-// canonicalPath resolves p to its absolute, symlink-free real path(원본 케이스 유지).
+// canonicalPath resolves p to its absolute, symlink/junction-free real path(원본 케이스
+// 유지). ident.RealPath를 쓴다(단순 filepath.EvalSymlinks가 아님) — windows에서
+// EvalSymlinks는 NTFS junction을 인식 못 해, 여기서만 미해석 채로 두면 ident.Canonicalize가
+// 계산한 projectRoot(§4.4 경계 기준)와 이 함수의 real이 junction 경유 경로에서 서로 다른
+// 문자열이 돼 정당한 경로를 WORKSPACE_VIOLATION으로 오판하거나(경로 별칭 불일치), 반대로
+// 프로젝트 내부의 junction이 밖을 가리킬 때 경계 우회를 허용해버린다(최종리뷰 F1 — ident가
+// 진실의 원천, 전 소비처가 동일 함수를 공유해야 한다).
 func canonicalPath(p string) (string, error) {
 	abs, err := filepath.Abs(p)
 	if err != nil {
 		return "", fmt.Errorf("ingest: canonicalize: %w", err)
 	}
-	real, err := filepath.EvalSymlinks(abs)
+	real, err := ident.RealPath(abs)
 	if err != nil {
 		return "", fmt.Errorf("ingest: canonicalize: %w", err)
 	}
@@ -391,7 +397,9 @@ func canonicalPath(p string) (string, error) {
 // canonicalUnchanged reports whether path(collect 시점 canonical 값)가 지금도
 // 자기 자신으로 canonicalize되는지 — TOCTOU 완화(실용판): 읽기 완료 후 그 자리가
 // 다른 곳으로 재링크되지 않았는지 확인한다.
-// ponytail: TOCTOU 완화 — 완전판(openat2/GetFinalPathNameByHandle)은 계획 3.
+// ponytail: TOCTOU 완화 — 완전판(openat2 등 커널 수준 원자적 open+검증)은 v0.0.1 이후(§14)
+// 이월. junction realpath 해석(ident.RealPath/GetFinalPathNameByHandle)은 계획 3에서 이미
+// 반영됨(최종리뷰 F1) — 이월 대상은 openat2뿐이다.
 func canonicalUnchanged(path string) bool {
 	real, err := canonicalPath(path)
 	return err == nil && real == path
@@ -693,6 +701,14 @@ func Run(ctx context.Context, st *store.Store, projectRoot string, allowPaths []
 	if err != nil {
 		return Report{}, err
 	}
+	// projectRoot/allowPaths는 이미 canonical하다는 게 계약이다(§2.1 런타임 불변 — 인가
+	// 루트는 시작 시 고정, 요청마다 재해석하지 않는다). 운영 호출부(mcp.registerIndex)는
+	// ident.Canonicalize(WorktreeRoot)·canonicalizeAllowPaths 결과를 넘긴다. 요청마다
+	// Abs+EvalSymlinks로 재해석하면 사후 심링크 스왑 공격에 열린다 — 허용 디렉터리를
+	// rename 후 /secret 심링크로 교체하면 재해석 시 루트·요청 둘 다 /secret으로 풀려
+	// "인가됨"이 되고(고정 루트였다면 거부), 무관한 allow 루트 하나가 삭제되면 재해석
+	// 실패로 요청 전체가 마비된다(Codex 교차리뷰 P1-2). 테스트는 realDir 헬퍼로 미리
+	// 해석한 값을 넘겨 이 계약을 스스로 지킨다.
 	foldedRoots := make([]string, 0, 1+len(allowPaths))
 	foldedRoots = append(foldedRoots, ident.Fold(projectRoot))
 	for _, p := range allowPaths {
@@ -755,13 +771,41 @@ func webSnippet(stored []byte) string {
 	return string(stored[:n])
 }
 
+// maxWebTitleBytes: 청크 title은 매 청크 행 + fts_porter/fts_trigram 양쪽에 그대로
+// 실체화된다 — title이 무제한이면(예: 수 MB <title>) 다중 청크 문서에서 응답 크기가 크게
+// 증폭될 수 있어(리뷰 Fix Round 1 P1-2) 512B로 상한한다. redaction 이후에 적용(자르는
+// 위치가 redact 대상 secret 중간을 가르지 않도록).
+const maxWebTitleBytes = 512
+
+// capTitleBytes: b를 최대 n바이트로 자르되 UTF-8 룬 경계에서 멈춘다(webSnippet과 동형 판정,
+// 이 파일 안에서만 쓰여 별도 공용 헬퍼로 뽑지 않는다).
+func capTitleBytes(b []byte, n int) []byte {
+	if len(b) <= n {
+		return b
+	}
+	for n > 0 && !utf8.RuneStart(b[n]) {
+		n--
+	}
+	return b[:n]
+}
+
 // RunWeb ingests an already-fetched web page through the §3.0 pipeline
 // (redact→store→chunk). ingest는 net/http를 import하지 않는다 — fetch↔ingest 배선은
 // 호출자(mcp 핸들러) 책임이라(규약 §2: netfetch leaf, mcp만 import) netfetch.Result가
 // 아닌 원시 인자를 받는다. rawHTML/body/mediaType/extraction은 netfetch.Fetch 결과 그대로:
 // html이면 rawHTML=원문·body=변환된 markdown, 그 외 미디어는 rawHTML 미설정·body=원문.
 // src_hash는 설계 §4.5대로 "원문" 기준 — html은 rawHTML, 그 외는 body(=원문)로 계산한다.
-func RunWeb(ctx context.Context, st *store.Store, url string, rawHTML, body []byte, mediaType, extraction string) (WebReport, error) {
+// 주의: non-html의 src_hash는 원본 바이트가 아니라 디코딩 후(post-decode, netfetch가
+// charset 변환을 마친) 바이트 기준이다 — body가 그 상태로 전달되기 때문.
+// title(netfetch.Result.Title, readability Article.Title)은 헤딩을 못 찾아 Title이 빈
+// 청크의 기본값으로 쓰인다(빈 문자열이면 미적용 — 청크는 그대로 빈 Title 유지). title도
+// body와 동일하게 Redact를 거친 뒤(리뷰 P1-1 — 안 거치면 <title>의 secret이 청크/FTS로
+// 그대로 노출된다) maxWebTitleBytes로 절단해 청크에 반영한다.
+// 알려진 한계(리뷰 P2-1, v0.1 이월): title은 artifact 단위가 아니라 청크 행에 실체화되므로,
+// 동일 본문(src_hash)이 재색인되면 Register가 청크 삽입 자체를 생략해 새 title이 반영되지
+// 않고 기존 값이 유지된다 — source-단위 title 컬럼으로 옮기기 전까지는 스키마 변경 없이
+// 근본 수정이 불가능하다.
+func RunWeb(ctx context.Context, st *store.Store, url string, rawHTML, body []byte, mediaType, extraction, title string) (WebReport, error) {
 	if err := ctx.Err(); err != nil {
 		return WebReport{}, err
 	}
@@ -771,12 +815,21 @@ func RunWeb(ctx context.Context, st *store.Store, url string, rawHTML, body []by
 	}
 	sum := sha256.Sum256(srcBytes)
 	srcHash := hex.EncodeToString(sum[:])
-	stored, spans := Redact(body)
+	stored, bodySpans := Redact(body)
+	redactedTitle, titleSpans := Redact([]byte(title))
+	safeTitle := capTitleBytes(redactedTitle, maxWebTitleBytes)
 	redaction := "none"
-	if spans > 0 {
+	if bodySpans+titleSpans > 0 {
 		redaction = "spans"
 	}
 	chunks := ChunkText(string(stored), mediaType == "text/markdown")
+	if len(safeTitle) > 0 {
+		for i := range chunks {
+			if chunks[i].Title == "" {
+				chunks[i].Title = string(safeTitle)
+			}
+		}
+	}
 	artID, err := st.Register(ctx, store.Registration{
 		StoredBytes: stored,
 		MediaType:   mediaType,

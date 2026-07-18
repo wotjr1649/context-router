@@ -1,12 +1,15 @@
 package mcp
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"io/fs"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -14,6 +17,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -160,6 +164,18 @@ func newTestServer(t *testing.T, enable []string) (*mcp.ClientSession, ident.Can
 	return cs, canon
 }
 
+// skipDarwinNoIsolation: transform 패키지와 동일 원인(3-OS CI 최초 실행 — darwin에서
+// RLIMIT_AS self-apply가 항상 실패, internal/transform/worker_test.go의 동명 헬퍼 참조)이
+// 여기서는 ctr_transform 도구 자체가 미등록되는 형태로 나타난다(NewServer가
+// transform.ProbeIsolation 실패 시 등록을 건너뛴다 — in-process fallback 금지, 설계
+// §4.3/§5.3). 이 도구 전용 테스트는 도구가 없으면 검증할 대상이 없다.
+func skipDarwinNoIsolation(t *testing.T) {
+	t.Helper()
+	if runtime.GOOS == "darwin" {
+		t.Skip("darwin: ctr_transform이 RLIMIT_AS self-apply 실패로 미등록 — 백로그: darwin 메모리 격리 전략 재설계")
+	}
+}
+
 func TestNewServerProfileGating(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -172,6 +188,13 @@ func TestNewServerProfileGating(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			want := tt.want
+			if runtime.GOOS == "darwin" {
+				// darwin: RLIMIT_AS self-apply가 항상 실패해 ctr_transform이 미등록된다
+				// (skipDarwinNoIsolation 주석 참조) — 이 서브테스트가 검증하는 프로필별
+				// ingest/net 게이팅 자체는 darwin에서도 유효하니 그 부분은 계속 확인한다.
+				want = slices.DeleteFunc(slices.Clone(tt.want), func(s string) bool { return s == "ctr_transform" })
+			}
 			cs, _ := newTestServer(t, tt.enable)
 			lt, err := cs.ListTools(context.Background(), nil)
 			if err != nil {
@@ -182,10 +205,38 @@ func TestNewServerProfileGating(t *testing.T) {
 				got[i] = tl.Name
 			}
 			sort.Strings(got)
-			if strings.Join(got, ",") != strings.Join(tt.want, ",") {
-				t.Fatalf("tools=%v want %v", got, tt.want)
+			if strings.Join(got, ",") != strings.Join(want, ",") {
+				t.Fatalf("tools=%v want %v", got, want)
 			}
 		})
+	}
+}
+
+// maxToolSchemaBytes: 게이트 11(스키마 토큰 예산, 설계 §2.3) — NewServer 기본 프로필
+// (ProbeIsolation 성공 환경의 3-도구: ctr_search/ctr_fetch/ctr_transform)의 tools/list 결과
+// JSON 직렬화 바이트 상한. 최초 실측값 4359B × 1.2 = 5230.8 → 반올림 5231로 고정한 값 —
+// 회귀(설명 문구 비대화 등) 조기 감지용 상한이지 정밀 예산이 아니다. 실측값·근거는
+// docs/gates-v0.0.1-ko.md 게이트 11 항목 참조.
+const maxToolSchemaBytes = 5231
+
+// TestSchemaTokenBudget: tools/list 결과(ListToolsResult 전체 — 실제 클라이언트가 받는
+// JSON 그대로) 직렬화 바이트가 maxToolSchemaBytes를 넘지 않는지 확인한다(게이트 11). 근사
+// 토큰 수 = bytes/4는 로그로만 남긴다 — Claude 정확 tokenizer는 비공개라 근사치일 뿐이고,
+// 실질 게이트는 바이트 상한 쪽이다.
+func TestSchemaTokenBudget(t *testing.T) {
+	cs, _ := newTestServer(t, nil) // Enable 없음 — 기본 프로필(ProbeIsolation 성공 시 3-도구)
+	lt, err := cs.ListTools(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("list tools: %v", err)
+	}
+	b, err := json.Marshal(lt)
+	if err != nil {
+		t.Fatalf("marshal tools/list result: %v", err)
+	}
+	approxTokens := len(b) / 4 // 근사치(bytes/4) — 정확 tokenizer 비공개, 주석 참조.
+	t.Logf("tools/list schema: %d bytes (~%d tokens approx, %d tools)", len(b), approxTokens, len(lt.Tools))
+	if len(b) > maxToolSchemaBytes {
+		t.Fatalf("tools/list schema=%d bytes exceeds budget %d bytes (게이트 11, 설계 §2.3)", len(b), maxToolSchemaBytes)
 	}
 }
 
@@ -337,6 +388,131 @@ func TestServeStdoutPurity(t *testing.T) {
 	}
 	if len(data) != 0 {
 		t.Fatalf("stdout polluted: %q (serve err=%v)", data, serveErr)
+	}
+}
+
+// TestServeStdoutPurityDuringErroringToolCall: Task 8 최종리뷰 minor "stdout purity 테스트
+// narrow(툴콜 중 오염 미검)" 해소(계획 3 게이트 10) — 위 TestServeStdoutPurity는 stdin을 즉시
+// 닫아 실제 툴콜이 한 번도 실행되지 않는다. 여기서는 실제 initialize→tools/call 왕복 도중
+// 핸들러가 진짜 오류를 내며(store를 미리 Close — mock이 아니라 실 리소스의 실 종료 상태)
+// db.QueryContext가 반환하는 오류가 toToolError의 어떤 sentinel에도 매칭되지 않아 default
+// 분기(codeInternal)로 떨어져 slog.Error가 stderr에 기록되는 바로 그 순간에도 stdout에는
+// 개행 구분 JSON-RPC 응답만 나오는지 확인한다(§5.5).
+func TestServeStdoutPurityDuringErroringToolCall(t *testing.T) {
+	dir := t.TempDir()
+	canon, err := ident.Canonicalize(dir)
+	if err != nil {
+		t.Fatalf("canonicalize: %v", err)
+	}
+	st, err := store.Open(t.TempDir(), false)
+	if err != nil {
+		t.Fatalf("store open: %v", err)
+	}
+	st.Close() // 의도적: 이후 모든 쿼리가 실 오류("database is closed" 부류)로 실패한다.
+
+	// slog 기본 핸들러는 os.Stderr *값을 생성 시점에 캡처*하므로(main.go의 run()이 동일
+	// 이유로 slog.SetDefault(stderr)를 명시 호출한다) 아래 os.Stdout 스와핑과 달리 전역
+	// os.Stderr 재대입만으로는 캡처되지 않는다 — 핸들러를 직접 버퍼로 교체해야 한다.
+	prevLogger := slog.Default()
+	var stderrBuf bytes.Buffer
+	slog.SetDefault(slog.New(slog.NewTextHandler(&stderrBuf, nil)))
+	defer slog.SetDefault(prevLogger)
+
+	inR, inW, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe: %v", err)
+	}
+	defer inR.Close()
+	defer inW.Close()
+	outR, outW, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe: %v", err)
+	}
+	defer outR.Close()
+	defer outW.Close()
+
+	oldIn, oldOut := os.Stdin, os.Stdout
+	os.Stdin, os.Stdout = inR, outW
+	defer func() { os.Stdin, os.Stdout = oldIn, oldOut }()
+
+	serveDone := make(chan error, 1)
+	go func() { serveDone <- Serve(context.Background(), Config{Canon: canon, Store: st}) }()
+
+	writeLine := func(v any) {
+		t.Helper()
+		b, err := json.Marshal(v)
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+		if _, err := inW.Write(append(b, '\n')); err != nil {
+			t.Fatalf("write stdin: %v", err)
+		}
+	}
+	sc := bufio.NewScanner(outR)
+	readLine := func() json.RawMessage {
+		t.Helper()
+		if !sc.Scan() {
+			t.Fatalf("scan stdout: %v", sc.Err())
+		}
+		line := sc.Bytes()
+		if !json.Valid(line) {
+			t.Fatalf("stdout line is not valid JSON (protocol pollution): %q", line)
+		}
+		return json.RawMessage(append([]byte(nil), line...))
+	}
+
+	writeLine(map[string]any{
+		"jsonrpc": "2.0", "id": 1, "method": "initialize",
+		"params": map[string]any{
+			"protocolVersion": "2025-06-18",
+			"capabilities":    map[string]any{},
+			"clientInfo":      map[string]any{"name": "purity-test", "version": "0.0.1"},
+		},
+	})
+	readLine() // initialize 응답 — JSON 유효성만 확인.
+	writeLine(map[string]any{"jsonrpc": "2.0", "method": "notifications/initialized", "params": map[string]any{}})
+
+	writeLine(map[string]any{
+		"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+		"params": map[string]any{"name": "ctr_search", "arguments": SearchInput{Queries: []string{"needle"}}},
+	})
+	var resp struct {
+		Result json.RawMessage `json:"result"`
+	}
+	if err := json.Unmarshal(readLine(), &resp); err != nil {
+		t.Fatalf("decode tools/call response: %v", err)
+	}
+	var tr struct {
+		IsError bool `json:"isError"`
+		Content []struct {
+			Text string `json:"text"`
+		} `json:"content"`
+	}
+	if err := json.Unmarshal(resp.Result, &tr); err != nil {
+		t.Fatalf("decode tools/call result: %v", err)
+	}
+	if !tr.IsError || len(tr.Content) == 0 || !strings.HasPrefix(tr.Content[0].Text, "["+codeInternal+"]") {
+		t.Fatalf("want %s error for closed-store search, got %+v", codeInternal, tr)
+	}
+
+	inW.Close() // client-initiated shutdown → Run()이 stdin EOF로 반환
+	if err := <-serveDone; err != nil {
+		t.Fatalf("serve: %v", err)
+	}
+	os.Stdin, os.Stdout = oldIn, oldOut
+	outW.Close()
+
+	for sc.Scan() { // 종료 전후 잔여 바이트까지 전부 JSON 한 줄이어야 한다.
+		if !json.Valid(sc.Bytes()) {
+			t.Fatalf("trailing stdout polluted: %q", sc.Bytes())
+		}
+	}
+	if err := sc.Err(); err != nil {
+		t.Fatalf("scan trailing stdout: %v", err)
+	}
+
+	if !strings.Contains(stderrBuf.String(), "mcp: internal tool error") {
+		t.Fatalf("want internal tool error logged to stderr during the call, got %q", stderrBuf.String())
 	}
 }
 
@@ -497,6 +673,7 @@ func TestApplyFetchBudgetNewlineBoundary(t *testing.T) {
 // TestCtrTransformRoundTrip: 색인(ingest) → artifact_id → ctr_transform이 저장된 텍스트
 // 길이를 정확히 반환해야 한다(T3 TDD 항목 2). def 래핑(top-level for/재귀 비활성) 준수 스크립트.
 func TestCtrTransformRoundTrip(t *testing.T) {
+	skipDarwinNoIsolation(t)
 	cs, canon := newTestServer(t, []string{"ingest"})
 	ctx := context.Background()
 
@@ -552,9 +729,75 @@ func TestCtrTransformRoundTrip(t *testing.T) {
 	}
 }
 
+// TestCtrTransformConfigTimeout: Config.TransformTimeout이 registerTransform 핸들러에
+// context.WithTimeout으로 실제 적용되는지 확인한다(계획2 §4 이월 (1)).
+// 결정성(Fix Round 2 — 재리뷰 잔존 1건): 이전 버전(50ms + "timeout 또는 budget 중 하나면
+// 통과")은 registerTransform의 WithTimeout 배선이 통째로 제거돼도 잡지 못했다 — ctx가
+// 무제한이면 Spawn 내부 안전망(defaultWorkerTimeout=10s)만 걸리는데, 이 스크립트(기본
+// 5,000,000 step budget, 100M회 루프)는 budget이 수백 ms 내 소진되므로(worker_test.go의
+// TestSpawn_Timeout이 budget보다 ctx timeout을 먼저 발동시키려 MaxSteps를 2조로 올려야
+// 했던 것이 증거) 배선이 없어도 "budget 소진"으로 통과해버렸다.
+// 그래서 TransformTimeout=1ns로 낮춘다 — WithTimeout 적용 직후 ctx는 사실상 이미
+// 데드라인을 넘긴 상태이므로, Spawn이 스텝을 하나도 실행하기 전에 ctx-deadline 경로로
+// 실패해야 한다(하드웨어 무관 결정론). 이 경로는 플랫폼/타이밍에 따라 코드 문자열이 셋 중
+// 하나로 갈릴 수 있다(worker killed=INVALID_ARGUMENT / raw ctx.Err() / applyMemLimit이 그
+// ctx.Err()를 감싸는 STORAGE_UNAVAILABLE) — 셋 다 codeBudgetExceeded는 아니므로 특정 코드
+// 문자열을 고정하지 않고 "budget이 아님"만으로 배선 제거 회귀를 판별한다(Fix Round 3).
+func TestCtrTransformConfigTimeout(t *testing.T) {
+	skipDarwinNoIsolation(t)
+	dir := t.TempDir()
+	canon, err := ident.Canonicalize(dir)
+	if err != nil {
+		t.Fatalf("canonicalize: %v", err)
+	}
+	st, err := store.Open(t.TempDir(), false)
+	if err != nil {
+		t.Fatalf("store open: %v", err)
+	}
+	t.Cleanup(func() { st.Close() })
+
+	srv, err := NewServer(Config{Canon: canon, Store: st, SelfExe: testSelfExe(t), TransformTimeout: time.Nanosecond})
+	if err != nil {
+		t.Fatalf("new server: %v", err)
+	}
+	srvT, cliT := mcp.NewInMemoryTransports()
+	ctx := context.Background()
+	if _, err := srv.Connect(ctx, srvT, nil); err != nil {
+		t.Fatalf("server connect: %v", err)
+	}
+	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "0"}, nil)
+	cs, err := client.Connect(ctx, cliT, nil)
+	if err != nil {
+		t.Fatalf("client connect: %v", err)
+	}
+	t.Cleanup(func() { cs.Close() })
+
+	start := time.Now()
+	res, err := cs.CallTool(ctx, &mcp.CallToolParams{Name: "ctr_transform", Arguments: TransformInput{
+		Script: "def f():\n\tfor i in range(100000000):\n\t\tpass\n\nf()\n",
+	}})
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("call: %v", err)
+	}
+	if !res.IsError {
+		t.Fatalf("want IsError=true for a ctx-already-expired transform call, got %+v", res)
+	}
+	text := res.Content[0].(*mcp.TextContent).Text
+	// 명시 배제: budget 소진이면 WithTimeout(1ns) 배선이 제거된 회귀다 — 위 주석의 세 합법
+	// 경로(worker killed/raw ctx.Err()/STORAGE_UNAVAILABLE) 중 어느 것도 budget이 아니다.
+	if strings.HasPrefix(text, "["+codeBudgetExceeded+"]") {
+		t.Fatalf("got budget-exceeded — TransformTimeout(1ns) wiring이 제거된 것으로 의심됨: %q", text)
+	}
+	if elapsed > 5*time.Second {
+		t.Fatalf("elapsed=%v — want well under the 10s default", elapsed)
+	}
+}
+
 // TestCtrTransformCapsMapping: budget/output_limit 초과 스크립트가 각각 BUDGET_EXCEEDED/
 // OUTPUT_LIMIT_EXCEEDED로 매핑돼야 한다(T3 TDD 항목 3).
 func TestCtrTransformCapsMapping(t *testing.T) {
+	skipDarwinNoIsolation(t)
 	cs, _ := newTestServer(t, nil)
 	ctx := context.Background()
 
@@ -589,6 +832,7 @@ func TestCtrTransformCapsMapping(t *testing.T) {
 // TestCtrTransformInputValidation: inputs 9개(최대 8 초과)·script 64KB 초과는 각각
 // INVALID_ARGUMENT여야 한다(T3 TDD 항목 4, 승계 (c)).
 func TestCtrTransformInputValidation(t *testing.T) {
+	skipDarwinNoIsolation(t)
 	cs, _ := newTestServer(t, nil)
 	ctx := context.Background()
 
@@ -624,6 +868,7 @@ func TestCtrTransformInputValidation(t *testing.T) {
 // TestCtrTransformDescriptionMentionsDefWrapping: 도구 description에 def 래핑 제약이
 // 명시돼야 한다(T1/T2 승계 (b) — 모르면 자연스러운 top-level for/while 스크립트가 실패한다).
 func TestCtrTransformDescriptionMentionsDefWrapping(t *testing.T) {
+	skipDarwinNoIsolation(t)
 	cs, _ := newTestServer(t, nil)
 	lt, err := cs.ListTools(context.Background(), nil)
 	if err != nil {
@@ -811,6 +1056,135 @@ func TestCtrFetchAndIndexRoundTrip(t *testing.T) {
 	remarshal(t, fetchRes3.StructuredContent, &fetchOut3)
 	if strings.Contains(fetchOut3.Content, secretCanary) {
 		t.Fatalf("fetch leaks secret canary: %q", fetchOut3.Content)
+	}
+	// 이월 검증(계획2 §4 (7)): 웹 경로(extraction!="")로 색인한 artifact는 ctr_fetch에서도
+	// source_coords_exact=false여야 한다(mcp.go sourceCoordsExact 분기 직접 실증).
+	if fetchOut3.SourceCoordsExact {
+		t.Fatalf("want SourceCoordsExact=false for web source (extraction=%q): %+v", fiOut.Extraction, fetchOut3)
+	}
+}
+
+// --- ctr_global_search (설계 §4.6/§5.4, Task 2) ---
+
+// newGlobalTestProject: srcDir에 content를 담은 파일 1개를 만들어 실제 store에 ingest.Run으로
+// 색인한 뒤 store를 닫고 read-only로 재오픈해 GlobalProject를 만든다 — global-search는
+// 항상 read-only 연결만 쓰므로(설계 §5.4 query_only=ON) 색인은 별도 writable 오픈으로 선행한다.
+func newGlobalTestProject(t *testing.T, id, content string) GlobalProject {
+	t.Helper()
+	dir := t.TempDir()
+	writeSt, err := store.Open(dir, false)
+	if err != nil {
+		t.Fatalf("store open (write): %v", err)
+	}
+	srcDir := t.TempDir()
+	file := filepath.Join(srcDir, "note.txt")
+	if err := os.WriteFile(file, []byte(content), 0o644); err != nil {
+		t.Fatalf("write fixture: %v", err)
+	}
+	// ingest.Run은 projectRoot가 이미 canonical(Abs+EvalSymlinks)함을 계약으로 삼는다
+	// (§2.1 인가 루트 고정, Codex 교차리뷰 P1-2 — newTestServer는 ident.Canonicalize를
+	// 거쳐 이미 이 계약을 지키지만, 여기는 raw t.TempDir()를 직접 넘기므로 별도 해석 필요).
+	canonSrcDir, err := filepath.EvalSymlinks(srcDir)
+	if err != nil {
+		t.Fatalf("realpath srcDir: %v", err)
+	}
+	if _, err := ingest.Run(context.Background(), writeSt, canonSrcDir, nil, ingest.Request{Path: file}); err != nil {
+		t.Fatalf("ingest: %v", err)
+	}
+	writeSt.Close()
+
+	roSt, err := store.Open(dir, true)
+	if err != nil {
+		t.Fatalf("store open (ro): %v", err)
+	}
+	t.Cleanup(func() { roSt.Close() })
+	return GlobalProject{ID: id, Root: srcDir, Store: roSt}
+}
+
+// TestGlobalSearch_MergesAcrossProjects: 서로 다른 두 프로젝트 store의 hit이 project 라벨과
+// 함께 score 내림차순으로 병합되고, tools/list에 ctr_global_search 하나만 노출되는지(설계
+// §4.6 금지 조항) 검증한다.
+func TestGlobalSearch_MergesAcrossProjects(t *testing.T) {
+	ctx := context.Background()
+	p1 := newGlobalTestProject(t, "proj-one", "needle content in project one\n")
+	p2 := newGlobalTestProject(t, "proj-two", "needle content in project two\n")
+
+	srv, err := NewGlobalServer(GlobalConfig{Projects: []GlobalProject{p1, p2}})
+	if err != nil {
+		t.Fatalf("new global server: %v", err)
+	}
+	srvT, cliT := mcp.NewInMemoryTransports()
+	if _, err := srv.Connect(ctx, srvT, nil); err != nil {
+		t.Fatalf("server connect: %v", err)
+	}
+	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "0"}, nil)
+	cs, err := client.Connect(ctx, cliT, nil)
+	if err != nil {
+		t.Fatalf("client connect: %v", err)
+	}
+	defer cs.Close()
+
+	lt, err := cs.ListTools(ctx, nil)
+	if err != nil {
+		t.Fatalf("list tools: %v", err)
+	}
+	if len(lt.Tools) != 1 || lt.Tools[0].Name != "ctr_global_search" {
+		t.Fatalf("tools/list=%v want exactly [ctr_global_search] (설계 §4.6 금지 조항)", lt.Tools)
+	}
+
+	res, err := cs.CallTool(ctx, &mcp.CallToolParams{Name: "ctr_global_search", Arguments: SearchInput{Queries: []string{"needle"}}})
+	if err != nil {
+		t.Fatalf("ctr_global_search call: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("ctr_global_search error: %+v", res.Content)
+	}
+	var out GlobalSearchOutput
+	remarshal(t, res.StructuredContent, &out)
+	if !out.Untrusted {
+		t.Fatalf("untrusted flag missing: %+v", out)
+	}
+	if len(out.Results) != 1 {
+		t.Fatalf("results=%d want 1", len(out.Results))
+	}
+	hits := out.Results[0].Hits
+	if len(hits) != 2 {
+		t.Fatalf("hits=%d want 2 (one per project): %+v", len(hits), hits)
+	}
+	seen := map[string]bool{}
+	for i, h := range hits {
+		seen[h.Project] = true
+		if i > 0 && hits[i-1].Score < h.Score {
+			t.Fatalf("hits not score-descending: %+v", hits)
+		}
+	}
+	if !seen["proj-one"] || !seen["proj-two"] {
+		t.Fatalf("missing project labels: %+v", hits)
+	}
+	if out.Results[0].Truncated {
+		t.Fatalf("want Truncated=false with default limit, got true: %+v", out.Results[0])
+	}
+
+	// limit=1: 두 프로젝트가 각각 1 hit씩 내도 병합 후 1개로 절단되고 truncated=true여야 한다.
+	res2, err := cs.CallTool(ctx, &mcp.CallToolParams{Name: "ctr_global_search", Arguments: SearchInput{Queries: []string{"needle"}, Limit: 1}})
+	if err != nil {
+		t.Fatalf("ctr_global_search(limit=1) call: %v", err)
+	}
+	var out2 GlobalSearchOutput
+	remarshal(t, res2.StructuredContent, &out2)
+	if len(out2.Results) != 1 || len(out2.Results[0].Hits) != 1 {
+		t.Fatalf("limit=1 hits=%+v want exactly 1", out2.Results)
+	}
+	if !out2.Results[0].Truncated {
+		t.Fatalf("want Truncated=true after merge cut to limit=1: %+v", out2.Results[0])
+	}
+}
+
+// TestNewGlobalServerEmptyProjectsErrors: Projects가 비면 시작 자체를 거부해야 한다(설계
+// §4.6 계약 — allowlist 미지정 시 시작 거부와 동일 취지의 방어선).
+func TestNewGlobalServerEmptyProjectsErrors(t *testing.T) {
+	if _, err := NewGlobalServer(GlobalConfig{}); err == nil {
+		t.Fatal("want error for empty Projects, got nil")
 	}
 }
 

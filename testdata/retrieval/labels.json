@@ -1,0 +1,18 @@
+{
+  "note": "Ground-truth relevance labels for gate 2 (retrieval recall@k). Each query maps to the corpus source files (basenames, under testdata/oracle/corpus/) that substantively answer it. recall@k = mean over queries of |relevant ∩ distinct-sources-in-top-k-chunks| / |relevant|.",
+  "corpus_dir": "testdata/oracle/corpus",
+  "labels": {
+    "jwt token": ["auth_handler.go", "security.md", "api-reference.md"],
+    "bcrypt password": ["auth_handler.go", "security.md"],
+    "cache eviction": ["cache.py", "caching.md"],
+    "cache ttl": ["cache.py", "caching.md"],
+    "sliding window": ["rate_limiter.js", "architecture.md"],
+    "rate limiter": ["rate_limiter.js", "architecture.md", "monitoring.md"],
+    "connection pool": ["db_pool.ts", "deployment.md", "troubleshooting.md"],
+    "graceful shutdown": ["deployment.md", "db_pool.ts"],
+    "cors preflight": ["api-reference.md", "security.md"],
+    "prometheus metrics": ["monitoring.md", "architecture.md"],
+    "health check": ["deployment.md", "monitoring.md", "db_pool.ts"],
+    "stack trace": ["troubleshooting.md", "server-error.log"]
+  }
+}
