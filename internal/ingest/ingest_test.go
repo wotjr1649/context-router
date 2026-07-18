@@ -627,3 +627,59 @@ func TestRunWeb_TitleFillsEmptyChunkTitle(t *testing.T) {
 		t.Fatalf("chunk title = %+v, want %q", title, "Example Page Title")
 	}
 }
+
+// TestRunWeb_TitleRedacted: title에 secret 캐너리가 있으면 body와 동일하게 Redact가
+// 적용돼 청크 title이 마커로 치환되고 artifacts.redaction="spans"가 반영되며, 검색으로
+// 원문 캐너리가 회수되지 않아야 한다(Fix Round 1 리뷰 P1-1 — §12 canary 계약).
+func TestRunWeb_TitleRedacted(t *testing.T) {
+	st, _ := openStoreT(t)
+	// 런타임 분할 리터럴 — 소스에 연속 secret 토큰 금지(규약 §8).
+	canary := "xox" + "b-1234567890ABCDEF"
+	title := "Leaked token: " + canary
+	body := []byte("plain body text with no markdown heading\n")
+
+	rep, err := RunWeb(context.Background(), st, "http://example.invalid/", nil, body, "text/plain", "", title)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var gotTitle sql.NullString
+	if err := st.Reader().QueryRow(`SELECT title FROM chunks WHERE artifact_id=? ORDER BY ordinal LIMIT 1`, rep.ArtifactID).Scan(&gotTitle); err != nil {
+		t.Fatalf("query chunk title: %v", err)
+	}
+	if strings.Contains(gotTitle.String, canary) {
+		t.Fatalf("chunk title leaks canary: %q", gotTitle.String)
+	}
+	if !strings.Contains(gotTitle.String, "REDACTED") {
+		t.Fatalf("chunk title missing redaction marker: %q", gotTitle.String)
+	}
+
+	var redaction string
+	if err := st.Reader().QueryRow(`SELECT redaction FROM artifacts WHERE id=?`, rep.ArtifactID).Scan(&redaction); err != nil {
+		t.Fatalf("query artifacts.redaction: %v", err)
+	}
+	if redaction != "spans" {
+		t.Fatalf("artifacts.redaction = %q, want spans", redaction)
+	}
+}
+
+// TestRunWeb_TitleCapped: 1MB급 title이 저장 청크 title에 512B 상한으로 절단돼야 한다
+// (Fix Round 1 리뷰 P1-2 — 무제한이면 청크마다·FTS 양쪽에 실체화돼 응답이 증폭된다).
+func TestRunWeb_TitleCapped(t *testing.T) {
+	st, _ := openStoreT(t)
+	bigTitle := strings.Repeat("A", 1<<20) // 1MB
+	body := []byte("plain body text with no markdown heading\n")
+
+	rep, err := RunWeb(context.Background(), st, "http://example.invalid/", nil, body, "text/plain", "", bigTitle)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var gotTitle sql.NullString
+	if err := st.Reader().QueryRow(`SELECT title FROM chunks WHERE artifact_id=? ORDER BY ordinal LIMIT 1`, rep.ArtifactID).Scan(&gotTitle); err != nil {
+		t.Fatalf("query chunk title: %v", err)
+	}
+	if len(gotTitle.String) > maxWebTitleBytes {
+		t.Fatalf("stored title = %d bytes, want <= %d", len(gotTitle.String), maxWebTitleBytes)
+	}
+}

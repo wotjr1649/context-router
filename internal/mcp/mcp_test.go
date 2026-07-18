@@ -554,8 +554,14 @@ func TestCtrTransformRoundTrip(t *testing.T) {
 
 // TestCtrTransformConfigTimeout: Config.TransformTimeout이 registerTransform 핸들러에
 // context.WithTimeout으로 실제 적용되는지 확인한다(계획2 §4 이월 (1)). 매우 짧은 타임아웃 +
-// 스텝 소모가 큰 루프 스크립트(TestCtrTransformCapsMapping과 동형 패턴)로 실행하면, worker
-// 프로세스 기동(스텝 예산 500만 도달보다 먼저 걸리는 실측)이 타임아웃에 걸려 kill되어야 한다.
+// 스텝 소모가 큰 루프 스크립트(TestCtrTransformCapsMapping과 동형 패턴)로 실행한다.
+// 결정성(Fix Round 1 리뷰 Claude Important): ctr_transform은 TransformInput에 MaxSteps를
+// 노출하지 않아 항상 기본 5,000,000 step budget이 걸린다 — 이 환경(worker 프로세스 기동
+// 자체가 50ms보다 느림)에서는 timeout이 이기지만, spawn이 훨씬 빠른 플랫폼(특히 fork()가
+// 저렴한 Linux CI)에서는 budget이 먼저 소진돼 이길 수 있다. 그 레이스 자체는
+// MaxSteps를 도구가 노출하지 않는 한 없앨 수 없으므로, "타임아웃 kill" 또는 "budget 소진"
+// 둘 중 하나(둘 다 리소스 상한류 오류)면 통과시키고, 대신 응답이 Config 미적용 시 걸릴
+// 기본값(10s)보다 훨씬 짧게 돌아왔는지로 50ms Config가 실제 반영됐음을 방증한다.
 func TestCtrTransformConfigTimeout(t *testing.T) {
 	dir := t.TempDir()
 	canon, err := ident.Canonicalize(dir)
@@ -584,18 +590,23 @@ func TestCtrTransformConfigTimeout(t *testing.T) {
 	}
 	t.Cleanup(func() { cs.Close() })
 
+	start := time.Now()
 	res, err := cs.CallTool(ctx, &mcp.CallToolParams{Name: "ctr_transform", Arguments: TransformInput{
 		Script: "def f():\n\tfor i in range(100000000):\n\t\tpass\n\nf()\n",
 	}})
+	elapsed := time.Since(start)
 	if err != nil {
 		t.Fatalf("call: %v", err)
 	}
 	if !res.IsError {
-		t.Fatalf("want IsError=true for timed-out script, got %+v", res)
+		t.Fatalf("want IsError=true for short-timeout/high-step script, got %+v", res)
 	}
 	text := res.Content[0].(*mcp.TextContent).Text
-	if !strings.Contains(text, "worker killed") {
-		t.Fatalf("want worker-killed timeout message, got %q", text)
+	if !strings.HasPrefix(text, "["+codeInvalidArgument+"]") && !strings.HasPrefix(text, "["+codeBudgetExceeded+"]") {
+		t.Fatalf("want timeout(worker killed)/budget error code, got %q", text)
+	}
+	if elapsed > 5*time.Second {
+		t.Fatalf("elapsed=%v — want well under the 10s default (TransformTimeout=50ms 미반영 의심)", elapsed)
 	}
 }
 

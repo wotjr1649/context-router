@@ -3,6 +3,8 @@ package netfetch
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"net"
@@ -430,9 +432,11 @@ func TestFetch_NonHTML_Passthrough(t *testing.T) {
 }
 
 // TestRetryableDialErr: hop 루프가 다음 주소로 재시도할지 판단하는 순수 함수 — 연결 계층
-// 오류(dial·handshake, *net.OpError)만 참이어야 한다(계획2 §4 이월 (3)).
+// 오류(dial·TLS handshake)만 참이어야 한다(계획2 §4 이월 (3), Fix Round 1 리뷰 P2-2로
+// TLS/x509 핸드셰이크 오류류 + ctx 취소/데드라인 우선 판정 케이스 추가).
 func TestRetryableDialErr(t *testing.T) {
 	dialErr := &net.OpError{Op: "dial", Net: "tcp", Err: errors.New("connection refused")}
+	cancelViaOpErr := &net.OpError{Op: "dial", Net: "tcp", Err: context.Canceled}
 	cases := []struct {
 		name string
 		err  error
@@ -441,9 +445,15 @@ func TestRetryableDialErr(t *testing.T) {
 		{"nil", nil, false},
 		{"plain error", errors.New("boom"), false},
 		{"context deadline exceeded", context.DeadlineExceeded, false},
+		{"net.OpError wrapping context.Canceled", cancelViaOpErr, false},
 		{"net.OpError direct", dialErr, true},
 		{"net.OpError wrapped by fmt.Errorf", fmt.Errorf("netfetch: request %s: %w", "http://x", dialErr), true},
 		{"url.Error wrapping net.OpError (client.Do 실반환 형태)", &url.Error{Op: "Get", URL: "http://x", Err: dialErr}, true},
+		{"tls.RecordHeaderError", tls.RecordHeaderError{Msg: "first record does not look like a TLS handshake"}, true},
+		{"tls.AlertError", tls.AlertError(0), true},
+		{"x509.HostnameError", x509.HostnameError{Host: "example.invalid"}, true},
+		{"x509.UnknownAuthorityError", x509.UnknownAuthorityError{}, true},
+		{"x509.CertificateInvalidError", x509.CertificateInvalidError{Reason: x509.Expired}, true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -451,6 +461,15 @@ func TestRetryableDialErr(t *testing.T) {
 				t.Fatalf("retryableDialErr(%v) = %v, want %v", tc.err, got, tc.want)
 			}
 		})
+	}
+}
+
+// TestBuildTransport_PerAddrTimeout: dial/handshake가 주소 1건에 fetch 전체 ctx를 소비하지
+// 않도록 상한이 걸려 있는지 필드로 확인한다(Fix Round 1 리뷰 P2-3).
+func TestBuildTransport_PerAddrTimeout(t *testing.T) {
+	tr := buildTransport(netip.MustParseAddr("127.0.0.1"), 80)
+	if tr.TLSHandshakeTimeout != perAddrConnTimeout {
+		t.Fatalf("TLSHandshakeTimeout = %v, want %v", tr.TLSHandshakeTimeout, perAddrConnTimeout)
 	}
 }
 
