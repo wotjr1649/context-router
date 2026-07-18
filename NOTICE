@@ -1,0 +1,72 @@
+context-router
+Copyright (c) 2026 wotjr1649 (context-router contributors)
+
+This project is an independent Go implementation informed by the tool
+contract of ctxscribe / context-mode (Elastic License 2.0). Not affiliated
+with or endorsed by the upstream authors.
+
+Upstream reference (oracle, not incorporated or redistributed):
+  ctxscribe v1.3.0 — https://github.com/wotjr1649/ctxscribe
+  Copyright 2026 Mert Koseoglu, licensed under the Elastic License 2.0.
+context-router shares no source code with ctxscribe; it independently
+reimplements the observed tool contract (see README.md for the name
+mapping).
+
+================================================================================
+Third-Party Notices
+================================================================================
+
+context-router is written in Go and statically links the following direct
+(non-indirect) module dependencies. License type and copyright holder below
+were verified against each module's own LICENSE file in the local Go module
+cache (`go env GOMODCACHE`), matched to the exact version pinned in go.mod.
+
+--------------------------------------------------------------------------------
+Module:    codeberg.org/readeck/go-readability
+Version:   v0.0.0-20260615104154-29522a0e224f
+License:   MIT
+Copyright: Copyright (c) 2019 Radhi Fadlillah
+
+--------------------------------------------------------------------------------
+Module:    github.com/JohannesKaufmann/html-to-markdown/v2
+Version:   v2.5.2
+License:   MIT
+Copyright: Copyright (c) 2018 Johannes Kaufmann
+
+--------------------------------------------------------------------------------
+Module:    github.com/modelcontextprotocol/go-sdk
+Version:   v1.6.1
+License:   Apache-2.0 (new contributions) / MIT (contributions not yet
+           relicensed) — project is mid-transition per its own LICENSE file
+Copyright: Copyright (c) 2024-2025 Model Context Protocol a Series of LF
+           Projects, LLC.
+
+--------------------------------------------------------------------------------
+Module:    go.starlark.net
+Version:   v0.0.0-20260708150628-5395d018f003
+License:   BSD-3-Clause
+Copyright: Copyright (c) 2017 The Bazel Authors. All rights reserved.
+
+--------------------------------------------------------------------------------
+Module:    golang.org/x/net
+Version:   v0.55.0
+License:   BSD-3-Clause
+Copyright: Copyright 2009 The Go Authors.
+
+--------------------------------------------------------------------------------
+Module:    golang.org/x/sys
+Version:   v0.46.0
+License:   BSD-3-Clause
+Copyright: Copyright 2009 The Go Authors.
+
+--------------------------------------------------------------------------------
+Module:    modernc.org/sqlite
+Version:   v1.54.0
+License:   BSD-3-Clause
+Copyright: Copyright (c) 2017 The Sqlite Authors. All rights reserved.
+
+--------------------------------------------------------------------------------
+
+Full license texts for each module are distributed with the module itself
+(source repository / Go module cache) at the path and version listed above,
+and are reproduced in full in each module's own LICENSE file.
