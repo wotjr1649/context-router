@@ -77,9 +77,11 @@ func TestOpen_UnixPermissions(t *testing.T) {
 		}
 	}
 	body := []byte("perm test")
-	if _, err := s.Register(t.Context(), Registration{StoredBytes: body, MediaType: "text/plain",
+	if _, err := s.Register(t.Context(), Registration{
+		StoredBytes: body, MediaType: "text/plain",
 		Source: SourceMeta{URI: "/perm.txt", Kind: "file", SrcHash: "hperm"},
-		Chunks: []Chunk{{Ordinal: 0, Text: string(body)}}}); err != nil {
+		Chunks: []Chunk{{Ordinal: 0, Text: string(body)}},
+	}); err != nil {
 		t.Fatal(err)
 	}
 	sum := sha256.Sum256(body)
@@ -146,9 +148,11 @@ func TestMigrate_HealsPartialSchema(t *testing.T) {
 
 func TestRegister_DedupTwoSourcesOneArtifact(t *testing.T) {
 	s := openT(t)
-	reg := Registration{StoredBytes: []byte("same body\nline2\n"), MediaType: "text/plain",
+	reg := Registration{
+		StoredBytes: []byte("same body\nline2\n"), MediaType: "text/plain",
 		Source: SourceMeta{URI: "/a.txt", Kind: "file", SrcHash: "h-a"},
-		Chunks: []Chunk{{Ordinal: 0, ByteStart: 0, ByteEnd: 16, LineStart: 1, LineEnd: 2, Text: "same body\nline2\n"}}}
+		Chunks: []Chunk{{Ordinal: 0, ByteStart: 0, ByteEnd: 16, LineStart: 1, LineEnd: 2, Text: "same body\nline2\n"}},
+	}
 	id1, err := s.Register(t.Context(), reg)
 	if err != nil {
 		t.Fatal(err)
@@ -182,9 +186,11 @@ func TestRegister_DedupTwoSourcesOneArtifact(t *testing.T) {
 func TestRegister_DedupRespectsMediaType(t *testing.T) {
 	s := openT(t)
 	body := []byte("same bytes different representation")
-	reg := Registration{StoredBytes: body, MediaType: "text/plain",
+	reg := Registration{
+		StoredBytes: body, MediaType: "text/plain",
 		Source: SourceMeta{URI: "/x.txt", Kind: "file", SrcHash: "hx"},
-		Chunks: []Chunk{{Ordinal: 0, ByteStart: 0, ByteEnd: int64(len(body)), Text: string(body)}}}
+		Chunks: []Chunk{{Ordinal: 0, ByteStart: 0, ByteEnd: int64(len(body)), Text: string(body)}},
+	}
 	id1, err := s.Register(t.Context(), reg)
 	if err != nil {
 		t.Fatal(err)
@@ -224,9 +230,11 @@ func TestRegister_DedupRespectsMediaType(t *testing.T) {
 
 func TestRegister_CASRejectsStaleWriter(t *testing.T) {
 	s := openT(t)
-	base := Registration{StoredBytes: []byte("v1"), MediaType: "text/plain",
+	base := Registration{
+		StoredBytes: []byte("v1"), MediaType: "text/plain",
 		Source: SourceMeta{URI: "/f.txt", Kind: "file", SrcHash: "hash-v1"},
-		Chunks: []Chunk{{Ordinal: 0, Text: "v1"}}}
+		Chunks: []Chunk{{Ordinal: 0, Text: "v1"}},
+	}
 	if _, err := s.Register(t.Context(), base); err != nil {
 		t.Fatal(err)
 	}
@@ -250,17 +258,21 @@ func TestRegister_CASRejectsStaleWriter(t *testing.T) {
 func TestRegister_ReindexUpdatesRawBlobHashAndExtraction(t *testing.T) {
 	s := openT(t)
 	uri := "https://example.com/p"
-	reg1 := Registration{StoredBytes: []byte("body v1"), MediaType: "text/plain",
+	reg1 := Registration{
+		StoredBytes: []byte("body v1"), MediaType: "text/plain",
 		Source:  SourceMeta{URI: uri, Kind: "web", SrcHash: "h-v1", Extraction: "readability"},
 		Chunks:  []Chunk{{Ordinal: 0, Text: "body v1"}},
-		RawBlob: []byte("<html>v1</html>")}
+		RawBlob: []byte("<html>v1</html>"),
+	}
 	if _, err := s.Register(t.Context(), reg1); err != nil {
 		t.Fatal(err)
 	}
-	reg2 := Registration{StoredBytes: []byte("body v2"), MediaType: "text/plain",
+	reg2 := Registration{
+		StoredBytes: []byte("body v2"), MediaType: "text/plain",
 		Source:  SourceMeta{URI: uri, Kind: "web", SrcHash: "h-v2", Extraction: "full"},
 		Chunks:  []Chunk{{Ordinal: 0, Text: "body v2"}},
-		RawBlob: []byte("<html>v2 differs</html>")}
+		RawBlob: []byte("<html>v2 differs</html>"),
+	}
 	if _, err := s.Register(t.Context(), reg2); err != nil {
 		t.Fatal(err)
 	}
@@ -284,9 +296,11 @@ func TestRegister_ReindexUpdatesRawBlobHashAndExtraction(t *testing.T) {
 // (회귀 없음).
 func TestRegister_FileReindexRawBlobHashStaysEmpty(t *testing.T) {
 	s := openT(t)
-	reg := Registration{StoredBytes: []byte("v1"), MediaType: "text/plain",
+	reg := Registration{
+		StoredBytes: []byte("v1"), MediaType: "text/plain",
 		Source: SourceMeta{URI: "/f.txt", Kind: "file", SrcHash: "h1"},
-		Chunks: []Chunk{{Ordinal: 0, Text: "v1"}}}
+		Chunks: []Chunk{{Ordinal: 0, Text: "v1"}},
+	}
 	if _, err := s.Register(t.Context(), reg); err != nil {
 		t.Fatal(err)
 	}
@@ -308,9 +322,11 @@ func TestRegister_FileReindexRawBlobHashStaysEmpty(t *testing.T) {
 func TestReadRange_Selectors(t *testing.T) {
 	s := openT(t)
 	body := "alpha\nbravo\ncharlie\n" // bytes: alpha(0-5)...
-	id, err := s.Register(t.Context(), Registration{StoredBytes: []byte(body), MediaType: "text/plain",
+	id, err := s.Register(t.Context(), Registration{
+		StoredBytes: []byte(body), MediaType: "text/plain",
 		Source: SourceMeta{URI: "/r.txt", Kind: "file", SrcHash: "h"},
-		Chunks: []Chunk{{Ordinal: 0, ByteStart: 0, ByteEnd: int64(len(body)), LineStart: 1, LineEnd: 3, Text: body}}})
+		Chunks: []Chunk{{Ordinal: 0, ByteStart: 0, ByteEnd: int64(len(body)), LineStart: 1, LineEnd: 3, Text: body}},
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -319,9 +335,11 @@ func TestReadRange_Selectors(t *testing.T) {
 		t.Fatalf("line sel: %v %q", err, r.Text)
 	}
 	// UTF-8 스냅: 한글 3바이트 중간을 요청해도 문자 경계로 스냅
-	id2, _ := s.Register(t.Context(), Registration{StoredBytes: []byte("가나다"), MediaType: "text/plain",
+	id2, _ := s.Register(t.Context(), Registration{
+		StoredBytes: []byte("가나다"), MediaType: "text/plain",
 		Source: SourceMeta{URI: "/k.txt", Kind: "file", SrcHash: "hk"},
-		Chunks: []Chunk{{Ordinal: 0, Text: "가나다"}}})
+		Chunks: []Chunk{{Ordinal: 0, Text: "가나다"}},
+	})
 	r2, err := s.ReadRange(t.Context(), id2, Selector{Kind: "byte", ByteStart: 1, ByteEnd: 4})
 	if err != nil {
 		t.Fatal(err)
@@ -336,9 +354,11 @@ func TestReadRange_Selectors(t *testing.T) {
 
 func TestReadRange_IOErrorHidesPath(t *testing.T) {
 	s := openT(t)
-	id, err := s.Register(t.Context(), Registration{StoredBytes: []byte("alpha\nbravo\n"), MediaType: "text/plain",
+	id, err := s.Register(t.Context(), Registration{
+		StoredBytes: []byte("alpha\nbravo\n"), MediaType: "text/plain",
 		Source: SourceMeta{URI: "/p.txt", Kind: "file", SrcHash: "hp"},
-		Chunks: []Chunk{{Ordinal: 0, Text: "alpha\nbravo\n"}}})
+		Chunks: []Chunk{{Ordinal: 0, Text: "alpha\nbravo\n"}},
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -366,9 +386,11 @@ func TestRegister_ConcurrentDistinctBlobsNoTmpLeftover(t *testing.T) {
 		go func(i int) {
 			defer wg.Done()
 			body := fmt.Sprintf("content-%d-unique-payload", i)
-			_, err := s.Register(t.Context(), Registration{StoredBytes: []byte(body), MediaType: "text/plain",
+			_, err := s.Register(t.Context(), Registration{
+				StoredBytes: []byte(body), MediaType: "text/plain",
 				Source: SourceMeta{URI: fmt.Sprintf("/c%d.txt", i), Kind: "file", SrcHash: fmt.Sprintf("h%d", i)},
-				Chunks: []Chunk{{Ordinal: 0, Text: body}}})
+				Chunks: []Chunk{{Ordinal: 0, Text: body}},
+			})
 			errs[i] = err
 		}(i)
 	}
@@ -395,9 +417,11 @@ func TestRegister_ConcurrentDistinctBlobsNoTmpLeftover(t *testing.T) {
 
 func TestReadRange_LineInvalidRangeRejected(t *testing.T) {
 	s := openT(t)
-	id, err := s.Register(t.Context(), Registration{StoredBytes: []byte("a\nb\nc\n"), MediaType: "text/plain",
+	id, err := s.Register(t.Context(), Registration{
+		StoredBytes: []byte("a\nb\nc\n"), MediaType: "text/plain",
 		Source: SourceMeta{URI: "/x.txt", Kind: "file", SrcHash: "hx"},
-		Chunks: []Chunk{{Ordinal: 0, Text: "a\nb\nc\n"}}})
+		Chunks: []Chunk{{Ordinal: 0, Text: "a\nb\nc\n"}},
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -424,9 +448,11 @@ func TestReadRange_LineInvalidRangeRejected(t *testing.T) {
 func TestReadRange_ByteOutOfRangeRejected(t *testing.T) {
 	s := openT(t)
 	body := "abcde" // len=5
-	id, err := s.Register(t.Context(), Registration{StoredBytes: []byte(body), MediaType: "text/plain",
+	id, err := s.Register(t.Context(), Registration{
+		StoredBytes: []byte(body), MediaType: "text/plain",
 		Source: SourceMeta{URI: "/b.txt", Kind: "file", SrcHash: "hb"},
-		Chunks: []Chunk{{Ordinal: 0, Text: body}}})
+		Chunks: []Chunk{{Ordinal: 0, Text: body}},
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -450,15 +476,19 @@ func TestReadRange_ByteOutOfRangeRejected(t *testing.T) {
 // 소속이 아니면 ErrNotFound가 아닌 ErrInvalidSelector.
 func TestReadRange_ChunkWrongArtifactRejected(t *testing.T) {
 	s := openT(t)
-	idA, err := s.Register(t.Context(), Registration{StoredBytes: []byte("artifact A body"), MediaType: "text/plain",
+	idA, err := s.Register(t.Context(), Registration{
+		StoredBytes: []byte("artifact A body"), MediaType: "text/plain",
 		Source: SourceMeta{URI: "/a2.txt", Kind: "file", SrcHash: "ha2"},
-		Chunks: []Chunk{{Ordinal: 0, Text: "artifact A body"}}})
+		Chunks: []Chunk{{Ordinal: 0, Text: "artifact A body"}},
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	idB, err := s.Register(t.Context(), Registration{StoredBytes: []byte("artifact B body"), MediaType: "text/plain",
+	idB, err := s.Register(t.Context(), Registration{
+		StoredBytes: []byte("artifact B body"), MediaType: "text/plain",
 		Source: SourceMeta{URI: "/b2.txt", Kind: "file", SrcHash: "hb2"},
-		Chunks: []Chunk{{Ordinal: 0, Text: "artifact B body"}}})
+		Chunks: []Chunk{{Ordinal: 0, Text: "artifact B body"}},
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -479,9 +509,11 @@ func TestReadRange_ChunkWrongArtifactRejected(t *testing.T) {
 
 func TestSourceOf(t *testing.T) {
 	s := openT(t)
-	id, err := s.Register(t.Context(), Registration{StoredBytes: []byte("body"), MediaType: "text/plain",
+	id, err := s.Register(t.Context(), Registration{
+		StoredBytes: []byte("body"), MediaType: "text/plain",
 		Source: SourceMeta{URI: "/z.txt", Kind: "file", SrcHash: "hz"},
-		Chunks: []Chunk{{Ordinal: 0, Text: "body"}}})
+		Chunks: []Chunk{{Ordinal: 0, Text: "body"}},
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -506,8 +538,10 @@ func TestStaleOf(t *testing.T) {
 		t.Fatal(err)
 	}
 	sum := sha256.Sum256(body)
-	info := SourceInfo{URI: filepath.ToSlash(file), Kind: "file", Size: fi.Size(),
-		MtimeNS: fi.ModTime().UnixNano(), SrcHash: hex.EncodeToString(sum[:])}
+	info := SourceInfo{
+		URI: filepath.ToSlash(file), Kind: "file", Size: fi.Size(),
+		MtimeNS: fi.ModTime().UnixNano(), SrcHash: hex.EncodeToString(sum[:]),
+	}
 
 	if StaleOf(info) {
 		t.Fatal("want 수정 전 Stale=false")
@@ -552,9 +586,11 @@ func TestReadRange_FillsSourceAndStale(t *testing.T) {
 	}
 	sum := sha256.Sum256(body)
 	uri := filepath.ToSlash(file)
-	id, err := s.Register(t.Context(), Registration{StoredBytes: body, MediaType: "text/plain",
+	id, err := s.Register(t.Context(), Registration{
+		StoredBytes: body, MediaType: "text/plain",
 		Source: SourceMeta{URI: uri, Kind: "file", Size: fi.Size(), MtimeNS: fi.ModTime().UnixNano(), SrcHash: hex.EncodeToString(sum[:])},
-		Chunks: []Chunk{{Ordinal: 0, ByteStart: 0, ByteEnd: int64(len(body)), LineStart: 1, LineEnd: 1, Text: string(body)}}})
+		Chunks: []Chunk{{Ordinal: 0, ByteStart: 0, ByteEnd: int64(len(body)), LineStart: 1, LineEnd: 1, Text: string(body)}},
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -590,9 +626,11 @@ func TestOpen_MkdirAllErrorHidesPath(t *testing.T) {
 func TestArtifactText(t *testing.T) {
 	s := openT(t)
 	body := "hello transform input"
-	id, err := s.Register(t.Context(), Registration{StoredBytes: []byte(body), MediaType: "text/plain",
+	id, err := s.Register(t.Context(), Registration{
+		StoredBytes: []byte(body), MediaType: "text/plain",
 		Source: SourceMeta{URI: "/t.txt", Kind: "file", SrcHash: "ht"},
-		Chunks: []Chunk{{Ordinal: 0, Text: body}}})
+		Chunks: []Chunk{{Ordinal: 0, Text: body}},
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -670,7 +708,8 @@ func TestOpen_ConcurrentFirstMigration(t *testing.T) {
 		outs := make([]bytes.Buffer, 2)
 		for c := range cmds {
 			cmd := exec.Command(exe)
-			cmd.Env = append(os.Environ(),
+			cmd.Env = append(
+				os.Environ(),
 				"CTR_TEST_CHILD=1",
 				"CTR_TEST_CHILD_DIR="+storeDir,
 				"CTR_TEST_CHILD_SIGNAL="+signal,
@@ -783,9 +822,11 @@ func TestLedgerStats_StatErrorOtherThanNotExist(t *testing.T) {
 // integrity-check가 통과해야 한다.
 func TestPurgeOlderThan(t *testing.T) {
 	s := openT(t)
-	oldReg := Registration{StoredBytes: []byte("old body"), MediaType: "text/plain",
+	oldReg := Registration{
+		StoredBytes: []byte("old body"), MediaType: "text/plain",
 		Source: SourceMeta{URI: "/old.txt", Kind: "file", SrcHash: "h-old"},
-		Chunks: []Chunk{{Ordinal: 0, Text: "old body"}}}
+		Chunks: []Chunk{{Ordinal: 0, Text: "old body"}},
+	}
 	oldID, err := s.Register(t.Context(), oldReg)
 	if err != nil {
 		t.Fatal(err)
@@ -795,9 +836,11 @@ func TestPurgeOlderThan(t *testing.T) {
 	cutoff := time.Now().Unix()
 	time.Sleep(1100 * time.Millisecond)
 
-	newReg := Registration{StoredBytes: []byte("new body"), MediaType: "text/plain",
+	newReg := Registration{
+		StoredBytes: []byte("new body"), MediaType: "text/plain",
 		Source: SourceMeta{URI: "/new.txt", Kind: "file", SrcHash: "h-new"},
-		Chunks: []Chunk{{Ordinal: 0, Text: "new body"}}}
+		Chunks: []Chunk{{Ordinal: 0, Text: "new body"}},
+	}
 	newID, err := s.Register(t.Context(), newReg)
 	if err != nil {
 		t.Fatal(err)
@@ -841,9 +884,11 @@ func TestPurgeOlderThan(t *testing.T) {
 // 삭제 대상이 아닌 경우 sources=0 artifacts=0이며 실제로 아무 행도 사라지지 않아야 한다.
 func TestPurgeOlderThan_MismatchLeavesEverything(t *testing.T) {
 	s := openT(t)
-	if _, err := s.Register(t.Context(), Registration{StoredBytes: []byte("keep me"), MediaType: "text/plain",
+	if _, err := s.Register(t.Context(), Registration{
+		StoredBytes: []byte("keep me"), MediaType: "text/plain",
 		Source: SourceMeta{URI: "/keep.txt", Kind: "file", SrcHash: "h-keep"},
-		Chunks: []Chunk{{Ordinal: 0, Text: "keep me"}}}); err != nil {
+		Chunks: []Chunk{{Ordinal: 0, Text: "keep me"}},
+	}); err != nil {
 		t.Fatal(err)
 	}
 	gotSources, gotArtifacts, err := s.PurgeOlderThan(t.Context(), 1) // 1970년대 cutoff — 아무것도 오래되지 않음
@@ -888,9 +933,11 @@ func writeAgedOrphanBlob(t *testing.T, storeDir, hash string) string {
 func TestGCOrphanBlobs(t *testing.T) {
 	s := openT(t)
 	body := []byte("referenced content")
-	if _, err := s.Register(t.Context(), Registration{StoredBytes: body, MediaType: "text/plain",
+	if _, err := s.Register(t.Context(), Registration{
+		StoredBytes: body, MediaType: "text/plain",
 		Source: SourceMeta{URI: "/ref.txt", Kind: "file", SrcHash: "h-ref"},
-		Chunks: []Chunk{{Ordinal: 0, Text: string(body)}}}); err != nil {
+		Chunks: []Chunk{{Ordinal: 0, Text: string(body)}},
+	}); err != nil {
 		t.Fatal(err)
 	}
 	sum := sha256.Sum256(body)
@@ -921,10 +968,12 @@ func TestGCOrphanBlobs(t *testing.T) {
 func TestGCOrphanBlobs_PreservesRawBlobHash(t *testing.T) {
 	s := openT(t)
 	raw := []byte("<html>raw source, not content-addressed via artifacts</html>")
-	if _, err := s.Register(t.Context(), Registration{StoredBytes: []byte("extracted text"), MediaType: "text/plain",
+	if _, err := s.Register(t.Context(), Registration{
+		StoredBytes: []byte("extracted text"), MediaType: "text/plain",
 		Source:  SourceMeta{URI: "https://example.com/p", Kind: "web", SrcHash: "h-web", Extraction: "readability"},
 		Chunks:  []Chunk{{Ordinal: 0, Text: "extracted text"}},
-		RawBlob: raw}); err != nil {
+		RawBlob: raw,
+	}); err != nil {
 		t.Fatal(err)
 	}
 	sum := sha256.Sum256(raw)

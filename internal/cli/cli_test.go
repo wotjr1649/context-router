@@ -337,9 +337,11 @@ func TestRunPurge_E2E_OlderThanForce(t *testing.T) {
 	if err != nil {
 		t.Fatalf("store.Open: %v", err)
 	}
-	if _, err := st.Register(t.Context(), store.Registration{StoredBytes: []byte("purge me"), MediaType: "text/plain",
+	if _, err := st.Register(t.Context(), store.Registration{
+		StoredBytes: []byte("purge me"), MediaType: "text/plain",
 		Source: store.SourceMeta{URI: "/purge.txt", Kind: "file", SrcHash: "h-purge"},
-		Chunks: []store.Chunk{{Ordinal: 0, Text: "purge me"}}}); err != nil {
+		Chunks: []store.Chunk{{Ordinal: 0, Text: "purge me"}},
+	}); err != nil {
 		t.Fatalf("register: %v", err)
 	}
 	if err := st.Close(); err != nil {
@@ -389,9 +391,11 @@ func TestRunPurge_E2E_MismatchLeavesDataIntact(t *testing.T) {
 	if err != nil {
 		t.Fatalf("store.Open: %v", err)
 	}
-	if _, err := st.Register(t.Context(), store.Registration{StoredBytes: []byte("do not touch"), MediaType: "text/plain",
+	if _, err := st.Register(t.Context(), store.Registration{
+		StoredBytes: []byte("do not touch"), MediaType: "text/plain",
 		Source: store.SourceMeta{URI: "/keep.txt", Kind: "file", SrcHash: "h-keep"},
-		Chunks: []store.Chunk{{Ordinal: 0, Text: "do not touch"}}}); err != nil {
+		Chunks: []store.Chunk{{Ordinal: 0, Text: "do not touch"}},
+	}); err != nil {
 		t.Fatalf("register: %v", err)
 	}
 	if err := st.Close(); err != nil {
@@ -438,9 +442,11 @@ func TestRunPurge_E2E_GCOnlyNoConfirm(t *testing.T) {
 	if err != nil {
 		t.Fatalf("store.Open: %v", err)
 	}
-	if _, err := st.Register(t.Context(), store.Registration{StoredBytes: body, MediaType: "text/plain",
+	if _, err := st.Register(t.Context(), store.Registration{
+		StoredBytes: body, MediaType: "text/plain",
 		Source: store.SourceMeta{URI: "/kept.txt", Kind: "file", SrcHash: "h-kept"},
-		Chunks: []store.Chunk{{Ordinal: 0, Text: string(body)}}}); err != nil {
+		Chunks: []store.Chunk{{Ordinal: 0, Text: string(body)}},
+	}); err != nil {
 		t.Fatalf("register: %v", err)
 	}
 	if err := st.Close(); err != nil {
@@ -511,9 +517,11 @@ func TestRunPurge_All_ContextCanceledStopsBeforeAnyDeletion(t *testing.T) {
 		if err != nil {
 			t.Fatalf("store.Open: %v", err)
 		}
-		if _, err := st.Register(t.Context(), store.Registration{StoredBytes: []byte("data"), MediaType: "text/plain",
+		if _, err := st.Register(t.Context(), store.Registration{
+			StoredBytes: []byte("data"), MediaType: "text/plain",
 			Source: store.SourceMeta{URI: "/d.txt", Kind: "file", SrcHash: "h"},
-			Chunks: []store.Chunk{{Ordinal: 0, Text: "data"}}}); err != nil {
+			Chunks: []store.Chunk{{Ordinal: 0, Text: "data"}},
+		}); err != nil {
 			t.Fatalf("register: %v", err)
 		}
 		if err := st.Close(); err != nil {

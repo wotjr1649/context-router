@@ -68,7 +68,8 @@ func indexCorpus(t *testing.T) (*store.Store, string, ingest.Report) {
 func chunkCountsBySource(t *testing.T, st *store.Store) map[string]int {
 	t.Helper()
 	rows, err := st.Reader().Query(
-		`SELECT s.uri, COUNT(*) FROM chunks c JOIN sources s ON s.artifact_id = c.artifact_id GROUP BY s.uri`)
+		`SELECT s.uri, COUNT(*) FROM chunks c JOIN sources s ON s.artifact_id = c.artifact_id GROUP BY s.uri`,
+	)
 	if err != nil {
 		t.Fatal(err)
 	}

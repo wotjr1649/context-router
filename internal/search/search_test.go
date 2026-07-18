@@ -30,8 +30,10 @@ func seedT(t *testing.T) *store.Store {
 		_, err := st.Register(t.Context(), store.Registration{
 			StoredBytes: []byte(d.text), MediaType: "text/plain", Redaction: "none",
 			Source: store.SourceMeta{URI: d.uri, Kind: "file", SrcHash: d.hash},
-			Chunks: []store.Chunk{{Ordinal: 0, ByteStart: 0, ByteEnd: int64(len(d.text)),
-				LineStart: 1, LineEnd: 1, Text: d.text}},
+			Chunks: []store.Chunk{{
+				Ordinal: 0, ByteStart: 0, ByteEnd: int64(len(d.text)),
+				LineStart: 1, LineEnd: 1, Text: d.text,
+			}},
 		})
 		if err != nil {
 			t.Fatal(err)
@@ -85,8 +87,10 @@ func regOne(t *testing.T, st *store.Store, uri, hash, text string) {
 	_, err := st.Register(t.Context(), store.Registration{
 		StoredBytes: []byte(text), MediaType: "text/plain", Redaction: "none",
 		Source: store.SourceMeta{URI: uri, Kind: "file", SrcHash: hash},
-		Chunks: []store.Chunk{{Ordinal: 0, ByteStart: 0, ByteEnd: int64(len(text)),
-			LineStart: 1, LineEnd: 1, Text: text}},
+		Chunks: []store.Chunk{{
+			Ordinal: 0, ByteStart: 0, ByteEnd: int64(len(text)),
+			LineStart: 1, LineEnd: 1, Text: text,
+		}},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -374,8 +378,10 @@ func TestQuery_SourceCoordsExact(t *testing.T) {
 	if _, err := st.Register(t.Context(), store.Registration{
 		StoredBytes: []byte(inline), MediaType: "text/plain", Redaction: "none",
 		Source: store.SourceMeta{URI: "inline:notes", Kind: "inline", SrcHash: "hi"},
-		Chunks: []store.Chunk{{Ordinal: 0, ByteStart: 0, ByteEnd: int64(len(inline)),
-			LineStart: 1, LineEnd: 1, Text: inline}},
+		Chunks: []store.Chunk{{
+			Ordinal: 0, ByteStart: 0, ByteEnd: int64(len(inline)),
+			LineStart: 1, LineEnd: 1, Text: inline,
+		}},
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -383,8 +389,10 @@ func TestQuery_SourceCoordsExact(t *testing.T) {
 	if _, err := st.Register(t.Context(), store.Registration{
 		StoredBytes: []byte(secret), MediaType: "text/plain", Redaction: "spans",
 		Source: store.SourceMeta{URI: "/secret.txt", Kind: "file", SrcHash: "hs"},
-		Chunks: []store.Chunk{{Ordinal: 0, ByteStart: 0, ByteEnd: int64(len(secret)),
-			LineStart: 1, LineEnd: 1, Text: secret}},
+		Chunks: []store.Chunk{{
+			Ordinal: 0, ByteStart: 0, ByteEnd: int64(len(secret)),
+			LineStart: 1, LineEnd: 1, Text: secret,
+		}},
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -451,9 +459,11 @@ func TestQuery_HitSourceDeterministicMultiSource(t *testing.T) {
 	}
 	t.Cleanup(func() { st.Close() })
 	body := "sharedbody multisource marker text"
-	reg := store.Registration{StoredBytes: []byte(body), MediaType: "text/plain",
+	reg := store.Registration{
+		StoredBytes: []byte(body), MediaType: "text/plain",
 		Source: store.SourceMeta{URI: "/z-later.txt", Kind: "file", SrcHash: "hz"},
-		Chunks: []store.Chunk{{Ordinal: 0, ByteStart: 0, ByteEnd: int64(len(body)), LineStart: 1, LineEnd: 1, Text: body}}}
+		Chunks: []store.Chunk{{Ordinal: 0, ByteStart: 0, ByteEnd: int64(len(body)), LineStart: 1, LineEnd: 1, Text: body}},
+	}
 	if _, err := st.Register(t.Context(), reg); err != nil {
 		t.Fatal(err)
 	}
