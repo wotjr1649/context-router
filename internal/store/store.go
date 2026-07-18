@@ -118,7 +118,9 @@ func Open(dir string, readOnly bool) (*Store, error) {
 		l, err := sql.Open("sqlite", "file:"+filepath.ToSlash(filepath.Join(dir, "ledger.db"))+pragmas)
 		if err == nil {
 			l.SetMaxOpenConns(1)
-			l.Exec(`CREATE TABLE IF NOT EXISTS ledger(
+			// ledger는 best-effort 보조 DB(Store 계약 미포함, Close와 동일 취급) — 테이블 생성
+			// 실패해도 이후 ledger insert들이 그냥 계속 실패할 뿐 Store 본체 동작에는 영향 없다.
+			_, _ = l.Exec(`CREATE TABLE IF NOT EXISTS ledger(
 				id INTEGER PRIMARY KEY, ts INTEGER NOT NULL, tool TEXT NOT NULL,
 				bytes_stored INTEGER NOT NULL DEFAULT 0, bytes_returned INTEGER NOT NULL DEFAULT 0,
 				duration_ms INTEGER NOT NULL DEFAULT 0)`)
@@ -190,7 +192,7 @@ func (s *Store) applySchemaV1() error {
 		return err
 	}
 	if _, err := tx.Exec(schemaV1); err != nil {
-		tx.Rollback()
+		_ = tx.Rollback() // 커밋 전이라 무해 — 원 오류(err)만 반환
 		return err
 	}
 	return tx.Commit()
@@ -348,7 +350,7 @@ func (s *Store) runTx(ctx context.Context, fn func(tx *sql.Tx) error) error {
 		return err
 	}
 	if err := fn(tx); err != nil {
-		tx.Rollback()
+		_ = tx.Rollback() // 커밋 전이라 무해 — 원 오류(err)만 반환
 		return err
 	}
 	return tx.Commit()

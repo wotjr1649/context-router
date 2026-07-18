@@ -722,13 +722,17 @@ func Run(ctx context.Context, st *store.Store, projectRoot string, allowPaths []
 
 	var items []workItem
 	if info.IsDir() {
-		items, err = collect(ctx, real, foldedRoots, projectRoot, req, maxBytes)
+		// relDisplay는 realProjectRoot(심링크 해석됨)를 써야 한다 — raw projectRoot를 쓰면
+		// macOS `/var`→`/private/var`에서 real(항상 해석됨)과 기준이 어긋나 SkipEntry.Path가
+		// "../../.../private/var/..."처럼 길게 새어나가 프로젝트 루트 절대경로 구조를
+		// 노출한다(3-OS CI 최초 실측 발견, relDisplay의 "절대경로 노출 금지" 계약 위반).
+		items, err = collect(ctx, real, foldedRoots, realProjectRoot, req, maxBytes)
 		if err != nil {
 			return Report{}, err
 		}
 	} else {
 		base := filepath.Base(real)
-		rel := relDisplay(projectRoot, real)
+		rel := relDisplay(realProjectRoot, real)
 		var it workItem
 		switch {
 		case DeniedFilename(rel) || DeniedFilename(real):
