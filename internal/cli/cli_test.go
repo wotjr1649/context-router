@@ -414,6 +414,60 @@ func TestRunPurge_E2E_GCOnlyNoConfirm(t *testing.T) {
 	}
 }
 
+// TestRunPurge_All_ContextCanceledStopsBeforeAnyDeletion: --all로 프로젝트 2개를 대상할 때
+// 이미 취소된 ctx를 주면 순회 첫 반복에서 즉시 멈춰야 한다(설계 §7 review 항목 — 다중 프로젝트
+// 순회의 주기적 ctx 검사) — 오류를 반환하고, 두 프로젝트 중 어느 쪽도 삭제되지 않아야 한다.
+// force=true로 확인 자체는 통과시켜(비TTY) 루프 진입 이후의 취소 검사만 순수하게 검증한다.
+func TestRunPurge_All_ContextCanceledStopsBeforeAnyDeletion(t *testing.T) {
+	storeRoot := t.TempDir()
+	ids := make([]string, 2)
+	for i := range ids {
+		projectRoot := t.TempDir()
+		canon, err := ident.Canonicalize(projectRoot)
+		if err != nil {
+			t.Fatalf("canonicalize: %v", err)
+		}
+		ids[i] = canon.ProjectID
+		projDir := filepath.Join(storeRoot, "projects", canon.ProjectID)
+		st, err := store.Open(projDir, false)
+		if err != nil {
+			t.Fatalf("store.Open: %v", err)
+		}
+		if _, err := st.Register(t.Context(), store.Registration{StoredBytes: []byte("data"), MediaType: "text/plain",
+			Source: store.SourceMeta{URI: "/d.txt", Kind: "file", SrcHash: "h"},
+			Chunks: []store.Chunk{{Ordinal: 0, Text: "data"}}}); err != nil {
+			t.Fatalf("register: %v", err)
+		}
+		if err := st.Close(); err != nil {
+			t.Fatalf("close: %v", err)
+		}
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	var out bytes.Buffer
+	err := runPurge(ctx, failReader{}, &out, storeRoot, []string{"--all", "--force"}, false)
+	if err == nil {
+		t.Fatal("want error for canceled context, got nil")
+	}
+
+	for _, id := range ids {
+		projDir := filepath.Join(storeRoot, "projects", id)
+		st, err := store.Open(projDir, true)
+		if err != nil {
+			t.Fatalf("reopen %s: %v", id, err)
+		}
+		var n int
+		if err := st.Reader().QueryRow("SELECT count(*) FROM sources").Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		st.Close()
+		if n != 1 {
+			t.Fatalf("project %s: sources=%d want 1(취소로 무삭제여야 함)", id, n)
+		}
+	}
+}
+
 // TestRunStats_Local: 임시 store에 LedgerAppend 3건(도구 2종)을 넣고 Run(ctx,"stats",...)을
 // 호출해 로컬 ledger 집계 표를 확인한다(설계 §6) — 두 도구명 모두·"bytes suppressed" 고정
 // 문구 포함, "token"/"$" 문자열은 어디에도 없어야 한다(토큰·달러 환산·절약률 주장 금지,
