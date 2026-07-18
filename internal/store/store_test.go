@@ -56,6 +56,24 @@ func TestOpen_PragmasAndSchema(t *testing.T) {
 	}
 }
 
+// TestCheckFTSIntegrity_DetectsContentDrift: 최종리뷰 F7 — rank=1을 넘기면 FTS5가
+// external-content table(chunks)과의 대조까지 수행한다. 정상 경로에선 schemaV1의
+// AFTER INSERT/DELETE/UPDATE 트리거가 chunks↔FTS를 항상 동기화하므로 드리프트가 생길 수
+// 없다 — 그래서 존재하지 않는 rowid를 가리키는 FTS 엔트리를 트리거 밖에서 직접 삽입해
+// 인위적으로 드리프트를 만든다(트리거가 관여하는 정상 chunks INSERT/DELETE 대신, 스키마
+// 자체가 허용하는 수동 INSERT INTO fts_porter(rowid,...) 형태 — chunks_ai 트리거와 동일
+// 문형). rank=1 integrity-check는 이를 잡아 실패해야 한다(rank 생략=0은 FTS 내부 구조만
+// 봐서 이 드리프트를 통과시킨다).
+func TestCheckFTSIntegrity_DetectsContentDrift(t *testing.T) {
+	s := openT(t)
+	if _, err := s.writer.Exec(`INSERT INTO fts_porter(rowid, title, text) VALUES(999999, 'ghost', 'ghost text')`); err != nil {
+		t.Fatalf("inject drift: %v", err)
+	}
+	if err := s.checkFTSIntegrity(t.Context()); err == nil {
+		t.Fatal("want error — rank=1 external-content 대조가 드리프트를 못 잡음(F7 회귀)")
+	}
+}
+
 // TestOpen_UnixPermissions: α4 — store 루트·artifacts·blob 해시프리픽스 디렉터리는 0700,
 // blob 파일은 0600(민감 콘텐츠 소유자 전용). Windows는 perm bit 미지원이라 skip.
 func TestOpen_UnixPermissions(t *testing.T) {
@@ -700,9 +718,12 @@ func runConcurrentOpenChild() int {
 }
 
 // TestOpen_ConcurrentFirstMigration: 신규 store 디렉터리 하나에 서브프로세스 2개가 동시에
-// 최초 Open(=최초 마이그레이션)을 개시했을 때 둘 다 성공해야 한다. busy_timeout이
-// journal_mode(WAL)보다 먼저 적용되지 않으면 timeout 0 상태에서 WAL 전환이 경합해
-// SQLITE_BUSY가 난다(게이트 7 심층, 세션01 Task9 발견). reps회 반복해 레이스 확률 확보.
+// 최초 Open(=최초 마이그레이션)을 개시했을 때 둘 다 성공해야 한다. 최초 WAL 전환 시
+// SQLite의 wal-index recovery 락 경로(WAL_RECOVER_LOCK)는 busy_timeout(busy handler)을
+// 거치지 않고 SQLITE_BUSY를 즉시 반환한다(실제 원인 — 최종리뷰 F10, DSN _pragma 순서
+// 문제라는 이전 서술은 반증됨. lockStore 주석 참조) — Open()의 advisory lock(lockStore)
+// 으로 직렬화해 근본 수정했다(게이트 7 심층, 세션01 Task9 발견). reps회 반복해 레이스
+// 확률 확보.
 func TestOpen_ConcurrentFirstMigration(t *testing.T) {
 	exe, err := os.Executable()
 	if err != nil {
@@ -896,10 +917,13 @@ func TestRegister_TwoProcessCASRace(t *testing.T) {
 
 // runKillWriteChild: 게이트7 심층(P1b, Codex 교차리뷰) 자식 — 대량 Register 루프(각 호출이
 // 자신의 BEGIN IMMEDIATE 트랜잭션, §3.5)를 돈다. 부모가 도중에 강제 kill할 것을 전제로 하며,
-// 끝까지 완주해도(kill이 너무 늦었을 뿐) 무해하다.
+// 끝까지 완주해도(kill이 너무 늦었을 뿐) 무해하다. 첫 커밋 성공 직후 CTR_TEST_CHILD_READY
+// 경로에 readiness 파일을 써 부모에게 알린다(최종리뷰 F8) — 부모가 고정 지연 대신 이
+// 신호를 기다렸다 kill해야 "커밋 0건"으로 vacuous 통과하는 경우를 구조적으로 배제할 수 있다.
 func runKillWriteChild() int {
 	dir := os.Getenv("CTR_TEST_CHILD_DIR")
 	signal := os.Getenv("CTR_TEST_CHILD_SIGNAL")
+	ready := os.Getenv("CTR_TEST_CHILD_READY")
 	n, err := strconv.Atoi(os.Getenv("CTR_TEST_CHILD_ITERS"))
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "iters parse:", err)
@@ -926,6 +950,12 @@ func runKillWriteChild() int {
 			fmt.Fprintln(os.Stderr, "register", i, ":", err)
 			return 1
 		}
+		if i == 0 {
+			if err := os.WriteFile(ready, []byte("1"), 0o600); err != nil {
+				fmt.Fprintln(os.Stderr, "ready write:", err)
+				return 1
+			}
+		}
 	}
 	return 0
 }
@@ -934,7 +964,11 @@ func runKillWriteChild() int {
 // Register 루프 도중 부모의 강제 kill(SIGKILL 상당/TerminateProcess)을 맞아도, 재오픈 시
 // quick_check·FTS integrity-check가 통과하고 이미 커밋된 행은 완전한 형태로 읽혀야 한다
 // (§3.5 단일 트랜잭션 계약 — 부분 반영 없음. lockStore 주석대로 커널이 advisory lock을
-// 자동 해제하므로 재오픈이 멎지 않는다).
+// 자동 해제하므로 재오픈이 멎지 않는다). 최종리뷰 F8: 예전엔 signal 이후 고정 50ms만
+// 기다려 kill했는데, 느린 CI에서는 그 50ms 안에 자식이 store Open조차 못 끝내 committed==0
+// 으로 vacuous 통과(kill mid-transaction을 실제로 검증하지 못함)할 수 있었다. 이제는
+// 자식의 첫 커밋 성공 readiness 신호를 폴링해 그 이후에만 kill하고, committed가 반드시
+// 0보다 크고 n보다 작다는 것을 하드 단언한다.
 func TestOpen_SurvivesWriteKillMidLoop(t *testing.T) {
 	exe, err := os.Executable()
 	if err != nil {
@@ -942,12 +976,14 @@ func TestOpen_SurvivesWriteKillMidLoop(t *testing.T) {
 	}
 	storeDir := t.TempDir()
 	signal := filepath.Join(t.TempDir(), "start.signal")
+	ready := filepath.Join(t.TempDir(), "first-commit.ready")
 	const n = 5000
 
 	cmd := exec.Command(exe)
 	cmd.Env = append(os.Environ(),
 		"CTR_TEST_CHILD=1", "CTR_TEST_CHILD_MODE=kill-write",
 		"CTR_TEST_CHILD_DIR="+storeDir, "CTR_TEST_CHILD_SIGNAL="+signal,
+		"CTR_TEST_CHILD_READY="+ready,
 		fmt.Sprintf("CTR_TEST_CHILD_ITERS=%d", n))
 	var errBuf bytes.Buffer
 	cmd.Stderr = &errBuf
@@ -958,7 +994,21 @@ func TestOpen_SurvivesWriteKillMidLoop(t *testing.T) {
 	if err := os.WriteFile(signal, []byte("go"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	time.Sleep(50 * time.Millisecond) // n=5000회 완주보다 훨씬 짧은 창 — 루프 도중 kill 목표
+
+	// readiness(첫 커밋 성공) 폴링 — 고정 지연 대신 실제 진행 신호를 기다린다.
+	readyDeadline := time.Now().Add(10 * time.Second)
+	for {
+		if _, statErr := os.Stat(ready); statErr == nil {
+			break
+		}
+		if time.Now().After(readyDeadline) {
+			_ = cmd.Process.Kill()
+			_, _ = cmd.Process.Wait()
+			t.Fatalf("첫 커밋 readiness 신호 대기 타임아웃 — child stderr: %s", errBuf.String())
+		}
+		time.Sleep(time.Millisecond)
+	}
+	time.Sleep(10 * time.Millisecond) // flake 방지 소폭 지연 — n=5000 완주에는 한참 못 미친다.
 	if err := cmd.Process.Kill(); err != nil {
 		t.Fatalf("kill: %v", err)
 	}
@@ -988,8 +1038,10 @@ func TestOpen_SurvivesWriteKillMidLoop(t *testing.T) {
 		t.Fatalf("count sources: %v", err)
 	}
 	t.Logf("kill mid-loop: %d/%d rows committed before kill", committed, n)
-	if committed > n {
-		t.Fatalf("committed=%d > iters=%d — 불가능(무결성 훼손 의심)", committed, n)
+	// 최종리뷰 F8: readiness 신호를 기다렸다 kill했으므로 committed==0은 구조적으로
+	// 불가능하고(첫 커밋 후에만 kill), n 완주도 목표가 아니다(하드 단언, 고정 시간 추측 아님).
+	if committed <= 0 || committed >= n {
+		t.Fatalf("committed=%d want 0 < committed < %d (readiness 이후 kill인데 이 범위를 벗어남)", committed, n)
 	}
 
 	rows, err := s.Reader().Query("SELECT uri, artifact_id FROM sources WHERE uri LIKE '/kill-race-%'")

@@ -691,10 +691,13 @@ func (s *Store) PurgeOlderThan(ctx context.Context, cutoffUnix int64) (sources, 
 }
 
 // checkFTSIntegrity: fts_porter/fts_trigram 양쪽에 SQLite FTS5 integrity-check 특수 명령을
-// 실행한다(게이트 6) — chunks와 FTS 인덱스가 어긋나면 실패한다.
+// 실행한다(게이트 6) — chunks와 FTS 인덱스가 어긋나면 실패한다. rank=1을 넘긴다(최종리뷰
+// F7) — rank 생략(=0)은 FTS5 내부 구조만 자기검사하고 external-content table(chunks)과의
+// 대조는 하지 않는다. rank가 0이 아니면 SQLite가 그 대조까지 수행해 chunks↔인덱스 행/토큰
+// 드리프트(예: 트리거 누락으로 인덱스만 갱신 안 된 경우)도 잡아낸다.
 func (s *Store) checkFTSIntegrity(ctx context.Context) error {
 	for _, fts := range [2]string{"fts_porter", "fts_trigram"} {
-		if _, err := s.writer.ExecContext(ctx, "INSERT INTO "+fts+"("+fts+") VALUES('integrity-check')"); err != nil {
+		if _, err := s.writer.ExecContext(ctx, "INSERT INTO "+fts+"("+fts+", rank) VALUES('integrity-check', 1)"); err != nil {
 			return fmt.Errorf("store: %s integrity-check 실패: %w", fts, err)
 		}
 	}
@@ -732,7 +735,21 @@ const gcOrphanMinAge = time.Hour
 // reader로 참조 해시 집합을 모은 뒤 os.ReadDir(artifacts/<prefix>/)로 대조한다. 파일명 길이가
 // sha256 hex(64자)가 아니면 blob이 아니라 writeBlob의 임시파일(hash.tmp.pid.seq)이므로 건드리지
 // 않는다. mtime이 gcOrphanMinAge보다 최근인 미참조 파일은 건너뛴다(위 불변식 참조).
+//
+// 삭제 수행 전 lockStore(s.dir)를 획득한다(최종리뷰 F2) — age gate(1h)는 크래시로 남은 고아를
+// 늦게 수거할 뿐, Register가 blob을 배치(writeBlob)하고 커밋하는 그 짧은 창과 GC가 우연히
+// 겹치는 경우까지는 못 막는다: GC가 "DB 참조 없음"으로 읽은 직후 Register가 커밋해버리면 GC는
+// 방금 참조된 blob을 여전히 고아로 보고 지울 수 있어(파일 삭제는 트랜잭션 밖) DB가 없는 blob을
+// 가리키는 손상이 생긴다. Register 자체의 쓰기 트랜잭션은 writer 직렬화(SetMaxOpenConns(1))로
+// 보호되지만 blob 물리 삭제는 그 보호 밖이므로, GC와 blob 배치를 같은 프로세스간 잠금
+// (lockStore)으로 직렬화하는 것이 근본 폐쇄다. age gate는 이중방어로 그대로 유지한다.
 func (s *Store) GCOrphanBlobs(ctx context.Context) (removed int64, err error) {
+	release, err := lockStore(s.dir)
+	if err != nil {
+		return 0, fmt.Errorf("store GCOrphanBlobs: %w", err)
+	}
+	defer release()
+
 	referenced, err := hashesFromQuery(ctx, s.reader, "SELECT content_hash FROM artifacts")
 	if err != nil {
 		return 0, fmt.Errorf("store GCOrphanBlobs: %w", err)
