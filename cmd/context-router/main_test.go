@@ -1,6 +1,9 @@
 package main
 
 import (
+	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -45,4 +48,40 @@ func TestBanner(t *testing.T) {
 	if got2 != want2 {
 		t.Fatalf("banner on-branch=%q want %q", got2, want2)
 	}
+}
+
+func TestCanonicalizeAllowPaths(t *testing.T) {
+	storeRoot := t.TempDir()
+	inside := filepath.Join(storeRoot, "projects", "p1")
+	if err := os.MkdirAll(inside, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	outside := t.TempDir()
+
+	if _, err := canonicalizeAllowPaths([]string{inside}, storeRoot); !errors.Is(err, errAllowPathViolation) {
+		t.Fatalf("inside store-root: err=%v want errAllowPathViolation", err)
+	}
+	got, err := canonicalizeAllowPaths([]string{outside}, storeRoot)
+	if err != nil {
+		t.Fatalf("outside store-root: unexpected err=%v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("got=%v want 1 entry", got)
+	}
+}
+
+func TestStoreRootFor(t *testing.T) {
+	t.Run("flag_wins", func(t *testing.T) {
+		got, err := storeRootFor(serverFlags{StoreRoot: "C:/custom"})
+		if err != nil || got != "C:/custom" {
+			t.Fatalf("got=%q err=%v", got, err)
+		}
+	})
+	t.Run("env_wins_over_default", func(t *testing.T) {
+		t.Setenv("CTR_STORE_ROOT", "C:/from-env")
+		got, err := storeRootFor(serverFlags{})
+		if err != nil || got != "C:/from-env" {
+			t.Fatalf("got=%q err=%v", got, err)
+		}
+	})
 }
