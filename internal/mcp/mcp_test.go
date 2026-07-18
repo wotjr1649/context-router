@@ -553,15 +553,20 @@ func TestCtrTransformRoundTrip(t *testing.T) {
 }
 
 // TestCtrTransformConfigTimeout: Config.TransformTimeout이 registerTransform 핸들러에
-// context.WithTimeout으로 실제 적용되는지 확인한다(계획2 §4 이월 (1)). 매우 짧은 타임아웃 +
-// 스텝 소모가 큰 루프 스크립트(TestCtrTransformCapsMapping과 동형 패턴)로 실행한다.
-// 결정성(Fix Round 1 리뷰 Claude Important): ctr_transform은 TransformInput에 MaxSteps를
-// 노출하지 않아 항상 기본 5,000,000 step budget이 걸린다 — 이 환경(worker 프로세스 기동
-// 자체가 50ms보다 느림)에서는 timeout이 이기지만, spawn이 훨씬 빠른 플랫폼(특히 fork()가
-// 저렴한 Linux CI)에서는 budget이 먼저 소진돼 이길 수 있다. 그 레이스 자체는
-// MaxSteps를 도구가 노출하지 않는 한 없앨 수 없으므로, "타임아웃 kill" 또는 "budget 소진"
-// 둘 중 하나(둘 다 리소스 상한류 오류)면 통과시키고, 대신 응답이 Config 미적용 시 걸릴
-// 기본값(10s)보다 훨씬 짧게 돌아왔는지로 50ms Config가 실제 반영됐음을 방증한다.
+// context.WithTimeout으로 실제 적용되는지 확인한다(계획2 §4 이월 (1)).
+// 결정성(Fix Round 2 — 재리뷰 잔존 1건): 이전 버전(50ms + "timeout 또는 budget 중 하나면
+// 통과")은 registerTransform의 WithTimeout 배선이 통째로 제거돼도 잡지 못했다 — ctx가
+// 무제한이면 Spawn 내부 안전망(defaultWorkerTimeout=10s)만 걸리는데, 이 스크립트(기본
+// 5,000,000 step budget, 100M회 루프)는 budget이 수백 ms 내 소진되므로(worker_test.go의
+// TestSpawn_Timeout이 budget보다 ctx timeout을 먼저 발동시키려 MaxSteps를 2조로 올려야
+// 했던 것이 증거) 배선이 없어도 "budget 소진"으로 통과해버렸다.
+// 그래서 TransformTimeout=1ns로 낮춘다 — WithTimeout 적용 직후 ctx는 사실상 이미
+// 데드라인을 넘긴 상태이므로, Spawn이 스텝을 하나도 실행하기 전에 ctx-deadline 경로로
+// 실패해야 한다(하드웨어 무관 결정론). 코드 리딩으로 확인한 실제 경로(os/exec.Cmd.Start가
+// c.ctx.Done()을 자체 사전 체크하지만, exec.CommandContext가 심어둔 watchCtx 트리킬이
+// 그보다 먼저 발동해 프로세스는 뜨자마자 kill됨) + 5회 반복 실측 전부
+// "[INVALID_ARGUMENT] worker killed (memory/time limit)"로 확인, 이 정확한 형태에 고정한다.
+// 배선이 제거되면 이 케이스는 codeBudgetExceeded가 되므로 그 배제 단언으로 회귀를 잡는다.
 func TestCtrTransformConfigTimeout(t *testing.T) {
 	dir := t.TempDir()
 	canon, err := ident.Canonicalize(dir)
@@ -574,7 +579,7 @@ func TestCtrTransformConfigTimeout(t *testing.T) {
 	}
 	t.Cleanup(func() { st.Close() })
 
-	srv, err := NewServer(Config{Canon: canon, Store: st, SelfExe: testSelfExe(t), TransformTimeout: 50 * time.Millisecond})
+	srv, err := NewServer(Config{Canon: canon, Store: st, SelfExe: testSelfExe(t), TransformTimeout: time.Nanosecond})
 	if err != nil {
 		t.Fatalf("new server: %v", err)
 	}
@@ -599,14 +604,19 @@ func TestCtrTransformConfigTimeout(t *testing.T) {
 		t.Fatalf("call: %v", err)
 	}
 	if !res.IsError {
-		t.Fatalf("want IsError=true for short-timeout/high-step script, got %+v", res)
+		t.Fatalf("want IsError=true for a ctx-already-expired transform call, got %+v", res)
 	}
 	text := res.Content[0].(*mcp.TextContent).Text
-	if !strings.HasPrefix(text, "["+codeInvalidArgument+"]") && !strings.HasPrefix(text, "["+codeBudgetExceeded+"]") {
-		t.Fatalf("want timeout(worker killed)/budget error code, got %q", text)
+	// ③ 명시 배제: budget 소진이면 WithTimeout(1ns) 배선이 제거된 회귀다.
+	if strings.HasPrefix(text, "["+codeBudgetExceeded+"]") {
+		t.Fatalf("got budget-exceeded — TransformTimeout(1ns) wiring이 제거된 것으로 의심됨: %q", text)
+	}
+	// ② ctx-deadline 경로 고유 형태(코드 리딩+5회 실측으로 고정) — worker가 뜨자마자 kill.
+	if !strings.HasPrefix(text, "["+codeInvalidArgument+"]") || !strings.Contains(text, "worker killed") {
+		t.Fatalf("want ctx-deadline kill 형태([%s] ... worker killed), got %q", codeInvalidArgument, text)
 	}
 	if elapsed > 5*time.Second {
-		t.Fatalf("elapsed=%v — want well under the 10s default (TransformTimeout=50ms 미반영 의심)", elapsed)
+		t.Fatalf("elapsed=%v — want well under the 10s default", elapsed)
 	}
 }
 
