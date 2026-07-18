@@ -19,7 +19,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/wotjr1649/context-router/internal/ident"
 	"github.com/wotjr1649/context-router/internal/mcp"
+	"github.com/wotjr1649/context-router/internal/store"
 )
 
 func TestParseFlags(t *testing.T) {
@@ -46,6 +48,17 @@ func TestParseFlags(t *testing.T) {
 				t.Fatalf("enable=%v want %v", got.Enable, tt.want.Enable)
 			}
 		})
+	}
+}
+
+// TestParseFlags_RejectsPositionalArgs: 최종리뷰 F4 — 서브커맨드가 플래그 뒤에 오타로
+// 붙으면(예: "--store-root X doctor") fs.Parse는 이를 소비하지 않고 위치 인자로 남긴다.
+// dispatchCLI는 args[1]("--store-root")이 "-"로 시작하므로 손대지 않고 run()으로
+// 넘기는데, 예전 parseFlags는 이 잔여 위치 인자를 조용히 버려 MCP 서버가 기동해버렸다
+// ("미지 서브커맨드 거부" 원칙과 반대). parseFlags가 명시적으로 거부해야 한다.
+func TestParseFlags_RejectsPositionalArgs(t *testing.T) {
+	if _, err := parseFlags([]string{"--store-root", "X", "doctor"}); err == nil {
+		t.Fatal("want error for trailing positional arg, got nil")
 	}
 }
 
@@ -124,6 +137,81 @@ func TestRun_GlobalProfile_OpenFailureRejectsStart(t *testing.T) {
 	}, &stderr)
 	if err == nil {
 		t.Fatal("want error for missing project store, got nil")
+	}
+}
+
+// TestResolveProjectEntry_StoreIDNotShadowedByCwdDir: 최종리뷰 F5 — cli.purgeProjectID의
+// 동일 회귀 케이스와 대응: cwd에 store ProjectID와 동명의 디렉터리가 우연히 있어도
+// --projects 엔트리는 store 쪽 프로젝트 ID로 확정돼야 한다(예전엔 "구분자 없고 cwd에
+// 동명 디렉터리 존재"를 경로로 오인해 ident.Canonicalize(그 cwd 디렉터리)로 완전히 다른
+// ID를 계산해버렸다).
+func TestResolveProjectEntry_StoreIDNotShadowedByCwdDir(t *testing.T) {
+	storeRoot := t.TempDir()
+	registeredRoot := t.TempDir()
+	canon, err := ident.Canonicalize(registeredRoot)
+	if err != nil {
+		t.Fatalf("canonicalize: %v", err)
+	}
+	id := canon.ProjectID
+	if err := os.MkdirAll(filepath.Join(storeRoot, "projects", id), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	cwdBase := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(cwdBase, id), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	origWD, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(cwdBase); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chdir(origWD) })
+
+	gotID, gotRoot, err := resolveProjectEntry(storeRoot, id)
+	if err != nil {
+		t.Fatalf("resolveProjectEntry: %v", err)
+	}
+	if gotID != id {
+		t.Fatalf("gotID=%q want %q (store ID가 cwd 동명 디렉터리에 가려짐)", gotID, id)
+	}
+	if gotRoot != "" {
+		t.Fatalf("gotRoot=%q want empty(ID 엔트리는 root 상대화 없음)", gotRoot)
+	}
+}
+
+// TestBuildGlobalProjects_DedupesRepeatedEntries: 최종리뷰 F5 — 같은 프로젝트를 경로 형태와
+// ProjectID 형태로 두 번 --projects에 주면 store는 한 번만 열리고 결과에 1개만 남아야
+// 한다(중복 hit 방지).
+func TestBuildGlobalProjects_DedupesRepeatedEntries(t *testing.T) {
+	storeRoot := t.TempDir()
+	projectRoot := t.TempDir()
+	canon, err := ident.Canonicalize(projectRoot)
+	if err != nil {
+		t.Fatalf("canonicalize: %v", err)
+	}
+	projDir := filepath.Join(storeRoot, "projects", canon.ProjectID)
+	st, err := store.Open(projDir, false)
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	projects, err := buildGlobalProjects(context.Background(), storeRoot, []string{projectRoot, canon.ProjectID})
+	if err != nil {
+		t.Fatalf("buildGlobalProjects: %v", err)
+	}
+	defer func() {
+		for _, p := range projects {
+			p.Store.Close()
+		}
+	}()
+	if len(projects) != 1 {
+		t.Fatalf("len(projects)=%d want 1 (중복 --projects가 dedupe되지 않음): %+v", len(projects), projects)
 	}
 }
 

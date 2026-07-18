@@ -56,6 +56,13 @@ func parseFlags(args []string) (serverFlags, error) {
 	if err := fs.Parse(args); err != nil {
 		return serverFlags{}, err
 	}
+	if n := fs.NArg(); n > 0 {
+		// 위치 인자는 허용하지 않는다(최종리뷰 F4) — 그러지 않으면 서브커맨드가 플래그보다
+		// 앞이 아니라 뒤에 오타로 붙은 호출(예: "--store-root X doctor")이 dispatchCLI를
+		// 그냥 통과해(args[0]가 "-"로 시작) MCP 서버가 조용히 기동해버린다("미지 서브커맨드
+		// 거부" 원칙과 반대되는 구멍). 개수만 밝히고 사용자 입력 원문은 에코하지 않는다(§6).
+		return serverFlags{}, fmt.Errorf("ctr: 위치 인자는 허용되지 않습니다 (받은 개수: %d)", n)
+	}
 	f.Profile = strings.Split(profile, ",")
 	if enable != "" {
 		f.Enable = strings.Split(enable, ",")
@@ -146,16 +153,17 @@ func withinRoot(root, p string) bool {
 	return rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
 }
 
-// canonicalizeStoreRoot: storeRoot를 allow-path와 동일한 기준(Abs→EvalSymlinks→Fold)으로
-// canonicalize한다 — 그래야 canonicalizeAllowPaths의 store-root 하위 거부가 심링크로
-// 우회되지 않는다(§4.4). storeRoot는 아직 생성 전일 수 있어 EvalSymlinks의 미존재 오류는
-// 관용 처리(Abs+Fold만 사용).
+// canonicalizeStoreRoot: storeRoot를 allow-path와 동일한 기준(Abs→ident.RealPath→Fold)으로
+// canonicalize한다 — 그래야 canonicalizeAllowPaths의 store-root 하위 거부가 심링크·windows
+// junction으로 우회되지 않는다(§4.4, 최종리뷰 F1 — ident.RealPath는 filepath.EvalSymlinks와
+// 달리 NTFS junction도 실경로로 해석한다). storeRoot는 아직 생성 전일 수 있어 RealPath의
+// 미존재 오류는 관용 처리(Abs+Fold만 사용).
 func canonicalizeStoreRoot(storeRoot string) (string, error) {
 	abs, err := filepath.Abs(storeRoot)
 	if err != nil {
 		return "", fmt.Errorf("ctr: store-root: %w", err)
 	}
-	real, err := filepath.EvalSymlinks(abs)
+	real, err := ident.RealPath(abs)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
 			return ident.Fold(abs), nil
@@ -165,14 +173,14 @@ func canonicalizeStoreRoot(storeRoot string) (string, error) {
 	return ident.Fold(real), nil
 }
 
-// canonicalizeAllowPaths: 각 --allow-path를 canonicalize(Abs→EvalSymlinks→Fold)하고
+// canonicalizeAllowPaths: 각 --allow-path를 canonicalize(Abs→ident.RealPath→Fold)하고
 // store-root 하위면 시작을 거부한다(Task6 이관, 설계 §4.4). storeRoot 인자 자체도
 // (호출자가 canonicalizeStoreRoot를 이미 거쳤든 raw든) 여기서 동일 기준으로
 // 다시 canonicalize한다 — macOS `/var`→`/private/var` 같은 심링크 낀 경로에서
 // storeRoot만 미해석 상태로 비교하면 실제로는 하위인 allow-path를 "무관"으로 오판해
 // store-root 하위 거부(§4.4)가 심링크로 우회된다(3-OS CI 최초 실측 발견).
 func canonicalizeAllowPaths(paths []string, storeRoot string) ([]string, error) {
-	foldedStoreRoot, err := canonicalizeStoreRoot(storeRoot) // 이미 Abs→EvalSymlinks→Fold 반환
+	foldedStoreRoot, err := canonicalizeStoreRoot(storeRoot) // 이미 Abs→RealPath→Fold 반환
 	if err != nil {
 		return nil, err
 	}
@@ -182,7 +190,7 @@ func canonicalizeAllowPaths(paths []string, storeRoot string) ([]string, error) 
 		if err != nil {
 			return nil, fmt.Errorf("ctr: allow-path: %w", err)
 		}
-		real, err := filepath.EvalSymlinks(abs)
+		real, err := ident.RealPath(abs)
 		if err != nil {
 			return nil, fmt.Errorf("ctr: allow-path: %w", err)
 		}
@@ -194,12 +202,23 @@ func canonicalizeAllowPaths(paths []string, storeRoot string) ([]string, error) 
 	return out, nil
 }
 
-// resolveProjectEntry: --projects 엔트리 1개를 판별한다. 경로 구분자(/,\)를 포함하거나
-// 존재하는 디렉터리면 경로로 취급해 ident.Canonicalize로 ProjectID·WorktreeRoot(=root)를
-// 구한다. 그 외는 ProjectID 문자열 그대로 취급하고 root=""를 반환한다(설계 §4.6 — ID
-// 엔트리는 원본 대조·경로 상대화가 제한됨, mcp.GlobalProject.Root 주석 참조).
-func resolveProjectEntry(entry string) (id, root string, err error) {
-	looksLikePath := strings.ContainsAny(entry, `/\`)
+// resolveProjectEntry: --projects 엔트리 1개를 판별한다. 경로 구분자가 없고
+// <storeRoot>/projects/<entry>가 실재하는 디렉터리면 그 자체로 이미 store ID이므로 확정하고
+// 경로 해석을 하지 않는다(최종리뷰 F5 — cli.purgeProjectID의 "ID 우선" 판별과 동형, D13상
+// 서로 다른 패키지라 자체 인터페이스 없이 각자 소유) — 그러지 않으면 cwd에 우연히 동명
+// 디렉터리가 있을 때 store ID가 경로로 오인되어 엉뚱한 프로젝트가 열린다. 그 외에는 기존
+// 로직: 경로 구분자를 포함하거나 존재하는 디렉터리면 경로로 취급해 ident.Canonicalize로
+// ProjectID·WorktreeRoot(=root)를 구한다. 그 외는 ProjectID 문자열 그대로 취급하고 root=""를
+// 반환한다(설계 §4.6 — ID 엔트리는 원본 대조·경로 상대화가 제한됨, mcp.GlobalProject.Root
+// 주석 참조).
+func resolveProjectEntry(storeRoot, entry string) (id, root string, err error) {
+	hasSep := strings.ContainsAny(entry, `/\`)
+	if !hasSep {
+		if fi, statErr := os.Stat(filepath.Join(storeRoot, "projects", entry)); statErr == nil && fi.IsDir() {
+			return entry, "", nil // 이미 store ID로 확정 — 경로 해석 생략
+		}
+	}
+	looksLikePath := hasSep
 	if !looksLikePath {
 		if fi, statErr := os.Stat(entry); statErr == nil && fi.IsDir() {
 			looksLikePath = true
@@ -216,9 +235,12 @@ func resolveProjectEntry(entry string) (id, root string, err error) {
 }
 
 // buildGlobalProjects: entries 각각을 resolveProjectEntry로 판별해 read-only store로 연다.
-// store.Open(dir, true)는 실제 DB 파일을 지연 연결하므로(디렉터리/DB 없음이어도 즉시
-// 에러가 안 남) PingContext로 강제 연결해 열기 실패를 즉시 드러낸다. 하나라도 실패하면
-// 이미 연 store를 모두 Close하고 시작을 거부한다(fail-closed, 설계 §4.6/§5.4).
+// ProjectID 기준으로 중복 엔트리를 먼저 걸러낸다(최종리뷰 F5) — 그러지 않으면 같은
+// 프로젝트를 --projects에 두 번 주었을 때 store가 두 번 열리고 global-search 결과에도
+// 같은 프로젝트의 hit이 중복 출현한다. store.Open(dir, true)는 실제 DB 파일을 지연
+// 연결하므로(디렉터리/DB 없음이어도 즉시 에러가 안 남) PingContext로 강제 연결해 열기
+// 실패를 즉시 드러낸다. 하나라도 실패하면 이미 연 store를 모두 Close하고 시작을
+// 거부한다(fail-closed, 설계 §4.6/§5.4).
 func buildGlobalProjects(ctx context.Context, storeRoot string, entries []string) ([]mcp.GlobalProject, error) {
 	projects := make([]mcp.GlobalProject, 0, len(entries))
 	closeAll := func() {
@@ -226,12 +248,17 @@ func buildGlobalProjects(ctx context.Context, storeRoot string, entries []string
 			p.Store.Close()
 		}
 	}
+	seen := make(map[string]bool, len(entries))
 	for _, entry := range entries {
-		id, root, err := resolveProjectEntry(entry)
+		id, root, err := resolveProjectEntry(storeRoot, entry)
 		if err != nil {
 			closeAll()
 			return nil, fmt.Errorf("ctr: global-search: %w", err)
 		}
+		if seen[id] {
+			continue
+		}
+		seen[id] = true
 		st, err := store.Open(filepath.Join(storeRoot, "projects", id), true)
 		if err == nil {
 			err = st.Reader().PingContext(ctx)
