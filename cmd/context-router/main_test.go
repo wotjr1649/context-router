@@ -184,6 +184,31 @@ func TestStoreRootFor(t *testing.T) {
 	})
 }
 
+// TestMainDispatch_CLI: doctor 서브커맨드가 dispatchCLI를 거쳐 storeRoot(미생성)·프로젝트
+// 디렉터리에서 정상 종료하는지 확인한다(Task3, 설계 §7). run()이 아닌 dispatchCLI를 직접
+// 호출해 os.Exit 경로 없이 검증한다.
+func TestMainDispatch_CLI(t *testing.T) {
+	proj := t.TempDir()
+	storeRoot := filepath.Join(t.TempDir(), "storeroot") // 의도적 미생성
+	args := []string{"context-router", "doctor", "--root", proj, "--store-root", storeRoot}
+	handled, err := dispatchCLI(context.Background(), args)
+	if !handled {
+		t.Fatal("want handled=true for doctor subcommand")
+	}
+	if err != nil {
+		t.Fatalf("doctor dispatch err=%v", err)
+	}
+}
+
+// TestMainDispatch_NotHandled: 서브커맨드가 아닌(MCP 서버용) 인자는 dispatchCLI가 손대지
+// 않아야 한다 — 미지 단어가 cli로 잘못 흡수되지 않는지의 반대쪽 보증(설계 §7).
+func TestMainDispatch_NotHandled(t *testing.T) {
+	handled, err := dispatchCLI(context.Background(), []string{"context-router", "--profile", "search"})
+	if handled {
+		t.Fatalf("want handled=false, err=%v", err)
+	}
+}
+
 // --- E2E stdio 스모크 (Task 9, 설계 §12-7·10 기초) ---
 //
 // 손수 프레이밍한 JSON-RPC로 실바이너리와 stdin/stdout 파이프를 주고받는다(SDK

@@ -17,6 +17,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/wotjr1649/context-router/internal/cli"
 	"github.com/wotjr1649/context-router/internal/ident"
 	"github.com/wotjr1649/context-router/internal/mcp"
 	"github.com/wotjr1649/context-router/internal/store"
@@ -325,6 +326,42 @@ func run(ctx context.Context, args []string, stderr io.Writer) error {
 // 먼저 분기해야 한다 — stdout은 Result JSON 1건이어야 하고 배너·로그가 섞이면 안 된다.
 const transformWorkerArg = "__transform-worker"
 
+// cliSubcommands: internal/cli가 처리하는 4개 서브커맨드 이름(설계 §7). 이 중 하나가 아닌
+// 첫 인자는 dispatchCLI의 관심사가 아니다 — MCP 서버 플래그로 그대로 흘려보낸다.
+var cliSubcommands = map[string]bool{"doctor": true, "stats": true, "purge": true, "upgrade": true}
+
+// dispatchCLI: args[1](=os.Args[1])이 cli 서브커맨드 4개 중 하나면 storeRoot·projectRoot를
+// 기존 storeRootFor+canonicalizeStoreRoot로 결정해 cli.Run에 위임한다. handled=false면
+// 호출자가 평소대로 MCP 서버 경로(run)로 진행해야 한다 — cli는 storeRoot를 재도출하지
+// 않는다(설계 §7 Produces).
+func dispatchCLI(ctx context.Context, args []string) (handled bool, err error) {
+	if len(args) < 2 || !cliSubcommands[args[1]] {
+		return false, nil
+	}
+	sub := args[1]
+	subArgs := args[2:]
+
+	f, err := parseFlags(subArgs)
+	if err != nil {
+		return true, err
+	}
+	root := f.Root
+	if root == "" {
+		if root, err = os.Getwd(); err != nil {
+			return true, err
+		}
+	}
+	storeRoot, err := storeRootFor(f)
+	if err != nil {
+		return true, err
+	}
+	storeRoot, err = canonicalizeStoreRoot(storeRoot)
+	if err != nil {
+		return true, err
+	}
+	return true, cli.Run(ctx, sub, subArgs, storeRoot, root, version, os.Stdout, os.Stderr)
+}
+
 func main() {
 	if len(os.Args) > 1 && os.Args[1] == transformWorkerArg {
 		if err := transform.RunWorker(os.Stdin, os.Stdout); err != nil {
@@ -336,6 +373,15 @@ func main() {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
+
+	if handled, err := dispatchCLI(ctx, os.Args); handled {
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "ctr:", err)
+			os.Exit(1)
+		}
+		return
+	}
+
 	if err := run(ctx, os.Args[1:], os.Stderr); err != nil {
 		fmt.Fprintln(os.Stderr, "ctr:", err)
 		os.Exit(1)

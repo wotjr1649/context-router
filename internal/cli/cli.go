@@ -1,0 +1,226 @@
+// Package cli — doctor·upgrade 서브커맨드(stats·purge는 Task4/5까지 임시 placeholder) 진입점. 설계서 §7.
+package cli
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"os"
+	"path/filepath"
+	"regexp"
+	"time"
+
+	"github.com/wotjr1649/context-router/internal/ident"
+	"github.com/wotjr1649/context-router/internal/store"
+)
+
+// releaseURL: 컴파일타임 상수 — upgrade가 응답에서 취하는 것은 tag_name 버전 문자열뿐이다.
+// 응답이 제공하는 URL·명령·기타 필드는 절대 출력하지 않는다(위생, 설계 §7).
+const releaseURL = "https://api.github.com/repos/wotjr1649/context-router/releases/latest"
+
+// Run: cli 서브커맨드 단일 진입점. storeRoot·projectRoot는 main이 이미 결정해 넘긴다(cli는
+// 재도출하지 않는다 — 설계서 §7 Produces). sub은 main이 4개 이름 중 하나임을 이미 확인했다.
+func Run(ctx context.Context, sub string, args []string, storeRoot, projectRoot, version string, stdout, stderr io.Writer) error {
+	switch sub {
+	case "doctor":
+		return runDoctor(ctx, stdout, storeRoot, projectRoot)
+	case "upgrade":
+		client := &http.Client{Timeout: 10 * time.Second}
+		return runUpgrade(stdout, client, releaseURL, version)
+	case "stats", "purge":
+		return fmt.Errorf("cli: 미구현 서브커맨드: %s", sub)
+	default:
+		return fmt.Errorf("cli: 미지 서브커맨드: %s", sub)
+	}
+}
+
+// tagNameRe: tag_name 위생 검증(설계 §7) — 영숫자·점·플러스·하이픈만, 1~64자.
+var tagNameRe = regexp.MustCompile(`^v?[0-9A-Za-z.+-]{1,64}$`)
+
+// runUpgrade: releaseURL에 GET → JSON tag_name만 취해 current/latest 두 줄 + 설치 안내
+// 1줄을 출력한다. 응답이 제공하는 다른 필드(URL·명령 등)는 절대 읽지도 출력하지도 않는다
+// (§7 위생). 네트워크 실패·타임아웃·비200·파싱실패·tag_name 위생검증 실패는 전부 동일하게
+// "current만 출력하고 nil 반환"으로 수렴한다 — upgrade는 진단 도구가 아니라 안내 도구이므로
+// 이런 실패를 사용자 오류로 다루지 않는다(정상 종료).
+func runUpgrade(w io.Writer, client *http.Client, releaseURL, current string) error {
+	printCurrent := func() { fmt.Fprintf(w, "current: v%s\n", current) }
+
+	resp, err := client.Get(releaseURL)
+	if err != nil {
+		printCurrent()
+		return nil
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		printCurrent()
+		return nil
+	}
+	var body struct {
+		TagName string `json:"tag_name"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil || !tagNameRe.MatchString(body.TagName) {
+		printCurrent()
+		return nil
+	}
+	printCurrent()
+	fmt.Fprintf(w, "latest: %s\n", body.TagName)
+	fmt.Fprintln(w, "install: download from the project releases page and replace the binary")
+	return nil
+}
+
+// probeWritable: dir에 임시 파일을 만들고 즉시 지워 쓰기 가능 여부만 확인한다 — dir 자체를
+// 생성하지 않는다(doctor no-create 원칙).
+func probeWritable(dir string) bool {
+	f, err := os.CreateTemp(dir, ".ctr-doctor-*")
+	if err != nil {
+		return false
+	}
+	name := f.Name()
+	f.Close()
+	os.Remove(name)
+	return true
+}
+
+// probeFTS5: reader(열려있는 content.db 연결)가 있으면 그 커넥션 하나에서 TEMP 가상 테이블을
+// 만들고 지워 FTS5 가용성을 확인한다(같은 물리 커넥션이어야 TEMP 테이블이 보인다 — sql.DB
+// 커넥션 풀에서 매 Exec가 다른 커넥션을 골라줄 수 있으므로 db.Conn으로 하나를 고정한다).
+// reader==nil(content.db 미존재)이면 :memory: 연결로 대신 확인한다(설계 §7).
+func probeFTS5(ctx context.Context, reader *sql.DB) error {
+	db := reader
+	if db == nil {
+		var err error
+		db, err = sql.Open("sqlite", ":memory:")
+		if err != nil {
+			return fmt.Errorf("fts5 probe: %w", err)
+		}
+		defer db.Close()
+	}
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		return fmt.Errorf("fts5 probe: %w", err)
+	}
+	defer conn.Close()
+	if _, err := conn.ExecContext(ctx, "CREATE VIRTUAL TABLE temp.probe USING fts5(x)"); err != nil {
+		return fmt.Errorf("fts5 probe: %w", err)
+	}
+	if _, err := conn.ExecContext(ctx, "DROP TABLE temp.probe"); err != nil {
+		return fmt.Errorf("fts5 probe: %w", err)
+	}
+	return nil
+}
+
+// hostSnippet: doctor 마지막에 출력하는 호스트 등록 안내(설계 §9) — Claude Code(.mcp.json +
+// permissions ask 규칙)와 Codex(config.toml 기본 3-도구 프로필 + approval prompt 권장).
+const hostSnippet = `--- host adapter snippets (설계 §9) ---
+
+## Claude Code (.mcp.json)
+{
+  "mcpServers": {
+    "ctr": { "command": "context-router", "args": [] },
+    "ctr-global": { "command": "context-router", "args": ["--profile", "global-search", "--projects", "<path-or-id,...>"] }
+  }
+}
+permissions (.claude/settings.json 예시 — ingest/net/global은 기본 ask):
+{
+  "permissions": {
+    "ask": ["mcp__ctr__ctr_index", "mcp__ctr__ctr_fetch_and_index", "mcp__ctr-global__*"]
+  }
+}
+
+## Codex (~/.codex/config.toml)
+[mcp_servers.ctr]
+command = "context-router"
+args = []
+enabled_tools = ["ctr_search", "ctr_fetch", "ctr_transform"]
+# ingest/net 활성화 시 권장: default_tools_approval_mode = "prompt"
+`
+
+// runDoctor: 5항목 진단(저장 루트/프로젝트 식별/content.db/FTS5/ledger.db) + 호스트 등록
+// 스니펫을 w에 출력한다. store를 생성하지 않는다(store.Open(dir, true)만 사용, 설계 §7).
+// 실패 항목이 있으면 error를 반환한다(main이 exit 1) — 반환 오류 메시지에는 절대경로를
+// 담지 않는다(§12 canary), 대신 상세는 w의 진단 본문에 있다.
+func runDoctor(ctx context.Context, w io.Writer, storeRoot, projectRoot string) error {
+	var failed []string
+	fmt.Fprintln(w, "context-router doctor")
+	fmt.Fprintln(w)
+
+	// [1] 저장 루트 존재·쓰기 가능
+	checkDir := storeRoot
+	exists := false
+	if fi, err := os.Stat(storeRoot); err == nil && fi.IsDir() {
+		exists = true
+	} else {
+		checkDir = filepath.Dir(storeRoot) // 미생성이면 상위만 확인 — storeRoot 자체는 만들지 않는다
+	}
+	writable := probeWritable(checkDir)
+	fmt.Fprintf(w, "[1] store-root: exists=%v writable=%v\n", exists, writable)
+	if !writable {
+		failed = append(failed, "store-root")
+	}
+
+	// [2] 프로젝트 식별
+	canon, err := ident.Canonicalize(projectRoot)
+	if err != nil {
+		fmt.Fprintf(w, "[2] project: 식별 실패: %v\n", err)
+		failed = append(failed, "project")
+	} else {
+		fmt.Fprintf(w, "[2] project: ProjectID=%s WorktreeRoot=%s\n", canon.ProjectID, canon.WorktreeRoot)
+	}
+
+	var reader *sql.DB // [3]에서 열린 read-only reader — 성공하면 [4]에서 재사용
+	if canon.ProjectID == "" {
+		fmt.Fprintln(w, "[3] content.db: skip (project 식별 실패)")
+		fmt.Fprintln(w, "[5] ledger.db: skip (project 식별 실패)")
+	} else {
+		projDir := filepath.Join(storeRoot, "projects", canon.ProjectID)
+		dbPath := filepath.Join(projDir, "content.db")
+		if fi, err := os.Stat(dbPath); err != nil || fi.IsDir() {
+			fmt.Fprintln(w, "[3] content.db: not initialized")
+		} else {
+			st, err := store.Open(projDir, true) // read-only — 절대 생성하지 않는다
+			if err != nil {
+				fmt.Fprintf(w, "[3] content.db: open 실패: %v\n", err)
+				failed = append(failed, "content.db")
+			} else {
+				defer st.Close()
+				var userVersion int
+				var quickCheck string
+				uvErr := st.Reader().QueryRowContext(ctx, "PRAGMA user_version").Scan(&userVersion)
+				qcErr := st.Reader().QueryRowContext(ctx, "PRAGMA quick_check").Scan(&quickCheck)
+				if uvErr != nil || qcErr != nil || quickCheck != "ok" {
+					fmt.Fprintf(w, "[3] content.db: quick_check 실패 (user_version=%d quick_check=%q)\n", userVersion, quickCheck)
+					failed = append(failed, "content.db")
+				} else {
+					fmt.Fprintf(w, "[3] content.db: user_version=%d quick_check=ok\n", userVersion)
+					reader = st.Reader()
+				}
+			}
+		}
+
+		// [5] ledger.db 존재 여부(정보성 — 실패로 취급하지 않는다, ledger는 best-effort)
+		ledgerExists := false
+		if fi, err := os.Stat(filepath.Join(projDir, "ledger.db")); err == nil && !fi.IsDir() {
+			ledgerExists = true
+		}
+		fmt.Fprintf(w, "[5] ledger.db: exists=%v\n", ledgerExists)
+	}
+
+	// [4] FTS5 가용성
+	if err := probeFTS5(ctx, reader); err != nil {
+		fmt.Fprintf(w, "[4] fts5: 불가 (%v)\n", err)
+		failed = append(failed, "fts5")
+	} else {
+		fmt.Fprintln(w, "[4] fts5: 가능")
+	}
+
+	fmt.Fprintln(w)
+	fmt.Fprint(w, hostSnippet)
+
+	if len(failed) > 0 {
+		return fmt.Errorf("doctor: 진단 실패 항목 %d개", len(failed))
+	}
+	return nil
+}
