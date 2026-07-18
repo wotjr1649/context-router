@@ -38,7 +38,8 @@ Mid-session directive (verbatim): review protocol change —
 ## 3. Current repo state
 
 - `main` @ **d73294a** — Plan 1+2 (v0.0.1 core + transform/net).
-- **Branch `feat/v0.0.1-global-cli`** @ 774c8a5 — 38 commits, all of Plan 3. **PR #2** OPEN (https://github.com/wotjr1649/context-router/pull/2 → main), awaiting merge (user decision).
+- **Branch `feat/v0.0.1-global-cli`** @ bc6ab2e — Plan 3 (38 code commits) + dependency review doc. **PR #2** OPEN (https://github.com/wotjr1649/context-router/pull/2 → main), awaiting merge (user decision).
+- **Dependency review (2026-07-19, user-directed):** `docs/superpowers/Specs/2026-07-19-pr-2-go-dependency-library-review.md` audited against PR #2 — decision upheld: **PR #2 keeps current `go.mod` unchanged** (none of §11's 3 blocking exceptions met). Verified: `go mod verify` all-verified, `go mod tidy -diff` clean, govulncheck **0 vulnerabilities**, dual-OS `CGO_ENABLED=0` builds OK, NOTICE/THIRD-PARTY == actual 25-module linked closure (go.mod's 26th = `google/uuid`, genuinely unlinked). Note: spec §4 x/sys usage table predates T10 — `internal/ident/realpath_windows.go` is a third x/sys/windows consumer.
 - All 9 packages GREEN (`go test -p 1 ./...`), 3-OS CI + crossbuild 6 targets GREEN.
 - **v0.0.1 redefined contract: COMPLETE** — 6 MCP tools + ctr_global_search + 4 CLI. Gates 1–13 documented in `docs/gates-v0.0.1-ko.md`.
 
@@ -55,6 +56,7 @@ Mid-session directive (verbatim): review protocol change —
 - 5000-doc trigram FTS bottleneck (~1.6s query; informational, non-gating).
 - per-directory case-sensitivity path test (CI admin-rights constraint).
 - openat2 full TOCTOU (junction realpath done; openat2 deferred to §14).
+- **Dependency follow-up PRs** (spec doc §10, separate from PR #2): P1 `go-readability` v0 → `/v2 v2.1.2` (API/output changes — needs fixture comparison); P2 `x/net v0.55.0→v0.57.0` + `x/sys v0.46.0→v0.47.0` maintenance bump (no security urgency — pinned versions already patched, govulncheck clean).
 - Non-blocking minors rolled into ledger (T1 lock error double-wrap, clamp dup, etc.).
 
 ## 5. Standing protocols
