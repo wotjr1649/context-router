@@ -1,33 +1,37 @@
-# docs/prompts — 세션 프롬프트 로그 & 핸드오프 지침
+# docs/prompts — session prompt log & handoff convention
 
-이 디렉터리는 세션마다 **"어떤 프롬프트로 시작했고 무엇을 끝냈는가"**를 기록해, 다음 세션이 문맥 손실 없이 이어받게 한다.
+This directory records, per session, **which prompt started it and what got
+finished**, so the next session resumes without context loss.
 
-> **왜 여기인가:** `.superpowers/sdd/progress.md`(SDD 실행 원장)는 gitignored라 **로컬·머신 이동 시 소실**된다. 반면 이 디렉터리의 기록은 git에 커밋되어 세션·머신·컴팩션을 건너 살아남는다 — **크로스세션 핸드오프의 진실 소스**다. (같은 머신 안에서는 SDD 원장을 상세 근거로 병용하되, 충돌 시 이 기록이 우선.)
+> **Why here:** the SDD execution ledger (`.superpowers/sdd/progress.md`) is
+> gitignored and does **not** survive a machine move or `git clean`. The records
+> in this directory are committed to git and survive across sessions, machines,
+> and compaction — the **source of truth for cross-session handoff**. On the same
+> machine the SDD ledger is a useful detail companion; if they conflict, this wins.
 
-## 기록 파일 규칙
+## Record files
 
-- 이름: `YYYY-MM-DD-session-NN-<주제>.md` (세션 **시작일** 기준, `NN`은 2자리 순번)
-- 세션이 끝날 때 **떠나는 세션이** 작성/갱신하고 커밋·푸시한다.
-- 과거 기록은 수정하지 않는다(추가만). 정정은 새 기록에서.
+- Name: `YYYY-MM-DD-session-NN-<topic>.md` (session **start date**, `NN` = 2-digit index).
+- The **departing** session writes/updates it and commits + pushes at session end.
+- Never edit past records (append only); make corrections in a new record.
 
-## 각 기록이 반드시 담을 것
+## Each record must contain
 
-1. **세션 번호·기간·모델/effort**
-2. **시작 프롬프트 (verbatim)** — 다음 사람이 "무엇을 요청받아 시작했는지" 알 수 있게 원문 그대로
-3. **한 일** — 커밋/브랜치/PR/주요 결정(Dnn) 요약
-4. **현재 저장소 상태** — `main` HEAD, 열린 PR, 활성 브랜치, 다음 작업의 base
-5. **이월 사항** — 다음 세션이 처리할 것(근거 문서 §번호 포함)
-6. **지켜야 할 프로토콜** — 요약 + 근거 문서 포인터
-7. **다음 세션 시작 프롬프트** — 그대로 복붙하면 다음 세션이 부팅되는 완성형
+1. Session number, span, model/effort.
+2. **Starting prompt (verbatim)** — keep the original language; do not translate a quote.
+3. **What was done** — commits / branches / PR / key decisions (Dnn).
+4. **Current repo state** — `main` HEAD, open PRs, active branch, base for next work.
+5. **Carryovers** — what the next session must handle (with design § references).
+6. **Standing protocols** — short list + pointers.
+7. **Next-session starting prompt** — a complete, paste-ready prompt that boots the next session.
 
-## 핸드오프 절차
+## Handoff procedure
 
-- **세션 종료 시:** 위 7항을 채운 기록 작성 → "다음 세션 시작 프롬프트" 준비 → `git add docs/prompts && git commit && git push`.
-- **세션 시작 시:** `docs/prompts`의 **최신 기록**을 먼저 읽고, 그 안의 "다음 세션 시작 프롬프트"대로 이어간다. 이어서 설계·규약 문서(`docs/context-router-design-v0.0.1-ko.md`, `docs/context-router-code-architecture-ko.md`)와, 같은 머신이면 `.superpowers/sdd/progress.md`를 확인한다.
+- **At session end:** fill the 7 items, prepare the next-session prompt, then
+  `git add docs/prompts && git commit && git push`.
+- **At session start:** read the **latest** record here and follow its
+  "next-session starting prompt". Then skim the design/architecture docs and,
+  on the same machine, `.superpowers/sdd/progress.md`.
 
-## 고정 사실 (매 세션 공통)
-
-- 저장소: `github.com/wotjr1649/context-router` · module path 동일 · origin 연결됨.
-- 언어 Go, 단일 바이너리 stdio MCP, 규약 = `docs/context-router-code-architecture-ko.md`(인터페이스 0·D13 반파편화·의존 그래프·부패 방지).
-- 테스트의 합성 비밀 캐너리는 **런타임 분할 리터럴**(`"xox"+"b-..."`)로 — GitHub push protection 오탐 방지(규약 §8).
-- 막히면 **Codex(교차 모델)·웹검색 협업** 필수(맹목 재시도 금지). 통합/최종 리뷰는 **서브에이전트 + Codex `review --base <ref>` 병행**.
+Records may be in English for token efficiency; the verbatim starting prompt in
+item 2 stays in its original language.
