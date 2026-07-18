@@ -209,6 +209,124 @@ func TestMainDispatch_NotHandled(t *testing.T) {
 	}
 }
 
+// TestPrescanRootFlags: dispatchCLI가 서버 전체 flagset(parseFlags) 재사용을 그만두고 쓰는
+// 경량 프리스캔 — "--f v"/"--f=v"/"-f v" 세 형태 모두에서 --root/--store-root만 뽑고
+// 나머지(서브커맨드 전용 플래그, 예: --provider)는 손대지 않아야 한다(Task4 Fix Round 1).
+func TestPrescanRootFlags(t *testing.T) {
+	tests := []struct {
+		name                    string
+		args                    []string
+		wantRoot, wantStoreRoot string
+		wantRest                []string
+	}{
+		{"space_form", []string{"--root", "R", "--store-root", "S"}, "R", "S", []string{}},
+		{"eq_form", []string{"--root=R", "--store-root=S", "--provider", "p"}, "R", "S", []string{"--provider", "p"}},
+		{"single_dash", []string{"-root", "R"}, "R", "", []string{}},
+		{"no_root_flags", []string{"--provider", "p"}, "", "", []string{"--provider", "p"}},
+		{"root_flags_interleaved", []string{"--provider", "p", "--root", "R"}, "R", "", []string{"--provider", "p"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			root, storeRoot, rest := prescanRootFlags(tt.args)
+			if root != tt.wantRoot || storeRoot != tt.wantStoreRoot {
+				t.Fatalf("root=%q storeRoot=%q want %q/%q", root, storeRoot, tt.wantRoot, tt.wantStoreRoot)
+			}
+			if strings.Join(rest, ",") != strings.Join(tt.wantRest, ",") {
+				t.Fatalf("rest=%v want %v", rest, tt.wantRest)
+			}
+		})
+	}
+}
+
+// captureStdout: fn 실행 동안 프로세스 전역 os.Stdout을 파이프로 바꿔 출력을 문자열로
+// 받는다. dispatchCLI가 os.Stdout을 하드코딩해 cli.Run에 넘기므로(Task3 이관 인지 사항)
+// dispatchCLI 레벨에서 실제 출력 내용을 확인하려면 이 방법뿐이다 — 병렬 테스트(t.Parallel)와
+// 섞이지 않는 한 안전하다(이 파일은 어떤 테스트도 병렬 실행하지 않는다).
+func captureStdout(t *testing.T, fn func()) string {
+	t.Helper()
+	orig := os.Stdout
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe: %v", err)
+	}
+	os.Stdout = w
+	fn()
+	w.Close()
+	os.Stdout = orig
+	out, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatalf("read pipe: %v", err)
+	}
+	return string(out)
+}
+
+// TestMainDispatch_Stats_Provider: 실제 dispatchCLI 경로로 `stats --provider <jsonl>`이
+// (--root/--store-root 없이) 끝까지 동작해 실측 토큰 합계를 출력하는지 확인한다(설계 §7 —
+// Task4 Fix Round 1: 이전에는 main의 서버 flagset이 --provider를 몰라 여기서 항상
+// "flag provided but not defined"로 실패했었다).
+func TestMainDispatch_Stats_Provider(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "transcript.jsonl")
+	line := `{"message":{"usage":{"input_tokens":7,"output_tokens":3,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}` + "\n"
+	if err := os.WriteFile(path, []byte(line), 0o600); err != nil {
+		t.Fatalf("write transcript: %v", err)
+	}
+
+	var handled bool
+	var dispatchErr error
+	out := captureStdout(t, func() {
+		handled, dispatchErr = dispatchCLI(context.Background(), []string{"context-router", "stats", "--provider", path})
+	})
+	if !handled {
+		t.Fatal("want handled=true for stats subcommand")
+	}
+	if dispatchErr != nil {
+		t.Fatalf("stats --provider dispatch err=%v out=%s", dispatchErr, out)
+	}
+	for _, want := range []string{"input_tokens: 7", "output_tokens: 3", "usage records: 1", "skipped: 0"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("out missing %q: %s", want, out)
+		}
+	}
+}
+
+// TestMainDispatch_Stats_WithStoreRoot: `stats --root <proj> --store-root <dir>`(플래그 조합)이
+// 실제 dispatchCLI를 거쳐 로컬 ledger 표를 출력하는지 확인한다 — prescanRootFlags가 값을
+// 뽑아 storeRootFor+canonicalizeStoreRoot에 넘기는 경로의 회귀 테스트.
+func TestMainDispatch_Stats_WithStoreRoot(t *testing.T) {
+	proj := t.TempDir()
+	storeRoot := filepath.Join(t.TempDir(), "storeroot")
+
+	var handled bool
+	var dispatchErr error
+	out := captureStdout(t, func() {
+		handled, dispatchErr = dispatchCLI(context.Background(), []string{
+			"context-router", "stats", "--root", proj, "--store-root", storeRoot,
+		})
+	})
+	if !handled {
+		t.Fatal("want handled=true for stats subcommand")
+	}
+	if dispatchErr != nil {
+		t.Fatalf("stats dispatch err=%v out=%s", dispatchErr, out)
+	}
+	if !strings.Contains(out, "bytes suppressed (local, 진단용)") {
+		t.Fatalf("out missing fixed suppression phrase: %s", out)
+	}
+}
+
+// TestMainDispatch_CLI_Upgrade: doctor에 이어 upgrade도 새 dispatchCLI(프리스캔) 경로로
+// 여전히 정상 동작하는지 확인한다(회귀) — upgrade는 네트워크 실패까지 항상 nil을 반환하는
+// 계약이라(runUpgrade, 설계 §7) 샌드박스에 외부망이 없어도 결정적으로 통과한다.
+func TestMainDispatch_CLI_Upgrade(t *testing.T) {
+	handled, err := dispatchCLI(context.Background(), []string{"context-router", "upgrade"})
+	if !handled {
+		t.Fatal("want handled=true for upgrade subcommand")
+	}
+	if err != nil {
+		t.Fatalf("upgrade dispatch err=%v", err)
+	}
+}
+
 // --- E2E stdio 스모크 (Task 9, 설계 §12-7·10 기초) ---
 //
 // 손수 프레이밍한 JSON-RPC로 실바이너리와 stdin/stdout 파이프를 주고받는다(SDK

@@ -330,10 +330,51 @@ const transformWorkerArg = "__transform-worker"
 // 첫 인자는 dispatchCLI의 관심사가 아니다 — MCP 서버 플래그로 그대로 흘려보낸다.
 var cliSubcommands = map[string]bool{"doctor": true, "stats": true, "purge": true, "upgrade": true}
 
+// prescanRootFlags: cli 서브커맨드 args에서 --root/--store-root(단대시 -root/-store-root,
+// "--f v"·"--f=v" 두 형태 모두)만 수동으로 뽑아내고 그 토큰을 제거한 나머지를 반환한다.
+// 서버 전체 flagset(parseFlags)을 서브커맨드에 재사용하지 않는 이유: stats(--provider),
+// 이후 purge(--project/--older-than/--gc/--force) 같은 서브커맨드 전용 플래그는 그 flagset에
+// 없어 항상 "flag provided but not defined"로 실패했다(Task4 리뷰 지적, 설계 §7 계약 —
+// `context-router stats --provider <path>`가 실제로 동작해야 한다). 나머지 플래그의 유효성
+// 검사는 여기서 하지 않는다 — 각 서브커맨드가 소유한 cli 쪽 flagset이 미지 플래그를 오류로
+// 낸다.
+func prescanRootFlags(args []string) (root, storeRoot string, rest []string) {
+	rest = make([]string, 0, len(args))
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		name := strings.TrimLeft(a, "-")
+		if name == a { // "-" 접두사가 없는 토큰(위치 인자)은 그대로 통과
+			rest = append(rest, a)
+			continue
+		}
+		key, val, hasEq := strings.Cut(name, "=")
+		var target *string
+		switch key {
+		case "root":
+			target = &root
+		case "store-root":
+			target = &storeRoot
+		default:
+			rest = append(rest, a)
+			continue
+		}
+		if hasEq {
+			*target = val
+			continue
+		}
+		if i+1 < len(args) {
+			*target = args[i+1]
+			i++
+		}
+	}
+	return root, storeRoot, rest
+}
+
 // dispatchCLI: args[1](=os.Args[1])이 cli 서브커맨드 4개 중 하나면 storeRoot·projectRoot를
-// 기존 storeRootFor+canonicalizeStoreRoot로 결정해 cli.Run에 위임한다. handled=false면
-// 호출자가 평소대로 MCP 서버 경로(run)로 진행해야 한다 — cli는 storeRoot를 재도출하지
-// 않는다(설계 §7 Produces).
+// prescanRootFlags + 기존 storeRootFor+canonicalizeStoreRoot로 결정해 cli.Run에 위임한다.
+// handled=false면 호출자가 평소대로 MCP 서버 경로(run)로 진행해야 한다 — cli는 storeRoot를
+// 재도출하지 않는다(설계 §7 Produces). --root/--store-root를 제외한 나머지 args는 그대로
+// cli.Run에 넘겨 서브커맨드 전용 flagset(stats의 --provider 등)이 스스로 파싱한다.
 func dispatchCLI(ctx context.Context, args []string) (handled bool, err error) {
 	if len(args) < 2 || !cliSubcommands[args[1]] {
 		return false, nil
@@ -341,17 +382,13 @@ func dispatchCLI(ctx context.Context, args []string) (handled bool, err error) {
 	sub := args[1]
 	subArgs := args[2:]
 
-	f, err := parseFlags(subArgs)
-	if err != nil {
-		return true, err
-	}
-	root := f.Root
+	root, storeRootRaw, rest := prescanRootFlags(subArgs)
 	if root == "" {
 		if root, err = os.Getwd(); err != nil {
 			return true, err
 		}
 	}
-	storeRoot, err := storeRootFor(f)
+	storeRoot, err := storeRootFor(serverFlags{StoreRoot: storeRootRaw})
 	if err != nil {
 		return true, err
 	}
@@ -359,7 +396,7 @@ func dispatchCLI(ctx context.Context, args []string) (handled bool, err error) {
 	if err != nil {
 		return true, err
 	}
-	return true, cli.Run(ctx, sub, subArgs, storeRoot, root, version, os.Stdout, os.Stderr)
+	return true, cli.Run(ctx, sub, rest, storeRoot, root, version, os.Stdout, os.Stderr)
 }
 
 func main() {
