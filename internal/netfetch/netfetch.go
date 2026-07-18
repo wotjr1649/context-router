@@ -15,7 +15,7 @@ import (
 	"time"
 )
 
-// Config: Fetch 정책. 값 0/nil = 기본값(Timeout=30s, MaxBytes=무제한).
+// Config: Fetch 정책. 값 0/nil = 기본값(Timeout=30s, MaxBytes<=0 → 기본 10MB 상한).
 type Config struct {
 	AllowLocal bool
 	ExtraPorts []int
@@ -37,6 +37,7 @@ type Result struct {
 var ErrDenied = errors.New("netfetch: destination denied")
 
 const (
+	defaultMaxBytes  = 10 << 20 // 10MB — 설계 §4.5 fetch_and_index 기본과 정합.
 	defaultTimeout   = 30 * time.Second
 	defaultUserAgent = "context-router/0.0.1"
 	maxRedirects     = 5
@@ -48,6 +49,10 @@ var (
 	cgnat     = netip.MustParsePrefix("100.64.0.0/10")
 	nat64     = netip.MustParsePrefix("64:ff9b::/96")
 	zeroNet   = netip.MustParsePrefix("0.0.0.0/8")
+	// v4CompatPrefix: RFC4291 폐지된 v4-compatible IPv6(예: ::127.0.0.1, ::10.0.0.1) — 임베디드
+	// IPv4 대역. v4-mapped(::ffff:0:0/96, Unmap()이 걷어내는 대역)와는 다른 별개 대역이라
+	// 명시적으로 차단해야 한다.
+	v4CompatPrefix = netip.MustParsePrefix("::/96")
 )
 
 // ClassifyAddr: 순수 함수 — I3 판정. "ok" | "block".
@@ -65,7 +70,8 @@ func ClassifyAddr(a netip.Addr) string {
 		a.IsUnspecified() ||
 		cgnat.Contains(a) ||
 		nat64.Contains(a) ||
-		zeroNet.Contains(a) {
+		zeroNet.Contains(a) ||
+		v4CompatPrefix.Contains(a) {
 		return "block"
 	}
 	return "ok"
@@ -137,20 +143,17 @@ func resolveAndValidate(ctx context.Context, host string, cfg Config) (netip.Add
 	return addrs[0].Unmap(), nil
 }
 
-// buildTransport: dial은 검증된 pinnedIP:port로만(I4) — Transport가 넘기는 addr의 host부는
-// 무시하고 port만 취해 재사용, hostname 재조회 경로 자체가 없다. TLSClientConfig는 미설정 —
+// buildTransport: dial은 검증된 pinnedIP:port로만(I4) — Transport가 넘기는 addr은 무시하고
+// closure의 pinnedIP:port를 그대로 재사용(hop마다 Transport 재생성이라 항상 addr과 동일값),
+// hostname 재조회 경로 자체가 없다. TLSClientConfig는 미설정 —
 // net/http가 원 요청 URL의 hostname으로 ServerName을 자동 설정하므로 SNI/인증서 검증은
 // 정규화 hostname 기준으로 유지된다(I5). Proxy: nil로 환경 프록시 무시(I6).
 func buildTransport(pinnedIP netip.Addr, port int) *http.Transport {
 	dialer := &net.Dialer{}
 	return &http.Transport{
 		Proxy: nil,
-		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-			p := strconv.Itoa(port)
-			if _, gotPort, err := net.SplitHostPort(addr); err == nil {
-				p = gotPort
-			}
-			return dialer.DialContext(ctx, network, net.JoinHostPort(pinnedIP.String(), p))
+		DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
+			return dialer.DialContext(ctx, network, net.JoinHostPort(pinnedIP.String(), strconv.Itoa(port)))
 		},
 	}
 }
@@ -166,6 +169,9 @@ var ErrBodyTooLarge = errors.New("netfetch: response body exceeds MaxBytes")
 func Fetch(ctx context.Context, cfg Config, rawURL string) (Result, error) {
 	if cfg.Timeout <= 0 {
 		cfg.Timeout = defaultTimeout
+	}
+	if cfg.MaxBytes <= 0 {
+		cfg.MaxBytes = defaultMaxBytes
 	}
 	ctx, cancel := context.WithTimeout(ctx, cfg.Timeout)
 	defer cancel()

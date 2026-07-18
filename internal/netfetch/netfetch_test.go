@@ -59,6 +59,8 @@ func TestClassifyAddr(t *testing.T) {
 		{"link-local v6 with zone", "fe80::1%eth0", "block"},
 		{"v4-mapped loopback unmaps to block", "::ffff:127.0.0.1", "block"},
 		{"v4-mapped public unmaps to ok", "::ffff:8.8.8.8", "ok"},
+		{"v4-compat embeds loopback (RFC4291 deprecated, distinct from v4-mapped)", "::127.0.0.1", "block"},
+		{"v4-compat embeds private (RFC4291 deprecated)", "::10.0.0.1", "block"},
 		{"nat64 encodes public v4 still blocked", "64:ff9b::808:808", "block"},
 		{"unique local v6", "fc00::1", "block"},
 		{"multicast v6", "ff02::1", "block"},
@@ -185,6 +187,21 @@ func TestFetch_MaxBytesExceededAborts(t *testing.T) {
 	_, err := Fetch(context.Background(), cfg, srv.URL)
 	if err == nil {
 		t.Fatalf("want error when body exceeds MaxBytes")
+	}
+}
+
+// TestFetch_ZeroMaxBytesDefaultsTo10MB: zero-value Config(SSRF-safe fetcher에서 최대 위험 케이스)도
+// 무제한이 아니라 기본 10MB 상한이 걸려야 한다.
+func TestFetch_ZeroMaxBytesDefaultsTo10MB(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(strings.Repeat("x", defaultMaxBytes+1)))
+	}))
+	defer srv.Close()
+
+	cfg := Config{AllowLocal: true, ExtraPorts: []int{srvPort(t, srv.URL)}, Timeout: 5 * time.Second}
+	_, err := Fetch(context.Background(), cfg, srv.URL)
+	if !errors.Is(err, ErrBodyTooLarge) {
+		t.Fatalf("zero-value MaxBytes: want ErrBodyTooLarge at default 10MB cap, got %v", err)
 	}
 }
 
