@@ -88,6 +88,9 @@ func TestToToolError(t *testing.T) {
 		{"workspace", ingest.ErrWorkspace, codeWorkspaceViolation},
 		{"unsupported", ingest.ErrUnsupported, codeUnsupportedFile},
 		{"network_denied", netfetch.ErrDenied, codeNetworkDenied},
+		{"body_too_large", netfetch.ErrBodyTooLarge, codeOutputLimitExceeded},
+		{"too_many_redirects", netfetch.ErrTooManyRedirects, codeNetworkDenied},
+		{"unsupported_media", netfetch.ErrUnsupportedMedia, codeUnsupportedFile},
 		{"not_exist", fs.ErrNotExist, codeNotFound},
 		{"not_exist_wrapped", fmt.Errorf("ingest: canonicalize: %w", fs.ErrNotExist), codeNotFound},
 		{"unknown", errors.New("boom"), codeInternal},
@@ -100,6 +103,27 @@ func TestToToolError(t *testing.T) {
 				t.Fatalf("toToolError(%v) = %q, want prefix %q", tt.err, got, want)
 			}
 		})
+	}
+}
+
+// TestToToolErrorCancellation: 최종리뷰 C2(fable Imp3) — 취소/데드라인은 sentinel 매핑을
+// 타지 않고 SDK가 처리하도록 원본 ctx 오류를 그대로 반환한다(INTERNAL로 뭉개거나 slog
+// 소음을 내지 않음). toToolError가 모든 핸들러의 단일 오류 변환 지점이므로(§6) 여기서
+// 검증하면 handler 호출 경로 전체를 대표한다.
+func TestToToolErrorCancellation(t *testing.T) {
+	tests := []error{
+		context.Canceled,
+		context.DeadlineExceeded,
+		fmt.Errorf("ingest: run web: %w", context.Canceled),
+	}
+	for _, err := range tests {
+		got := toToolError(err)
+		if got != err {
+			t.Fatalf("toToolError(%v) = %v, want original error unchanged", err, got)
+		}
+		if strings.Contains(got.Error(), codeInternal) {
+			t.Fatalf("toToolError(%v) = %q, want no INTERNAL code", err, got)
+		}
 	}
 }
 
@@ -612,6 +636,11 @@ func TestCtrTransformDescriptionMentionsDefWrapping(t *testing.T) {
 		if !strings.Contains(tl.Description, "def f()") {
 			t.Fatalf("description에 def 래핑 제약 누락: %q", tl.Description)
 		}
+		// 최종리뷰 C5(fable triage b): while/재귀는 def 안에서도 지원 안 됨을 정확히 명시.
+		const wantPhrase = "최상위 for는 def 함수 안에서 사용. while·재귀는 starlark 기본 설정상 지원 안 됨(def 안에서도)."
+		if !strings.Contains(tl.Description, wantPhrase) {
+			t.Fatalf("description에 while/재귀 정정 문구 누락: %q", tl.Description)
+		}
 		return
 	}
 	t.Fatal("ctr_transform 도구 없음")
@@ -671,7 +700,12 @@ func newNetTestServer(t *testing.T, allowLocal bool, ports []int) (*mcp.ClientSe
 	return cs, st, storeDir
 }
 
-const fetchAndIndexTestPage = `<html><body><h1>Sample Doc</h1><p>needle unique marker text for search verification.</p><script>var rawOnlyMarkerXYZ789 = 1;</script></body></html>`
+// secretCanary: AWS 키 형태 캐너리. 소스에 연속 토큰을 두지 않는다(규약 §8, push
+// protection 재발 방지 — .superpowers/sdd/progress.md 2026-07-18 CANARY FIX) — 런타임
+// 분할 리터럴 + 비실토큰 값으로 구성.
+const secretCanary = "AKIA" + "NOTAREALKEY01234"
+
+const fetchAndIndexTestPage = `<html><body><h1>Sample Doc</h1><p>needle unique marker text for search verification. token=` + secretCanary + `</p><script>var rawOnlyMarkerXYZ789 = 1;</script></body></html>`
 
 // TestCtrFetchAndIndexRoundTrip: fetch_and_index→search 본문 hit(+SourceCoordsExact=false
 // [이월 검증])·raw blob 파일 보존·FTS 미등록(스크립트 전용 마커는 검색으로 안 잡힘)을 확인한다.
@@ -702,6 +736,16 @@ func TestCtrFetchAndIndexRoundTrip(t *testing.T) {
 	}
 	if len(fiOut.Snippet) == 0 || len(fiOut.Snippet) > 1024 {
 		t.Fatalf("bad snippet length=%d", len(fiOut.Snippet))
+	}
+	// 최종리뷰 C1(수렴 Critical): snippet은 저장본(redacted) 기준이어야 한다 — netfetch 원문
+	// 기준이면 redaction 이전 secret이 응답 1KB로 그대로 유출된다.
+	if strings.Contains(fiOut.Snippet, secretCanary) {
+		t.Fatalf("snippet leaks secret canary (redaction bypass): %q", fiOut.Snippet)
+	}
+	// 최종리뷰 C4(fable Imp5): 원격 웹 콘텐츠 반환 도구는 SearchOutput/FetchOutput과 일관되게
+	// untrusted 마커를 달아야 한다(프롬프트 주입 표면 표시).
+	if !fiOut.Untrusted {
+		t.Fatalf("untrusted flag missing: %+v", fiOut)
 	}
 
 	searchRes, err := cs.CallTool(ctx, &mcp.CallToolParams{Name: "ctr_search", Arguments: SearchInput{Queries: []string{"needle"}}})
@@ -741,6 +785,32 @@ func TestCtrFetchAndIndexRoundTrip(t *testing.T) {
 	remarshal(t, searchRes2.StructuredContent, &searchOut2)
 	if len(searchOut2.Results) != 1 || len(searchOut2.Results[0].Hits) != 0 {
 		t.Fatalf("script-only marker unexpectedly indexed: %+v", searchOut2.Results)
+	}
+
+	// secret 캐너리는 redaction으로 저장 단계에서 사라지므로 search/fetch 어디서도 안 나와야
+	// 한다(기존 보장 유지 확인 — snippet 쪽 유출만 이번 회귀의 신규 지점이었다).
+	searchRes3, err := cs.CallTool(ctx, &mcp.CallToolParams{Name: "ctr_search", Arguments: SearchInput{Queries: []string{secretCanary}}})
+	if err != nil {
+		t.Fatalf("ctr_search(canary) call: %v", err)
+	}
+	var searchOut3 SearchOutput
+	remarshal(t, searchRes3.StructuredContent, &searchOut3)
+	if len(searchOut3.Results) != 1 || len(searchOut3.Results[0].Hits) != 0 {
+		t.Fatalf("secret canary unexpectedly searchable: %+v", searchOut3.Results)
+	}
+
+	var bs, be int64 = 0, fiOut.ByteLength
+	fetchRes3, err := cs.CallTool(ctx, &mcp.CallToolParams{Name: "ctr_fetch", Arguments: FetchInput{ArtifactID: fiOut.ArtifactID, ByteStart: &bs, ByteEnd: &be}})
+	if err != nil {
+		t.Fatalf("ctr_fetch(full) call: %v", err)
+	}
+	if fetchRes3.IsError {
+		t.Fatalf("ctr_fetch(full) error: %+v", fetchRes3.Content)
+	}
+	var fetchOut3 FetchOutput
+	remarshal(t, fetchRes3.StructuredContent, &fetchOut3)
+	if strings.Contains(fetchOut3.Content, secretCanary) {
+		t.Fatalf("fetch leaks secret canary: %q", fetchOut3.Content)
 	}
 }
 

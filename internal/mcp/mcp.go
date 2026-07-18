@@ -93,6 +93,9 @@ func toolErr(code, msg string) error { return fmt.Errorf("[%s] %s", code, msg) }
 // toToolError: sentinel→MCP 코드 단일 변환 지점. 매핑 없는 오류는 INTERNAL로 뭉개고
 // 상세는 stderr slog에만 남긴다(원문·절대경로는 이미 생성 시점에 위생 처리됨, §6).
 func toToolError(err error) error {
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return err // SDK가 취소/데드라인을 직접 처리하도록 원본 그대로 반환(§6, INTERNAL/slog 소음 방지)
+	}
 	switch {
 	case errors.Is(err, store.ErrNotFound):
 		return toolErr(codeNotFound, "대상을 찾을 수 없습니다")
@@ -112,6 +115,12 @@ func toToolError(err error) error {
 		return toolErr(codeUnsupportedFile, "지원하지 않는 파일입니다")
 	case errors.Is(err, netfetch.ErrDenied):
 		return toolErr(codeNetworkDenied, "네트워크 목적지가 거부되었습니다")
+	case errors.Is(err, netfetch.ErrBodyTooLarge):
+		return toolErr(codeOutputLimitExceeded, "응답 본문이 상한을 초과했습니다")
+	case errors.Is(err, netfetch.ErrTooManyRedirects):
+		return toolErr(codeNetworkDenied, "리다이렉트 상한을 초과했습니다")
+	case errors.Is(err, netfetch.ErrUnsupportedMedia):
+		return toolErr(codeUnsupportedFile, "지원하지 않는 미디어 타입입니다")
 	case errors.Is(err, fs.ErrNotExist):
 		return toolErr(codeNotFound, "대상을 찾을 수 없습니다")
 	default:
@@ -438,8 +447,8 @@ const (
 // transformDescription: starlark의 def 래핑 제약을 명시한다 — 모르면 자연스러운 top-level
 // for/while/재귀 스크립트가 실패하므로 필수(T1/T2 승계 계약 (b)).
 const transformDescription = "artifact 텍스트를 starlark 스크립트로 변환한다. " +
-	"스크립트는 starlark: 최상위 for/while/재귀는 비활성이며 def f(): ... 안에서 " +
-	"정의하고 호출해야 한다. inputs[i].text()/.lines()/.json(), args, emit(x)로 " +
+	"최상위 for는 def 함수 안에서 사용. while·재귀는 starlark 기본 설정상 지원 안 됨(def 안에서도). " +
+	"예: def f(): ... 안에서 정의하고 호출해야 한다. inputs[i].text()/.lines()/.json(), args, emit(x)로 " +
 	"출력한다. 내장: regex_extract/json_project/line_window/head/tail/count/sort/dedupe."
 
 type TransformInput struct {
@@ -527,20 +536,7 @@ type FetchAndIndexOutput struct {
 	Extraction    string `json:"extraction"`
 	IndexedChunks int    `json:"indexed_chunks"`
 	Snippet       string `json:"snippet"`
-}
-
-const maxSnippetBytes = 1024
-
-// snippetOf: body 앞부분을 UTF-8 경계로 스냅해 미리보기로 반환한다(설계 §4.5 "snippet(≤1KB)").
-func snippetOf(body []byte) string {
-	if len(body) <= maxSnippetBytes {
-		return string(body)
-	}
-	n := maxSnippetBytes
-	for n > 0 && !utf8.RuneStart(body[n]) {
-		n--
-	}
-	return string(body[:n])
+	Untrusted     bool   `json:"untrusted"`
 }
 
 // registerFetchAndIndex: 핸들러의 구체 호출은 netfetch.Fetch→ingest.RunWeb 2개뿐(규약 §2 —
@@ -566,7 +562,8 @@ func registerFetchAndIndex(srv *mcp.Server, st *store.Store, allowLocal bool, ex
 		}
 		out := FetchAndIndexOutput{
 			ArtifactID: rep.ArtifactID, Title: res.FinalURL, ByteLength: rep.ByteLength,
-			Extraction: res.Extraction, IndexedChunks: rep.IndexedChunks, Snippet: snippetOf(res.Body),
+			Extraction: res.Extraction, IndexedChunks: rep.IndexedChunks, Snippet: rep.Snippet,
+			Untrusted: true,
 		}
 		st.LedgerAppend("ctr_fetch_and_index", rep.ByteLength, jsonLen(out), time.Since(start).Milliseconds())
 		return nil, out, nil

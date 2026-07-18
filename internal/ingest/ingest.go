@@ -736,6 +736,23 @@ type WebReport struct {
 	ArtifactID    int64
 	ByteLength    int64
 	IndexedChunks int
+	// Snippet: 저장본(redacted) 선두 ≤1KB. 호출부는 netfetch 원문이 아닌 이 값만 노출해야
+	// 한다 — 최종리뷰 C1(수렴 Critical), redaction 우회로 인한 secret 유출 차단.
+	Snippet string
+}
+
+const maxSnippetBytes = 1024
+
+// webSnippet: stored(redacted) 선두를 UTF-8 경계로 스냅해 미리보기로 반환한다.
+func webSnippet(stored []byte) string {
+	if len(stored) <= maxSnippetBytes {
+		return string(stored)
+	}
+	n := maxSnippetBytes
+	for n > 0 && !utf8.RuneStart(stored[n]) {
+		n--
+	}
+	return string(stored[:n])
 }
 
 // RunWeb ingests an already-fetched web page through the §3.0 pipeline
@@ -774,5 +791,5 @@ func RunWeb(ctx context.Context, st *store.Store, url string, rawHTML, body []by
 	if err != nil {
 		return WebReport{}, fmt.Errorf("ingest: run web: %w", err)
 	}
-	return WebReport{ArtifactID: artID, ByteLength: int64(len(stored)), IndexedChunks: len(chunks)}, nil
+	return WebReport{ArtifactID: artID, ByteLength: int64(len(stored)), IndexedChunks: len(chunks), Snippet: webSnippet(stored)}, nil
 }
