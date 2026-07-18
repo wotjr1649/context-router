@@ -1,0 +1,34 @@
+127.0.0.1 - tenant-01 [11/May/2026:08:00:01 +0000] "GET /v1/orders?limit=50 HTTP/2" 200 8213 12ms upstream=orders cache=miss
+127.0.0.1 - tenant-01 [11/May/2026:08:00:01 +0000] "GET /v1/orders?limit=50 HTTP/2" 200 8213 2ms upstream=orders cache=hit
+127.0.0.1 - tenant-07 [11/May/2026:08:00:02 +0000] "POST /v1/orders HTTP/2" 201 412 44ms upstream=orders cache=bypass
+127.0.0.1 - anonymous [11/May/2026:08:00:03 +0000] "OPTIONS /v1/orders HTTP/2" 204 0 1ms cors=preflight
+127.0.0.1 - tenant-07 [11/May/2026:08:00:03 +0000] "GET /v1/inventory/9921 HTTP/2" 200 1002 18ms upstream=inventory cache=miss
+127.0.0.1 - tenant-42 [11/May/2026:08:00:04 +0000] "GET /v1/search?q=widget HTTP/2" 200 22188 96ms upstream=search cache=miss
+127.0.0.1 - tenant-42 [11/May/2026:08:00:05 +0000] "GET /v1/search?q=widget HTTP/2" 429 71 0ms ratelimit=exceeded retry_after=4
+127.0.0.1 - monitor [11/May/2026:08:00:05 +0000] "GET /healthz HTTP/1.1" 200 84 0ms probe=health
+127.0.0.1 - prometheus [11/May/2026:08:00:06 +0000] "GET /metrics HTTP/1.1" 200 41221 3ms scrape=true
+127.0.0.1 - tenant-01 [11/May/2026:08:00:07 +0000] "GET /v1/orders/551 HTTP/2" 304 0 1ms upstream=orders cache=validated
+127.0.0.1 - tenant-19 [11/May/2026:08:00:08 +0000] "DELETE /v1/cart/items/12 HTTP/2" 200 33 27ms upstream=cart cache=bypass
+127.0.0.1 - anonymous [11/May/2026:08:00:08 +0000] "GET /v1/orders HTTP/2" 401 71 0ms auth=missing_token
+127.0.0.1 - tenant-03 [11/May/2026:08:00:09 +0000] "GET /v1/pricing/quote?sku=88 HTTP/2" 200 210 61ms upstream=pricing cache=miss
+127.0.0.1 - tenant-03 [11/May/2026:08:00:10 +0000] "GET /v1/pricing/quote?sku=88 HTTP/2" 200 210 1ms upstream=pricing cache=hit
+127.0.0.1 - tenant-11 [11/May/2026:08:00:11 +0000] "PUT /v1/profile HTTP/2" 403 71 4ms auth=insufficient_scope
+127.0.0.1 - tenant-07 [11/May/2026:08:00:12 +0000] "GET /v1/inventory?cursor=abc HTTP/2" 200 15540 22ms upstream=inventory cache=miss
+127.0.0.1 - monitor [11/May/2026:08:00:15 +0000] "GET /healthz HTTP/1.1" 200 84 0ms probe=health
+127.0.0.1 - prometheus [11/May/2026:08:00:21 +0000] "GET /metrics HTTP/1.1" 200 41250 3ms scrape=true
+127.0.0.1 - tenant-42 [11/May/2026:08:00:22 +0000] "GET /v1/search?q=gadget HTTP/2" 200 19004 88ms upstream=search cache=miss
+127.0.0.1 - tenant-42 [11/May/2026:08:00:23 +0000] "GET /v1/search?q=gadget HTTP/2" 429 71 0ms ratelimit=exceeded retry_after=3
+127.0.0.1 - tenant-55 [11/May/2026:08:00:24 +0000] "GET /v1/orders?limit=200 HTTP/2" 200 91002 210ms upstream=orders cache=miss
+127.0.0.1 - anonymous [11/May/2026:08:00:24 +0000] "OPTIONS /v1/search HTTP/2" 204 0 1ms cors=preflight
+127.0.0.1 - tenant-55 [11/May/2026:08:00:26 +0000] "GET /v1/orders?limit=200&cursor=def HTTP/2" 200 90551 205ms upstream=orders cache=miss
+127.0.0.1 - tenant-19 [11/May/2026:08:00:28 +0000] "GET /v1/cart HTTP/2" 200 640 9ms upstream=cart cache=hit
+127.0.0.1 - tenant-03 [11/May/2026:08:00:30 +0000] "GET /v1/inventory/1200 HTTP/2" 503 71 1500ms upstream=inventory error=pool_exhausted
+127.0.0.1 - monitor [11/May/2026:08:00:30 +0000] "GET /healthz HTTP/1.1" 503 96 0ms probe=health subsystem=pool
+127.0.0.1 - tenant-03 [11/May/2026:08:00:32 +0000] "GET /v1/inventory/1200 HTTP/2" 503 71 1ms upstream=inventory error=breaker_open
+127.0.0.1 - prometheus [11/May/2026:08:00:36 +0000] "GET /metrics HTTP/1.1" 200 41310 4ms scrape=true
+127.0.0.1 - tenant-01 [11/May/2026:08:00:38 +0000] "GET /v1/orders/551 HTTP/2" 200 8210 2ms upstream=orders cache=hit
+127.0.0.1 - tenant-88 [11/May/2026:08:00:40 +0000] "POST /v1/pricing/quote HTTP/2" 504 71 2001ms upstream=pricing error=timeout
+127.0.0.1 - monitor [11/May/2026:08:00:45 +0000] "GET /healthz HTTP/1.1" 200 84 0ms probe=health
+127.0.0.1 - tenant-11 [11/May/2026:08:00:47 +0000] "GET /v1/profile HTTP/2" 200 512 7ms upstream=profile cache=miss
+127.0.0.1 - tenant-19 [11/May/2026:08:00:49 +0000] "POST /v1/cart/items HTTP/2" 200 33 15ms upstream=cart cache=bypass
+127.0.0.1 - prometheus [11/May/2026:08:00:51 +0000] "GET /metrics HTTP/1.1" 200 41288 3ms scrape=true

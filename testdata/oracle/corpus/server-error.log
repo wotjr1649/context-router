@@ -1,0 +1,53 @@
+2026-05-11T08:14:02.114Z ERROR request_id=7f3a1c handler panic recovered upstream=orders route=/v1/orders status=500
+2026-05-11T08:14:02.114Z ERROR request_id=7f3a1c stack trace follows:
+panic: runtime error: invalid memory address or nil pointer dereference
+	at orders.(*Repo).Load(repo.go:88)
+	at orders.Handler.Get(handler.go:142)
+	at gateway.(*Router).dispatch(router.go:311)
+	at gateway.recoverMiddleware(middleware.go:57)
+	at net/http.(*conn).serve(server.go:2092)
+2026-05-11T08:14:02.130Z INFO  request_id=7f3a1c returned 500 internal server error to client after panic recovery
+2026-05-11T08:19:44.905Z WARN  request_id=9b21ee pool acquire slow upstream=inventory waited_ms=812 in_use=64 idle=0
+2026-05-11T08:19:45.700Z ERROR request_id=9b21ee acquire timeout — connection pool exhausted upstream=inventory pool_max=64 waited_ms=1500
+2026-05-11T08:19:45.701Z ERROR request_id=9b21ee returned 503 upstream unavailable route=/v1/inventory
+2026-05-11T08:19:46.010Z WARN  connection pool saturation upstream=inventory in_use=64 idle=0 waiters=37
+2026-05-11T08:20:01.221Z INFO  circuit breaker opened upstream=inventory reason=timeout_ratio window=30s ratio=0.62
+2026-05-11T08:20:01.222Z INFO  serving stale cache entry route=/v1/inventory reason=breaker_open
+2026-05-11T08:31:17.554Z ERROR request_id=c04d90 upstream request timeout upstream=pricing deadline_ms=2000 elapsed_ms=2001
+2026-05-11T08:31:17.554Z ERROR request_id=c04d90 stack trace follows:
+context deadline exceeded
+	at pricing.(*Client).Quote(client.go:203)
+	at pricing.Handler.Post(handler.go:77)
+	at gateway.(*Router).dispatch(router.go:311)
+2026-05-11T08:31:17.560Z INFO  request_id=c04d90 returned 504 gateway timeout route=/v1/pricing
+2026-05-11T08:44:29.101Z WARN  jwt token verification failed request_id=aa17f2 reason=expired route=/v1/orders
+2026-05-11T08:44:29.101Z INFO  request_id=aa17f2 returned 401 unauthorized — invalid jwt token
+2026-05-11T08:45:03.318Z WARN  jwt token verification failed request_id=aa2201 reason=unknown_kid route=/v1/orders
+2026-05-11T08:45:03.318Z INFO  rotating public keys — unknown kid observed, forcing key ring refresh
+2026-05-11T08:52:10.774Z ERROR request_id=de99b1 handler panic recovered upstream=orders route=/v1/orders/export status=500
+2026-05-11T08:52:10.774Z ERROR request_id=de99b1 stack trace follows:
+panic: send on closed channel
+	at export.(*Streamer).emit(streamer.go:64)
+	at export.Handler.Get(handler.go:210)
+	at gateway.(*Router).dispatch(router.go:311)
+	at gateway.recoverMiddleware(middleware.go:57)
+2026-05-11T08:52:10.780Z INFO  request_id=de99b1 returned 500 internal server error after panic
+2026-05-11T09:03:55.400Z WARN  cache invalidation event dropped topic=orders reason=bus_backpressure — entries will age out via ttl
+2026-05-11T09:10:12.006Z WARN  rate limit exceeded client=tenant-42 route=/v1/search rejected=true retry_after_s=4
+2026-05-11T09:10:12.930Z WARN  rate limit exceeded client=tenant-42 route=/v1/search rejected=true retry_after_s=3
+2026-05-11T09:12:48.213Z ERROR request_id=f10ab3 upstream request timeout upstream=search deadline_ms=1500 elapsed_ms=1501
+2026-05-11T09:12:48.213Z ERROR request_id=f10ab3 returned 504 gateway timeout route=/v1/search
+2026-05-11T09:20:33.918Z INFO  circuit breaker half-open upstream=inventory probing with single request
+2026-05-11T09:20:34.402Z INFO  circuit breaker closed upstream=inventory recovered
+2026-05-11T09:33:19.665Z ERROR request_id=1188cd handler panic recovered route=/v1/cart status=500
+2026-05-11T09:33:19.665Z ERROR request_id=1188cd stack trace follows:
+panic: assignment to entry in nil map
+	at cart.(*Session).Put(session.go:41)
+	at cart.Handler.Post(handler.go:96)
+	at gateway.(*Router).dispatch(router.go:311)
+2026-05-11T09:33:19.670Z INFO  request_id=1188cd returned 500 internal server error to client
+2026-05-11T09:41:57.223Z WARN  connection pool acquire slow upstream=pricing waited_ms=640 in_use=48 idle=0
+2026-05-11T09:42:02.889Z INFO  graceful shutdown signalled — SIGTERM received, draining connections
+2026-05-11T09:42:02.889Z INFO  readiness probe now failing so kubernetes stops routing during graceful shutdown
+2026-05-11T09:42:07.905Z INFO  connection pool drained — all borrowed connections returned, closing idle sockets
+2026-05-11T09:42:07.980Z INFO  shutdown complete after graceful drain elapsed_ms=5091
