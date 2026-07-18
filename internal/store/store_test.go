@@ -1,0 +1,518 @@
+package store
+
+import (
+	"crypto/sha256"
+	"database/sql"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"runtime"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+	"unicode/utf8"
+)
+
+func openT(t *testing.T) *Store {
+	t.Helper()
+	s, err := Open(t.TempDir(), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { s.Close() })
+	return s
+}
+
+func TestOpen_PragmasAndSchema(t *testing.T) {
+	s := openT(t)
+	for q, want := range map[string]string{
+		"PRAGMA journal_mode": "wal",
+		"PRAGMA foreign_keys": "1",
+		"PRAGMA user_version": "1",
+		"PRAGMA synchronous":  "1",
+		"PRAGMA busy_timeout": "5000",
+	} {
+		var got string
+		if err := s.reader.QueryRow(q).Scan(&got); err != nil {
+			t.Fatalf("%s: %v", q, err)
+		}
+		if got != want {
+			t.Fatalf("%s=%q want %q", q, got, want)
+		}
+	}
+	// FTS integrity-check가 빈 DB에서 통과 (게이트 6 기초)
+	for _, fts := range []string{"fts_porter", "fts_trigram"} {
+		if _, err := s.writer.Exec("INSERT INTO " + fts + "(" + fts + ") VALUES('integrity-check')"); err != nil {
+			t.Fatalf("%s integrity: %v", fts, err)
+		}
+	}
+}
+
+// TestOpen_UnixPermissions: α4 — store 루트·artifacts·blob 해시프리픽스 디렉터리는 0700,
+// blob 파일은 0600(민감 콘텐츠 소유자 전용). Windows는 perm bit 미지원이라 skip.
+func TestOpen_UnixPermissions(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("unix perm bit만 검증 — windows는 무시됨")
+	}
+	base := t.TempDir()
+	storeRoot := filepath.Join(base, "store") // Open이 직접 생성해야 검증 가능(기존 dir는 대상 아님)
+	s, err := Open(storeRoot, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	for _, p := range []string{storeRoot, filepath.Join(storeRoot, "artifacts")} {
+		fi, err := os.Stat(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if fi.Mode().Perm() != 0o700 {
+			t.Fatalf("%s mode=%v want 0700", p, fi.Mode().Perm())
+		}
+	}
+	body := []byte("perm test")
+	if _, err := s.Register(t.Context(), Registration{StoredBytes: body, MediaType: "text/plain",
+		Source: SourceMeta{URI: "/perm.txt", Kind: "file", SrcHash: "hperm"},
+		Chunks: []Chunk{{Ordinal: 0, Text: string(body)}}}); err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256(body)
+	hash := hex.EncodeToString(sum[:])
+	blobDir := filepath.Join(storeRoot, "artifacts", hash[:2])
+	if fi, err := os.Stat(blobDir); err != nil || fi.Mode().Perm() != 0o700 {
+		t.Fatalf("blobDir mode=%v err=%v want 0700", fi.Mode().Perm(), err)
+	}
+	if fi, err := os.Stat(filepath.Join(blobDir, hash)); err != nil || fi.Mode().Perm() != 0o600 {
+		t.Fatalf("blob file mode=%v err=%v want 0600", fi.Mode().Perm(), err)
+	}
+}
+
+func TestOpen_NewerVersionRefusedNonDestructively(t *testing.T) {
+	dir := t.TempDir()
+	s, err := Open(dir, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.writer.Exec("PRAGMA user_version = 99"); err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+	if _, err = Open(dir, false); !errors.Is(err, ErrUnavailable) {
+		t.Fatalf("want ErrUnavailable, got %v", err)
+	}
+	// 비파괴 확인: 파일이 여전히 user_version=99
+	db, _ := sql.Open("sqlite", "file:"+filepath.ToSlash(filepath.Join(dir, "content.db")))
+	defer db.Close()
+	var v int
+	db.QueryRow("PRAGMA user_version").Scan(&v)
+	if v != 99 {
+		t.Fatalf("destroyed! user_version=%d", v)
+	}
+}
+
+func TestMigrate_HealsPartialSchema(t *testing.T) {
+	dir := t.TempDir()
+	// 부분 생성 상태 시뮬레이션: artifacts만 있고 user_version=0
+	db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(filepath.Join(dir, "content.db")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`CREATE TABLE artifacts(
+	  id INTEGER PRIMARY KEY, content_hash TEXT NOT NULL UNIQUE, media_type TEXT NOT NULL,
+	  byte_length INTEGER NOT NULL, redaction TEXT NOT NULL DEFAULT 'none', created_at INTEGER NOT NULL)`); err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+	s, err := Open(dir, false) // 고착 없이 나머지 스키마 완성해야 함
+	if err != nil {
+		t.Fatalf("partial schema에서 open 실패(고착): %v", err)
+	}
+	defer s.Close()
+	var v int
+	if err := s.reader.QueryRow("PRAGMA user_version").Scan(&v); err != nil || v != 1 {
+		t.Fatalf("user_version=%d err=%v", v, err)
+	}
+	var n int
+	if err := s.reader.QueryRow("SELECT count(*) FROM sources").Scan(&n); err != nil {
+		t.Fatalf("sources 미생성: %v", err)
+	}
+}
+
+func TestRegister_DedupTwoSourcesOneArtifact(t *testing.T) {
+	s := openT(t)
+	reg := Registration{StoredBytes: []byte("same body\nline2\n"), MediaType: "text/plain",
+		Source: SourceMeta{URI: "/a.txt", Kind: "file", SrcHash: "h-a"},
+		Chunks: []Chunk{{Ordinal: 0, ByteStart: 0, ByteEnd: 16, LineStart: 1, LineEnd: 2, Text: "same body\nline2\n"}}}
+	id1, err := s.Register(t.Context(), reg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reg.Source = SourceMeta{URI: "/b.txt", Kind: "file", SrcHash: "h-b"}
+	id2, err := s.Register(t.Context(), reg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if id1 != id2 {
+		t.Fatalf("dedup 실패: %d != %d", id1, id2)
+	}
+	var n int
+	s.reader.QueryRow("SELECT count(*) FROM sources").Scan(&n)
+	if n != 2 {
+		t.Fatalf("sources=%d want 2", n)
+	}
+	// blob 존재 + 내용 일치
+	var ch string
+	s.reader.QueryRow("SELECT content_hash FROM artifacts WHERE id=?", id1).Scan(&ch)
+	b, err := os.ReadFile(filepath.Join(s.dir, "artifacts", ch[:2], ch))
+	if err != nil || string(b) != "same body\nline2\n" {
+		t.Fatalf("blob: %v %q", err, b)
+	}
+}
+
+// TestRegister_DedupRespectsMediaType: α3 — 같은 바이트를 다른 media_type으로 등록하면
+// dedup이 (content_hash, media_type) 기준이라 별개 artifact가 되어야 한다(같은 바이트가
+// .txt/.md로 색인될 때 두 번째가 첫 artifact를 재사용해 md 청킹을 잃는 문제 방지).
+// blob 파일은 content_hash 주소라 여전히 1개만 공유된다.
+func TestRegister_DedupRespectsMediaType(t *testing.T) {
+	s := openT(t)
+	body := []byte("same bytes different representation")
+	reg := Registration{StoredBytes: body, MediaType: "text/plain",
+		Source: SourceMeta{URI: "/x.txt", Kind: "file", SrcHash: "hx"},
+		Chunks: []Chunk{{Ordinal: 0, ByteStart: 0, ByteEnd: int64(len(body)), Text: string(body)}}}
+	id1, err := s.Register(t.Context(), reg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reg2 := reg
+	reg2.MediaType = "text/markdown"
+	reg2.Source = SourceMeta{URI: "/x.md", Kind: "file", SrcHash: "hmd"}
+	id2, err := s.Register(t.Context(), reg2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if id1 == id2 {
+		t.Fatalf("want 별개 artifact(media_type 다름), got 동일 id=%d", id1)
+	}
+	var n int
+	s.reader.QueryRow("SELECT count(*) FROM artifacts").Scan(&n)
+	if n != 2 {
+		t.Fatalf("artifacts=%d want 2", n)
+	}
+	var c1, c2 int
+	s.reader.QueryRow("SELECT count(*) FROM chunks WHERE artifact_id=?", id1).Scan(&c1)
+	s.reader.QueryRow("SELECT count(*) FROM chunks WHERE artifact_id=?", id2).Scan(&c2)
+	if c1 != 1 || c2 != 1 {
+		t.Fatalf("want 각자 청크 1개, got c1=%d c2=%d", c1, c2)
+	}
+	var ch1, ch2 string
+	s.reader.QueryRow("SELECT content_hash FROM artifacts WHERE id=?", id1).Scan(&ch1)
+	s.reader.QueryRow("SELECT content_hash FROM artifacts WHERE id=?", id2).Scan(&ch2)
+	if ch1 != ch2 {
+		t.Fatalf("want 동일 content_hash(같은 바이트), got %q vs %q", ch1, ch2)
+	}
+	blobs, _ := filepath.Glob(filepath.Join(s.dir, "artifacts", ch1[:2], ch1))
+	if len(blobs) != 1 {
+		t.Fatalf("want blob 파일 1개(공유), got %v", blobs)
+	}
+}
+
+func TestRegister_CASRejectsStaleWriter(t *testing.T) {
+	s := openT(t)
+	base := Registration{StoredBytes: []byte("v1"), MediaType: "text/plain",
+		Source: SourceMeta{URI: "/f.txt", Kind: "file", SrcHash: "hash-v1"},
+		Chunks: []Chunk{{Ordinal: 0, Text: "v1"}}}
+	if _, err := s.Register(t.Context(), base); err != nil {
+		t.Fatal(err)
+	}
+	newer := base
+	newer.StoredBytes, newer.Source.SrcHash, newer.ExpectedOldSrcHash = []byte("v2"), "hash-v2", "hash-v1"
+	newer.Chunks = []Chunk{{Ordinal: 0, Text: "v2"}}
+	if _, err := s.Register(t.Context(), newer); err != nil {
+		t.Fatal(err)
+	}
+	stale := base // 구버전을 v1 기대로 다시 커밋 시도 → 현재는 hash-v2라 거부
+	stale.ExpectedOldSrcHash = "hash-v1"
+	if _, err := s.Register(t.Context(), stale); !errors.Is(err, ErrConflict) {
+		t.Fatalf("want ErrConflict, got %v", err)
+	}
+}
+
+func TestReadRange_Selectors(t *testing.T) {
+	s := openT(t)
+	body := "alpha\nbravo\ncharlie\n" // bytes: alpha(0-5)...
+	id, err := s.Register(t.Context(), Registration{StoredBytes: []byte(body), MediaType: "text/plain",
+		Source: SourceMeta{URI: "/r.txt", Kind: "file", SrcHash: "h"},
+		Chunks: []Chunk{{Ordinal: 0, ByteStart: 0, ByteEnd: int64(len(body)), LineStart: 1, LineEnd: 3, Text: body}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r, err := s.ReadRange(t.Context(), id, Selector{Kind: "line", LineStart: 2, LineEnd: 2})
+	if err != nil || string(r.Text) != "bravo\n" {
+		t.Fatalf("line sel: %v %q", err, r.Text)
+	}
+	// UTF-8 스냅: 한글 3바이트 중간을 요청해도 문자 경계로 스냅
+	id2, _ := s.Register(t.Context(), Registration{StoredBytes: []byte("가나다"), MediaType: "text/plain",
+		Source: SourceMeta{URI: "/k.txt", Kind: "file", SrcHash: "hk"},
+		Chunks: []Chunk{{Ordinal: 0, Text: "가나다"}}})
+	r2, err := s.ReadRange(t.Context(), id2, Selector{Kind: "byte", ByteStart: 1, ByteEnd: 4})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(r2.Text) != "가" && string(r2.Text) != "나" { // 스냅 결과는 완전한 문자
+		t.Fatalf("snap: %q (start=%d end=%d)", r2.Text, r2.ByteStart, r2.ByteEnd)
+	}
+	if _, err := s.ReadRange(t.Context(), 9999, Selector{Kind: "chunk", ChunkID: 1}); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("want ErrNotFound, got %v", err)
+	}
+}
+
+func TestReadRange_IOErrorHidesPath(t *testing.T) {
+	s := openT(t)
+	id, err := s.Register(t.Context(), Registration{StoredBytes: []byte("alpha\nbravo\n"), MediaType: "text/plain",
+		Source: SourceMeta{URI: "/p.txt", Kind: "file", SrcHash: "hp"},
+		Chunks: []Chunk{{Ordinal: 0, Text: "alpha\nbravo\n"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var ch string
+	s.reader.QueryRow("SELECT content_hash FROM artifacts WHERE id=?", id).Scan(&ch)
+	if err := os.Remove(filepath.Join(s.dir, "artifacts", ch[:2], ch)); err != nil {
+		t.Fatal(err)
+	}
+	_, err = s.ReadRange(t.Context(), id, Selector{Kind: "line", LineStart: 1, LineEnd: 1})
+	if err == nil {
+		t.Fatal("want error, got nil")
+	}
+	if strings.Contains(err.Error(), s.dir) {
+		t.Fatalf("오류에 경로 노출: %v", err)
+	}
+}
+
+func TestRegister_ConcurrentDistinctBlobsNoTmpLeftover(t *testing.T) {
+	s := openT(t)
+	const n = 8
+	var wg sync.WaitGroup
+	errs := make([]error, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			body := fmt.Sprintf("content-%d-unique-payload", i)
+			_, err := s.Register(t.Context(), Registration{StoredBytes: []byte(body), MediaType: "text/plain",
+				Source: SourceMeta{URI: fmt.Sprintf("/c%d.txt", i), Kind: "file", SrcHash: fmt.Sprintf("h%d", i)},
+				Chunks: []Chunk{{Ordinal: 0, Text: body}}})
+			errs[i] = err
+		}(i)
+	}
+	wg.Wait()
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("goroutine %d: %v", i, err)
+		}
+	}
+	for i := 0; i < n; i++ {
+		body := fmt.Sprintf("content-%d-unique-payload", i)
+		sum := sha256.Sum256([]byte(body))
+		hash := hex.EncodeToString(sum[:])
+		b, err := os.ReadFile(filepath.Join(s.dir, "artifacts", hash[:2], hash))
+		if err != nil || string(b) != body {
+			t.Fatalf("blob %d mismatch: %v %q", i, err, b)
+		}
+	}
+	leftover, _ := filepath.Glob(filepath.Join(s.dir, "artifacts", "*", "*.tmp*"))
+	if len(leftover) != 0 {
+		t.Fatalf("임시파일 잔존: %v", leftover)
+	}
+}
+
+func TestReadRange_LineInvalidRangeRejected(t *testing.T) {
+	s := openT(t)
+	id, err := s.Register(t.Context(), Registration{StoredBytes: []byte("a\nb\nc\n"), MediaType: "text/plain",
+		Source: SourceMeta{URI: "/x.txt", Kind: "file", SrcHash: "hx"},
+		Chunks: []Chunk{{Ordinal: 0, Text: "a\nb\nc\n"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, sel := range []Selector{
+		{Kind: "line", LineStart: 3, LineEnd: 1},
+		{Kind: "line", LineStart: 1, LineEnd: 0},
+		{Kind: "line", LineStart: 4, LineEnd: 4}, // α2: 실제 줄 수(3) 초과 — 관대 클램프 금지
+		{Kind: "line", LineStart: 1, LineEnd: 4}, // α2: LineEnd만 초과해도 거부
+	} {
+		if _, err := s.ReadRange(t.Context(), id, sel); !errors.Is(err, ErrInvalidSelector) {
+			t.Fatalf("sel=%+v: want ErrInvalidSelector, got %v (no panic expected)", sel, err)
+		}
+	}
+	// 힌트에 실제 줄 수(3) 포함 — 경로·원문 없이 숫자만 (α2)
+	_, err = s.ReadRange(t.Context(), id, Selector{Kind: "line", LineStart: 4, LineEnd: 4})
+	if err == nil || !strings.Contains(err.Error(), "1..3") {
+		t.Fatalf("want hint 1..3, got %v", err)
+	}
+}
+
+// TestReadRange_ByteOutOfRangeRejected: α2 — byte 선택자가 blob 길이를 벗어나면(음수·
+// 역전·시작이 끝이상·끝이 길이초과) 관대 클램프 없이 ErrInvalidSelector, 힌트에 실제
+// 길이가 숫자로만 포함된다.
+func TestReadRange_ByteOutOfRangeRejected(t *testing.T) {
+	s := openT(t)
+	body := "abcde" // len=5
+	id, err := s.Register(t.Context(), Registration{StoredBytes: []byte(body), MediaType: "text/plain",
+		Source: SourceMeta{URI: "/b.txt", Kind: "file", SrcHash: "hb"},
+		Chunks: []Chunk{{Ordinal: 0, Text: body}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, sel := range []Selector{
+		{Kind: "byte", ByteStart: -1, ByteEnd: 3},
+		{Kind: "byte", ByteStart: 2, ByteEnd: 2},
+		{Kind: "byte", ByteStart: 5, ByteEnd: 5}, // ByteStart>=len
+		{Kind: "byte", ByteStart: 0, ByteEnd: 6}, // ByteEnd>len — 초과분 클램프 금지
+	} {
+		if _, err := s.ReadRange(t.Context(), id, sel); !errors.Is(err, ErrInvalidSelector) {
+			t.Fatalf("sel=%+v: want ErrInvalidSelector, got %v", sel, err)
+		}
+	}
+	_, err = s.ReadRange(t.Context(), id, Selector{Kind: "byte", ByteStart: 0, ByteEnd: 6})
+	if err == nil || !strings.Contains(err.Error(), "0..5") {
+		t.Fatalf("want hint 0..5, got %v", err)
+	}
+}
+
+// TestReadRange_ChunkWrongArtifactRejected: α2 — chunk_id가 실재하되 요청한 artifact
+// 소속이 아니면 ErrNotFound가 아닌 ErrInvalidSelector.
+func TestReadRange_ChunkWrongArtifactRejected(t *testing.T) {
+	s := openT(t)
+	idA, err := s.Register(t.Context(), Registration{StoredBytes: []byte("artifact A body"), MediaType: "text/plain",
+		Source: SourceMeta{URI: "/a2.txt", Kind: "file", SrcHash: "ha2"},
+		Chunks: []Chunk{{Ordinal: 0, Text: "artifact A body"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	idB, err := s.Register(t.Context(), Registration{StoredBytes: []byte("artifact B body"), MediaType: "text/plain",
+		Source: SourceMeta{URI: "/b2.txt", Kind: "file", SrcHash: "hb2"},
+		Chunks: []Chunk{{Ordinal: 0, Text: "artifact B body"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var chunkIDofB int64
+	if err := s.reader.QueryRow("SELECT id FROM chunks WHERE artifact_id=?", idB).Scan(&chunkIDofB); err != nil {
+		t.Fatal(err)
+	}
+	_, err = s.ReadRange(t.Context(), idA, Selector{Kind: "chunk", ChunkID: chunkIDofB})
+	if !errors.Is(err, ErrInvalidSelector) {
+		t.Fatalf("want ErrInvalidSelector(chunk 실재·타 artifact), got %v", err)
+	}
+	// 진짜 미존재 chunk_id는 여전히 ErrNotFound
+	_, err = s.ReadRange(t.Context(), idA, Selector{Kind: "chunk", ChunkID: 99999})
+	if !errors.Is(err, ErrNotFound) {
+		t.Fatalf("want ErrNotFound(진짜 미존재), got %v", err)
+	}
+}
+
+func TestSourceOf(t *testing.T) {
+	s := openT(t)
+	id, err := s.Register(t.Context(), Registration{StoredBytes: []byte("body"), MediaType: "text/plain",
+		Source: SourceMeta{URI: "/z.txt", Kind: "file", SrcHash: "hz"},
+		Chunks: []Chunk{{Ordinal: 0, Text: "body"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	info, ok := s.sourceOf(id)
+	if !ok || info.URI != "/z.txt" || info.Kind != "file" || info.SrcHash != "hz" {
+		t.Fatalf("sourceOf=%+v ok=%v", info, ok)
+	}
+	if _, ok := s.sourceOf(9999); ok {
+		t.Fatal("want ok=false for unknown artifact_id")
+	}
+}
+
+func TestStaleOf(t *testing.T) {
+	dir := t.TempDir()
+	file := filepath.Join(dir, "doc.txt")
+	body := []byte("hello world")
+	if err := os.WriteFile(file, body, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	fi, err := os.Stat(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256(body)
+	info := SourceInfo{URI: filepath.ToSlash(file), Kind: "file", Size: fi.Size(),
+		MtimeNS: fi.ModTime().UnixNano(), SrcHash: hex.EncodeToString(sum[:])}
+
+	if StaleOf(info) {
+		t.Fatal("want 수정 전 Stale=false")
+	}
+	inlineInfo := info
+	inlineInfo.Kind = "inline"
+	inlineInfo.URI = "/does/not/exist.txt" // kind!=file → os.Stat조차 하지 않는 단락 경로
+	if StaleOf(inlineInfo) {
+		t.Fatal("want kind=inline 항상 Stale=false")
+	}
+
+	future := time.Now().Add(time.Hour)
+	if err := os.WriteFile(file, []byte("hello world MODIFIED"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(file, future, future); err != nil {
+		t.Fatal(err)
+	}
+	if !StaleOf(info) {
+		t.Fatal("want 수정 후 Stale=true")
+	}
+
+	if err := os.Remove(file); err != nil {
+		t.Fatal(err)
+	}
+	if !StaleOf(info) {
+		t.Fatal("want 삭제 후 Stale=true")
+	}
+}
+
+func TestReadRange_FillsSourceAndStale(t *testing.T) {
+	s := openT(t)
+	dir := t.TempDir()
+	file := filepath.Join(dir, "src.txt")
+	body := []byte("line one\n")
+	if err := os.WriteFile(file, body, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	fi, err := os.Stat(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256(body)
+	uri := filepath.ToSlash(file)
+	id, err := s.Register(t.Context(), Registration{StoredBytes: body, MediaType: "text/plain",
+		Source: SourceMeta{URI: uri, Kind: "file", Size: fi.Size(), MtimeNS: fi.ModTime().UnixNano(), SrcHash: hex.EncodeToString(sum[:])},
+		Chunks: []Chunk{{Ordinal: 0, ByteStart: 0, ByteEnd: int64(len(body)), LineStart: 1, LineEnd: 1, Text: string(body)}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r, err := s.ReadRange(t.Context(), id, Selector{Kind: "line", LineStart: 1, LineEnd: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !r.HasSource || r.Source.URI != uri || r.Stale {
+		t.Fatalf("want HasSource=true Stale=false, got HasSource=%v Source=%+v Stale=%v", r.HasSource, r.Source, r.Stale)
+	}
+}
+
+func FuzzSnapUTF8(f *testing.F) {
+	f.Add([]byte("가나다"), int64(1), int64(4))
+	f.Add([]byte("hello\nworld"), int64(0), int64(11))
+	f.Add([]byte{0xE0, 0x41, 0x80, 0x80}, int64(0), int64(4))
+	f.Fuzz(func(t *testing.T, data []byte, start, end int64) {
+		s, e := snapUTF8(data, start, end)
+		if s < 0 || e < s || e > int64(len(data)) {
+			t.Fatalf("range invariant 위반: start=%d end=%d len=%d", s, e, len(data))
+		}
+		if !utf8.Valid(data[s:e]) {
+			t.Fatalf("잘못된 UTF-8 반환: %q", data[s:e])
+		}
+	})
+}
