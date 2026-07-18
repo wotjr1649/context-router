@@ -48,7 +48,7 @@ func NewServer(cfg Config) (*mcp.Server, error) {
 	}
 	srv := mcp.NewServer(&mcp.Implementation{Name: "context-router", Version: serverVersion}, nil)
 	registerSearch(srv, cfg.Store, cfg.Canon.ProjectRoot)
-	registerFetch(srv, cfg.Store)
+	registerFetch(srv, cfg.Store, cfg.Canon.ProjectRoot)
 	if slices.Contains(cfg.Enable, "ingest") {
 		registerIndex(srv, cfg.Store, cfg.Canon.ProjectRoot, cfg.AllowPaths)
 	}
@@ -187,14 +187,17 @@ type FetchInput struct {
 	MaxReturnBytes int    `json:"max_return_bytes,omitempty" jsonschema:"기본 16384, 최대 65536"`
 }
 
-// fetchProvenance: 설계 §4.2 계약 중 store.ReadRange(ArtifactMeta)만으로 채울 수 있는
-// 부분집합. src_hash/source/source_kind/stale은 sources 테이블 조회가 필요한데 store가
-// 이를 노출하지 않고(§10 mcp는 database/sql 직접 조회 금지) store 수정은 범위 밖이라
-// 생략한다 — report에 명시.
+// fetchProvenance: 설계 §4.2 provenance 전체 계약. src_hash/source/source_kind/stale은
+// store.ReadRange가 채운 RangeResult.Source/HasSource/Stale에서 온다 — HasSource=false면
+// (소스 없는 artifact) 4필드 모두 zero value(""/false)로 남긴다.
 type fetchProvenance struct {
 	ContentHash string `json:"content_hash"`
 	Redaction   string `json:"redaction"`
 	CreatedAt   int64  `json:"created_at"`
+	SrcHash     string `json:"src_hash"`
+	Source      string `json:"source"`
+	SourceKind  string `json:"source_kind"`
+	Stale       bool   `json:"stale"`
 }
 
 type FetchOutput struct {
@@ -268,7 +271,7 @@ func applyFetchBudget(res store.RangeResult, maxBytes int) (text []byte, byteEnd
 	return cut, res.ByteStart + int64(n), lineEnd, true
 }
 
-func registerFetch(srv *mcp.Server, st *store.Store) {
+func registerFetch(srv *mcp.Server, st *store.Store, projectRoot string) {
 	mcp.AddTool(srv, &mcp.Tool{
 		Name:        "ctr_fetch",
 		Description: "artifact 저장본에서 선택자 범위를 그대로 회수한다.",
@@ -290,16 +293,23 @@ func registerFetch(srv *mcp.Server, st *store.Store) {
 			maxBytes = 65536
 		}
 		text, byteEnd, lineEnd, truncated := applyFetchBudget(res, maxBytes)
+		prov := fetchProvenance{
+			ContentHash: res.Artifact.ContentHash, Redaction: res.Artifact.Redaction,
+			CreatedAt: res.Artifact.CreatedAt,
+		}
+		if res.HasSource {
+			prov.SrcHash = res.Source.SrcHash
+			prov.Source = search.RelativizeSource(projectRoot, res.Source.URI)
+			prov.SourceKind = res.Source.Kind
+			prov.Stale = res.Stale
+		}
 		out := FetchOutput{
 			Content: string(text), ByteStart: res.ByteStart, ByteEnd: byteEnd,
 			LineStart: res.LineStart, LineEnd: lineEnd, Truncated: truncated,
 			ExactScope: "artifact", Representation: representationOf(res.Artifact.MediaType),
 			SourceCoordsExact: res.Artifact.Redaction == "none",
-			Provenance: fetchProvenance{
-				ContentHash: res.Artifact.ContentHash, Redaction: res.Artifact.Redaction,
-				CreatedAt: res.Artifact.CreatedAt,
-			},
-			Untrusted: true,
+			Provenance:        prov,
+			Untrusted:         true,
 		}
 		st.LedgerAppend("ctr_fetch", 0, jsonLen(out), time.Since(start).Milliseconds())
 		return nil, out, nil

@@ -319,9 +319,9 @@ func TestRelativizeSource_ProjectRelativeInvariants(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			got := relativizeSource(c.uri, c.root)
+			got := RelativizeSource(c.root, c.uri)
 			if got != c.want {
-				t.Fatalf("relativizeSource(%q,%q) = %q, want %q", c.uri, c.root, got, c.want)
+				t.Fatalf("RelativizeSource(%q,%q) = %q, want %q", c.root, c.uri, got, c.want)
 			}
 			if filepath.IsAbs(got) {
 				t.Fatalf("want !IsAbs, got %q", got)

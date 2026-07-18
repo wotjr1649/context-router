@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
@@ -184,6 +185,36 @@ func TestRoundTrip(t *testing.T) {
 	}
 	if fetchOut.Content == "" {
 		t.Fatalf("fetch content empty")
+	}
+	if fetchOut.Provenance.SrcHash == "" {
+		t.Fatalf("provenance.src_hash empty: %+v", fetchOut.Provenance)
+	}
+	if fetchOut.Provenance.Source == "" || filepath.IsAbs(fetchOut.Provenance.Source) {
+		t.Fatalf("provenance.source want project-relative, got %q", fetchOut.Provenance.Source)
+	}
+	if fetchOut.Provenance.Stale {
+		t.Fatalf("provenance.stale=true, want false before modification")
+	}
+
+	// 파일 수정 후 재-fetch: 같은 chunk 선택자라도 provenance.stale이 true로 바뀌어야 한다.
+	future := time.Now().Add(time.Hour)
+	if err := os.WriteFile(tmpFile, []byte("needle content MODIFIED for round trip\n"), 0o644); err != nil {
+		t.Fatalf("modify tmp file: %v", err)
+	}
+	if err := os.Chtimes(tmpFile, future, future); err != nil {
+		t.Fatalf("chtimes: %v", err)
+	}
+	fetchRes2, err := cs.CallTool(ctx, &mcp.CallToolParams{Name: "ctr_fetch", Arguments: FetchInput{ArtifactID: hit.ArtifactID, ChunkID: &chunkID}})
+	if err != nil {
+		t.Fatalf("ctr_fetch call 2: %v", err)
+	}
+	if fetchRes2.IsError {
+		t.Fatalf("ctr_fetch error 2: %+v", fetchRes2.Content)
+	}
+	var fetchOut2 FetchOutput
+	remarshal(t, fetchRes2.StructuredContent, &fetchOut2)
+	if !fetchOut2.Provenance.Stale {
+		t.Fatalf("provenance.stale=false after modification, want true: %+v", fetchOut2.Provenance)
 	}
 }
 

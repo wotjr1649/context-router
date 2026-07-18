@@ -3,13 +3,9 @@ package search
 
 import (
 	"context"
-	"crypto/sha256"
 	"database/sql"
-	"encoding/hex"
 	"errors"
 	"fmt"
-	"os"
-	"path/filepath"
 	"sort"
 	"strings"
 	"unicode"
@@ -191,7 +187,7 @@ func loadHit(ctx context.Context, db *sql.DB, chunkID int64, score float64, q, p
 	}
 	h.ChunkID = chunkID
 	h.Score = score
-	h.Source = relativizeSource(uri, projectRoot)
+	h.Source = RelativizeSource(projectRoot, uri)
 	h.Snippet = snippetWindow(text, firstMatchToken(q, text))
 	h.Redacted = redaction == "spans"
 	// SourceCoordsExact: file/inline은 저장된 좌표가 원문을 그대로 가리켜 정확하다. web처럼
@@ -201,12 +197,12 @@ func loadHit(ctx context.Context, db *sql.DB, chunkID int64, score float64, q, p
 	return h, nil
 }
 
-// relativizeSource: uri(ident.Fold된 절대경로 또는 inline:제목)를 projectRoot(ident.Fold된
+// RelativizeSource: uri(ident.Fold된 절대경로 또는 inline:제목)를 projectRoot(ident.Fold된
 // canonical project root) 기준 project-relative 경로로 바꾼다(설계 §4.1 source(project-relative);
 // 절대경로 전체 노출 금지가 계약). uri가 projectRoot+"/"로 시작하면 그 접두를 잘라낸 진짜
 // 상대경로를 반환한다. 아니면(프로젝트 밖 uri, projectRoot 불명 등) fallback: 선행 "/" 제거,
 // 드라이브 세그먼트("c:" 등) 제거 후 마지막 최대 3개 '/' 세그먼트만 남기는 근사치.
-func relativizeSource(uri, projectRoot string) string {
+func RelativizeSource(projectRoot, uri string) string {
 	if projectRoot != "" {
 		if rel, ok := strings.CutPrefix(uri, projectRoot+"/"); ok {
 			return rel
@@ -358,10 +354,9 @@ func snapWindow(s string, start, end int) (int, int) {
 	return start, pos
 }
 
-// isStale: source_kind!="file"이면 항상 false(설계 §3.6). file이면 os.Stat으로 size/mtime_ns를
-// sources 행과 비교하고, 불일치 시 원본을 재해시해 src_hash와 대조한다(content_hash는 저장본
-// 주소라 원본 대조에 미사용). Stat 실패도 stale=true. cache는 Query 호출 1회 동안 uri별 1회만
-// 계산하도록 재사용된다.
+// isStale: 판정 자체는 store.StaleOf(설계 §3.6)에 위임한다. cache는 Query 호출 1회 동안
+// uri별 1회만 계산하도록 재사용된다(kind!="file" 단락은 store.StaleOf 호출조차 생략하는
+// 빠른 경로).
 func isStale(uri, kind string, size, mtimeNS int64, srcHash string, cache map[string]bool) bool {
 	if kind != "file" {
 		return false
@@ -369,26 +364,9 @@ func isStale(uri, kind string, size, mtimeNS int64, srcHash string, cache map[st
 	if v, ok := cache[uri]; ok {
 		return v
 	}
-	stale := statStale(uri, size, mtimeNS, srcHash)
+	stale := store.StaleOf(store.SourceInfo{URI: uri, Kind: kind, Size: size, MtimeNS: mtimeNS, SrcHash: srcHash})
 	cache[uri] = stale
 	return stale
-}
-
-func statStale(uri string, size, mtimeNS int64, srcHash string) bool {
-	p := filepath.FromSlash(uri)
-	fi, err := os.Stat(p)
-	if err != nil {
-		return true
-	}
-	if fi.Size() == size && fi.ModTime().UnixNano() == mtimeNS {
-		return false
-	}
-	raw, err := os.ReadFile(p)
-	if err != nil {
-		return true
-	}
-	sum := sha256.Sum256(raw)
-	return hex.EncodeToString(sum[:]) != srcHash
 }
 
 // Query: queries 각각에 대해 fts_porter+fts_trigram을 병행 질의하고 상위 limit×4개씩을

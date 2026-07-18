@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 	"unicode/utf8"
 )
 
@@ -255,6 +256,96 @@ func TestReadRange_LineInvalidRangeRejected(t *testing.T) {
 		if _, err := s.ReadRange(t.Context(), id, sel); !errors.Is(err, ErrInvalidSelector) {
 			t.Fatalf("sel=%+v: want ErrInvalidSelector, got %v (no panic expected)", sel, err)
 		}
+	}
+}
+
+func TestSourceOf(t *testing.T) {
+	s := openT(t)
+	id, err := s.Register(t.Context(), Registration{StoredBytes: []byte("body"), MediaType: "text/plain",
+		Source: SourceMeta{URI: "/z.txt", Kind: "file", SrcHash: "hz"},
+		Chunks: []Chunk{{Ordinal: 0, Text: "body"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	info, ok := s.sourceOf(id)
+	if !ok || info.URI != "/z.txt" || info.Kind != "file" || info.SrcHash != "hz" {
+		t.Fatalf("sourceOf=%+v ok=%v", info, ok)
+	}
+	if _, ok := s.sourceOf(9999); ok {
+		t.Fatal("want ok=false for unknown artifact_id")
+	}
+}
+
+func TestStaleOf(t *testing.T) {
+	dir := t.TempDir()
+	file := filepath.Join(dir, "doc.txt")
+	body := []byte("hello world")
+	if err := os.WriteFile(file, body, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	fi, err := os.Stat(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256(body)
+	info := SourceInfo{URI: filepath.ToSlash(file), Kind: "file", Size: fi.Size(),
+		MtimeNS: fi.ModTime().UnixNano(), SrcHash: hex.EncodeToString(sum[:])}
+
+	if StaleOf(info) {
+		t.Fatal("want 수정 전 Stale=false")
+	}
+	inlineInfo := info
+	inlineInfo.Kind = "inline"
+	inlineInfo.URI = "/does/not/exist.txt" // kind!=file → os.Stat조차 하지 않는 단락 경로
+	if StaleOf(inlineInfo) {
+		t.Fatal("want kind=inline 항상 Stale=false")
+	}
+
+	future := time.Now().Add(time.Hour)
+	if err := os.WriteFile(file, []byte("hello world MODIFIED"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(file, future, future); err != nil {
+		t.Fatal(err)
+	}
+	if !StaleOf(info) {
+		t.Fatal("want 수정 후 Stale=true")
+	}
+
+	if err := os.Remove(file); err != nil {
+		t.Fatal(err)
+	}
+	if !StaleOf(info) {
+		t.Fatal("want 삭제 후 Stale=true")
+	}
+}
+
+func TestReadRange_FillsSourceAndStale(t *testing.T) {
+	s := openT(t)
+	dir := t.TempDir()
+	file := filepath.Join(dir, "src.txt")
+	body := []byte("line one\n")
+	if err := os.WriteFile(file, body, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	fi, err := os.Stat(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256(body)
+	uri := filepath.ToSlash(file)
+	id, err := s.Register(t.Context(), Registration{StoredBytes: body, MediaType: "text/plain",
+		Source: SourceMeta{URI: uri, Kind: "file", Size: fi.Size(), MtimeNS: fi.ModTime().UnixNano(), SrcHash: hex.EncodeToString(sum[:])},
+		Chunks: []Chunk{{Ordinal: 0, ByteStart: 0, ByteEnd: int64(len(body)), LineStart: 1, LineEnd: 1, Text: string(body)}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r, err := s.ReadRange(t.Context(), id, Selector{Kind: "line", LineStart: 1, LineEnd: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !r.HasSource || r.Source.URI != uri || r.Stale {
+		t.Fatalf("want HasSource=true Stale=false, got HasSource=%v Source=%+v Stale=%v", r.HasSource, r.Source, r.Stale)
 	}
 }
 

@@ -189,11 +189,21 @@ type Selector struct {
 	Kind               string
 }
 
+// SourceInfo — sources 1행의 provenance 부분집합(§4.2 ctr_fetch 계약, RangeResult가 담아 반환).
+type SourceInfo struct {
+	URI, Kind           string
+	Size, MtimeNS       int64
+	SrcHash, Extraction string
+}
+
 type RangeResult struct {
 	Text               []byte
 	ByteStart, ByteEnd int64
 	LineStart, LineEnd int
 	Artifact           ArtifactMeta
+	Source             SourceInfo
+	HasSource          bool
+	Stale              bool
 }
 
 type ArtifactMeta struct {
@@ -441,6 +451,46 @@ func (s *Store) readChunk(res *RangeResult, artifactID, chunkID int64) error {
 	return nil
 }
 
+// sourceOf: artifactID의 sources 중 첫 행(uri ASC — 다중 소스면 결정적으로 하나를 고른다).
+// 없으면 ok=false.
+func (s *Store) sourceOf(artifactID int64) (SourceInfo, bool) {
+	var info SourceInfo
+	var size, mtimeNS sql.NullInt64
+	var srcHash, extraction sql.NullString
+	err := s.reader.QueryRow(`SELECT uri,source_kind,src_size,src_mtime_ns,src_hash,extraction
+		FROM sources WHERE artifact_id=? ORDER BY uri ASC LIMIT 1`, artifactID).
+		Scan(&info.URI, &info.Kind, &size, &mtimeNS, &srcHash, &extraction)
+	if err != nil {
+		return SourceInfo{}, false
+	}
+	info.Size, info.MtimeNS = size.Int64, mtimeNS.Int64
+	info.SrcHash, info.Extraction = srcHash.String, extraction.String
+	return info, true
+}
+
+// StaleOf: source_kind!="file"이면 항상 false(설계 §3.6). file이면 os.Stat으로 size/mtime_ns를
+// info와 비교하고, 불일치 시 원본을 재해시해 SrcHash와 대조한다(content_hash는 저장본 주소라
+// 원본 대조에 미사용). Stat 실패도 stale=true.
+func StaleOf(info SourceInfo) bool {
+	if info.Kind != "file" {
+		return false
+	}
+	p := filepath.FromSlash(info.URI)
+	fi, err := os.Stat(p)
+	if err != nil {
+		return true
+	}
+	if fi.Size() == info.Size && fi.ModTime().UnixNano() == info.MtimeNS {
+		return false
+	}
+	raw, err := os.ReadFile(p)
+	if err != nil {
+		return true
+	}
+	sum := sha256.Sum256(raw)
+	return hex.EncodeToString(sum[:]) != info.SrcHash
+}
+
 // ReadRange: Selector.Kind 하나로 chunk 저장 좌표, blob 라인 스캔, blob UTF-8 스냅 바이트
 // 구간 중 하나를 읽는다 (설계 §3.5).
 func (s *Store) ReadRange(ctx context.Context, artifactID int64, sel Selector) (RangeResult, error) {
@@ -484,6 +534,10 @@ func (s *Store) ReadRange(ctx context.Context, artifactID int64, sel Selector) (
 		}
 		res.ByteStart, res.ByteEnd = snapUTF8(blob, sel.ByteStart, sel.ByteEnd)
 		res.Text = blob[res.ByteStart:res.ByteEnd]
+	}
+	if info, ok := s.sourceOf(artifactID); ok {
+		res.Source, res.HasSource = info, true
+		res.Stale = StaleOf(info)
 	}
 	return res, nil
 }

@@ -7,6 +7,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -135,11 +136,26 @@ func canonicalizeAllowPaths(paths []string, storeRoot string) ([]string, error) 
 	return out, nil
 }
 
+// parseLogLevel: --log-level 문자열→slog.Level. 미지 값은 info로 뭉갠다.
+func parseLogLevel(s string) slog.Level {
+	switch s {
+	case "debug":
+		return slog.LevelDebug
+	case "warn":
+		return slog.LevelWarn
+	case "error":
+		return slog.LevelError
+	default:
+		return slog.LevelInfo
+	}
+}
+
 func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	f, err := parseFlags(args)
 	if err != nil {
 		return err
 	}
+	slog.SetDefault(slog.New(slog.NewTextHandler(stderr, &slog.HandlerOptions{Level: parseLogLevel(f.LogLevel)})))
 	root := f.Root
 	if root == "" {
 		if root, err = os.Getwd(); err != nil {

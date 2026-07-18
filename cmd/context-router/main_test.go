@@ -70,6 +70,14 @@ func TestCanonicalizeAllowPaths(t *testing.T) {
 	}
 }
 
+func TestCanonicalizeAllowPaths_NonexistentPathErrors(t *testing.T) {
+	storeRoot := t.TempDir()
+	missing := filepath.Join(t.TempDir(), "does-not-exist")
+	if _, err := canonicalizeAllowPaths([]string{missing}, storeRoot); err == nil {
+		t.Fatal("want error for nonexistent allow-path, got nil")
+	}
+}
+
 func TestStoreRootFor(t *testing.T) {
 	t.Run("flag_wins", func(t *testing.T) {
 		got, err := storeRootFor(serverFlags{StoreRoot: "C:/custom"})
