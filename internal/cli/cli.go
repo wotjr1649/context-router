@@ -404,9 +404,27 @@ func runPurge(ctx context.Context, in io.Reader, w io.Writer, storeRoot string, 
 		// 리뷰 P2-2: writable store.Open 전에 대상 존재를 확인한다 — store.Open(dir,false)는
 		// MkdirAll+migrate로 존재하지 않던 프로젝트를 그 자리에서 새로 만들어버리고(phantom
 		// project), 전체 삭제 분기의 os.RemoveAll은 대상이 없어도 조용히 nil을 반환해 오타를
-		// 성공으로 오인시킨다. content.db 존재로 "실재하는 프로젝트"를 판정한다.
+		// 성공으로 오인시킨다. content.db 존재로 "실재하는 프로젝트"를 판정한다. 이 존재 검사는
+		// --project 단일 대상의 오타 방지용이다 — --all은 이미 listProjectDirs가 실재 목록에서
+		// 뽑은 id를 순회하므로 오타일 수 없다.
 		if _, err := os.Stat(filepath.Join(projDir, "content.db")); err != nil {
-			return errors.New("purge: 대상 프로젝트 없음")
+			if !*all {
+				return errors.New("purge: 대상 프로젝트 없음")
+			}
+			// 최종리뷰 F3: lock 타임아웃·migrate 실패·크래시가 artifacts/+lock 파일만 남기고
+			// content.db는 없는 부분 생성 디렉터리를 남길 수 있다(설계 §3.1). --all 순회
+			// 도중 이런 디렉터리를 만나도 배치 전체를 fail-stuck시키지 않는다: 전체삭제
+			// 모드(선택 삭제 아님)면 정리 목적에 부합하게 통째로 지운다. 선택 삭제
+			// (--older-than)는 indexed_at 판단 근거(content.db)가 없어 지울 수 없으므로
+			// skip하고 계속 진행한다 — 나머지 정상 프로젝트가 이 하나 때문에 막히면 안 된다.
+			if selective {
+				fmt.Fprintf(w, "purge: skip %s (content.db 없음)\n", id)
+				continue
+			}
+			if err := os.RemoveAll(projDir); err != nil {
+				return errors.New("purge: 손상된 프로젝트 디렉터리 정리 실패")
+			}
+			continue
 		}
 
 		if gcOnly {
@@ -465,21 +483,25 @@ func probeWritable(dir string) bool {
 	return true
 }
 
-// nearestExistingDir: path의 조상 디렉터리 중 실제로 존재하는 가장 가까운 것을 찾는다.
-// store.Open은 MkdirAll(path/artifacts, ...)로 중간 디렉터리를 몇 단계든 한 번에 만들 수
-// 있으므로(설계 §3.1), 미생성 storeRoot의 쓰기 가능 여부는 딱 한 단계 위(filepath.Dir)가
-// 아니라 실제로 존재하는 조상에서 판정해야 한다 — 예전 구현은 한 단계 위까지 없는 신규
-// 배치(예: storeRoot의 부모·조부모가 전부 미생성)에서 그 부모조차 못 만들고 늘 "쓰기
-// 불가"로 오판했다(리뷰 Fix Round 3, item 2).
-func nearestExistingDir(path string) string {
-	dir := path
+// nearestExistingDir: path의 조상 중 실제로 존재하는 가장 가까운 항목을 찾는다. 그 항목이
+// 디렉터리면 (경로, true)를 반환해 store.Open의 MkdirAll(path/artifacts, ...)이 거기서부터
+// 중간 디렉터리를 만들 수 있는지(설계 §3.1) probeWritable로 확인하게 한다. 그 항목이
+// 디렉터리가 아닌 일반 파일이면(즉 os.Stat(path)이 ENOTDIR로 실패할 만큼 중간 조상이
+// 비디렉터리인 경우 포함) (경로, false)를 반환한다 — MkdirAll은 그 비디렉터리 조상을 뚫고
+// 지나갈 수 없어 절대 성공하지 못하므로, 그 이상 위로 계속 올라가 엉뚱한 "쓰기 가능한 먼
+// 조상"을 찾아 성공으로 오판하면 안 된다(최종리뷰 F6 — 예전 구현은 `err == nil &&
+// fi.IsDir()`를 종료 조건으로 삼아 비디렉터리 조상을 그냥 지나쳐버렸다). 딱 한 단계 위가
+// 아니라 실제로 존재하는 가장 가까운 조상까지 오르는 이유는 여러 단계가 한꺼번에
+// 미생성인 신규 배치를 다루기 위해서다(리뷰 Fix Round 3, item 2).
+func nearestExistingDir(path string) (dir string, isDir bool) {
+	dir = path
 	for {
-		if fi, err := os.Stat(dir); err == nil && fi.IsDir() {
-			return dir
+		if fi, err := os.Stat(dir); err == nil {
+			return dir, fi.IsDir()
 		}
 		parent := filepath.Dir(dir)
-		if parent == dir { // 루트 도달 — 더 못 올라감
-			return dir
+		if parent == dir { // 루트 도달 — 더 못 올라감(사실상 발생하지 않음, 방어적 종료)
+			return dir, false
 		}
 		dir = parent
 	}
@@ -558,9 +580,9 @@ func runDoctor(ctx context.Context, w io.Writer, storeRoot, projectRoot string) 
 		if fi.IsDir() {
 			writable = probeWritable(storeRoot)
 		} // else: 디렉터리가 아닌 기존 경로 — writable은 false로 둔다(명시 거부)
-	} else {
-		writable = probeWritable(nearestExistingDir(storeRoot))
-	}
+	} else if nearest, isDir := nearestExistingDir(storeRoot); isDir {
+		writable = probeWritable(nearest)
+	} // else: 비디렉터리 조상이 경로를 막고 있음(F6) — MkdirAll이 절대 성공 못 하므로 writable=false 유지
 	fmt.Fprintf(w, "[1] store-root: exists=%v writable=%v\n", exists, writable)
 	if !writable {
 		failed = append(failed, "store-root")

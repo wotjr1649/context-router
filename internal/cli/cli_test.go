@@ -554,6 +554,99 @@ func TestRunPurge_All_ContextCanceledStopsBeforeAnyDeletion(t *testing.T) {
 	}
 }
 
+// TestRunPurge_All_PartiallyCreatedDirRemovedNotFailStuck: 최종리뷰 F3 — lock 타임아웃·
+// migrate 실패·크래시가 artifacts/만 남기고 content.db가 없는 부분 생성 디렉터리를
+// projects/ 밑에 남길 수 있다. --all --force(전체삭제 모드, --older-than 없음)가 이런
+// 디렉터리와 정상 프로젝트를 함께 순회할 때, 예전엔 첫 os.Stat(content.db) 실패에서 즉시
+// 전체 중단돼 정상 프로젝트도 못 지웠다 — 이제는 깨진 디렉터리를 정리 목적에 맞게
+// RemoveAll하고 정상 프로젝트도 계속 처리해야 한다(양쪽 다 사라져야 함).
+func TestRunPurge_All_PartiallyCreatedDirRemovedNotFailStuck(t *testing.T) {
+	storeRoot := t.TempDir()
+
+	projectRoot := t.TempDir()
+	canon, err := ident.Canonicalize(projectRoot)
+	if err != nil {
+		t.Fatalf("canonicalize: %v", err)
+	}
+	goodDir := filepath.Join(storeRoot, "projects", canon.ProjectID)
+	st, err := store.Open(goodDir, false)
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	if _, err := st.Register(t.Context(), store.Registration{
+		StoredBytes: []byte("data"), MediaType: "text/plain",
+		Source: store.SourceMeta{URI: "/d.txt", Kind: "file", SrcHash: "h"},
+		Chunks: []store.Chunk{{Ordinal: 0, Text: "data"}},
+	}); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	// 부분 생성 디렉터리 모사: content.db 없이 artifacts/만 존재.
+	brokenDir := filepath.Join(storeRoot, "projects", "broken-partial-dir")
+	if err := os.MkdirAll(filepath.Join(brokenDir, "artifacts"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	if err := runPurge(context.Background(), failReader{}, &out, storeRoot, []string{"--all", "--force"}, false); err != nil {
+		t.Fatalf("runPurge --all --force: %v (out=%s)", err, out.String())
+	}
+
+	if _, statErr := os.Stat(goodDir); !os.IsNotExist(statErr) {
+		t.Fatalf("정상 프로젝트가 삭제되지 않음: stat err=%v", statErr)
+	}
+	if _, statErr := os.Stat(brokenDir); !os.IsNotExist(statErr) {
+		t.Fatalf("깨진 디렉터리가 정리되지 않음: stat err=%v", statErr)
+	}
+}
+
+// TestRunPurge_All_Selective_PartiallyCreatedDirSkipped: 선택 삭제 모드(--older-than)에서는
+// content.db가 없는 디렉터리를 지울 근거(indexed_at)가 없으므로 RemoveAll하지 않고 skip
+// 보고만 하며, 나머지 정상 프로젝트는 계속 처리해야 한다(F3).
+func TestRunPurge_All_Selective_PartiallyCreatedDirSkipped(t *testing.T) {
+	storeRoot := t.TempDir()
+	projectRoot := t.TempDir()
+	canon, err := ident.Canonicalize(projectRoot)
+	if err != nil {
+		t.Fatalf("canonicalize: %v", err)
+	}
+	goodDir := filepath.Join(storeRoot, "projects", canon.ProjectID)
+	st, err := store.Open(goodDir, false)
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	if _, err := st.Register(t.Context(), store.Registration{
+		StoredBytes: []byte("data"), MediaType: "text/plain",
+		Source: store.SourceMeta{URI: "/d.txt", Kind: "file", SrcHash: "h"},
+		Chunks: []store.Chunk{{Ordinal: 0, Text: "data"}},
+	}); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	brokenDir := filepath.Join(storeRoot, "projects", "broken-partial-dir")
+	if err := os.MkdirAll(filepath.Join(brokenDir, "artifacts"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	args := []string{"--all", "--force", "--older-than", "1ns"}
+	if err := runPurge(context.Background(), failReader{}, &out, storeRoot, args, false); err != nil {
+		t.Fatalf("runPurge: %v (out=%s)", err, out.String())
+	}
+	if _, statErr := os.Stat(brokenDir); statErr != nil {
+		t.Fatalf("선택 삭제 모드에서 깨진 디렉터리가 임의로 지워짐: stat err=%v", statErr)
+	}
+	if !strings.Contains(out.String(), "broken-partial-dir") {
+		t.Fatalf("skip 보고 누락: out=%s", out.String())
+	}
+}
+
 // TestRunStats_Local: 임시 store에 LedgerAppend 3건(도구 2종)을 넣고 Run(ctx,"stats",...)을
 // 호출해 로컬 ledger 집계 표를 확인한다(설계 §6) — 두 도구명 모두·"bytes suppressed" 고정
 // 문구 포함, "token"/"$" 문자열은 어디에도 없어야 한다(토큰·달러 환산·절약률 주장 금지,
@@ -785,6 +878,32 @@ func TestRunDoctor_StoreRootDeepMissingParents_Writable(t *testing.T) {
 	}
 	if _, err := os.Stat(storeRoot); !os.IsNotExist(err) {
 		t.Fatalf("store root must not be created by doctor: stat err=%v", err)
+	}
+}
+
+// TestRunDoctor_StoreRootAncestorIsFile_Rejected: 최종리뷰 F6 — storeRoot 자신이 아니라
+// 그 중간 조상이 일반 파일이면 os.Stat(storeRoot)이 ENOTDIR로 실패한다. 예전
+// nearestExistingDir는 `err == nil && fi.IsDir()`를 종료 조건으로 삼아 그 비디렉터리
+// 조상을 그냥 지나쳐 위의 진짜 디렉터리에서 probeWritable을 실행해 writable=true를
+// 오판 보고했다 — 실제로는 store.Open의 MkdirAll이 그 파일을 뚫고 지나갈 수 없어 항상
+// 실패한다. ENOTDIR(비디렉터리 조상)은 미존재와 구분해 writable=false로 즉시 실패
+// 보고해야 한다.
+func TestRunDoctor_StoreRootAncestorIsFile_Rejected(t *testing.T) {
+	base := t.TempDir()
+	ancestorFile := filepath.Join(base, "ancestor-is-a-file")
+	if err := os.WriteFile(ancestorFile, []byte("x"), 0o600); err != nil {
+		t.Fatalf("write file: %v", err)
+	}
+	storeRoot := filepath.Join(ancestorFile, "store", "root") // ancestorFile은 파일 — 그 밑은 절대 생성 불가
+	projectRoot := t.TempDir()
+
+	var buf bytes.Buffer
+	err := runDoctor(context.Background(), &buf, storeRoot, projectRoot)
+	if err == nil {
+		t.Fatal("want error — store-root의 중간 조상이 비디렉터리 파일")
+	}
+	if !strings.Contains(buf.String(), "[1] store-root: exists=false writable=false") {
+		t.Fatalf("out missing exists=false writable=false: %s", buf.String())
 	}
 }
 
