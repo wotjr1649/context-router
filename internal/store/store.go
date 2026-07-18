@@ -664,3 +664,47 @@ func (s *Store) LedgerAppend(tool string, stored, returned, ms int64) {
 	_, _ = s.ledger.Exec(`INSERT INTO ledger(ts,tool,bytes_stored,bytes_returned,duration_ms) VALUES(?,?,?,?,?)`,
 		time.Now().Unix(), tool, stored, returned, ms)
 }
+
+// ToolStat: ledger.db 도구별 집계 1행(설계 §6 stats local 계약). FirstTS/LastTS는
+// LedgerAppend가 기록하는 unix 초 단위(time.Now().Unix())다.
+type ToolStat struct {
+	Tool                       string
+	Calls                      int64
+	BytesStored, BytesReturned int64
+	FirstTS, LastTS            int64
+}
+
+// LedgerStats: dir/ledger.db를 read-only로 열어 도구별 사용량을 집계한 뒤 닫는다(설계 §6). ledger.db
+// 미존재는 오류가 아니다 — LedgerAppend와 동일하게 ledger를 best-effort 보조 산출물로 취급해
+// 빈 슬라이스+nil을 반환한다(os.Stat 선판정, 없는 파일을 sql.Open이 새로 만들지 않도록).
+func LedgerStats(dir string) ([]ToolStat, error) {
+	path := filepath.Join(dir, "ledger.db")
+	if _, err := os.Stat(path); err != nil {
+		return nil, nil
+	}
+	db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(path)+"?mode=ro&_pragma=busy_timeout(5000)")
+	if err != nil {
+		return nil, fmt.Errorf("store LedgerStats: %w", err)
+	}
+	defer db.Close()
+
+	rows, err := db.Query(`SELECT tool, COUNT(*), SUM(bytes_stored), SUM(bytes_returned), MIN(ts), MAX(ts)
+		FROM ledger GROUP BY tool ORDER BY tool`)
+	if err != nil {
+		return nil, fmt.Errorf("store LedgerStats: %w", err)
+	}
+	defer rows.Close()
+
+	var out []ToolStat
+	for rows.Next() {
+		var st ToolStat
+		if err := rows.Scan(&st.Tool, &st.Calls, &st.BytesStored, &st.BytesReturned, &st.FirstTS, &st.LastTS); err != nil {
+			return nil, fmt.Errorf("store LedgerStats: %w", err)
+		}
+		out = append(out, st)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("store LedgerStats: %w", err)
+	}
+	return out, nil
+}

@@ -700,6 +700,66 @@ func TestOpen_ConcurrentFirstMigration(t *testing.T) {
 	}
 }
 
+// TestLedgerStats: LedgerAppend 3건(도구 2종)을 넣고 LedgerStats(dir)가 도구별로 calls·바이트
+// 합계·span(first/last ts)을 정확히 집계하는지 확인한다(설계 §6 stats local 계약). ledger.db가
+// 아예 없는 디렉터리는 빈 슬라이스 + err=nil이어야 한다(ledger는 best-effort 보조 산출물).
+func TestLedgerStats(t *testing.T) {
+	dir := t.TempDir()
+	s, err := Open(dir, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.LedgerAppend("ctr_fetch", 100, 10, 5)
+	s.LedgerAppend("ctr_fetch", 200, 20, 7)
+	s.LedgerAppend("ctr_search", 50, 500, 3)
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	stats, err := LedgerStats(dir)
+	if err != nil {
+		t.Fatalf("LedgerStats: %v", err)
+	}
+	if len(stats) != 2 {
+		t.Fatalf("len=%d want 2: %+v", len(stats), stats)
+	}
+	if stats[0].Tool != "ctr_fetch" || stats[0].Calls != 2 || stats[0].BytesStored != 300 || stats[0].BytesReturned != 30 {
+		t.Fatalf("ctr_fetch row wrong: %+v", stats[0])
+	}
+	if stats[0].FirstTS == 0 || stats[0].LastTS == 0 || stats[0].FirstTS > stats[0].LastTS {
+		t.Fatalf("ctr_fetch span wrong: %+v", stats[0])
+	}
+	if stats[1].Tool != "ctr_search" || stats[1].Calls != 1 || stats[1].BytesStored != 50 || stats[1].BytesReturned != 500 {
+		t.Fatalf("ctr_search row wrong: %+v", stats[1])
+	}
+
+	empty, err := LedgerStats(t.TempDir())
+	if err != nil {
+		t.Fatalf("ledger.db 미존재: err=%v want nil", err)
+	}
+	if len(empty) != 0 {
+		t.Fatalf("ledger.db 미존재: stats=%+v want 빈 슬라이스", empty)
+	}
+
+	// ledger.db는 존재하지만 행이 0개인 경우(store만 열고 LedgerAppend를 한 번도 안 한 경우) —
+	// "파일 미존재" 조기 반환과는 다른 코드 경로(실제 SELECT가 빈 결과셋을 만남)라 별도로 확인한다.
+	emptyDir := t.TempDir()
+	es, err := Open(emptyDir, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := es.Close(); err != nil {
+		t.Fatal(err)
+	}
+	emptyLedger, err := LedgerStats(emptyDir)
+	if err != nil {
+		t.Fatalf("빈 ledger.db: err=%v want nil", err)
+	}
+	if len(emptyLedger) != 0 {
+		t.Fatalf("빈 ledger.db: stats=%+v want 빈 슬라이스", emptyLedger)
+	}
+}
+
 func FuzzSnapUTF8(f *testing.F) {
 	f.Add([]byte("가나다"), int64(1), int64(4))
 	f.Add([]byte("hello\nworld"), int64(0), int64(11))

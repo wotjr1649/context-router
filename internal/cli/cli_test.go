@@ -193,14 +193,115 @@ func TestRun_UnknownSub(t *testing.T) {
 	}
 }
 
-// TestRun_NotYetImplementedSubs: stats/purge는 Task4/5 소관이지만 dispatch 자체는 지금
+// TestRun_NotYetImplementedSubs: purge는 Task5 소관이지만 dispatch 자체는 지금
 // 4개 이름을 모두 인식해야 한다 — 명확한 "미구현" 오류를 반환한다(어떤 이름도 삼켜지지 않음).
+// stats는 Task4에서 구현됐으므로 이 표에서 제외(아래 TestRunStats_* 참조).
 func TestRun_NotYetImplementedSubs(t *testing.T) {
-	for _, sub := range []string{"stats", "purge"} {
+	for _, sub := range []string{"purge"} {
 		var out, errOut bytes.Buffer
 		err := Run(context.Background(), sub, nil, t.TempDir(), t.TempDir(), "0.0.1-dev", &out, &errOut)
 		if err == nil {
 			t.Fatalf("sub=%s: want error (not yet implemented), got nil", sub)
 		}
+	}
+}
+
+// TestRunStats_Local: 임시 store에 LedgerAppend 3건(도구 2종)을 넣고 Run(ctx,"stats",...)을
+// 호출해 로컬 ledger 집계 표를 확인한다(설계 §6) — 두 도구명 모두·"bytes suppressed" 고정
+// 문구 포함, "token"/"$" 문자열은 어디에도 없어야 한다(토큰·달러 환산·절약률 주장 금지,
+// §6 차단 항목).
+func TestRunStats_Local(t *testing.T) {
+	storeRoot := t.TempDir()
+	projectRoot := t.TempDir()
+	canon, err := ident.Canonicalize(projectRoot)
+	if err != nil {
+		t.Fatalf("canonicalize: %v", err)
+	}
+	projDir := filepath.Join(storeRoot, "projects", canon.ProjectID)
+	st, err := store.Open(projDir, false)
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	st.LedgerAppend("ctr_fetch_and_index", 1000, 20, 5)
+	st.LedgerAppend("ctr_fetch_and_index", 500, 30, 4)
+	st.LedgerAppend("ctr_search", 50, 500, 3)
+	if err := st.Close(); err != nil {
+		t.Fatalf("store.Close: %v", err)
+	}
+
+	var out, errOut bytes.Buffer
+	if err := Run(context.Background(), "stats", nil, storeRoot, projectRoot, "0.0.1-dev", &out, &errOut); err != nil {
+		t.Fatalf("Run stats err=%v out=%s", err, out.String())
+	}
+	got := out.String()
+	for _, want := range []string{"ctr_fetch_and_index", "ctr_search", "bytes suppressed (local, 진단용)"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("out missing %q: %s", want, got)
+		}
+	}
+	for _, banned := range []string{"token", "$"} {
+		if strings.Contains(got, banned) {
+			t.Fatalf("out must not contain %q (환산·절약 금지, 설계 §6): %s", banned, got)
+		}
+	}
+}
+
+// TestRunStats_Local_NoLedger: ledger.db가 아예 없는(=store를 한 번도 연 적 없는) 프로젝트에서도
+// stats는 오류 없이 표(빈 본문 + 합계 0줄)를 출력해야 한다 — LedgerStats의 "미존재 → 빈 슬라이스"
+// 계약이 cli까지 그대로 이어지는지 확인한다.
+func TestRunStats_Local_NoLedger(t *testing.T) {
+	var out, errOut bytes.Buffer
+	if err := Run(context.Background(), "stats", nil, t.TempDir(), t.TempDir(), "0.0.1-dev", &out, &errOut); err != nil {
+		t.Fatalf("Run stats err=%v out=%s", err, out.String())
+	}
+	got := out.String()
+	if !strings.Contains(got, "bytes suppressed (local, 진단용)") {
+		t.Fatalf("out missing fixed suppression phrase: %s", got)
+	}
+	for _, banned := range []string{"token", "$"} {
+		if strings.Contains(got, banned) {
+			t.Fatalf("out must not contain %q: %s", banned, got)
+		}
+	}
+}
+
+// TestRunStats_Provider: 임시 JSONL 3줄(usage 2건 + 파싱 불가 1건)을 스캔해 실측 토큰 합계와
+// skipped 카운트를 검증한다(설계 §6 provider 계약) — 절약 주장·비교 문구는 없다(실측 합계만).
+func TestRunStats_Provider(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "transcript.jsonl")
+	lines := []string{
+		`{"message":{"usage":{"input_tokens":100,"output_tokens":20,"cache_read_input_tokens":5,"cache_creation_input_tokens":1}}}`,
+		`{"message":{"usage":{"input_tokens":50,"output_tokens":10,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}`,
+		`not valid json`,
+	}
+	if err := os.WriteFile(path, []byte(strings.Join(lines, "\n")+"\n"), 0o600); err != nil {
+		t.Fatalf("write transcript: %v", err)
+	}
+
+	var out, errOut bytes.Buffer
+	args := []string{"--provider", path}
+	if err := Run(context.Background(), "stats", args, t.TempDir(), t.TempDir(), "0.0.1-dev", &out, &errOut); err != nil {
+		t.Fatalf("Run stats --provider err=%v out=%s", err, out.String())
+	}
+	got := out.String()
+	for _, want := range []string{
+		"input_tokens: 150", "output_tokens: 30",
+		"cache_read_input_tokens: 5", "cache_creation_input_tokens: 1",
+		"skipped: 1",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("out missing %q: %s", want, got)
+		}
+	}
+}
+
+// TestRunStats_Provider_FileMissing: --provider 경로가 없으면 오류를 반환해야 한다(침묵 무시 금지).
+func TestRunStats_Provider_FileMissing(t *testing.T) {
+	var out, errOut bytes.Buffer
+	args := []string{"--provider", filepath.Join(t.TempDir(), "missing.jsonl")}
+	err := Run(context.Background(), "stats", args, t.TempDir(), t.TempDir(), "0.0.1-dev", &out, &errOut)
+	if err == nil {
+		t.Fatal("want error for missing --provider file, got nil")
 	}
 }

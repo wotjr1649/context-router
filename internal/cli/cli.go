@@ -1,10 +1,12 @@
-// Package cli — doctor·upgrade 서브커맨드(stats·purge는 Task4/5까지 임시 placeholder) 진입점. 설계서 §7.
+// Package cli — doctor·upgrade·stats(purge는 Task5까지 임시 placeholder) 진입점. 설계서 §7.
 package cli
 
 import (
+	"bufio"
 	"context"
 	"database/sql"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"io"
 	"net/http"
@@ -23,8 +25,9 @@ const releaseURL = "https://api.github.com/repos/wotjr1649/context-router/releas
 
 // Run: cli 서브커맨드 단일 진입점. storeRoot·projectRoot는 main이 이미 결정해 넘긴다(cli는
 // 재도출하지 않는다 — 설계서 §7 Produces). sub은 main이 4개 이름 중 하나임을 이미 확인했다.
-// args·stderr는 doctor·upgrade에서 미사용 — stats·purge(Task4/5)가 서브커맨드 고유 플래그
-// 파싱과 별도 출력 채널용으로 쓴다(의도적 미사용, 시그니처는 4개 서브커맨드 공통).
+// args는 doctor·upgrade에서 미사용, stats가 --provider 고유 플래그 파싱에 쓴다(전용
+// flag.NewFlagSet, 설계 §7 — main의 serverFlags와 별개). stderr는 아직 어떤 서브커맨드도
+// 쓰지 않는다(의도적 미사용, 시그니처는 4개 서브커맨드 공통).
 func Run(ctx context.Context, sub string, args []string, storeRoot, projectRoot, version string, stdout, stderr io.Writer) error {
 	switch sub {
 	case "doctor":
@@ -32,7 +35,9 @@ func Run(ctx context.Context, sub string, args []string, storeRoot, projectRoot,
 	case "upgrade":
 		client := &http.Client{Timeout: 10 * time.Second}
 		return runUpgrade(stdout, client, releaseURL, version)
-	case "stats", "purge":
+	case "stats":
+		return runStats(stdout, args, storeRoot, projectRoot)
+	case "purge":
 		return fmt.Errorf("cli: 미구현 서브커맨드: %s", sub)
 	default:
 		return fmt.Errorf("cli: 미지 서브커맨드: %s", sub)
@@ -70,6 +75,104 @@ func runUpgrade(w io.Writer, client *http.Client, releaseURL, current string) er
 	printCurrent()
 	fmt.Fprintf(w, "latest: %s\n", body.TagName)
 	fmt.Fprintln(w, "install: download from the project releases page and replace the binary")
+	return nil
+}
+
+// runStats: local(ledger.db 집계)과 --provider(transcript JSONL 실측)를 분기한다(설계 §6).
+// 두 경로 모두 토큰·달러 환산과 절약률 주장을 출력하지 않는다(§6 차단 항목 — v0.2 A/B
+// 게이트 전까지) — local은 바이트 집계만, provider는 실측 토큰 합계만 보여준다.
+func runStats(w io.Writer, args []string, storeRoot, projectRoot string) error {
+	fs := flag.NewFlagSet("stats", flag.ContinueOnError)
+	provider := fs.String("provider", "", "Claude Code transcript JSONL 경로 — 실측 토큰 합계만 출력")
+	if err := fs.Parse(args); err != nil {
+		return fmt.Errorf("stats: 플래그 파싱 실패: %w", err)
+	}
+	if *provider != "" {
+		return runStatsProvider(w, *provider)
+	}
+	return runStatsLocal(w, storeRoot, projectRoot)
+}
+
+// runStatsLocal: 현재 프로젝트(<storeRoot>/projects/<ProjectID>)의 ledger.db를
+// store.LedgerStats로 집계해 tool/calls/bytes_stored/bytes_returned/span(RFC3339) 표를
+// 출력한다. 합계 줄 끝에는 고정 문구 "bytes suppressed (local, 진단용)"를 붙인다 — 토큰·달러
+// 환산이나 절약률 주장은 여기 어디에도 없다(설계 §6).
+func runStatsLocal(w io.Writer, storeRoot, projectRoot string) error {
+	canon, err := ident.Canonicalize(projectRoot)
+	if err != nil {
+		return fmt.Errorf("stats: 프로젝트 식별 실패: %w", err)
+	}
+	projDir := filepath.Join(storeRoot, "projects", canon.ProjectID)
+	stats, err := store.LedgerStats(projDir)
+	if err != nil {
+		return fmt.Errorf("stats: ledger 집계 실패: %w", err)
+	}
+
+	fmt.Fprintln(w, "tool\tcalls\tbytes_stored\tbytes_returned\tspan")
+	var totalCalls, totalStored, totalReturned int64
+	for _, s := range stats {
+		span := time.Unix(s.FirstTS, 0).UTC().Format(time.RFC3339) + "~" + time.Unix(s.LastTS, 0).UTC().Format(time.RFC3339)
+		fmt.Fprintf(w, "%s\t%d\t%d\t%d\t%s\n", s.Tool, s.Calls, s.BytesStored, s.BytesReturned, span)
+		totalCalls += s.Calls
+		totalStored += s.BytesStored
+		totalReturned += s.BytesReturned
+	}
+	fmt.Fprintf(w, "total\t%d\t%d\t%d\tbytes suppressed (local, 진단용)\n", totalCalls, totalStored, totalReturned)
+	return nil
+}
+
+// providerUsageLine: Claude Code transcript 한 줄 중 관심 필드만 취한다(그 외 필드는 무시,
+// 설계 §6). Usage가 포인터인 이유는 "message.usage 키 자체가 없는 줄"과 "값이 0인 usage"를
+// 구분해 전자를 skipped로 세기 위해서다.
+type providerUsageLine struct {
+	Message struct {
+		Usage *struct {
+			InputTokens              int64 `json:"input_tokens"`
+			OutputTokens             int64 `json:"output_tokens"`
+			CacheReadInputTokens     int64 `json:"cache_read_input_tokens"`
+			CacheCreationInputTokens int64 `json:"cache_creation_input_tokens"`
+		} `json:"usage"`
+	} `json:"message"`
+}
+
+// runStatsProvider: path의 Claude Code transcript JSONL을 한 줄씩 스캔해 message.usage의 4개
+// 토큰 필드를 합산하고 usage 보유 레코드 수를 센다(설계 §6). 파싱 불가 줄·message.usage 없는
+// 줄은 로그 없이 skipped 카운트만 올린다. 실측 합계만 출력한다 — 절약 주장·비교 문구 없음.
+// 파일 크기와 무관하게 큰 버퍼(10MB)의 bufio.Scanner를 쓴다(transcript 한 줄이 클 수 있음).
+func runStatsProvider(w io.Writer, path string) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return fmt.Errorf("stats provider: 파일 열기 실패: %w", err)
+	}
+	defer f.Close()
+
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 0, 64*1024), 10<<20)
+
+	var input, output, cacheRead, cacheCreate, records, skipped int64
+	for scanner.Scan() {
+		var line providerUsageLine
+		if err := json.Unmarshal(scanner.Bytes(), &line); err != nil || line.Message.Usage == nil {
+			skipped++
+			continue
+		}
+		u := line.Message.Usage
+		input += u.InputTokens
+		output += u.OutputTokens
+		cacheRead += u.CacheReadInputTokens
+		cacheCreate += u.CacheCreationInputTokens
+		records++
+	}
+	if err := scanner.Err(); err != nil {
+		return fmt.Errorf("stats provider: 스캔 실패: %w", err)
+	}
+
+	fmt.Fprintf(w, "input_tokens: %d\n", input)
+	fmt.Fprintf(w, "output_tokens: %d\n", output)
+	fmt.Fprintf(w, "cache_read_input_tokens: %d\n", cacheRead)
+	fmt.Fprintf(w, "cache_creation_input_tokens: %d\n", cacheCreate)
+	fmt.Fprintf(w, "usage records: %d\n", records)
+	fmt.Fprintf(w, "skipped: %d\n", skipped)
 	return nil
 }
 
