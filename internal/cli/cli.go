@@ -23,6 +23,8 @@ const releaseURL = "https://api.github.com/repos/wotjr1649/context-router/releas
 
 // Run: cli 서브커맨드 단일 진입점. storeRoot·projectRoot는 main이 이미 결정해 넘긴다(cli는
 // 재도출하지 않는다 — 설계서 §7 Produces). sub은 main이 4개 이름 중 하나임을 이미 확인했다.
+// args·stderr는 doctor·upgrade에서 미사용 — stats·purge(Task4/5)가 서브커맨드 고유 플래그
+// 파싱과 별도 출력 채널용으로 쓴다(의도적 미사용, 시그니처는 4개 서브커맨드 공통).
 func Run(ctx context.Context, sub string, args []string, storeRoot, projectRoot, version string, stdout, stderr io.Writer) error {
 	switch sub {
 	case "doctor":
@@ -84,10 +86,12 @@ func probeWritable(dir string) bool {
 	return true
 }
 
-// probeFTS5: reader(열려있는 content.db 연결)가 있으면 그 커넥션 하나에서 TEMP 가상 테이블을
-// 만들고 지워 FTS5 가용성을 확인한다(같은 물리 커넥션이어야 TEMP 테이블이 보인다 — sql.DB
-// 커넥션 풀에서 매 Exec가 다른 커넥션을 골라줄 수 있으므로 db.Conn으로 하나를 고정한다).
-// reader==nil(content.db 미존재)이면 :memory: 연결로 대신 확인한다(설계 §7).
+// probeFTS5: reader(열려있는 content.db 연결)가 있으면 그 reader로, 없으면(content.db
+// 미존재) :memory: 연결로 fts5 모듈 등록 여부를 순수 SELECT로 확인한다. CREATE VIRTUAL
+// TABLE 방식은 채택하지 않는다 — reader는 store.Open(dir,true)의 mode=ro&
+// _pragma=query_only(ON) 연결이라 TEMP 스키마 생성조차 SQLITE_READONLY로 거부되므로,
+// 이미 초기화된 프로젝트에서 doctor가 항상 fts5 불가로 오판했다(리뷰 발견 버그). 순수
+// SELECT는 read-only 연결에서도 항상 동작한다.
 func probeFTS5(ctx context.Context, reader *sql.DB) error {
 	db := reader
 	if db == nil {
@@ -98,16 +102,12 @@ func probeFTS5(ctx context.Context, reader *sql.DB) error {
 		}
 		defer db.Close()
 	}
-	conn, err := db.Conn(ctx)
-	if err != nil {
+	var count int
+	if err := db.QueryRowContext(ctx, "SELECT count(*) FROM pragma_module_list WHERE name='fts5'").Scan(&count); err != nil {
 		return fmt.Errorf("fts5 probe: %w", err)
 	}
-	defer conn.Close()
-	if _, err := conn.ExecContext(ctx, "CREATE VIRTUAL TABLE temp.probe USING fts5(x)"); err != nil {
-		return fmt.Errorf("fts5 probe: %w", err)
-	}
-	if _, err := conn.ExecContext(ctx, "DROP TABLE temp.probe"); err != nil {
-		return fmt.Errorf("fts5 probe: %w", err)
+	if count == 0 {
+		return fmt.Errorf("fts5 probe: 모듈 미등록")
 	}
 	return nil
 }

@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/wotjr1649/context-router/internal/ident"
+	"github.com/wotjr1649/context-router/internal/store"
 )
 
 // TestRunUpgrade_Table: httptest 서버로 정상/오류/타임아웃/위생검증 경로를 모두 확인한다
@@ -141,6 +142,44 @@ func TestRunDoctor_Smoke(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(storeRoot, "projects", canon.ProjectID)); !os.IsNotExist(err) {
 		t.Fatalf("per-project store dir must not be created by doctor: stat err=%v", err)
+	}
+}
+
+// TestRunDoctor_InitializedStore: 실제 store.Open(dir,false)+Close로 content.db를 생성한
+// 뒤(read-write로 스키마까지 마이그레이션됨) doctor를 read-only로 실행한다. 리뷰에서 발견된
+// 버그 — reader가 store.Open(dir,true)의 mode=ro&query_only(ON) 연결이라 예전 fts5 프로브
+// (CREATE VIRTUAL TABLE)가 SQLITE_READONLY로 항상 실패하던 것 — 의 회귀를 막는다: err=nil과
+// "fts5: 가능" 출력을 직접 검증한다(TestRunDoctor_Smoke는 미초기화 분기만 커버해 이 버그를
+// 가렸었다).
+func TestRunDoctor_InitializedStore(t *testing.T) {
+	storeRoot := t.TempDir()
+	projectRoot := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(projectRoot, ".git"), 0o755); err != nil {
+		t.Fatalf("mkdir project: %v", err)
+	}
+	canon, err := ident.Canonicalize(projectRoot)
+	if err != nil {
+		t.Fatalf("canonicalize: %v", err)
+	}
+
+	st, err := store.Open(filepath.Join(storeRoot, "projects", canon.ProjectID), false)
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatalf("store.Close: %v", err)
+	}
+
+	var buf bytes.Buffer
+	if err := runDoctor(context.Background(), &buf, storeRoot, projectRoot); err != nil {
+		t.Fatalf("runDoctor err=%v out=%s", err, buf.String())
+	}
+	out := buf.String()
+	if !strings.Contains(out, "user_version=1 quick_check=ok") {
+		t.Fatalf("out missing content.db quick_check=ok: %s", out)
+	}
+	if !strings.Contains(out, "[4] fts5: 가능") {
+		t.Fatalf("out missing fts5 available on an initialized (read-only-probed) store: %s", out)
 	}
 }
 
