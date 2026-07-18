@@ -284,6 +284,154 @@ func TestDeniedFilename(t *testing.T) {
 	}
 }
 
+// TestRun_DeniedFilename_SubdirPathSuffix: DeniedFilename의 ".docker/config.json"
+// 접미 규칙은 base name만 받으면 절대 매치되지 않는다(β1-1 사문화) — collect가
+// base 대신 전체 상대경로도 넘기는지 실증.
+func TestRun_DeniedFilename_SubdirPathSuffix(t *testing.T) {
+	root := t.TempDir()
+	p := filepath.Join(root, "x", ".docker", "config.json")
+	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(p, []byte(`{"auths":{}}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	st, _ := openStoreT(t)
+	rep, err := Run(context.Background(), st, root, nil, Request{Path: root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rep.Indexed != 0 || len(rep.Skipped) != 1 || rep.Skipped[0].Reason != "secret-denylist" {
+		t.Fatalf("rep=%+v want 0 indexed / 1 skip secret-denylist", rep)
+	}
+}
+
+// TestRun_DeniedFilename_SymlinkBypass: 심링크(safe.txt -> .env)로 denylist를
+// 우회할 수 있었다(β1-1) — collect가 canonicalize된 real 경로도 검사하는지 실증.
+// unix 한정(windows는 심링크 생성 권한 부족 시 skip).
+func TestRun_DeniedFilename_SymlinkBypass(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, ".env"), []byte("SECRET=1\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(root, "safe.txt")
+	if err := os.Symlink(filepath.Join(root, ".env"), link); err != nil {
+		t.Skipf("심링크 생성 실패(권한 부족으로 추정) — skip: %v", err)
+	}
+	st, _ := openStoreT(t)
+	rep, err := Run(context.Background(), st, root, nil, Request{Path: root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rep.Indexed != 0 || len(rep.Skipped) != 2 {
+		t.Fatalf("rep=%+v want 0 indexed / 2 skip (both secret-denylist)", rep)
+	}
+	for _, s := range rep.Skipped {
+		if s.Reason != "secret-denylist" {
+			t.Fatalf("skip=%+v want secret-denylist", s)
+		}
+	}
+}
+
+// TestCanonicalUnchanged: β1-2 TOCTOU 재검증 로직 단위 테스트(함수 분리로 검증 —
+// 실제 레이스 재현 불요). canonical한 경로는 true, 그 자리가 다른 곳으로
+// 재링크되면 false. unix 한정(windows는 심링크 생성 권한 부족 시 skip).
+func TestCanonicalUnchanged(t *testing.T) {
+	dir := t.TempDir()
+	f := filepath.Join(dir, "a.txt")
+	if err := os.WriteFile(f, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	real, err := canonicalPath(f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !canonicalUnchanged(real) {
+		t.Fatal("변화 없는데 false")
+	}
+
+	elsewhere := filepath.Join(dir, "b.txt")
+	if err := os.WriteFile(elsewhere, []byte("y"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(real); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(elsewhere, real); err != nil {
+		t.Skipf("심링크 생성 실패(권한 부족으로 추정) — skip: %v", err)
+	}
+	if canonicalUnchanged(real) {
+		t.Fatal("교체됐는데 true")
+	}
+}
+
+// TestIsBinary_NonUTF8: NUL 없는 무효 UTF-8(CP949 등)도 binary 게이트로 skip돼야
+// 한다(β1-3 — byte-exact 계약 보호).
+func TestIsBinary_NonUTF8(t *testing.T) {
+	b := bytes.Repeat([]byte{0xB0, 0xA1, 0xFF, 0xFE}, 50)
+	if !isBinary(b) {
+		t.Fatal("무효 UTF-8인데 isBinary=false")
+	}
+}
+
+// TestFatalRegisterErr: β1-4 분기 단위 테스트 — ctx 취소·store.ErrUnavailable은
+// fatal(전파), 그 외 개별 오류는 skip 흡수 유지.
+func TestFatalRegisterErr(t *testing.T) {
+	cases := []struct {
+		err  error
+		want bool
+	}{
+		{context.Canceled, true},
+		{context.DeadlineExceeded, true},
+		{store.ErrUnavailable, true},
+		{errors.New("disk full"), false},
+	}
+	for _, tc := range cases {
+		if got := fatalRegisterErr(tc.err); got != tc.want {
+			t.Fatalf("fatalRegisterErr(%v)=%v want %v", tc.err, got, tc.want)
+		}
+	}
+}
+
+// TestRunPool_CancelledCtxPropagatesError: 취소된 ctx로 인한 store.Register 실패가
+// "register-failed" skip으로 흡수되지 않고 error로 전파돼야 한다(β1-4).
+func TestRunPool_CancelledCtxPropagatesError(t *testing.T) {
+	root := t.TempDir()
+	f := filepath.Join(root, "a.txt")
+	if err := os.WriteFile(f, []byte("hello\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	real, err := canonicalPath(f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(real)
+	if err != nil {
+		t.Fatal(err)
+	}
+	st, _ := openStoreT(t)
+	items := []workItem{{
+		abs: real, rel: "a.txt", base: "a.txt",
+		size: info.Size(), mtimeNS: info.ModTime().UnixNano(), maxBytes: defaultMaxFileBytes,
+	}}
+
+	cctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	rep, err := runPool(cctx, st, items)
+	if err == nil {
+		t.Fatalf("취소된 ctx인데 error==nil (rep=%+v)", rep)
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("err=%v want context.Canceled 포함", err)
+	}
+	for _, s := range rep.Skipped {
+		if s.Reason == "register-failed" {
+			t.Fatalf("취소가 register-failed skip으로 흡수됨: %+v", rep)
+		}
+	}
+}
+
 func sha256hex(t *testing.T, b []byte) string {
 	t.Helper()
 	sum := sha256.Sum256(b)

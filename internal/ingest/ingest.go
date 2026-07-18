@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -360,13 +361,18 @@ func isMarkdownExt(name string) bool {
 	return ext == ".md" || ext == ".markdown"
 }
 
-// isBinary sniffs the first 8KB of b for a NUL byte (§4.4 스킵 규칙).
+// isBinary sniffs the first 8KB of b for a NUL byte, or reports b(전체) as
+// invalid UTF-8(§4.4 스킵 규칙; β1-3 — NUL 없는 비 UTF-8도 byte-exact 계약 보호를
+// 위해 skip. 전체 b로 검사 — 8KB 경계에서 멀티바이트 rune이 잘려 오탐하는 것을 방지).
 func isBinary(b []byte) bool {
 	n := len(b)
 	if n > 8192 {
 		n = 8192
 	}
-	return bytes.IndexByte(b[:n], 0) != -1
+	if bytes.IndexByte(b[:n], 0) != -1 {
+		return true
+	}
+	return !utf8.Valid(b)
 }
 
 // canonicalPath resolves p to its absolute, symlink-free real path(원본 케이스 유지).
@@ -380,6 +386,15 @@ func canonicalPath(p string) (string, error) {
 		return "", fmt.Errorf("ingest: canonicalize: %w", err)
 	}
 	return real, nil
+}
+
+// canonicalUnchanged reports whether path(collect 시점 canonical 값)가 지금도
+// 자기 자신으로 canonicalize되는지 — TOCTOU 완화(실용판): 읽기 완료 후 그 자리가
+// 다른 곳으로 재링크되지 않았는지 확인한다.
+// ponytail: TOCTOU 완화 — 완전판(openat2/GetFinalPathNameByHandle)은 계획 3.
+func canonicalUnchanged(path string) bool {
+	real, err := canonicalPath(path)
+	return err == nil && real == path
 }
 
 // withinRoot reports whether real(canonicalPath 결과)이 foldedRoot(ident.Fold된 허용
@@ -425,6 +440,7 @@ func globMatchAny(patterns []string, name string) bool {
 type workItem struct {
 	abs, rel, base string
 	size, mtimeNS  int64
+	maxBytes       int64 // ingestOne의 읽기 직전 재검(β1-2 TOCTOU 완화)용 — preSkip 항목은 미사용
 	preSkip        string
 }
 
@@ -468,7 +484,9 @@ func collect(ctx context.Context, root string, foldedRoots []string, projectRoot
 		if info.IsDir() { // 심링크→디렉터리: 파일 아님, 조용히 제외
 			return nil
 		}
-		if DeniedFilename(base) {
+		// β1-1: base name만이 아니라 원 상대경로 전체(경로 접미 규칙용)와
+		// canonicalize된 real 경로 전체(심링크 우회 차단용)도 함께 검사한다.
+		if DeniedFilename(relDisplay(projectRoot, p)) || DeniedFilename(real) {
 			items = append(items, workItem{rel: relDisplay(projectRoot, p), preSkip: "secret-denylist"})
 			return nil
 		}
@@ -478,7 +496,7 @@ func collect(ctx context.Context, root string, foldedRoots []string, projectRoot
 		}
 		items = append(items, workItem{
 			abs: real, rel: relDisplay(projectRoot, p), base: base,
-			size: info.Size(), mtimeNS: info.ModTime().UnixNano(),
+			size: info.Size(), mtimeNS: info.ModTime().UnixNano(), maxBytes: maxBytes,
 		})
 		return nil
 	})
@@ -488,19 +506,43 @@ func collect(ctx context.Context, root string, foldedRoots []string, projectRoot
 	return items, nil
 }
 
+// fatalRegisterErr reports whether err(store.Register 실패)가 ctx 취소나 스토리지
+// 자체 불가라 개별 skip으로 흡수하지 말고 Run 전체를 중단해야 하는지(β1-4).
+func fatalRegisterErr(err error) bool {
+	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, store.ErrUnavailable)
+}
+
 // ingestOne runs the §3.0 pipeline for one workItem: 원본읽기→binary sniff→
 // src_hash→Redact→ChunkText→store.Register. preSkip이 있으면 I/O 없이 그 사유를
-// 반환한다. 개별 파일 실패는 전부 reason 문자열로 흡수(전체 실패시키지 않음).
-func ingestOne(ctx context.Context, st *store.Store, w workItem) (skipReason string, storedBytes int64) {
+// 반환한다. 개별 파일 실패는 reason 문자열로 흡수하지만, ctx 취소·스토리지 불가
+// (fatalRegisterErr)는 err로 반환해 전체 Run을 중단시킨다(β1-4).
+func ingestOne(ctx context.Context, st *store.Store, w workItem) (skipReason string, storedBytes int64, err error) {
 	if w.preSkip != "" {
-		return w.preSkip, 0
+		return w.preSkip, 0, nil
 	}
-	raw, err := os.ReadFile(w.abs)
-	if err != nil {
-		return "unreadable", 0
+	// β1-2: 검사(collect)↔읽기 TOCTOU 완화(실용판). 핸들 확보 후 크기 재검 →
+	// 읽기 → 읽기 후 재-canonicalize해 collect 시점 경로와 여전히 일치하는지 확인.
+	f, oerr := os.Open(w.abs)
+	if oerr != nil {
+		return "unreadable", 0, nil
+	}
+	defer f.Close()
+	info, serr := f.Stat()
+	if serr != nil {
+		return "unreadable", 0, nil
+	}
+	if info.Size() > w.maxBytes {
+		return "too-large", 0, nil
+	}
+	raw, rerr := io.ReadAll(f)
+	if rerr != nil {
+		return "unreadable", 0, nil
+	}
+	if !canonicalUnchanged(w.abs) {
+		return "changed-during-read", 0, nil
 	}
 	if isBinary(raw) {
-		return "binary", 0
+		return "binary", 0, nil
 	}
 	sum := sha256.Sum256(raw)
 	srcHash := hex.EncodeToString(sum[:])
@@ -514,7 +556,7 @@ func ingestOne(ctx context.Context, st *store.Store, w workItem) (skipReason str
 	if md {
 		mediaType = "text/markdown"
 	}
-	_, err = st.Register(ctx, store.Registration{
+	_, rgerr := st.Register(ctx, store.Registration{
 		StoredBytes: stored,
 		MediaType:   mediaType,
 		Redaction:   redaction,
@@ -524,16 +566,21 @@ func ingestOne(ctx context.Context, st *store.Store, w workItem) (skipReason str
 		},
 		Chunks: ChunkText(string(stored), md),
 	})
-	if err != nil {
-		return "register-failed", 0
+	if rgerr != nil {
+		if fatalRegisterErr(rgerr) {
+			return "", 0, rgerr
+		}
+		return "register-failed", 0, nil
 	}
-	return "", int64(len(stored))
+	return "", int64(len(stored)), nil
 }
 
 // runPool: min(GOMAXPROCS,4) 고정 worker pool로 items를 병렬 처리한다(파일별
 // goroutine 생성 금지 — 규약 §7). store.Register 직렬화는 store 내부(writer
-// SetMaxOpenConns(1))가 보장하므로 워커가 각자 호출해도 안전하다.
-func runPool(ctx context.Context, st *store.Store, items []workItem) Report {
+// SetMaxOpenConns(1))가 보장하므로 워커가 각자 호출해도 안전하다. ingestOne이
+// fatal error(ctx 취소·store.ErrUnavailable)를 반환하면 나머지 미착수 작업을
+// 중단하고 그 error를 반환한다(β1-4 — skip으로 흡수하지 않음).
+func runPool(ctx context.Context, st *store.Store, items []workItem) (Report, error) {
 	n := runtime.GOMAXPROCS(0)
 	if n > 4 {
 		n = 4
@@ -542,20 +589,30 @@ func runPool(ctx context.Context, st *store.Store, items []workItem) Report {
 		n = 1
 	}
 
+	feedCtx, stopFeed := context.WithCancel(ctx)
+	defer stopFeed()
+
 	ch := make(chan workItem)
 	var mu sync.Mutex
 	var rep Report
+	var firstErr error
 	var wg sync.WaitGroup
 	wg.Add(n)
 	for k := 0; k < n; k++ {
 		go func() {
 			defer wg.Done()
 			for it := range ch {
-				reason, stored := ingestOne(ctx, st, it)
+				reason, stored, ierr := ingestOne(ctx, st, it)
 				mu.Lock()
-				if reason != "" {
+				switch {
+				case ierr != nil:
+					if firstErr == nil {
+						firstErr = ierr
+					}
+					stopFeed()
+				case reason != "":
 					rep.Skipped = append(rep.Skipped, SkipEntry{Path: it.rel, Reason: reason})
-				} else {
+				default:
 					rep.Indexed++
 					rep.BytesStored += stored
 				}
@@ -566,14 +623,19 @@ func runPool(ctx context.Context, st *store.Store, items []workItem) Report {
 feed:
 	for _, it := range items {
 		select {
-		case <-ctx.Done():
+		case <-feedCtx.Done():
 			break feed
 		case ch <- it:
 		}
 	}
 	close(ch)
 	wg.Wait()
-	return rep
+	if firstErr == nil {
+		// ctx가 (mid-flight 취소 포함) done인데 어느 ingestOne 호출도 그 에러를
+		// 직접 관측 못한 경우(예: 취소가 feed 루프 자체를 끊은 경우)의 안전망.
+		firstErr = ctx.Err()
+	}
+	return rep, firstErr
 }
 
 // runInline ingests req.Content directly (uri=inline:<Title>) — §3.0 순서에서 파일
@@ -656,15 +718,15 @@ func Run(ctx context.Context, st *store.Store, projectRoot string, allowPaths []
 		rel := relDisplay(projectRoot, real)
 		var it workItem
 		switch {
-		case DeniedFilename(base):
+		case DeniedFilename(rel) || DeniedFilename(real):
 			it = workItem{rel: rel, preSkip: "secret-denylist"}
 		case info.Size() > maxBytes:
 			it = workItem{rel: rel, preSkip: "too-large"}
 		default:
-			it = workItem{abs: real, rel: rel, base: base, size: info.Size(), mtimeNS: info.ModTime().UnixNano()}
+			it = workItem{abs: real, rel: rel, base: base, size: info.Size(), mtimeNS: info.ModTime().UnixNano(), maxBytes: maxBytes}
 		}
 		items = []workItem{it}
 	}
 
-	return runPool(ctx, st, items), nil
+	return runPool(ctx, st, items)
 }
