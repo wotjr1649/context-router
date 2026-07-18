@@ -49,14 +49,14 @@ func applyMemLimit(cmd *exec.Cmd, bytes int64) (func(), error) {
 
 	procHandle, err := windows.OpenProcess(windows.PROCESS_SET_QUOTA|windows.PROCESS_TERMINATE, false, uint32(cmd.Process.Pid))
 	if err != nil {
-		windows.TerminateJobObject(job, 1)
+		killOrphan(cmd)
 		windows.CloseHandle(job)
 		return nil, err
 	}
 	assignErr := windows.AssignProcessToJobObject(job, procHandle)
 	windows.CloseHandle(procHandle)
 	if assignErr != nil {
-		windows.TerminateJobObject(job, 1)
+		killOrphan(cmd)
 		windows.CloseHandle(job)
 		return nil, assignErr
 	}
@@ -76,3 +76,12 @@ func applyMemLimit(cmd *exec.Cmd, bytes int64) (func(), error) {
 // selfApplyMemLimit: windows는 부모가 Job Object로 이미 상한을 적용하므로 자식 self-apply가
 // 불필요하다.
 func selfApplyMemLimit() {}
+
+// killOrphan: Start() 이후 Job 배정(OpenProcess/AssignProcessToJobObject) 실패 시 호출한다.
+// 이 시점엔 자식이 아직 job에 assign되지 않아 TerminateJobObject(job,*)로는 죽지 않으므로
+// (리뷰 Critical: 이전 코드는 이걸로 착각해 자식을 leak했다) cmd.Process를 직접 kill하고
+// Wait()로 reap해 좀비를 방지한다.
+func killOrphan(cmd *exec.Cmd) {
+	_ = cmd.Process.Kill()
+	_, _ = cmd.Process.Wait()
+}

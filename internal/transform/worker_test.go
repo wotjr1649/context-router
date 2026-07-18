@@ -128,6 +128,33 @@ func TestSpawn_Timeout(t *testing.T) {
 	t.Logf("timeout result: %+v elapsed=%v", res, elapsed)
 }
 
+// TestSpawn_DefaultTimeout: ctx에 deadline이 없으면 Spawn이 내부 안전망(defaultWorkerTimeout
+// =10s)을 씌운다 — CPU-only 무한루프(스텝 budget은 충분히 크게 줘 budget보다 timeout이 먼저
+// 발동하도록)가 10s 근방(±2s)에서 오류 Result로 죽는지 검증한다. 기존 TestSpawn_Timeout(명시
+// deadline 500ms, elapsed<10s 단언)이 "deadline 있으면 그대로 존중"의 회귀 가드를 겸한다.
+func TestSpawn_DefaultTimeout(t *testing.T) {
+	exe := testSelfExe(t)
+	req := Request{
+		Script: "def f():\n\tfor i in range(1000000000000):\n\t\tpass\n\nf()\n",
+		Caps:   Caps{MaxSteps: 2_000_000_000_000},
+	}
+
+	start := time.Now()
+	res, err := Spawn(context.Background(), exe, req) // deadline 없음
+	elapsed := time.Since(start)
+
+	if err != nil {
+		t.Fatalf("Spawn returned Go error (parent must survive): %v", err)
+	}
+	if res.ErrKind == "" {
+		t.Fatalf("want non-empty ErrKind (worker should have been default-timeout-killed), got %+v", res)
+	}
+	if elapsed < 8*time.Second || elapsed > 12*time.Second {
+		t.Fatalf("elapsed=%v want ~10s (±2s) for defaultWorkerTimeout safety net", elapsed)
+	}
+	t.Logf("default timeout result: %+v elapsed=%v", res, elapsed)
+}
+
 // TestSpawn_ConcurrencyLimit: 3개 동시 Spawn → workerSem 관측상 동시 실행이 2를 넘지 않는다.
 func TestSpawn_ConcurrencyLimit(t *testing.T) {
 	exe := testSelfExe(t)

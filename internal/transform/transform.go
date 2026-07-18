@@ -64,6 +64,7 @@ const (
 	defaultMaxSteps       = 5_000_000
 	defaultMaxOutputBytes = 32768
 	defaultMemLimitBytes  = 256 * 1024 * 1024 // 설계 §4.3 기본 상한 256MB
+	defaultWorkerTimeout  = 10 * time.Second  // 리뷰 Important: ctx에 deadline 없을 때 안전망
 )
 
 // Eval: 순수 함수 — 파일·네트워크·env·시계·난수 접근 없음. panic 없이 항상 Result를 반환한다.
@@ -179,6 +180,14 @@ func RunWorker(r io.Reader, w io.Writer) error {
 // — 부모 프로세스는 절대 죽지 않는다. error 반환은 "실행 자체를 시작 못함" 케이스뿐이다:
 // ctx가 세마포어 대기 중 취소, Request 인코딩 실패, ErrNoIsolation.
 func Spawn(ctx context.Context, selfExe string, req Request) (Result, error) {
+	// 안전망: 호출자 ctx에 deadline이 없으면 CPU-only 무한루프가 메모리 상한보다 먼저 죽도록
+	// 10s를 씌운다. deadline이 이미 있으면 그대로 존중(더 길어도 줄이지 않음).
+	if _, ok := ctx.Deadline(); !ok {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, defaultWorkerTimeout)
+		defer cancel()
+	}
+
 	select {
 	case workerSem <- struct{}{}:
 	case <-ctx.Done():
