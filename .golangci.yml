@@ -7,3 +7,14 @@ linters:
   default: standard
   enable:
     - misspell
+  settings:
+    errcheck:
+      # internal/cli의 진단 출력 함수(runDoctor/runStats/runUpgrade 등)는 io.Writer 하나에
+      # 사람이 읽는 리포트 텍스트만 쓴다 — 실패는 stdout 파이프 자체가 끊긴 경우뿐이고, 이미
+      # 계산된 실패 판정(failed []string 등)은 그 앞에서 별도로 검사·반환된다. 이 CLI 리포트
+      # 문구를 못 쓴 경우를 별도 처리해도 진단 정확도에 영향이 없어(3-OS CI lint 최초 실행,
+      # errcheck 기본셋 실측) 반복적인 `_, _ = fmt.Fprintf(...)` 잡음보다 이 exclude가 낫다.
+      exclude-functions:
+        - fmt.Fprintf
+        - fmt.Fprintln
+        - fmt.Fprint

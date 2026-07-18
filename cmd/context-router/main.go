@@ -166,9 +166,16 @@ func canonicalizeStoreRoot(storeRoot string) (string, error) {
 }
 
 // canonicalizeAllowPaths: 각 --allow-path를 canonicalize(Abs→EvalSymlinks→Fold)하고
-// store-root 하위면 시작을 거부한다(Task6 이관, 설계 §4.4).
+// store-root 하위면 시작을 거부한다(Task6 이관, 설계 §4.4). storeRoot 인자 자체도
+// (호출자가 canonicalizeStoreRoot를 이미 거쳤든 raw든) 여기서 동일 기준으로
+// 다시 canonicalize한다 — macOS `/var`→`/private/var` 같은 심링크 낀 경로에서
+// storeRoot만 미해석 상태로 비교하면 실제로는 하위인 allow-path를 "무관"으로 오판해
+// store-root 하위 거부(§4.4)가 심링크로 우회된다(3-OS CI 최초 실측 발견).
 func canonicalizeAllowPaths(paths []string, storeRoot string) ([]string, error) {
-	foldedStoreRoot := ident.Fold(storeRoot)
+	foldedStoreRoot, err := canonicalizeStoreRoot(storeRoot) // 이미 Abs→EvalSymlinks→Fold 반환
+	if err != nil {
+		return nil, err
+	}
 	out := make([]string, 0, len(paths))
 	for _, p := range paths {
 		abs, err := filepath.Abs(p)

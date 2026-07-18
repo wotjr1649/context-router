@@ -78,7 +78,7 @@ func runUpgrade(w io.Writer, client *http.Client, releaseURL, current string) er
 		printCurrent()
 		return nil
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }() // 응답 다 읽은 뒤 정리 — 실패해도 이미 취할 조치 없음
 	if resp.StatusCode != http.StatusOK {
 		printCurrent()
 		return nil
@@ -215,7 +215,7 @@ func runStatsProvider(ctx context.Context, w io.Writer, path string) error {
 		}
 		return errors.New("stats provider: 파일 열기 실패")
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }() // 읽기 전용 — 닫기 실패해도 데이터 유실 없음
 
 	var input, output, cacheRead, cacheCreate, records, skipped int64
 	br := bufio.NewReaderSize(f, 64*1024)
@@ -460,8 +460,8 @@ func probeWritable(dir string) bool {
 		return false
 	}
 	name := f.Name()
-	f.Close()
-	os.Remove(name)
+	_ = f.Close()       // 프로브 전용 임시파일 — 닫기 실패해도 아래 Remove로 정리 시도는 계속한다
+	_ = os.Remove(name) // best-effort 정리 — 실패해도 쓰기 가능 여부 판정(true)에는 영향 없음
 	return true
 }
 
@@ -499,7 +499,7 @@ func probeFTS5(ctx context.Context, reader *sql.DB) error {
 		if err != nil {
 			return fmt.Errorf("fts5 probe: %w", err)
 		}
-		defer db.Close()
+		defer func() { _ = db.Close() }() // :memory: 프로브 전용 — 닫기 실패해도 영향 없음
 	}
 	var count int
 	if err := db.QueryRowContext(ctx, "SELECT count(*) FROM pragma_module_list WHERE name='fts5'").Scan(&count); err != nil {
@@ -590,7 +590,7 @@ func runDoctor(ctx context.Context, w io.Writer, storeRoot, projectRoot string) 
 				fmt.Fprintf(w, "[3] content.db: open 실패: %v\n", err)
 				failed = append(failed, "content.db")
 			} else {
-				defer st.Close()
+				defer func() { _ = st.Close() }() // read-only 진단 프로브 — 닫기 실패해도 영향 없음
 				var userVersion int
 				var quickCheck string
 				uvErr := st.Reader().QueryRowContext(ctx, "PRAGMA user_version").Scan(&userVersion)

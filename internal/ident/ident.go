@@ -24,7 +24,10 @@ func Fold(p string) string {
 	if strings.HasPrefix(p, `UNC\`) || strings.HasPrefix(p, `UNC/`) {
 		p = `\\` + p[4:] // (\\?\|//?/)UNC\server\share → \\server\share
 	}
-	p = filepath.ToSlash(p)
+	// 구분자 통일은 OS 불문 무조건 적용(설계 §3.2) — filepath.ToSlash는 빌드 OS의 네이티브
+	// 구분자만 변환해 unix 빌드에서는 백슬래시를 그대로 남긴다(3-OS CI 최초 실측 발견,
+	// TestFold_ExtendedUNC_SlashVariant가 linux에서 실패했던 근본 원인). case-fold만 GOOS별.
+	p = strings.ReplaceAll(p, `\`, "/")
 	if runtime.GOOS == "windows" || runtime.GOOS == "darwin" {
 		p = strings.ToLower(p)
 	}

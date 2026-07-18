@@ -693,10 +693,23 @@ func Run(ctx context.Context, st *store.Store, projectRoot string, allowPaths []
 	if err != nil {
 		return Report{}, err
 	}
+	// projectRoot/allowPaths도 real과 동일 기준(Abs→EvalSymlinks)으로 재해석 후 Fold한다 —
+	// 호출자가 이미 canonicalize된 값을 넘기면 EvalSymlinks가 그대로 idempotent하지만,
+	// macOS `/var`→`/private/var`처럼 심링크 낀 경로를 raw로 넘기는 호출자(단위 테스트 등)가
+	// 있으면 real만 심링크 해석되고 root는 안 되어 하위 경로가 ".."로 새어나가 오탐
+	// "outside workspace"가 난다(3-OS CI 최초 실측 발견, 설계 §4.4 경계 판정의 전제 위반).
+	realProjectRoot, err := canonicalPath(projectRoot)
+	if err != nil {
+		return Report{}, err
+	}
 	foldedRoots := make([]string, 0, 1+len(allowPaths))
-	foldedRoots = append(foldedRoots, ident.Fold(projectRoot))
+	foldedRoots = append(foldedRoots, ident.Fold(realProjectRoot))
 	for _, p := range allowPaths {
-		foldedRoots = append(foldedRoots, ident.Fold(p))
+		realAllow, err := canonicalPath(p)
+		if err != nil {
+			return Report{}, err
+		}
+		foldedRoots = append(foldedRoots, ident.Fold(realAllow))
 	}
 	if !withinAny(foldedRoots, real) {
 		return Report{}, fmt.Errorf("ingest: run: %w", ErrWorkspace)
