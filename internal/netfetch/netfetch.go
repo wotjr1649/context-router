@@ -22,6 +22,7 @@ import (
 	"github.com/JohannesKaufmann/html-to-markdown/v2/plugin/commonmark"
 	"github.com/JohannesKaufmann/html-to-markdown/v2/plugin/table"
 	"golang.org/x/net/html"
+	"golang.org/x/net/html/charset"
 )
 
 // Config: Fetch 정책. 값 0/nil = 기본값(Timeout=30s, MaxBytes<=0 → 기본 10MB 상한).
@@ -64,6 +65,20 @@ var (
 	// IPv4 대역. v4-mapped(::ffff:0:0/96, Unmap()이 걷어내는 대역)와는 다른 별개 대역이라
 	// 명시적으로 차단해야 한다.
 	v4CompatPrefix = netip.MustParsePrefix("::/96")
+	// blockedPrefixes: IANA special-use 등록 대역(RFC 5737/2544/1112 등) — 공인 라우팅
+	// 목적이 아니므로 목적지로 허용하지 않는다. loopback/private/link-local 등은 위 개별
+	// 필드로 이미 처리되어 여기 포함하지 않는다.
+	blockedPrefixes = []netip.Prefix{
+		netip.MustParsePrefix("192.0.2.0/24"),    // TEST-NET-1
+		netip.MustParsePrefix("198.51.100.0/24"), // TEST-NET-2
+		netip.MustParsePrefix("203.0.113.0/24"),  // TEST-NET-3
+		netip.MustParsePrefix("198.18.0.0/15"),   // benchmark
+		netip.MustParsePrefix("240.0.0.0/4"),     // reserved
+		netip.MustParsePrefix("2001:db8::/32"),   // documentation
+		netip.MustParsePrefix("2001::/23"),       // IETF protocol assignments
+		netip.MustParsePrefix("2002::/16"),       // 6to4
+		netip.MustParsePrefix("2001::/32"),       // Teredo
+	}
 )
 
 // ClassifyAddr: 순수 함수 — I3 판정. "ok" | "block".
@@ -84,6 +99,11 @@ func ClassifyAddr(a netip.Addr) string {
 		zeroNet.Contains(a) ||
 		v4CompatPrefix.Contains(a) {
 		return "block"
+	}
+	for _, p := range blockedPrefixes {
+		if p.Contains(a) {
+			return "block"
+		}
 	}
 	return "ok"
 }
@@ -162,7 +182,8 @@ func resolveAndValidate(ctx context.Context, host string, cfg Config) (netip.Add
 func buildTransport(pinnedIP netip.Addr, port int) *http.Transport {
 	dialer := &net.Dialer{}
 	return &http.Transport{
-		Proxy: nil,
+		Proxy:             nil,
+		DisableKeepAlives: true, // hop마다 1회용 Transport — 재사용 없음, 유휴 소켓 잔존 방지.
 		DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
 			return dialer.DialContext(ctx, network, net.JoinHostPort(pinnedIP.String(), strconv.Itoa(port)))
 		},
@@ -174,6 +195,36 @@ var ErrTooManyRedirects = errors.New("netfetch: too many redirects")
 
 // ErrBodyTooLarge: 응답 본문이 Config.MaxBytes 초과 — 스트리밍 중단(I8, 계약: 절단 아닌 오류).
 var ErrBodyTooLarge = errors.New("netfetch: response body exceeds MaxBytes")
+
+// ErrUnsupportedMedia: 색인 파이프라인이 다루지 않는 미디어 타입(바이너리 등) — 처리 전 거부.
+var ErrUnsupportedMedia = errors.New("netfetch: unsupported media type")
+
+// mediaTypeAllowed: text/*·application/json·application/xml·application/xhtml+xml만 통과.
+// Content-Type 없음/파싱 실패(mt=="")는 계약상 보수적으로 거부.
+func mediaTypeAllowed(mt string) bool {
+	if mt == "" {
+		return false
+	}
+	if strings.HasPrefix(mt, "text/") {
+		return true
+	}
+	switch mt {
+	case "application/json", "application/xml", "application/xhtml+xml":
+		return true
+	}
+	return false
+}
+
+// decodeToUTF8: Content-Type의 charset 파라미터(및 HTML이면 meta 태그) 기준으로 body를 UTF-8로
+// 변환. charset이 없거나 이미 utf-8이면 원문 그대로(A5). RawHTML은 이 결과가 아닌 디코딩 전
+// 원본 바이트를 보존해야 한다 — 호출부에서 반드시 body(원본)를 따로 유지할 것.
+func decodeToUTF8(body []byte, contentTypeHeader string) ([]byte, error) {
+	r, err := charset.NewReader(bytes.NewReader(body), contentTypeHeader)
+	if err != nil {
+		return nil, err
+	}
+	return io.ReadAll(r)
+}
 
 // Fetch: I1~I8 전체 적용. scheme http/https만, redirect 매 hop 재검증(최대 5회),
 // https→http 강등 hop 거부, 쿠키/자격 헤더 미전송(Jar 미설정), UA 고정.
@@ -194,6 +245,9 @@ func Fetch(ctx context.Context, cfg Config, rawURL string) (Result, error) {
 		if err != nil {
 			return Result{}, fmt.Errorf("netfetch: parse url: %w", err)
 		}
+		if u.User != nil {
+			return Result{}, fmt.Errorf("netfetch: userinfo not allowed: %w", ErrDenied)
+		}
 		if u.Scheme != "http" && u.Scheme != "https" {
 			return Result{}, fmt.Errorf("netfetch: scheme %q not allowed: %w", u.Scheme, ErrDenied)
 		}
@@ -206,8 +260,10 @@ func Fetch(ctx context.Context, cfg Config, rawURL string) (Result, error) {
 			return Result{}, err
 		}
 
+		transport := buildTransport(pinnedIP, port)
+		defer transport.CloseIdleConnections() // hop별 1회용 Transport 정리 — 반환/오류 경로 모두.
 		client := &http.Client{
-			Transport: buildTransport(pinnedIP, port),
+			Transport: transport,
 			CheckRedirect: func(req *http.Request, via []*http.Request) error {
 				return http.ErrUseLastResponse // 자동 redirect 비활성 — 아래 수동 루프가 처리(I6).
 			},
@@ -253,10 +309,17 @@ func Fetch(ctx context.Context, cfg Config, rawURL string) (Result, error) {
 		if err != nil {
 			mediaType = ""
 		}
-		result := Result{Body: body, MediaType: mediaType, FinalURL: current}
+		if !mediaTypeAllowed(mediaType) {
+			return Result{}, fmt.Errorf("netfetch: media type %q: %w", mediaType, ErrUnsupportedMedia)
+		}
+		decoded, err := decodeToUTF8(body, resp.Header.Get("Content-Type"))
+		if err != nil {
+			return Result{}, fmt.Errorf("netfetch: charset decode: %w", err)
+		}
+		result := Result{Body: decoded, MediaType: mediaType, FinalURL: current}
 		if mediaType == "text/html" {
-			result.RawHTML = body
-			md, extraction, err := convertToMarkdown(body, u)
+			result.RawHTML = body // 원문 바이트(디코딩 전) 보존 — 재처리/감사용.
+			md, extraction, err := convertToMarkdown(decoded, u)
 			if err != nil {
 				return Result{}, err
 			}

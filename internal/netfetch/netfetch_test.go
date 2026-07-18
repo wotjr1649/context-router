@@ -14,7 +14,11 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 )
+
+// eucKRAnnyeong: "안녕하세요" EUC-KR 인코딩 바이트(charset 디코딩 테스트 픽스처).
+var eucKRAnnyeong = []byte{0xBE, 0xC8, 0xB3, 0xE7, 0xC7, 0xCF, 0xBC, 0xBC, 0xBF, 0xE4}
 
 // srvPort: httptest.NewServer는 임의 포트를 쓰므로 Config.ExtraPorts에 넣어줘야 한다
 // (포트 정책 자체는 별도로 TestFetch_SchemeAndPortDenied가 검증).
@@ -68,6 +72,12 @@ func TestClassifyAddr(t *testing.T) {
 		{"multicast v6", "ff02::1", "block"},
 		{"public v6 cloudflare", "2606:4700::1111", "ok"},
 		{"public v6 google dns", "2001:4860:4860::8888", "ok"},
+		{"test-net-1 (192.0.2.0/24)", "192.0.2.1", "block"},
+		{"benchmark (198.18.0.0/15)", "198.18.0.1", "block"},
+		{"test-net-3 (203.0.113.0/24)", "203.0.113.5", "block"},
+		{"documentation v6 (2001:db8::/32)", "2001:db8::1", "block"},
+		{"6to4 (2002::/16)", "2002::1", "block"},
+		{"ietf protocol assignments/teredo (2001::/23)", "2001::1", "block"},
 	}
 	if len(cases) < 20 {
 		t.Fatalf("matrix must have 20+ rows, has %d", len(cases))
@@ -124,6 +134,15 @@ func TestTransportIgnoresEnvProxyAndHasNoRedirectFollow(t *testing.T) {
 	tr := buildTransport(netip.MustParseAddr("127.0.0.1"), 80)
 	if tr.Proxy != nil {
 		t.Fatalf("want Transport.Proxy nil (env proxy ignored), got non-nil")
+	}
+}
+
+// TestBuildTransportDisablesKeepAlives: 일회용 hop마다 새 Transport라 커넥션 재사용이 없다 —
+// keep-alive를 켜두면 유휴 소켓만 남으므로 명시적으로 끈다.
+func TestBuildTransportDisablesKeepAlives(t *testing.T) {
+	tr := buildTransport(netip.MustParseAddr("127.0.0.1"), 80)
+	if !tr.DisableKeepAlives {
+		t.Fatalf("want Transport.DisableKeepAlives = true")
 	}
 }
 
@@ -216,6 +235,93 @@ func TestFetch_SchemeAndPortDenied(t *testing.T) {
 	_, err = Fetch(context.Background(), Config{AllowLocal: true, Timeout: time.Second}, "http://127.0.0.1:8080/")
 	if !errors.Is(err, ErrDenied) {
 		t.Fatalf("disallowed port: want ErrDenied, got %v", err)
+	}
+}
+
+// TestFetch_UserinfoDenied: URL에 userinfo(user:pass@)가 있으면 AllowLocal 무관하게 거부(I8
+// 자격유출 방지 — http.Client가 Basic Authorization을 자동 전송하는 것 차단).
+func TestFetch_UserinfoDenied(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("should not reach"))
+	}))
+	defer srv.Close()
+	target := strings.Replace(srv.URL, "://", "://user:pass@", 1)
+
+	cfg := Config{AllowLocal: true, ExtraPorts: []int{srvPort(t, srv.URL)}, Timeout: 2 * time.Second}
+	_, err := Fetch(context.Background(), cfg, target)
+	if !errors.Is(err, ErrDenied) {
+		t.Fatalf("userinfo URL: want ErrDenied, got %v", err)
+	}
+}
+
+// TestFetch_RedirectToUserinfoDenied: redirect Location에 userinfo가 있으면 그 hop에서 거부.
+func TestFetch_RedirectToUserinfoDenied(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "http://user:pass@127.0.0.1/next", http.StatusFound)
+	}))
+	defer srv.Close()
+
+	cfg := Config{AllowLocal: true, ExtraPorts: []int{srvPort(t, srv.URL)}, Timeout: 2 * time.Second}
+	_, err := Fetch(context.Background(), cfg, srv.URL)
+	if !errors.Is(err, ErrDenied) {
+		t.Fatalf("redirect to userinfo URL: want ErrDenied, got %v", err)
+	}
+}
+
+// TestFetch_UnsupportedMediaTypeDenied: 바이너리(image/*)는 색인 전 거부(A4).
+func TestFetch_UnsupportedMediaTypeDenied(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "image/png")
+		w.Write([]byte("\x89PNG\r\n\x1a\n"))
+	}))
+	defer srv.Close()
+	cfg := Config{AllowLocal: true, ExtraPorts: []int{srvPort(t, srv.URL)}, Timeout: 2 * time.Second}
+	_, err := Fetch(context.Background(), cfg, srv.URL)
+	if !errors.Is(err, ErrUnsupportedMedia) {
+		t.Fatalf("image/png: want ErrUnsupportedMedia, got %v", err)
+	}
+}
+
+// TestFetch_EmptyContentTypeDenied: Content-Type 없음/파싱불가 → 보수적으로 거부(계약 고정).
+func TestFetch_EmptyContentTypeDenied(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "") // sniff 억제 — 클라이언트가 빈 값을 받도록.
+		w.Write([]byte("mystery bytes"))
+	}))
+	defer srv.Close()
+	cfg := Config{AllowLocal: true, ExtraPorts: []int{srvPort(t, srv.URL)}, Timeout: 2 * time.Second}
+	_, err := Fetch(context.Background(), cfg, srv.URL)
+	if !errors.Is(err, ErrUnsupportedMedia) {
+		t.Fatalf("empty content-type: want ErrUnsupportedMedia (conservative reject), got %v", err)
+	}
+}
+
+// TestFetch_HTML_CharsetEUCKRDecoded: charset=euc-kr 응답 → Body는 올바른 UTF-8 한글로 디코딩되고
+// RawHTML은 euc-kr 원문 바이트 그대로 보존된다(재처리/감사용, A5).
+func TestFetch_HTML_CharsetEUCKRDecoded(t *testing.T) {
+	var raw []byte
+	raw = append(raw, []byte(`<html><body><p>`)...)
+	raw = append(raw, eucKRAnnyeong...)
+	raw = append(raw, []byte(`</p></body></html>`)...)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=euc-kr")
+		w.Write(raw)
+	}))
+	defer srv.Close()
+	cfg := Config{AllowLocal: true, ExtraPorts: []int{srvPort(t, srv.URL)}, Timeout: 5 * time.Second}
+	res, err := Fetch(context.Background(), cfg, srv.URL)
+	if err != nil {
+		t.Fatalf("Fetch: %v", err)
+	}
+	if !utf8.Valid(res.Body) {
+		t.Fatalf("Body not valid UTF-8: %x", res.Body)
+	}
+	if !bytes.Contains(res.Body, []byte("안녕하세요")) {
+		t.Fatalf("Body missing decoded Korean text: %s", res.Body)
+	}
+	if !bytes.Equal(res.RawHTML, raw) {
+		t.Fatalf("RawHTML not preserved as original euc-kr bytes")
 	}
 }
 
