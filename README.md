@@ -37,15 +37,18 @@ separately in `docs/oracle-mapping-ko.md`.
 
 ## Install & host registration
 
-Build from source (no tagged release yet):
+No tagged release yet — install from source with `go install`, which places
+the binary in `$(go env GOPATH)/bin` (add that to `PATH`, or reference it by
+absolute path):
+
+```sh
+go install github.com/wotjr1649/context-router/cmd/context-router@latest
+```
+
+Or build locally and run it by path:
 
 ```sh
 go build -o context-router ./cmd/context-router
-```
-
-Then run:
-
-```sh
 ./context-router doctor
 ```
 
@@ -54,6 +57,8 @@ project, and prints ready-to-use host registration snippets (e.g. for Claude
 Code's `.mcp.json` / `claude mcp add`, or Codex's `~/.codex/config.toml`),
 including recommended default permission rules (`ctr_index` /
 `ctr_fetch_and_index` and any `global-search`-profile tool default to "ask").
+If `context-router` is not on `PATH`, use the absolute path to the binary in
+the registration snippet the host config expects.
 
 ## CLI
 
@@ -61,9 +66,13 @@ including recommended default permission rules (`ctr_index` /
 context-router                      # run as an MCP server (flags below)
 context-router doctor               # diagnose store/DB/FTS5 + host registration snippets
 context-router stats [--provider <transcript-path>]
-context-router purge (--project <id|path> | --all) [--older-than <dur>] [--gc]
+context-router purge (--project <id|path> | --all) [--older-than <dur>] [--gc] [--force]
 context-router upgrade               # print current + latest release version
 ```
+
+`purge` always asks for confirmation before deleting: in a TTY it shows the
+target project slug and requires you to type that exact slug back; in a
+non-TTY (automation) context it refuses unless `--force` is passed.
 
 ## Server flags
 
@@ -71,7 +80,7 @@ context-router upgrade               # print current + latest release version
 |---|---|---|
 | `--root <path>` | cwd | project root |
 | `--store-root <path>` | OS-default store dir | override storage location (env `CTR_STORE_ROOT`) |
-| `--profile <list>` | `search,fetch,transform` | tool profile; `global-search` for cross-project search |
+| `--profile <list>` | `search,fetch,transform` | v0.0.1 accepts only the default 3-tool profile or `global-search` alone — arbitrary subsets are rejected at startup (tool gating by profile is reserved for a later version) |
 | `--enable <list>` | (none) | opt-in extra capabilities: `ingest`, `net` |
 | `--allow-path <path>` | (none) | extra `ctr_index` allowed root (repeatable) |
 | `--projects <list>` | (none) | project allowlist, required with `--profile global-search` |

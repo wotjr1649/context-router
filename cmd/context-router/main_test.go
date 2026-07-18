@@ -103,6 +103,18 @@ func TestRun_DefaultProfile_RejectsProjects(t *testing.T) {
 	}
 }
 
+// TestRun_ArbitraryProfileSubset_Rejected: mcp.NewServer는 Profile로 도구를 게이팅하지
+// 않으므로(v0.0.1 예약), 기본 3종·global-search 단독 외의 임의 부분집합을 조용히 받으면
+// 사용자가 "일부만 켰다"고 오인한다 — 시작 시점에 명시 오류로 거부해야 한다(Codex 교차
+// 리뷰 P1-2, 설계 §2.1 "등록됨 = 보안 경계").
+func TestRun_ArbitraryProfileSubset_Rejected(t *testing.T) {
+	var stderr bytes.Buffer
+	err := run(context.Background(), []string{"--profile", "search", "--root", t.TempDir(), "--store-root", t.TempDir()}, &stderr)
+	if err == nil {
+		t.Fatal("want error for --profile search (arbitrary subset), got nil")
+	}
+}
+
 // TestRun_GlobalProfile_OpenFailureRejectsStart: --projects 엔트리 중 store가 아직 없는
 // (디렉터리/DB 없음) 것이 하나라도 있으면 시작 전체를 거부해야 한다(fail-closed, 설계 §4.6).
 func TestRun_GlobalProfile_OpenFailureRejectsStart(t *testing.T) {

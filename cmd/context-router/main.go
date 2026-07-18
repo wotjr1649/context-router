@@ -77,6 +77,12 @@ func parseFlags(args []string) (serverFlags, error) {
 	return f, nil
 }
 
+// validProfile: v0.0.1이 실제로 지원하는 두 형태뿐(mcp.NewServer가 Profile로 도구를
+// 게이팅하지 않으므로, 임의 부분집합을 받아주면 사용자가 오인한다 — 설계 §8).
+func validProfile(p []string) bool {
+	return slices.Equal(p, []string{"search", "fetch", "transform"}) || slices.Equal(p, []string{"global-search"})
+}
+
 func banner(f serverFlags, root string) string {
 	onoff := func(name string) string {
 		if slices.Contains(f.Enable, name) {
@@ -255,6 +261,13 @@ func run(ctx context.Context, args []string, stderr io.Writer) error {
 		return err
 	}
 	slog.SetDefault(slog.New(slog.NewTextHandler(stderr, &slog.HandlerOptions{Level: parseLogLevel(f.LogLevel)})))
+
+	// mcp.NewServer는 Profile을 아직 미분기(v0.0.1 예약, 설계 §8 주석) — 그런데도 임의
+	// 부분집합을 조용히 받으면 사용자가 실제로는 전체 도구가 등록되는데도 일부만 켠
+	// 것으로 오인한다(설계 §2.1 "등록됨 = 보안 경계"). 침묵 대신 시작 시점에 거부한다.
+	if !validProfile(f.Profile) {
+		return fmt.Errorf("ctr: --profile: v0.0.1은 기본값 \"search,fetch,transform\" 또는 \"global-search\" 단독만 지원합니다 (받은 값: %q)", strings.Join(f.Profile, ","))
+	}
 
 	// global-search 프로필 ⇄ --projects는 1:1 필수 대응(모호성 차단, 설계 §4.6/§8).
 	isGlobal := slices.Contains(f.Profile, "global-search")
