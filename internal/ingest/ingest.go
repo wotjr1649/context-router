@@ -375,13 +375,19 @@ func isBinary(b []byte) bool {
 	return !utf8.Valid(b)
 }
 
-// canonicalPath resolves p to its absolute, symlink-free real path(원본 케이스 유지).
+// canonicalPath resolves p to its absolute, symlink/junction-free real path(원본 케이스
+// 유지). ident.RealPath를 쓴다(단순 filepath.EvalSymlinks가 아님) — windows에서
+// EvalSymlinks는 NTFS junction을 인식 못 해, 여기서만 미해석 채로 두면 ident.Canonicalize가
+// 계산한 projectRoot(§4.4 경계 기준)와 이 함수의 real이 junction 경유 경로에서 서로 다른
+// 문자열이 돼 정당한 경로를 WORKSPACE_VIOLATION으로 오판하거나(경로 별칭 불일치), 반대로
+// 프로젝트 내부의 junction이 밖을 가리킬 때 경계 우회를 허용해버린다(최종리뷰 F1 — ident가
+// 진실의 원천, 전 소비처가 동일 함수를 공유해야 한다).
 func canonicalPath(p string) (string, error) {
 	abs, err := filepath.Abs(p)
 	if err != nil {
 		return "", fmt.Errorf("ingest: canonicalize: %w", err)
 	}
-	real, err := filepath.EvalSymlinks(abs)
+	real, err := ident.RealPath(abs)
 	if err != nil {
 		return "", fmt.Errorf("ingest: canonicalize: %w", err)
 	}
@@ -391,7 +397,9 @@ func canonicalPath(p string) (string, error) {
 // canonicalUnchanged reports whether path(collect 시점 canonical 값)가 지금도
 // 자기 자신으로 canonicalize되는지 — TOCTOU 완화(실용판): 읽기 완료 후 그 자리가
 // 다른 곳으로 재링크되지 않았는지 확인한다.
-// ponytail: TOCTOU 완화 — 완전판(openat2/GetFinalPathNameByHandle)은 계획 3.
+// ponytail: TOCTOU 완화 — 완전판(openat2 등 커널 수준 원자적 open+검증)은 v0.0.1 이후(§14)
+// 이월. junction realpath 해석(ident.RealPath/GetFinalPathNameByHandle)은 계획 3에서 이미
+// 반영됨(최종리뷰 F1) — 이월 대상은 openat2뿐이다.
 func canonicalUnchanged(path string) bool {
 	real, err := canonicalPath(path)
 	return err == nil && real == path

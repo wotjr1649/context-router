@@ -43,7 +43,7 @@ func Canonicalize(root string) (Canon, error) {
 	if err != nil {
 		return Canon{}, fmt.Errorf("canonicalize: %w", err)
 	}
-	real, err := realPath(abs)
+	real, err := RealPath(abs)
 	if err != nil {
 		return Canon{}, fmt.Errorf("canonicalize: %w", err) // 존재하지 않으면 시작 거부 (§2.2)
 	}

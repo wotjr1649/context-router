@@ -10,7 +10,9 @@ import (
 	"errors"
 	"flag"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -574,6 +576,67 @@ func TestRun_PathEscape_Symlink(t *testing.T) {
 	_, err := Run(context.Background(), st, root, nil, Request{Path: link})
 	if !errors.Is(err, ErrWorkspace) {
 		t.Fatalf("err=%v want ErrWorkspace", err)
+	}
+}
+
+// TestRun_JunctionProjectAllowsLegitimatePath: 최종리뷰 F1(windows 전용) — 프로젝트 루트
+// 자체가 NTFS junction(mklink /J) 경유일 때, junction 안의 정당한 파일 색인이
+// WORKSPACE_VIOLATION으로 오탐되면 안 된다. root(=projectRoot)는 운영 배선과 동일하게
+// ident.Canonicalize(junction).WorktreeRoot를 쓴다(mcp.go가 실제로 이렇게 넘긴다) — 이 값은
+// junction을 이미 실경로로 해석한 상태라, canonicalPath(내부에서 ident.RealPath 사용, F1)가
+// 되돌리는 real과 반드시 같은 문자열이어야 withinAny가 정당 경로를 통과시킨다. F1 수정 전엔
+// canonicalPath가 filepath.EvalSymlinks만 써 junction을 못 풀어 이 테스트가 실패했다.
+func TestRun_JunctionProjectAllowsLegitimatePath(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("NTFS junction은 windows 전용")
+	}
+	target := t.TempDir()
+	junction := filepath.Join(t.TempDir(), "junc-project")
+	if out, err := exec.Command("cmd", "/c", "mklink", "/J", junction, target).CombinedOutput(); err != nil {
+		t.Fatalf("mklink /J: %v: %s", err, out)
+	}
+	canon, err := ident.Canonicalize(junction)
+	if err != nil {
+		t.Fatalf("canonicalize junction: %v", err)
+	}
+	root := canon.WorktreeRoot
+
+	if err := os.WriteFile(filepath.Join(junction, "note.txt"), []byte("hello via junction\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	st, _ := openStoreT(t)
+
+	rep, err := Run(context.Background(), st, root, nil, Request{Path: junction})
+	if err != nil {
+		t.Fatalf("Run: %v (F1 회귀 — junction 경유 프로젝트에서 정당 경로가 WORKSPACE_VIOLATION)", err)
+	}
+	if rep.Indexed != 1 {
+		t.Fatalf("Indexed=%d want 1: skipped=%+v", rep.Indexed, rep.Skipped)
+	}
+}
+
+// TestRun_JunctionEscapesWorkspace: 최종리뷰 F1(windows 전용) — 프로젝트 내부에 있는
+// junction이 프로젝트 밖을 가리키면(TestRun_PathEscape_Symlink의 junction판) 그 경유
+// 색인은 여전히 ErrWorkspace로 거부돼야 한다. F1 수정 전엔 canonicalPath가 junction을 못
+// 풀어(원본 문자열 그대로 root 하위로 보임) 경계 우회가 가능했다.
+func TestRun_JunctionEscapesWorkspace(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("NTFS junction은 windows 전용")
+	}
+	root := realDir(t, t.TempDir())
+	outside := t.TempDir()
+	if err := os.WriteFile(filepath.Join(outside, "secret.txt"), []byte("nope\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	junction := filepath.Join(root, "escape-junc")
+	if out, err := exec.Command("cmd", "/c", "mklink", "/J", junction, outside).CombinedOutput(); err != nil {
+		t.Fatalf("mklink /J: %v: %s", err, out)
+	}
+	st, _ := openStoreT(t)
+
+	_, err := Run(context.Background(), st, root, nil, Request{Path: filepath.Join(junction, "secret.txt")})
+	if !errors.Is(err, ErrWorkspace) {
+		t.Fatalf("err=%v want ErrWorkspace(junction 경유 경계 우회가 차단되지 않음, F1 회귀)", err)
 	}
 }
 
