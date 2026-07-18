@@ -34,17 +34,19 @@ func Run(ctx context.Context, sub string, args []string, storeRoot, projectRoot,
 	switch sub {
 	case "doctor":
 		if len(args) > 0 {
-			return fmt.Errorf("cli: doctor: 예상치 않은 인자: %v", args)
+			// 사용자 입력(원시 args)을 오류 문구에 에코하지 않는다 — 개수만(규약 §6, 리뷰
+			// Fix Round 3, item 5).
+			return fmt.Errorf("cli: doctor: 예상치 않은 인자 %d개", len(args))
 		}
 		return runDoctor(ctx, stdout, storeRoot, projectRoot)
 	case "upgrade":
 		if len(args) > 0 {
-			return fmt.Errorf("cli: upgrade: 예상치 않은 인자: %v", args)
+			return fmt.Errorf("cli: upgrade: 예상치 않은 인자 %d개", len(args))
 		}
 		client := &http.Client{Timeout: 10 * time.Second}
 		return runUpgrade(stdout, client, releaseURL, version)
 	case "stats":
-		return runStats(stdout, args, storeRoot, projectRoot)
+		return runStats(ctx, stdout, args, storeRoot, projectRoot)
 	case "purge":
 		return fmt.Errorf("cli: 미구현 서브커맨드: %s", sub)
 	default:
@@ -89,14 +91,19 @@ func runUpgrade(w io.Writer, client *http.Client, releaseURL, current string) er
 // runStats: local(ledger.db 집계)과 --provider(transcript JSONL 실측)를 분기한다(설계 §6).
 // 두 경로 모두 토큰·달러 환산과 절약률 주장을 출력하지 않는다(§6 차단 항목 — v0.2 A/B
 // 게이트 전까지) — local은 바이트 집계만, provider는 실측 토큰 합계만 보여준다.
-func runStats(w io.Writer, args []string, storeRoot, projectRoot string) error {
+func runStats(ctx context.Context, w io.Writer, args []string, storeRoot, projectRoot string) error {
 	fs := flag.NewFlagSet("stats", flag.ContinueOnError)
 	provider := fs.String("provider", "", "Claude Code transcript JSONL 경로 — 실측 토큰 합계만 출력")
 	if err := fs.Parse(args); err != nil {
 		return fmt.Errorf("stats: 플래그 파싱 실패: %w", err)
 	}
+	if rest := fs.Args(); len(rest) > 0 {
+		// 위치 인자를 침묵 수용하지 않는다(리뷰 Fix Round 3, item 4) — 개수만 밝힌다(item 5와
+		// 동일 원칙, 사용자 입력 원문 에코 금지).
+		return fmt.Errorf("stats: 예상치 않은 인자 %d개", len(rest))
+	}
 	if *provider != "" {
-		return runStatsProvider(w, *provider)
+		return runStatsProvider(ctx, w, *provider)
 	}
 	return runStatsLocal(w, storeRoot, projectRoot)
 }
@@ -177,11 +184,19 @@ func readTranscriptLine(br *bufio.Reader, max int) (line []byte, truncated bool,
 	}
 }
 
+// cancelCheckLines: runStatsProvider가 ctx 취소를 확인하는 주기(줄 수) — 리뷰 Fix Round 3
+// item 7. 매 줄마다 ctx.Err()를 호출하지 않는 이유는 순전히 비용 절감이며(취소는 어차피
+// 사람 타임스케일 이벤트), 상한(maxProviderLine)과 무관하게 파일이 아무리 커도 이 주기마다
+// 반드시 취소를 반영한다.
+const cancelCheckLines = 256
+
 // runStatsProvider: path의 Claude Code transcript JSONL을 한 줄씩 스캔해 message.usage의 4개
 // 토큰 필드를 합산하고 usage 보유 레코드 수를 센다(설계 §6). 파싱 불가 줄·message.usage 없는
 // 줄·maxProviderLine을 넘는 줄은 로그 없이 skipped 카운트만 올린다(마지막 경우는 명령을
-// 중단시키지 않고 계속 진행). 실측 합계만 출력한다 — 절약 주장·비교 문구 없음.
-func runStatsProvider(w io.Writer, path string) error {
+// 중단시키지 않고 계속 진행). 실측 합계만 출력한다 — 절약 주장·비교 문구 없음. ctx가 취소되면
+// (cancelCheckLines줄마다 확인) 그 시점까지 읽은 결과를 버리고 오류로 중단한다 — 아주 큰
+// transcript를 스캔하는 동안 상위 호출자가 취소할 길을 남겨둔다.
+func runStatsProvider(ctx context.Context, w io.Writer, path string) error {
 	f, err := os.Open(path)
 	if err != nil {
 		// *fs.PathError는 경로를 담는다(§12 canary) — errors.Is로 원인 종류만 남기고
@@ -196,7 +211,12 @@ func runStatsProvider(w io.Writer, path string) error {
 
 	var input, output, cacheRead, cacheCreate, records, skipped int64
 	br := bufio.NewReaderSize(f, 64*1024)
-	for {
+	for lineNo := 0; ; lineNo++ {
+		if lineNo%cancelCheckLines == 0 {
+			if cerr := ctx.Err(); cerr != nil {
+				return fmt.Errorf("stats provider: 취소됨: %w", cerr)
+			}
+		}
 		raw, truncated, ferr := readTranscriptLine(br, maxProviderLine)
 		switch {
 		case truncated:
@@ -242,6 +262,26 @@ func probeWritable(dir string) bool {
 	f.Close()
 	os.Remove(name)
 	return true
+}
+
+// nearestExistingDir: path의 조상 디렉터리 중 실제로 존재하는 가장 가까운 것을 찾는다.
+// store.Open은 MkdirAll(path/artifacts, ...)로 중간 디렉터리를 몇 단계든 한 번에 만들 수
+// 있으므로(설계 §3.1), 미생성 storeRoot의 쓰기 가능 여부는 딱 한 단계 위(filepath.Dir)가
+// 아니라 실제로 존재하는 조상에서 판정해야 한다 — 예전 구현은 한 단계 위까지 없는 신규
+// 배치(예: storeRoot의 부모·조부모가 전부 미생성)에서 그 부모조차 못 만들고 늘 "쓰기
+// 불가"로 오판했다(리뷰 Fix Round 3, item 2).
+func nearestExistingDir(path string) string {
+	dir := path
+	for {
+		if fi, err := os.Stat(dir); err == nil && fi.IsDir() {
+			return dir
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir { // 루트 도달 — 더 못 올라감
+			return dir
+		}
+		dir = parent
+	}
 }
 
 // probeFTS5: reader(열려있는 content.db 연결)가 있으면 그 reader로, 없으면(content.db
@@ -305,15 +345,21 @@ func runDoctor(ctx context.Context, w io.Writer, storeRoot, projectRoot string) 
 	fmt.Fprintln(w, "context-router doctor")
 	fmt.Fprintln(w)
 
-	// [1] 저장 루트 존재·쓰기 가능
-	checkDir := storeRoot
+	// [1] 저장 루트 존재·쓰기 가능. storeRoot 자체는 절대 만들지 않는다(no-create 원칙) —
+	// 이미 존재하는 디렉터리면 그 자신을, 존재하지 않으면 실제로 존재하는 가장 가까운 조상을
+	// 프로브 대상으로 삼는다(nearestExistingDir, 리뷰 Fix Round 3 item 2). 그 경로에
+	// 디렉터리가 아닌 무언가(일반 파일 등)가 이미 있으면 store.Open의 MkdirAll이 절대
+	// 성공할 수 없으므로 프로브 없이 명시 거부한다.
 	exists := false
-	if fi, err := os.Stat(storeRoot); err == nil && fi.IsDir() {
+	var writable bool
+	if fi, err := os.Stat(storeRoot); err == nil {
 		exists = true
+		if fi.IsDir() {
+			writable = probeWritable(storeRoot)
+		} // else: 디렉터리가 아닌 기존 경로 — writable은 false로 둔다(명시 거부)
 	} else {
-		checkDir = filepath.Dir(storeRoot) // 미생성이면 상위만 확인 — storeRoot 자체는 만들지 않는다
+		writable = probeWritable(nearestExistingDir(storeRoot))
 	}
-	writable := probeWritable(checkDir)
 	fmt.Fprintf(w, "[1] store-root: exists=%v writable=%v\n", exists, writable)
 	if !writable {
 		failed = append(failed, "store-root")

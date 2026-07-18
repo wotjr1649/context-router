@@ -361,12 +361,16 @@ func TestRunStats_Provider_OversizedLine(t *testing.T) {
 
 // TestRunDoctor_UnexpectedArgs / TestRunUpgrade_UnexpectedArgs: doctor·upgrade는 args를
 // 소비하지 않으므로 잔여 인자를 침묵 수용하면 안 된다(리뷰 Fix Round 2, Important-2) —
-// 미지 인자가 있으면 명시적으로 오류여야 한다.
+// 미지 인자가 있으면 명시적으로 오류여야 한다. 오류 문구에는 사용자가 입력한 원문("--bogus")이
+// 그대로 에코되면 안 된다(규약 §6, 리뷰 Fix Round 3 item 5 — 개수만 밝힌다).
 func TestRunDoctor_UnexpectedArgs(t *testing.T) {
 	var out, errOut bytes.Buffer
 	err := Run(context.Background(), "doctor", []string{"--bogus"}, t.TempDir(), t.TempDir(), "0.0.1-dev", &out, &errOut)
 	if err == nil {
 		t.Fatal("want error for unexpected doctor args, got nil")
+	}
+	if strings.Contains(err.Error(), "--bogus") {
+		t.Fatalf("error must not echo raw user input: %v", err)
 	}
 }
 
@@ -375,5 +379,84 @@ func TestRunUpgrade_UnexpectedArgs(t *testing.T) {
 	err := Run(context.Background(), "upgrade", []string{"--bogus"}, t.TempDir(), t.TempDir(), "0.0.1-dev", &out, &errOut)
 	if err == nil {
 		t.Fatal("want error for unexpected upgrade args, got nil")
+	}
+	if strings.Contains(err.Error(), "--bogus") {
+		t.Fatalf("error must not echo raw user input: %v", err)
+	}
+}
+
+// TestRunStats_UnexpectedPositionalArg: flag.Parse가 소비하지 못한 위치 인자(예: --provider
+// 없이 그냥 파일명만 넘긴 경우)를 침묵 수용하면 안 된다(리뷰 Fix Round 3, item 4).
+func TestRunStats_UnexpectedPositionalArg(t *testing.T) {
+	var out, errOut bytes.Buffer
+	err := Run(context.Background(), "stats", []string{"provider.jsonl"}, t.TempDir(), t.TempDir(), "0.0.1-dev", &out, &errOut)
+	if err == nil {
+		t.Fatal("want error for unexpected positional arg, got nil")
+	}
+	if strings.Contains(err.Error(), "provider.jsonl") {
+		t.Fatalf("error must not echo raw user input: %v", err)
+	}
+}
+
+// TestRunStats_Provider_ContextCanceled: 이미 취소된 ctx로 stats --provider를 호출하면
+// 오류로 중단해야 한다(리뷰 Fix Round 3, item 7) — 취소 확인은 cancelCheckLines(256)줄마다
+// 이루어지는데, lineNo=0에서 첫 확인이 스캔 시작 전에 실행되므로 파일이 짧아도(1줄) 검증된다.
+func TestRunStats_Provider_ContextCanceled(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "transcript.jsonl")
+	line := `{"message":{"usage":{"input_tokens":1,"output_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}` + "\n"
+	if err := os.WriteFile(path, []byte(line), 0o600); err != nil {
+		t.Fatalf("write transcript: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	var out, errOut bytes.Buffer
+	err := Run(ctx, "stats", []string{"--provider", path}, t.TempDir(), t.TempDir(), "0.0.1-dev", &out, &errOut)
+	if err == nil {
+		t.Fatal("want error for canceled context, got nil")
+	}
+}
+
+// TestRunDoctor_StoreRootDeepMissingParents_Writable: storeRoot의 부모·조부모가 전부
+// 미생성이어도(딱 한 단계 위까지도 없는 신규 배치) store.Open의 MkdirAll이 계층 전체를 한
+// 번에 만들 수 있으므로 writable=true로 판정해야 한다(리뷰 Fix Round 3, item 2 — 예전
+// 구현은 filepath.Dir 한 단계만 봐서 이 경우 항상 writable=false로 오판했다).
+func TestRunDoctor_StoreRootDeepMissingParents_Writable(t *testing.T) {
+	base := t.TempDir()
+	storeRoot := filepath.Join(base, "a", "b", "c") // a,b,c 전부 미생성
+	projectRoot := t.TempDir()
+
+	var buf bytes.Buffer
+	if err := runDoctor(context.Background(), &buf, storeRoot, projectRoot); err != nil {
+		t.Fatalf("runDoctor err=%v out=%s", err, buf.String())
+	}
+	if !strings.Contains(buf.String(), "[1] store-root: exists=false writable=true") {
+		t.Fatalf("out missing writable=true for deep-missing store-root: %s", buf.String())
+	}
+	if _, err := os.Stat(storeRoot); !os.IsNotExist(err) {
+		t.Fatalf("store root must not be created by doctor: stat err=%v", err)
+	}
+}
+
+// TestRunDoctor_StoreRootIsFile_Rejected: storeRoot 위치에 이미 일반 파일이 있으면
+// store.Open의 MkdirAll이 절대 성공할 수 없으므로 프로브 없이 writable=false로 명시
+// 거부해야 한다(리뷰 Fix Round 3, item 2).
+func TestRunDoctor_StoreRootIsFile_Rejected(t *testing.T) {
+	base := t.TempDir()
+	storeRoot := filepath.Join(base, "storeroot-is-a-file")
+	if err := os.WriteFile(storeRoot, []byte("x"), 0o600); err != nil {
+		t.Fatalf("write file: %v", err)
+	}
+	projectRoot := t.TempDir()
+
+	var buf bytes.Buffer
+	err := runDoctor(context.Background(), &buf, storeRoot, projectRoot)
+	if err == nil {
+		t.Fatal("want error — store-root path is an existing non-directory file")
+	}
+	if !strings.Contains(buf.String(), "[1] store-root: exists=true writable=false") {
+		t.Fatalf("out missing exists=true writable=false: %s", buf.String())
 	}
 }

@@ -209,6 +209,20 @@ func TestMainDispatch_NotHandled(t *testing.T) {
 	}
 }
 
+// TestMainDispatch_UnknownSubcommandRejected: "-"로 시작하지 않으면서 4개 서브커맨드도
+// 아닌 첫 인자(예: "stats"의 오타 "stat")는 조용히 MCP 서버 경로로 흘러가면 안 된다 —
+// handled=true와 명시 오류를 반환해야 한다(리뷰 Fix Round 3, item 1). 진짜 서버 플래그
+// (--profile 등, "-" 시작)는 여전히 handled=false로 통과한다(TestMainDispatch_NotHandled).
+func TestMainDispatch_UnknownSubcommandRejected(t *testing.T) {
+	handled, err := dispatchCLI(context.Background(), []string{"context-router", "stat"})
+	if !handled {
+		t.Fatal("want handled=true for unknown non-flag first arg (typo'd subcommand)")
+	}
+	if err == nil {
+		t.Fatal("want error for unknown subcommand-like arg, got nil")
+	}
+}
+
 // TestPrescanRootFlags: dispatchCLI가 서버 전체 flagset(parseFlags) 재사용을 그만두고 쓰는
 // 경량 프리스캔 — "--f v"/"--f=v"/"-f v" 세 형태 모두에서 --root/--store-root만 뽑고
 // 나머지(서브커맨드 전용 플래그, 예: --provider)는 손대지 않아야 한다(Task4 Fix Round 1).
@@ -331,15 +345,20 @@ func TestMainDispatch_Stats_WithStoreRoot(t *testing.T) {
 }
 
 // TestMainDispatch_CLI_Upgrade: doctor에 이어 upgrade도 새 dispatchCLI(프리스캔) 경로로
-// 여전히 정상 동작하는지 확인한다(회귀) — upgrade는 네트워크 실패까지 항상 nil을 반환하는
-// 계약이라(runUpgrade, 설계 §7) 샌드박스에 외부망이 없어도 결정적으로 통과한다.
+// 여전히 정상 라우팅되는지 확인한다(회귀) — 네트워크는 절대 건드리지 않는다(리뷰 Fix Round 3,
+// item 6: 예전엔 실제 releaseURL(GitHub API)까지 client.Get으로 도달해 오프라인 환경에서
+// DNS/연결 타임아웃에 의존했다). "upgrade" 뒤에 미지 인자를 하나 붙여 cli.Run의
+// unexpected-args 검사(네트워크 호출보다 먼저 실행됨)에서 오류로 반환되는 경로만으로
+// dispatchCLI가 "upgrade"를 cli.Run에 제대로 넘기는지 검증한다 — runUpgrade 자체의
+// 네트워크 정책(현재/최신 버전, 실패 시 폴백 등)은 internal/cli의 TestRunUpgrade_Table이
+// httptest 서버를 주입해 이미 결정적으로 커버한다.
 func TestMainDispatch_CLI_Upgrade(t *testing.T) {
-	handled, err := dispatchCLI(context.Background(), []string{"context-router", "upgrade"})
+	handled, err := dispatchCLI(context.Background(), []string{"context-router", "upgrade", "bogus-arg"})
 	if !handled {
 		t.Fatal("want handled=true for upgrade subcommand")
 	}
-	if err != nil {
-		t.Fatalf("upgrade dispatch err=%v", err)
+	if err == nil {
+		t.Fatal("want error for upgrade with unexpected arg (routing check — network never reached)")
 	}
 }
 

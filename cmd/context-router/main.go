@@ -379,10 +379,18 @@ func prescanRootFlags(args []string) (root, storeRoot string, rest []string, err
 // 재도출하지 않는다(설계 §7 Produces). --root/--store-root를 제외한 나머지 args는 그대로
 // cli.Run에 넘겨 서브커맨드 전용 flagset(stats의 --provider 등)이 스스로 파싱한다.
 func dispatchCLI(ctx context.Context, args []string) (handled bool, err error) {
-	if len(args) < 2 || !cliSubcommands[args[1]] {
+	if len(args) < 2 {
 		return false, nil
 	}
 	sub := args[1]
+	if !cliSubcommands[sub] {
+		if strings.HasPrefix(sub, "-") {
+			return false, nil // MCP 서버 플래그(예: --profile) — run()으로 진행
+		}
+		// "-"로 시작하지 않는데 4개 서브커맨드도 아니다 — `context-router stat` 같은 오타를
+		// 조용히 MCP 서버로 흘려보내면 안 된다(리뷰 Fix Round 3, item 1). 명시 거부.
+		return true, fmt.Errorf("ctr: 미지 서브커맨드: %s", sub)
+	}
 	subArgs := args[2:]
 
 	root, storeRootRaw, rest, err := prescanRootFlags(subArgs)

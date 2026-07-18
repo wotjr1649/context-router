@@ -760,6 +760,22 @@ func TestLedgerStats(t *testing.T) {
 	}
 }
 
+// TestLedgerStats_StatErrorOtherThanNotExist: os.Stat 오류가 ErrNotExist가 아니면(권한 거부
+// 등) 삼키지 않고 반환해야 한다(리뷰 Fix Round 3, item 3) — 그리고 그 반환 오류에 원본 경로가
+// 섞이면 안 된다(sanitizeIOErr, §5.5). 실제 권한 거부는 OS 종속적이라 이식성 있게 재현하기
+// 어려워, NUL 바이트가 든 경로로 os.Stat이 결정적으로 "invalid argument"(ErrNotExist 아님)를
+// 내도록 유도한다(Windows에서 실측: errors.Is(err, os.ErrNotExist)=false 확인 완료).
+func TestLedgerStats_StatErrorOtherThanNotExist(t *testing.T) {
+	dir := "bad\x00dir"
+	stats, err := LedgerStats(dir)
+	if err == nil {
+		t.Fatalf("want error for non-ErrNotExist os.Stat failure, got nil (stats=%+v)", stats)
+	}
+	if strings.Contains(err.Error(), dir) {
+		t.Fatalf("error must not leak the raw path: %v", err)
+	}
+}
+
 func FuzzSnapUTF8(f *testing.F) {
 	f.Add([]byte("가나다"), int64(1), int64(4))
 	f.Add([]byte("hello\nworld"), int64(0), int64(11))

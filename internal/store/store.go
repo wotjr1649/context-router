@@ -675,12 +675,17 @@ type ToolStat struct {
 }
 
 // LedgerStats: dir/ledger.db를 read-only로 열어 도구별 사용량을 집계한 뒤 닫는다(설계 §6). ledger.db
-// 미존재는 오류가 아니다 — LedgerAppend와 동일하게 ledger를 best-effort 보조 산출물로 취급해
-// 빈 슬라이스+nil을 반환한다(os.Stat 선판정, 없는 파일을 sql.Open이 새로 만들지 않도록).
+// 미존재(os.ErrNotExist — io/fs.ErrNotExist와 동일값)는 오류가 아니다 — LedgerAppend와 동일하게
+// ledger를 best-effort 보조 산출물로 취급해 빈 슬라이스+nil을 반환한다(os.Stat 선판정, 없는
+// 파일을 sql.Open이 새로 만들지 않도록). 그 외 os.Stat 오류(권한 등)는 진짜 문제이므로 삼키지
+// 않고 반환한다 — sanitizeIOErr로 절대경로는 벗기고 원인만 남긴다(리뷰 Fix Round 3, item 3).
 func LedgerStats(dir string) ([]ToolStat, error) {
 	path := filepath.Join(dir, "ledger.db")
 	if _, err := os.Stat(path); err != nil {
-		return nil, nil
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, nil
+		}
+		return nil, sanitizeIOErr("ledger stat", err)
 	}
 	db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(path)+"?mode=ro&_pragma=busy_timeout(5000)")
 	if err != nil {
