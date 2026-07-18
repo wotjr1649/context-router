@@ -14,6 +14,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -160,6 +161,18 @@ func newTestServer(t *testing.T, enable []string) (*mcp.ClientSession, ident.Can
 	return cs, canon
 }
 
+// skipDarwinNoIsolation: transform 패키지와 동일 원인(3-OS CI 최초 실행 — darwin에서
+// RLIMIT_AS self-apply가 항상 실패, internal/transform/worker_test.go의 동명 헬퍼 참조)이
+// 여기서는 ctr_transform 도구 자체가 미등록되는 형태로 나타난다(NewServer가
+// transform.ProbeIsolation 실패 시 등록을 건너뛴다 — in-process fallback 금지, 설계
+// §4.3/§5.3). 이 도구 전용 테스트는 도구가 없으면 검증할 대상이 없다.
+func skipDarwinNoIsolation(t *testing.T) {
+	t.Helper()
+	if runtime.GOOS == "darwin" {
+		t.Skip("darwin: ctr_transform이 RLIMIT_AS self-apply 실패로 미등록 — 백로그: darwin 메모리 격리 전략 재설계")
+	}
+}
+
 func TestNewServerProfileGating(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -172,6 +185,13 @@ func TestNewServerProfileGating(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			want := tt.want
+			if runtime.GOOS == "darwin" {
+				// darwin: RLIMIT_AS self-apply가 항상 실패해 ctr_transform이 미등록된다
+				// (skipDarwinNoIsolation 주석 참조) — 이 서브테스트가 검증하는 프로필별
+				// ingest/net 게이팅 자체는 darwin에서도 유효하니 그 부분은 계속 확인한다.
+				want = slices.DeleteFunc(slices.Clone(tt.want), func(s string) bool { return s == "ctr_transform" })
+			}
 			cs, _ := newTestServer(t, tt.enable)
 			lt, err := cs.ListTools(context.Background(), nil)
 			if err != nil {
@@ -182,8 +202,8 @@ func TestNewServerProfileGating(t *testing.T) {
 				got[i] = tl.Name
 			}
 			sort.Strings(got)
-			if strings.Join(got, ",") != strings.Join(tt.want, ",") {
-				t.Fatalf("tools=%v want %v", got, tt.want)
+			if strings.Join(got, ",") != strings.Join(want, ",") {
+				t.Fatalf("tools=%v want %v", got, want)
 			}
 		})
 	}
@@ -497,6 +517,7 @@ func TestApplyFetchBudgetNewlineBoundary(t *testing.T) {
 // TestCtrTransformRoundTrip: 색인(ingest) → artifact_id → ctr_transform이 저장된 텍스트
 // 길이를 정확히 반환해야 한다(T3 TDD 항목 2). def 래핑(top-level for/재귀 비활성) 준수 스크립트.
 func TestCtrTransformRoundTrip(t *testing.T) {
+	skipDarwinNoIsolation(t)
 	cs, canon := newTestServer(t, []string{"ingest"})
 	ctx := context.Background()
 
@@ -567,6 +588,7 @@ func TestCtrTransformRoundTrip(t *testing.T) {
 // ctx.Err()를 감싸는 STORAGE_UNAVAILABLE) — 셋 다 codeBudgetExceeded는 아니므로 특정 코드
 // 문자열을 고정하지 않고 "budget이 아님"만으로 배선 제거 회귀를 판별한다(Fix Round 3).
 func TestCtrTransformConfigTimeout(t *testing.T) {
+	skipDarwinNoIsolation(t)
 	dir := t.TempDir()
 	canon, err := ident.Canonicalize(dir)
 	if err != nil {
@@ -619,6 +641,7 @@ func TestCtrTransformConfigTimeout(t *testing.T) {
 // TestCtrTransformCapsMapping: budget/output_limit 초과 스크립트가 각각 BUDGET_EXCEEDED/
 // OUTPUT_LIMIT_EXCEEDED로 매핑돼야 한다(T3 TDD 항목 3).
 func TestCtrTransformCapsMapping(t *testing.T) {
+	skipDarwinNoIsolation(t)
 	cs, _ := newTestServer(t, nil)
 	ctx := context.Background()
 
@@ -653,6 +676,7 @@ func TestCtrTransformCapsMapping(t *testing.T) {
 // TestCtrTransformInputValidation: inputs 9개(최대 8 초과)·script 64KB 초과는 각각
 // INVALID_ARGUMENT여야 한다(T3 TDD 항목 4, 승계 (c)).
 func TestCtrTransformInputValidation(t *testing.T) {
+	skipDarwinNoIsolation(t)
 	cs, _ := newTestServer(t, nil)
 	ctx := context.Background()
 
@@ -688,6 +712,7 @@ func TestCtrTransformInputValidation(t *testing.T) {
 // TestCtrTransformDescriptionMentionsDefWrapping: 도구 description에 def 래핑 제약이
 // 명시돼야 한다(T1/T2 승계 (b) — 모르면 자연스러운 top-level for/while 스크립트가 실패한다).
 func TestCtrTransformDescriptionMentionsDefWrapping(t *testing.T) {
+	skipDarwinNoIsolation(t)
 	cs, _ := newTestServer(t, nil)
 	lt, err := cs.ListTools(context.Background(), nil)
 	if err != nil {
