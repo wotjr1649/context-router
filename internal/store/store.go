@@ -39,7 +39,7 @@ func Open(dir string, readOnly bool) (*Store, error) {
 		// 0o700: store 루트+artifacts 모두 이 한 호출로 생성(MkdirAll이 만드는 모든 중간
 		// 디렉터리에 동일 perm 적용) — Windows는 Unix perm bit 무시(§10 no-op, 주석만).
 		if err := os.MkdirAll(filepath.Join(dir, "artifacts"), 0o700); err != nil {
-			return nil, fmt.Errorf("store open: %w", err)
+			return nil, sanitizeIOErr("open mkdir", err)
 		}
 	}
 	dsn := "file:" + filepath.ToSlash(filepath.Join(dir, "content.db")) + pragmas
@@ -182,6 +182,7 @@ type Registration struct {
 	Source               SourceMeta
 	Chunks               []Chunk
 	ExpectedOldSrcHash   string // ""=신규 허용, 그 외=CAS 조건 (§3.5)
+	RawBlob              []byte // nil 아니면 비색인 원본 blob 보존(§4.5) — writeBlob 재사용, chunks/FTS 미포함
 }
 
 // Selector.Kind: "chunk"|"line"|"byte"
@@ -325,6 +326,14 @@ func (s *Store) Register(ctx context.Context, reg Registration) (int64, error) {
 	if err := s.writeBlob(contentHash, reg.StoredBytes); err != nil { // DB 커밋 전 배치 (§3.5)
 		return 0, err
 	}
+	rawBlobHash := ""
+	if reg.RawBlob != nil {
+		rsum := sha256.Sum256(reg.RawBlob)
+		rawBlobHash = hex.EncodeToString(rsum[:])
+		if err := s.writeBlob(rawBlobHash, reg.RawBlob); err != nil {
+			return 0, err
+		}
+	}
 	var artID int64
 	err := s.txRetry(ctx, func(tx *sql.Tx) error {
 		if err := tx.QueryRow("SELECT id FROM artifacts WHERE content_hash=? AND media_type=?", contentHash, reg.MediaType).Scan(&artID); err == sql.ErrNoRows {
@@ -348,7 +357,7 @@ func (s *Store) Register(ctx context.Context, reg Registration) (int64, error) {
 			res, err := tx.Exec(`UPDATE sources SET artifact_id=?,source_kind=?,src_size=?,src_mtime_ns=?,src_hash=?,raw_blob_hash=?,extraction=?,indexed_at=?
 				WHERE uri=? AND src_hash=?`,
 				artID, reg.Source.Kind, reg.Source.Size, reg.Source.MtimeNS, reg.Source.SrcHash,
-				nullIfEmpty(reg.Source.RawBlobHash), nullIfEmpty(reg.Source.Extraction), time.Now().Unix(),
+				nullIfEmpty(rawBlobHash), nullIfEmpty(reg.Source.Extraction), time.Now().Unix(),
 				reg.Source.URI, reg.ExpectedOldSrcHash)
 			if err != nil {
 				return err
@@ -361,9 +370,10 @@ func (s *Store) Register(ctx context.Context, reg Registration) (int64, error) {
 		_, err := tx.Exec(`INSERT INTO sources(uri,artifact_id,source_kind,src_size,src_mtime_ns,src_hash,raw_blob_hash,extraction,indexed_at)
 			VALUES(?,?,?,?,?,?,?,?,?)
 			ON CONFLICT(uri) DO UPDATE SET artifact_id=excluded.artifact_id,src_size=excluded.src_size,
-			  src_mtime_ns=excluded.src_mtime_ns,src_hash=excluded.src_hash,indexed_at=excluded.indexed_at`,
+			  src_mtime_ns=excluded.src_mtime_ns,src_hash=excluded.src_hash,indexed_at=excluded.indexed_at,
+			  raw_blob_hash=excluded.raw_blob_hash,extraction=excluded.extraction`,
 			reg.Source.URI, artID, reg.Source.Kind, reg.Source.Size, reg.Source.MtimeNS, reg.Source.SrcHash,
-			nullIfEmpty(reg.Source.RawBlobHash), nullIfEmpty(reg.Source.Extraction), time.Now().Unix())
+			nullIfEmpty(rawBlobHash), nullIfEmpty(reg.Source.Extraction), time.Now().Unix())
 		return err
 	})
 	return artID, err
@@ -516,6 +526,30 @@ func StaleOf(info SourceInfo) bool {
 	}
 	sum := sha256.Sum256(raw)
 	return hex.EncodeToString(sum[:]) != info.SrcHash
+}
+
+// ArtifactText: artifactID의 저장 콘텐츠 전체를 문자열로 반환한다(ctr_transform 입력 로더,
+// 설계 §4.2.3). byte_length(메타데이터)가 maxBytes를 넘으면 blob을 읽지 않고 즉시
+// ErrInvalidSelector로 거부한다. maxBytes<=0이면 상한 미적용.
+func (s *Store) ArtifactText(ctx context.Context, artifactID int64, maxBytes int64) (string, error) {
+	var contentHash string
+	var byteLength int64
+	err := s.reader.QueryRowContext(ctx, "SELECT content_hash,byte_length FROM artifacts WHERE id=?", artifactID).
+		Scan(&contentHash, &byteLength)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", fmt.Errorf("store ArtifactText: artifact 없음: %w", ErrNotFound)
+	}
+	if err != nil {
+		return "", fmt.Errorf("store ArtifactText: %w", err)
+	}
+	if maxBytes > 0 && byteLength > maxBytes {
+		return "", fmt.Errorf("store ArtifactText: byte_length=%d > maxBytes=%d: %w", byteLength, maxBytes, ErrInvalidSelector)
+	}
+	blob, err := s.readBlob(contentHash)
+	if err != nil {
+		return "", err
+	}
+	return string(blob), nil
 }
 
 // ReadRange: Selector.Kind 하나로 chunk 저장 좌표, blob 라인 스캔, blob UTF-8 스냅 바이트

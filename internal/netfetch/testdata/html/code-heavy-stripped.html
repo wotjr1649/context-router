@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Widget API Overview</title></head>
+<body>
+<nav class="nav"><a href="/">Home</a><a href="/docs">Docs</a></nav>
+<aside class="sidebar examples-sidebar">
+<h2>Quick Examples</h2>
+<pre><code>widget.new("a")</code></pre>
+<pre><code>widget.new("b")</code></pre>
+<pre><code>widget.new("c")</code></pre>
+<pre><code>widget.new("d")</code></pre>
+<pre><code>widget.new("e")</code></pre>
+<pre><code>widget.new("f")</code></pre>
+</aside>
+<article>
+<h1>Widget API Overview</h1>
+<p>This page describes the design philosophy behind the widget API rather than its exact
+syntax, which is covered in the quick examples sidebar and the full reference elsewhere.
+The API was designed around a single principle: every widget should be constructible from
+a single function call, with all optional behavior expressed through plain configuration
+values instead of subclassing or callback registration. That principle has held up well
+across three major versions of the library, even as the number of supported widget types
+has grown from four to over thirty.</p>
+<p>Internally the API is implemented as a thin layer over a lower-level rendering engine
+that most application code never touches directly. The separation exists mainly to keep
+the public surface small and stable, since the rendering engine has changed its internal
+representation twice since the project started, without requiring any changes to code
+written against the public widget API. Application authors who need to bypass the widget
+layer entirely can still reach the rendering engine directly, but that path is intentionally
+undocumented and unsupported.</p>
+<pre><code>widget.new("g", timeout=5)</code></pre>
+<p>The example above shows the one case where a caller needs an option beyond the default:
+a longer timeout for a widget whose data source is known to be slow. Every other option
+follows the same keyword-argument pattern, so a caller who has read this single example has
+effectively learned the whole surface area of the configuration system.</p>
+</article>
+</body>
+</html>

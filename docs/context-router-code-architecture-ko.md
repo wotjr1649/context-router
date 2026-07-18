@@ -87,6 +87,8 @@ store · ident · netfetch · transform : internal 상호 의존 0 (leaf)
 
 fuzz는 CI에서 시드 corpus 회귀만(상시 fuzzing은 로컬 수동), 5,000-doc 성능 스모크는 별도 태그 — memory-capped CI(전역 test-guard 규율) 준수.
 
+**비밀 캐너리 작성 규칙 (2026-07-18 추가)**: 새로 추가하는 비밀 패턴 테스트 픽스처는 소스에 연속 리터럴로 쓰지 않고 **런타임 결합**(`"xoxb-" + "1234..."` 또는 `string(rune(...))`)으로 구성한다 — GitHub push protection 등 소스 바이트 스캐너 오탐 방지(실사례: Slack 캐너리 차단). 기존 캐너리는 GitHub allowlist로 처리됨(이력 rewrite 비용 > 실익).
+
 ## 9. 도구 체인 (개발 도구 — 의존성 아님)
 
 - 포맷: **gofumpt**(설정 0). 린트: **golangci-lint v2 `default: standard`**(errcheck·govet·ineffassign·staticcheck·unused) + misspell — 추가 린터는 점진 도입만.

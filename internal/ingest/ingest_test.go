@@ -31,7 +31,9 @@ func TestRedact_Canaries(t *testing.T) {
 		// ghp_ — raw 바이트에 "ghp_"가 없음(아래 가드로 실증). unescape 뷰만 잡을 수 있음.
 		{"json-escaped-real", `{"k":"gh\p_abcdefghijklmnopqrstuvwxyz012345"}`, "abcdefghijklmnopqrstuvwxyz012345"},
 		{"jwt-bare", `{"token":"eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV"}`, "SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV"},
-		{"slack", "hook xoxb-123456789012-abcdefghijklmnop end", "xoxb-123456789012-abcdefghijklmnop"},
+		// ponytail: 런타임 분할 리터럴 — 소스에 연속 xoxb- 토큰이 없어 secret-scanner 오탐 방지 (규약 §8).
+		// 값도 실제 Slack 토큰의 -<숫자>-<영숫자> 다중 세그먼트 구조와 다른 명백한 테스트 문자열.
+		{"slack", "hook " + "xox" + "b-CANARYtestnotarealtoken" + " end", "xox" + "b-CANARYtestnotarealtoken"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -582,5 +584,26 @@ func TestRun_InlineContent(t *testing.T) {
 	}
 	if rep.Indexed != 1 || rep.BytesStored == 0 {
 		t.Fatalf("rep=%+v", rep)
+	}
+}
+
+// TestRunWeb_SnippetRedacted: 최종리뷰 C1(수렴 Critical) — WebReport.Snippet은 저장본
+// (redacted) 기준이어야 한다. mcp 핸들러가 netfetch 원문이 아닌 이 값만 노출하므로, 여기서
+// 새지 않아야 호출부의 redaction 우회가 근본적으로 막힌다.
+func TestRunWeb_SnippetRedacted(t *testing.T) {
+	st, _ := openStoreT(t)
+	// 런타임 분할 리터럴 — 소스에 연속 secret 토큰 금지(규약 §8).
+	canary := "AKIA" + "NOTAREALKEY01234"
+	body := []byte("hello world token=" + canary + " end of body\n")
+
+	rep, err := RunWeb(context.Background(), st, "http://example.invalid/", nil, body, "text/plain", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(rep.Snippet, canary) {
+		t.Fatalf("Snippet=%q leaks secret canary", rep.Snippet)
+	}
+	if len(rep.Snippet) == 0 || len(rep.Snippet) > 1024 {
+		t.Fatalf("bad snippet length=%d", len(rep.Snippet))
 	}
 }

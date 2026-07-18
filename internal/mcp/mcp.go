@@ -17,19 +17,24 @@ import (
 
 	"github.com/wotjr1649/context-router/internal/ident"
 	"github.com/wotjr1649/context-router/internal/ingest"
+	"github.com/wotjr1649/context-router/internal/netfetch"
 	"github.com/wotjr1649/context-router/internal/search"
 	"github.com/wotjr1649/context-router/internal/store"
+	"github.com/wotjr1649/context-router/internal/transform"
 )
 
 const serverVersion = "0.0.1-dev"
 
 // Config — Serve/NewServer 입력 (설계 §4, §8).
 type Config struct {
-	Canon      ident.Canon
-	Store      *store.Store
-	Profile    []string // 예약: transform/global-search 게이팅용 — v0.0.1은 미분기(§8)
-	Enable     []string // opt-in: "ingest"·"net"
-	AllowPaths []string // 이미 canonicalize된 ctr_index 허용 root (cmd가 검증 — §4.4)
+	Canon         ident.Canon
+	Store         *store.Store
+	SelfExe       string   // transform worker 재실행 경로(os.Executable(), §4.3) — 격리 프로브·Spawn에 사용
+	Profile       []string // 예약: transform/global-search 게이팅용 — v0.0.1은 미분기(§8)
+	Enable        []string // opt-in: "ingest"·"net"
+	AllowPaths    []string // 이미 canonicalize된 ctr_index 허용 root (cmd가 검증 — §4.4)
+	NetAllowLocal bool     // --net-allow-local (§4.5, ctr_fetch_and_index)
+	NetPorts      []int    // --net-ports 추가 허용 포트 (§4.5)
 }
 
 // Serve builds the tool server per cfg and runs it over stdio until ctx가 끝나거나
@@ -53,8 +58,18 @@ func NewServer(cfg Config) (*mcp.Server, error) {
 	// 된다(저장소 디렉터리 명명 ProjectID는 ProjectRoot 기반 그대로, main.go 참조).
 	registerSearch(srv, cfg.Store, cfg.Canon.WorktreeRoot)
 	registerFetch(srv, cfg.Store, cfg.Canon.WorktreeRoot)
+	// ProbeIsolation: OS 메모리 격리가 안 되는 환경에서는 ctr_transform 자체를 미등록한다
+	// (in-process fallback 금지, 설계 §4.3/§5.3) — 첫 실제 호출에서야 실패를 알리지 않는다.
+	if err := transform.ProbeIsolation(cfg.SelfExe); err != nil {
+		slog.Warn("mcp: transform 격리 프로브 실패 — ctr_transform 비활성화", "error", err)
+	} else {
+		registerTransform(srv, cfg.Store, cfg.SelfExe)
+	}
 	if slices.Contains(cfg.Enable, "ingest") {
 		registerIndex(srv, cfg.Store, cfg.Canon.WorktreeRoot, cfg.AllowPaths)
+	}
+	if slices.Contains(cfg.Enable, "net") {
+		registerFetchAndIndex(srv, cfg.Store, cfg.NetAllowLocal, cfg.NetPorts)
 	}
 	return srv, nil
 }
@@ -62,12 +77,15 @@ func NewServer(cfg Config) (*mcp.Server, error) {
 // --- 오류 변환 (규약 §6: mcp의 toToolError 하나가 sentinel→코드 매핑을 전담) ---
 
 const (
-	codeInvalidArgument    = "INVALID_ARGUMENT"
-	codeNotFound           = "NOT_FOUND"
-	codeWorkspaceViolation = "WORKSPACE_VIOLATION"
-	codeUnsupportedFile    = "UNSUPPORTED_FILE"
-	codeStorageUnavailable = "STORAGE_UNAVAILABLE"
-	codeInternal           = "INTERNAL"
+	codeInvalidArgument     = "INVALID_ARGUMENT"
+	codeNotFound            = "NOT_FOUND"
+	codeWorkspaceViolation  = "WORKSPACE_VIOLATION"
+	codeUnsupportedFile     = "UNSUPPORTED_FILE"
+	codeStorageUnavailable  = "STORAGE_UNAVAILABLE"
+	codeBudgetExceeded      = "BUDGET_EXCEEDED"
+	codeOutputLimitExceeded = "OUTPUT_LIMIT_EXCEEDED"
+	codeNetworkDenied       = "NETWORK_DENIED"
+	codeInternal            = "INTERNAL"
 )
 
 func toolErr(code, msg string) error { return fmt.Errorf("[%s] %s", code, msg) }
@@ -75,6 +93,9 @@ func toolErr(code, msg string) error { return fmt.Errorf("[%s] %s", code, msg) }
 // toToolError: sentinel→MCP 코드 단일 변환 지점. 매핑 없는 오류는 INTERNAL로 뭉개고
 // 상세는 stderr slog에만 남긴다(원문·절대경로는 이미 생성 시점에 위생 처리됨, §6).
 func toToolError(err error) error {
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return err // SDK가 취소/데드라인을 직접 처리하도록 원본 그대로 반환(§6, INTERNAL/slog 소음 방지)
+	}
 	switch {
 	case errors.Is(err, store.ErrNotFound):
 		return toolErr(codeNotFound, "대상을 찾을 수 없습니다")
@@ -82,10 +103,24 @@ func toToolError(err error) error {
 		return toolErr(codeInvalidArgument, "잘못된 선택자입니다")
 	case errors.Is(err, store.ErrUnavailable):
 		return toolErr(codeStorageUnavailable, "저장소를 사용할 수 없습니다")
+	case errors.Is(err, transform.ErrNoIsolation):
+		return toolErr(codeStorageUnavailable, "격리 실행을 사용할 수 없습니다")
+	case errors.Is(err, transform.ErrBudget):
+		return toolErr(codeBudgetExceeded, "실행 스텝 상한을 초과했습니다")
+	case errors.Is(err, transform.ErrOutputLimit):
+		return toolErr(codeOutputLimitExceeded, "출력 크기 상한을 초과했습니다")
 	case errors.Is(err, ingest.ErrWorkspace):
 		return toolErr(codeWorkspaceViolation, "작업 영역 밖 경로입니다")
 	case errors.Is(err, ingest.ErrUnsupported):
 		return toolErr(codeUnsupportedFile, "지원하지 않는 파일입니다")
+	case errors.Is(err, netfetch.ErrDenied):
+		return toolErr(codeNetworkDenied, "네트워크 목적지가 거부되었습니다")
+	case errors.Is(err, netfetch.ErrBodyTooLarge):
+		return toolErr(codeOutputLimitExceeded, "응답 본문이 상한을 초과했습니다")
+	case errors.Is(err, netfetch.ErrTooManyRedirects):
+		return toolErr(codeNetworkDenied, "리다이렉트 상한을 초과했습니다")
+	case errors.Is(err, netfetch.ErrUnsupportedMedia):
+		return toolErr(codeUnsupportedFile, "지원하지 않는 미디어 타입입니다")
 	case errors.Is(err, fs.ErrNotExist):
 		return toolErr(codeNotFound, "대상을 찾을 수 없습니다")
 	default:
@@ -395,6 +430,142 @@ func registerIndex(srv *mcp.Server, st *store.Store, worktreeRoot string, allowP
 		}
 		out := IndexOutput{Indexed: rep.Indexed, BytesStored: rep.BytesStored, Skipped: skipped}
 		st.LedgerAppend("ctr_index", rep.BytesStored, jsonLen(out), time.Since(start).Milliseconds())
+		return nil, out, nil
+	})
+}
+
+// --- ctr_transform (설계 §4.2.3, §4.3) ---
+
+const (
+	maxTransformScriptBytes = 64 * 1024
+	maxTransformInputs      = 8
+	maxTransformInputBytes  = 8 * 1024 * 1024
+	maxTransformTotalBytes  = 16 * 1024 * 1024
+	maxTransformOutputBytes = 262144
+)
+
+// transformDescription: starlark의 def 래핑 제약을 명시한다 — 모르면 자연스러운 top-level
+// for/while/재귀 스크립트가 실패하므로 필수(T1/T2 승계 계약 (b)).
+const transformDescription = "artifact 텍스트를 starlark 스크립트로 변환한다. " +
+	"최상위 for는 def 함수 안에서 사용. while·재귀는 starlark 기본 설정상 지원 안 됨(def 안에서도). " +
+	"예: def f(): ... 안에서 정의하고 호출해야 한다. inputs[i].text()/.lines()/.json(), args, emit(x)로 " +
+	"출력한다. 내장: regex_extract/json_project/line_window/head/tail/count/sort/dedupe."
+
+type TransformInput struct {
+	Script         string            `json:"script" jsonschema:"starlark 스크립트, 최대 64KB"`
+	Inputs         []int64           `json:"inputs,omitempty" jsonschema:"입력 artifact ID 목록, 최대 8개"`
+	Args           map[string]string `json:"args,omitempty" jsonschema:"스크립트 args로 전달할 키/값"`
+	MaxOutputBytes int               `json:"max_output_bytes,omitempty" jsonschema:"출력 상한, 기본 32768, 최대 262144"`
+}
+
+type TransformOutput struct {
+	Result    string `json:"result"`
+	StepsUsed int64  `json:"steps_used"`
+	Truncated bool   `json:"truncated"`
+}
+
+// transformResultErr: Eval의 ErrKind→도구 오류. budget/output_limit은 toToolError의 sentinel
+// 매핑을 그대로 재사용(§6 단일 지점), script는 ErrSummary가 이미 안전(원문·데이터 미포함).
+func transformResultErr(res transform.Result) error {
+	switch res.ErrKind {
+	case "budget":
+		return toToolError(transform.ErrBudget)
+	case "output_limit":
+		return toToolError(transform.ErrOutputLimit)
+	case "script":
+		return toolErr(codeInvalidArgument, res.ErrSummary)
+	}
+	return nil
+}
+
+func registerTransform(srv *mcp.Server, st *store.Store, selfExe string) {
+	mcp.AddTool(srv, &mcp.Tool{
+		Name:        "ctr_transform",
+		Description: transformDescription,
+		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true},
+	}, func(ctx context.Context, _ *mcp.CallToolRequest, in TransformInput) (*mcp.CallToolResult, TransformOutput, error) {
+		start := time.Now()
+		if len(in.Script) > maxTransformScriptBytes {
+			return nil, TransformOutput{}, toolErr(codeInvalidArgument, "script가 상한(64KB)을 초과했습니다")
+		}
+		if len(in.Inputs) > maxTransformInputs {
+			return nil, TransformOutput{}, toolErr(codeInvalidArgument, "inputs는 최대 8개입니다")
+		}
+		if in.MaxOutputBytes > maxTransformOutputBytes {
+			return nil, TransformOutput{}, toolErr(codeInvalidArgument, "max_output_bytes가 상한(262144)을 초과했습니다")
+		}
+		inputs := make([]transform.Input, len(in.Inputs))
+		var total int64
+		for i, id := range in.Inputs {
+			text, err := st.ArtifactText(ctx, id, maxTransformInputBytes)
+			if err != nil {
+				return nil, TransformOutput{}, toToolError(err)
+			}
+			if total += int64(len(text)); total > maxTransformTotalBytes {
+				return nil, TransformOutput{}, toolErr(codeInvalidArgument, "inputs 총합이 상한(16MB)을 초과했습니다")
+			}
+			inputs[i] = transform.Input{ID: id, Text: text}
+		}
+		res, err := transform.Spawn(ctx, selfExe, transform.Request{
+			Script: in.Script, Inputs: inputs, Args: in.Args,
+			Caps: transform.Caps{MaxOutputBytes: in.MaxOutputBytes}, // MaxSteps=0 → transform 기본 5_000_000
+		})
+		if err != nil {
+			return nil, TransformOutput{}, toToolError(err)
+		}
+		if terr := transformResultErr(res); terr != nil {
+			return nil, TransformOutput{}, terr
+		}
+		out := TransformOutput{Result: res.Output, StepsUsed: res.StepsUsed, Truncated: res.Truncated}
+		st.LedgerAppend("ctr_transform", 0, jsonLen(out), time.Since(start).Milliseconds())
+		return nil, out, nil
+	})
+}
+
+// --- ctr_fetch_and_index (설계 §4.5, Enable에 "net" 있을 때만 등록) ---
+
+type FetchAndIndexInput struct {
+	URL      string `json:"url" jsonschema:"가져올 URL(http/https)"`
+	MaxBytes int64  `json:"max_bytes,omitempty" jsonschema:"응답 본문 상한 바이트, 기본 10MB"`
+}
+
+type FetchAndIndexOutput struct {
+	ArtifactID    int64  `json:"artifact_id"`
+	Title         string `json:"title"`
+	ByteLength    int64  `json:"byte_length"`
+	Extraction    string `json:"extraction"`
+	IndexedChunks int    `json:"indexed_chunks"`
+	Snippet       string `json:"snippet"`
+	Untrusted     bool   `json:"untrusted"`
+}
+
+// registerFetchAndIndex: 핸들러의 구체 호출은 netfetch.Fetch→ingest.RunWeb 2개뿐(규약 §2 —
+// mcp만 netfetch를 import하고, ingest에는 원시 인자로 배선해 ingest→netfetch 의존을 피한다).
+func registerFetchAndIndex(srv *mcp.Server, st *store.Store, allowLocal bool, extraPorts []int) {
+	destructive := false
+	mcp.AddTool(srv, &mcp.Tool{
+		Name:        "ctr_fetch_and_index",
+		Description: "URL을 SSRF 안전 정책으로 가져와 색인에 등록한다.",
+		Annotations: &mcp.ToolAnnotations{DestructiveHint: &destructive},
+	}, func(ctx context.Context, _ *mcp.CallToolRequest, in FetchAndIndexInput) (*mcp.CallToolResult, FetchAndIndexOutput, error) {
+		start := time.Now()
+		if in.URL == "" {
+			return nil, FetchAndIndexOutput{}, toolErr(codeInvalidArgument, "url이 필요합니다")
+		}
+		res, err := netfetch.Fetch(ctx, netfetch.Config{AllowLocal: allowLocal, ExtraPorts: extraPorts, MaxBytes: in.MaxBytes}, in.URL)
+		if err != nil {
+			return nil, FetchAndIndexOutput{}, toToolError(err)
+		}
+		rep, err := ingest.RunWeb(ctx, st, res.FinalURL, res.RawHTML, res.Body, res.MediaType, res.Extraction)
+		if err != nil {
+			return nil, FetchAndIndexOutput{}, toToolError(err)
+		}
+		out := FetchAndIndexOutput{
+			ArtifactID: rep.ArtifactID, Title: res.FinalURL, ByteLength: rep.ByteLength,
+			Extraction: res.Extraction, IndexedChunks: rep.IndexedChunks, Snippet: rep.Snippet,
+			Untrusted: true,
+		}
+		st.LedgerAppend("ctr_fetch_and_index", rep.ByteLength, jsonLen(out), time.Since(start).Milliseconds())
 		return nil, out, nil
 	})
 }

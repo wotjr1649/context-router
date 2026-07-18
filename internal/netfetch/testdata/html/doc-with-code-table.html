@@ -1,0 +1,69 @@
+<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Configuring the Widget Client</title></head>
+<body>
+<nav class="nav site-nav">
+<ul>
+<li><a href="/">Home</a></li>
+<li><a href="/docs">Docs</a></li>
+<li><a href="/docs/api">API Reference</a></li>
+<li><a href="/docs/guides">Guides</a></li>
+<li><a href="/blog">Blog</a></li>
+<li><a href="/about">About</a></li>
+<li><a href="/contact">Contact</a></li>
+</ul>
+</nav>
+<article>
+<h1>Configuring the Widget Client</h1>
+<p>The widget client library gives applications a small, dependency-free way to construct
+and configure widgets for embedding in a dashboard. This guide walks through the basic
+configuration options, shows a minimal code example, and documents every option in a
+reference table at the end. Read through the whole guide before wiring the client into a
+production dashboard, since a few of the defaults are intentionally conservative and will
+need to be tuned for high-traffic deployments.</p>
+<p>Start by constructing a client with a name. The constructor validates the name eagerly so
+that configuration mistakes surface immediately at startup rather than later when the widget
+is first rendered. Once the client exists, override any of the fields you need before calling
+Render. Fields left at their zero value fall back to the documented defaults, which are safe
+for local development but usually too small for production dashboards serving real traffic.</p>
+<pre><code class="language-go">func NewWidget(name string) *Widget {
+    return &amp;Widget{
+        Name:    name,
+        Size:    10,
+        Timeout: 5 * time.Second,
+    }
+}
+
+func (w *Widget) Render(ctx context.Context) error {
+    if w.Name == "" {
+        return errors.New("widget: name required")
+    }
+    return renderTo(ctx, w)
+}
+</code></pre>
+<p>Every configuration field is documented in the table below, along with its default value
+and a short description of what it controls. Options marked required must be set explicitly
+before calling Render, or the constructor returns an error describing exactly which field is
+missing so the mistake is easy to track down without reading the source.</p>
+<table>
+<thead>
+<tr><th>Option</th><th>Default</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td>Name</td><td>(required)</td><td>Unique identifier shown in the dashboard header.</td></tr>
+<tr><td>Size</td><td>10</td><td>Relative size of the widget grid cell, from 1 to 100.</td></tr>
+<tr><td>Timeout</td><td>5s</td><td>Maximum time to wait for the widget's data source.</td></tr>
+<tr><td>Retries</td><td>3</td><td>Number of times to retry a failed data fetch.</td></tr>
+</tbody>
+</table>
+<p>Once the table above is configured to match your deployment, call Render inside your
+dashboard's normal request handler. The widget client caches nothing internally, so callers
+that want caching should wrap Render with their own layer; this keeps the library small and
+keeps caching policy a decision made by the application rather than the library.</p>
+</article>
+<footer class="footer site-footer">
+<p>Copyright 2026 Example Corp. All rights reserved.</p>
+<p><a href="/privacy">Privacy Policy</a> | <a href="/terms">Terms of Service</a> | <a href="/contact">Contact Us</a></p>
+</footer>
+</body>
+</html>

@@ -14,11 +14,13 @@ import (
 	"path/filepath"
 	"runtime"
 	"slices"
+	"strconv"
 	"strings"
 
 	"github.com/wotjr1649/context-router/internal/ident"
 	"github.com/wotjr1649/context-router/internal/mcp"
 	"github.com/wotjr1649/context-router/internal/store"
+	"github.com/wotjr1649/context-router/internal/transform"
 )
 
 const version = "0.0.1-dev"
@@ -26,6 +28,8 @@ const version = "0.0.1-dev"
 type serverFlags struct {
 	Root, StoreRoot, LogLevel   string
 	Profile, Enable, AllowPaths []string
+	NetAllowLocal               bool
+	NetPorts                    []int
 }
 
 func parseFlags(args []string) (serverFlags, error) {
@@ -42,12 +46,24 @@ func parseFlags(args []string) (serverFlags, error) {
 		f.AllowPaths = append(f.AllowPaths, v)
 		return nil
 	})
+	fs.BoolVar(&f.NetAllowLocal, "net-allow-local", false, "allow 127.0.0.1/::1 destinations for fetch_and_index")
+	var netPorts string
+	fs.StringVar(&netPorts, "net-ports", "", "extra allowed ports for fetch_and_index (comma-separated)")
 	if err := fs.Parse(args); err != nil {
 		return serverFlags{}, err
 	}
 	f.Profile = strings.Split(profile, ",")
 	if enable != "" {
 		f.Enable = strings.Split(enable, ",")
+	}
+	if netPorts != "" {
+		for _, p := range strings.Split(netPorts, ",") {
+			n, err := strconv.Atoi(strings.TrimSpace(p))
+			if err != nil {
+				return serverFlags{}, fmt.Errorf("ctr: net-ports: %w", err)
+			}
+			f.NetPorts = append(f.NetPorts, n)
+		}
 	}
 	return f, nil
 }
@@ -206,13 +222,30 @@ func run(ctx context.Context, args []string, stderr io.Writer) error {
 	}
 	defer st.Close()
 
+	selfExe, err := os.Executable()
+	if err != nil {
+		return err
+	}
 	return mcp.Serve(ctx, mcp.Config{
-		Canon: canon, Store: st,
+		Canon: canon, Store: st, SelfExe: selfExe,
 		Profile: f.Profile, Enable: f.Enable, AllowPaths: allowPaths,
+		NetAllowLocal: f.NetAllowLocal, NetPorts: f.NetPorts,
 	})
 }
 
+// transformWorkerArg: worker 프로세스 재실행 숨김 모드 인자(설계 §4.3). 플래그 파싱보다
+// 먼저 분기해야 한다 — stdout은 Result JSON 1건이어야 하고 배너·로그가 섞이면 안 된다.
+const transformWorkerArg = "__transform-worker"
+
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == transformWorkerArg {
+		if err := transform.RunWorker(os.Stdin, os.Stdout); err != nil {
+			fmt.Fprintln(os.Stderr, "ctr:", err)
+			os.Exit(1)
+		}
+		return
+	}
+
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
 	if err := run(ctx, os.Args[1:], os.Stderr); err != nil {
