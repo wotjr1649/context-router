@@ -1,12 +1,15 @@
 package mcp
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"io/fs"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -209,6 +212,34 @@ func TestNewServerProfileGating(t *testing.T) {
 	}
 }
 
+// maxToolSchemaBytes: 게이트 11(스키마 토큰 예산, 설계 §2.3) — NewServer 기본 프로필
+// (ProbeIsolation 성공 환경의 3-도구: ctr_search/ctr_fetch/ctr_transform)의 tools/list 결과
+// JSON 직렬화 바이트 상한. 최초 실측값 4359B × 1.2 = 5230.8 → 반올림 5231로 고정한 값 —
+// 회귀(설명 문구 비대화 등) 조기 감지용 상한이지 정밀 예산이 아니다. 실측값·근거는
+// docs/gates-v0.0.1-ko.md 게이트 11 항목 참조.
+const maxToolSchemaBytes = 5231
+
+// TestSchemaTokenBudget: tools/list 결과(ListToolsResult 전체 — 실제 클라이언트가 받는
+// JSON 그대로) 직렬화 바이트가 maxToolSchemaBytes를 넘지 않는지 확인한다(게이트 11). 근사
+// 토큰 수 = bytes/4는 로그로만 남긴다 — Claude 정확 tokenizer는 비공개라 근사치일 뿐이고,
+// 실질 게이트는 바이트 상한 쪽이다.
+func TestSchemaTokenBudget(t *testing.T) {
+	cs, _ := newTestServer(t, nil) // Enable 없음 — 기본 프로필(ProbeIsolation 성공 시 3-도구)
+	lt, err := cs.ListTools(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("list tools: %v", err)
+	}
+	b, err := json.Marshal(lt)
+	if err != nil {
+		t.Fatalf("marshal tools/list result: %v", err)
+	}
+	approxTokens := len(b) / 4 // 근사치(bytes/4) — 정확 tokenizer 비공개, 주석 참조.
+	t.Logf("tools/list schema: %d bytes (~%d tokens approx, %d tools)", len(b), approxTokens, len(lt.Tools))
+	if len(b) > maxToolSchemaBytes {
+		t.Fatalf("tools/list schema=%d bytes exceeds budget %d bytes (게이트 11, 설계 §2.3)", len(b), maxToolSchemaBytes)
+	}
+}
+
 func remarshal(t *testing.T, v, out any) {
 	t.Helper()
 	b, err := json.Marshal(v)
@@ -357,6 +388,131 @@ func TestServeStdoutPurity(t *testing.T) {
 	}
 	if len(data) != 0 {
 		t.Fatalf("stdout polluted: %q (serve err=%v)", data, serveErr)
+	}
+}
+
+// TestServeStdoutPurityDuringErroringToolCall: Task 8 최종리뷰 minor "stdout purity 테스트
+// narrow(툴콜 중 오염 미검)" 해소(계획 3 게이트 10) — 위 TestServeStdoutPurity는 stdin을 즉시
+// 닫아 실제 툴콜이 한 번도 실행되지 않는다. 여기서는 실제 initialize→tools/call 왕복 도중
+// 핸들러가 진짜 오류를 내며(store를 미리 Close — mock이 아니라 실 리소스의 실 종료 상태)
+// db.QueryContext가 반환하는 오류가 toToolError의 어떤 sentinel에도 매칭되지 않아 default
+// 분기(codeInternal)로 떨어져 slog.Error가 stderr에 기록되는 바로 그 순간에도 stdout에는
+// 개행 구분 JSON-RPC 응답만 나오는지 확인한다(§5.5).
+func TestServeStdoutPurityDuringErroringToolCall(t *testing.T) {
+	dir := t.TempDir()
+	canon, err := ident.Canonicalize(dir)
+	if err != nil {
+		t.Fatalf("canonicalize: %v", err)
+	}
+	st, err := store.Open(t.TempDir(), false)
+	if err != nil {
+		t.Fatalf("store open: %v", err)
+	}
+	st.Close() // 의도적: 이후 모든 쿼리가 실 오류("database is closed" 부류)로 실패한다.
+
+	// slog 기본 핸들러는 os.Stderr *값을 생성 시점에 캡처*하므로(main.go의 run()이 동일
+	// 이유로 slog.SetDefault(stderr)를 명시 호출한다) 아래 os.Stdout 스와핑과 달리 전역
+	// os.Stderr 재대입만으로는 캡처되지 않는다 — 핸들러를 직접 버퍼로 교체해야 한다.
+	prevLogger := slog.Default()
+	var stderrBuf bytes.Buffer
+	slog.SetDefault(slog.New(slog.NewTextHandler(&stderrBuf, nil)))
+	defer slog.SetDefault(prevLogger)
+
+	inR, inW, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe: %v", err)
+	}
+	defer inR.Close()
+	defer inW.Close()
+	outR, outW, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe: %v", err)
+	}
+	defer outR.Close()
+	defer outW.Close()
+
+	oldIn, oldOut := os.Stdin, os.Stdout
+	os.Stdin, os.Stdout = inR, outW
+	defer func() { os.Stdin, os.Stdout = oldIn, oldOut }()
+
+	serveDone := make(chan error, 1)
+	go func() { serveDone <- Serve(context.Background(), Config{Canon: canon, Store: st}) }()
+
+	writeLine := func(v any) {
+		t.Helper()
+		b, err := json.Marshal(v)
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+		if _, err := inW.Write(append(b, '\n')); err != nil {
+			t.Fatalf("write stdin: %v", err)
+		}
+	}
+	sc := bufio.NewScanner(outR)
+	readLine := func() json.RawMessage {
+		t.Helper()
+		if !sc.Scan() {
+			t.Fatalf("scan stdout: %v", sc.Err())
+		}
+		line := sc.Bytes()
+		if !json.Valid(line) {
+			t.Fatalf("stdout line is not valid JSON (protocol pollution): %q", line)
+		}
+		return json.RawMessage(append([]byte(nil), line...))
+	}
+
+	writeLine(map[string]any{
+		"jsonrpc": "2.0", "id": 1, "method": "initialize",
+		"params": map[string]any{
+			"protocolVersion": "2025-06-18",
+			"capabilities":    map[string]any{},
+			"clientInfo":      map[string]any{"name": "purity-test", "version": "0.0.1"},
+		},
+	})
+	readLine() // initialize 응답 — JSON 유효성만 확인.
+	writeLine(map[string]any{"jsonrpc": "2.0", "method": "notifications/initialized", "params": map[string]any{}})
+
+	writeLine(map[string]any{
+		"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+		"params": map[string]any{"name": "ctr_search", "arguments": SearchInput{Queries: []string{"needle"}}},
+	})
+	var resp struct {
+		Result json.RawMessage `json:"result"`
+	}
+	if err := json.Unmarshal(readLine(), &resp); err != nil {
+		t.Fatalf("decode tools/call response: %v", err)
+	}
+	var tr struct {
+		IsError bool `json:"isError"`
+		Content []struct {
+			Text string `json:"text"`
+		} `json:"content"`
+	}
+	if err := json.Unmarshal(resp.Result, &tr); err != nil {
+		t.Fatalf("decode tools/call result: %v", err)
+	}
+	if !tr.IsError || len(tr.Content) == 0 || !strings.HasPrefix(tr.Content[0].Text, "["+codeInternal+"]") {
+		t.Fatalf("want %s error for closed-store search, got %+v", codeInternal, tr)
+	}
+
+	inW.Close() // client-initiated shutdown → Run()이 stdin EOF로 반환
+	if err := <-serveDone; err != nil {
+		t.Fatalf("serve: %v", err)
+	}
+	os.Stdin, os.Stdout = oldIn, oldOut
+	outW.Close()
+
+	for sc.Scan() { // 종료 전후 잔여 바이트까지 전부 JSON 한 줄이어야 한다.
+		if !json.Valid(sc.Bytes()) {
+			t.Fatalf("trailing stdout polluted: %q", sc.Bytes())
+		}
+	}
+	if err := sc.Err(); err != nil {
+		t.Fatalf("scan trailing stdout: %v", err)
+	}
+
+	if !strings.Contains(stderrBuf.String(), "mcp: internal tool error") {
+		t.Fatalf("want internal tool error logged to stderr during the call, got %q", stderrBuf.String())
 	}
 }
 

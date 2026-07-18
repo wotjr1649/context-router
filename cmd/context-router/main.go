@@ -24,7 +24,7 @@ import (
 	"github.com/wotjr1649/context-router/internal/transform"
 )
 
-const version = "0.0.1-dev"
+const version = "0.0.1"
 
 type serverFlags struct {
 	Root, StoreRoot, LogLevel   string
