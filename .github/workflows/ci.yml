@@ -50,7 +50,7 @@ jobs:
             exit 1
           fi
 
-      - name: golangci-lint (v2, default: standard + misspell)
+      - name: "golangci-lint (v2, default: standard + misspell)"
         uses: golangci/golangci-lint-action@v9
         with:
           version: v2.12
