@@ -12,6 +12,10 @@
 
 - `corpus/` — 게이트 1·2 공유 코퍼스(14개: markdown 7 / 코드 4 / 로그 2 / json 1,
   실제적 내용, 팽창 없음). 게이트 2 recall 하네스도 동일 코퍼스를 쓴다.
+  - **의도적 편차(팽창 금지 우선)**: 파일당 청크 수는 균일하지 않다 — markdown 7개는 각
+    ≥3청크(헤딩 경계), 코드 4개는 ~2청크, 소형 distractor(access.log·config.json)는 실제
+    크기라 1청크다. `strings.Repeat`/생성 스크립트로 억지 증량하지 않는다(브리프 계약).
+    aggregate 하한은 `TestCorpusShape`가 고정(총 청크 ≥50, 다중청크≥3 파일 ≥7).
 - `queries.json` — 공유 쿼리 12개 + oracle top-k(`oracle_k=3`).
 - `golden.json` — oracle 실측: 쿼리 → oracle top-3 소스 파일(basename) 목록.
 - `gen-golden.mjs` — 골든 생성 스크립트(재현용, 커밋됨).

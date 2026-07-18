@@ -36,7 +36,20 @@ const OUT_FILE = join(HERE, "golden.json");
 const ORACLE_STORE =
   process.env.CTX_ORACLE_STORE ||
   "C:/Users/js/Documents/ClaudeCode/context-mode/build/store.js";
-const ORACLE_VERSION = process.env.CTX_ORACLE_VERSION || "1.3.0";
+
+// oracle 버전 검증: 참조 저장소 package.json에서 실측 버전을 읽어 1.3.0이 아니면 생성 거부
+// (다른 버전으로 만든 골든이 조용히 커밋되는 것을 막는다). 실측 버전을 golden에 기록한다.
+const EXPECTED_VERSION = "1.3.0";
+const ORACLE_ROOT = dirname(dirname(ORACLE_STORE));
+const { version: ORACLE_VERSION } = JSON.parse(
+  readFileSync(join(ORACLE_ROOT, "package.json"), "utf-8"),
+);
+if (ORACLE_VERSION !== EXPECTED_VERSION) {
+  throw new Error(
+    `oracle 버전 불일치: ${ORACLE_ROOT}/package.json version=${ORACLE_VERSION}, ` +
+      `기대=${EXPECTED_VERSION} — golden 생성 거부.`,
+  );
+}
 
 const { ContentStore } = await import(pathToFileURL(ORACLE_STORE).href);
 
