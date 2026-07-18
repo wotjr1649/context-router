@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"slices"
 	"strings"
@@ -47,10 +48,13 @@ func NewServer(cfg Config) (*mcp.Server, error) {
 		return nil, fmt.Errorf("mcp: nil store")
 	}
 	srv := mcp.NewServer(&mcp.Implementation{Name: "context-router", Version: serverVersion}, nil)
-	registerSearch(srv, cfg.Store, cfg.Canon.ProjectRoot)
-	registerFetch(srv, cfg.Store, cfg.Canon.ProjectRoot)
+	// 경로 허용(ingest root)·상대화(search/fetch relativize) 기준 = WorktreeRoot — linked git
+	// worktree에서 ProjectRoot(주 checkout)를 쓰면 현재 worktree 파일이 WORKSPACE_VIOLATION이
+	// 된다(저장소 디렉터리 명명 ProjectID는 ProjectRoot 기반 그대로, main.go 참조).
+	registerSearch(srv, cfg.Store, cfg.Canon.WorktreeRoot)
+	registerFetch(srv, cfg.Store, cfg.Canon.WorktreeRoot)
 	if slices.Contains(cfg.Enable, "ingest") {
-		registerIndex(srv, cfg.Store, cfg.Canon.ProjectRoot, cfg.AllowPaths)
+		registerIndex(srv, cfg.Store, cfg.Canon.WorktreeRoot, cfg.AllowPaths)
 	}
 	return srv, nil
 }
@@ -82,6 +86,8 @@ func toToolError(err error) error {
 		return toolErr(codeWorkspaceViolation, "작업 영역 밖 경로입니다")
 	case errors.Is(err, ingest.ErrUnsupported):
 		return toolErr(codeUnsupportedFile, "지원하지 않는 파일입니다")
+	case errors.Is(err, fs.ErrNotExist):
+		return toolErr(codeNotFound, "대상을 찾을 수 없습니다")
 	default:
 		slog.Error("mcp: internal tool error", "error", err)
 		return toolErr(codeInternal, "내부 오류가 발생했습니다")
@@ -138,7 +144,7 @@ func toSearchHit(h search.Hit) searchHit {
 	}
 }
 
-func registerSearch(srv *mcp.Server, st *store.Store, projectRoot string) {
+func registerSearch(srv *mcp.Server, st *store.Store, worktreeRoot string) {
 	mcp.AddTool(srv, &mcp.Tool{
 		Name:        "ctr_search",
 		Description: "프로젝트 색인을 BM25+RRF로 검색해 스니펫을 반환한다.",
@@ -158,7 +164,7 @@ func registerSearch(srv *mcp.Server, st *store.Store, projectRoot string) {
 		if budget <= 0 {
 			budget = 8192
 		}
-		qrs, err := search.Query(ctx, st, projectRoot, in.Queries, limit, budget)
+		qrs, err := search.Query(ctx, st, worktreeRoot, in.Queries, limit, budget)
 		if err != nil {
 			return nil, SearchOutput{}, toToolError(err)
 		}
@@ -243,10 +249,20 @@ func selectorFromInput(in FetchInput) (store.Selector, error) {
 	return sel, nil
 }
 
-// representationOf: media_type만으로 근사(§10 store 미수정 — sources.source_kind 미조회).
-// ponytail: file/inline 구분은 sources 조인이 필요해 v0.0.1은 file로 뭉갠다 — 필요해지면
-// store에 소스 조회 메서드를 추가한다.
-func representationOf(mediaType string) string {
+// sourceCoordsExact: search 의미론(§4.0)과 통일 — file/inline이고 extraction을 거치지 않은
+// 무편집 소스일 때만 좌표가 원문을 그대로 가리킨다.
+func sourceCoordsExact(res store.RangeResult) bool {
+	return res.HasSource && res.Source.Extraction == "" &&
+		(res.Source.Kind == "file" || res.Source.Kind == "inline") &&
+		res.Artifact.Redaction == "none"
+}
+
+// representationOf: sourceKind(res.Source.Kind)가 "inline"이면 최우선으로 "inline"을
+// 반환한다. 그 외는 media_type 근사(markdown/file).
+func representationOf(mediaType, sourceKind string) string {
+	if sourceKind == "inline" {
+		return "inline"
+	}
 	if mediaType == "text/markdown" {
 		return "markdown"
 	}
@@ -267,11 +283,14 @@ func applyFetchBudget(res store.RangeResult, maxBytes int) (text []byte, byteEnd
 	lineEnd = res.LineEnd
 	if res.LineStart > 0 { // line/chunk 선택자만 라인 정보를 갖는다(byte는 0 유지)
 		lineEnd = res.LineStart + strings.Count(string(cut), "\n")
+		if len(cut) > 0 && cut[len(cut)-1] == '\n' {
+			lineEnd-- // 개행으로 정확히 끝나면 다음 줄은 아직 포함되지 않음 — 과계산 보정
+		}
 	}
 	return cut, res.ByteStart + int64(n), lineEnd, true
 }
 
-func registerFetch(srv *mcp.Server, st *store.Store, projectRoot string) {
+func registerFetch(srv *mcp.Server, st *store.Store, worktreeRoot string) {
 	mcp.AddTool(srv, &mcp.Tool{
 		Name:        "ctr_fetch",
 		Description: "artifact 저장본에서 선택자 범위를 그대로 회수한다.",
@@ -299,15 +318,15 @@ func registerFetch(srv *mcp.Server, st *store.Store, projectRoot string) {
 		}
 		if res.HasSource {
 			prov.SrcHash = res.Source.SrcHash
-			prov.Source = search.RelativizeSource(projectRoot, res.Source.URI)
+			prov.Source = search.RelativizeSource(worktreeRoot, res.Source.URI)
 			prov.SourceKind = res.Source.Kind
 			prov.Stale = res.Stale
 		}
 		out := FetchOutput{
 			Content: string(text), ByteStart: res.ByteStart, ByteEnd: byteEnd,
 			LineStart: res.LineStart, LineEnd: lineEnd, Truncated: truncated,
-			ExactScope: "artifact", Representation: representationOf(res.Artifact.MediaType),
-			SourceCoordsExact: res.Artifact.Redaction == "none",
+			ExactScope: "artifact", Representation: representationOf(res.Artifact.MediaType, res.Source.Kind),
+			SourceCoordsExact: sourceCoordsExact(res),
 			Provenance:        prov,
 			Untrusted:         true,
 		}
@@ -338,7 +357,21 @@ type IndexOutput struct {
 	Skipped     []indexSkip `json:"skipped"`
 }
 
-func registerIndex(srv *mcp.Server, st *store.Store, projectRoot string, allowPaths []string) {
+// validateIndexInput: path/content는 XOR(둘 다 또는 둘 다 아님은 오류)이고, content를 쓸
+// 때는 title이 필수다(설계 §4.4).
+func validateIndexInput(in IndexInput) error {
+	switch {
+	case in.Path == "" && in.Content == "":
+		return toolErr(codeInvalidArgument, "path 또는 content가 필요합니다")
+	case in.Path != "" && in.Content != "":
+		return toolErr(codeInvalidArgument, "path와 content는 동시에 지정할 수 없습니다")
+	case in.Content != "" && in.Title == "":
+		return toolErr(codeInvalidArgument, "content 지정 시 title이 필요합니다")
+	}
+	return nil
+}
+
+func registerIndex(srv *mcp.Server, st *store.Store, worktreeRoot string, allowPaths []string) {
 	destructive := false
 	mcp.AddTool(srv, &mcp.Tool{
 		Name:        "ctr_index",
@@ -346,10 +379,10 @@ func registerIndex(srv *mcp.Server, st *store.Store, projectRoot string, allowPa
 		Annotations: &mcp.ToolAnnotations{DestructiveHint: &destructive},
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, in IndexInput) (*mcp.CallToolResult, IndexOutput, error) {
 		start := time.Now()
-		if in.Path == "" && in.Content == "" {
-			return nil, IndexOutput{}, toolErr(codeInvalidArgument, "path 또는 content가 필요합니다")
+		if err := validateIndexInput(in); err != nil {
+			return nil, IndexOutput{}, err
 		}
-		rep, err := ingest.Run(ctx, st, projectRoot, allowPaths, ingest.Request{
+		rep, err := ingest.Run(ctx, st, worktreeRoot, allowPaths, ingest.Request{
 			Path: in.Path, Content: in.Content, Title: in.Title,
 			Include: in.Include, Exclude: in.Exclude, MaxFileBytes: in.MaxFileBytes,
 		})

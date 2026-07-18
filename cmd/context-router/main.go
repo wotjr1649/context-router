@@ -7,6 +7,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"io/fs"
 	"log/slog"
 	"os"
 	"os/signal"
@@ -114,6 +115,25 @@ func withinRoot(root, p string) bool {
 	return rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
 }
 
+// canonicalizeStoreRoot: storeRoot를 allow-path와 동일한 기준(Abs→EvalSymlinks→Fold)으로
+// canonicalize한다 — 그래야 canonicalizeAllowPaths의 store-root 하위 거부가 심링크로
+// 우회되지 않는다(§4.4). storeRoot는 아직 생성 전일 수 있어 EvalSymlinks의 미존재 오류는
+// 관용 처리(Abs+Fold만 사용).
+func canonicalizeStoreRoot(storeRoot string) (string, error) {
+	abs, err := filepath.Abs(storeRoot)
+	if err != nil {
+		return "", fmt.Errorf("ctr: store-root: %w", err)
+	}
+	real, err := filepath.EvalSymlinks(abs)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return ident.Fold(abs), nil
+		}
+		return "", fmt.Errorf("ctr: store-root: %w", err)
+	}
+	return ident.Fold(real), nil
+}
+
 // canonicalizeAllowPaths: 각 --allow-path를 canonicalize(Abs→EvalSymlinks→Fold)하고
 // store-root 하위면 시작을 거부한다(Task6 이관, 설계 §4.4).
 func canonicalizeAllowPaths(paths []string, storeRoot string) ([]string, error) {
@@ -150,7 +170,7 @@ func parseLogLevel(s string) slog.Level {
 	}
 }
 
-func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
+func run(ctx context.Context, args []string, stderr io.Writer) error {
 	f, err := parseFlags(args)
 	if err != nil {
 		return err
@@ -169,6 +189,10 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 		return err
 	}
 	storeRoot, err := storeRootFor(f)
+	if err != nil {
+		return err
+	}
+	storeRoot, err = canonicalizeStoreRoot(storeRoot)
 	if err != nil {
 		return err
 	}
@@ -191,7 +215,7 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
-	if err := run(ctx, os.Args[1:], os.Stdout, os.Stderr); err != nil {
+	if err := run(ctx, os.Args[1:], os.Stderr); err != nil {
 		fmt.Fprintln(os.Stderr, "ctr:", err)
 		os.Exit(1)
 	}

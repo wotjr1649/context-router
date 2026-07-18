@@ -14,8 +14,10 @@
 cmd ──┬─ mcp ─┬─ search ──→ store
       │       ├─ ingest ──→ store, ident
       │       ├─ transform → store        # blob 경로 조회용
-      │       └─ netfetch                 # leaf — 저장하지 않는다
+      │       ├─ netfetch                 # leaf — 저장하지 않는다
+      │       └─ store, ident             # Config 배선(Store 포인터·Canon)
       ├─ cli ─────────────→ store, ident
+      ├─ store                            # store.Open 직접 호출
       └─ ident                            # leaf, 순수 함수
 store · ident · netfetch · transform : internal 상호 의존 0 (leaf)
 ```
@@ -42,7 +44,7 @@ store · ident · netfetch · transform : internal 상호 의존 0 (leaf)
 - **자체 정의 인터페이스 0개.** 두 번째 *실존* 구현이 생기기 전까지 `Clock`·`Repository`·`Fetcher`·`Runner`류 금지. stdlib 인터페이스(io.Reader/Writer 등)는 자유. transform 경계는 Go 인터페이스가 아니라 **프로세스+JSON 프로토콜**이다(3채널 만장일치) — `RunWorker(r io.Reader, w io.Writer)`로 충분.
 - **테스트 심 3수단**(인터페이스 대체): ① 순수 함수 분리(SSRF 판정 = `netip.Addr→verdict`), ② stdlib func 필드 주입(`http.Transport.DialContext`), ③ 실물(임시 디렉터리의 진짜 SQLite, 테스트용 자기 바이너리). 테스트 목적 인터페이스 wrapping·mock 클라이언트 금지(Google 규칙).
 - **생성자**: 필수 인자 ≤3개면 개별 인자(`store.Open(path string, readOnly bool)`), 정책 값 ≥4개면 검증 가능한 `Config` struct(`netfetch.Config{...}`). 의존성을 Config에 숨기지 않는다. **functional options 금지**(기본값·필수값 grep 불가 + 투기적 확장점).
-- **배선**: `main()`은 `run(ctx, args, stdout) error` 1회 호출 + `os.Exit` 1회(exit-once). `signal.NotifyContext`는 run 안. store는 main이 1회 열어 **구체 포인터**를 전달. 도구별 등록 함수(`mcp.RegisterSearch(s *search.Service)`) — 거대 Deps struct·nil 필드·전역 singleton·service locator 금지.
+- **배선**: `main()`은 `run(ctx, args, stderr) error` 1회 호출 + `os.Exit` 1회(exit-once). `signal.NotifyContext`는 run 안. store는 main이 1회 열어 **구체 포인터**를 전달. 도구별 등록 함수(`mcp.RegisterSearch(s *search.Service)`) — 거대 Deps struct·nil 필드·전역 singleton·service locator 금지.
 - export는 "다른 internal 패키지가 지금 호출하는 것"만. `Get` 접두사 금지(`Counts`, 비용 크면 `Compute`/`Fetch`).
 
 ## 5. 파일 구성 — 반파편화 (D13)

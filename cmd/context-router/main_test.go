@@ -88,6 +88,16 @@ func TestCanonicalizeAllowPaths_NonexistentPathErrors(t *testing.T) {
 	}
 }
 
+func TestCanonicalizeStoreRoot_RelativeBecomesAbsolute(t *testing.T) {
+	got, err := canonicalizeStoreRoot("relative-store-dir-does-not-exist")
+	if err != nil {
+		t.Fatalf("unexpected err=%v", err)
+	}
+	if !filepath.IsAbs(got) {
+		t.Fatalf("got=%q want absolute path", got)
+	}
+}
+
 func TestStoreRootFor(t *testing.T) {
 	t.Run("flag_wins", func(t *testing.T) {
 		got, err := storeRootFor(serverFlags{StoreRoot: "C:/custom"})
