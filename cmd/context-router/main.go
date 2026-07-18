@@ -28,6 +28,7 @@ const version = "0.0.1-dev"
 type serverFlags struct {
 	Root, StoreRoot, LogLevel   string
 	Profile, Enable, AllowPaths []string
+	Projects                    []string // --projects: global-search 전용 allowlist (설계 §8)
 	NetAllowLocal               bool
 	NetPorts                    []int
 }
@@ -49,12 +50,19 @@ func parseFlags(args []string) (serverFlags, error) {
 	fs.BoolVar(&f.NetAllowLocal, "net-allow-local", false, "allow 127.0.0.1/::1 destinations for fetch_and_index")
 	var netPorts string
 	fs.StringVar(&netPorts, "net-ports", "", "extra allowed ports for fetch_and_index (comma-separated)")
+	var projects string
+	fs.StringVar(&projects, "projects", "", "global-search project allowlist (comma-separated paths or IDs, required for --profile global-search)")
 	if err := fs.Parse(args); err != nil {
 		return serverFlags{}, err
 	}
 	f.Profile = strings.Split(profile, ",")
 	if enable != "" {
 		f.Enable = strings.Split(enable, ",")
+	}
+	for _, p := range strings.Split(projects, ",") {
+		if p = strings.TrimSpace(p); p != "" {
+			f.Projects = append(f.Projects, p)
+		}
 	}
 	if netPorts != "" {
 		for _, p := range strings.Split(netPorts, ",") {
@@ -172,6 +180,60 @@ func canonicalizeAllowPaths(paths []string, storeRoot string) ([]string, error) 
 	return out, nil
 }
 
+// resolveProjectEntry: --projects 엔트리 1개를 판별한다. 경로 구분자(/,\)를 포함하거나
+// 존재하는 디렉터리면 경로로 취급해 ident.Canonicalize로 ProjectID·WorktreeRoot(=root)를
+// 구한다. 그 외는 ProjectID 문자열 그대로 취급하고 root=""를 반환한다(설계 §4.6 — ID
+// 엔트리는 원본 대조·경로 상대화가 제한됨, mcp.GlobalProject.Root 주석 참조).
+func resolveProjectEntry(entry string) (id, root string, err error) {
+	looksLikePath := strings.ContainsAny(entry, `/\`)
+	if !looksLikePath {
+		if fi, statErr := os.Stat(entry); statErr == nil && fi.IsDir() {
+			looksLikePath = true
+		}
+	}
+	if !looksLikePath {
+		return entry, "", nil
+	}
+	canon, err := ident.Canonicalize(entry)
+	if err != nil {
+		return "", "", err
+	}
+	return canon.ProjectID, canon.WorktreeRoot, nil
+}
+
+// buildGlobalProjects: entries 각각을 resolveProjectEntry로 판별해 read-only store로 연다.
+// store.Open(dir, true)는 실제 DB 파일을 지연 연결하므로(디렉터리/DB 없음이어도 즉시
+// 에러가 안 남) PingContext로 강제 연결해 열기 실패를 즉시 드러낸다. 하나라도 실패하면
+// 이미 연 store를 모두 Close하고 시작을 거부한다(fail-closed, 설계 §4.6/§5.4).
+func buildGlobalProjects(ctx context.Context, storeRoot string, entries []string) ([]mcp.GlobalProject, error) {
+	projects := make([]mcp.GlobalProject, 0, len(entries))
+	closeAll := func() {
+		for _, p := range projects {
+			p.Store.Close()
+		}
+	}
+	for _, entry := range entries {
+		id, root, err := resolveProjectEntry(entry)
+		if err != nil {
+			closeAll()
+			return nil, fmt.Errorf("ctr: global-search: %w", err)
+		}
+		st, err := store.Open(filepath.Join(storeRoot, "projects", id), true)
+		if err == nil {
+			err = st.Reader().PingContext(ctx)
+		}
+		if err != nil {
+			if st != nil {
+				st.Close()
+			}
+			closeAll()
+			return nil, fmt.Errorf("ctr: global-search: 프로젝트 %q 열기 실패: %w", id, err)
+		}
+		projects = append(projects, mcp.GlobalProject{ID: id, Root: root, Store: st})
+	}
+	return projects, nil
+}
+
 // parseLogLevel: --log-level 문자열→slog.Level. 미지 값은 info로 뭉갠다.
 func parseLogLevel(s string) slog.Level {
 	switch s {
@@ -192,6 +254,16 @@ func run(ctx context.Context, args []string, stderr io.Writer) error {
 		return err
 	}
 	slog.SetDefault(slog.New(slog.NewTextHandler(stderr, &slog.HandlerOptions{Level: parseLogLevel(f.LogLevel)})))
+
+	// global-search 프로필 ⇄ --projects는 1:1 필수 대응(모호성 차단, 설계 §4.6/§8).
+	isGlobal := slices.Contains(f.Profile, "global-search")
+	if isGlobal && len(f.Projects) == 0 {
+		return errors.New("ctr: --profile global-search은 --projects가 필수입니다")
+	}
+	if !isGlobal && len(f.Projects) > 0 {
+		return errors.New("ctr: --projects는 --profile global-search에서만 사용할 수 있습니다")
+	}
+
 	root := f.Root
 	if root == "" {
 		if root, err = os.Getwd(); err != nil {
@@ -200,15 +272,31 @@ func run(ctx context.Context, args []string, stderr io.Writer) error {
 	}
 	fmt.Fprintln(stderr, banner(f, root))
 
-	canon, err := ident.Canonicalize(root)
-	if err != nil {
-		return err
-	}
 	storeRoot, err := storeRootFor(f)
 	if err != nil {
 		return err
 	}
 	storeRoot, err = canonicalizeStoreRoot(storeRoot)
+	if err != nil {
+		return err
+	}
+
+	if isGlobal {
+		// global 분기: cwd store.Open/transform probe/ingest·net 게이팅 전부 미수행 —
+		// 오직 --projects의 read-only store만 열어 mcp.ServeGlobal에 넘긴다(설계 §5.4).
+		projects, err := buildGlobalProjects(ctx, storeRoot, f.Projects)
+		if err != nil {
+			return err
+		}
+		defer func() {
+			for _, p := range projects {
+				p.Store.Close()
+			}
+		}()
+		return mcp.ServeGlobal(ctx, mcp.GlobalConfig{Projects: projects})
+	}
+
+	canon, err := ident.Canonicalize(root)
 	if err != nil {
 		return err
 	}

@@ -814,6 +814,123 @@ func TestCtrFetchAndIndexRoundTrip(t *testing.T) {
 	}
 }
 
+// --- ctr_global_search (설계 §4.6/§5.4, Task 2) ---
+
+// newGlobalTestProject: srcDir에 content를 담은 파일 1개를 만들어 실제 store에 ingest.Run으로
+// 색인한 뒤 store를 닫고 read-only로 재오픈해 GlobalProject를 만든다 — global-search는
+// 항상 read-only 연결만 쓰므로(설계 §5.4 query_only=ON) 색인은 별도 writable 오픈으로 선행한다.
+func newGlobalTestProject(t *testing.T, id, content string) GlobalProject {
+	t.Helper()
+	dir := t.TempDir()
+	writeSt, err := store.Open(dir, false)
+	if err != nil {
+		t.Fatalf("store open (write): %v", err)
+	}
+	srcDir := t.TempDir()
+	file := filepath.Join(srcDir, "note.txt")
+	if err := os.WriteFile(file, []byte(content), 0o644); err != nil {
+		t.Fatalf("write fixture: %v", err)
+	}
+	if _, err := ingest.Run(context.Background(), writeSt, srcDir, nil, ingest.Request{Path: file}); err != nil {
+		t.Fatalf("ingest: %v", err)
+	}
+	writeSt.Close()
+
+	roSt, err := store.Open(dir, true)
+	if err != nil {
+		t.Fatalf("store open (ro): %v", err)
+	}
+	t.Cleanup(func() { roSt.Close() })
+	return GlobalProject{ID: id, Root: srcDir, Store: roSt}
+}
+
+// TestGlobalSearch_MergesAcrossProjects: 서로 다른 두 프로젝트 store의 hit이 project 라벨과
+// 함께 score 내림차순으로 병합되고, tools/list에 ctr_global_search 하나만 노출되는지(설계
+// §4.6 금지 조항) 검증한다.
+func TestGlobalSearch_MergesAcrossProjects(t *testing.T) {
+	ctx := context.Background()
+	p1 := newGlobalTestProject(t, "proj-one", "needle content in project one\n")
+	p2 := newGlobalTestProject(t, "proj-two", "needle content in project two\n")
+
+	srv, err := NewGlobalServer(GlobalConfig{Projects: []GlobalProject{p1, p2}})
+	if err != nil {
+		t.Fatalf("new global server: %v", err)
+	}
+	srvT, cliT := mcp.NewInMemoryTransports()
+	if _, err := srv.Connect(ctx, srvT, nil); err != nil {
+		t.Fatalf("server connect: %v", err)
+	}
+	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "0"}, nil)
+	cs, err := client.Connect(ctx, cliT, nil)
+	if err != nil {
+		t.Fatalf("client connect: %v", err)
+	}
+	defer cs.Close()
+
+	lt, err := cs.ListTools(ctx, nil)
+	if err != nil {
+		t.Fatalf("list tools: %v", err)
+	}
+	if len(lt.Tools) != 1 || lt.Tools[0].Name != "ctr_global_search" {
+		t.Fatalf("tools/list=%v want exactly [ctr_global_search] (설계 §4.6 금지 조항)", lt.Tools)
+	}
+
+	res, err := cs.CallTool(ctx, &mcp.CallToolParams{Name: "ctr_global_search", Arguments: SearchInput{Queries: []string{"needle"}}})
+	if err != nil {
+		t.Fatalf("ctr_global_search call: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("ctr_global_search error: %+v", res.Content)
+	}
+	var out GlobalSearchOutput
+	remarshal(t, res.StructuredContent, &out)
+	if !out.Untrusted {
+		t.Fatalf("untrusted flag missing: %+v", out)
+	}
+	if len(out.Results) != 1 {
+		t.Fatalf("results=%d want 1", len(out.Results))
+	}
+	hits := out.Results[0].Hits
+	if len(hits) != 2 {
+		t.Fatalf("hits=%d want 2 (one per project): %+v", len(hits), hits)
+	}
+	seen := map[string]bool{}
+	for i, h := range hits {
+		seen[h.Project] = true
+		if i > 0 && hits[i-1].Score < h.Score {
+			t.Fatalf("hits not score-descending: %+v", hits)
+		}
+	}
+	if !seen["proj-one"] || !seen["proj-two"] {
+		t.Fatalf("missing project labels: %+v", hits)
+	}
+	if out.Results[0].Truncated {
+		t.Fatalf("want Truncated=false with default limit, got true: %+v", out.Results[0])
+	}
+
+	// limit=1: 두 프로젝트가 각각 1 hit씩 내도 병합 후 1개로 절단되고 truncated=true여야 한다.
+	res2, err := cs.CallTool(ctx, &mcp.CallToolParams{Name: "ctr_global_search", Arguments: SearchInput{Queries: []string{"needle"}, Limit: 1}})
+	if err != nil {
+		t.Fatalf("ctr_global_search(limit=1) call: %v", err)
+	}
+	var out2 GlobalSearchOutput
+	remarshal(t, res2.StructuredContent, &out2)
+	if len(out2.Results) != 1 || len(out2.Results[0].Hits) != 1 {
+		t.Fatalf("limit=1 hits=%+v want exactly 1", out2.Results)
+	}
+	if !out2.Results[0].Truncated {
+		t.Fatalf("want Truncated=true after merge cut to limit=1: %+v", out2.Results[0])
+	}
+}
+
+// TestNewGlobalServerEmptyProjectsErrors: Projects가 비면 시작 자체를 거부해야 한다(설계
+// §4.6 계약 — allowlist 미지정 시 시작 거부와 동일 취지의 방어선).
+func TestNewGlobalServerEmptyProjectsErrors(t *testing.T) {
+	if _, err := NewGlobalServer(GlobalConfig{}); err == nil {
+		t.Fatal("want error for empty Projects, got nil")
+	}
+}
+
 // TestCtrFetchAndIndexDenied: AllowLocal=false에서 사설/루프백 목적지는 NETWORK_DENIED.
 func TestCtrFetchAndIndexDenied(t *testing.T) {
 	cs, _, _ := newNetTestServer(t, false, nil)

@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -58,6 +59,59 @@ func TestParseFlagsNet(t *testing.T) {
 	}
 	if len(got.NetPorts) != 2 || got.NetPorts[0] != 8080 || got.NetPorts[1] != 9090 {
 		t.Fatalf("NetPorts=%v want [8080 9090]", got.NetPorts)
+	}
+}
+
+// TestParseFlags_Projects: --projects는 콤마 구분·공백 트림으로 분해되고, 미지정 시
+// 빈 값이어야 한다(설계 §8).
+func TestParseFlags_Projects(t *testing.T) {
+	got, err := parseFlags([]string{"--projects", "proj-a, proj-b ,proj-c"})
+	if err != nil {
+		t.Fatalf("err=%v", err)
+	}
+	want := []string{"proj-a", "proj-b", "proj-c"}
+	if strings.Join(got.Projects, ",") != strings.Join(want, ",") {
+		t.Fatalf("Projects=%v want %v", got.Projects, want)
+	}
+
+	def, err := parseFlags(nil)
+	if err != nil {
+		t.Fatalf("err=%v", err)
+	}
+	if len(def.Projects) != 0 {
+		t.Fatalf("default Projects=%v want empty", def.Projects)
+	}
+}
+
+// TestRun_GlobalProfile_RequiresProjects: --profile global-search인데 --projects
+// 미지정이면 시작을 거부해야 한다(설계 §4.6 "기본값 없음").
+func TestRun_GlobalProfile_RequiresProjects(t *testing.T) {
+	var stderr bytes.Buffer
+	err := run(context.Background(), []string{"--profile", "global-search", "--store-root", t.TempDir()}, &stderr)
+	if err == nil {
+		t.Fatal("want error for global-search profile without --projects, got nil")
+	}
+}
+
+// TestRun_DefaultProfile_RejectsProjects: 기본 프로필에서 --projects 지정은 모호성
+// 차단을 위해 오류로 거부해야 한다(설계 §4.6/§8).
+func TestRun_DefaultProfile_RejectsProjects(t *testing.T) {
+	var stderr bytes.Buffer
+	err := run(context.Background(), []string{"--root", t.TempDir(), "--store-root", t.TempDir(), "--projects", "some-id"}, &stderr)
+	if err == nil {
+		t.Fatal("want error for default profile with --projects, got nil")
+	}
+}
+
+// TestRun_GlobalProfile_OpenFailureRejectsStart: --projects 엔트리 중 store가 아직 없는
+// (디렉터리/DB 없음) 것이 하나라도 있으면 시작 전체를 거부해야 한다(fail-closed, 설계 §4.6).
+func TestRun_GlobalProfile_OpenFailureRejectsStart(t *testing.T) {
+	var stderr bytes.Buffer
+	err := run(context.Background(), []string{
+		"--profile", "global-search", "--store-root", t.TempDir(), "--projects", "nonexistent-project-id",
+	}, &stderr)
+	if err == nil {
+		t.Fatal("want error for missing project store, got nil")
 	}
 }
 
