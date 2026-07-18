@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"slices"
+	"strconv"
 	"strings"
 
 	"github.com/wotjr1649/context-router/internal/ident"
@@ -27,6 +28,8 @@ const version = "0.0.1-dev"
 type serverFlags struct {
 	Root, StoreRoot, LogLevel   string
 	Profile, Enable, AllowPaths []string
+	NetAllowLocal               bool
+	NetPorts                    []int
 }
 
 func parseFlags(args []string) (serverFlags, error) {
@@ -43,12 +46,24 @@ func parseFlags(args []string) (serverFlags, error) {
 		f.AllowPaths = append(f.AllowPaths, v)
 		return nil
 	})
+	fs.BoolVar(&f.NetAllowLocal, "net-allow-local", false, "allow 127.0.0.1/::1 destinations for fetch_and_index")
+	var netPorts string
+	fs.StringVar(&netPorts, "net-ports", "", "extra allowed ports for fetch_and_index (comma-separated)")
 	if err := fs.Parse(args); err != nil {
 		return serverFlags{}, err
 	}
 	f.Profile = strings.Split(profile, ",")
 	if enable != "" {
 		f.Enable = strings.Split(enable, ",")
+	}
+	if netPorts != "" {
+		for _, p := range strings.Split(netPorts, ",") {
+			n, err := strconv.Atoi(strings.TrimSpace(p))
+			if err != nil {
+				return serverFlags{}, fmt.Errorf("ctr: net-ports: %w", err)
+			}
+			f.NetPorts = append(f.NetPorts, n)
+		}
 	}
 	return f, nil
 }
@@ -214,6 +229,7 @@ func run(ctx context.Context, args []string, stderr io.Writer) error {
 	return mcp.Serve(ctx, mcp.Config{
 		Canon: canon, Store: st, SelfExe: selfExe,
 		Profile: f.Profile, Enable: f.Enable, AllowPaths: allowPaths,
+		NetAllowLocal: f.NetAllowLocal, NetPorts: f.NetPorts,
 	})
 }
 

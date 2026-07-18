@@ -182,6 +182,7 @@ type Registration struct {
 	Source               SourceMeta
 	Chunks               []Chunk
 	ExpectedOldSrcHash   string // ""=신규 허용, 그 외=CAS 조건 (§3.5)
+	RawBlob              []byte // nil 아니면 비색인 원본 blob 보존(§4.5) — writeBlob 재사용, chunks/FTS 미포함
 }
 
 // Selector.Kind: "chunk"|"line"|"byte"
@@ -325,6 +326,14 @@ func (s *Store) Register(ctx context.Context, reg Registration) (int64, error) {
 	if err := s.writeBlob(contentHash, reg.StoredBytes); err != nil { // DB 커밋 전 배치 (§3.5)
 		return 0, err
 	}
+	rawBlobHash := ""
+	if reg.RawBlob != nil {
+		rsum := sha256.Sum256(reg.RawBlob)
+		rawBlobHash = hex.EncodeToString(rsum[:])
+		if err := s.writeBlob(rawBlobHash, reg.RawBlob); err != nil {
+			return 0, err
+		}
+	}
 	var artID int64
 	err := s.txRetry(ctx, func(tx *sql.Tx) error {
 		if err := tx.QueryRow("SELECT id FROM artifacts WHERE content_hash=? AND media_type=?", contentHash, reg.MediaType).Scan(&artID); err == sql.ErrNoRows {
@@ -348,7 +357,7 @@ func (s *Store) Register(ctx context.Context, reg Registration) (int64, error) {
 			res, err := tx.Exec(`UPDATE sources SET artifact_id=?,source_kind=?,src_size=?,src_mtime_ns=?,src_hash=?,raw_blob_hash=?,extraction=?,indexed_at=?
 				WHERE uri=? AND src_hash=?`,
 				artID, reg.Source.Kind, reg.Source.Size, reg.Source.MtimeNS, reg.Source.SrcHash,
-				nullIfEmpty(reg.Source.RawBlobHash), nullIfEmpty(reg.Source.Extraction), time.Now().Unix(),
+				nullIfEmpty(rawBlobHash), nullIfEmpty(reg.Source.Extraction), time.Now().Unix(),
 				reg.Source.URI, reg.ExpectedOldSrcHash)
 			if err != nil {
 				return err
@@ -363,7 +372,7 @@ func (s *Store) Register(ctx context.Context, reg Registration) (int64, error) {
 			ON CONFLICT(uri) DO UPDATE SET artifact_id=excluded.artifact_id,src_size=excluded.src_size,
 			  src_mtime_ns=excluded.src_mtime_ns,src_hash=excluded.src_hash,indexed_at=excluded.indexed_at`,
 			reg.Source.URI, artID, reg.Source.Kind, reg.Source.Size, reg.Source.MtimeNS, reg.Source.SrcHash,
-			nullIfEmpty(reg.Source.RawBlobHash), nullIfEmpty(reg.Source.Extraction), time.Now().Unix())
+			nullIfEmpty(rawBlobHash), nullIfEmpty(reg.Source.Extraction), time.Now().Unix())
 		return err
 	})
 	return artID, err

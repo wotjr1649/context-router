@@ -17,6 +17,7 @@ import (
 
 	"github.com/wotjr1649/context-router/internal/ident"
 	"github.com/wotjr1649/context-router/internal/ingest"
+	"github.com/wotjr1649/context-router/internal/netfetch"
 	"github.com/wotjr1649/context-router/internal/search"
 	"github.com/wotjr1649/context-router/internal/store"
 	"github.com/wotjr1649/context-router/internal/transform"
@@ -26,12 +27,14 @@ const serverVersion = "0.0.1-dev"
 
 // Config — Serve/NewServer 입력 (설계 §4, §8).
 type Config struct {
-	Canon      ident.Canon
-	Store      *store.Store
-	SelfExe    string   // transform worker 재실행 경로(os.Executable(), §4.3) — 격리 프로브·Spawn에 사용
-	Profile    []string // 예약: transform/global-search 게이팅용 — v0.0.1은 미분기(§8)
-	Enable     []string // opt-in: "ingest"·"net"
-	AllowPaths []string // 이미 canonicalize된 ctr_index 허용 root (cmd가 검증 — §4.4)
+	Canon         ident.Canon
+	Store         *store.Store
+	SelfExe       string   // transform worker 재실행 경로(os.Executable(), §4.3) — 격리 프로브·Spawn에 사용
+	Profile       []string // 예약: transform/global-search 게이팅용 — v0.0.1은 미분기(§8)
+	Enable        []string // opt-in: "ingest"·"net"
+	AllowPaths    []string // 이미 canonicalize된 ctr_index 허용 root (cmd가 검증 — §4.4)
+	NetAllowLocal bool     // --net-allow-local (§4.5, ctr_fetch_and_index)
+	NetPorts      []int    // --net-ports 추가 허용 포트 (§4.5)
 }
 
 // Serve builds the tool server per cfg and runs it over stdio until ctx가 끝나거나
@@ -65,6 +68,9 @@ func NewServer(cfg Config) (*mcp.Server, error) {
 	if slices.Contains(cfg.Enable, "ingest") {
 		registerIndex(srv, cfg.Store, cfg.Canon.WorktreeRoot, cfg.AllowPaths)
 	}
+	if slices.Contains(cfg.Enable, "net") {
+		registerFetchAndIndex(srv, cfg.Store, cfg.NetAllowLocal, cfg.NetPorts)
+	}
 	return srv, nil
 }
 
@@ -78,6 +84,7 @@ const (
 	codeStorageUnavailable  = "STORAGE_UNAVAILABLE"
 	codeBudgetExceeded      = "BUDGET_EXCEEDED"
 	codeOutputLimitExceeded = "OUTPUT_LIMIT_EXCEEDED"
+	codeNetworkDenied       = "NETWORK_DENIED"
 	codeInternal            = "INTERNAL"
 )
 
@@ -103,6 +110,8 @@ func toToolError(err error) error {
 		return toolErr(codeWorkspaceViolation, "작업 영역 밖 경로입니다")
 	case errors.Is(err, ingest.ErrUnsupported):
 		return toolErr(codeUnsupportedFile, "지원하지 않는 파일입니다")
+	case errors.Is(err, netfetch.ErrDenied):
+		return toolErr(codeNetworkDenied, "네트워크 목적지가 거부되었습니다")
 	case errors.Is(err, fs.ErrNotExist):
 		return toolErr(codeNotFound, "대상을 찾을 수 없습니다")
 	default:
@@ -500,6 +509,66 @@ func registerTransform(srv *mcp.Server, st *store.Store, selfExe string) {
 		}
 		out := TransformOutput{Result: res.Output, StepsUsed: res.StepsUsed, Truncated: res.Truncated}
 		st.LedgerAppend("ctr_transform", 0, jsonLen(out), time.Since(start).Milliseconds())
+		return nil, out, nil
+	})
+}
+
+// --- ctr_fetch_and_index (설계 §4.5, Enable에 "net" 있을 때만 등록) ---
+
+type FetchAndIndexInput struct {
+	URL      string `json:"url" jsonschema:"가져올 URL(http/https)"`
+	MaxBytes int64  `json:"max_bytes,omitempty" jsonschema:"응답 본문 상한 바이트, 기본 10MB"`
+}
+
+type FetchAndIndexOutput struct {
+	ArtifactID    int64  `json:"artifact_id"`
+	Title         string `json:"title"`
+	ByteLength    int64  `json:"byte_length"`
+	Extraction    string `json:"extraction"`
+	IndexedChunks int    `json:"indexed_chunks"`
+	Snippet       string `json:"snippet"`
+}
+
+const maxSnippetBytes = 1024
+
+// snippetOf: body 앞부분을 UTF-8 경계로 스냅해 미리보기로 반환한다(설계 §4.5 "snippet(≤1KB)").
+func snippetOf(body []byte) string {
+	if len(body) <= maxSnippetBytes {
+		return string(body)
+	}
+	n := maxSnippetBytes
+	for n > 0 && !utf8.RuneStart(body[n]) {
+		n--
+	}
+	return string(body[:n])
+}
+
+// registerFetchAndIndex: 핸들러의 구체 호출은 netfetch.Fetch→ingest.RunWeb 2개뿐(규약 §2 —
+// mcp만 netfetch를 import하고, ingest에는 원시 인자로 배선해 ingest→netfetch 의존을 피한다).
+func registerFetchAndIndex(srv *mcp.Server, st *store.Store, allowLocal bool, extraPorts []int) {
+	destructive := false
+	mcp.AddTool(srv, &mcp.Tool{
+		Name:        "ctr_fetch_and_index",
+		Description: "URL을 SSRF 안전 정책으로 가져와 색인에 등록한다.",
+		Annotations: &mcp.ToolAnnotations{DestructiveHint: &destructive},
+	}, func(ctx context.Context, _ *mcp.CallToolRequest, in FetchAndIndexInput) (*mcp.CallToolResult, FetchAndIndexOutput, error) {
+		start := time.Now()
+		if in.URL == "" {
+			return nil, FetchAndIndexOutput{}, toolErr(codeInvalidArgument, "url이 필요합니다")
+		}
+		res, err := netfetch.Fetch(ctx, netfetch.Config{AllowLocal: allowLocal, ExtraPorts: extraPorts, MaxBytes: in.MaxBytes}, in.URL)
+		if err != nil {
+			return nil, FetchAndIndexOutput{}, toToolError(err)
+		}
+		rep, err := ingest.RunWeb(ctx, st, res.FinalURL, res.RawHTML, res.Body, res.MediaType, res.Extraction)
+		if err != nil {
+			return nil, FetchAndIndexOutput{}, toToolError(err)
+		}
+		out := FetchAndIndexOutput{
+			ArtifactID: rep.ArtifactID, Title: res.FinalURL, ByteLength: rep.ByteLength,
+			Extraction: res.Extraction, IndexedChunks: rep.IndexedChunks, Snippet: snippetOf(res.Body),
+		}
+		st.LedgerAppend("ctr_fetch_and_index", rep.ByteLength, jsonLen(out), time.Since(start).Milliseconds())
 		return nil, out, nil
 	})
 }

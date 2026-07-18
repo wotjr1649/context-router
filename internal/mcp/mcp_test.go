@@ -7,11 +7,15 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -21,6 +25,7 @@ import (
 
 	"github.com/wotjr1649/context-router/internal/ident"
 	"github.com/wotjr1649/context-router/internal/ingest"
+	"github.com/wotjr1649/context-router/internal/netfetch"
 	"github.com/wotjr1649/context-router/internal/store"
 	"github.com/wotjr1649/context-router/internal/transform"
 )
@@ -82,6 +87,7 @@ func TestToToolError(t *testing.T) {
 		{"output_limit", transform.ErrOutputLimit, codeOutputLimitExceeded},
 		{"workspace", ingest.ErrWorkspace, codeWorkspaceViolation},
 		{"unsupported", ingest.ErrUnsupported, codeUnsupportedFile},
+		{"network_denied", netfetch.ErrDenied, codeNetworkDenied},
 		{"not_exist", fs.ErrNotExist, codeNotFound},
 		{"not_exist_wrapped", fmt.Errorf("ingest: canonicalize: %w", fs.ErrNotExist), codeNotFound},
 		{"unknown", errors.New("boom"), codeInternal},
@@ -138,6 +144,7 @@ func TestNewServerProfileGating(t *testing.T) {
 	}{
 		{"base", nil, []string{"ctr_fetch", "ctr_search", "ctr_transform"}},
 		{"ingest", []string{"ingest"}, []string{"ctr_fetch", "ctr_index", "ctr_search", "ctr_transform"}},
+		{"net", []string{"net"}, []string{"ctr_fetch", "ctr_fetch_and_index", "ctr_search", "ctr_transform"}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -608,4 +615,148 @@ func TestCtrTransformDescriptionMentionsDefWrapping(t *testing.T) {
 		return
 	}
 	t.Fatal("ctr_transform 도구 없음")
+}
+
+// --- ctr_fetch_and_index (설계 §4.5, T6) ---
+
+// srvPort extracts srv.URL's port as int (httptest 서버는 임의 포트를 쓰므로 ExtraPorts에
+// 필요 — internal/netfetch/netfetch_test.go의 동형 헬퍼를 패키지 경계상 재사용 불가해 복제).
+func srvPort(t *testing.T, rawURL string) int {
+	t.Helper()
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		t.Fatalf("parse %s: %v", rawURL, err)
+	}
+	p, err := strconv.Atoi(u.Port())
+	if err != nil {
+		t.Fatalf("port of %s: %v", rawURL, err)
+	}
+	return p
+}
+
+// newNetTestServer: newTestServer과 동형이나 "net" 프로필+NetAllowLocal/NetPorts까지
+// 구성하고, store와 저장 디렉터리(raw blob 파일 확인용)도 반환한다(T6 전용).
+func newNetTestServer(t *testing.T, allowLocal bool, ports []int) (*mcp.ClientSession, *store.Store, string) {
+	t.Helper()
+	dir := t.TempDir()
+	canon, err := ident.Canonicalize(dir)
+	if err != nil {
+		t.Fatalf("canonicalize: %v", err)
+	}
+	storeDir := t.TempDir()
+	st, err := store.Open(storeDir, false)
+	if err != nil {
+		t.Fatalf("store open: %v", err)
+	}
+	t.Cleanup(func() { st.Close() })
+
+	srv, err := NewServer(Config{
+		Canon: canon, Store: st, SelfExe: testSelfExe(t), Enable: []string{"net"},
+		NetAllowLocal: allowLocal, NetPorts: ports,
+	})
+	if err != nil {
+		t.Fatalf("new server: %v", err)
+	}
+	srvT, cliT := mcp.NewInMemoryTransports()
+	ctx := context.Background()
+	if _, err := srv.Connect(ctx, srvT, nil); err != nil {
+		t.Fatalf("server connect: %v", err)
+	}
+	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "0"}, nil)
+	cs, err := client.Connect(ctx, cliT, nil)
+	if err != nil {
+		t.Fatalf("client connect: %v", err)
+	}
+	t.Cleanup(func() { cs.Close() })
+	return cs, st, storeDir
+}
+
+const fetchAndIndexTestPage = `<html><body><h1>Sample Doc</h1><p>needle unique marker text for search verification.</p><script>var rawOnlyMarkerXYZ789 = 1;</script></body></html>`
+
+// TestCtrFetchAndIndexRoundTrip: fetch_and_index→search 본문 hit(+SourceCoordsExact=false
+// [이월 검증])·raw blob 파일 보존·FTS 미등록(스크립트 전용 마커는 검색으로 안 잡힘)을 확인한다.
+func TestCtrFetchAndIndexRoundTrip(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		w.Write([]byte(fetchAndIndexTestPage))
+	}))
+	defer srv.Close()
+
+	cs, st, storeDir := newNetTestServer(t, true, []int{srvPort(t, srv.URL)})
+	ctx := context.Background()
+
+	fiRes, err := cs.CallTool(ctx, &mcp.CallToolParams{Name: "ctr_fetch_and_index", Arguments: FetchAndIndexInput{URL: srv.URL}})
+	if err != nil {
+		t.Fatalf("ctr_fetch_and_index call: %v", err)
+	}
+	if fiRes.IsError {
+		t.Fatalf("ctr_fetch_and_index error: %+v", fiRes.Content)
+	}
+	var fiOut FetchAndIndexOutput
+	remarshal(t, fiRes.StructuredContent, &fiOut)
+	if fiOut.ArtifactID == 0 || fiOut.IndexedChunks == 0 || fiOut.ByteLength == 0 {
+		t.Fatalf("bad fetch_and_index output: %+v", fiOut)
+	}
+	if fiOut.Extraction == "" {
+		t.Fatalf("extraction empty: %+v", fiOut)
+	}
+	if len(fiOut.Snippet) == 0 || len(fiOut.Snippet) > 1024 {
+		t.Fatalf("bad snippet length=%d", len(fiOut.Snippet))
+	}
+
+	searchRes, err := cs.CallTool(ctx, &mcp.CallToolParams{Name: "ctr_search", Arguments: SearchInput{Queries: []string{"needle"}}})
+	if err != nil {
+		t.Fatalf("ctr_search call: %v", err)
+	}
+	var searchOut SearchOutput
+	remarshal(t, searchRes.StructuredContent, &searchOut)
+	if len(searchOut.Results) != 1 || len(searchOut.Results[0].Hits) == 0 {
+		t.Fatalf("no hits for body text: %+v", searchOut.Results)
+	}
+	if searchOut.Results[0].Hits[0].SourceCoordsExact {
+		t.Fatalf("want SourceCoordsExact=false for web source: %+v", searchOut.Results[0].Hits[0])
+	}
+
+	var rawBlobHash string
+	if err := st.Reader().QueryRow(`SELECT raw_blob_hash FROM sources WHERE artifact_id=?`, fiOut.ArtifactID).Scan(&rawBlobHash); err != nil {
+		t.Fatalf("query raw_blob_hash: %v", err)
+	}
+	if rawBlobHash == "" {
+		t.Fatalf("raw_blob_hash empty")
+	}
+	blobPath := filepath.Join(storeDir, "artifacts", rawBlobHash[:2], rawBlobHash)
+	raw, err := os.ReadFile(blobPath)
+	if err != nil {
+		t.Fatalf("read raw blob file: %v", err)
+	}
+	if string(raw) != fetchAndIndexTestPage {
+		t.Fatalf("raw blob content mismatch: %q", raw)
+	}
+
+	searchRes2, err := cs.CallTool(ctx, &mcp.CallToolParams{Name: "ctr_search", Arguments: SearchInput{Queries: []string{"rawOnlyMarkerXYZ789"}}})
+	if err != nil {
+		t.Fatalf("ctr_search(script marker) call: %v", err)
+	}
+	var searchOut2 SearchOutput
+	remarshal(t, searchRes2.StructuredContent, &searchOut2)
+	if len(searchOut2.Results) != 1 || len(searchOut2.Results[0].Hits) != 0 {
+		t.Fatalf("script-only marker unexpectedly indexed: %+v", searchOut2.Results)
+	}
+}
+
+// TestCtrFetchAndIndexDenied: AllowLocal=false에서 사설/루프백 목적지는 NETWORK_DENIED.
+func TestCtrFetchAndIndexDenied(t *testing.T) {
+	cs, _, _ := newNetTestServer(t, false, nil)
+	ctx := context.Background()
+	res, err := cs.CallTool(ctx, &mcp.CallToolParams{Name: "ctr_fetch_and_index", Arguments: FetchAndIndexInput{URL: "http://127.0.0.1:1/"}})
+	if err != nil {
+		t.Fatalf("call: %v", err)
+	}
+	if !res.IsError {
+		t.Fatalf("want IsError=true for denied local address, got %+v", res)
+	}
+	text := res.Content[0].(*mcp.TextContent).Text
+	if !strings.HasPrefix(text, "["+codeNetworkDenied+"]") {
+		t.Fatalf("want %s prefix, got %q", codeNetworkDenied, text)
+	}
 }

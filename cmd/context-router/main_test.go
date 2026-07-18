@@ -7,6 +7,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -42,6 +45,19 @@ func TestParseFlags(t *testing.T) {
 				t.Fatalf("enable=%v want %v", got.Enable, tt.want.Enable)
 			}
 		})
+	}
+}
+
+func TestParseFlagsNet(t *testing.T) {
+	got, err := parseFlags([]string{"--net-allow-local", "--net-ports", "8080,9090"})
+	if err != nil {
+		t.Fatalf("err=%v", err)
+	}
+	if !got.NetAllowLocal {
+		t.Fatalf("NetAllowLocal=false want true")
+	}
+	if len(got.NetPorts) != 2 || got.NetPorts[0] != 8080 || got.NetPorts[1] != 9090 {
+		t.Fatalf("NetPorts=%v want [8080 9090]", got.NetPorts)
 	}
 }
 
@@ -492,5 +508,56 @@ func TestE2E_TwoProcessConcurrentIndex(t *testing.T) {
 	}
 	if err := closeAndWait(cmd3, c3); err != nil {
 		t.Fatalf("process#3 exit: %v (stderr=%s)", err, stderrBuf3.String())
+	}
+}
+
+// TestE2E_FetchAndIndex: 실바이너리를 --enable net --net-allow-local --net-ports <포트>로
+// 띄우고 httptest URL을 ctr_fetch_and_index로 색인한 뒤 ctr_search로 본문을 찾는다(T6).
+func TestE2E_FetchAndIndex(t *testing.T) {
+	if testing.Short() {
+		t.Skip("느린 E2E 스모크 — short 모드 skip")
+	}
+	bin := buildCtrBinary(t)
+
+	const page = `<html><body><h1>Doc</h1><p>zulunet unique e2e marker text.</p></body></html>`
+	httpSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		w.Write([]byte(page))
+	}))
+	defer httpSrv.Close()
+	u, err := url.Parse(httpSrv.URL)
+	if err != nil {
+		t.Fatalf("parse httptest url: %v", err)
+	}
+
+	proj := t.TempDir()
+	storeRoot := t.TempDir()
+	cmd, c, stderrBuf, err := spawnCtr(t, bin, "--root", proj, "--store-root", storeRoot,
+		"--enable", "net", "--net-allow-local", "--net-ports", u.Port())
+	if err != nil {
+		t.Fatalf("spawn: %v", err)
+	}
+	if err := handshake(c, "ctr-e2e-net"); err != nil {
+		t.Fatalf("handshake: %v", err)
+	}
+
+	var fiOut mcp.FetchAndIndexOutput
+	if err := callTool(c, "ctr_fetch_and_index", mcp.FetchAndIndexInput{URL: httpSrv.URL}, &fiOut); err != nil {
+		t.Fatalf("ctr_fetch_and_index: %v", err)
+	}
+	if fiOut.ArtifactID == 0 || fiOut.IndexedChunks == 0 {
+		t.Fatalf("bad fetch_and_index output: %+v", fiOut)
+	}
+
+	var searchOut mcp.SearchOutput
+	if err := callTool(c, "ctr_search", mcp.SearchInput{Queries: []string{"zulunet"}}, &searchOut); err != nil {
+		t.Fatalf("ctr_search: %v", err)
+	}
+	if len(searchOut.Results) != 1 || len(searchOut.Results[0].Hits) == 0 {
+		t.Fatalf("no hits: %+v", searchOut.Results)
+	}
+
+	if err := closeAndWait(cmd, c); err != nil {
+		t.Fatalf("process exit: %v (stderr=%s)", err, stderrBuf.String())
 	}
 }
