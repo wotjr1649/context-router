@@ -223,6 +223,18 @@ func Spawn(ctx context.Context, selfExe string, req Request) (Result, error) {
 	return res, nil
 }
 
+// ProbeIsolation: OS 메모리 격리(applyMemLimit)가 이 환경에서 실제로 동작하는지 최소 비용
+// (빈 스크립트 1회 Spawn)으로 확인한다. mcp.NewServer가 ctr_transform 등록 여부를 정하는 데
+// 쓴다 — 실패 시 도구 자체를 미등록해야 한다(in-process fallback 금지, 설계 §4.3/§5.3).
+// Spawn의 error 반환은 정확히 "실행을 시작조차 못함"(ctx 취소·인코딩 실패·ErrNoIsolation)
+// 케이스뿐이므로 그대로 반환해 호출자가 원인을 구분할 수 있게 한다.
+func ProbeIsolation(selfExe string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), defaultWorkerTimeout)
+	defer cancel()
+	_, err := Spawn(ctx, selfExe, Request{Script: ""})
+	return err
+}
+
 // displayString: emit()의 str() 대응 — 문자열은 따옴표 없이, 그 외는 starlark 기본 표현.
 func displayString(v starlark.Value) string {
 	if s, ok := v.(starlark.String); ok {

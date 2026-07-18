@@ -8,9 +8,12 @@ import (
 	"io"
 	"io/fs"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -19,7 +22,50 @@ import (
 	"github.com/wotjr1649/context-router/internal/ident"
 	"github.com/wotjr1649/context-router/internal/ingest"
 	"github.com/wotjr1649/context-router/internal/store"
+	"github.com/wotjr1649/context-router/internal/transform"
 )
+
+// testSelfExe: 실 ctr 바이너리를 1회만 빌드해(sync.Once) 재사용한다 — ctr_transform은
+// 실제 "__transform-worker" 프로세스 경계를 타므로(internal/transform/worker_test.go와
+// 동형 패턴), NewServer의 ProbeIsolation·Spawn이 프로덕션과 동일 경로로 검증된다.
+var (
+	testExeOnce sync.Once
+	testExePath string
+	testExeErr  error
+)
+
+func testSelfExe(t *testing.T) string {
+	t.Helper()
+	testExeOnce.Do(func() {
+		dir, err := os.MkdirTemp("", "ctr-mcp-test-*")
+		if err != nil {
+			testExeErr = err
+			return
+		}
+		bin := filepath.Join(dir, "ctr-test")
+		if runtime.GOOS == "windows" {
+			bin += ".exe"
+		}
+		cmd := exec.Command("go", "build", "-o", bin, "github.com/wotjr1649/context-router/cmd/context-router")
+		if out, err := cmd.CombinedOutput(); err != nil {
+			testExeErr = fmt.Errorf("selfExe 빌드 실패: %w: %s", err, out)
+			return
+		}
+		testExePath = bin
+	})
+	if testExeErr != nil {
+		t.Fatalf("selfExe 빌드 실패: %v", testExeErr)
+	}
+	return testExePath
+}
+
+func TestMain(m *testing.M) {
+	code := m.Run()
+	if testExePath != "" {
+		os.RemoveAll(filepath.Dir(testExePath))
+	}
+	os.Exit(code)
+}
 
 func TestToToolError(t *testing.T) {
 	tests := []struct {
@@ -31,6 +77,9 @@ func TestToToolError(t *testing.T) {
 		{"not_found_wrapped", fmt.Errorf("op: %w", store.ErrNotFound), codeNotFound},
 		{"invalid_selector", store.ErrInvalidSelector, codeInvalidArgument},
 		{"unavailable", store.ErrUnavailable, codeStorageUnavailable},
+		{"no_isolation", transform.ErrNoIsolation, codeStorageUnavailable},
+		{"budget", transform.ErrBudget, codeBudgetExceeded},
+		{"output_limit", transform.ErrOutputLimit, codeOutputLimitExceeded},
 		{"workspace", ingest.ErrWorkspace, codeWorkspaceViolation},
 		{"unsupported", ingest.ErrUnsupported, codeUnsupportedFile},
 		{"not_exist", fs.ErrNotExist, codeNotFound},
@@ -62,7 +111,7 @@ func newTestServer(t *testing.T, enable []string) (*mcp.ClientSession, ident.Can
 	}
 	t.Cleanup(func() { st.Close() })
 
-	srv, err := NewServer(Config{Canon: canon, Store: st, Enable: enable})
+	srv, err := NewServer(Config{Canon: canon, Store: st, SelfExe: testSelfExe(t), Enable: enable})
 	if err != nil {
 		t.Fatalf("new server: %v", err)
 	}
@@ -87,8 +136,8 @@ func TestNewServerProfileGating(t *testing.T) {
 		enable []string
 		want   []string
 	}{
-		{"base", nil, []string{"ctr_fetch", "ctr_search"}},
-		{"ingest", []string{"ingest"}, []string{"ctr_fetch", "ctr_index", "ctr_search"}},
+		{"base", nil, []string{"ctr_fetch", "ctr_search", "ctr_transform"}},
+		{"ingest", []string{"ingest"}, []string{"ctr_fetch", "ctr_index", "ctr_search", "ctr_transform"}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -412,4 +461,151 @@ func TestApplyFetchBudgetNewlineBoundary(t *testing.T) {
 	if lineEnd != 2 {
 		t.Fatalf("lineEnd=%d want 2 (개행 경계 과계산 회귀)", lineEnd)
 	}
+}
+
+// TestCtrTransformRoundTrip: 색인(ingest) → artifact_id → ctr_transform이 저장된 텍스트
+// 길이를 정확히 반환해야 한다(T3 TDD 항목 2). def 래핑(top-level for/재귀 비활성) 준수 스크립트.
+func TestCtrTransformRoundTrip(t *testing.T) {
+	cs, canon := newTestServer(t, []string{"ingest"})
+	ctx := context.Background()
+
+	lt, err := cs.ListTools(ctx, nil)
+	if err != nil {
+		t.Fatalf("list tools: %v", err)
+	}
+	byName := map[string]*mcp.Tool{}
+	for _, tl := range lt.Tools {
+		byName[tl.Name] = tl
+	}
+	if tl := byName["ctr_transform"]; tl == nil || tl.Annotations == nil || !tl.Annotations.ReadOnlyHint {
+		t.Fatalf("ctr_transform readOnlyHint 누락: %+v", tl)
+	}
+
+	body := "needle content for transform round trip\n"
+	tmpFile := filepath.Join(canon.ProjectRoot, "xform.txt")
+	if err := os.WriteFile(tmpFile, []byte(body), 0o644); err != nil {
+		t.Fatalf("write tmp file: %v", err)
+	}
+	idxRes, err := cs.CallTool(ctx, &mcp.CallToolParams{Name: "ctr_index", Arguments: IndexInput{Path: tmpFile}})
+	if err != nil {
+		t.Fatalf("ctr_index call: %v", err)
+	}
+	if idxRes.IsError {
+		t.Fatalf("ctr_index error: %+v", idxRes.Content)
+	}
+
+	searchRes, err := cs.CallTool(ctx, &mcp.CallToolParams{Name: "ctr_search", Arguments: SearchInput{Queries: []string{"needle"}}})
+	if err != nil {
+		t.Fatalf("ctr_search call: %v", err)
+	}
+	var searchOut SearchOutput
+	remarshal(t, searchRes.StructuredContent, &searchOut)
+	if len(searchOut.Results) != 1 || len(searchOut.Results[0].Hits) == 0 {
+		t.Fatalf("no hits: %+v", searchOut.Results)
+	}
+	artifactID := searchOut.Results[0].Hits[0].ArtifactID
+
+	script := "def f():\n  emit(str(len(inputs[0].text())))\nf()\n"
+	xRes, err := cs.CallTool(ctx, &mcp.CallToolParams{Name: "ctr_transform", Arguments: TransformInput{Script: script, Inputs: []int64{artifactID}}})
+	if err != nil {
+		t.Fatalf("ctr_transform call: %v", err)
+	}
+	if xRes.IsError {
+		t.Fatalf("ctr_transform error: %+v", xRes.Content)
+	}
+	var xOut TransformOutput
+	remarshal(t, xRes.StructuredContent, &xOut)
+	want := fmt.Sprintf("%d", len(body))
+	if xOut.Result != want {
+		t.Fatalf("result=%q want %q (stored text length)", xOut.Result, want)
+	}
+}
+
+// TestCtrTransformCapsMapping: budget/output_limit 초과 스크립트가 각각 BUDGET_EXCEEDED/
+// OUTPUT_LIMIT_EXCEEDED로 매핑돼야 한다(T3 TDD 항목 3).
+func TestCtrTransformCapsMapping(t *testing.T) {
+	cs, _ := newTestServer(t, nil)
+	ctx := context.Background()
+
+	budgetRes, err := cs.CallTool(ctx, &mcp.CallToolParams{Name: "ctr_transform", Arguments: TransformInput{
+		Script: "def f():\n\tfor i in range(100000000):\n\t\tpass\n\nf()\n",
+	}})
+	if err != nil {
+		t.Fatalf("budget call: %v", err)
+	}
+	if !budgetRes.IsError {
+		t.Fatalf("want IsError=true for budget script, got %+v", budgetRes)
+	}
+	if text := budgetRes.Content[0].(*mcp.TextContent).Text; !strings.HasPrefix(text, "["+codeBudgetExceeded+"]") {
+		t.Fatalf("want %s prefix, got %q", codeBudgetExceeded, text)
+	}
+
+	outRes, err := cs.CallTool(ctx, &mcp.CallToolParams{Name: "ctr_transform", Arguments: TransformInput{
+		Script:         "def f():\n\tfor i in range(1000):\n\t\temit(\"x\")\n\nf()\n",
+		MaxOutputBytes: 4,
+	}})
+	if err != nil {
+		t.Fatalf("output_limit call: %v", err)
+	}
+	if !outRes.IsError {
+		t.Fatalf("want IsError=true for output_limit script, got %+v", outRes)
+	}
+	if text := outRes.Content[0].(*mcp.TextContent).Text; !strings.HasPrefix(text, "["+codeOutputLimitExceeded+"]") {
+		t.Fatalf("want %s prefix, got %q", codeOutputLimitExceeded, text)
+	}
+}
+
+// TestCtrTransformInputValidation: inputs 9개(최대 8 초과)·script 64KB 초과는 각각
+// INVALID_ARGUMENT여야 한다(T3 TDD 항목 4, 승계 (c)).
+func TestCtrTransformInputValidation(t *testing.T) {
+	cs, _ := newTestServer(t, nil)
+	ctx := context.Background()
+
+	tooManyInputs := make([]int64, 9)
+	for i := range tooManyInputs {
+		tooManyInputs[i] = int64(i + 1)
+	}
+	res, err := cs.CallTool(ctx, &mcp.CallToolParams{Name: "ctr_transform", Arguments: TransformInput{
+		Script: "def f():\n  emit('x')\nf()\n", Inputs: tooManyInputs,
+	}})
+	if err != nil {
+		t.Fatalf("9-inputs call: %v", err)
+	}
+	if !res.IsError {
+		t.Fatalf("want IsError=true for 9 inputs, got %+v", res)
+	}
+	if text := res.Content[0].(*mcp.TextContent).Text; !strings.HasPrefix(text, "["+codeInvalidArgument+"]") {
+		t.Fatalf("want %s prefix, got %q", codeInvalidArgument, text)
+	}
+
+	res2, err := cs.CallTool(ctx, &mcp.CallToolParams{Name: "ctr_transform", Arguments: TransformInput{Script: strings.Repeat("a", 70000)}})
+	if err != nil {
+		t.Fatalf("big-script call: %v", err)
+	}
+	if !res2.IsError {
+		t.Fatalf("want IsError=true for 64KB+ script, got %+v", res2)
+	}
+	if text := res2.Content[0].(*mcp.TextContent).Text; !strings.HasPrefix(text, "["+codeInvalidArgument+"]") {
+		t.Fatalf("want %s prefix, got %q", codeInvalidArgument, text)
+	}
+}
+
+// TestCtrTransformDescriptionMentionsDefWrapping: 도구 description에 def 래핑 제약이
+// 명시돼야 한다(T1/T2 승계 (b) — 모르면 자연스러운 top-level for/while 스크립트가 실패한다).
+func TestCtrTransformDescriptionMentionsDefWrapping(t *testing.T) {
+	cs, _ := newTestServer(t, nil)
+	lt, err := cs.ListTools(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("list tools: %v", err)
+	}
+	for _, tl := range lt.Tools {
+		if tl.Name != "ctr_transform" {
+			continue
+		}
+		if !strings.Contains(tl.Description, "def f()") {
+			t.Fatalf("description에 def 래핑 제약 누락: %q", tl.Description)
+		}
+		return
+	}
+	t.Fatal("ctr_transform 도구 없음")
 }

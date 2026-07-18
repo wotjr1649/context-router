@@ -207,8 +207,12 @@ func run(ctx context.Context, args []string, stderr io.Writer) error {
 	}
 	defer st.Close()
 
+	selfExe, err := os.Executable()
+	if err != nil {
+		return err
+	}
 	return mcp.Serve(ctx, mcp.Config{
-		Canon: canon, Store: st,
+		Canon: canon, Store: st, SelfExe: selfExe,
 		Profile: f.Profile, Enable: f.Enable, AllowPaths: allowPaths,
 	})
 }

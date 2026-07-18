@@ -39,7 +39,7 @@ func Open(dir string, readOnly bool) (*Store, error) {
 		// 0o700: store 루트+artifacts 모두 이 한 호출로 생성(MkdirAll이 만드는 모든 중간
 		// 디렉터리에 동일 perm 적용) — Windows는 Unix perm bit 무시(§10 no-op, 주석만).
 		if err := os.MkdirAll(filepath.Join(dir, "artifacts"), 0o700); err != nil {
-			return nil, fmt.Errorf("store open: %w", err)
+			return nil, sanitizeIOErr("open mkdir", err)
 		}
 	}
 	dsn := "file:" + filepath.ToSlash(filepath.Join(dir, "content.db")) + pragmas
@@ -516,6 +516,30 @@ func StaleOf(info SourceInfo) bool {
 	}
 	sum := sha256.Sum256(raw)
 	return hex.EncodeToString(sum[:]) != info.SrcHash
+}
+
+// ArtifactText: artifactID의 저장 콘텐츠 전체를 문자열로 반환한다(ctr_transform 입력 로더,
+// 설계 §4.2.3). byte_length(메타데이터)가 maxBytes를 넘으면 blob을 읽지 않고 즉시
+// ErrInvalidSelector로 거부한다. maxBytes<=0이면 상한 미적용.
+func (s *Store) ArtifactText(ctx context.Context, artifactID int64, maxBytes int64) (string, error) {
+	var contentHash string
+	var byteLength int64
+	err := s.reader.QueryRowContext(ctx, "SELECT content_hash,byte_length FROM artifacts WHERE id=?", artifactID).
+		Scan(&contentHash, &byteLength)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", fmt.Errorf("store ArtifactText: artifact 없음: %w", ErrNotFound)
+	}
+	if err != nil {
+		return "", fmt.Errorf("store ArtifactText: %w", err)
+	}
+	if maxBytes > 0 && byteLength > maxBytes {
+		return "", fmt.Errorf("store ArtifactText: byte_length=%d > maxBytes=%d: %w", byteLength, maxBytes, ErrInvalidSelector)
+	}
+	blob, err := s.readBlob(contentHash)
+	if err != nil {
+		return "", err
+	}
+	return string(blob), nil
 }
 
 // ReadRange: Selector.Kind 하나로 chunk 저장 좌표, blob 라인 스캔, blob UTF-8 스냅 바이트

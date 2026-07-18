@@ -502,6 +502,47 @@ func TestReadRange_FillsSourceAndStale(t *testing.T) {
 	}
 }
 
+// TestOpen_MkdirAllErrorHidesPath: 이월 c — Open()의 MkdirAll 실패도(readBlob 계열과
+// 동일하게) sanitizeIOErr를 거쳐 절대경로를 노출하면 안 된다.
+func TestOpen_MkdirAllErrorHidesPath(t *testing.T) {
+	base := t.TempDir()
+	blocked := filepath.Join(base, "blocked")
+	if err := os.WriteFile(blocked, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// blocked는 파일이라 MkdirAll(blocked/artifacts)가 반드시 실패한다.
+	_, err := Open(blocked, false)
+	if err == nil {
+		t.Fatal("want error, got nil")
+	}
+	if strings.Contains(err.Error(), blocked) {
+		t.Fatalf("오류에 경로 노출: %v", err)
+	}
+}
+
+// TestArtifactText: ctr_transform 입력 로더 — 존재하는 artifact는 원문 그대로, 없으면
+// ErrNotFound, byte_length가 maxBytes를 넘으면 ErrInvalidSelector(§4.2.3).
+func TestArtifactText(t *testing.T) {
+	s := openT(t)
+	body := "hello transform input"
+	id, err := s.Register(t.Context(), Registration{StoredBytes: []byte(body), MediaType: "text/plain",
+		Source: SourceMeta{URI: "/t.txt", Kind: "file", SrcHash: "ht"},
+		Chunks: []Chunk{{Ordinal: 0, Text: body}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.ArtifactText(t.Context(), id, 0)
+	if err != nil || got != body {
+		t.Fatalf("got=%q err=%v want %q", got, err, body)
+	}
+	if _, err := s.ArtifactText(t.Context(), id, int64(len(body)-1)); !errors.Is(err, ErrInvalidSelector) {
+		t.Fatalf("want ErrInvalidSelector for maxBytes 초과, got %v", err)
+	}
+	if _, err := s.ArtifactText(t.Context(), 9999, 0); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("want ErrNotFound, got %v", err)
+	}
+}
+
 func FuzzSnapUTF8(f *testing.F) {
 	f.Add([]byte("가나다"), int64(1), int64(4))
 	f.Add([]byte("hello\nworld"), int64(0), int64(11))
