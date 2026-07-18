@@ -12,8 +12,10 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 	"unicode/utf8"
@@ -646,11 +648,19 @@ func TestArtifactText(t *testing.T) {
 	}
 }
 
-// TestMain: CTR_TEST_CHILD=1이면 자기 바이너리 재실행 자식 프로세스 모드 —
-// TestOpen_ConcurrentFirstMigration의 2-프로세스 경합 재현용(go/os/exec 표준 helper-process 패턴).
+// TestMain: CTR_TEST_CHILD=1이면 자기 바이너리 재실행 자식 프로세스 모드(go/os/exec 표준
+// helper-process 패턴) — CTR_TEST_CHILD_MODE로 시나리오를 고른다(미지정=기존 최초-마이그레이션
+// 경합, "cas-race"=게이트7 심층 CAS 2-프로세스 경쟁, "kill-write"=게이트7 심층 강제kill 내구성).
 func TestMain(m *testing.M) {
 	if os.Getenv("CTR_TEST_CHILD") == "1" {
-		os.Exit(runConcurrentOpenChild())
+		switch os.Getenv("CTR_TEST_CHILD_MODE") {
+		case "cas-race":
+			os.Exit(runCASRaceChild())
+		case "kill-write":
+			os.Exit(runKillWriteChild())
+		default:
+			os.Exit(runConcurrentOpenChild())
+		}
 	}
 	os.Exit(m.Run())
 }
@@ -736,6 +746,350 @@ func TestOpen_ConcurrentFirstMigration(t *testing.T) {
 			}(c)
 		}
 		wg.Wait()
+	}
+}
+
+// runCASRaceChild: 게이트7 심층(P1a, Codex 교차리뷰) 자식 — 같은 URI("/cas-race.txt")에
+// 서로 다른 컨텐츠로 등록을 시도하되 둘 다 동일한 ExpectedOldSrcHash("h-base")로 CAS 경쟁한다
+// (§3.5: UPDATE ... WHERE uri=? AND src_hash=? — 먼저 커밋한 쪽만 매치되고, 나머지는 그
+// 시점엔 이미 src_hash가 바뀌어 있어 RowsAffected=0→ErrConflict). 결과를 stdout 한 줄로
+// 보고해 부모가 "정확히 하나만 성공"을 판별하게 한다.
+func runCASRaceChild() int {
+	dir := os.Getenv("CTR_TEST_CHILD_DIR")
+	signal := os.Getenv("CTR_TEST_CHILD_SIGNAL")
+	id := os.Getenv("CTR_TEST_CHILD_ID")
+	for {
+		if _, err := os.Stat(signal); err == nil {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	s, err := Open(dir, false)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "open:", err)
+		return 1
+	}
+	defer s.Close()
+	body := "cas-race-content-" + id
+	_, err = s.Register(context.Background(), Registration{
+		StoredBytes:        []byte(body),
+		MediaType:          "text/plain",
+		Source:             SourceMeta{URI: "/cas-race.txt", Kind: "file", SrcHash: "h-" + id},
+		ExpectedOldSrcHash: "h-base",
+		Chunks:             []Chunk{{Ordinal: 0, Text: body}},
+	})
+	switch {
+	case err == nil:
+		fmt.Println("WON")
+		return 0
+	case errors.Is(err, ErrConflict):
+		fmt.Println("LOST")
+		return 0
+	default:
+		fmt.Fprintln(os.Stderr, "register unexpected:", err)
+		return 1
+	}
+}
+
+// TestRegister_TwoProcessCASRace: 게이트7 심층(P1a, Codex 교차리뷰) — 실 OS 프로세스 2개가
+// 같은 소스 URI를 서로 다른 콘텐츠·구지문 기반 CAS로 경쟁하면 정확히 하나만 커밋되고,
+// 최종 sources 포인터는 두 후보 중 하나의 완결 상태여야 한다(과거 base로 회귀 금지) +
+// FTS integrity-check 통과.
+func TestRegister_TwoProcessCASRace(t *testing.T) {
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	storeDir := t.TempDir()
+	signal := filepath.Join(t.TempDir(), "start.signal")
+
+	base, err := Open(storeDir, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := base.Register(context.Background(), Registration{
+		StoredBytes: []byte("base"), MediaType: "text/plain",
+		Source: SourceMeta{URI: "/cas-race.txt", Kind: "file", SrcHash: "h-base"},
+		Chunks: []Chunk{{Ordinal: 0, Text: "base"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := base.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	cmds := make([]*exec.Cmd, 2)
+	outs := make([]bytes.Buffer, 2)
+	errBufs := make([]bytes.Buffer, 2)
+	for c := range cmds {
+		cmd := exec.Command(exe)
+		cmd.Env = append(os.Environ(),
+			"CTR_TEST_CHILD=1", "CTR_TEST_CHILD_MODE=cas-race",
+			"CTR_TEST_CHILD_DIR="+storeDir, "CTR_TEST_CHILD_SIGNAL="+signal,
+			fmt.Sprintf("CTR_TEST_CHILD_ID=%d", c+1))
+		cmd.Stdout = &outs[c]
+		cmd.Stderr = &errBufs[c]
+		if err := cmd.Start(); err != nil {
+			t.Fatalf("child %d start: %v", c, err)
+		}
+		cmds[c] = cmd
+	}
+	time.Sleep(20 * time.Millisecond) // 두 자식 모두 signal 폴링 루프에 들어갈 시간 확보
+	if err := os.WriteFile(signal, []byte("go"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var wg sync.WaitGroup
+	for c := range cmds {
+		wg.Add(1)
+		go func(c int) {
+			defer wg.Done()
+			if err := cmds[c].Wait(); err != nil {
+				t.Errorf("child %d 실패: %v (stderr=%s)", c, err, errBufs[c].String())
+			}
+		}(c)
+	}
+	wg.Wait()
+
+	wonCount, lostCount := 0, 0
+	results := [2]string{strings.TrimSpace(outs[0].String()), strings.TrimSpace(outs[1].String())}
+	for _, r := range results {
+		switch r {
+		case "WON":
+			wonCount++
+		case "LOST":
+			lostCount++
+		default:
+			t.Fatalf("unexpected child stdout: %q (results=%v)", r, results)
+		}
+	}
+	if wonCount != 1 || lostCount != 1 {
+		t.Fatalf("want exactly 1 WON + 1 LOST, got results=%v", results)
+	}
+
+	final, err := Open(storeDir, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer final.Close()
+	var srcHash string
+	var artifactID int64
+	if err := final.Reader().QueryRow(
+		"SELECT src_hash, artifact_id FROM sources WHERE uri='/cas-race.txt'",
+	).Scan(&srcHash, &artifactID); err != nil {
+		t.Fatalf("query final sources row: %v", err)
+	}
+	if srcHash != "h-1" && srcHash != "h-2" {
+		t.Fatalf("src_hash=%q want h-1 or h-2 (과거 h-base로 회귀 금지)", srcHash)
+	}
+	wantBody := "cas-race-content-" + strings.TrimPrefix(srcHash, "h-")
+	text, err := final.ArtifactText(context.Background(), artifactID, 0)
+	if err != nil {
+		t.Fatalf("ArtifactText: %v", err)
+	}
+	if text != wantBody {
+		t.Fatalf("final content=%q want %q (src_hash=%s와 불일치 — 교차오염 의심)", text, wantBody, srcHash)
+	}
+	if err := final.checkFTSIntegrity(context.Background()); err != nil {
+		t.Fatalf("integrity-check: %v", err)
+	}
+}
+
+// runKillWriteChild: 게이트7 심층(P1b, Codex 교차리뷰) 자식 — 대량 Register 루프(각 호출이
+// 자신의 BEGIN IMMEDIATE 트랜잭션, §3.5)를 돈다. 부모가 도중에 강제 kill할 것을 전제로 하며,
+// 끝까지 완주해도(kill이 너무 늦었을 뿐) 무해하다.
+func runKillWriteChild() int {
+	dir := os.Getenv("CTR_TEST_CHILD_DIR")
+	signal := os.Getenv("CTR_TEST_CHILD_SIGNAL")
+	n, err := strconv.Atoi(os.Getenv("CTR_TEST_CHILD_ITERS"))
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "iters parse:", err)
+		return 1
+	}
+	for {
+		if _, err := os.Stat(signal); err == nil {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	s, err := Open(dir, false)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "open:", err)
+		return 1
+	}
+	for i := 0; i < n; i++ {
+		body := fmt.Sprintf("kill-write-body-%d", i)
+		if _, err := s.Register(context.Background(), Registration{
+			StoredBytes: []byte(body), MediaType: "text/plain",
+			Source: SourceMeta{URI: fmt.Sprintf("/kill-race-%05d.txt", i), Kind: "file", SrcHash: fmt.Sprintf("h%d", i)},
+			Chunks: []Chunk{{Ordinal: 0, Text: body}},
+		}); err != nil {
+			fmt.Fprintln(os.Stderr, "register", i, ":", err)
+			return 1
+		}
+	}
+	return 0
+}
+
+// TestOpen_SurvivesWriteKillMidLoop: 게이트7 심층(P1b, Codex 교차리뷰) — 자식이 대량
+// Register 루프 도중 부모의 강제 kill(SIGKILL 상당/TerminateProcess)을 맞아도, 재오픈 시
+// quick_check·FTS integrity-check가 통과하고 이미 커밋된 행은 완전한 형태로 읽혀야 한다
+// (§3.5 단일 트랜잭션 계약 — 부분 반영 없음. lockStore 주석대로 커널이 advisory lock을
+// 자동 해제하므로 재오픈이 멎지 않는다).
+func TestOpen_SurvivesWriteKillMidLoop(t *testing.T) {
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	storeDir := t.TempDir()
+	signal := filepath.Join(t.TempDir(), "start.signal")
+	const n = 5000
+
+	cmd := exec.Command(exe)
+	cmd.Env = append(os.Environ(),
+		"CTR_TEST_CHILD=1", "CTR_TEST_CHILD_MODE=kill-write",
+		"CTR_TEST_CHILD_DIR="+storeDir, "CTR_TEST_CHILD_SIGNAL="+signal,
+		fmt.Sprintf("CTR_TEST_CHILD_ITERS=%d", n))
+	var errBuf bytes.Buffer
+	cmd.Stderr = &errBuf
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("child start: %v", err)
+	}
+	time.Sleep(20 * time.Millisecond) // 자식이 signal 폴링 루프에 들어갈 시간 확보
+	if err := os.WriteFile(signal, []byte("go"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(50 * time.Millisecond) // n=5000회 완주보다 훨씬 짧은 창 — 루프 도중 kill 목표
+	if err := cmd.Process.Kill(); err != nil {
+		t.Fatalf("kill: %v", err)
+	}
+	_, _ = cmd.Process.Wait() // 좀비 방지 — exit status는 강제kill이라 무시
+
+	s, err := Open(storeDir, false)
+	if err != nil {
+		t.Fatalf("reopen after kill: %v", err)
+	}
+	defer s.Close()
+
+	var quick string
+	if err := s.Reader().QueryRow("PRAGMA quick_check").Scan(&quick); err != nil {
+		t.Fatalf("quick_check query: %v", err)
+	}
+	if quick != "ok" {
+		t.Fatalf("quick_check=%q want ok", quick)
+	}
+	if err := s.checkFTSIntegrity(context.Background()); err != nil {
+		t.Fatalf("integrity-check: %v", err)
+	}
+
+	var committed int
+	if err := s.Reader().QueryRow(
+		"SELECT COUNT(*) FROM sources WHERE uri LIKE '/kill-race-%'",
+	).Scan(&committed); err != nil {
+		t.Fatalf("count sources: %v", err)
+	}
+	t.Logf("kill mid-loop: %d/%d rows committed before kill", committed, n)
+	if committed > n {
+		t.Fatalf("committed=%d > iters=%d — 불가능(무결성 훼손 의심)", committed, n)
+	}
+
+	rows, err := s.Reader().Query("SELECT uri, artifact_id FROM sources WHERE uri LIKE '/kill-race-%'")
+	if err != nil {
+		t.Fatalf("query committed rows: %v", err)
+	}
+	defer rows.Close()
+	checked := 0
+	for rows.Next() {
+		var uri string
+		var artID int64
+		if err := rows.Scan(&uri, &artID); err != nil {
+			t.Fatalf("scan: %v", err)
+		}
+		var idx int
+		if _, err := fmt.Sscanf(uri, "/kill-race-%05d.txt", &idx); err != nil {
+			t.Fatalf("parse uri %q: %v", uri, err)
+		}
+		wantBody := fmt.Sprintf("kill-write-body-%d", idx)
+		text, err := s.ArtifactText(context.Background(), artID, 0)
+		if err != nil {
+			t.Fatalf("ArtifactText(%d): %v", artID, err)
+		}
+		if text != wantBody {
+			t.Fatalf("row %q content=%q want %q (부분 반영 의심)", uri, text, wantBody)
+		}
+		checked++
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if checked != committed {
+		t.Fatalf("checked=%d != committed count=%d", checked, committed)
+	}
+}
+
+// TestConcurrency_Writer1Reader4: 게이트7(P1c, Codex 교차리뷰) — writer 고루틴 1개가 연속
+// Register하는 동안 reader 고루틴 4개(=Reader() 풀 크기 SetMaxOpenConns(4)와 일치)가 raw FTS
+// MATCH 질의 + ArtifactText를 연속 수행해도 오류가 0이어야 한다(-race는 CI ubuntu 잡이 커버).
+func TestConcurrency_Writer1Reader4(t *testing.T) {
+	s := openT(t)
+	const writes = 300
+	var errCount atomic.Int64
+	var latestArtifactID atomic.Int64
+
+	var writeWG sync.WaitGroup
+	writeWG.Add(1)
+	go func() {
+		defer writeWG.Done()
+		for i := 0; i < writes; i++ {
+			body := fmt.Sprintf("needle concurrent body %d", i)
+			id, err := s.Register(context.Background(), Registration{
+				StoredBytes: []byte(body), MediaType: "text/plain",
+				Source: SourceMeta{URI: fmt.Sprintf("/writer-%d.txt", i), Kind: "file", SrcHash: fmt.Sprintf("h%d", i)},
+				Chunks: []Chunk{{Ordinal: 0, Text: body}},
+			})
+			if err != nil {
+				t.Errorf("register %d: %v", i, err)
+				errCount.Add(1)
+				return
+			}
+			latestArtifactID.Store(id)
+		}
+	}()
+
+	stop := make(chan struct{})
+	go func() { writeWG.Wait(); close(stop) }()
+
+	var readWG sync.WaitGroup
+	for r := 0; r < 4; r++ {
+		readWG.Add(1)
+		go func(r int) {
+			defer readWG.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				rows, err := s.Reader().QueryContext(context.Background(),
+					`SELECT rowid FROM fts_porter WHERE fts_porter MATCH ? LIMIT 5`, `"needle"`)
+				if err != nil {
+					t.Errorf("reader %d fts query: %v", r, err)
+					errCount.Add(1)
+					return
+				}
+				rows.Close()
+				if id := latestArtifactID.Load(); id != 0 {
+					if _, err := s.ArtifactText(context.Background(), id, 0); err != nil {
+						t.Errorf("reader %d ArtifactText(%d): %v", r, id, err)
+						errCount.Add(1)
+						return
+					}
+				}
+			}
+		}(r)
+	}
+	readWG.Wait()
+	if errCount.Load() != 0 {
+		t.Fatalf("errCount=%d want 0", errCount.Load())
 	}
 }
 
