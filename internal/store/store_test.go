@@ -240,6 +240,68 @@ func TestRegister_CASRejectsStaleWriter(t *testing.T) {
 	}
 }
 
+// TestRegister_ReindexUpdatesRawBlobHashAndExtraction: 리뷰 Important — 같은 URI를
+// ExpectedOldSrcHash 없이(ingest.RunWeb 경로) raw blob/extraction이 다른 값으로 재등록하면
+// sources.raw_blob_hash·extraction이 최신 값으로 갱신돼야 한다. 과거엔 ON CONFLICT DO UPDATE가
+// 이 두 컬럼을 빼먹어 최초 값에 고정되고 새로 쓴 raw blob이 영구 고아가 됐다.
+func TestRegister_ReindexUpdatesRawBlobHashAndExtraction(t *testing.T) {
+	s := openT(t)
+	uri := "https://example.com/p"
+	reg1 := Registration{StoredBytes: []byte("body v1"), MediaType: "text/plain",
+		Source:  SourceMeta{URI: uri, Kind: "web", SrcHash: "h-v1", Extraction: "readability"},
+		Chunks:  []Chunk{{Ordinal: 0, Text: "body v1"}},
+		RawBlob: []byte("<html>v1</html>")}
+	if _, err := s.Register(t.Context(), reg1); err != nil {
+		t.Fatal(err)
+	}
+	reg2 := Registration{StoredBytes: []byte("body v2"), MediaType: "text/plain",
+		Source:  SourceMeta{URI: uri, Kind: "web", SrcHash: "h-v2", Extraction: "full"},
+		Chunks:  []Chunk{{Ordinal: 0, Text: "body v2"}},
+		RawBlob: []byte("<html>v2 differs</html>")}
+	if _, err := s.Register(t.Context(), reg2); err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256(reg2.RawBlob)
+	want := hex.EncodeToString(sum[:])
+	var gotHash, gotExtraction string
+	if err := s.reader.QueryRow("SELECT raw_blob_hash, extraction FROM sources WHERE uri=?", uri).
+		Scan(&gotHash, &gotExtraction); err != nil {
+		t.Fatal(err)
+	}
+	if gotHash != want {
+		t.Fatalf("raw_blob_hash=%q want %q (재색인 후 stale — 고아 blob)", gotHash, want)
+	}
+	if gotExtraction != "full" {
+		t.Fatalf("extraction=%q want %q", gotExtraction, "full")
+	}
+}
+
+// TestRegister_FileReindexRawBlobHashStaysEmpty: file 경로는 RawBlob/Extraction을 넘기지
+// 않으므로(둘 다 빈값) 위 수정으로 excluded 참조를 추가해도 재색인 후 계속 NULL이어야 한다
+// (회귀 없음).
+func TestRegister_FileReindexRawBlobHashStaysEmpty(t *testing.T) {
+	s := openT(t)
+	reg := Registration{StoredBytes: []byte("v1"), MediaType: "text/plain",
+		Source: SourceMeta{URI: "/f.txt", Kind: "file", SrcHash: "h1"},
+		Chunks: []Chunk{{Ordinal: 0, Text: "v1"}}}
+	if _, err := s.Register(t.Context(), reg); err != nil {
+		t.Fatal(err)
+	}
+	reg.StoredBytes, reg.Source.SrcHash = []byte("v2"), "h2"
+	reg.Chunks = []Chunk{{Ordinal: 0, Text: "v2"}}
+	if _, err := s.Register(t.Context(), reg); err != nil {
+		t.Fatal(err)
+	}
+	var gotHash, gotExtraction sql.NullString
+	if err := s.reader.QueryRow("SELECT raw_blob_hash, extraction FROM sources WHERE uri=?", "/f.txt").
+		Scan(&gotHash, &gotExtraction); err != nil {
+		t.Fatal(err)
+	}
+	if gotHash.Valid || gotExtraction.Valid {
+		t.Fatalf("want NULL raw_blob_hash/extraction, got %v/%v", gotHash, gotExtraction)
+	}
+}
+
 func TestReadRange_Selectors(t *testing.T) {
 	s := openT(t)
 	body := "alpha\nbravo\ncharlie\n" // bytes: alpha(0-5)...
