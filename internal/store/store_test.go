@@ -1,12 +1,15 @@
 package store
 
 import (
+	"bytes"
+	"context"
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -602,6 +605,98 @@ func TestArtifactText(t *testing.T) {
 	}
 	if _, err := s.ArtifactText(t.Context(), 9999, 0); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("want ErrNotFound, got %v", err)
+	}
+}
+
+// TestMain: CTR_TEST_CHILD=1이면 자기 바이너리 재실행 자식 프로세스 모드 —
+// TestOpen_ConcurrentFirstMigration의 2-프로세스 경합 재현용(go/os/exec 표준 helper-process 패턴).
+func TestMain(m *testing.M) {
+	if os.Getenv("CTR_TEST_CHILD") == "1" {
+		os.Exit(runConcurrentOpenChild())
+	}
+	os.Exit(m.Run())
+}
+
+// runConcurrentOpenChild: 부모가 signal 파일을 만들 때까지 폴링 대기했다가 동시에
+// Open→Register→Close 1세트를 수행한다. 실패 시 stderr에 원인을 남기고 1 반환.
+func runConcurrentOpenChild() int {
+	dir := os.Getenv("CTR_TEST_CHILD_DIR")
+	signal := os.Getenv("CTR_TEST_CHILD_SIGNAL")
+	id := os.Getenv("CTR_TEST_CHILD_ID")
+	for {
+		if _, err := os.Stat(signal); err == nil {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	s, err := Open(dir, false)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "open:", err)
+		return 1
+	}
+	body := "concurrent-first-migration-" + id
+	if _, err := s.Register(context.Background(), Registration{
+		StoredBytes: []byte(body), MediaType: "text/plain",
+		Source: SourceMeta{URI: "/child-" + id + ".txt", Kind: "file", SrcHash: "h" + id},
+		Chunks: []Chunk{{Ordinal: 0, Text: body}},
+	}); err != nil {
+		fmt.Fprintln(os.Stderr, "register:", err)
+		s.Close()
+		return 1
+	}
+	if err := s.Close(); err != nil {
+		fmt.Fprintln(os.Stderr, "close:", err)
+		return 1
+	}
+	return 0
+}
+
+// TestOpen_ConcurrentFirstMigration: 신규 store 디렉터리 하나에 서브프로세스 2개가 동시에
+// 최초 Open(=최초 마이그레이션)을 개시했을 때 둘 다 성공해야 한다. busy_timeout이
+// journal_mode(WAL)보다 먼저 적용되지 않으면 timeout 0 상태에서 WAL 전환이 경합해
+// SQLITE_BUSY가 난다(게이트 7 심층, 세션01 Task9 발견). reps회 반복해 레이스 확률 확보.
+func TestOpen_ConcurrentFirstMigration(t *testing.T) {
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	const reps = 8
+	for i := 0; i < reps; i++ {
+		root := t.TempDir()
+		storeDir := filepath.Join(root, "store") // Open이 MkdirAll로 신규 생성 — 두 자식 모두 최초 기동
+		signal := filepath.Join(root, "start.signal")
+
+		cmds := make([]*exec.Cmd, 2)
+		outs := make([]bytes.Buffer, 2)
+		for c := range cmds {
+			cmd := exec.Command(exe)
+			cmd.Env = append(os.Environ(),
+				"CTR_TEST_CHILD=1",
+				"CTR_TEST_CHILD_DIR="+storeDir,
+				"CTR_TEST_CHILD_SIGNAL="+signal,
+				fmt.Sprintf("CTR_TEST_CHILD_ID=%d", c),
+			)
+			cmd.Stderr = &outs[c]
+			if err := cmd.Start(); err != nil {
+				t.Fatalf("rep %d child %d start: %v", i, c, err)
+			}
+			cmds[c] = cmd
+		}
+		time.Sleep(20 * time.Millisecond) // 두 자식이 signal 폴링 루프에 들어갈 시간 확보
+		if err := os.WriteFile(signal, []byte("go"), 0o600); err != nil {
+			t.Fatalf("rep %d signal: %v", i, err)
+		}
+		var wg sync.WaitGroup
+		for c := range cmds {
+			wg.Add(1)
+			go func(c int) {
+				defer wg.Done()
+				if err := cmds[c].Wait(); err != nil {
+					t.Errorf("rep %d child %d 실패: %v\nstderr: %s", i, c, err, outs[c].String())
+				}
+			}(c)
+		}
+		wg.Wait()
 	}
 }
 

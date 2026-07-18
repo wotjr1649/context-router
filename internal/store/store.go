@@ -34,6 +34,47 @@ type Store struct {
 
 const pragmas = "?_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)&_pragma=busy_timeout(5000)&_pragma=foreign_keys(ON)"
 
+const lockFileName = "content.db.rebuild.lock"
+
+// errLockBusy: tryLockFile(build-tag별 unix/windows 구현)의 논블로킹 시도가 다른 프로세스
+// 보유로 실패했음을 나타내는 내부 신호(lockStore 재시도 대상) — 권한 오류 등 그 외 실패와
+// 구분해 후자는 즉시 반환한다(무한 재시도 방지).
+var errLockBusy = errors.New("store: lock busy")
+
+// lockStore: writable Open()을 프로세스 간 직렬화한다. 신규 DB 최초 WAL 전환 시 SQLite의
+// wal-index recovery 락 경로(WAL_RECOVER_LOCK)는 busy handler를 거치지 않고 SQLITE_BUSY를
+// 즉시 반환한다(SQLite 정본 동작, modernc.org/sqlite v1.54.0 동일 — DSN _pragma 순서는
+// applyQueryParams가 busy_timeout을 자체 우선정렬해 no-op이라 근본 수정이 못 된다). 이
+// 구간은 busy_timeout으로 못 덮으므로 OS advisory lock으로 대신 직렬화한다(설계 §3.5의
+// 배타 잠금 파일 경로를 store 생명주기 잠금으로 재사용). tryLockFile은 unix(flock)/
+// windows(LockFileEx) 각각 store_lock_unix.go/store_lock_windows.go에 구현.
+//
+// 논블로킹 시도를 10→20→40→80→160ms(이후 160ms 유지) 지수 백오프로 재시도하며 총 5초
+// 초과 시 ErrUnavailable로 포기한다(보유 프로세스 hang 시 무한대기 방지). 실패 모드: 보유
+// 프로세스 크래시 → 커널이 잠금 자동 해제(stale lock 없음) / 마이그레이션 중 크래시 →
+// 다음 프로세스가 멱등 스키마 재실행. 잠금 해제 후 파일 자체는 삭제하지 않는다.
+func lockStore(dir string) (func(), error) {
+	path := filepath.Join(dir, lockFileName)
+	deadline := time.Now().Add(5 * time.Second)
+	delay := 10 * time.Millisecond
+	for {
+		release, err := tryLockFile(path)
+		if err == nil {
+			return release, nil
+		}
+		if !errors.Is(err, errLockBusy) {
+			return nil, fmt.Errorf("store open: 잠금 획득 실패: %w", err)
+		}
+		if time.Now().After(deadline) {
+			return nil, fmt.Errorf("store open: 잠금 대기 초과: %w", ErrUnavailable)
+		}
+		time.Sleep(delay)
+		if delay < 160*time.Millisecond {
+			delay *= 2
+		}
+	}
+}
+
 func Open(dir string, readOnly bool) (*Store, error) {
 	if !readOnly {
 		// 0o700: store 루트+artifacts 모두 이 한 호출로 생성(MkdirAll이 만드는 모든 중간
@@ -41,6 +82,12 @@ func Open(dir string, readOnly bool) (*Store, error) {
 		if err := os.MkdirAll(filepath.Join(dir, "artifacts"), 0o700); err != nil {
 			return nil, sanitizeIOErr("open mkdir", err)
 		}
+		// migrate()·ledger.db DDL까지 포함해 Open 반환 시점(defer)까지 보유 — 아래 lockStore 주석 참조.
+		release, err := lockStore(dir)
+		if err != nil {
+			return nil, err
+		}
+		defer release()
 	}
 	dsn := "file:" + filepath.ToSlash(filepath.Join(dir, "content.db")) + pragmas
 	wdsn := dsn
