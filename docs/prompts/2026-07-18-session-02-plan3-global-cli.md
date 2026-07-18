@@ -38,7 +38,7 @@ Mid-session directive (verbatim): review protocol change —
 ## 3. Current repo state
 
 - `main` @ **d73294a** — Plan 1+2 (v0.0.1 core + transform/net).
-- **Branch `feat/v0.0.1-global-cli`** @ (final fix wave head) — 38 commits, all of Plan 3. PR opened (see §PR).
+- **Branch `feat/v0.0.1-global-cli`** @ 774c8a5 — 38 commits, all of Plan 3. **PR #2** OPEN (https://github.com/wotjr1649/context-router/pull/2 → main), awaiting merge (user decision).
 - All 9 packages GREEN (`go test -p 1 ./...`), 3-OS CI + crossbuild 6 targets GREEN.
 - **v0.0.1 redefined contract: COMPLETE** — 6 MCP tools + ctr_global_search + 4 CLI. Gates 1–13 documented in `docs/gates-v0.0.1-ko.md`.
 
