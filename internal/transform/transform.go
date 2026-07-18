@@ -126,7 +126,10 @@ func Eval(req Request) (result Result) {
 		"dedupe":        starlark.NewBuiltin("dedupe", biDedupe),
 	}
 
-	_, err := starlark.ExecFile(thread, "script.star", req.Script, predeclared)
+	// ExecFile은 deprecated(SA1019, legacy 전역변수 의존) — ExecFile 자체가 내부적으로
+	// syntax.LegacyFileOptions()를 넘겨 ExecFileOptions를 호출할 뿐이라(go.starlark.net
+	// eval.go), 그걸 그대로 인라인해 동작은 완전히 동일하게 유지하면서 경고만 없앤다.
+	_, err := starlark.ExecFileOptions(syntax.LegacyFileOptions(), thread, "script.star", req.Script, predeclared)
 
 	res := Result{
 		Output:    out.String(),
