@@ -50,26 +50,28 @@
 
 ### Task 1: WAL 최초 기동 경합 근본 수정 (store DSN 프라그마 재배열 + 2-프로세스 최초 마이그레이션 테스트)
 
-**배경(원인 확정):** `internal/store/store.go:35`의 DSN 상수가 `journal_mode(WAL)`를 `busy_timeout(5000)`보다 **먼저** 적용한다. modernc.org/sqlite는 DSN `_pragma`를 나열 순서대로 각 신규 연결에서 실행하므로, 신규 DB에 두 프로세스가 동시에 최초 기동하면 timeout 0 상태에서 WAL 전환이 경합해 SQLITE_BUSY가 난다(세션 01 Task 9 발견, 게이트 7 심층). 근본 수정 = busy_timeout을 최우선 배치. `applySchemaV1`은 이미 멱등(IF NOT EXISTS)+명시 트랜잭션이라 재배열만으로 동시 최초 마이그레이션이 안전해진다. ledger.db도 같은 상수를 쓰므로 자동 수정된다.
+**배경(재판정 2026-07-18 — 구현자 반증 + Codex 자문 병합):** 당초 진단(DSN `_pragma` 순서)은 **no-op으로 실증 반증됨** — modernc.org/sqlite v1.54.0 `applyQueryParams`가 DSN 순서와 무관하게 busy_timeout을 최우선 정렬·실행한다(업스트림 gitlab issue 198). 실제 원인: 신규 DB 최초 WAL 전환 시 wal-index recovery 락 경로(`walTryBeginRead`/`WAL_RECOVER_LOCK`)는 **busy handler를 호출하지 않고** SQLITE_BUSY(_RECOVERY)를 즉시 반환한다 — SQLite 정본 동작이며 modernc 번역 구현도 동일. 드라이버 버전 업은 불가(2026-07 최신 = v1.54.0, 해당 수정 없음). **근본 수정 = writable `Open()` 전체를 OS advisory lock으로 프로세스 간 직렬화** (설계 §3.5의 배타 잠금 파일 경로 재사용).
 
 **Files:**
-- Modify: `internal/store/store.go:35`
-- Test: `internal/store/store_test.go` (기존 다중 프로세스 테스트 헬퍼 패턴 재사용 — 파일 안에서 `exec.Command`/`os.Executable` 기반 자기 바이너리 재실행 헬퍼를 먼저 찾아 그 패턴을 따를 것)
+- Modify: `internal/store/store.go` (Open의 !readOnly 분기에 잠금 획득/해제)
+- Create: `internal/store/store_lock_windows.go`, `internal/store/store_lock_unix.go` (D13 §5-① OS build-tag 예외 — worker_windows/unix 선례)
+- Test: `internal/store/store_test.go` — **재현 테스트는 이미 작업 트리에 미커밋 상태로 존재**(`TestMain`+`CTR_TEST_CHILD` 자식 모드, `TestOpen_ConcurrentFirstMigration` 8회 반복·서브프로세스 2개; RED 실증 완료). 재작성 금지, 그대로 사용.
 
-**Interfaces:** API 변경 없음 (상수 내부 재배열).
+**Interfaces:**
+- Produces: `lockStore(dir string) (release func(), err error)` — 비공개, build-tag 파일 쌍 양쪽 동일 시그니처.
 
-- [ ] **Step 1: 실패 재현 테스트 작성** — `TestOpen_ConcurrentFirstMigration`: 신규 임시 store 디렉터리 1개에 대해 **서브프로세스 2개**가 동시에 `store.Open(dir, false)` → `Register` 1건 → `Close`를 수행하고 둘 다 성공해야 한다. 반복 8회(레이스 확률 확보). 서브프로세스 모드는 기존 store_test.go의 자기 바이너리 재실행 헬퍼(환경변수 분기)를 재사용하고, 없으면 `TestMain`+`CTR_TEST_CHILD` 환경변수 분기로 신설한다. 동기화: 부모가 파일 생성으로 스타트 신호를 주고 두 자식이 그 파일을 폴링해 동시에 Open을 개시한다.
-- [ ] **Step 2: 테스트가 (간헐이라도) 실패함을 확인** — Run: `go test -p 1 -run TestOpen_ConcurrentFirstMigration -count 3 ./internal/store/`. Expected: `SQLITE_BUSY`(코드 5) 계열 실패가 최소 1회 관측. *주의: 타이밍상 전부 통과할 수 있다 — 그 경우 반복 횟수를 16으로 올려 1회만 더 시도하고, 그래도 통과하면 "재현 불가·수정은 원인 분석 기반" 이라고 태스크 보고서에 기록하고 진행한다(맹목 재시도 금지).*
-- [ ] **Step 3: DSN 재배열** — store.go:35를 다음으로 교체:
+**잠금 계약 (Codex 자문 병합판):**
+- 파일: `filepath.Join(dir, "content.db.rebuild.lock")` — 설계 §3.5의 잠금 경로를 store 생명주기 잠금으로 재사용(별도 init.lock 신설 금지). 모드 0600. **잠금 해제 후 파일은 삭제하지 않는다.**
+- unix(`//go:build !windows`): `syscall.Flock(fd, LOCK_EX|LOCK_NB)`. windows: `golang.org/x/sys/windows`의 `LockFileEx(EXCLUSIVE|FAIL_IMMEDIATELY)`로 `[0,1)` 1바이트 잠금(x/sys는 기존 직접 의존성 — 신규 의존 아님).
+- 논블로킹 시도 + 지수 백오프 10→20→40→80→160ms(이후 160ms 유지), **총 deadline 5초** 초과 시 `fmt.Errorf("store open: 잠금 대기 초과: %w", ErrUnavailable)` (→ mcp에서 STORAGE_UNAVAILABLE).
+- 배치: Open의 `!readOnly` 분기, `os.MkdirAll` 성공 **직후·첫 `sql.Open` 이전** 획득 — migrate()·ledger.db 최초 DDL까지 포함해 **Open 반환 직전 defer 해제**. 이유: modernc는 lazy 연결이라 PRAGMA/WAL 전환이 첫 QueryRow(migrate)에서 발생 — migrate만 감싸면 늦다. `readOnly` 경로는 잠금 파일을 만들지도 잡지도 않는다(doctor no-create 계약).
+- 실패 모드(문서화됨): 보유 프로세스 크래시 → 커널 자동 해제(stale lock 없음) / 마이그레이션 중 크래시 → 다음 프로세스가 멱등 스키마 재실행 / 보유 프로세스 hang → 5s 후 STORAGE_UNAVAILABLE(무한 대기 방지).
 
-```go
-// busy_timeout을 최우선 적용 — 신규 DB 최초 기동 2-프로세스가 timeout 0으로
-// journal_mode(WAL) 전환을 경합하는 SQLITE_BUSY 방지 (게이트 7 심층, 세션01 Task9 발견).
-const pragmas = "?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)&_pragma=foreign_keys(ON)"
-```
-
-- [ ] **Step 4: 전체 확인** — Run: `go test -p 1 -run TestOpen_ConcurrentFirstMigration -count 5 ./internal/store/` → PASS, 이어서 `go test -p 1 ./...` → 전체 GREEN.
-- [ ] **Step 5: Commit** — `fix(store): busy_timeout을 DSN 최우선 배치 — 2-프로세스 최초 WAL 전환 경합 근본 수정 (게이트 7 심층)`
+- [ ] **Step 1: store.go:35 원상 복구** — 미커밋 재배열을 되돌린다(원래 상수: `"?_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)&_pragma=busy_timeout(5000)&_pragma=foreign_keys(ON)"`, 추가 주석 없음). 근본 원인 설명 주석은 잠금 코드 쪽에 단다(driver가 busy_timeout을 자체 정렬한다는 사실 + recovery 락은 busy handler 미경유 + 설계 §3.5 참조).
+- [ ] **Step 2: RED 확인** — Run: `go test -p 1 -run TestOpen_ConcurrentFirstMigration -count 3 ./internal/store/` → 여전히 간헐 FAIL(SQLITE_BUSY) 확인.
+- [ ] **Step 3: lockStore 구현** — 위 잠금 계약대로 build-tag 파일 쌍 작성 + Open 배선.
+- [ ] **Step 4: GREEN 확인** — Run: `go test -p 1 -run TestOpen_ConcurrentFirstMigration -count 5 ./internal/store/` → PASS(40/40 반복), 이어서 `go test -p 1 ./...` 전체 GREEN + `CGO_ENABLED=0 GOOS=linux go build ./...`(unix 잠금 파일 컴파일 확인) + `GOOS=darwin go build ./...`.
+- [ ] **Step 5: Commit** — `fix(store): writable Open을 OS advisory lock으로 직렬화 — 최초 WAL 전환 recovery-lock 경합 근본 수정 (게이트 7 심층, Codex 자문 병합)`
 
 ---
 
