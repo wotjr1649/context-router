@@ -26,8 +26,11 @@ does not survive a machine move or `git clean`. Record-writing convention:
 
 - **Stuck** (implementer BLOCKED / 2–3 failed attempts / unclear fix): collaborate —
   Codex rescue for design/root-cause, web or context7 for library facts. No blind retry.
-- **Integration & final reviews**: subagent reviewer **plus** Codex
-  `review --base <ref>` in parallel, then merge findings before fixing.
+- **Reviews — task/integration/final (user directive 2026-07-18)**: every review
+  checkpoint runs a subagent reviewer **plus** Codex `review --base <ref>` in
+  parallel (cross-model, multi-angle), then merge findings before fixing.
+  Re-reviews after fix rounds are subagent-only — Codex stays at max one pass
+  per checkpoint (usage guard).
 - **Execution**: superpowers `subagent-driven-development` — fresh subagent per task,
   task review (spec + quality), fix → re-review. BASE from the ledger, never `HEAD~1`.
 - **Subagent hygiene**: response-splitting discipline (no whole-file rewrites; build
