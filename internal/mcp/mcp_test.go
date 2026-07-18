@@ -562,11 +562,10 @@ func TestCtrTransformRoundTrip(t *testing.T) {
 // 했던 것이 증거) 배선이 없어도 "budget 소진"으로 통과해버렸다.
 // 그래서 TransformTimeout=1ns로 낮춘다 — WithTimeout 적용 직후 ctx는 사실상 이미
 // 데드라인을 넘긴 상태이므로, Spawn이 스텝을 하나도 실행하기 전에 ctx-deadline 경로로
-// 실패해야 한다(하드웨어 무관 결정론). 코드 리딩으로 확인한 실제 경로(os/exec.Cmd.Start가
-// c.ctx.Done()을 자체 사전 체크하지만, exec.CommandContext가 심어둔 watchCtx 트리킬이
-// 그보다 먼저 발동해 프로세스는 뜨자마자 kill됨) + 5회 반복 실측 전부
-// "[INVALID_ARGUMENT] worker killed (memory/time limit)"로 확인, 이 정확한 형태에 고정한다.
-// 배선이 제거되면 이 케이스는 codeBudgetExceeded가 되므로 그 배제 단언으로 회귀를 잡는다.
+// 실패해야 한다(하드웨어 무관 결정론). 이 경로는 플랫폼/타이밍에 따라 코드 문자열이 셋 중
+// 하나로 갈릴 수 있다(worker killed=INVALID_ARGUMENT / raw ctx.Err() / applyMemLimit이 그
+// ctx.Err()를 감싸는 STORAGE_UNAVAILABLE) — 셋 다 codeBudgetExceeded는 아니므로 특정 코드
+// 문자열을 고정하지 않고 "budget이 아님"만으로 배선 제거 회귀를 판별한다(Fix Round 3).
 func TestCtrTransformConfigTimeout(t *testing.T) {
 	dir := t.TempDir()
 	canon, err := ident.Canonicalize(dir)
@@ -607,13 +606,10 @@ func TestCtrTransformConfigTimeout(t *testing.T) {
 		t.Fatalf("want IsError=true for a ctx-already-expired transform call, got %+v", res)
 	}
 	text := res.Content[0].(*mcp.TextContent).Text
-	// ③ 명시 배제: budget 소진이면 WithTimeout(1ns) 배선이 제거된 회귀다.
+	// 명시 배제: budget 소진이면 WithTimeout(1ns) 배선이 제거된 회귀다 — 위 주석의 세 합법
+	// 경로(worker killed/raw ctx.Err()/STORAGE_UNAVAILABLE) 중 어느 것도 budget이 아니다.
 	if strings.HasPrefix(text, "["+codeBudgetExceeded+"]") {
 		t.Fatalf("got budget-exceeded — TransformTimeout(1ns) wiring이 제거된 것으로 의심됨: %q", text)
-	}
-	// ② ctx-deadline 경로 고유 형태(코드 리딩+5회 실측으로 고정) — worker가 뜨자마자 kill.
-	if !strings.HasPrefix(text, "["+codeInvalidArgument+"]") || !strings.Contains(text, "worker killed") {
-		t.Fatalf("want ctx-deadline kill 형태([%s] ... worker killed), got %q", codeInvalidArgument, text)
 	}
 	if elapsed > 5*time.Second {
 		t.Fatalf("elapsed=%v — want well under the 10s default", elapsed)
