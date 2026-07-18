@@ -246,7 +246,9 @@ func buildCtrBinary(t *testing.T) string {
 // spawnCtr starts bin with args, wiring stdin/stdout into a stdioClient and
 // stderr into a buffer. Read the returned buffer only after the process has
 // exited (exec.Cmd synchronizes non-pipe Stderr writers with Wait).
-func spawnCtr(bin string, args ...string) (*exec.Cmd, *stdioClient, *bytes.Buffer, error) {
+// Registers t.Cleanup to Kill and Wait on the process if it's still running
+// (no-op after closeAndWait, safe on graceful exit).
+func spawnCtr(t *testing.T, bin string, args ...string) (*exec.Cmd, *stdioClient, *bytes.Buffer, error) {
 	cmd := exec.Command(bin, args...)
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
@@ -261,6 +263,12 @@ func spawnCtr(bin string, args ...string) (*exec.Cmd, *stdioClient, *bytes.Buffe
 	if err := cmd.Start(); err != nil {
 		return nil, nil, nil, err
 	}
+	t.Cleanup(func() {
+		if cmd.Process != nil {
+			_ = cmd.Process.Kill()
+			_, _ = cmd.Process.Wait()
+		}
+	})
 	return cmd, newStdioClient(stdin, stdout), &stderrBuf, nil
 }
 
@@ -296,7 +304,7 @@ func TestE2E_StdioRoundTrip(t *testing.T) {
 	}
 	storeRoot := t.TempDir()
 
-	cmd, c, stderrBuf, err := spawnCtr(bin, "--root", proj, "--store-root", storeRoot, "--enable", "ingest")
+	cmd, c, stderrBuf, err := spawnCtr(t, bin, "--root", proj, "--store-root", storeRoot, "--enable", "ingest")
 	if err != nil {
 		t.Fatalf("spawn: %v", err)
 	}
@@ -371,8 +379,8 @@ func TestE2E_StdioRoundTrip(t *testing.T) {
 // Runs inside a goroutine in TestE2E_TwoProcessConcurrentIndex — must never
 // call t.Fatal*, only return error (testing.T.FailNow requires the test
 // goroutine).
-func indexOneFile(bin, proj, storeRoot, name string) error {
-	cmd, c, stderrBuf, err := spawnCtr(bin, "--root", proj, "--store-root", storeRoot, "--enable", "ingest")
+func indexOneFile(t *testing.T, bin, proj, storeRoot, name string) error {
+	cmd, c, stderrBuf, err := spawnCtr(t, bin, "--root", proj, "--store-root", storeRoot, "--enable", "ingest")
 	if err != nil {
 		return fmt.Errorf("%s: spawn: %w", name, err)
 	}
@@ -417,10 +425,13 @@ func TestE2E_TwoProcessConcurrentIndex(t *testing.T) {
 	}
 	storeRoot := t.TempDir()
 
-	// 워밍업: 스키마 최초 생성(WAL 파일 포함)을 먼저 끝내 둔다 — 이후 두 프로세스는
-	// 브리프가 검증 대상으로 명시한 "동시 쓰기"를 테스트한다. 동시 최초 마이그레이션
-	// 경합(WAL 파일 최초 생성)은 브리프 self-review상 계획 3 게이트 하네스 범위.
-	warmCmd, warmC, warmStderr, err := spawnCtr(bin, "--root", proj, "--store-root", storeRoot, "--enable", "ingest")
+	// 워밍업 1회: 두 프로세스가 같은 store를 "최초로" 동시 생성하면 WAL 전환이
+	// busy_timeout 적용 이전에 일어나 SQLITE_BUSY 경합이 실측됨 (Task 9 발견).
+	// 근본 수정(DSN pragma 순서 또는 최초 migrate 파일락)은 계획 3 게이트 7 심층 범위 —
+	// 컨트롤러 파견문이 이 테스트에서는 기초 검증(동시 쓰기)만 요구하고
+	// integrity_check는 "세 번째 프로세스의 정상 동작으로 갈음 가능"으로 명시 허용.
+	// 추적: .superpowers/sdd/progress.md "Task 9 발견" 항목.
+	warmCmd, warmC, warmStderr, err := spawnCtr(t, bin, "--root", proj, "--store-root", storeRoot, "--enable", "ingest")
 	if err != nil {
 		t.Fatalf("warmup spawn: %v", err)
 	}
@@ -437,7 +448,7 @@ func TestE2E_TwoProcessConcurrentIndex(t *testing.T) {
 		wg.Add(1)
 		go func(name string) {
 			defer wg.Done()
-			errs <- indexOneFile(bin, proj, storeRoot, name)
+			errs <- indexOneFile(t, bin, proj, storeRoot, name)
 		}(name)
 	}
 	wg.Wait()
@@ -450,7 +461,7 @@ func TestE2E_TwoProcessConcurrentIndex(t *testing.T) {
 
 	// 세 번째(신규) 프로세스로 두 파일 내용이 모두 검색되는지 확인 — sources=2·DB
 	// 무결성은 이 정상 동작으로 갈음한다(설계 §12-10 기초, 심층 검증은 계획 3).
-	cmd3, c3, stderrBuf3, err := spawnCtr(bin, "--root", proj, "--store-root", storeRoot, "--enable", "ingest")
+	cmd3, c3, stderrBuf3, err := spawnCtr(t, bin, "--root", proj, "--store-root", storeRoot, "--enable", "ingest")
 	if err != nil {
 		t.Fatalf("spawn#3: %v", err)
 	}
