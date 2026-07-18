@@ -776,6 +776,164 @@ func TestLedgerStats_StatErrorOtherThanNotExist(t *testing.T) {
 	}
 }
 
+// TestPurgeOlderThan: 구 source 1개(cutoff 이전에 등록) + 신 source 1개(cutoff 이후)를
+// 등록하고 cutoff를 그 경계로 준다(등록 사이에 time.Now()를 캡처 — indexed_at 조작을 위한
+// writer UPDATE 테스트 헬퍼 대신 실제 시각 흐름으로 경계를 만든다, 설계 §7). 구 source만
+// 삭제되고 그 artifact/chunks도 함께 삭제되며(신 source의 artifact는 남음), FTS
+// integrity-check가 통과해야 한다.
+func TestPurgeOlderThan(t *testing.T) {
+	s := openT(t)
+	oldReg := Registration{StoredBytes: []byte("old body"), MediaType: "text/plain",
+		Source: SourceMeta{URI: "/old.txt", Kind: "file", SrcHash: "h-old"},
+		Chunks: []Chunk{{Ordinal: 0, Text: "old body"}}}
+	oldID, err := s.Register(t.Context(), oldReg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	time.Sleep(1100 * time.Millisecond) // indexed_at은 unix 초 단위 — 경계를 넘기려면 1초 이상 필요
+	cutoff := time.Now().Unix()
+	time.Sleep(1100 * time.Millisecond)
+
+	newReg := Registration{StoredBytes: []byte("new body"), MediaType: "text/plain",
+		Source: SourceMeta{URI: "/new.txt", Kind: "file", SrcHash: "h-new"},
+		Chunks: []Chunk{{Ordinal: 0, Text: "new body"}}}
+	newID, err := s.Register(t.Context(), newReg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	gotSources, gotArtifacts, err := s.PurgeOlderThan(t.Context(), cutoff)
+	if err != nil {
+		t.Fatalf("PurgeOlderThan: %v", err)
+	}
+	if gotSources != 1 || gotArtifacts != 1 {
+		t.Fatalf("sources=%d artifacts=%d want 1,1", gotSources, gotArtifacts)
+	}
+
+	var n int
+	if err := s.reader.QueryRow("SELECT count(*) FROM sources WHERE uri=?", "/old.txt").Scan(&n); err != nil || n != 0 {
+		t.Fatalf("old source 잔존: n=%d err=%v", n, err)
+	}
+	if err := s.reader.QueryRow("SELECT count(*) FROM artifacts WHERE id=?", oldID).Scan(&n); err != nil || n != 0 {
+		t.Fatalf("old artifact 잔존: n=%d err=%v", n, err)
+	}
+	if err := s.reader.QueryRow("SELECT count(*) FROM chunks WHERE artifact_id=?", oldID).Scan(&n); err != nil || n != 0 {
+		t.Fatalf("old chunks 잔존: n=%d err=%v", n, err)
+	}
+	if err := s.reader.QueryRow("SELECT count(*) FROM sources WHERE uri=?", "/new.txt").Scan(&n); err != nil || n != 1 {
+		t.Fatalf("new source 삭제됨: n=%d err=%v", n, err)
+	}
+	if err := s.reader.QueryRow("SELECT count(*) FROM artifacts WHERE id=?", newID).Scan(&n); err != nil || n != 1 {
+		t.Fatalf("new artifact 삭제됨: n=%d err=%v", n, err)
+	}
+
+	// FTS 동기 확인: old chunk의 텍스트가 검색 인덱스에서도 사라졌어야 한다.
+	if err := s.reader.QueryRow("SELECT count(*) FROM fts_porter WHERE fts_porter MATCH 'old'").Scan(&n); err != nil {
+		t.Fatalf("fts_porter query: %v", err)
+	}
+	if n != 0 {
+		t.Fatalf("fts_porter에 old chunk 잔존: n=%d", n)
+	}
+}
+
+// TestPurgeOlderThan_MismatchLeavesEverything: cutoff가 모든 source보다 과거라 아무것도
+// 삭제 대상이 아닌 경우 sources=0 artifacts=0이며 실제로 아무 행도 사라지지 않아야 한다.
+func TestPurgeOlderThan_MismatchLeavesEverything(t *testing.T) {
+	s := openT(t)
+	if _, err := s.Register(t.Context(), Registration{StoredBytes: []byte("keep me"), MediaType: "text/plain",
+		Source: SourceMeta{URI: "/keep.txt", Kind: "file", SrcHash: "h-keep"},
+		Chunks: []Chunk{{Ordinal: 0, Text: "keep me"}}}); err != nil {
+		t.Fatal(err)
+	}
+	gotSources, gotArtifacts, err := s.PurgeOlderThan(t.Context(), 1) // 1970년대 cutoff — 아무것도 오래되지 않음
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotSources != 0 || gotArtifacts != 0 {
+		t.Fatalf("sources=%d artifacts=%d want 0,0", gotSources, gotArtifacts)
+	}
+	var n int
+	s.reader.QueryRow("SELECT count(*) FROM sources").Scan(&n)
+	if n != 1 {
+		t.Fatalf("sources=%d want 1(무삭제)", n)
+	}
+}
+
+// TestGCOrphanBlobs: 정상 등록된 artifact의 blob(참조됨)과, 등록 없이 artifacts/에 직접
+// 만든 더미 blob 파일(재색인으로 raw_blob_hash가 교체돼 고아가 된 상황을 모사, 설계 §7)을
+// 함께 둔 뒤 GC가 고아만 지우고 참조 blob은 남기는지 확인한다.
+func TestGCOrphanBlobs(t *testing.T) {
+	s := openT(t)
+	body := []byte("referenced content")
+	if _, err := s.Register(t.Context(), Registration{StoredBytes: body, MediaType: "text/plain",
+		Source: SourceMeta{URI: "/ref.txt", Kind: "file", SrcHash: "h-ref"},
+		Chunks: []Chunk{{Ordinal: 0, Text: string(body)}}}); err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256(body)
+	refHash := hex.EncodeToString(sum[:])
+
+	orphanHash := strings.Repeat("f", 64) // 64자 hex 모양이지만 어디에도 참조되지 않는 더미 해시
+	orphanDir := filepath.Join(s.dir, "artifacts", orphanHash[:2])
+	if err := os.MkdirAll(orphanDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(orphanDir, orphanHash), []byte("orphan blob"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	removed, err := s.GCOrphanBlobs(t.Context())
+	if err != nil {
+		t.Fatalf("GCOrphanBlobs: %v", err)
+	}
+	if removed != 1 {
+		t.Fatalf("removed=%d want 1", removed)
+	}
+	if _, err := os.Stat(filepath.Join(orphanDir, orphanHash)); !os.IsNotExist(err) {
+		t.Fatalf("orphan blob 잔존: err=%v", err)
+	}
+	if _, err := os.Stat(filepath.Join(s.dir, "artifacts", refHash[:2], refHash)); err != nil {
+		t.Fatalf("참조 blob이 GC에 삭제됨: %v", err)
+	}
+}
+
+// TestGCOrphanBlobs_PreservesRawBlobHash: sources.raw_blob_hash로만 참조되는 blob(RawBlob
+// 필드로 저장된 원본 HTML 등 — content_hash 집합에는 없다)도 GC가 지우면 안 된다(설계 §7 —
+// GC는 content_hash·raw_blob_hash 양쪽 집합 모두를 참조로 인정해야 한다).
+func TestGCOrphanBlobs_PreservesRawBlobHash(t *testing.T) {
+	s := openT(t)
+	raw := []byte("<html>raw source, not content-addressed via artifacts</html>")
+	if _, err := s.Register(t.Context(), Registration{StoredBytes: []byte("extracted text"), MediaType: "text/plain",
+		Source:  SourceMeta{URI: "https://example.com/p", Kind: "web", SrcHash: "h-web", Extraction: "readability"},
+		Chunks:  []Chunk{{Ordinal: 0, Text: "extracted text"}},
+		RawBlob: raw}); err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256(raw)
+	rawHash := hex.EncodeToString(sum[:])
+
+	orphanHash := strings.Repeat("9", 64)
+	orphanDir := filepath.Join(s.dir, "artifacts", orphanHash[:2])
+	if err := os.MkdirAll(orphanDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(orphanDir, orphanHash), []byte("orphan"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	removed, err := s.GCOrphanBlobs(t.Context())
+	if err != nil {
+		t.Fatalf("GCOrphanBlobs: %v", err)
+	}
+	if removed != 1 {
+		t.Fatalf("removed=%d want 1(orphan만)", removed)
+	}
+	if _, err := os.Stat(filepath.Join(s.dir, "artifacts", rawHash[:2], rawHash)); err != nil {
+		t.Fatalf("raw_blob_hash로만 참조되는 blob이 GC에 삭제됨: %v", err)
+	}
+}
+
 func FuzzSnapUTF8(f *testing.F) {
 	f.Add([]byte("가나다"), int64(1), int64(4))
 	f.Add([]byte("hello\nworld"), int64(0), int64(11))

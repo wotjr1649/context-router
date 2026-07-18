@@ -656,6 +656,120 @@ func (s *Store) ReadRange(ctx context.Context, artifactID int64, sel Selector) (
 	return res, nil
 }
 
+// PurgeOlderThan: sources.indexed_at < cutoffUnix인 행을 삭제하고, 그 결과 어떤 source도
+// 참조하지 않게 된 artifacts와 그 chunks를 같은 트랜잭션(txRetry)에서 삭제한다 — chunks를
+// artifacts보다 먼저 명시적으로 지워 AFTER DELETE 트리거가 정상 발화해 FTS를 동기화한다
+// (설계 §7 purge 선택 삭제). 커밋 후 fts_porter/fts_trigram 양쪽에 integrity-check를 실행해
+// 실패하면 오류로 보고한다(게이트 6) — 이 시점에는 이미 커밋된 뒤라 롤백은 없다.
+func (s *Store) PurgeOlderThan(ctx context.Context, cutoffUnix int64) (sources, artifacts int64, err error) {
+	err = s.txRetry(ctx, func(tx *sql.Tx) error {
+		res, txErr := tx.ExecContext(ctx, "DELETE FROM sources WHERE indexed_at < ?", cutoffUnix)
+		if txErr != nil {
+			return txErr
+		}
+		sources, _ = res.RowsAffected()
+		if _, txErr = tx.ExecContext(ctx, `DELETE FROM chunks WHERE artifact_id IN
+			(SELECT id FROM artifacts WHERE id NOT IN (SELECT artifact_id FROM sources))`); txErr != nil {
+			return txErr
+		}
+		res, txErr = tx.ExecContext(ctx, `DELETE FROM artifacts WHERE id NOT IN (SELECT artifact_id FROM sources)`)
+		if txErr != nil {
+			return txErr
+		}
+		artifacts, _ = res.RowsAffected()
+		return nil
+	})
+	if err != nil {
+		return 0, 0, err
+	}
+	if err := s.checkFTSIntegrity(ctx); err != nil {
+		return sources, artifacts, err
+	}
+	return sources, artifacts, nil
+}
+
+// checkFTSIntegrity: fts_porter/fts_trigram 양쪽에 SQLite FTS5 integrity-check 특수 명령을
+// 실행한다(게이트 6) — chunks와 FTS 인덱스가 어긋나면 실패한다.
+func (s *Store) checkFTSIntegrity(ctx context.Context) error {
+	for _, fts := range [2]string{"fts_porter", "fts_trigram"} {
+		if _, err := s.writer.ExecContext(ctx, "INSERT INTO "+fts+"("+fts+") VALUES('integrity-check')"); err != nil {
+			return fmt.Errorf("store: %s integrity-check 실패: %w", fts, err)
+		}
+	}
+	return nil
+}
+
+// hashesFromQuery: query가 반환하는 문자열 컬럼 1개를 집합으로 모은다(GCOrphanBlobs 전용
+// 소소한 헬퍼 — content_hash/raw_blob_hash 두 조회에 재사용).
+func hashesFromQuery(ctx context.Context, db *sql.DB, query string) (map[string]bool, error) {
+	rows, err := db.QueryContext(ctx, query)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	set := map[string]bool{}
+	for rows.Next() {
+		var h string
+		if err := rows.Scan(&h); err != nil {
+			return nil, err
+		}
+		set[h] = true
+	}
+	return set, rows.Err()
+}
+
+// GCOrphanBlobs: artifacts/ 아래 blob 파일 중 artifacts.content_hash에도 sources.raw_blob_hash
+// (NULL 아닌 것)에도 없는 해시만 삭제한다(계획2 이월 "과거 raw blob 물리 GC" 해소, 설계 §7).
+// reader로 참조 해시 집합을 모은 뒤 os.ReadDir(artifacts/<prefix>/)로 대조한다. 파일명 길이가
+// sha256 hex(64자)가 아니면 blob이 아니라 writeBlob의 임시파일(hash.tmp.pid.seq)이므로 건드리지
+// 않는다.
+func (s *Store) GCOrphanBlobs(ctx context.Context) (removed int64, err error) {
+	referenced, err := hashesFromQuery(ctx, s.reader, "SELECT content_hash FROM artifacts")
+	if err != nil {
+		return 0, fmt.Errorf("store GCOrphanBlobs: %w", err)
+	}
+	rawReferenced, err := hashesFromQuery(ctx, s.reader, "SELECT raw_blob_hash FROM sources WHERE raw_blob_hash IS NOT NULL")
+	if err != nil {
+		return 0, fmt.Errorf("store GCOrphanBlobs: %w", err)
+	}
+	for h := range rawReferenced {
+		referenced[h] = true
+	}
+
+	blobRoot := filepath.Join(s.dir, "artifacts")
+	prefixes, err := os.ReadDir(blobRoot)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return 0, nil
+		}
+		return 0, sanitizeIOErr("gc readdir", err)
+	}
+	for _, p := range prefixes {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return removed, ctxErr
+		}
+		if !p.IsDir() {
+			continue
+		}
+		dir := filepath.Join(blobRoot, p.Name())
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			return removed, sanitizeIOErr("gc readdir", err)
+		}
+		for _, e := range entries {
+			hash := e.Name()
+			if len(hash) != 64 || referenced[hash] {
+				continue
+			}
+			if err := os.Remove(filepath.Join(dir, hash)); err != nil {
+				return removed, sanitizeIOErr("gc remove", err)
+			}
+			removed++
+		}
+	}
+	return removed, nil
+}
+
 // LedgerAppend: best-effort 사용량 기록 — ledger 없음/오류는 무시(§3.5).
 func (s *Store) LedgerAppend(tool string, stored, returned, ms int64) {
 	if s.ledger == nil {

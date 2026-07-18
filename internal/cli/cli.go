@@ -1,4 +1,4 @@
-// Package cli — doctor·upgrade·stats(purge는 Task5까지 임시 placeholder) 진입점. 설계서 §7.
+// Package cli — doctor·upgrade·stats·purge 진입점. 설계서 §7.
 package cli
 
 import (
@@ -15,6 +15,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strings"
 	"time"
 
 	"github.com/wotjr1649/context-router/internal/ident"
@@ -48,7 +49,14 @@ func Run(ctx context.Context, sub string, args []string, storeRoot, projectRoot,
 	case "stats":
 		return runStats(ctx, stdout, args, storeRoot, projectRoot)
 	case "purge":
-		return fmt.Errorf("cli: 미구현 서브커맨드: %s", sub)
+		// TTY 판정은 여기서만 한다(cli.Run 시그니처는 불변 — confirmPurge는 그 결과값만
+		// 받는 순수 함수, 설계 §7). os.Stdin.Stat() 실패는 TTY 아님으로 취급(비대화형 파이프
+		// 등과 동일하게 --force를 요구).
+		isTTY := false
+		if fi, statErr := os.Stdin.Stat(); statErr == nil {
+			isTTY = fi.Mode()&os.ModeCharDevice != 0
+		}
+		return runPurge(ctx, os.Stdin, stdout, storeRoot, args, isTTY)
 	default:
 		return fmt.Errorf("cli: 미지 서브커맨드: %s", sub)
 	}
@@ -248,6 +256,177 @@ func runStatsProvider(ctx context.Context, w io.Writer, path string) error {
 	fmt.Fprintf(w, "cache_creation_input_tokens: %d\n", cacheCreate)
 	fmt.Fprintf(w, "usage records: %d\n", records)
 	fmt.Fprintf(w, "skipped: %d\n", skipped)
+	return nil
+}
+
+// confirmPurge: 삭제 확인 규칙(설계 §7) — TTY면 expected 슬러그를 보여주고 사용자가 그
+// 슬러그를 그대로 입력해야 nil을 반환한다(정적 "yes" 같은 건 없다 — 그냥 문자열 비교라
+// expected와 다르면 무엇을 입력해도 오류). 비TTY면 force가 없으면 즉시 오류(in을 전혀 읽지
+// 않는다), force가 있으면 즉시 nil(역시 in을 읽지 않는다) — 자동화 경로에서 stdin을 소비하지
+// 않기 위함. 순수 함수(설계 §8 규약) — TTY 판정·os.Stdin 소유는 호출자(Run의 purge 분기) 몫.
+func confirmPurge(in io.Reader, out io.Writer, isTTY bool, force bool, expected string) error {
+	if !isTTY {
+		if !force {
+			return errors.New("purge: 비TTY 환경에서는 --force 없이 진행할 수 없습니다")
+		}
+		return nil
+	}
+	fmt.Fprintf(out, "purge: 삭제 대상을 확인합니다. 계속하려면 다음을 그대로 입력하세요: %s\n> ", expected)
+	sc := bufio.NewScanner(in)
+	if !sc.Scan() {
+		return errors.New("purge: 확인 입력을 읽지 못했습니다 — 삭제하지 않았습니다")
+	}
+	if strings.TrimSpace(sc.Text()) != expected {
+		return errors.New("purge: 확인 슬러그가 일치하지 않습니다 — 삭제하지 않았습니다")
+	}
+	return nil
+}
+
+// purgeProjectID: --project 값(ID 또는 경로)을 ProjectID로 정규화한다. 경로 구분자를
+// 포함하거나 실재하는 디렉터리면 경로로 보고 ident.Canonicalize, 그 외는 ID 문자열 그대로
+// 취급한다 — main.resolveProjectEntry와 동형(설계 §4.6/§7, D13상 서로 다른 패키지라 자체
+// 인터페이스 없이 각자 소유).
+func purgeProjectID(entry string) (string, error) {
+	looksLikePath := strings.ContainsAny(entry, `/\`)
+	if !looksLikePath {
+		if fi, err := os.Stat(entry); err == nil && fi.IsDir() {
+			looksLikePath = true
+		}
+	}
+	if !looksLikePath {
+		return entry, nil
+	}
+	canon, err := ident.Canonicalize(entry)
+	if err != nil {
+		return "", err
+	}
+	return canon.ProjectID, nil
+}
+
+// listProjectDirs: <storeRoot>/projects/ 하위 디렉터리 이름(=ProjectID) 목록(--all 대상,
+// 설계 §7). projects/ 자체가 없으면(아무 프로젝트도 색인된 적 없음) 빈 목록+nil.
+func listProjectDirs(storeRoot string) ([]string, error) {
+	entries, err := os.ReadDir(filepath.Join(storeRoot, "projects"))
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, nil
+		}
+		return nil, errors.New("purge: 프로젝트 목록 조회 실패")
+	}
+	var ids []string
+	for _, e := range entries {
+		if e.IsDir() {
+			ids = append(ids, e.Name())
+		}
+	}
+	return ids, nil
+}
+
+// runPurge: purge 서브커맨드(설계 §7). --project/--all 중 정확히 하나. --older-than 지정 시
+// 선택 삭제(store.PurgeOlderThan, chunks/FTS 동기+무결성 확인은 store가 책임), 미지정 시
+// 프로젝트 디렉터리 전체 삭제(os.RemoveAll). --gc가 --older-than 없이 단독으로 주어지면
+// ("GC 단독", 설계 §7) 삭제를 전혀 하지 않고 orphan blob GC만 수행하며 확인을 생략한다 —
+// 고아 blob은 정의상 미참조 데이터라 삭제 확인 규칙(데이터 삭제 대상) 밖이다. 그 외 모든
+// 경로는 삭제 전 confirmPurge로 확인해야 하며, --gc가 --older-than과 함께면 확인 후
+// 삭제→GC 순서로 수행한다.
+func runPurge(ctx context.Context, in io.Reader, w io.Writer, storeRoot string, args []string, isTTY bool) error {
+	fs := flag.NewFlagSet("purge", flag.ContinueOnError)
+	project := fs.String("project", "", "purge 대상 프로젝트(ID 또는 경로)")
+	all := fs.Bool("all", false, "storeRoot 하위 전체 프로젝트 대상")
+	olderThanFlag := fs.String("older-than", "", "time.ParseDuration 형식 — 지정 시 선택 삭제, 미지정 시 전체 삭제")
+	gc := fs.Bool("gc", false, "orphan blob GC 수행")
+	force := fs.Bool("force", false, "비TTY 환경에서 확인을 생략(자동화 전용)")
+	if err := fs.Parse(args); err != nil {
+		return fmt.Errorf("purge: 플래그 파싱 실패: %w", err)
+	}
+	if rest := fs.Args(); len(rest) > 0 {
+		return fmt.Errorf("purge: 예상치 않은 인자 %d개", len(rest))
+	}
+	if (*project != "") == *all {
+		return errors.New("purge: --project와 --all 중 정확히 하나를 지정해야 합니다")
+	}
+
+	var ids []string
+	var expected string
+	if *all {
+		list, err := listProjectDirs(storeRoot)
+		if err != nil {
+			return err
+		}
+		ids = list
+		expected = fmt.Sprintf("all-%d-projects", len(list))
+	} else {
+		id, err := purgeProjectID(*project)
+		if err != nil {
+			return errors.New("purge: 프로젝트 식별 실패")
+		}
+		ids = []string{id}
+		expected = id
+	}
+
+	selective := *olderThanFlag != ""
+	gcOnly := *gc && !selective
+	var cutoffUnix int64
+	if selective {
+		d, err := time.ParseDuration(*olderThanFlag)
+		if err != nil {
+			return fmt.Errorf("purge: --older-than 파싱 실패: %w", err)
+		}
+		cutoffUnix = time.Now().Add(-d).Unix()
+	}
+
+	if !gcOnly { // GC 단독은 데이터 삭제가 아니므로 확인 생략(설계 §7)
+		if err := confirmPurge(in, w, isTTY, *force, expected); err != nil {
+			return err
+		}
+	}
+
+	for _, id := range ids {
+		if err := ctx.Err(); err != nil { // --all 다중 순회 취소 전파
+			return err
+		}
+		projDir := filepath.Join(storeRoot, "projects", id)
+
+		if gcOnly {
+			st, err := store.Open(projDir, true) // read-only — GC는 DB 쓰기가 없다
+			if err != nil {
+				return err
+			}
+			_, gcErr := st.GCOrphanBlobs(ctx)
+			closeErr := st.Close()
+			if gcErr != nil {
+				return gcErr
+			}
+			if closeErr != nil {
+				return closeErr
+			}
+			continue
+		}
+
+		if !selective { // 전체 삭제
+			if err := os.RemoveAll(projDir); err != nil {
+				return errors.New("purge: 프로젝트 삭제 실패")
+			}
+			continue
+		}
+
+		// 선택 삭제 (+ 후속 --gc)
+		st, err := store.Open(projDir, false)
+		if err != nil {
+			return err
+		}
+		_, _, purgeErr := st.PurgeOlderThan(ctx, cutoffUnix)
+		if purgeErr == nil && *gc {
+			_, purgeErr = st.GCOrphanBlobs(ctx)
+		}
+		closeErr := st.Close()
+		if purgeErr != nil {
+			return purgeErr
+		}
+		if closeErr != nil {
+			return closeErr
+		}
+	}
 	return nil
 }
 

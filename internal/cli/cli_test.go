@@ -3,6 +3,9 @@ package cli
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -193,16 +196,221 @@ func TestRun_UnknownSub(t *testing.T) {
 	}
 }
 
-// TestRun_NotYetImplementedSubs: purge는 Task5 소관이지만 dispatch 자체는 지금
-// 4개 이름을 모두 인식해야 한다 — 명확한 "미구현" 오류를 반환한다(어떤 이름도 삼켜지지 않음).
-// stats는 Task4에서 구현됐으므로 이 표에서 제외(아래 TestRunStats_* 참조).
-func TestRun_NotYetImplementedSubs(t *testing.T) {
-	for _, sub := range []string{"purge"} {
+// TestRunPurge_ExactlyOneSelector: --project/--all 중 정확히 하나가 아니면 사용법 오류(설계
+// §7). Run을 통해 호출해 dispatch까지 포함해 확인한다 — 비TTY(테스트 프로세스 stdin)라
+// --force 미비로도 오류가 나겠지만, 이 값 자체는 selector 검증이 먼저 걸려야 한다.
+func TestRunPurge_ExactlyOneSelector(t *testing.T) {
+	for _, args := range [][]string{
+		{},                          // 둘 다 없음
+		{"--project", "x", "--all"}, // 둘 다 있음
+	} {
 		var out, errOut bytes.Buffer
-		err := Run(context.Background(), sub, nil, t.TempDir(), t.TempDir(), "0.0.1-dev", &out, &errOut)
+		err := Run(context.Background(), "purge", args, t.TempDir(), t.TempDir(), "0.0.1-dev", &out, &errOut)
 		if err == nil {
-			t.Fatalf("sub=%s: want error (not yet implemented), got nil", sub)
+			t.Fatalf("args=%v: want selector 오류, got nil", args)
 		}
+	}
+}
+
+// failReader: Read 호출 시 즉시 panic — confirmPurge의 force 경로가 실제로 in을 전혀 읽지
+// 않음을 증명하는 용도(읽으면 테스트가 panic으로 즉시 실패한다).
+type failReader struct{}
+
+func (failReader) Read([]byte) (int, error) {
+	panic("confirmPurge: force 경로에서 입력을 읽으면 안 됩니다")
+}
+
+// TestConfirmPurge: 확인 규칙 table-driven(설계 §7 — TTY 필수+슬러그 정확 입력, 정적 "yes"
+// 금지, 비TTY는 --force만). confirmPurge는 순수 함수라 os.Stdin 없이 직접 호출한다.
+func TestConfirmPurge(t *testing.T) {
+	tests := []struct {
+		name    string
+		in      io.Reader
+		isTTY   bool
+		force   bool
+		wantErr bool
+	}{
+		{"tty_exact_slug_ok", strings.NewReader("myproj\n"), true, false, false},
+		{"tty_wrong_input_rejected", strings.NewReader("nope\n"), true, false, true},
+		{"tty_static_yes_rejected", strings.NewReader("yes\n"), true, false, true},
+		{"non_tty_without_force_rejected", failReader{}, false, false, true},
+		{"non_tty_with_force_ok_and_unread", failReader{}, false, true, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var out bytes.Buffer
+			err := confirmPurge(tt.in, &out, tt.isTTY, tt.force, "myproj")
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("err=%v wantErr=%v", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+// TestRunPurge_E2E_OlderThanForce: 임시 store에 source 1건을 등록한 뒤 runPurge를
+// --project(경로 형태, purgeProjectID의 Canonicalize 분기까지 exercised) --force
+// --older-than 1ns로 호출한다. isTTY는 false로 명시 주입한다 — 이 값은 원래 Run()의 purge
+// 분기가 os.Stdin.Stat()으로 판정하지만(테스트 대상 아님, 한 줄짜리 위임), 테스트 프로세스의
+// 실제 stdin이 셸/CI 환경에 따라 문자 장치로 보일 수도 있어(이식성 없음) runPurge를 직접
+// 호출해 비TTY 경로를 결정적으로 재현한다. 삭제 후 sources/artifacts가 실제로 비어야 한다
+// (설계 §7 선택 삭제).
+func TestRunPurge_E2E_OlderThanForce(t *testing.T) {
+	storeRoot := t.TempDir()
+	projectRoot := t.TempDir()
+	canon, err := ident.Canonicalize(projectRoot)
+	if err != nil {
+		t.Fatalf("canonicalize: %v", err)
+	}
+	projDir := filepath.Join(storeRoot, "projects", canon.ProjectID)
+	st, err := store.Open(projDir, false)
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	if _, err := st.Register(t.Context(), store.Registration{StoredBytes: []byte("purge me"), MediaType: "text/plain",
+		Source: store.SourceMeta{URI: "/purge.txt", Kind: "file", SrcHash: "h-purge"},
+		Chunks: []store.Chunk{{Ordinal: 0, Text: "purge me"}}}); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	time.Sleep(1100 * time.Millisecond) // indexed_at은 unix 초 — --older-than 1ns가 실제로 경계를 넘도록
+
+	var out bytes.Buffer
+	args := []string{"--project", projectRoot, "--force", "--older-than", "1ns"}
+	if err := runPurge(context.Background(), failReader{}, &out, storeRoot, args, false); err != nil {
+		t.Fatalf("runPurge err=%v out=%s", err, out.String())
+	}
+
+	st2, err := store.Open(projDir, true)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer st2.Close()
+	var n int
+	if err := st2.Reader().QueryRow("SELECT count(*) FROM sources").Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Fatalf("sources=%d want 0(삭제됐어야 함)", n)
+	}
+	if err := st2.Reader().QueryRow("SELECT count(*) FROM artifacts").Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Fatalf("artifacts=%d want 0(삭제됐어야 함)", n)
+	}
+}
+
+// TestRunPurge_E2E_MismatchLeavesDataIntact: TTY 경로에서 확인 슬러그를 잘못 입력하면
+// runPurge가 오류를 반환하고 sources/artifacts를 전혀 건드리면 안 된다(설계 §7 — 불일치 시
+// 무삭제, self-review 필수 항목). --older-than을 지정하지 않아 전체 삭제(RemoveAll) 분기까지
+// 타는 경우도 포함 — 확인 실패 시 그 분기 자체에 도달하면 안 된다는 것까지 증명한다.
+func TestRunPurge_E2E_MismatchLeavesDataIntact(t *testing.T) {
+	storeRoot := t.TempDir()
+	projectRoot := t.TempDir()
+	canon, err := ident.Canonicalize(projectRoot)
+	if err != nil {
+		t.Fatalf("canonicalize: %v", err)
+	}
+	projDir := filepath.Join(storeRoot, "projects", canon.ProjectID)
+	st, err := store.Open(projDir, false)
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	if _, err := st.Register(t.Context(), store.Registration{StoredBytes: []byte("do not touch"), MediaType: "text/plain",
+		Source: store.SourceMeta{URI: "/keep.txt", Kind: "file", SrcHash: "h-keep"},
+		Chunks: []store.Chunk{{Ordinal: 0, Text: "do not touch"}}}); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	var out bytes.Buffer
+	args := []string{"--project", canon.ProjectID} // --older-than 미지정 → 성공했다면 전체 삭제였을 경로
+	err = runPurge(context.Background(), strings.NewReader("wrong-slug\n"), &out, storeRoot, args, true)
+	if err == nil {
+		t.Fatal("want error for mismatched confirmation slug, got nil")
+	}
+
+	if _, err := os.Stat(projDir); err != nil {
+		t.Fatalf("projDir must survive a rejected confirmation: %v", err)
+	}
+	st2, err := store.Open(projDir, true)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer st2.Close()
+	var n int
+	if err := st2.Reader().QueryRow("SELECT count(*) FROM sources").Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Fatalf("sources=%d want 1(무삭제)", n)
+	}
+}
+
+// TestRunPurge_E2E_GCOnlyNoConfirm: --gc 단독(older-than 없음)이면 --force도 TTY도 없이
+// 성공해야 하고(확인 생략, 설계 §7), orphan blob만 지우고 참조 중인 source/artifact/blob은
+// 전혀 건드리지 않아야 한다.
+func TestRunPurge_E2E_GCOnlyNoConfirm(t *testing.T) {
+	storeRoot := t.TempDir()
+	projectRoot := t.TempDir()
+	canon, err := ident.Canonicalize(projectRoot)
+	if err != nil {
+		t.Fatalf("canonicalize: %v", err)
+	}
+	projDir := filepath.Join(storeRoot, "projects", canon.ProjectID)
+	body := []byte("kept content")
+	st, err := store.Open(projDir, false)
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	if _, err := st.Register(t.Context(), store.Registration{StoredBytes: body, MediaType: "text/plain",
+		Source: store.SourceMeta{URI: "/kept.txt", Kind: "file", SrcHash: "h-kept"},
+		Chunks: []store.Chunk{{Ordinal: 0, Text: string(body)}}}); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	sum := sha256.Sum256(body)
+	keptHash := hex.EncodeToString(sum[:])
+
+	orphanHash := strings.Repeat("e", 64)
+	orphanDir := filepath.Join(projDir, "artifacts", orphanHash[:2])
+	if err := os.MkdirAll(orphanDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(orphanDir, orphanHash), []byte("orphan"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	var out, errOut bytes.Buffer
+	// --force도 --older-than도 없다 — gc 단독이 확인을 생략하고도 성공해야 한다.
+	args := []string{"--project", projectRoot, "--gc"}
+	if err := Run(context.Background(), "purge", args, storeRoot, projectRoot, "0.0.1-dev", &out, &errOut); err != nil {
+		t.Fatalf("Run purge --gc err=%v out=%s", err, out.String())
+	}
+
+	if _, err := os.Stat(filepath.Join(orphanDir, orphanHash)); !os.IsNotExist(err) {
+		t.Fatalf("orphan blob 잔존: err=%v", err)
+	}
+	if _, err := os.Stat(filepath.Join(projDir, "artifacts", keptHash[:2], keptHash)); err != nil {
+		t.Fatalf("참조 blob이 gc-only에 삭제됨: %v", err)
+	}
+	st2, err := store.Open(projDir, true)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer st2.Close()
+	var n int
+	if err := st2.Reader().QueryRow("SELECT count(*) FROM sources").Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Fatalf("sources=%d want 1(gc-only는 DB 행을 지우지 않음)", n)
 	}
 }
 
