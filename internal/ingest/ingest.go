@@ -693,23 +693,18 @@ func Run(ctx context.Context, st *store.Store, projectRoot string, allowPaths []
 	if err != nil {
 		return Report{}, err
 	}
-	// projectRoot/allowPaths도 real과 동일 기준(Abs→EvalSymlinks)으로 재해석 후 Fold한다 —
-	// 호출자가 이미 canonicalize된 값을 넘기면 EvalSymlinks가 그대로 idempotent하지만,
-	// macOS `/var`→`/private/var`처럼 심링크 낀 경로를 raw로 넘기는 호출자(단위 테스트 등)가
-	// 있으면 real만 심링크 해석되고 root는 안 되어 하위 경로가 ".."로 새어나가 오탐
-	// "outside workspace"가 난다(3-OS CI 최초 실측 발견, 설계 §4.4 경계 판정의 전제 위반).
-	realProjectRoot, err := canonicalPath(projectRoot)
-	if err != nil {
-		return Report{}, err
-	}
+	// projectRoot/allowPaths는 이미 canonical하다는 게 계약이다(§2.1 런타임 불변 — 인가
+	// 루트는 시작 시 고정, 요청마다 재해석하지 않는다). 운영 호출부(mcp.registerIndex)는
+	// ident.Canonicalize(WorktreeRoot)·canonicalizeAllowPaths 결과를 넘긴다. 요청마다
+	// Abs+EvalSymlinks로 재해석하면 사후 심링크 스왑 공격에 열린다 — 허용 디렉터리를
+	// rename 후 /secret 심링크로 교체하면 재해석 시 루트·요청 둘 다 /secret으로 풀려
+	// "인가됨"이 되고(고정 루트였다면 거부), 무관한 allow 루트 하나가 삭제되면 재해석
+	// 실패로 요청 전체가 마비된다(Codex 교차리뷰 P1-2). 테스트는 realDir 헬퍼로 미리
+	// 해석한 값을 넘겨 이 계약을 스스로 지킨다.
 	foldedRoots := make([]string, 0, 1+len(allowPaths))
-	foldedRoots = append(foldedRoots, ident.Fold(realProjectRoot))
+	foldedRoots = append(foldedRoots, ident.Fold(projectRoot))
 	for _, p := range allowPaths {
-		realAllow, err := canonicalPath(p)
-		if err != nil {
-			return Report{}, err
-		}
-		foldedRoots = append(foldedRoots, ident.Fold(realAllow))
+		foldedRoots = append(foldedRoots, ident.Fold(p))
 	}
 	if !withinAny(foldedRoots, real) {
 		return Report{}, fmt.Errorf("ingest: run: %w", ErrWorkspace)
@@ -722,17 +717,13 @@ func Run(ctx context.Context, st *store.Store, projectRoot string, allowPaths []
 
 	var items []workItem
 	if info.IsDir() {
-		// relDisplay는 realProjectRoot(심링크 해석됨)를 써야 한다 — raw projectRoot를 쓰면
-		// macOS `/var`→`/private/var`에서 real(항상 해석됨)과 기준이 어긋나 SkipEntry.Path가
-		// "../../.../private/var/..."처럼 길게 새어나가 프로젝트 루트 절대경로 구조를
-		// 노출한다(3-OS CI 최초 실측 발견, relDisplay의 "절대경로 노출 금지" 계약 위반).
-		items, err = collect(ctx, real, foldedRoots, realProjectRoot, req, maxBytes)
+		items, err = collect(ctx, real, foldedRoots, projectRoot, req, maxBytes)
 		if err != nil {
 			return Report{}, err
 		}
 	} else {
 		base := filepath.Base(real)
-		rel := relDisplay(realProjectRoot, real)
+		rel := relDisplay(projectRoot, real)
 		var it workItem
 		switch {
 		case DeniedFilename(rel) || DeniedFilename(real):

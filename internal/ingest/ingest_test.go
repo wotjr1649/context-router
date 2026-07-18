@@ -290,7 +290,7 @@ func TestDeniedFilename(t *testing.T) {
 // 접미 규칙은 base name만 받으면 절대 매치되지 않는다(β1-1 사문화) — collect가
 // base 대신 전체 상대경로도 넘기는지 실증.
 func TestRun_DeniedFilename_SubdirPathSuffix(t *testing.T) {
-	root := t.TempDir()
+	root := realDir(t, t.TempDir())
 	p := filepath.Join(root, "x", ".docker", "config.json")
 	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
 		t.Fatal(err)
@@ -312,7 +312,7 @@ func TestRun_DeniedFilename_SubdirPathSuffix(t *testing.T) {
 // 우회할 수 있었다(β1-1) — collect가 canonicalize된 real 경로도 검사하는지 실증.
 // unix 한정(windows는 심링크 생성 권한 부족 시 skip).
 func TestRun_DeniedFilename_SymlinkBypass(t *testing.T) {
-	root := t.TempDir()
+	root := realDir(t, t.TempDir())
 	if err := os.WriteFile(filepath.Join(root, ".env"), []byte("SECRET=1\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -451,10 +451,29 @@ func openStoreT(t *testing.T) (*store.Store, string) {
 	return st, dir
 }
 
+// realDir: t.TempDir()류 경로를 canonicalPath와 동일 기준(Abs+EvalSymlinks)으로
+// 해석한다. Run의 projectRoot/allowPaths 인자는 이미 canonical하다는 게 계약이다(§2.1
+// 런타임 불변 — 인가 루트는 요청마다 재해석하지 않는다, Codex 교차리뷰 P1-2). 운영
+// 경로는 mcp.go가 ident.Canonicalize(→Fold(EvalSymlinks(...)))로 이렇게 넘기므로,
+// 테스트도 raw t.TempDir()가 아니라 이 함수로 미리 해석한 값을 넘겨야 macOS의
+// `/var`→`/private/var` 같은 심링크에서 Run이 실제 운영 계약과 같은 입력을 받는다.
+func realDir(t *testing.T, p string) string {
+	t.Helper()
+	abs, err := filepath.Abs(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	real, err := filepath.EvalSymlinks(abs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return real
+}
+
 // TestRun_DirectoryPipeline: 임시 프로젝트(일반/비밀포함/denylist/6MB초과/서브디렉터리)를
 // 워크해 Report{Indexed,Skipped}와 store 반영(redaction·src_hash≠content_hash)을 검증.
 func TestRun_DirectoryPipeline(t *testing.T) {
-	root := t.TempDir()
+	root := realDir(t, t.TempDir())
 	st, storeDir := openStoreT(t)
 
 	secretContent := "key=AKIAIOSFODNN7EXAMPLE ok\n"
@@ -525,7 +544,7 @@ func TestRun_DirectoryPipeline(t *testing.T) {
 }
 
 func TestRun_PathEscape_Absolute(t *testing.T) {
-	root := t.TempDir()
+	root := realDir(t, t.TempDir())
 	outside := t.TempDir()
 	outsideFile := filepath.Join(outside, "secret.txt")
 	if err := os.WriteFile(outsideFile, []byte("nope\n"), 0o644); err != nil {
@@ -540,7 +559,7 @@ func TestRun_PathEscape_Absolute(t *testing.T) {
 }
 
 func TestRun_PathEscape_Symlink(t *testing.T) {
-	root := t.TempDir()
+	root := realDir(t, t.TempDir())
 	outside := t.TempDir()
 	outsideFile := filepath.Join(outside, "real.txt")
 	if err := os.WriteFile(outsideFile, []byte("nope\n"), 0o644); err != nil {
@@ -559,7 +578,7 @@ func TestRun_PathEscape_Symlink(t *testing.T) {
 }
 
 func TestRun_SingleFile(t *testing.T) {
-	root := t.TempDir()
+	root := realDir(t, t.TempDir())
 	f := filepath.Join(root, "one.md")
 	if err := os.WriteFile(f, []byte("# Solo\nbody\n"), 0o644); err != nil {
 		t.Fatal(err)

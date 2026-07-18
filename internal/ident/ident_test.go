@@ -106,7 +106,13 @@ func TestFindGitProjectRoot_ReadFailureWrapped(t *testing.T) {
 	}
 }
 
+// TestFold_ExtendedUNC / _SlashVariant: 확장 UNC 경로 문법(`\\?\...`, `//?/...`)은
+// windows 전용 개념이다 — unix(darwin 포함)에서는 `\`가 구분자가 아니라 합법 파일명
+// 바이트라 이 두 픽스처를 "동일 경로"로 접을 근거가 없다(Codex 교차리뷰 P1-1).
 func TestFold_ExtendedUNC(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("UNC 확장경로 문법은 windows 전용 — unix에서는 백슬래시가 구분자가 아니다")
+	}
 	a := Fold(`\\?\UNC\Server\Share\p`)
 	b := Fold(`\\Server\Share\p`)
 	if a != b {
@@ -115,8 +121,11 @@ func TestFold_ExtendedUNC(t *testing.T) {
 }
 
 // TestFold_ExtendedUNC_SlashVariant: 계획2 Task2 이월 — 확장 UNC 접두의 슬래시 변형
-// (`//?/UNC/...`)도 백슬래시 변형(`\\?\UNC\...`)과 동일하게 fold되어야 한다.
+// (`//?/UNC/...`)도 백슬래시 변형(`\\?\UNC\...`)과 동일하게 fold되어야 한다(windows 전용).
 func TestFold_ExtendedUNC_SlashVariant(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("UNC 확장경로 문법은 windows 전용 — unix에서는 백슬래시가 구분자가 아니다")
+	}
 	a := Fold(`//?/UNC/Server/Share/p`)
 	b := Fold(`\\Server\Share\p`)
 	if a != b {
@@ -124,14 +133,40 @@ func TestFold_ExtendedUNC_SlashVariant(t *testing.T) {
 	}
 }
 
+// TestFold_OSRule: 구분자 통일(windows만)과 case-fold(windows·darwin)는 서로 다른
+// 게이트다 — darwin은 unix 계열이라 `\`를 구분자로 바꾸지 않지만 대소문자는 접는다.
 func TestFold_OSRule(t *testing.T) {
 	got := Fold(`C:\Some\Dir`)
-	if runtime.GOOS == "windows" || runtime.GOOS == "darwin" {
+	switch runtime.GOOS {
+	case "windows":
 		if got != "c:/some/dir" {
 			t.Fatalf("fold=%q", got)
 		}
-	} else if got != `C:\Some\Dir` && got != "C:/Some/Dir" {
-		t.Fatalf("linux fold=%q", got)
+	case "darwin":
+		if got != `c:\some\dir` {
+			t.Fatalf("darwin fold=%q want case-fold만(슬래시 미변환)", got)
+		}
+	default: // linux 등 — case-sensitive, 슬래시도 구분자 아님(백슬래시는 합법 파일명 바이트)
+		if got != `C:\Some\Dir` {
+			t.Fatalf("linux fold=%q want 원본 그대로", got)
+		}
+	}
+}
+
+// TestFold_PreservesBackslashInUnixFilename: Codex 교차리뷰 P1-1 — unix에서 `\`는
+// 합법 파일명 바이트다. 전역 치환을 windows 전용으로 되돌린 회귀 가드: 실제 파일명에
+// 백슬래시가 섞여 있어도(예: "work\root") 구분자로 오인돼 경계 판정을 깨서는 안 된다.
+func TestFold_PreservesBackslashInUnixFilename(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("windows는 `\\`가 실제 구분자 — TestFold_OSRule/ExtendedUNC가 이미 커버")
+	}
+	p := `/tmp/work\root/file.txt`
+	want := p
+	if runtime.GOOS == "darwin" {
+		want = strings.ToLower(p) // case-fold만 적용, 백슬래시는 그대로
+	}
+	if got := Fold(p); got != want {
+		t.Fatalf("Fold(%q)=%q want %q (백슬래시가 구분자로 오인돼 변형됨)", p, got, want)
 	}
 }
 

@@ -925,7 +925,14 @@ func newGlobalTestProject(t *testing.T, id, content string) GlobalProject {
 	if err := os.WriteFile(file, []byte(content), 0o644); err != nil {
 		t.Fatalf("write fixture: %v", err)
 	}
-	if _, err := ingest.Run(context.Background(), writeSt, srcDir, nil, ingest.Request{Path: file}); err != nil {
+	// ingest.Run은 projectRoot가 이미 canonical(Abs+EvalSymlinks)함을 계약으로 삼는다
+	// (§2.1 인가 루트 고정, Codex 교차리뷰 P1-2 — newTestServer는 ident.Canonicalize를
+	// 거쳐 이미 이 계약을 지키지만, 여기는 raw t.TempDir()를 직접 넘기므로 별도 해석 필요).
+	canonSrcDir, err := filepath.EvalSymlinks(srcDir)
+	if err != nil {
+		t.Fatalf("realpath srcDir: %v", err)
+	}
+	if _, err := ingest.Run(context.Background(), writeSt, canonSrcDir, nil, ingest.Request{Path: file}); err != nil {
 		t.Fatalf("ingest: %v", err)
 	}
 	writeSt.Close()

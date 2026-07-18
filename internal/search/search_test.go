@@ -13,6 +13,22 @@ import (
 	"github.com/wotjr1649/context-router/internal/store"
 )
 
+// realDir: t.TempDir()류 경로를 canonical(Abs+EvalSymlinks)로 해석한다. ingest.Run의
+// projectRoot 인자는 이미 canonical함을 계약으로 삼는다(§2.1 인가 루트 고정, Codex
+// 교차리뷰 P1-2) — 운영 경로는 mcp.go가 ident.Canonicalize로 이렇게 넘긴다.
+func realDir(t *testing.T, p string) string {
+	t.Helper()
+	abs, err := filepath.Abs(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	real, err := filepath.EvalSymlinks(abs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return real
+}
+
 // seedT: store.Register 직접 3건 — porter/trigram/RRF 3개 테스트가 공유하는 코퍼스.
 func seedT(t *testing.T) *store.Store {
 	t.Helper()
@@ -208,7 +224,7 @@ func TestQuery_StaleDetectsModifiedFile(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { st.Close() })
-	root := t.TempDir()
+	root := realDir(t, t.TempDir())
 	file := filepath.Join(root, "doc.txt")
 	if err := os.WriteFile(file, []byte("caching stale test v1"), 0o644); err != nil {
 		t.Fatal(err)
@@ -251,7 +267,7 @@ func TestQuery_ReindexOrphanDoesNotFailQuery(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { st.Close() })
-	root := t.TempDir()
+	root := realDir(t, t.TempDir())
 	file := filepath.Join(root, "doc.txt")
 	if err := os.WriteFile(file, []byte("oldwordunique content here"), 0o644); err != nil {
 		t.Fatal(err)

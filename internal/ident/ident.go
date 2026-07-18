@@ -24,10 +24,14 @@ func Fold(p string) string {
 	if strings.HasPrefix(p, `UNC\`) || strings.HasPrefix(p, `UNC/`) {
 		p = `\\` + p[4:] // (\\?\|//?/)UNC\server\share → \\server\share
 	}
-	// 구분자 통일은 OS 불문 무조건 적용(설계 §3.2) — filepath.ToSlash는 빌드 OS의 네이티브
-	// 구분자만 변환해 unix 빌드에서는 백슬래시를 그대로 남긴다(3-OS CI 최초 실측 발견,
-	// TestFold_ExtendedUNC_SlashVariant가 linux에서 실패했던 근본 원인). case-fold만 GOOS별.
-	p = strings.ReplaceAll(p, `\`, "/")
+	// 구분자 통일은 windows 전용이다 — unix(darwin 포함)는 `\`가 합법 파일명 바이트라
+	// 무조건 치환하면 "/tmp/work\root" 같은 실재 경로를 "/tmp/work/root"로 오염시켜
+	// 경계 판정·ID 계산이 깨진다(Codex 교차리뷰 P1-1, Fix Round 1 — 3-OS CI 최초 실측
+	// 대응 중 반대로 과도 수정했던 것을 원복). filepath.ToSlash와 동일한 의미론을
+	// 케이스폴드 게이트와 같은 형태의 명시 분기로 재현한다.
+	if runtime.GOOS == "windows" {
+		p = strings.ReplaceAll(p, `\`, "/")
+	}
 	if runtime.GOOS == "windows" || runtime.GOOS == "darwin" {
 		p = strings.ToLower(p)
 	}
