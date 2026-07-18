@@ -134,7 +134,7 @@ func TestIsDowngrade(t *testing.T) {
 func TestTransportIgnoresEnvProxyAndHasNoRedirectFollow(t *testing.T) {
 	t.Setenv("HTTP_PROXY", "http://example.invalid:8080")
 	t.Setenv("HTTPS_PROXY", "http://example.invalid:8080")
-	tr := buildTransport(netip.MustParseAddr("127.0.0.1"), 80)
+	tr := buildTransport(netip.MustParseAddr("127.0.0.1"), 80, "example.invalid")
 	if tr.Proxy != nil {
 		t.Fatalf("want Transport.Proxy nil (env proxy ignored), got non-nil")
 	}
@@ -143,7 +143,7 @@ func TestTransportIgnoresEnvProxyAndHasNoRedirectFollow(t *testing.T) {
 // TestBuildTransportDisablesKeepAlives: 일회용 hop마다 새 Transport라 커넥션 재사용이 없다 —
 // keep-alive를 켜두면 유휴 소켓만 남으므로 명시적으로 끈다.
 func TestBuildTransportDisablesKeepAlives(t *testing.T) {
-	tr := buildTransport(netip.MustParseAddr("127.0.0.1"), 80)
+	tr := buildTransport(netip.MustParseAddr("127.0.0.1"), 80, "example.invalid")
 	if !tr.DisableKeepAlives {
 		t.Fatalf("want Transport.DisableKeepAlives = true")
 	}
@@ -454,6 +454,11 @@ func TestRetryableDialErr(t *testing.T) {
 		{"x509.HostnameError", x509.HostnameError{Host: "example.invalid"}, true},
 		{"x509.UnknownAuthorityError", x509.UnknownAuthorityError{}, true},
 		{"x509.CertificateInvalidError", x509.CertificateInvalidError{Reason: x509.Expired}, true},
+		// 최종리뷰 F9: 주소별 예산(perAddrConnTimeout) 초과 — 부모 ctx는 살아있음 — 은
+		// context.DeadlineExceeded보다 최우선으로 재시도 대상이어야 한다(내부 dial 오류
+		// 체인이 우연히 context.DeadlineExceeded도 함께 감싸고 있는 경우 포함).
+		{"errAddrTimeout wrapping context.DeadlineExceeded", fmt.Errorf("%w: %w", errAddrTimeout, context.DeadlineExceeded), true},
+		{"errAddrTimeout alone", errAddrTimeout, true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -464,12 +469,17 @@ func TestRetryableDialErr(t *testing.T) {
 	}
 }
 
-// TestBuildTransport_PerAddrTimeout: dial/handshake가 주소 1건에 fetch 전체 ctx를 소비하지
-// 않도록 상한이 걸려 있는지 필드로 확인한다(Fix Round 1 리뷰 P2-3).
+// TestBuildTransport_PerAddrTimeout: dial+handshake가 주소 1건에 fetch 전체 ctx를 소비하지
+// 않도록 상한이 걸려 있는지 확인한다(Fix Round 1 리뷰 P2-3, 최종리뷰 F9로 DialTLSContext
+// 기반 공유 예산 방식으로 재수정 — TLSHandshakeTimeout 필드는 DialTLSContext가 설정되면
+// net/http가 아예 참조하지 않으므로 더는 이 계약의 증거가 될 수 없다).
 func TestBuildTransport_PerAddrTimeout(t *testing.T) {
-	tr := buildTransport(netip.MustParseAddr("127.0.0.1"), 80)
-	if tr.TLSHandshakeTimeout != perAddrConnTimeout {
-		t.Fatalf("TLSHandshakeTimeout = %v, want %v", tr.TLSHandshakeTimeout, perAddrConnTimeout)
+	tr := buildTransport(netip.MustParseAddr("127.0.0.1"), 80, "example.invalid")
+	if tr.DialTLSContext == nil {
+		t.Fatal("DialTLSContext가 설정되지 않음 — dial+TLS 공유 예산(F9) 미적용")
+	}
+	if tr.DialContext == nil {
+		t.Fatal("DialContext가 설정되지 않음 — plain-http 경로도 주소별 예산을 공유해야 함")
 	}
 }
 

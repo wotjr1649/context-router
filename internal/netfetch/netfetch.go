@@ -181,16 +181,29 @@ func resolveAndValidate(ctx context.Context, host string, cfg Config) ([]netip.A
 	return out, nil
 }
 
+// errAddrTimeout: 주소 1건의 dial+TLS handshake 공유 예산(perAddrConnTimeout) 초과 —
+// classifyAddrCtxErr가 부모 ctx는 아직 살아있다고 판단했을 때만 이 sentinel로 감싼다
+// (최종리뷰 F9). retryableDialErr가 이를 최우선으로 재시도 대상 분류해 다음 주소로
+// 넘어간다 — 부모 ctx(fetch 전체) 자체의 취소·만료는 이 sentinel로 감싸지 않으므로 기존
+// 그대로 non-retryable로 남는다.
+var errAddrTimeout = errors.New("netfetch: 주소별 dial/TLS 예산 초과")
+
 // retryableDialErr: hop 루프가 다음 주소로 재시도할지 판단 — 연결 계층 오류(dial·TLS
 // handshake)만 참. client.Do는 HTTP 응답을 받으면 항상 err=nil이므로, 응답 수신 후 오류
 // (상태코드·본문 등)는 애초에 이 함수의 판정 대상이 되지 않는다. 판정 순서(Fix Round 1
-// 리뷰 P2-2):
+// 리뷰 P2-2, 최종리뷰 F9로 0번 추가):
+//  0. errAddrTimeout(주소별 예산 초과, 부모 ctx는 생존) → true. 반드시 1번보다 먼저 검사한다
+//     — 내부 dial/handshake 오류 체인이 우연히 context.DeadlineExceeded를 함께 감싸고
+//     있어도 이 sentinel이 우선한다.
 //  1. ctx 취소/데드라인(*net.OpError가 원인으로 감싸고 있어도) → false. 목적지 문제가
 //     아니라 호출자 쪽 사정이라 다음 주소로 넘어가도 의미가 없다.
 //  2. *net.OpError(dial 실패: connection refused 등) → true.
 //  3. TLS handshake 실패 부류(레코드 헤더 오류·TLS alert·인증서 검증 오류) → true — 이
 //     주소가 애초에 유효한 TLS 종단이 아니라는 신호라 다음 주소를 시도할 가치가 있다.
 func retryableDialErr(err error) bool {
+	if errors.Is(err, errAddrTimeout) {
+		return true
+	}
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		return false
 	}
@@ -218,25 +231,70 @@ func retryableDialErr(err error) bool {
 	return errors.As(err, &certErr)
 }
 
-// perAddrConnTimeout: 주소 시도 1건당 dial+TLS handshake 예산(Fix Round 1 리뷰 P2-3) —
-// 없으면 첫 주소가 SYN이나 handshake를 조용히 드롭할 때 fetch 전체 ctx(기본 30s)를 그
-// 시도 혼자 소비해버려, 남은 주소들이 이미 만료된 ctx로 즉시 실패하고 재시도 기회를
-// 못 받는다.
+// perAddrConnTimeout: 주소 시도 1건당 dial+TLS handshake 공유 예산(Fix Round 1 리뷰 P2-3,
+// 최종리뷰 F9로 dial과 handshake가 하나의 예산을 공유하도록 재수정) — 없으면 첫 주소가
+// SYN이나 handshake를 조용히 드롭할 때 fetch 전체 ctx(기본 30s)를 그 시도 혼자 소비해버려,
+// 남은 주소들이 이미 만료된 ctx로 즉시 실패하고 재시도 기회를 못 받는다.
 const perAddrConnTimeout = 10 * time.Second
 
-// buildTransport: dial은 검증된 pinnedIP:port로만(I4) — Transport가 넘기는 addr은 무시하고
-// closure의 pinnedIP:port를 그대로 재사용(hop의 주소 시도마다 Transport를 새로 만들어 넘기므로
-// 항상 addr과 동일값), hostname 재조회 경로 자체가 없다. TLSClientConfig는 미설정 —
-// net/http가 원 요청 URL의 hostname으로 ServerName을 자동 설정하므로 SNI/인증서 검증은
-// 정규화 hostname 기준으로 유지된다(I5). Proxy: nil로 환경 프록시 무시(I6).
-func buildTransport(pinnedIP netip.Addr, port int) *http.Transport {
-	dialer := &net.Dialer{Timeout: perAddrConnTimeout}
+// classifyAddrCtxErr: addrCtx(parent에서 파생된 주소별 자식 context)가 만료돼 dial/handshake가
+// 실패했을 때, parent(fetch 전체 ctx)는 아직 살아있는지로 재시도 여부를 가른다(최종리뷰 F9).
+// parent가 살아있고 addrCtx만 만료됐다면 이 주소 하나의 예산 초과일 뿐이므로 errAddrTimeout으로
+// 감싸 retryableDialErr가 다음 주소로 넘어가게 한다. parent 자체가 만료·취소됐다면(fetch 전체
+// 종료) 원본 오류를 그대로 반환해 기존 non-retryable 판정을 그대로 유지한다.
+func classifyAddrCtxErr(parent, addrCtx context.Context, err error) error {
+	if parent.Err() == nil && errors.Is(addrCtx.Err(), context.DeadlineExceeded) {
+		return fmt.Errorf("%w: %w", errAddrTimeout, err)
+	}
+	return err
+}
+
+// dialAddr: 주소별 자식 context(perAddrConnTimeout)로 pinnedIP:port에 접속한다. dial과(https
+// 경로에서는) TLS handshake가 이 자식 context 하나를 공유해야 "한 주소 시도"의 예산이 dial과
+// handshake로 이중 소비되지 않는다(최종리뷰 F9(a)).
+func dialAddr(ctx context.Context, network, addr string) (net.Conn, error) {
+	var d net.Dialer
+	return d.DialContext(ctx, network, addr)
+}
+
+// buildTransport: dial(+https는 handshake까지)은 검증된 pinnedIP:port로만(I4) — Transport가
+// 넘기는 addr은 무시하고 closure의 pinnedIP:port를 그대로 재사용(hop의 주소 시도마다
+// Transport를 새로 만들어 넘기므로 항상 addr과 동일값), hostname 재조회 경로 자체가 없다.
+// https는 DialTLSContext로 dial+handshake를 직접 수행해 perAddrConnTimeout 자식 context
+// 하나를 dial과 handshake 전체에 공유한다(최종리뷰 F9) — 이전엔 net.Dialer.Timeout(dial)과
+// Transport.TLSHandshakeTimeout(handshake)이 각자 별도 10s를 새로 소비해 한 주소 시도가
+// 최악 20s를 먹었고, handshake 타임아웃은 net/http 비공개 타입(tlsHandshakeTimeoutError)이라
+// retryableDialErr가 재시도 대상으로 분류하지도 못했다(다음 IP로 못 넘어감). serverName은
+// 호출자가 원 요청 hostname(u.Hostname())을 넘겨 SNI/인증서 검증을 유지한다(I5,
+// DialTLSContext 경로에서는 Transport가 자동 설정하지 않는다). Proxy: nil로 환경 프록시
+// 무시(I6).
+func buildTransport(pinnedIP netip.Addr, port int, serverName string) *http.Transport {
+	addr := net.JoinHostPort(pinnedIP.String(), strconv.Itoa(port))
 	return &http.Transport{
-		Proxy:               nil,
-		DisableKeepAlives:   true, // 주소 시도마다 1회용 Transport — 재사용 없음, 유휴 소켓 잔존 방지.
-		TLSHandshakeTimeout: perAddrConnTimeout,
+		Proxy:             nil,
+		DisableKeepAlives: true, // 주소 시도마다 1회용 Transport — 재사용 없음, 유휴 소켓 잔존 방지.
 		DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
-			return dialer.DialContext(ctx, network, net.JoinHostPort(pinnedIP.String(), strconv.Itoa(port)))
+			addrCtx, cancel := context.WithTimeout(ctx, perAddrConnTimeout)
+			defer cancel()
+			conn, err := dialAddr(addrCtx, network, addr)
+			if err != nil {
+				return nil, classifyAddrCtxErr(ctx, addrCtx, err)
+			}
+			return conn, nil
+		},
+		DialTLSContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
+			addrCtx, cancel := context.WithTimeout(ctx, perAddrConnTimeout)
+			defer cancel()
+			conn, err := dialAddr(addrCtx, network, addr)
+			if err != nil {
+				return nil, classifyAddrCtxErr(ctx, addrCtx, err)
+			}
+			tlsConn := tls.Client(conn, &tls.Config{ServerName: serverName})
+			if err := tlsConn.HandshakeContext(addrCtx); err != nil {
+				conn.Close()
+				return nil, classifyAddrCtxErr(ctx, addrCtx, err)
+			}
+			return tlsConn, nil
 		},
 	}
 }
@@ -316,7 +374,7 @@ func Fetch(ctx context.Context, cfg Config, rawURL string) (Result, error) {
 		// 반환했을 것이므로) — 재시도 금지 요구사항은 그 사실만으로 자동 충족된다.
 		var resp *http.Response
 		for i, addr := range addrs {
-			transport := buildTransport(addr, port)
+			transport := buildTransport(addr, port, u.Hostname())
 			defer transport.CloseIdleConnections() // 주소 시도별 1회용 Transport 정리 — 반환/오류 경로 모두.
 			client := &http.Client{
 				Transport: transport,
