@@ -37,8 +37,8 @@ Mid-session directive (verbatim): review protocol change —
 
 ## 3. Current repo state
 
-- `main` @ **d73294a** — Plan 1+2 (v0.0.1 core + transform/net).
-- **Branch `feat/v0.0.1-global-cli`** @ bc6ab2e — Plan 3 (38 code commits) + dependency review doc. **PR #2** OPEN (https://github.com/wotjr1649/context-router/pull/2 → main), awaiting merge (user decision).
+- `main` @ **78a7927** — **PR #2 MERGED** (2026-07-19): Plan 1+2+3 all on main. Branch `feat/v0.0.1-global-cli` (head e7dc7c5) merged, kept (not deleted).
+- **PR #2**: https://github.com/wotjr1649/context-router/pull/2 — merged with dependency review doc included (bc6ab2e). Main CI run after merge must be confirmed GREEN before tagging.
 - **Dependency review (2026-07-19, user-directed):** `docs/superpowers/Specs/2026-07-19-pr-2-go-dependency-library-review.md` audited against PR #2 — decision upheld: **PR #2 keeps current `go.mod` unchanged** (none of §11's 3 blocking exceptions met). Verified: `go mod verify` all-verified, `go mod tidy -diff` clean, govulncheck **0 vulnerabilities**, dual-OS `CGO_ENABLED=0` builds OK, NOTICE/THIRD-PARTY == actual 25-module linked closure (go.mod's 26th = `google/uuid`, genuinely unlinked). Note: spec §4 x/sys usage table predates T10 — `internal/ident/realpath_windows.go` is a third x/sys/windows consumer.
 - All 9 packages GREEN (`go test -p 1 ./...`), 3-OS CI + crossbuild 6 targets GREEN.
 - **v0.0.1 redefined contract: COMPLETE** — 6 MCP tools + ctr_global_search + 4 CLI. Gates 1–13 documented in `docs/gates-v0.0.1-ko.md`.
