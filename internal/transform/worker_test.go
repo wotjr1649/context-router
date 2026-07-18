@@ -1,7 +1,9 @@
 package transform
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -58,6 +60,45 @@ func TestMain(m *testing.M) {
 		os.RemoveAll(filepath.Dir(testExePath))
 	}
 	os.Exit(code)
+}
+
+// TestRunWorker_NoIsolationSignal: 리뷰 B2(P1) — unix 전용(GOOS 가드). CTR_WORKER_MEM이
+// 파싱 불가(비수치/음수)면 selfApplyMemLimit이 실패하고, RunWorker는 Eval을 건너뛴 채
+// ErrKind="no_isolation" Result를 stdout에 쓰고 exit 0(에러 아님)으로 반환해야 한다 —
+// Spawn이 이를 ErrNoIsolation으로 변환해 도구를 비활성화하는 계약의 전제(격리 실패를
+// 조용히 무시하고 무제한 실행을 계속하면 안 된다). 실제 Setrlimit(2) 거부(권한 등) 주입은
+// 어려워 CI 실환경으로 이월 — 여기서는 파싱 실패 → 신호 경로만 검증한다.
+func TestRunWorker_NoIsolationSignal(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("unix 전용: selfApplyMemLimit self-Setrlimit 경로(windows는 부모 Job 적용이라 무변경)")
+	}
+	cases := []string{"not-a-number", "-1"}
+	for _, v := range cases {
+		t.Run(v, func(t *testing.T) {
+			t.Setenv("CTR_WORKER_MEM", v)
+
+			reqBytes, err := json.Marshal(Request{Script: `emit("should not run")`})
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			var stdout bytes.Buffer
+			if err := RunWorker(bytes.NewReader(reqBytes), &stdout); err != nil {
+				t.Fatalf("RunWorker error: %v", err)
+			}
+
+			var got Result
+			if err := json.Unmarshal(stdout.Bytes(), &got); err != nil {
+				t.Fatalf("Result JSON 파싱 실패: %v (raw=%q)", err, stdout.String())
+			}
+			if got.ErrKind != "no_isolation" {
+				t.Fatalf("ErrKind=%q want no_isolation (격리 실패가 무시되고 계속 실행됨 — 리뷰 B2 회귀)", got.ErrKind)
+			}
+			if got.Output != "" {
+				t.Fatalf("Output=%q want empty (격리 실패 시 Eval을 실행하면 안 됨)", got.Output)
+			}
+		})
+	}
 }
 
 // TestSpawn_Normal: 정상 스크립트 → Spawn이 올바른 Output을 반환한다(실 프로세스 경계).

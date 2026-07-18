@@ -17,11 +17,14 @@ import (
 // 상한 밖이지만, 그 창은 cmd.Process.Kill 기본 취소 로직이 여전히 커버하고(아래 참고) 이후
 // 모든 할당에는 상한이 적용된다.
 //
-// cmd.Cancel: exec.CommandContext는 Start() 호출 시점에 "watcher" 고루틴을 이미 띄우고,
-// 그 고루틴은 ctx.Done() 시점에 c.Cancel 필드를 **그때 값으로** 읽는다(Go 1.20+
-// os/exec.watchCtx). 즉 Start() 이후 아무 때나 cmd.Cancel을 재설정해도 안전하다 — Job
-// 배정 이전에 취소되면 CommandContext의 기본 Cancel(Process.Kill)이 이미 유효하고, 배정
-// 이후에는 아래에서 closeJob으로 교체해 Job 전체(KILL_ON_JOB_CLOSE)를 트리킬한다.
+// cmd.Cancel: 일부러 건드리지 않는다. exec.CommandContext(Spawn에서 cmd 생성 시점)가 이미
+// `func() error { return cmd.Process.Kill() }`를 Start() **전에** 심어둔다 — Start() 내부에서
+// 띄우는 watchCtx 고루틴이 c.Cancel을 동기화 없이 읽으므로(Go stdlib os/exec.go), Start() 후
+// 재대입하면 그 읽기와 unsynchronized 데이터 레이스가 된다(-race가 잡는 실제 레이스, 리뷰
+// Imp2/B3 — 이전 코드는 여기서 closeJob으로 교체했었다). 이 worker는 자식을 스폰하지 않으므로
+// (starlark 샌드박스에 서브프로세스 실행 수단이 없다) 기본 Cancel(단일 프로세스 kill)만으로
+// 트리킬에 충분하다 — closeJob은 아래 Job 핸들의 **정상 경로 자원 해제**(cleanup 반환값)
+// 전용으로만 쓴다.
 func applyMemLimit(cmd *exec.Cmd, bytes int64) (func(), error) {
 	job, err := windows.CreateJobObject(nil, nil)
 	if err != nil {
@@ -62,20 +65,17 @@ func applyMemLimit(cmd *exec.Cmd, bytes int64) (func(), error) {
 	}
 
 	var once sync.Once
-	// closeJob: 마지막 Job 핸들 close 시 KILL_ON_JOB_CLOSE가 배정된 프로세스 트리 전체를
-	// 종료한다. cleanup(정상 완료 후)과 cmd.Cancel(timeout/ctx 취소) 양쪽에서 공유 — 정상
-	// 종료 후 재호출돼도 sync.Once로 안전.
+	// closeJob: 마지막 Job 핸들 close 시 KILL_ON_JOB_CLOSE가 배정된 프로세스(트리)를 종료한다.
+	// Spawn의 defer cleanup()(정상/타임아웃 후 공통 경로)에서만 호출된다 — cmd.Cancel에는
+	// 더 이상 배선하지 않는다(위 주석, 리뷰 B3). 재호출돼도 sync.Once로 안전.
 	closeJob := func() { once.Do(func() { windows.CloseHandle(job) }) }
-	cmd.Cancel = func() error {
-		closeJob()
-		return nil
-	}
 	return closeJob, nil
 }
 
 // selfApplyMemLimit: windows는 부모가 Job Object로 이미 상한을 적용하므로 자식 self-apply가
-// 불필요하다.
-func selfApplyMemLimit() {}
+// 불필요하다 — 항상 성공(nil)을 반환한다(unix는 자식이 자기 자신에게 Setrlimit을 걸어야 해서
+// 실패할 수 있다, 리뷰 B2).
+func selfApplyMemLimit() error { return nil }
 
 // killOrphan: Start() 이후 Job 배정(OpenProcess/AssignProcessToJobObject) 실패 시 호출한다.
 // 이 시점엔 자식이 아직 job에 assign되지 않아 TerminateJobObject(job,*)로는 죽지 않으므로

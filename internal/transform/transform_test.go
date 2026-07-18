@@ -163,6 +163,43 @@ func TestErrSummary_Script(t *testing.T) {
 	}
 }
 
+// TestErrSummary_NoInputLeak_Fail: 리뷰 B1(수렴 Critical) — fail(...)로 입력 데이터를 오류
+// 메시지에 주입해도 ErrSummary/Output에 새어 나가지 않아야 한다(MCP 오류 채널이 출력 상한
+// 32768B를 우회해 최대 8MB 입력을 노출하는 경로 차단).
+func TestErrSummary_NoInputLeak_Fail(t *testing.T) {
+	const canary = "CANARYBODY123"
+	req := Request{
+		Script: `fail("SECRET-INPUT-" + inputs[0].text())`,
+		Inputs: []Input{{ID: 1, Text: canary}},
+	}
+	r := Eval(req)
+	if r.ErrKind != "script" {
+		t.Fatalf("ErrKind=%q want script", r.ErrKind)
+	}
+	if strings.Contains(r.ErrSummary, canary) {
+		t.Fatalf("ErrSummary=%q leaks input canary", r.ErrSummary)
+	}
+	if strings.Contains(r.ErrSummary, "SECRET-INPUT") {
+		t.Fatalf("ErrSummary=%q leaks script literal", r.ErrSummary)
+	}
+	if strings.Contains(r.Output, canary) {
+		t.Fatalf("Output=%q leaks input canary", r.Output)
+	}
+
+	// 8MB 입력 — 상한 우회 없이 ErrSummary가 여전히 짧고 내용을 담지 않아야 한다.
+	big := strings.Repeat("A", 8*1024*1024)
+	br := Eval(Request{
+		Script: `fail("SECRET-INPUT-" + inputs[0].text())`,
+		Inputs: []Input{{ID: 1, Text: big}},
+	})
+	if len(br.ErrSummary) > 200 {
+		t.Fatalf("ErrSummary len=%d want <=200 (8MB 입력이 그대로 새면 상한 우회)", len(br.ErrSummary))
+	}
+	if strings.Contains(br.ErrSummary, "AAAA") {
+		t.Fatalf("ErrSummary leaks 8MB input content")
+	}
+}
+
 // TestErrSummary_BudgetAndOutputLimit: budget/output_limit도 ErrSummary가 채워진다.
 func TestErrSummary_BudgetAndOutputLimit(t *testing.T) {
 	budget := Eval(Request{

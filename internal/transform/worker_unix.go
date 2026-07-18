@@ -3,6 +3,7 @@
 package transform
 
 import (
+	"fmt"
 	"os"
 	"os/exec"
 	"strconv"
@@ -17,37 +18,52 @@ import (
 // kill(-pgid, SIGKILL)해 트리킬한다(설계 §4.3 kill(-pgid) 요구사항).
 // CI 이월: 이 파일은 darwin/linux 공용(!windows) — 로컬 실측은 linux/darwin 미보유로
 // `GOOS=linux go build ./...` 컴파일 확인까지만 수행했다(Windows 머신, task-2 브리프 §협업).
+//
+// cmd.Cancel: 반드시 cmd.Start() **전에** 설정한다. exec.CommandContext가 Start() 내부에서
+// 띄우는 watchCtx 고루틴은 c.Cancel 필드를 동기화 없이 읽는다(Go stdlib os/exec.go
+// watchCtx: `if c.Cancel != nil { c.Cancel() }`) — Start() 후 재대입하면 그 읽기와
+// unsynchronized 데이터 레이스가 된다(-race가 잡는 실제 레이스, 리뷰 Imp2/B3). kill 클로저는
+// cmd.Process.Pid를 호출 시점에 지연 읽어 pgid를 얻는다 — watchCtx는 Start()가 c.Process를
+// 채운 뒤에야 띄워지므로(Start() 내부 순서: StartProcess → watcher goroutine 기동) 안전하다.
 func applyMemLimit(cmd *exec.Cmd, bytes int64) (func(), error) {
 	cmd.Env = append(os.Environ(), "CTR_WORKER_MEM="+strconv.FormatInt(bytes, 10))
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
-	if err := cmd.Start(); err != nil {
-		return nil, err
-	}
-
-	pgid := cmd.Process.Pid
 	kill := func() {
-		_ = syscall.Kill(-pgid, syscall.SIGKILL) // 이미 종료된 그룹이면 ESRCH — 무시(idempotent)
+		if cmd.Process == nil {
+			return
+		}
+		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL) // 이미 종료된 그룹이면 ESRCH — 무시(idempotent)
 	}
 	cmd.Cancel = func() error {
 		kill()
 		return nil
 	}
+
+	if err := cmd.Start(); err != nil {
+		return nil, err
+	}
 	return kill, nil
 }
 
 // selfApplyMemLimit: 부모(applyMemLimit)가 설정한 CTR_WORKER_MEM 환경변수를 읽어 자기
-// 프로세스에 RLIMIT_AS를 적용한다(self-apply 방식). 값이 없거나 파싱 실패면 조용히 skip —
-// 이 경우 부모 쪽 프로세스 그룹 kill(timeout)만 방어선으로 남는다.
-func selfApplyMemLimit() {
+// 프로세스에 RLIMIT_AS를 적용한다(self-apply 방식). 값이 없으면 격리가 요구되지 않은
+// 호출이므로 nil(성공)을 반환한다. 값이 있는데 파싱 실패거나 Setrlimit(2)가 거부되면
+// 격리를 보장할 수 없으므로 error를 반환한다 — 호출자(RunWorker)가 이를 "no_isolation"
+// 신호로 바꿔 무제한 실행을 막는다(리뷰 B2: 종전에는 실패를 버리고 조용히 무제한 계속
+// 실행해 ProbeIsolation이 격리 불가 환경도 통과시켰다).
+func selfApplyMemLimit() error {
 	v := os.Getenv("CTR_WORKER_MEM")
 	if v == "" {
-		return
+		return nil
 	}
 	n, err := strconv.ParseUint(v, 10, 64)
 	if err != nil {
-		return
+		return fmt.Errorf("transform: CTR_WORKER_MEM 파싱 실패: %w", err)
 	}
 	lim := syscall.Rlimit{Cur: n, Max: n}
-	_ = syscall.Setrlimit(syscall.RLIMIT_AS, &lim)
+	if err := syscall.Setrlimit(syscall.RLIMIT_AS, &lim); err != nil {
+		return fmt.Errorf("transform: Setrlimit(RLIMIT_AS) 실패: %w", err)
+	}
+	return nil
 }

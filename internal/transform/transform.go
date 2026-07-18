@@ -15,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	"go.starlark.net/resolve"
 	"go.starlark.net/starlark"
 	"go.starlark.net/syntax"
 )
@@ -39,7 +40,9 @@ type Request struct {
 	Caps   Caps
 }
 
-// Result: Eval의 순수 출력. ErrKind: ""|"budget"|"output_limit"|"script".
+// Result: Eval의 순수 출력. ErrKind: ""|"budget"|"output_limit"|"script"|"no_isolation".
+// no_isolation은 worker가 OS 메모리 격리를 자기 자신에게 적용하지 못해(unix Setrlimit 실패)
+// Eval을 실행하지 않고 거부했다는 신호다(Spawn이 ErrNoIsolation으로 변환, 리뷰 B2).
 type Result struct {
 	Output    string
 	StepsUsed int64
@@ -71,7 +74,8 @@ const (
 func Eval(req Request) (result Result) {
 	defer func() {
 		if r := recover(); r != nil {
-			result = Result{ErrKind: "script", ErrSummary: firstLine("script error: " + fmt.Sprint(r))}
+			// 고정 문구만 — panic 값(any)은 예측 불가해 내용을 절대 신뢰하지 않는다(B1).
+			result = Result{ErrKind: "script", ErrSummary: "script error (panic)"}
 		}
 	}()
 
@@ -139,18 +143,32 @@ func Eval(req Request) (result Result) {
 		res.ErrSummary = ErrOutputLimit.Error()
 	default:
 		res.ErrKind = "script"
-		res.ErrSummary = firstLine("script error: " + err.Error())
+		res.ErrSummary = scriptErrSummary(err)
 	}
 	return res
 }
 
-// firstLine: 오류 메시지의 첫 줄만 취한다 — starlark 오류는 위치·종류만 담고 스크립트
-// 원문/입력 데이터를 포함하지 않으므로 이대로 노출해도 안전하다.
-func firstLine(msg string) string {
-	if i := strings.IndexByte(msg, '\n'); i >= 0 {
-		msg = msg[:i]
+// scriptErrSummary: ErrKind="script" 오류의 안전 요약 — 고정 카테고리 문구 + 가능하면 스크립트
+// 내 줄 번호만. err.Error()/EvalError.Msg는 사용자 스크립트의 fail(...)이 주입한 임의 문자열
+// (입력 데이터 포함 가능)을 그대로 담고 있으므로 절대 사용하지 않는다(리뷰 B1 — MCP 오류
+// 채널로 출력 상한을 우회한 입력 유출 차단).
+func scriptErrSummary(err error) string {
+	switch e := err.(type) {
+	case *starlark.EvalError:
+		if len(e.CallStack) > 0 {
+			return fmt.Sprintf("script error (eval) at line %d", e.CallStack.At(0).Pos.Line)
+		}
+		return "script error (eval)"
+	case resolve.ErrorList:
+		if len(e) > 0 {
+			return fmt.Sprintf("script error (resolve) at line %d", e[0].Pos.Line)
+		}
+		return "script error (resolve)"
+	case syntax.Error:
+		return fmt.Sprintf("script error (syntax) at line %d", e.Pos.Line)
+	default:
+		return "script error"
 	}
-	return msg
 }
 
 // workerSem: worker 프로세스 동시 실행 ≤2 (설계 §4.3). 패키지 레벨 — 이 프로세스 내 모든
@@ -161,7 +179,14 @@ var workerSem = make(chan struct{}, 2)
 // Request JSON 1건을 읽어 Eval을 실행하고 Result JSON 1건을 stdout에 쓴다. 호출자(main)는
 // 이 함수 전후로 배너·로그를 stdout에 출력해서는 안 된다(stdout은 JSON 1건이어야 한다).
 func RunWorker(r io.Reader, w io.Writer) error {
-	selfApplyMemLimit() // unix: CTR_WORKER_MEM 있으면 self Setrlimit. windows: no-op(부모가 Job으로 이미 제한).
+	// unix: CTR_WORKER_MEM 있으면 self Setrlimit. windows: no-op(부모가 Job으로 이미 제한).
+	// 실패하면 무제한 상태로 스크립트를 실행할 수 없으므로(in-process fallback 금지, §4.3/§5.3)
+	// Eval을 건너뛰고 신호용 Result만 stdout에 쓴다 — exit는 0으로 유지해 Spawn이 stdout JSON을
+	// 정상 파싱해서 ErrNoIsolation으로 변환할 수 있게 한다(비정상 exit는 Spawn에서 "worker
+	// killed"로 뭉개져 신호가 유실된다).
+	if err := selfApplyMemLimit(); err != nil {
+		return json.NewEncoder(w).Encode(Result{ErrKind: "no_isolation"})
+	}
 	var req Request
 	if err := json.NewDecoder(r).Decode(&req); err != nil {
 		return fmt.Errorf("transform: request 디코딩: %w", err)
@@ -174,8 +199,10 @@ func RunWorker(r io.Reader, w io.Writer) error {
 }
 
 // Spawn: selfExe(자기 바이너리 경로)를 "__transform-worker" 인자로 재실행해 req를 격리
-// 평가한다. 동시 실행 ≤2(workerSem), OS 메모리 상한(applyMemLimit, 실패 시 ErrNoIsolation),
-// ctx 취소/timeout 시 트리킬(applyMemLimit이 설정하는 cmd.Cancel). worker가 상한·timeout으로
+// 평가한다. 동시 실행 ≤2(workerSem), OS 메모리 상한(applyMemLimit, 부모측 실패 시
+// ErrNoIsolation; 자식측 self-apply 실패는 Result.ErrKind="no_isolation"으로 보고되어 아래서
+// 동일하게 ErrNoIsolation으로 변환), ctx 취소/timeout 시 트리킬(applyMemLimit이 설정하는
+// cmd.Cancel). worker가 상한·timeout으로
 // 죽어도(exit code 비정상·부분 출력) 이 함수는 error를 반환하지 않고 합성 Result를 반환한다
 // — 부모 프로세스는 절대 죽지 않는다. error 반환은 "실행 자체를 시작 못함" 케이스뿐이다:
 // ctx가 세마포어 대기 중 취소, Request 인코딩 실패, ErrNoIsolation.
@@ -219,6 +246,11 @@ func Spawn(ctx context.Context, selfExe string, req Request) (Result, error) {
 	}
 	if err := json.Unmarshal(stdout.Bytes(), &res); err != nil {
 		return Result{ErrKind: "script", ErrSummary: "worker killed (memory/time limit)"}, nil
+	}
+	if res.ErrKind == "no_isolation" {
+		// worker가 자기 격리 적용에 실패해 Eval을 거부했다(리뷰 B2) — 격리 실패는 in-process
+		// fallback 없이 도구 비활성화로 이어져야 하므로 ErrNoIsolation으로 변환한다.
+		return Result{}, ErrNoIsolation
 	}
 	return res, nil
 }
