@@ -69,23 +69,6 @@ const (
 	defaultMemLimitBytes  = 256 * 1024 * 1024 // 설계 §4.3 기본 상한 256MB
 	defaultWorkerTimeout  = 10 * time.Second  // 리뷰 Important: ctx에 deadline 없을 때 안전망
 	gomemlimitRatio       = 0.8               // D19-a: Job/RLIMIT 캡의 80%에서 GC 선제 발동
-
-	// vaHeadroomBytes: linux selfApplyMemLimit이 RLIMIT_AS에 얹는 가상주소공간 여유분 —
-	// CI 실측으로 조정 시 이 상수 1곳만 바꾼다(설계 §1.3 D19-b). windows 경로는 이 상수를
-	// 쓰지 않는다(RLIMIT_AS 없음, Job Object 사용).
-	//
-	// 진단 v2(2026-07-19, ubuntu CI stderr 캡처 + /proc 샘플링): 애초 "Go 런타임 VA
-	// 예약이 ~1GB pagealloc summary 수준" 진단(세션-04)은 불완전했다 — 실측 워커 시동
-	// 시점 기준선은 VmPeak 5,880,560kB(≈5.75GB), 총 VA 5742MB/74매핑이며 지배 항은
-	// Go 런타임이 아니라 ctr 바이너리가 링크하는 의존성 init이 예약하는 단일 4096MB
-	// r--p 익명 매핑(그 외 Go 런타임 몫은 383MB×2·176MB·128MB·63MB×3 등 상대적으로
-	// 소액). 768MB는 물론 1536MB(총 1.5GB)·2560MB·3584MB·4096MB·4608MB(총 4.5GB)
-	// 한도까지 전부 runtime.sysMap ENOMEM으로 즉사(exit 2, GOMEMLIMIT 유무 무관) —
-	// 무제한이면 2.3초에 정상 완주. 8192MB(총 8448MB)는 기준선(5880MB) + 약 2.5GB
-	// 여유로 확정. 실질 메모리 제어는 GOMEMLIMIT(gomemlimitBytes)·스텝 예산·10s
-	// 타임아웃이 담당하고, RLIMIT_AS는 이 헤드룸만큼 후퇴한 완전 폭주 방지용
-	// 백스톱이다.
-	vaHeadroomBytes = 8192 << 20
 )
 
 // gomemlimitBytes: 자식 worker의 GOMEMLIMIT 값(바이트) — Job Object/RLIMIT 캡(commit·가상
@@ -93,21 +76,54 @@ const (
 // GOMEMLIMIT이 이 소프트 한도에서 GC를 선제 발동시켜 commit이 Job 캡(256MB)에 도달하기 전에
 // 회수시킨다. Go 공식 가이드는 5-10% 여유를 권장하나 Job은 RSS가 아닌 commit을 재므로 보수적
 // 80%(설계 §1.3 D19-a, 최종 수치는 실측으로 확정). 어디까지나 GC용 soft limit — Job
-// Object/RLIMIT 하드 백스톱은 그대로 유지된다(제거하지 않는다).
+// Object/RLIMIT 하드 백스톱은 그대로 유지된다(제거하지 않는다). 커플링 주의: 이 함수는
+// applyMemLimit의 bytes 파라미터가 아니라 defaultMemLimitBytes를 직접 참조한다 — 호출자가
+// 캡을 가변화(파라미터로 다른 값 전달)하면 이 함수도 파라미터를 받도록 승격해야 한다(Minor 3).
 func gomemlimitBytes() int64 {
 	limitBytes := float64(defaultMemLimitBytes) // 변수 경유: 상수식 그대로면 214748364.8이
 	return int64(limitBytes * gomemlimitRatio)  // 정확한 int64로 안 떨어져 컴파일타임 변환 불가
 }
 
-// rlimitASBytes: linux selfApplyMemLimit이 RLIMIT_AS.Cur에 실제로 설정할 값 —
-// CTR_WORKER_MEM(cap, 순수 캡 — 이 함수 밖에서는 의미가 그대로 유지된다)에
-// vaHeadroomBytes를 더한다. 실질 메모리 제어는 이제 GOMEMLIMIT(gomemlimitBytes)이
-// 담당하고, RLIMIT_AS는 프로세스 완전 폭주를 막는 백스톱으로 후퇴했다(설계 §1.3 D19-b).
+// rlimitASBytes: linux selfApplyMemLimit이 RLIMIT_AS.Cur에 실제로 설정할 값 — self-apply
+// 시점의 현재 가상주소공간 크기(currentVA, /proc/self/statm에서 parseStatmVmBytes로 읽음)에
+// CTR_WORKER_MEM(cap, 순수 캡 — 이 함수 밖에서는 의미가 그대로 유지된다)을 더해 "이 시점부터
+// cap만큼의 신규 VA 성장만 허용"하는 동적 한도를 만든다 — windows Job Object의 commit
+// 캡과 동등한 계약 수준이며, 기준선(currentVA)이 배포·버전마다 드리프트해도 자동 적응한다.
+//
+// 배경(설계 §1.3 D19-b): 진단 v1(할당 0인데 8.4ms 사망)은 256MB 고정 캡이 Go 런타임
+// 시동 자체의 VA 예약보다 작다는 것만 보였다. 진단 v2(2026-07-19, ubuntu CI stderr
+// 캡처 + /proc 샘플링)는 실제 기준선을 측정했다 — 워커 시동 시점 VmPeak 5,880,560kB
+// (≈5.75GB), 총 VA 5742MB/74매핑, 지배 항은 Go 런타임이 아니라 ctr 바이너리가 링크하는
+// 의존성 init이 예약하는 단일 4096MB r--p 익명 매핑(Go 런타임 몫은 383MB×2·176MB·128MB·
+// 63MB×3 등 상대적으로 소액). 고정 headroom 768MB/1536MB는 물론 2560~4608MB까지 전부
+// runtime.sysMap ENOMEM으로 즉사했고, 8192MB(총 8448MB, 기준선+약 2.5GB)에서야 스모크를
+// 통과했다. 그러나 고정 8GB 한도는 GOMEMLIMIT이 soft limit이라(교차리뷰 Codex P1)
+// live-heap이 그 한도까지 자라는 것을 막지 못해 설계 §4.3의 "256MB 캡" 계약을 사실상
+// 무력화한다 — 그래서 고정 상수 대신 이 동적 한도(currentVA+cap)로 전환해 §4.3의 신규
+// 성장 캡 계약을 실질적으로 복원했다. 실질 메모리 제어는 다시 RLIMIT_AS(신규 성장 하드
+// 캡)가 지고, GOMEMLIMIT은 그 안에서 GC를 선제 발동시키는 soft 보조 역할로 후퇴한다.
+//
 // 순수 함수 — env/syscall 접근 없음. 기존 hard limit(Max) 절삭 로직은 이 함수의
 // 반환값에 대해 selfApplyMemLimit이 그대로 재사용한다(unix 전용, transform.go에 둔
 // 것은 windows 로컬에서도 단위 테스트가 돌아가게 하기 위함).
-func rlimitASBytes(cap int64) int64 {
-	return cap + vaHeadroomBytes
+func rlimitASBytes(currentVA, cap int64) int64 {
+	return currentVA + cap
+}
+
+// parseStatmVmBytes: /proc/self/statm의 첫 필드(총 프로그램 크기, 페이지 단위)를 바이트로
+// 변환한다 — linux selfApplyMemLimit이 self-apply 시점의 currentVA를 얻는 유일한 소스.
+// 순수 함수(문자열 파싱만, 파일 접근은 호출자 책임)라 windows 로컬에서도 단위 테스트가
+// 가능하다. statm 포맷: "size resident shared text lib data dt"(공백 구분, size가 VA).
+func parseStatmVmBytes(data string, pageSize int64) (int64, error) {
+	fields := strings.Fields(data)
+	if len(fields) == 0 {
+		return 0, fmt.Errorf("transform: /proc/self/statm 비어있음")
+	}
+	pages, err := strconv.ParseInt(fields[0], 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("transform: /proc/self/statm 첫 필드 파싱 실패: %w", err)
+	}
+	return pages * pageSize, nil
 }
 
 // Eval: 순수 함수 — 파일·네트워크·env·시계·난수 접근 없음. panic 없이 항상 Result를 반환한다.
@@ -293,10 +309,12 @@ func Spawn(ctx context.Context, selfExe string, req Request) (Result, error) {
 		// — "worker killed" 접두사는 main_test.go:1026,1077·mcp_test.go의 부분 문자열
 		// 단언 전제이므로 불변.
 		reason := "memory or crash"
-		switch ctx.Err() {
-		case context.Canceled:
+		// 사유 분류는 best-effort다 — OOM-kill 직후 ctx deadline이 마침 함께 지나 있으면
+		// 실제로는 메모리 상한에 죽었어도 "time limit"로 귀속될 수 있다(레이스, 계측 목적상
+		// 무해).
+		if errors.Is(ctx.Err(), context.Canceled) {
 			reason = "cancelled"
-		case context.DeadlineExceeded:
+		} else if errors.Is(ctx.Err(), context.DeadlineExceeded) {
 			reason = "time limit"
 		}
 		return Result{ErrKind: "script", ErrSummary: "worker killed (" + reason + ")"}, nil

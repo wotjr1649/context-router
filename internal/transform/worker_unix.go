@@ -75,11 +75,27 @@ func selfApplyMemLimit() error {
 	if err := syscall.Getrlimit(syscall.RLIMIT_AS, &existing); err != nil {
 		return fmt.Errorf("transform: Getrlimit(RLIMIT_AS) 실패: %w", err)
 	}
-	// D19-b: RLIMIT_AS는 n(순수 캡) 그대로가 아니라 rlimitASBytes(n)(n+vaHeadroomBytes)로
-	// 건다 — Go 런타임이 시동 시 예약하는 VA가 256MB 캡을 넘어 조기 사망하던 문제(ubuntu
-	// 실측: 할당 0, 8.4ms 사망)의 backstop. 실질 메모리 제어는 이제 GOMEMLIMIT(T2)이
-	// 담당하므로 여기서 RLIMIT_AS를 넉넉히 잡아도 메모리 안전성은 그대로 유지된다.
-	lim := syscall.Rlimit{Cur: uint64(rlimitASBytes(int64(n))), Max: existing.Max}
+	// D19-b(동적 한도): RLIMIT_AS는 고정 headroom이 아니라 self-apply 시점의 현재 VA
+	// (/proc/self/statm)에 cap(n)을 더한 값으로 건다 — "이 시점부터 cap만큼의 신규 VA
+	// 성장만 허용"하는, windows Job commit 캡과 동등한 계약. 고정 headroom(8192MB 확정치
+	// 포함, rlimitASBytes 주석 참조)은 GOMEMLIMIT이 soft limit이라 live-heap이 그 한도까지
+	// 자라는 걸 못 막아 §4.3의 256MB 캡 계약을 무력화했다(교차리뷰 Codex P1) — 그래서 실질
+	// 캡은 다시 RLIMIT_AS(신규 성장 하드 캡)가 지고, GOMEMLIMIT은 그 안에서 GC를 선제
+	// 발동시키는 soft 보조 역할로 후퇴한다.
+	//
+	// /proc/self/statm을 읽거나 파싱하지 못하면 currentVA를 모르는 채로 임의 캡을 거는
+	// 셈이 되어(조기사망 재발 위험) 격리를 보장할 수 없으므로 fail-closed한다 — darwin은
+	// /proc이 아예 없어 여기서 항상 실패하고, 기존과 동일하게 도구 미등록으로 귀결된다
+	// (리뷰 B2 계약과 일관, skipDarwinNoIsolation 참조).
+	statm, err := os.ReadFile("/proc/self/statm")
+	if err != nil {
+		return fmt.Errorf("transform: /proc/self/statm 읽기 실패: %w", err)
+	}
+	currentVA, err := parseStatmVmBytes(string(statm), int64(os.Getpagesize()))
+	if err != nil {
+		return fmt.Errorf("transform: /proc/self/statm 파싱 실패: %w", err)
+	}
+	lim := syscall.Rlimit{Cur: uint64(rlimitASBytes(currentVA, int64(n))), Max: existing.Max}
 	if lim.Cur > lim.Max { // 기존 hard limit이 요청값(headroom 포함)보다 낮으면 그 한도까지만
 		lim.Cur = lim.Max
 	}
