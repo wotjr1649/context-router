@@ -41,8 +41,11 @@ const pragmas = "?_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)&_pragma=
 
 const schemaVersion = 1 // session.db 독자 PRAGMA user_version 공간(설계 §2.1) — store.SchemaVersion과 무관
 
-// schemaV1 — 설계서 §2.2 스키마 v1 전문(문자 그대로). FTS DDL은 T6에서 같은 applySchemaV1에
-// 합류할 예정(브리프 — 출시 전 v1 완성 중이므로 마이그레이션 아님, 지금은 미포함).
+// schemaV1 — 설계서 §2.2 스키마 v1 전문 + §2.3 이벤트 FTS(T6, 같은 applySchemaV1에 합류 —
+// 출시 전 v1 완성 중이므로 마이그레이션 아님, user_version은 1 그대로). 주의: 이 DDL은
+// migrate()의 user_version==0 분기 뒤에서만 실행된다(applySchemaV1 참고) — 이미 v1로 열린
+// 적 있는 기존 로컬 dev session.db에는 FTS 테이블이 생기지 않는다(출시 전이라 허용, 코드로
+// 우회 마이그레이션을 만들지 않음 — 태스크 브리프 명시 지침).
 const schemaV1 = `
 CREATE TABLE IF NOT EXISTS session_events(
   id            INTEGER PRIMARY KEY,   -- rowid = append 순서(커밋 순 전순서)
@@ -68,6 +71,21 @@ CREATE TABLE IF NOT EXISTS sessions(       -- 불변 세션 메타(가변 컬럼
   producer      TEXT NOT NULL,              -- "context-router/<version>" — export producer 유도(오귀속 방지)
   retention_sec INTEGER NOT NULL DEFAULT 0  -- 0 = 무기한(정책 미표명) — §5 스윕 의미론
 );
+
+-- 이벤트 FTS(설계 §2.3) — content.db(internal/store/store.go)의 porter+trigram external
+-- content 패턴과 동형이나 색인 대상은 summary 컬럼만(payload는 노이즈·비밀 표면이라 제외).
+-- session_events는 append-only + retention DELETE만 있어(UPDATE 없음) AFTER UPDATE 트리거는
+-- 불필요.
+CREATE VIRTUAL TABLE IF NOT EXISTS fts_ev_porter  USING fts5(summary, content='session_events', content_rowid='id', tokenize='porter unicode61');
+CREATE VIRTUAL TABLE IF NOT EXISTS fts_ev_trigram USING fts5(summary, content='session_events', content_rowid='id', tokenize='trigram');
+CREATE TRIGGER IF NOT EXISTS session_events_ai AFTER INSERT ON session_events BEGIN
+  INSERT INTO fts_ev_porter(rowid, summary) VALUES (new.id, new.summary);
+  INSERT INTO fts_ev_trigram(rowid, summary) VALUES (new.id, new.summary);
+END;
+CREATE TRIGGER IF NOT EXISTS session_events_ad AFTER DELETE ON session_events BEGIN
+  INSERT INTO fts_ev_porter(fts_ev_porter, rowid, summary) VALUES ('delete', old.id, old.summary);
+  INSERT INTO fts_ev_trigram(fts_ev_trigram, rowid, summary) VALUES ('delete', old.id, old.summary);
+END;
 PRAGMA user_version = 1;`
 
 // eventTypeSessionStart — 서버 시작 시 자동 append되는 이벤트 타입(설계 §2.2). 어휘 비강제

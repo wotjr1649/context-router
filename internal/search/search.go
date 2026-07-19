@@ -441,6 +441,147 @@ func ArtifactHashExists(ctx context.Context, st *store.Store, hash string) (bool
 	return true, nil
 }
 
+// EventHit — search.QueryEvents 1건 표시(설계 §2.3·§3.4). session.Event/session.DB를
+// 참조하지 않는 자체 필드 정의(search→session 타입 의존 금지). Superseded는 색인에서
+// 제거하지 않고 잔존 행 기준으로 계산해 표기한다(v0.0.1 §3.6 stale 철학과 대칭).
+type EventHit struct {
+	EventID, SessionID, EventType string
+	TS                            int64
+	Summary                       string
+	Superseded                    bool
+}
+
+// bm25RankEvents: bm25Rank(위)의 이벤트판. session_events는 append-only+retention DELETE만
+// 있어(session.go의 session_events_ad 트리거가 즉시 FTS를 동기화) chunks처럼 트리거 밖에서
+// 생기는 orphan이 없다 — 그래서 content.db의 orphan 서브쿼리(sources 존재 확인)가 필요
+// 없다. match==""면 질의를 생략한다. content 경로(bm25Rank)는 그대로 두고 별도 함수로
+// 둔다(회귀 위험 없이 이벤트 전용).
+func bm25RankEvents(ctx context.Context, r *sql.DB, table, match string, n int) ([]int64, error) {
+	if match == "" {
+		return nil, nil
+	}
+	rows, err := r.QueryContext(ctx,
+		"SELECT rowid FROM "+table+" WHERE "+table+" MATCH ? ORDER BY bm25("+table+") LIMIT ?", match, n)
+	if err != nil {
+		return nil, fmt.Errorf("search: %s match: %w", table, err)
+	}
+	defer rows.Close()
+	var ids []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
+}
+
+// filterShortTokenCandidatesEvents: filterShortTokenCandidates(위, Fix E)의 이벤트판 —
+// session_events.summary에서 trigram 식이 누락한 짧은 토큰(<3자)의 리터럴 존재를 재확인해
+// AND 계약을 지킨다. content 경로는 손대지 않는다(회귀 테스트 무영향).
+func filterShortTokenCandidatesEvents(ctx context.Context, r *sql.DB, ids []int64, shortToks []string) ([]int64, error) {
+	if len(shortToks) == 0 || len(ids) == 0 {
+		return ids, nil
+	}
+	placeholders := make([]string, len(ids))
+	args := make([]any, len(ids))
+	for i, id := range ids {
+		placeholders[i] = "?"
+		args[i] = id
+	}
+	rows, err := r.QueryContext(ctx,
+		"SELECT id, summary FROM session_events WHERE id IN ("+strings.Join(placeholders, ",")+")", args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	texts := make(map[int64]string, len(ids))
+	for rows.Next() {
+		var id int64
+		var text string
+		if err := rows.Scan(&id, &text); err != nil {
+			return nil, err
+		}
+		texts[id] = text
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	kept := make([]int64, 0, len(ids))
+	for _, id := range ids {
+		text, ok := texts[id]
+		if !ok {
+			continue
+		}
+		all := true
+		for _, tok := range shortToks {
+			if foldIndex(text, tok) < 0 {
+				all = false
+				break
+			}
+		}
+		if all {
+			kept = append(kept, id)
+		}
+	}
+	return kept, nil
+}
+
+// eventHitQuery: session_events에서 EventHit 표시 컬럼 + superseded 판정(잔존 행 기준
+// EXISTS)을 1개 SELECT로 채운다. 스윕(§5)이 교정 이벤트를 지워도 이 쿼리는 그 시점 잔존
+// 행만 보므로 자동으로 정합적이다.
+const eventHitQuery = `SELECT event_id, session_id, event_type, ts, summary,
+	EXISTS(SELECT 1 FROM session_events s2 WHERE s2.supersedes = session_events.event_id)
+	FROM session_events WHERE id = ?`
+
+// loadEventHit: id(session_events.id, rowid) 1건을 EventHit으로 채운다.
+func loadEventHit(ctx context.Context, r *sql.DB, id int64) (EventHit, error) {
+	var h EventHit
+	var superseded int
+	err := r.QueryRowContext(ctx, eventHitQuery, id).
+		Scan(&h.EventID, &h.SessionID, &h.EventType, &h.TS, &h.Summary, &superseded)
+	if err != nil {
+		return EventHit{}, fmt.Errorf("search: load event %d: %w", id, err)
+	}
+	h.Superseded = superseded != 0
+	return h, nil
+}
+
+// QueryEvents: session.db의 fts_ev_porter+fts_ev_trigram(summary만 색인, 설계 §2.3)을
+// Query(위)와 동일한 porter+trigram RRF(k=60) 패턴으로 병합해 상위 limit개 EventHit를
+// 반환한다. r은 session.DB.Reader()를 그대로 받는다 — search가 session 타입을 참조하지
+// 않도록 reader 인자로 받는 계약(T7이 이 함수를 소비한다).
+func QueryEvents(ctx context.Context, r *sql.DB, q string, limit int) ([]EventHit, error) {
+	porter, trigram, shortToks := normalizeQuery(q)
+	pIDs, err := bm25RankEvents(ctx, r, "fts_ev_porter", porter, limit*4)
+	if err != nil {
+		return nil, err
+	}
+	tIDs, err := bm25RankEvents(ctx, r, "fts_ev_trigram", trigram, limit*4)
+	if err != nil {
+		return nil, err
+	}
+	tIDs, err = filterShortTokenCandidatesEvents(ctx, r, tIDs, shortToks)
+	if err != nil {
+		return nil, err
+	}
+	top := topN(rrfMerge(pIDs, tIDs), limit)
+	hits := make([]EventHit, 0, len(top))
+	for _, sc := range top {
+		h, err := loadEventHit(ctx, r, sc.id)
+		if errors.Is(err, sql.ErrNoRows) {
+			continue // 이론상 append-only+즉시 트리거 동기화라 발생하지 않지만, loadHit과
+			// 동일 방어망을 유지한다.
+		}
+		if err != nil {
+			return nil, err
+		}
+		hits = append(hits, h)
+	}
+	return hits, nil
+}
+
 // applyBudget: hits(이미 점수순 정렬됨)를 순서대로 채우다 스니펫 바이트 누적합이 share를
 // 초과하는 hit을 만나면 그 hit부터 절단한다(설계 §4.1 예산 배분).
 func applyBudget(hits []Hit, share int) (kept []Hit, used int, truncated bool) {

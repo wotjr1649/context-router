@@ -2,6 +2,8 @@ package session
 
 import (
 	"context"
+	"database/sql"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -541,4 +543,101 @@ func TestSummarize_LimitPerTypeClamps(t *testing.T) {
 	if notes.Events[0].EventID != last {
 		t.Fatalf("note group[0]=%s want most recent %s", notes.Events[0].EventID, last)
 	}
+}
+
+// matchesFTS: fts에서 token이 하나라도 MATCH되면 true(설계 §2.3 이벤트 FTS 동기화 검증
+// 공용 헬퍼 — ①②③ 공유).
+func matchesFTS(t *testing.T, d *DB, fts, token string) bool {
+	t.Helper()
+	var rowid int64
+	err := d.reader.QueryRow("SELECT rowid FROM "+fts+" WHERE "+fts+" MATCH ?", token).Scan(&rowid)
+	if err == nil {
+		return true
+	}
+	if errors.Is(err, sql.ErrNoRows) {
+		return false
+	}
+	t.Fatalf("%s MATCH %q: %v", fts, token, err)
+	return false
+}
+
+// TestFTSEvents_SyncOnAppend — 브리프 Step1 ①: append 직후 porter·trigram 양쪽에서 즉시
+// 매치되어야 한다(session_events_ai 트리거).
+func TestFTSEvents_SyncOnAppend(t *testing.T) {
+	dir := t.TempDir()
+	d := openT(t, dir, Options{Producer: "p"})
+
+	mustAppend(t, d, Event{Type: "note", Summary: "hello unique zzyzxsummary token"})
+
+	for _, fts := range []string{"fts_ev_porter", "fts_ev_trigram"} {
+		if !matchesFTS(t, d, fts, "zzyzxsummary") {
+			t.Fatalf("%s: append 직후 매치 안 됨", fts)
+		}
+	}
+}
+
+// TestFTSEvents_DeleteRemovesFromIndex — 브리프 Step1 ②: retention DELETE 후 양쪽 FTS에서
+// 미매치(session_events_ad 트리거, 'delete' 특수 INSERT).
+func TestFTSEvents_DeleteRemovesFromIndex(t *testing.T) {
+	dir := t.TempDir()
+	d := openT(t, dir, Options{Producer: "p"})
+
+	id := mustAppendID(t, d, Event{Type: "note", Summary: "retentiontoken abcde"})
+	if _, err := d.writer.Exec("DELETE FROM session_events WHERE id=?", id); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+
+	for _, fts := range []string{"fts_ev_porter", "fts_ev_trigram"} {
+		if matchesFTS(t, d, fts, "retentiontoken") {
+			t.Fatalf("%s: DELETE 후에도 매치됨(트리거 미동작)", fts)
+		}
+	}
+}
+
+// TestFTSEvents_PayloadNotIndexed — 브리프 Step1 ③: payload(attributes)에만 있는 토큰은
+// 색인되지 않는다(summary만 색인 — 설계 §2.3).
+func TestFTSEvents_PayloadNotIndexed(t *testing.T) {
+	dir := t.TempDir()
+	d := openT(t, dir, Options{Producer: "p"})
+
+	attrs, err := json.Marshal(map[string]string{"secret_field": "onlyinpayloadxyz"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustAppend(t, d, Event{Type: "note", Summary: "generic summary text", Attributes: attrs})
+
+	for _, fts := range []string{"fts_ev_porter", "fts_ev_trigram"} {
+		if matchesFTS(t, d, fts, "onlyinpayloadxyz") {
+			t.Fatalf("%s: payload 토큰이 색인됨(summary만 색인해야 함)", fts)
+		}
+	}
+	for _, fts := range []string{"fts_ev_porter", "fts_ev_trigram"} {
+		if !matchesFTS(t, d, fts, "generic") {
+			t.Fatalf("%s: summary 토큰이 색인되지 않음", fts)
+		}
+	}
+}
+
+// TestFTSEvents_IntegrityCheckPasses — 브리프 Step1 ⑥: fts_ev_porter/fts_ev_trigram
+// 양쪽에 FTS5 integrity-check 특수 명령이 통과해야 한다(store.go 선례와 동형).
+func TestFTSEvents_IntegrityCheckPasses(t *testing.T) {
+	dir := t.TempDir()
+	d := openT(t, dir, Options{Producer: "p"})
+	mustAppend(t, d, Event{Type: "note", Summary: "some summary for integrity check"})
+
+	for _, fts := range []string{"fts_ev_porter", "fts_ev_trigram"} {
+		if _, err := d.writer.Exec("INSERT INTO " + fts + "(" + fts + ") VALUES('integrity-check')"); err != nil {
+			t.Fatalf("%s integrity: %v", fts, err)
+		}
+	}
+}
+
+// mustAppendID — mustAppend와 동형이나 rowid(id)를 반환한다(DELETE 대상 지정용).
+func mustAppendID(t *testing.T, d *DB, ev Event) int64 {
+	t.Helper()
+	id, _, _, err := d.Append(ev)
+	if err != nil {
+		t.Fatalf("append(%+v): %v", ev, err)
+	}
+	return id
 }
