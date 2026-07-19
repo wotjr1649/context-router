@@ -246,6 +246,65 @@ func TestRunWorker_RoundTrip(t *testing.T) {
 	}
 }
 
+// TestRlimitASBytes: linux self-apply(selfApplyMemLimit)가 RLIMIT_AS에 실제로 거는 값 —
+// self-apply 시점의 현재 VA(currentVA)에 CTR_WORKER_MEM(순수 캡)을 더한 동적 한도여야
+// 한다(D19-b, 고정 headroom 폐기 — 교차리뷰 Codex P1: 고정 한도는 soft GOMEMLIMIT이
+// 못 막는 live-heap 성장을 수 GiB까지 허용해 §4.3 캡 계약을 무력화했다). 상한 절삭(기존
+// hard limit이 더 낮으면 그 값 유지)은 selfApplyMemLimit이 이 함수의 반환값에 대해 그대로
+// 재사용하므로 여기서는 가산 자체만 검증한다.
+func TestRlimitASBytes(t *testing.T) {
+	cases := []struct {
+		name      string
+		currentVA int64
+		cap       int64
+		want      int64
+	}{
+		{name: "5.75GB VA + 256MB cap", currentVA: 5888 << 20, cap: 256 << 20, want: 6144 << 20}, // 5.75GB+256MB=6GB
+		{name: "zero VA", currentVA: 0, cap: 256 << 20, want: 256 << 20},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := rlimitASBytes(c.currentVA, c.cap); got != c.want {
+				t.Fatalf("rlimitASBytes(%d, %d) = %d, want %d", c.currentVA, c.cap, got, c.want)
+			}
+		})
+	}
+}
+
+// TestParseStatmVmBytes: /proc/self/statm 첫 필드(총 프로그램 크기, 페이지 단위) → 바이트
+// 파싱 계약 — linux selfApplyMemLimit이 currentVA를 얻는 유일한 소스라 windows 로컬에서도
+// 고정한다. 실패 케이스(빈 입력·비수치 첫 필드)는 selfApplyMemLimit의 fail-closed 계약
+// (읽기/파싱 실패 시 error → RunWorker가 no_isolation으로 변환)의 전제 검증.
+func TestParseStatmVmBytes(t *testing.T) {
+	cases := []struct {
+		name    string
+		data    string
+		want    int64
+		wantErr bool
+	}{
+		{name: "normal", data: "1437640 8657 2270 379 0 361180 0\n", want: 1437640 * 4096},
+		{name: "empty", data: "", wantErr: true},
+		{name: "non-numeric first field", data: "abc 123\n", wantErr: true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got, err := parseStatmVmBytes(c.data, 4096)
+			if c.wantErr {
+				if err == nil {
+					t.Fatalf("parseStatmVmBytes(%q) = %d, nil; want error", c.data, got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("parseStatmVmBytes(%q) unexpected error: %v", c.data, err)
+			}
+			if got != c.want {
+				t.Fatalf("parseStatmVmBytes(%q) = %d, want %d", c.data, got, c.want)
+			}
+		})
+	}
+}
+
 func FuzzEval(f *testing.F) {
 	f.Add("emit(1)", "hello")
 	f.Add("def f():\n\tfor i in range(10):\n\t\temit(i)\n\nf()\n", "")

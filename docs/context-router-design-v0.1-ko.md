@@ -39,7 +39,7 @@
 
 ### 1.3 선행 조건
 
-**v0.0.2 (worker robustness) 패치가 v0.1 착수 전에 머지**되어야 한다: (a) worker `GOMEMLIMIT`(캡의 ~80%, 최종 수치는 churn 20회 실측으로 확정; OS 캡은 하드 백스톱 유지 — GOMEMLIMIT은 soft limit), (b) linux RLIMIT_AS에 Go 런타임 VA 예약 여유분(CI 실측), (c) `worker killed` 사유 구분(취소/메모리/시간 — 기존 `"worker killed"` 접두사 유지 + 사유 접미사, ErrSummary 위생 계약 유지). 검증: 게이트 8 스위트 + churn 재현 + linux CI. 게이트 문서 신설 없음.
+**v0.0.2 (worker robustness) 패치가 v0.1 착수 전에 머지**되어야 한다: (a) worker `GOMEMLIMIT`(캡의 ~80%, 최종 수치는 churn 20회 실측으로 확정; OS 캡은 하드 백스톱 유지 — GOMEMLIMIT은 soft limit), (b) linux RLIMIT_AS — 실측(CI 진단 v2, 2026-07-19)으로 원인이 "Go 런타임 VA 예약"이 아니라 워커 시동 시점 VA 기준선 5.75GB(ctr 바이너리가 링크하는 의존성 init의 4GB 예약이 지배)임이 드러났고, 고정 headroom 접근(768MB→1536MB→8192MB 순차 증액)은 GOMEMLIMIT이 soft limit이라 live-heap 성장을 못 막아 §4.3의 256MB 캡 계약을 무력화하는 한계가 있어(교차리뷰 Codex P1) 최종적으로 self-apply 시점 "현재 VA + 256MB 캡" 동적 한도(신규 VA 성장만 캡만큼 허용, windows Job commit 캡과 동등)를 채택, (c) `worker killed` 사유 구분(취소/메모리/시간 — 기존 `"worker killed"` 접두사 유지 + 사유 접미사, ErrSummary 위생 계약 유지). 검증: 게이트 8 스위트 + churn 재현 + linux CI. 게이트 문서 신설 없음.
 
 ## 2. Session DB
 

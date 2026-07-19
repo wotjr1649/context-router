@@ -3,7 +3,9 @@
 package transform
 
 import (
+	"os"
 	"os/exec"
+	"strconv"
 	"sync"
 	"unsafe"
 
@@ -26,6 +28,10 @@ import (
 // 트리킬에 충분하다 — closeJob은 아래 Job 핸들의 **정상 경로 자원 해제**(cleanup 반환값)
 // 전용으로만 쓴다.
 func applyMemLimit(cmd *exec.Cmd, bytes int64) (func(), error) {
+	// D19-a: GOMEMLIMIT(소프트) 주입 — Job 캡(하드)은 그대로 유지. 현재 cmd.Env는 미설정
+	// (nil=상속)이므로 os.Environ()에 이어붙인다.
+	cmd.Env = append(os.Environ(), "GOMEMLIMIT="+strconv.FormatInt(gomemlimitBytes(), 10))
+
 	job, err := windows.CreateJobObject(nil, nil)
 	if err != nil {
 		return nil, err

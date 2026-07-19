@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -186,6 +187,83 @@ func TestSpawn_Timeout(t *testing.T) {
 		t.Fatalf("Spawn took %v, want bounded near ctx deadline (트리킬 실패 의심)", elapsed)
 	}
 	t.Logf("timeout result: %+v elapsed=%v", res, elapsed)
+}
+
+// TestSpawn_Kill_Cancelled: 호출자가 ctx를 명시적으로 취소(context.Canceled)하면
+// ErrSummary가 "(cancelled)" 접미사를 갖는다(D19-c) — timeout/memory와 구분되는 사유.
+// "worker killed" 접두사는 불변(main_test.go:1026,1077 부분 문자열 단언 전제).
+func TestSpawn_Kill_Cancelled(t *testing.T) {
+	skipDarwinNoIsolation(t)
+	exe := testSelfExe(t)
+	parent, cancelParent := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancelParent()
+	ctx, cancel := context.WithCancel(parent)
+
+	req := Request{
+		Script: "def f():\n\tfor i in range(2000000000):\n\t\tpass\n\nf()\n",
+		Caps:   Caps{MaxSteps: 2_000_000_000_000}, // step budget보다 cancel이 먼저 발동하도록
+	}
+
+	type spawnOutcome struct {
+		res Result
+		err error
+	}
+	done := make(chan spawnOutcome, 1)
+	go func() {
+		res, err := Spawn(ctx, exe, req)
+		done <- spawnOutcome{res, err}
+	}()
+
+	time.Sleep(300 * time.Millisecond) // worker 프로세스가 실제로 기동해 루프 중임을 보장
+	cancel()
+
+	var got spawnOutcome
+	select {
+	case got = <-done:
+	case <-time.After(15 * time.Second):
+		t.Fatal("Spawn이 취소 후에도 반환하지 않음(트리킬 실패 의심)")
+	}
+
+	if got.err != nil {
+		t.Fatalf("Spawn returned Go error (parent must survive cancellation): %v", got.err)
+	}
+	if !strings.Contains(got.res.ErrSummary, "worker killed (cancelled)") {
+		t.Fatalf("ErrSummary=%q want contains %q", got.res.ErrSummary, "worker killed (cancelled)")
+	}
+	if strings.Contains(got.res.ErrSummary, exe) {
+		t.Fatalf("ErrSummary=%q leaks selfExe path", got.res.ErrSummary)
+	}
+	if strings.Contains(got.res.ErrSummary, "CTR_WORKER_MEM") {
+		t.Fatalf("ErrSummary=%q leaks env var name", got.res.ErrSummary)
+	}
+}
+
+// TestSpawn_Kill_Timeout: ctx 데드라인 초과(context.DeadlineExceeded)면 ErrSummary가
+// "(time limit)" 접미사를 갖는다(D19-c) — cancel/memory와 구분되는 사유.
+func TestSpawn_Kill_Timeout(t *testing.T) {
+	skipDarwinNoIsolation(t)
+	exe := testSelfExe(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+
+	req := Request{
+		Script: "def f():\n\tfor i in range(2000000000):\n\t\tpass\n\nf()\n",
+		Caps:   Caps{MaxSteps: 2_000_000_000_000}, // step budget보다 ctx timeout이 먼저 발동하도록
+	}
+
+	res, err := Spawn(ctx, exe, req)
+	if err != nil {
+		t.Fatalf("Spawn returned Go error (parent must survive): %v", err)
+	}
+	if !strings.Contains(res.ErrSummary, "worker killed (time limit)") {
+		t.Fatalf("ErrSummary=%q want contains %q", res.ErrSummary, "worker killed (time limit)")
+	}
+	if strings.Contains(res.ErrSummary, exe) {
+		t.Fatalf("ErrSummary=%q leaks selfExe path", res.ErrSummary)
+	}
+	if strings.Contains(res.ErrSummary, "CTR_WORKER_MEM") {
+		t.Fatalf("ErrSummary=%q leaks env var name", res.ErrSummary)
+	}
 }
 
 // TestSpawn_DefaultTimeout: ctx에 deadline이 없으면 Spawn이 내부 안전망(defaultWorkerTimeout
