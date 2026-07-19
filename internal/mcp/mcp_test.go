@@ -218,10 +218,11 @@ func TestNewServerProfileGating(t *testing.T) {
 
 // maxToolSchemaBytes: 게이트 11(스키마 토큰 예산, 설계 §2.3) — NewServer 기본 프로필
 // (ProbeIsolation 성공 환경의 3-도구: ctr_search/ctr_fetch/ctr_transform)의 tools/list 결과
-// JSON 직렬화 바이트 상한. 최초 실측값 4359B × 1.2 = 5230.8 → 반올림 5231로 고정한 값 —
+// JSON 직렬화 바이트 상한. 태스크 7(ctr_search scope 확장 + ctr_fetch 문구, 설계 §3.4·§3.5)
+// 반영 후 재실측값 5139B × 1.2 = 6166.8 → 올림 6167로 재기준화한 값(이전 기준 4359B×1.2=5231) —
 // 회귀(설명 문구 비대화 등) 조기 감지용 상한이지 정밀 예산이 아니다. 실측값·근거는
 // docs/gates-v0.0.1-ko.md 게이트 11 항목 참조.
-const maxToolSchemaBytes = 5231
+const maxToolSchemaBytes = 6167
 
 // TestSchemaTokenBudget: tools/list 결과(ListToolsResult 전체 — 실제 클라이언트가 받는
 // JSON 그대로) 직렬화 바이트가 maxToolSchemaBytes를 넘지 않는지 확인한다(게이트 11). 근사
@@ -1206,6 +1207,235 @@ func TestCtrFetchAndIndexDenied(t *testing.T) {
 	text := res.Content[0].(*mcp.TextContent).Text
 	if !strings.HasPrefix(text, "["+codeNetworkDenied+"]") {
 		t.Fatalf("want %s prefix, got %q", codeNetworkDenied, text)
+	}
+}
+
+// --- ctr_search scope 확장 + ctr_fetch 문구 (태스크 7, 설계 §3.4·§3.5) ---
+
+// newSearchScopeTestServer: newTestServer(ingest)와 newRecordEventTestServer를 합친 형태 —
+// content 색인(ctr_index)과 세션 이벤트(sess.Append)를 같은 서버에서 함께 검증해야 하는
+// scope=all 테스트를 위해 별도로 둔다(기존 헬퍼 시그니처 변경은 다른 태스크의 호출부를 건드림).
+func newSearchScopeTestServer(t *testing.T) (cs *mcp.ClientSession, canon ident.Canon, sess *session.DB) {
+	t.Helper()
+	var err error
+	canon, err = ident.Canonicalize(t.TempDir())
+	if err != nil {
+		t.Fatalf("canonicalize: %v", err)
+	}
+	st, err := store.Open(t.TempDir(), false)
+	if err != nil {
+		t.Fatalf("store open: %v", err)
+	}
+	t.Cleanup(func() { st.Close() })
+	sess, err = session.Open(t.TempDir(), session.Options{Producer: "test/search-scope"})
+	if err != nil {
+		t.Fatalf("session open: %v", err)
+	}
+	t.Cleanup(func() { sess.Close() })
+
+	srv, err := NewServer(Config{Canon: canon, Store: st, SelfExe: testSelfExe(t), Enable: []string{"ingest"}, Session: sess})
+	if err != nil {
+		t.Fatalf("new server: %v", err)
+	}
+	srvT, cliT := mcp.NewInMemoryTransports()
+	ctx := context.Background()
+	if _, err := srv.Connect(ctx, srvT, nil); err != nil {
+		t.Fatalf("server connect: %v", err)
+	}
+	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "0"}, nil)
+	cs, err = client.Connect(ctx, cliT, nil)
+	if err != nil {
+		t.Fatalf("client connect: %v", err)
+	}
+	t.Cleanup(func() { cs.Close() })
+	return cs, canon, sess
+}
+
+// indexNeedle: canon.ProjectRoot 아래 파일 1개를 needle 텍스트로 써서 ctr_index로 색인한다
+// (scope 테스트들의 공용 content 시드 헬퍼).
+func indexNeedle(t *testing.T, cs *mcp.ClientSession, canon ident.Canon, needle string) {
+	t.Helper()
+	tmpFile := filepath.Join(canon.ProjectRoot, "note.txt")
+	if err := os.WriteFile(tmpFile, []byte(needle+" content in file\n"), 0o644); err != nil {
+		t.Fatalf("write tmp file: %v", err)
+	}
+	res, err := cs.CallTool(context.Background(), &mcp.CallToolParams{Name: "ctr_index", Arguments: IndexInput{Path: tmpFile}})
+	if err != nil {
+		t.Fatalf("ctr_index call: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("ctr_index error: %+v", res.Content)
+	}
+}
+
+// TestSearchScopeDefaultContent — 브리프 Step1 ①: scope 생략 시 기존 content-only 동작과
+// 동일(이벤트 섹션 비어 있음) — 기존 호출 무변 계약의 명시적 회귀 케이스.
+func TestSearchScopeDefaultContent(t *testing.T) {
+	cs, canon, _ := newSearchScopeTestServer(t)
+	indexNeedle(t, cs, canon, "needle")
+
+	res, err := cs.CallTool(context.Background(), &mcp.CallToolParams{Name: "ctr_search", Arguments: SearchInput{Queries: []string{"needle"}}})
+	if err != nil {
+		t.Fatalf("call: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("search error: %+v", res.Content)
+	}
+	var out SearchOutput
+	remarshal(t, res.StructuredContent, &out)
+	if len(out.Results) != 1 || len(out.Results[0].Hits) == 0 {
+		t.Fatalf("no content hits: %+v", out.Results)
+	}
+	if len(out.Results[0].Events) != 0 {
+		t.Fatalf("events want empty for default scope, got %+v", out.Results[0].Events)
+	}
+}
+
+// TestSearchScopeEvents — 브리프 Step1 ②: scope=events는 content hits 없이 EventHit만
+// 반환하고, 교정된(superseded) 이벤트도 포함하되 플래그로 구분한다(§2.3 색인 미제거 대칭).
+func TestSearchScopeEvents(t *testing.T) {
+	cs, _, sess := newSearchScopeTestServer(t)
+	origID := mustAppend(t, sess, session.Event{Type: "decision", Summary: "adopt widgetfoo approach"})
+	newID := mustAppend(t, sess, session.Event{Type: "decision", Summary: "revise widgetfoo approach", Supersedes: origID})
+
+	res, err := cs.CallTool(context.Background(), &mcp.CallToolParams{Name: "ctr_search",
+		Arguments: SearchInput{Queries: []string{"widgetfoo"}, Scope: "events"}})
+	if err != nil {
+		t.Fatalf("call: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("search error: %+v", res.Content)
+	}
+	var out SearchOutput
+	remarshal(t, res.StructuredContent, &out)
+	if len(out.Results) != 1 || len(out.Results[0].Hits) != 0 {
+		t.Fatalf("results=%+v want 1 result with empty content hits", out.Results)
+	}
+	events := out.Results[0].Events
+	if len(events) != 2 {
+		t.Fatalf("events=%+v want 2", events)
+	}
+	var sawOrig, sawNew bool
+	for _, e := range events {
+		if e.SessionID != sess.SessionID() || e.EventType != "decision" {
+			t.Fatalf("event fields=%+v", e)
+		}
+		switch e.EventID {
+		case origID:
+			sawOrig = true
+			if !e.Superseded {
+				t.Fatalf("orig event want superseded=true: %+v", e)
+			}
+		case newID:
+			sawNew = true
+			if e.Superseded {
+				t.Fatalf("new event want superseded=false: %+v", e)
+			}
+		}
+	}
+	if !sawOrig || !sawNew {
+		t.Fatalf("want both orig+new event, got %+v", events)
+	}
+}
+
+// TestSearchScopeAll — 브리프 Step1 ③: scope=all은 같은 질의 결과에 content hits와 이벤트
+// 섹션이 동시에 실린다.
+func TestSearchScopeAll(t *testing.T) {
+	cs, canon, sess := newSearchScopeTestServer(t)
+	indexNeedle(t, cs, canon, "gizmoqux")
+	mustAppend(t, sess, session.Event{Type: "note", Summary: "gizmoqux discussion recap"})
+
+	res, err := cs.CallTool(context.Background(), &mcp.CallToolParams{Name: "ctr_search",
+		Arguments: SearchInput{Queries: []string{"gizmoqux"}, Scope: "all"}})
+	if err != nil {
+		t.Fatalf("call: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("search error: %+v", res.Content)
+	}
+	var out SearchOutput
+	remarshal(t, res.StructuredContent, &out)
+	if len(out.Results) != 1 {
+		t.Fatalf("results=%+v want 1", out.Results)
+	}
+	if len(out.Results[0].Hits) == 0 {
+		t.Fatalf("want content hits in scope=all, got none: %+v", out.Results[0])
+	}
+	if len(out.Results[0].Events) == 0 {
+		t.Fatalf("want events in scope=all, got none: %+v", out.Results[0])
+	}
+}
+
+// TestSearchScopeRequiresSessionForEventsAndAll — 브리프 Step1 ④: session.db 불용(T10 배선
+// 전이므로 Session=nil 주입)에서 events/all은 조용한 빈 결과가 아니라 STORAGE_UNAVAILABLE로
+// 실패해야 한다(설계 §3.4). content scope는 세션과 무관하게 정상이어야 하므로 함께 확인한다.
+func TestSearchScopeRequiresSessionForEventsAndAll(t *testing.T) {
+	cs, _ := newTestServer(t, nil) // Session=nil(base profile)
+	ctx := context.Background()
+
+	for _, scope := range []string{"events", "all"} {
+		t.Run(scope, func(t *testing.T) {
+			res, err := cs.CallTool(ctx, &mcp.CallToolParams{Name: "ctr_search",
+				Arguments: SearchInput{Queries: []string{"anything"}, Scope: scope}})
+			if err != nil {
+				t.Fatalf("call: %v", err)
+			}
+			if !res.IsError {
+				t.Fatalf("want IsError=true for scope=%s without session, got %+v", scope, res)
+			}
+			text := res.Content[0].(*mcp.TextContent).Text
+			if !strings.HasPrefix(text, "["+codeStorageUnavailable+"]") {
+				t.Fatalf("want %s prefix, got %q", codeStorageUnavailable, text)
+			}
+		})
+	}
+
+	res, err := cs.CallTool(ctx, &mcp.CallToolParams{Name: "ctr_search", Arguments: SearchInput{Queries: []string{"anything"}}})
+	if err != nil {
+		t.Fatalf("call: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("content scope without session should still succeed, got error: %+v", res.Content)
+	}
+}
+
+// TestSearchScopeInvalidValue: 미지의 scope 값은 신규 코드 없이 기존 INVALID_ARGUMENT로 거부.
+func TestSearchScopeInvalidValue(t *testing.T) {
+	cs, _ := newTestServer(t, nil)
+	res, err := cs.CallTool(context.Background(), &mcp.CallToolParams{Name: "ctr_search", Arguments: SearchInput{Queries: []string{"x"}, Scope: "bogus"}})
+	if err != nil {
+		t.Fatalf("call: %v", err)
+	}
+	if !res.IsError {
+		t.Fatalf("want IsError=true for invalid scope")
+	}
+	text := res.Content[0].(*mcp.TextContent).Text
+	if !strings.HasPrefix(text, "["+codeInvalidArgument+"]") {
+		t.Fatalf("want %s prefix, got %q", codeInvalidArgument, text)
+	}
+}
+
+// TestFetchDescriptionMentionsByteExactNotWebFetch — 브리프 Step1 ⑤: ctr_fetch 설명에
+// "byte-exact"·"웹 fetch"·"ctr_fetch_and_index" 문구가 있는지 확인한다(설계 §3.5).
+func TestFetchDescriptionMentionsByteExactNotWebFetch(t *testing.T) {
+	cs, _ := newTestServer(t, nil)
+	lt, err := cs.ListTools(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("list tools: %v", err)
+	}
+	var desc string
+	for _, tl := range lt.Tools {
+		if tl.Name == "ctr_fetch" {
+			desc = tl.Description
+		}
+	}
+	if desc == "" {
+		t.Fatalf("ctr_fetch not found in tools/list")
+	}
+	for _, want := range []string{"byte-exact", "웹 fetch", "ctr_fetch_and_index"} {
+		if !strings.Contains(desc, want) {
+			t.Fatalf("ctr_fetch description=%q want to contain %q", desc, want)
+		}
 	}
 }
 
