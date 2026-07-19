@@ -190,21 +190,16 @@ func TestSpawn_Timeout(t *testing.T) {
 
 // TestSpawn_DefaultTimeout: ctx에 deadline이 없으면 Spawn이 내부 안전망(defaultWorkerTimeout
 // =10s)을 씌운다 — CPU-only 무한루프(스텝 budget은 충분히 크게 줘 budget보다 timeout이 먼저
-// 발동하도록)가 10s 근방(±2s)에서 오류 Result로 죽는지 검증한다. 기존 TestSpawn_Timeout(명시
-// deadline 500ms, elapsed<10s 단언)이 "deadline 있으면 그대로 존중"의 회귀 가드를 겸한다.
+// 발동하도록)가 deadline 없는 ctx로도 유한 시간(≤12s) 안에 오류 Result로 반환되는지 검증한다.
+// 안전망 부재 회귀 = Spawn 영구 행 → go test 타임아웃으로 검출된다. elapsed **하한은 단언하지
+// 않는다**: 워커(RLIMIT_AS 256MB self-apply)는 CI 러너에서 안전망 발동 전에 조기 사망할 수
+// 있고(ubuntu 실측 3회: 194ms run 29665928841 / 5.1s run 29668381108 / 6.5s run 29663189187,
+// -race·non-race 스텝 모두에서 관측 — 사망 사유는 Spawn이 합성 Result로 뭉개 구분 불가),
+// 그 조기 사망 자체가 fail-closed 정상 경로라 실패로 취급하면 안 된다. "10s 근방(±2s)"
+// 정밀 단언은 워커의 10s 생존을 전제해 본질적으로 flaky였다. 명시 deadline 존중의 회귀
+// 가드는 TestSpawn_Timeout(500ms deadline, elapsed<10s 단언)이 겸한다.
 func TestSpawn_DefaultTimeout(t *testing.T) {
 	skipDarwinNoIsolation(t)
-	if raceEnabled {
-		// CI -race 스텝에서만 이 테스트가 flaky하다(실측 2회: elapsed=194ms run 29665928841,
-		// 6.5s run 29663189187 — 같은 SHA에서 성공/실패 혼재). 워커 자체는 testSelfExe의
-		// plain `go build` 산출물이라 non-race이므로 race instrumentation 직접 효과는
-		// 아니고(-race 미전파, Codex 교차리뷰 지적), -race 스텝의 러너 환경 요인으로 워커
-		// (RLIMIT_AS 256MB self-apply)가 10s 안전망 전에 조기 사망하는 것으로 추정된다 —
-		// 사망 원인은 Spawn이 합성 Result로 뭉개 로그로 구분 불가. 하한(8s) 단언은 워커의
-		// 10s 생존이 전제인데 이 스텝에서 보장할 수 없어 skip한다. 본 검증(안전망 발동)은
-		// non-race 3-OS 스텝이 계속 수행한다. 원인 규명은 태그 후 이월(게이트 문서 참조).
-		t.Skip("-race 스텝: 워커 조기 사망 flaky 실측 — elapsed 하한 단언 불가(non-race 3-OS가 본 검증 수행)")
-	}
 	exe := testSelfExe(t)
 	req := Request{
 		Script: "def f():\n\tfor i in range(1000000000000):\n\t\tpass\n\nf()\n",
@@ -221,8 +216,8 @@ func TestSpawn_DefaultTimeout(t *testing.T) {
 	if res.ErrKind == "" {
 		t.Fatalf("want non-empty ErrKind (worker should have been default-timeout-killed), got %+v", res)
 	}
-	if elapsed < 8*time.Second || elapsed > 12*time.Second {
-		t.Fatalf("elapsed=%v want ~10s (±2s) for defaultWorkerTimeout safety net", elapsed)
+	if elapsed > 12*time.Second {
+		t.Fatalf("elapsed=%v want ≤12s (defaultWorkerTimeout 안전망 미발동 의심)", elapsed)
 	}
 	t.Logf("default timeout result: %+v elapsed=%v", res, elapsed)
 }
