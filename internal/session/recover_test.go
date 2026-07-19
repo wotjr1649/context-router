@@ -267,6 +267,146 @@ func TestRecover_ResumesAfterCrashBeforePublish(t *testing.T) {
 	}
 }
 
+// TestRecover_ResumesAfterPublishInterruptedMidRename — Fix Round1 Critical(재리뷰 발견):
+// publishRescued의 backupOriginal까지만 실행하고(원본 → .bak 완료) finishPublish(tmp→
+// session.db)는 호출하지 않는 상태("게시 rename 도중 crash" — session.db 부재 + 검증 완료된
+// 건강한 tmp + .bak family 존재)에서 Recover(dir) 재호출이 **재인양 없이** 게시만 마저
+// 끝내야 한다. 수정 전 코드는 이 상태에서 rescueAll의 첫 줄(removeDBFamily)이 검증 완료된
+// tmp를 삭제하고, 이어서 부재한 session.db를 열려다 영구 wedge됐다.
+func TestRecover_ResumesAfterPublishInterruptedMidRename(t *testing.T) {
+	dir := t.TempDir()
+	seedAndCorruptEvents(t, dir, 400)
+
+	markerPath := filepath.Join(dir, recoverMarkerName)
+	if err := createMarker(markerPath); err != nil {
+		t.Fatalf("createMarker: %v", err)
+	}
+	wantEvents, wantSessions, err := rescueAll(dir)
+	if err != nil {
+		t.Fatalf("rescueAll: %v", err)
+	}
+	if err := verifyRescued(dir); err != nil {
+		t.Fatalf("verifyRescued: %v", err)
+	}
+	if _, err := backupOriginal(dir); err != nil {
+		t.Fatalf("backupOriginal: %v", err)
+	}
+	// finishPublish를 의도적으로 호출하지 않는다 — "session.db 부재 + tmp = 검증된 건강
+	// 인양본" crash 상태.
+
+	if _, statErr := os.Stat(filepath.Join(dir, dbFileName)); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("precondition: session.db should be gone(renamed to bak), stat err=%v", statErr)
+	}
+	if _, statErr := os.Stat(filepath.Join(dir, recoverTmpName)); statErr != nil {
+		t.Fatalf("precondition: rescued tmp should still exist, stat err=%v", statErr)
+	}
+	if len(bakFamilyFiles(t, dir)) == 0 {
+		t.Fatal("precondition: backup family should already exist")
+	}
+
+	result, err := Recover(dir)
+	if err != nil {
+		t.Fatalf("resume Recover: %v", err)
+	}
+	if result.NoOp || result.MarkerOnly {
+		t.Fatalf("want real resumed-publish recovery, got %+v", result)
+	}
+	if result.RecoveredEvents != wantEvents || result.RecoveredSessions != wantSessions {
+		t.Fatalf("resume RecoveredEvents/Sessions=%d/%d want %d/%d(재인양 없이 이전 인양 건수 그대로 보고)",
+			result.RecoveredEvents, result.RecoveredSessions, wantEvents, wantSessions)
+	}
+
+	if _, statErr := os.Stat(markerPath); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("marker should be gone, stat err=%v", statErr)
+	}
+	if _, statErr := os.Stat(filepath.Join(dir, recoverTmpName)); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("tmp should be consumed(renamed), stat err=%v", statErr)
+	}
+
+	reader, err := OpenReadOnly(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = reader.Close() }()
+	if err := quickCheck(reader); err != nil {
+		t.Fatalf("published db not healthy after resume: %v", err)
+	}
+	var count int64
+	if err := reader.QueryRow("SELECT COUNT(*) FROM session_events").Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != wantEvents {
+		t.Fatalf("published session_events count=%d want %d", count, wantEvents)
+	}
+}
+
+// TestRecover_RestoresFromBackupWhenTmpMissingAfterPublishCrash — Fix Round1 Critical 방어
+// 분기(리뷰 지시 3): session.db 부재 + 인양본(tmp)도 부재 + `.bak-<ts>` family 존재인 극단
+// 상태(게시 rename 도중 crash 이후 tmp까지 사라진 경우)에서 Recover가 가장 최근 백업을
+// session.db 자리로 복원한 뒤 처음부터 다시 인양·게시를 완료해야 한다.
+func TestRecover_RestoresFromBackupWhenTmpMissingAfterPublishCrash(t *testing.T) {
+	dir := t.TempDir()
+	seedAndCorruptEvents(t, dir, 400)
+
+	markerPath := filepath.Join(dir, recoverMarkerName)
+	if err := createMarker(markerPath); err != nil {
+		t.Fatalf("createMarker: %v", err)
+	}
+	if _, _, err := rescueAll(dir); err != nil {
+		t.Fatalf("rescueAll: %v", err)
+	}
+	if err := verifyRescued(dir); err != nil {
+		t.Fatalf("verifyRescued: %v", err)
+	}
+	backupName, err := backupOriginal(dir)
+	if err != nil {
+		t.Fatalf("backupOriginal: %v", err)
+	}
+	// tmp까지 사라진 극단 상태를 흉내(예: 디스크 이슈로 게시 대상 인양본이 추가로 유실) —
+	// 직접 지운다.
+	if err := removeDBFamily(filepath.Join(dir, recoverTmpName)); err != nil {
+		t.Fatalf("removeDBFamily(tmp): %v", err)
+	}
+
+	if _, statErr := os.Stat(filepath.Join(dir, dbFileName)); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("precondition: session.db should be gone, stat err=%v", statErr)
+	}
+	if _, statErr := os.Stat(filepath.Join(dir, recoverTmpName)); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("precondition: tmp should be gone, stat err=%v", statErr)
+	}
+	if _, statErr := os.Stat(filepath.Join(dir, backupName)); statErr != nil {
+		t.Fatalf("precondition: backup should exist, stat err=%v", statErr)
+	}
+
+	result, err := Recover(dir)
+	if err != nil {
+		t.Fatalf("resume Recover: %v", err)
+	}
+	if result.NoOp || result.MarkerOnly {
+		t.Fatalf("want real re-recovery via backup restore, got %+v", result)
+	}
+	if result.RecoveredEvents <= 0 {
+		t.Fatalf("RecoveredEvents=%d want >0", result.RecoveredEvents)
+	}
+
+	if _, statErr := os.Stat(markerPath); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("marker should be gone, stat err=%v", statErr)
+	}
+	reader, err := OpenReadOnly(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = reader.Close() }()
+	if err := quickCheck(reader); err != nil {
+		t.Fatalf("published db not healthy: %v", err)
+	}
+	// 복원에 쓰인 원래 백업이 정상 파이프라인에 의해 다시 인양·백업됐으므로(새 타임스탬프),
+	// 최소 1개의 .bak-<ts> family가 남아있어야 한다.
+	if len(bakFamilyFiles(t, dir)) == 0 {
+		t.Fatal("expected at least one .bak-<ts> family to remain after re-pipeline")
+	}
+}
+
 // TestRecover_HealthyDBWithLeftoverMarker_DeletesMarkerOnly — 브리프 9b Step1 ⑤(N-2 회귀):
 // 게시가 이미 완료된 상태(건강한 session.db + .bak family 존재)에서 마커만 잔존 → 재실행이
 // 마커만 삭제하고 session.db는 절대 건드리지 않는다("무작업 종료 금지"이되 재인양도 금지).

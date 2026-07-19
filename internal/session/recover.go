@@ -84,6 +84,42 @@ func Recover(dir string) (RecoverResult, error) {
 			}
 			return RecoverResult{MarkerOnly: true}, nil
 		}
+
+		// 재리뷰 Critical 수정: session.db 부재는 "게시(⑥) rename 도중 crash"를 뜻할 수 있다
+		// (backupOriginal은 끝났지만 finishPublish 전) — 이 경우 아래 공용 파이프라인으로 그냥
+		// 떨어지면 rescueAll이 이미 검증 완료된 인양본을 지우고 부재한 session.db를 열려다
+		// 영구 wedge된다(설계 §6.3 ⑦ "재실행이 잔여 상태를 감지해 이어서 완료" 위반). 여기서
+		// 먼저 감지·분기한다.
+		dbExists, err := fileExists(filepath.Join(dir, dbFileName))
+		if err != nil {
+			return RecoverResult{}, err
+		}
+		if !dbExists {
+			healthy, err := tmpIsHealthy(dir)
+			if err != nil {
+				return RecoverResult{}, err
+			}
+			if healthy {
+				nEvents, nSessions, err := resumePublishOnly(dir)
+				if err != nil {
+					return RecoverResult{}, err
+				}
+				backupPrefix, _, err := latestBackupMain(dir) // 이미 있는 백업 그대로 보고(새로 만들지 않음)
+				if err != nil {
+					return RecoverResult{}, err
+				}
+				if err := os.Remove(markerPath); err != nil {
+					return RecoverResult{}, sanitizeIOErr("recover marker remove", err)
+				}
+				return RecoverResult{RecoveredEvents: nEvents, RecoveredSessions: nSessions, BackupPrefix: backupPrefix}, nil
+			}
+			// tmp가 없거나 불건강 — 방어 분기: 가장 최근 백업을 session.db 자리로 되돌려
+			// "훼손된 원본이 다시 그 자리에 있는" 상태로 만든 뒤, 아래 공용 파이프라인이
+			// 처음부터 다시 인양·게시하게 한다.
+			if err := restoreLatestBackup(dir); err != nil {
+				return RecoverResult{}, err
+			}
+		}
 		// 마커는 있으나 게시 미완료 — ④부터 이어서 진행(단순 재실행, 위 패키지 주석 참고).
 	}
 
@@ -362,7 +398,10 @@ func rescueSessions(src, dst *sql.DB) (int64, error) {
 
 // verifyRescued — 설계 §6.3 ⑤: 인양본을 wal_checkpoint(TRUNCATE)+연결 종료로 단일 파일로 접은
 // 뒤 quick_check + user_version(스키마) 확인. 체크포인트+정상 종료 후 -wal/-shm이 남지 않는
-// 것을 실측 확인했지만(Windows), 크로스플랫폼 방어로 명시 삭제도 병행한다.
+// 것을 실측 확인했지만(Windows), 크로스플랫폼 방어로 명시 삭제도 병행한다. 마지막에 syncDir로
+// 인양본을 디스크에 확정한다 — 재리뷰 Critical 수정: 게시(⑥) 도중 crash 재개 분기
+// (resumePublishOnly)가 "검증까지 끝난 tmp가 디스크에 살아있다"는 사실에 의존하게 됐으므로,
+// 이 fsync는 이제 단순 defense-in-depth가 아니라 재개 계약의 전제(load-bearing)다.
 func verifyRescued(dir string) error {
 	tmpPath := filepath.Join(dir, recoverTmpName)
 	dsn := "file:" + filepath.ToSlash(tmpPath) + pragmas + "&_txlock=immediate"
@@ -389,12 +428,21 @@ func verifyRescued(dir string) error {
 		return fmt.Errorf("session recover: 인양본 재확인 열기 실패: %w", err)
 	}
 	defer func() { _ = vconn.Close() }()
+	if err := checkRescuedHealth(vconn); err != nil {
+		return err
+	}
+	return syncDir(dir)
+}
 
-	if err := quickCheck(vconn); err != nil {
+// checkRescuedHealth — quick_check + user_version(스키마) 확인(설계 §6.3 ⑤ 검증부). conn은
+// 이미 열려 있는 읽기 전용 연결. verifyRescued(최초 검증)와 tmpIsHealthy(게시 crash 재개
+// 분기가 이전에 검증된 tmp를 재확인할 때)가 공유한다 — 재리뷰 Critical 수정으로 분리.
+func checkRescuedHealth(conn *sql.DB) error {
+	if err := quickCheck(conn); err != nil {
 		return fmt.Errorf("session recover: 인양본 quick_check 실패: %w", err)
 	}
 	var uv int
-	if err := vconn.QueryRow("PRAGMA user_version").Scan(&uv); err != nil {
+	if err := conn.QueryRow("PRAGMA user_version").Scan(&uv); err != nil {
 		return fmt.Errorf("session recover: 인양본 user_version 확인 실패: %w", err)
 	}
 	if uv != schemaVersion {
@@ -403,14 +451,111 @@ func verifyRescued(dir string) error {
 	return nil
 }
 
-// publishRescued — 설계 §6.3 ⑥: 원본 family(-shm→-wal→session.db 순)를 session.db.bak-<ts>
-// family로 rename, 인양본(단일 파일)→session.db, 디렉터리 fsync. 반환값은 부여된 백업 파일명
-// (dir 상대, 표시용).
+// tmpIsHealthy — 게시(⑥) 도중 crash 재개 분기 전용(재리뷰 Critical 수정, 설계 §6.3 ⑦): 이미
+// verifyRescued를 통과한 적 있는 인양본(recoverTmpName)이 재실행 시점에도 여전히 건강한지
+// 재확인한다. 존재하지 않거나 열기·검증 중 어떤 오류든 나면 "건강하지 않음"으로 취급해
+// 호출자가 재인양 경로(restoreLatestBackup)로 넘어가게 한다 — 이 함수 자체는 원인을 구분하지
+// 않는다(보수적 기본값).
+func tmpIsHealthy(dir string) (bool, error) {
+	tmpPath := filepath.Join(dir, recoverTmpName)
+	exists, err := fileExists(tmpPath)
+	if err != nil {
+		return false, err
+	}
+	if !exists {
+		return false, nil
+	}
+	conn, err := openReadOnlyAt(tmpPath)
+	if err != nil {
+		return false, nil
+	}
+	defer func() { _ = conn.Close() }()
+	if err := checkRescuedHealth(conn); err != nil {
+		return false, nil
+	}
+	return true, nil
+}
+
+// latestBackupMain — dbFileName+bakInfix<ts> 메인 멤버(‑wal/‑shm 접미사 없는 것) 중 사전순
+// (=시간순, ts 포맷이 정렬 가능) 최신 것의 파일명을 반환한다(설계 §6.3 ⑦ 재개 방어 분기 —
+// bak family로부터 원본 위치 복원 대상 선정, 재리뷰 Critical 수정).
+func latestBackupMain(dir string) (string, bool, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return "", false, sanitizeIOErr("recover dir read", err)
+	}
+	prefix := dbFileName + bakInfix
+	var latest string
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		name := e.Name()
+		if !strings.HasPrefix(name, prefix) || strings.HasSuffix(name, "-wal") || strings.HasSuffix(name, "-shm") {
+			continue
+		}
+		if name > latest {
+			latest = name
+		}
+	}
+	return latest, latest != "", nil
+}
+
+// restoreLatestBackup — 게시(⑥) crash 재개의 방어 분기(재리뷰 Critical 수정, 설계 §6.3 ⑦):
+// session.db가 없고 인양본(tmp)도 못 쓰는 상태에서, 가장 최근 .bak-<ts> family(원본이 게시
+// 직전 rename된 것, -shm/-wal 포함)를 session.db 위치로 되돌린다. 되돌린 뒤에는 다시 "훼손된
+// 원본이 그 자리에 있는" 상태가 되어 호출자(Recover)의 정상 인양 파이프라인(④~⑦)이 처음부터
+// 다시 돈다. 수동 CLI(session recover) 내부에서, 사용자가 명시적으로 recover를 실행했다는
+// 동의 하에 recover 자신이 만든 백업을 자신이 되돌리는 것뿐이므로, 설계 §6.1이 기각한 "서버가
+// 스스로 감지해 rename"과는 성격이 다르다 — §6.2의 자동 rename 금지(서버 fail-closed 유지
+// 목적)와 충돌하지 않는다.
+func restoreLatestBackup(dir string) error {
+	main, found, err := latestBackupMain(dir)
+	if err != nil {
+		return err
+	}
+	if !found {
+		return errors.New("session recover: 게시 중단 감지됐으나 인양본·백업 모두 없음 — 수동 확인 필요")
+	}
+	for _, suffix := range []string{"", "-wal", "-shm"} {
+		src := filepath.Join(dir, main+suffix)
+		exists, err := fileExists(src)
+		if err != nil {
+			return err
+		}
+		if !exists {
+			continue
+		}
+		dst := filepath.Join(dir, dbFileName+suffix)
+		if err := os.Rename(src, dst); err != nil {
+			return sanitizeIOErr("recover restore backup rename", err)
+		}
+	}
+	return nil
+}
+
+// publishRescued — 설계 §6.3 ⑥: 원본을 백업하고(backupOriginal) 인양본을 게시한다
+// (finishPublish). 둘로 나뉜 이유(재리뷰 Critical 수정): (1) 테스트가 backupOriginal까지만
+// 호출해 "원본은 이미 .bak로 옮겨졌지만 인양본 게시는 아직" crash 상태를 주입할 수 있게,
+// (2) resumePublishOnly(게시 crash 재개 경로)가 finishPublish만 재사용할 수 있게(원본은 이미
+// 이전 실행에서 백업됐으므로 다시 백업하면 안 된다).
 func publishRescued(dir string) (string, error) {
+	backupName, err := backupOriginal(dir)
+	if err != nil {
+		return "", err
+	}
+	if err := finishPublish(dir); err != nil {
+		return "", err
+	}
+	return backupName, nil
+}
+
+// backupOriginal — 설계 §6.3 ⑥ 전반부: 원본 family(-shm→-wal→session.db 순)를
+// session.db.bak-<ts> family로 rename한다.
+func backupOriginal(dir string) (string, error) {
 	ts := time.Now().UTC().Format("20060102T150405.000000000Z")
 	backupName := dbFileName + bakInfix + ts
 	dbPath := filepath.Join(dir, dbFileName)
-	tmpPath := filepath.Join(dir, recoverTmpName)
 
 	for _, suffix := range []string{"-shm", "-wal", ""} {
 		src := dbPath + suffix
@@ -426,15 +571,41 @@ func publishRescued(dir string) (string, error) {
 			return "", sanitizeIOErr("recover publish backup rename", err)
 		}
 	}
-
-	if err := os.Rename(tmpPath, dbPath); err != nil {
-		return "", sanitizeIOErr("recover publish rename", err)
-	}
-
-	if err := syncDir(dir); err != nil {
-		return "", err
-	}
 	return backupName, nil
+}
+
+// finishPublish — 설계 §6.3 ⑥ 후반부: 인양본(단일 파일) → session.db, 디렉터리 fsync.
+func finishPublish(dir string) error {
+	tmpPath := filepath.Join(dir, recoverTmpName)
+	dbPath := filepath.Join(dir, dbFileName)
+	if err := os.Rename(tmpPath, dbPath); err != nil {
+		return sanitizeIOErr("recover publish rename", err)
+	}
+	return syncDir(dir)
+}
+
+// resumePublishOnly — 게시(⑥) crash 재개 경로(재리뷰 Critical 수정, 설계 §6.3 ⑦):
+// session.db가 없고(직전 실행이 backupOriginal까지 끝내고 crash) 검증된 인양본이 여전히
+// 건강하면, 재인양 없이 게시만 마저 끝낸다. 반환하는 건수는 tmp를 직접 세어 §6.3 ⑦의 "인양
+// 건수 보고"를 재인양 없이도 지킨다.
+func resumePublishOnly(dir string) (events, sessionsN int64, err error) {
+	tmpPath := filepath.Join(dir, recoverTmpName)
+	conn, err := openReadOnlyAt(tmpPath)
+	if err != nil {
+		return 0, 0, fmt.Errorf("session recover: 재개 인양본 열기 실패: %w", err)
+	}
+	countErr := conn.QueryRow("SELECT COUNT(*) FROM session_events").Scan(&events)
+	if countErr == nil {
+		countErr = conn.QueryRow("SELECT COUNT(*) FROM sessions").Scan(&sessionsN)
+	}
+	_ = conn.Close()
+	if countErr != nil {
+		return 0, 0, fmt.Errorf("session recover: 재개 인양본 건수 조회 실패: %w", countErr)
+	}
+	if err := finishPublish(dir); err != nil {
+		return 0, 0, err
+	}
+	return events, sessionsN, nil
 }
 
 // syncDir — 디렉터리 fsync(설계 §6.3 ⑥, publish 원자성 보강 — defense-in-depth일 뿐 정확성의
