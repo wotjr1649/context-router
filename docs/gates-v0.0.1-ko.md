@@ -21,7 +21,7 @@
 | 10 | **프로토콜 위생**: stdout 오염 0 + Claude Code·Codex 실 등록 스모크(tools/list·호출·cancellation) | 자동: `cmd/context-router/main_test.go` `TestE2E_StdioRoundTrip`(실 바이너리 stdio 왕복, 매 stdout 줄 JSON 유효성 검증), `internal/mcp/mcp_test.go` `TestServeStdoutPurity`(즉시 EOF 기준선), `TestServeStdoutPurityDuringErroringToolCall`(**신규, 계획3 T10** — store를 미리 Close해 tools/call 처리 도중 실제로 `slog.Error`가 stderr에 찍히는 그 순간에도 stdout이 JSON-RPC 줄만 유지되는지 확인, Task 8 minor "stdout purity 테스트 narrow(툴콜 중 오염 미검)" 해소). **신규(session-04, PR #5)**: `TestE2E_CallToolCancellation` — 서버 취소 계약 (3a)의 CI 상주 스모크(notifications/cancelled 결정적 주입 + worker 슬롯 해제 직접 관찰). 수동(2건, 아래 §수동 스모크 참조): **확인 완료(2026-07-19)** — cancellation은 확인 항목 3의 분리 판정((3a) 스크립트드 PASS 필수 + (3b) 실호스트 1회 재시도 기입, 비차단 협의) | PASS |
 | 11 | **스키마 토큰 예산**: 기본 3종 도구 정의 tokenizer 실측, 상한 기록 | `internal/mcp/mcp_test.go` `TestSchemaTokenBudget`(**신규, 계획3 T10**) — 기본 프로필(ctr_search/ctr_fetch/ctr_transform) tools/list 결과 직렬화 **4359 bytes**(근사 토큰 ~1089, bytes/4 — Claude 정확 tokenizer 비공개라 근사치, 바이트 상한이 실질 게이트). 상한 `maxToolSchemaBytes` = 최초 실측×1.2 반올림 = **5231 bytes**로 고정 | PASS |
 | 12 | **빌드**: `CGO_ENABLED=0` 6타깃 크로스빌드 + 크기 기록, memory-capped CI | `.github/workflows/ci.yml` — 3-OS(ubuntu/macos/windows) 테스트 매트릭스 + crossbuild 6타깃(6조합 GOOS/GOARCH) + 바이너리 크기를 `GITHUB_STEP_SUMMARY`에 기록. CI run: https://github.com/wotjr1649/context-router/actions/runs/29652804882 (GREEN) | PASS |
-| 13 | 전 게이트 통과 전 태그 금지 | 아래 §태그 절차 참조 | 절차 기록됨(태그는 PR 머지 후) |
+| 13 | 전 게이트 통과 전 태그 금지 | 아래 §태그 절차 참조 — 게이트 1~12 전체 PASS 확인 후 **v0.0.1 태그 생성·push 완료(2026-07-19, 대상 커밋 09d7c2d, main CI GREEN run 29677079320)** | PASS(태그 완료) |
 
 ## 게이트 10 — 수동 스모크 (실 등록, 자동화 불가)
 
@@ -116,6 +116,9 @@ ctx 취소 시 notifications/cancelled 자동 송신 — SDK transport.go:229-23
 **이 이월분이 해소되기 전에는 게이트 13 태그를 만들지 않는다.**
 
 ## 태그 절차 (게이트 13)
+
+**실행 완료(2026-07-19)**: 아래 절차대로 전 게이트 PASS 확인 후 `v0.0.1` 태그를
+커밋 09d7c2d에 생성·push했다.
 
 전 게이트(1~12) PASS + 게이트 10 수동 스모크 2건 확인 전에는 태그를 만들지 않는다.
 
