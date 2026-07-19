@@ -14,11 +14,13 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	sdk "github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/wotjr1649/context-router/internal/ident"
 	"github.com/wotjr1649/context-router/internal/mcp"
 	"github.com/wotjr1649/context-router/internal/store"
@@ -891,5 +893,157 @@ func TestE2E_FetchAndIndex(t *testing.T) {
 
 	if err := closeAndWait(cmd, c); err != nil {
 		t.Fatalf("process exit: %v (stderr=%s)", err, stderrBuf.String())
+	}
+}
+
+// TestE2E_CallToolCancellation: 게이트 10 확인 항목 (3a) — 서버 취소 계약의 스크립트드
+// 스모크(session-03 이월, gates-v0.0.1-ko.md §게이트 10 "이월 경위" 참조). go-sdk
+// 클라이언트는 CallTool ctx가 취소되면 notifications/cancelled를 자동 송신하므로(SDK
+// transport.go call()의 ctx.Err() 분기), 사람 개입 없이 실 바이너리에 취소를 결정적으로
+// 주입할 수 있다. 손수 만든 stdioClient가 아니라 SDK ClientSession을 쓰는 이유: call()이
+// 동기라 호출 도중 취소를 보낼 수 없다. 단언 3종:
+//
+//	(a) 취소 시점에 즉시 context.Canceled 반환 — 클라이언트측 계약이다(jsonrpc2 Await가
+//	    로컬 select라 서버 처리와 무관하게 성립). 서버가 취소를 처리했다는 증거는 아니고,
+//	    notifications/cancelled 송신까지만 보장한다(교차 리뷰 지적).
+//	(b) 서버가 취소를 실제로 처리했는가의 직접 관찰 — worker 슬롯(transform.go workerSem
+//	    ≤2)을 장기 호출 2건으로 점유하고 취소한 직후, 세 번째 transform이 수 초 내에
+//	    완료돼야 한다. 서버가 취소 알림을 무시하면 슬롯이 각 핸들러의 10s timeout까지
+//	    잠겨 세 번째 호출이 ≥9s 걸린다(교차 리뷰 P1 — 이 시간 차가 결정적 판별 신호).
+//	(c) 후속 ctr_search 정상 응답 + stdin close에 graceful exit(코드 0, 서버 생존).
+//
+// darwin은 ctr_transform이 fail-closed 미등록이라 대상 외(게이트 10 확인 항목 1 참조).
+func TestE2E_CallToolCancellation(t *testing.T) {
+	if testing.Short() {
+		t.Skip("느린 E2E 스모크 — short 모드 skip")
+	}
+	if runtime.GOOS != "linux" && runtime.GOOS != "windows" {
+		t.Skip("ctr_transform 미등록 플랫폼 — 취소 창을 만들 장시간 도구가 없음")
+	}
+	bin := buildCtrBinary(t)
+
+	cmd := exec.Command(bin, "--root", t.TempDir(), "--store-root", t.TempDir())
+	var stderrBuf bytes.Buffer // Wait 이후에만 읽는다(spawnCtr 주석과 동일한 계약)
+	cmd.Stderr = &stderrBuf
+	// SDK가 Close에서 Kill/Wait까지 책임지지만, 그 전에 t.Fatal로 이탈하면 자식이
+	// 잔존한다 — spawnCtr과 동일한 안전망(정상 종료 후에는 no-op).
+	t.Cleanup(func() {
+		if cmd.Process != nil {
+			_ = cmd.Process.Kill()
+			_, _ = cmd.Process.Wait()
+		}
+	})
+
+	client := sdk.NewClient(&sdk.Implementation{Name: "ctr-cancel-smoke", Version: "0.0.1"}, nil)
+	sess, err := client.Connect(context.Background(), &sdk.CommandTransport{Command: cmd}, nil)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+
+	// bounded churn: 워커 상한(5M steps·256MB·10s)에 스스로 도달하기 전에 취소가
+	// 끼어들 수 초짜리 창을 만든다. 반드시 할당 없는 CPU 워크로드여야 한다 — 8MB
+	// 가비지를 반복 생성하는 초안(base+base 버리기)은 GC의 커밋 반환이 순간적으로
+	// 뒤처지면 상주 12MB로도 커밋이 Job Object 상한(256MB)에 닿아 worker가
+	// 비결정적으로 조기 사망했다(windows 실측 20회 중 7회, VirtualAlloc errno=1455 →
+	// Go runtime OOM abort; PR #4가 미규명으로 남긴 ubuntu RLIMIT_AS 조기 사망과 동일
+	// 계열). count 스캔은 스텝당 수~수십 ms짜리 순수 CPU 작업이라 스텝 예산(≈32K ≪ 5M)과
+	// 메모리 상한(상주 ≈4MB 고정, 가비지 0) 어느 쪽에도 닿지 않는다.
+	//
+	// 반복 수 8000의 근거(재리뷰 Important — 자연 완주가 10s 미만이면 아래 (b)의 슬롯
+	// 판별이 "취소 무시 + 자연 완주" 회귀를 그린으로 통과시킬 수 있다): 이 워크로드의
+	// 1500회 버전이 실호스트 스모크 2회에서 모두 핸들러 10s 상한에 도달했다(자연 완주
+	// >10s 실측 하한). 8000회는 그 ≈5.3배라 ~5배 빠른 머신에서도 자연 완주가 10s를
+	// 확실히 넘는다 — 어떤 실패 모드든 슬롯 해제는 "취소 처리" 아니면 "10s timeout"뿐.
+	script := "base = \"x\" * 4000000\n" +
+		"def churn():\n" +
+		"    n = 0\n" +
+		"    for _ in range(8000):\n" +
+		"        n += base.count(\"xx\")\n" +
+		"    return str(n)\n" +
+		"emit(churn())\n"
+
+	// worker 슬롯 2개를 모두 점유하는 장기 호출 2건을 동시에 걸고 1s 뒤 함께 취소한다.
+	churnCtx, cancelChurn := context.WithCancel(context.Background())
+	defer cancelChurn()
+	timer := time.AfterFunc(1*time.Second, cancelChurn)
+	defer timer.Stop()
+	type callOutcome struct {
+		res     *sdk.CallToolResult
+		err     error
+		elapsed time.Duration
+	}
+	outcomes := make(chan callOutcome, 2)
+	for range 2 {
+		go func() {
+			start := time.Now()
+			r, err := sess.CallTool(churnCtx, &sdk.CallToolParams{
+				Name: "ctr_transform", Arguments: mcp.TransformInput{Script: script},
+			})
+			outcomes <- callOutcome{res: r, err: err, elapsed: time.Since(start)}
+		}()
+	}
+	for range 2 {
+		oc := <-outcomes
+		if !errors.Is(oc.err, context.Canceled) {
+			var detail string
+			if oc.res != nil {
+				b, _ := json.Marshal(oc.res)
+				detail = string(b)
+			}
+			// stderr 복사 고루틴은 exec.Cmd.Wait만 join한다(교차 리뷰 P2 — Process.Wait는
+			// 안 됨). SDK가 아직 Wait 전(sess.Close 미호출)이므로 여기의 cmd.Wait이 첫
+			// 호출이라 안전하다.
+			_ = cmd.Process.Kill()
+			_ = cmd.Wait()
+			t.Fatalf("(a) want context.Canceled, got err=%v res=%s (elapsed=%v)\nstderr=%s", oc.err, detail, oc.elapsed, stderrBuf.String())
+		}
+		// 취소(1s) 직후 반환해야 한다. 상한만 단언하고 하한은 두지 않는다(PR #4 교훈 —
+		// 하한은 구현 우연에 대한 단언이 된다).
+		if oc.elapsed >= 4*time.Second {
+			t.Fatalf("(a) 취소 반환이 늦음: %v", oc.elapsed)
+		}
+	}
+
+	// (b) 서버측 취소 처리의 직접 관찰: 취소가 핸들러 ctx→worker까지 전파됐다면 슬롯 2개가
+	// 곧 풀려 이 호출은 ~2s 내(스폰 포함)에 끝난다. 무시됐다면 두 churn 핸들러가 각자의
+	// 10s timeout까지 슬롯을 쥐고 있어 ≥9s가 걸린다 — 7s 상한이 두 경우를 가른다.
+	thirdCtx, cancelThird := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancelThird()
+	thirdStart := time.Now()
+	third, err := sess.CallTool(thirdCtx, &sdk.CallToolParams{
+		Name: "ctr_transform", Arguments: mcp.TransformInput{Script: `emit("ok")`},
+	})
+	thirdElapsed := time.Since(thirdStart)
+	if err != nil {
+		t.Fatalf("(b) 취소 직후 transform: %v (elapsed=%v)", err, thirdElapsed)
+	}
+	if third.IsError {
+		b, _ := json.Marshal(third)
+		t.Fatalf("(b) 취소 직후 transform 도구 오류: %s", b)
+	}
+	if thirdElapsed >= 7*time.Second {
+		t.Fatalf("(b) worker 슬롯이 제때 풀리지 않음(서버 취소 미처리 의심): %v", thirdElapsed)
+	}
+
+	// (c) 동일 세션 후속 호출 — 빈 스토어라 히트 내용은 보지 않고 정상 응답만 확인.
+	folCtx, cancelFol := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancelFol()
+	res, err := sess.CallTool(folCtx, &sdk.CallToolParams{
+		Name: "ctr_search", Arguments: mcp.SearchInput{Queries: []string{"cancel-smoke"}},
+	})
+	if err != nil {
+		t.Fatalf("(c) 후속 ctr_search: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("(c) 후속 ctr_search가 도구 오류를 반환: %+v", res)
+	}
+
+	// (c-2) stdin close 후 TerminateDuration(기본 5s) 안에 graceful exit해야 한다 —
+	// 서버가 취소로 죽었거나 핸들러가 매달려 있으면 kill 경로로 빠져 오류가 난다.
+	if err := sess.Close(); err != nil {
+		t.Fatalf("(c) graceful shutdown: %v (stderr=%s)", err, stderrBuf.String())
+	}
+	if st := cmd.ProcessState; st == nil || !st.Success() {
+		t.Fatalf("(c) exit state=%v want 코드 0 (stderr=%s)", st, stderrBuf.String())
 	}
 }
