@@ -1854,3 +1854,315 @@ func mustAppend(t *testing.T, sess *session.DB, ev session.Event) string {
 	}
 	return eventID
 }
+
+// --- ctr_export_events (태스크 5, 설계 §3.3, D16) ---
+
+// exportBaseline: session_start 자동 이벤트(Open 시점 기록)를 건너뛰기 위해, 테스트가 이벤트를
+// 추가로 append하기 전 현재 세션의 next_after를 조회해 커서 시작점으로 쓴다.
+func exportBaseline(t *testing.T, cs *mcp.ClientSession, sessionID string) int64 {
+	t.Helper()
+	res, err := cs.CallTool(context.Background(), &mcp.CallToolParams{Name: "ctr_export_events",
+		Arguments: ExportEventsInput{SessionID: sessionID, Limit: maxExportLimit}})
+	if err != nil {
+		t.Fatalf("exportBaseline call: %v", err)
+	}
+	var out ExportEventsOutput
+	remarshal(t, res.StructuredContent, &out)
+	return out.NextAfter
+}
+
+// findExportEvent: 응답 events에서 event_id로 찾는 테스트 공용 헬퍼.
+func findExportEvent(out ExportEventsOutput, eventID string) *session.EventV1 {
+	for i := range out.Events {
+		if out.Events[i].EventID == eventID {
+			return &out.Events[i]
+		}
+	}
+	return nil
+}
+
+// TestExportEvents_RoundTrip: record_event로 기록한 이벤트가 export에서 §26 전 필드로
+// 왕복한다(schemaVersion·privacyLabel 상수, producer 유도, artifact_refs/related/attributes
+// 보존, untrusted:true).
+func TestExportEvents_RoundTrip(t *testing.T) {
+	cs, _, sess, _, _ := newSummaryTestServer(t)
+	ctx := context.Background()
+	eid := mustAppend(t, sess, session.Event{
+		Type: "decision", Summary: "chose approach A",
+		Attributes:   json.RawMessage(`{"k":"v"}`),
+		ArtifactRefs: []string{"artifact://" + sess.SessionID() + "/sha256-abc"},
+		Related:      []string{"symbol://x"},
+	})
+
+	res, err := cs.CallTool(ctx, &mcp.CallToolParams{Name: "ctr_export_events", Arguments: ExportEventsInput{}})
+	if err != nil {
+		t.Fatalf("call: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("export error: %+v", res.Content)
+	}
+	var out ExportEventsOutput
+	remarshal(t, res.StructuredContent, &out)
+
+	if !out.Untrusted {
+		t.Fatalf("Untrusted=false want true")
+	}
+	ev := findExportEvent(out, eid)
+	if ev == nil {
+		t.Fatalf("event %s not found in export: %+v", eid, out.Events)
+	}
+	if ev.SchemaVersion != "1.0" || ev.PrivacyLabel != "internal" {
+		t.Fatalf("ev=%+v want schemaVersion=1.0 privacyLabel=internal", ev)
+	}
+	if ev.SessionID != sess.SessionID() || ev.EventType != "decision" || ev.Summary != "chose approach A" {
+		t.Fatalf("ev identity=%+v", ev)
+	}
+	if ev.Producer.Name != "context-router" {
+		t.Fatalf("ev.Producer=%+v want name=context-router", ev.Producer)
+	}
+	if len(ev.ArtifactRefs) != 1 || ev.ArtifactRefs[0] != "artifact://"+sess.SessionID()+"/sha256-abc" {
+		t.Fatalf("ev.ArtifactRefs=%v", ev.ArtifactRefs)
+	}
+	if len(ev.RelatedResources) != 1 || ev.RelatedResources[0] != "symbol://x" {
+		t.Fatalf("ev.RelatedResources=%v", ev.RelatedResources)
+	}
+	attrs, ok := ev.Attributes.(map[string]any)
+	if !ok || attrs["k"] != "v" {
+		t.Fatalf("ev.Attributes=%v want {k:v}", ev.Attributes)
+	}
+}
+
+// TestExportEvents_DefaultLimitClamp: limit 미지정 시 기본 50건까지만 반환(브리프 설계 §3.3).
+func TestExportEvents_DefaultLimitClamp(t *testing.T) {
+	cs, _, sess, _, _ := newSummaryTestServer(t)
+	ctx := context.Background()
+	for i := 0; i < 60; i++ {
+		mustAppend(t, sess, session.Event{Type: "note", Summary: fmt.Sprintf("n%02d", i)})
+	}
+
+	res, err := cs.CallTool(ctx, &mcp.CallToolParams{Name: "ctr_export_events", Arguments: ExportEventsInput{}})
+	if err != nil {
+		t.Fatalf("call: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("export error: %+v", res.Content)
+	}
+	var out ExportEventsOutput
+	remarshal(t, res.StructuredContent, &out)
+	if len(out.Events) != 50 {
+		t.Fatalf("default limit len=%d want 50", len(out.Events))
+	}
+}
+
+// TestClampExportLimit: 기본 50·최대 200(초과 클램프), 0 이하는 기본값(순수 함수 단위 테스트).
+func TestClampExportLimit(t *testing.T) {
+	cases := []struct{ in, want int }{
+		{0, defaultExportLimit},
+		{-5, defaultExportLimit},
+		{10, 10},
+		{200, 200},
+		{201, maxExportLimit},
+		{9999, maxExportLimit},
+	}
+	for _, c := range cases {
+		if got := clampExportLimit(c.in); got != c.want {
+			t.Fatalf("clampExportLimit(%d)=%d want %d", c.in, got, c.want)
+		}
+	}
+}
+
+// TestExportEvents_CursorPagination: limit=2로 도구를 반복 호출하면 시드된 이벤트 전부를
+// 정확히 한 번씩, 삽입 순서대로 방문하고 next_after가 매 호출 단조 증가한다(session_id로
+// 필터해 session_start 자동 이벤트와 섞이지 않게 한다).
+func TestExportEvents_CursorPagination(t *testing.T) {
+	cs, _, sess, _, _ := newSummaryTestServer(t)
+	ctx := context.Background()
+	after := exportBaseline(t, cs, sess.SessionID()) // session_start 자동 이벤트를 건너뛴다.
+
+	const n = 5
+	want := make([]string, n)
+	for i := 0; i < n; i++ {
+		want[i] = mustAppend(t, sess, session.Event{Type: "note", Summary: fmt.Sprintf("n%d", i)})
+	}
+
+	var got []string
+	lastAfter := after
+	for i := 0; i < 10; i++ { // 안전 상한(무한루프 방지)
+		res, err := cs.CallTool(ctx, &mcp.CallToolParams{Name: "ctr_export_events",
+			Arguments: ExportEventsInput{After: after, SessionID: sess.SessionID(), Limit: 2}})
+		if err != nil {
+			t.Fatalf("call: %v", err)
+		}
+		if res.IsError {
+			t.Fatalf("export error: %+v", res.Content)
+		}
+		var out ExportEventsOutput
+		remarshal(t, res.StructuredContent, &out)
+		if len(out.Events) == 0 {
+			break
+		}
+		if out.NextAfter <= lastAfter {
+			t.Fatalf("iter %d: next_after=%d want > %d(단조 증가)", i, out.NextAfter, lastAfter)
+		}
+		for _, ev := range out.Events {
+			got = append(got, ev.EventID)
+		}
+		after = out.NextAfter
+		lastAfter = out.NextAfter
+	}
+
+	if len(got) != n {
+		t.Fatalf("got=%v(len=%d) want %d events", got, len(got), n)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("got[%d]=%s want %s(순서/중복 위반)", i, got[i], want[i])
+		}
+	}
+}
+
+// TestExportEvents_MaxReturnBytesTruncatesWithoutLoss: max_return_bytes를 작게 잡아 배치를
+// 강제로 절단시켜도, next_after를 따라 반복 호출하면 이벤트가 하나도 유실되지 않는다(mcp
+// 계층 applyExportBudget의 존재 이유 — RowID 기반 next_after 정확성 회귀 검증).
+func TestExportEvents_MaxReturnBytesTruncatesWithoutLoss(t *testing.T) {
+	cs, _, sess, _, _ := newSummaryTestServer(t)
+	ctx := context.Background()
+	after := exportBaseline(t, cs, sess.SessionID()) // session_start 자동 이벤트를 건너뛴다.
+
+	const n = 5
+	want := make([]string, n)
+	for i := 0; i < n; i++ {
+		want[i] = mustAppend(t, sess, session.Event{Type: "note", Summary: strings.Repeat("n", 50)})
+	}
+
+	var got []string
+	sawTruncated := false
+	for i := 0; i < 20; i++ { // 안전 상한(무한루프 방지)
+		res, err := cs.CallTool(ctx, &mcp.CallToolParams{Name: "ctr_export_events",
+			Arguments: ExportEventsInput{After: after, SessionID: sess.SessionID(), MaxReturnBytes: 120}})
+		if err != nil {
+			t.Fatalf("call: %v", err)
+		}
+		if res.IsError {
+			t.Fatalf("export error: %+v", res.Content)
+		}
+		var out ExportEventsOutput
+		remarshal(t, res.StructuredContent, &out)
+		if len(out.Events) == 0 {
+			break
+		}
+		if out.Truncated {
+			sawTruncated = true
+		}
+		if out.NextAfter <= after {
+			t.Fatalf("next_after=%d want > %d(진행 없음 — 무손실 재구성 위반)", out.NextAfter, after)
+		}
+		for _, ev := range out.Events {
+			got = append(got, ev.EventID)
+		}
+		after = out.NextAfter
+	}
+
+	if !sawTruncated {
+		t.Fatalf("120B 예산으로 50B 이벤트 5건을 실었는데 truncated=true가 한 번도 없었다 — 테스트 전제 오류")
+	}
+	if len(got) != n {
+		t.Fatalf("got=%v(len=%d) want %d events(no loss under byte budget)", got, len(got), n)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("got[%d]=%s want %s(순서/중복/유실 위반)", i, got[i], want[i])
+		}
+	}
+}
+
+// TestExportEvents_IncludesSuperseded: export는 무필터라 superseded 이벤트도 포함한다
+// (ctr_session_summary와의 핵심 차이).
+func TestExportEvents_IncludesSuperseded(t *testing.T) {
+	cs, _, sess, _, _ := newSummaryTestServer(t)
+	ctx := context.Background()
+	oldID := mustAppend(t, sess, session.Event{Type: "decision", Summary: "first take"})
+	newID := mustAppend(t, sess, session.Event{Type: "decision", Summary: "corrected", Supersedes: oldID})
+
+	res, err := cs.CallTool(ctx, &mcp.CallToolParams{Name: "ctr_export_events",
+		Arguments: ExportEventsInput{SessionID: sess.SessionID()}})
+	if err != nil {
+		t.Fatalf("call: %v", err)
+	}
+	var out ExportEventsOutput
+	remarshal(t, res.StructuredContent, &out)
+
+	if findExportEvent(out, oldID) == nil {
+		t.Fatalf("superseded event %s missing from export(무필터 위반): %+v", oldID, out.Events)
+	}
+	newEv := findExportEvent(out, newID)
+	if newEv == nil || newEv.Supersedes != oldID {
+		t.Fatalf("newEv=%+v want Supersedes=%s", newEv, oldID)
+	}
+}
+
+// TestExportEvents_SchemaGating: Session이 있으면 기본 표면에 등장(ReadOnlyHint=true)하고,
+// 없으면 등장하지 않는다(registerRecordEvent/registerSessionSummary와 동일 게이트).
+func TestExportEvents_SchemaGating(t *testing.T) {
+	cs, _, _, _, _ := newSummaryTestServer(t)
+	lt, err := cs.ListTools(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("list tools: %v", err)
+	}
+	var tool *mcp.Tool
+	for _, tl := range lt.Tools {
+		if tl.Name == "ctr_export_events" {
+			tool = tl
+		}
+	}
+	if tool == nil {
+		t.Fatalf("ctr_export_events not in tools/list: %+v", lt.Tools)
+	}
+	if tool.Annotations == nil || !tool.Annotations.ReadOnlyHint {
+		t.Fatalf("ctr_export_events ReadOnlyHint want true, got %+v", tool.Annotations)
+	}
+
+	csNoSession, _ := newTestServer(t, nil)
+	lt2, err := csNoSession.ListTools(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("list tools (no session): %v", err)
+	}
+	for _, tl := range lt2.Tools {
+		if tl.Name == "ctr_export_events" {
+			t.Fatalf("ctr_export_events should not be registered when Session is nil")
+		}
+	}
+}
+
+// TestExportEvents_LedgerAppend: 호출마다 LedgerAppend(ctr_record_event/ctr_session_summary
+// 패턴 승계).
+func TestExportEvents_LedgerAppend(t *testing.T) {
+	cs, _, sess, _, storeDir := newSummaryTestServer(t)
+	ctx := context.Background()
+	mustAppend(t, sess, session.Event{Type: "note", Summary: "s"})
+
+	res, err := cs.CallTool(ctx, &mcp.CallToolParams{Name: "ctr_export_events", Arguments: ExportEventsInput{}})
+	if err != nil {
+		t.Fatalf("call: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("export error: %+v", res.Content)
+	}
+
+	stats, err := store.LedgerStats(storeDir)
+	if err != nil {
+		t.Fatalf("LedgerStats: %v", err)
+	}
+	found := false
+	for _, s := range stats {
+		if s.Tool == "ctr_export_events" {
+			found = true
+			if s.Calls != 1 {
+				t.Fatalf("ctr_export_events calls=%d want 1", s.Calls)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("ctr_export_events ledger row missing: %+v", stats)
+	}
+}

@@ -1,6 +1,7 @@
-// mcp_session.go — 세션 이벤트 도구 2종(ctr_record_event·ctr_session_summary, 설계 §3.1·§3.2).
-// mcp.go에서 분리(코드-아키텍처 §"선호 밴드 300~1,000줄" — 세션 도구가 2종으로 늘며 mcp.go가
-// 밴드를 넘어 응집된 이음새를 따라 분리, 사전 승인 3경우 중 ②).
+// mcp_session.go — 세션 이벤트 도구 3종(ctr_record_event·ctr_session_summary·
+// ctr_export_events, 설계 §3.1·§3.2·§3.3). mcp.go에서 분리(코드-아키텍처 §"선호 밴드
+// 300~1,000줄" — 세션 도구가 늘며 mcp.go가 밴드를 넘어 응집된 이음새를 따라 분리, 사전 승인
+// 3경우 중 ②).
 package mcp
 
 import (
@@ -348,6 +349,85 @@ func registerSessionSummary(srv *mcp.Server, st *store.Store, sess *session.DB) 
 			return nil, SessionSummaryOutput{}, err
 		}
 		st.LedgerAppend("ctr_session_summary", 0, jsonLen(out), time.Since(start).Milliseconds())
+		return nil, out, nil
+	})
+}
+
+// --- ctr_export_events (설계 §3.3, D16) ---
+
+const (
+	defaultExportLimit    = 50
+	maxExportLimit        = 200
+	defaultExportMaxBytes = 8192 // ctr_search/ctr_session_summary 기본 예산과 동일 수치(§4.0 승계)
+)
+
+type ExportEventsInput struct {
+	After          int64  `json:"after,omitempty" jsonschema:"커서(rowid), 생략 시 처음부터"`
+	SessionID      string `json:"session_id,omitempty" jsonschema:"세션 ID 필터, 생략 시 worktree 전체(§2.4 기본 범위)"`
+	Limit          int    `json:"limit,omitempty" jsonschema:"최대 반환 이벤트 수, 기본 50, 최대 200"`
+	MaxReturnBytes int    `json:"max_return_bytes,omitempty" jsonschema:"응답 바이트 예산, 기본 8192"`
+}
+
+type ExportEventsOutput struct {
+	Events    []session.EventV1 `json:"events"`
+	Truncated bool              `json:"truncated"`
+	NextAfter int64             `json:"next_after"`
+	Untrusted bool              `json:"untrusted"`
+}
+
+// clampExportLimit — 기본 50·최대 200(초과 클램프), 0 이하는 기본값(clampSummaryLimit과 동형).
+func clampExportLimit(limit int) int {
+	switch {
+	case limit <= 0:
+		return defaultExportLimit
+	case limit > maxExportLimit:
+		return maxExportLimit
+	default:
+		return limit
+	}
+}
+
+// applyExportBudget — max_return_bytes 예산 내에서 앞에서부터 이벤트를 채운다(순수 Go 후처리,
+// buildSessionSummaryOutput과 동형 — 측정 단위는 summary 텍스트 길이만 쓰는 snippet-only 관례
+// 승계, ponytail: 필드별 정밀 JSON 바이트 계산은 하지 않는다). nextAfter는 항상 **실제로 포함된
+// 마지막 이벤트의 rowid**(EventV1.RowID)로 계산한다 — session.Export가 돌려준 배치 전체의
+// 마지막 행을 그대로 쓰면 예산 밖으로 밀려난 이벤트가 다음 호출에서 건너뛰어져 영구
+// 유실된다(무손실 재구성이 export의 존재 이유, §3.3). 이벤트가 없거나 첫 이벤트조차 예산을
+// 넘으면 nextAfter는 after 그대로(진행 없음).
+func applyExportBudget(events []session.EventV1, after int64, maxReturnBytes int) (kept []session.EventV1, truncated bool, nextAfter int64) {
+	budget := maxReturnBytes
+	if budget <= 0 {
+		budget = defaultExportMaxBytes
+	}
+	kept = []session.EventV1{}
+	nextAfter = after
+	remaining := budget
+	for _, ev := range events {
+		if len(ev.Summary) > remaining {
+			return kept, true, nextAfter
+		}
+		kept = append(kept, ev)
+		remaining -= len(ev.Summary)
+		nextAfter = ev.RowID
+	}
+	return kept, false, nextAfter
+}
+
+func registerExportEvents(srv *mcp.Server, st *store.Store, sess *session.DB) {
+	mcp.AddTool(srv, &mcp.Tool{
+		Name: "ctr_export_events",
+		Description: "세션 이벤트를 SessionEvent v1(schemaVersion 1.0) camelCase 배열로 내보낸다 — " +
+			"rowid 커서로 전체 무필터 스트림(superseded 포함)을 페이지네이션한다.",
+		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true},
+	}, func(ctx context.Context, _ *mcp.CallToolRequest, in ExportEventsInput) (*mcp.CallToolResult, ExportEventsOutput, error) {
+		start := time.Now()
+		events, _, err := session.Export(ctx, sess.Reader(), in.After, in.SessionID, clampExportLimit(in.Limit))
+		if err != nil {
+			return nil, ExportEventsOutput{}, toToolError(err)
+		}
+		kept, truncated, nextAfter := applyExportBudget(events, in.After, in.MaxReturnBytes)
+		out := ExportEventsOutput{Events: kept, Truncated: truncated, NextAfter: nextAfter, Untrusted: true}
+		st.LedgerAppend("ctr_export_events", 0, jsonLen(out), time.Since(start).Milliseconds())
 		return nil, out, nil
 	})
 }

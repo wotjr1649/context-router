@@ -86,6 +86,7 @@ func NewServer(cfg Config) (*mcp.Server, error) {
 	if cfg.Session != nil {
 		registerRecordEvent(srv, cfg.Store, cfg.Session)
 		registerSessionSummary(srv, cfg.Store, cfg.Session)
+		registerExportEvents(srv, cfg.Store, cfg.Session)
 	}
 	return srv, nil
 }
