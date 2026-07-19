@@ -256,7 +256,7 @@ func TestRlimitASBytes(t *testing.T) {
 		cap  int64
 		want int64
 	}{
-		{name: "256MB cap", cap: 256 << 20, want: 1792 << 20}, // 256MB + 1536MB = 1792MB
+		{name: "256MB cap", cap: 256 << 20, want: 8448 << 20}, // 256MB + 8192MB = 8448MB
 		{name: "zero cap", cap: 0, want: vaHeadroomBytes},
 	}
 	for _, c := range cases {
