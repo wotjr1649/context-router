@@ -415,6 +415,15 @@ context-router upgrade              # 최소형: 현재 버전 + 최신 릴리�
 - **Codex** (`~/.codex/config.toml`): deferral 없음 → 기본 3-도구 프로필 권장. `enabled_tools` 절단 예시 포함, ingest/net 활성 시 `default_tools_approval_mode` prompt 권장.
 - 차이표(제공 문서에 포함): deferral 유무, 승인 모델, resources 미지원 공통.
 
+**v0.1 추가(session events, 델타 문서 `context-router-design-v0.1-ko.md` §1.1)**: `ctr_record_event`·
+`ctr_session_summary`·`ctr_export_events` 세션 3종은 `ctr_index`/`ctr_fetch_and_index`와
+달리 워크스페이스 파일 읽기가 없고 쓰기는 store-root(session.db) 한정이라 **기본 등록**
+(opt-in `Enable` 불요)이고, 위 permissions 예시의 `ask` 목록에도 추가하지 않는다 — 기존
+서술(3-도구 기본 프로필·ingest/net opt-in ask 규칙)은 그대로 유지된다. `doctor` 출력
+스니펫(`internal/cli/cli.go` `hostSnippet`)이 실제 등록 도구 집합의 정본이므로, 세션
+3종을 포함한 최신 형태는 항상 `doctor` 실행 결과를 그대로 복사해 쓴다(이 문서에 스니펫
+사본을 중복 관리하지 않는다는 기존 원칙 승계).
+
 ## 10. 라이선스·고지 (Q12)
 
 - `LICENSE` = Elastic License 2.0 (HANDOFF 확정 운영 원칙 — fork/port 관계를 숨기지 않는 보수적 선택).

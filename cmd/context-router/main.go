@@ -121,9 +121,8 @@ func retentionSecFromDuration(d time.Duration) int64 {
 
 // sweepSessionRetentionAtStart — 서버 시작 시 1회 retention 스윕을 수행하는 헬퍼(설계 §5:
 // "시작 시 1회 트랜잭션 + 삭제 건수 stderr 1줄 고지, 실패는 log-and-continue"). now는 값
-// 주입(G7 결정론). 호출부는 아직 없다 — 현재 main.run()은 session.Open을 배선하지 않으므로
-// (mcp.Config.Session은 nil) 이 헬퍼를 부를 *session.DB가 없다. T10이 session.Open 조립을
-// 추가할 때 이 헬퍼를 그 자리에 합류시킨다(구조 결정 — task-8-report.md 참고).
+// 주입(G7 결정론). run()이 openSessionDB로 session.Open을 배선한 직후(sessDB!=nil일 때만)
+// 호출한다(T10, task-8-report.md의 구조 결정 그대로 이 자리에 합류).
 func sweepSessionRetentionAtStart(ctx context.Context, d *session.DB, now time.Time, stderr io.Writer) {
 	deleted, err := session.Sweep(ctx, d, now)
 	if err != nil {
@@ -131,6 +130,24 @@ func sweepSessionRetentionAtStart(ctx context.Context, d *session.DB, now time.T
 		return
 	}
 	fmt.Fprintf(stderr, "ctr: session retention sweep: %d개 이벤트 삭제\n", deleted)
+}
+
+// openSessionDB — session.Open을 배선한다(설계 §6.2 fail-closed, T10). sentinel 3종
+// (ErrCorrupt·ErrRecoverPending·ErrLeaseHeld) 및 그 외 예기치 못한 오류 전부를 동일하게
+// 처리한다: nil을 반환하고 stderr에 1줄 경고만 남긴 뒤 서버 시작은 계속 진행한다(§6.2
+// "가용성 트레이드오프 수용" — content 도구는 정상 서빙, 세션 표면만 미등록이 NewServer의
+// cfg.Session==nil 분기로 이어진다). ErrCorrupt·ErrRecoverPending은 수동 복구 CLI 안내를
+// 추가로 남긴다(§6.3 "recover 재실행을 stderr로 안내").
+func openSessionDB(dir string, opts session.Options, stderr io.Writer) *session.DB {
+	d, err := session.Open(dir, opts)
+	if err != nil {
+		fmt.Fprintf(stderr, "ctr: session.db 사용 불가 — 세션 도구 비활성(content 도구는 정상 진행): %v\n", err)
+		if errors.Is(err, session.ErrCorrupt) || errors.Is(err, session.ErrRecoverPending) {
+			fmt.Fprintln(stderr, "ctr: 복구하려면 `context-router session recover`를 실행하세요")
+		}
+		return nil
+	}
+	return d
 }
 
 // validProfile: v0.0.1이 실제로 지원하는 두 형태뿐(mcp.NewServer가 Profile로 도구를
@@ -407,6 +424,17 @@ func run(ctx context.Context, args []string, stderr io.Writer) error {
 	}
 	defer st.Close()
 
+	// session.db 배선(설계 §2.1 경로 예약: projects/<pid>/worktrees/<wid>) — 실패는
+	// fail-closed(openSessionDB가 nil+stderr 경고로 흡수, content 도구는 영향 없음).
+	sessDB := openSessionDB(
+		filepath.Join(storeRoot, "projects", canon.ProjectID, "worktrees", canon.WorktreeID),
+		session.Options{RetentionSec: retentionSecFromDuration(f.RetentionEvents), Producer: fmt.Sprintf("context-router/%s", version)},
+		stderr)
+	if sessDB != nil {
+		defer sessDB.Close() // lease 해제 — release 비멱등 1회(session.DB.Close 계약)
+		sweepSessionRetentionAtStart(ctx, sessDB, time.Now(), stderr)
+	}
+
 	selfExe, err := os.Executable()
 	if err != nil {
 		return err
@@ -415,6 +443,7 @@ func run(ctx context.Context, args []string, stderr io.Writer) error {
 		Canon: canon, Store: st, SelfExe: selfExe,
 		Profile: f.Profile, Enable: f.Enable, AllowPaths: allowPaths,
 		NetAllowLocal: f.NetAllowLocal, NetPorts: f.NetPorts,
+		Session: sessDB,
 	})
 }
 
