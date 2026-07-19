@@ -1435,6 +1435,98 @@ func TestGCOrphanBlobs_AgeGate(t *testing.T) {
 	}
 }
 
+// TestAcquireLock_SharedSharedCoexist: 두 shared 잠금이 동시에 성립해야 한다(release 전
+// 둘 다 성공) — 같은 프로세스라도 별도 os.OpenFile 호출이라 open file description/핸들이
+// 갈라져 flock/LockFileEx의 shared+shared 공존이 실제로 검증된다(vacuous하지 않음).
+func TestAcquireLock_SharedSharedCoexist(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "test.lock")
+	rel1, err := AcquireLock(path, true)
+	if err != nil {
+		t.Fatalf("first shared: %v", err)
+	}
+	defer rel1()
+	rel2, err := AcquireLock(path, true)
+	if err != nil {
+		t.Fatalf("second shared(첫 shared 미해제 상태): %v", err)
+	}
+	rel2()
+}
+
+// TestAcquireLock_SharedThenExclusiveFails: shared 보유 중 exclusive는 실패해야 하고,
+// shared release 후에는 성공해야 한다.
+func TestAcquireLock_SharedThenExclusiveFails(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "test.lock")
+	relShared, err := AcquireLock(path, true)
+	if err != nil {
+		t.Fatalf("shared: %v", err)
+	}
+	if _, err := AcquireLock(path, false); err == nil {
+		t.Fatal("want exclusive 실패(shared 보유 중), got nil")
+	}
+	relShared()
+	relExcl, err := AcquireLock(path, false)
+	if err != nil {
+		t.Fatalf("release 후 exclusive: %v", err)
+	}
+	relExcl()
+}
+
+// TestAcquireLock_ExclusiveThenSharedFails: exclusive 보유 중 shared는 실패해야 한다.
+func TestAcquireLock_ExclusiveThenSharedFails(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "test.lock")
+	relExcl, err := AcquireLock(path, false)
+	if err != nil {
+		t.Fatalf("exclusive: %v", err)
+	}
+	defer relExcl()
+	if _, err := AcquireLock(path, true); err == nil {
+		t.Fatal("want shared 실패(exclusive 보유 중), got nil")
+	}
+}
+
+// TestAcquireLock_NonBlocking: 논블로킹 고정 — 경합 실패는 즉시 반환되어야 한다(lockStore의
+// 5초 백오프 재시도 루프와 달리 AcquireLock은 단발 시도라 대기가 없다).
+func TestAcquireLock_NonBlocking(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "test.lock")
+	relExcl, err := AcquireLock(path, false)
+	if err != nil {
+		t.Fatalf("exclusive: %v", err)
+	}
+	defer relExcl()
+	start := time.Now()
+	if _, err := AcquireLock(path, false); err == nil {
+		t.Fatal("want 실패, got nil")
+	}
+	if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
+		t.Fatalf("논블로킹 위반 — 실패까지 %v 소요(블로킹 대기 의심)", elapsed)
+	}
+}
+
+// TestArtifactHashByID: 등록된 artifact의 content_hash를 반환하고, 미존재 id는 ErrNotFound.
+func TestArtifactHashByID(t *testing.T) {
+	s := openT(t)
+	body := []byte("hash-by-id-content")
+	id, err := s.Register(t.Context(), Registration{
+		StoredBytes: body, MediaType: "text/plain",
+		Source: SourceMeta{URI: "/hbi.txt", Kind: "file", SrcHash: "h-hbi"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256(body)
+	want := hex.EncodeToString(sum[:])
+	got, err := s.ArtifactHashByID(t.Context(), id)
+	if err != nil {
+		t.Fatalf("ArtifactHashByID: %v", err)
+	}
+	if got != want {
+		t.Fatalf("hash=%q want %q", got, want)
+	}
+	if _, err := s.ArtifactHashByID(t.Context(), 9999); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("want ErrNotFound, got %v", err)
+	}
+}
+
 func FuzzSnapUTF8(f *testing.F) {
 	f.Add([]byte("가나다"), int64(1), int64(4))
 	f.Add([]byte("hello\nworld"), int64(0), int64(11))
