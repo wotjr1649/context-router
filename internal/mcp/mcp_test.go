@@ -1343,6 +1343,36 @@ func TestSearchScopeEvents(t *testing.T) {
 	}
 }
 
+// TestSearchScopeEventsBudget — 최종리뷰 C3(Codex P2): scope=events에서 max_return_bytes가
+// 이벤트 섹션에도 적용된다 — 예산을 작게 잡으면 일부 이벤트만 실리고 truncated=true로 신호한다
+// (이전엔 이벤트 섹션이 예산 무시로 무제한이었다).
+func TestSearchScopeEventsBudget(t *testing.T) {
+	cs, _, sess := newSearchScopeTestServer(t)
+	const n = 5
+	summary := "budgettoken " + strings.Repeat("x", 200) // 212B
+	for i := 0; i < n; i++ {
+		mustAppend(t, sess, session.Event{Type: "note", Summary: summary})
+	}
+
+	res, err := cs.CallTool(context.Background(), &mcp.CallToolParams{Name: "ctr_search",
+		Arguments: SearchInput{Queries: []string{"budgettoken"}, Scope: "events", Limit: n, MaxReturnBytes: 300}})
+	if err != nil {
+		t.Fatalf("call: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("search error: %+v", res.Content)
+	}
+	var out SearchOutput
+	remarshal(t, res.StructuredContent, &out)
+	events := out.Results[0].Events
+	if len(events) == 0 || len(events) >= n {
+		t.Fatalf("events len=%d want 0<n<%d (예산 절단)", len(events), n)
+	}
+	if !out.Results[0].Truncated {
+		t.Fatalf("Truncated=false want true(이벤트 예산 초과 절단): %+v", out.Results[0])
+	}
+}
+
 // TestSearchScopeAll — 브리프 Step1 ③: scope=all은 같은 질의 결과에 content hits와 이벤트
 // 섹션이 동시에 실린다.
 func TestSearchScopeAll(t *testing.T) {
@@ -1573,6 +1603,22 @@ func TestRecordEventCapViolations(t *testing.T) {
 		}
 		recordEventErrPrefix(t, cs, in, codeInvalidArgument)
 	})
+
+	// C5: 개별 필드·related는 상한 이내이고 refs 없이는 총합 7000B(≤8192)로 통과하지만,
+	// 해석될 artifact URI(119B×16=1904)를 더하면 8904B로 초과해야 한다. refs가 계상되지 않으면
+	// 7000B로 통과해 이 테스트가 실패하므로, 가산 회귀를 정확히 잡는다(refs는 해석 전 거부되어
+	// 실재하지 않아도 됨).
+	t.Run("total_8KB_with_artifact_uris", func(t *testing.T) {
+		item := "https://example.com/" + strings.Repeat("a", 474-len("https://example.com/")) // 474B×2 = 948
+		in := RecordEventInput{
+			EventType:        "note",                          // 4
+			Summary:          strings.Repeat("s", 2048),       // 2048
+			Attributes:       mapAttrsOfSize(4000),            // 4000
+			RelatedResources: []string{item, item},           // 948 → 소계 7000
+			ArtifactRefs:     make([]int64, maxRefsOrRelated), // +119×16 = 1904 → 8904
+		}
+		recordEventErrPrefix(t, cs, in, codeInvalidArgument)
+	})
 }
 
 // TestRecordEventSecretCanaryRedacted: 브리프 Step1 ③(G4 기록 경로) — summary·attributes·
@@ -1662,12 +1708,14 @@ func TestRecordEventArtifactRefs(t *testing.T) {
 	recordEventErrPrefix(t, cs, RecordEventInput{EventType: "note", Summary: "s", ArtifactRefs: []int64{999999}}, codeInvalidArgument)
 }
 
-// TestRecordEventSupersedesMissingIsNotFound: 브리프 Step1 ⑤ — supersedes 미존재 → NOT_FOUND.
-func TestRecordEventSupersedesMissingIsNotFound(t *testing.T) {
+// TestRecordEventSupersedesMissingIsInvalidArgument: 최종리뷰 C1(설계 §3.1 명문) — supersedes
+// 미존재는 INVALID_ARGUMENT(artifact_refs 미존재와 대칭). 이전 구현은 NOT_FOUND였으나 설계서
+// 우선 규칙으로 교정(플랜 T3 문면 교정 필요).
+func TestRecordEventSupersedesMissingIsInvalidArgument(t *testing.T) {
 	cs, _, _, _ := newRecordEventTestServer(t)
 	recordEventErrPrefix(t, cs, RecordEventInput{
 		EventType: "decision", Summary: "corrected", Supersedes: "00000000-0000-7000-8000-000000000000",
-	}, codeNotFound)
+	}, codeInvalidArgument)
 }
 
 // TestRecordEventLedgerAppend: 브리프 Step1 ⑥ — 호출마다 LedgerAppend(ctr_fetch/ctr_search
@@ -1788,6 +1836,36 @@ func findSummaryGroup(out SessionSummaryOutput, eventType string) *summaryGroup 
 		}
 	}
 	return nil
+}
+
+// TestSessionRuntimeStorageErrorMapsToStorageUnavailable — 최종리뷰 C2(Codex P2): startup 이후
+// session.db가 malformed/불용이 됐을 때 세션 질의가 던지는 raw SQLite 오류가 INTERNAL로
+// 떨어지지 않고 STORAGE_UNAVAILABLE로 매핑돼야 한다. 세 핸들러(summary/export/search-events)가
+// 공통으로 쓰는 매핑 조합 `toToolError(session.ClassifyStorageErr(err))`를, 실제 훼손 파일에
+// 대한 실 SQLite 오류로 검증한다 — 열린 연결을 in-place로 훼손하는 방식은 WAL 그림자와 Windows
+// 의 -shm 메모리 매핑 때문에 이식성이 없어(실측), 프레시 훼손 파일로 동일 오류 경로를 재현한다.
+func TestSessionRuntimeStorageErrorMapsToStorageUnavailable(t *testing.T) {
+	dir := t.TempDir()
+	// 헤더 없는 쓰레기 바이트 = SQLITE_NOTADB(=26). session.OpenReadOnly는 지연 연결이라
+	// 첫 쿼리에서 오류가 표면화된다.
+	if err := os.WriteFile(filepath.Join(dir, "session.db"), bytes.Repeat([]byte{0xEE}, 4096), 0o600); err != nil {
+		t.Fatalf("write garbage: %v", err)
+	}
+	reader, err := session.OpenReadOnly(dir)
+	if err != nil {
+		t.Fatalf("OpenReadOnly: %v", err)
+	}
+	defer func() { _ = reader.Close() }()
+	var s string
+	qErr := reader.QueryRow("PRAGMA quick_check").Scan(&s)
+	if qErr == nil {
+		t.Fatalf("expected a SQLite storage error from garbage db, got quick_check=%q", s)
+	}
+
+	mapped := toToolError(session.ClassifyStorageErr(qErr))
+	if !strings.HasPrefix(mapped.Error(), "["+codeStorageUnavailable+"]") {
+		t.Fatalf("mapped=%q want %s prefix", mapped.Error(), codeStorageUnavailable)
+	}
 }
 
 // TestSummary_RoundTrip: 브리프 Step1 ①⑦ — 타입 그룹·시간 역순·artifact_refs 왕복·untrusted:true.
@@ -2175,7 +2253,9 @@ func TestExportEvents_DefaultLimitClamp(t *testing.T) {
 		mustAppend(t, sess, session.Event{Type: "note", Summary: fmt.Sprintf("n%02d", i)})
 	}
 
-	res, err := cs.CallTool(ctx, &mcp.CallToolParams{Name: "ctr_export_events", Arguments: ExportEventsInput{}})
+	// C4: 예산 계상이 직렬화 전체 바이트가 된 뒤로 기본 예산(8192)이 50건 전에 절단하므로,
+	// limit 클램프(50)만 격리 검증하도록 예산을 크게 준다.
+	res, err := cs.CallTool(ctx, &mcp.CallToolParams{Name: "ctr_export_events", Arguments: ExportEventsInput{MaxReturnBytes: 1 << 20}})
 	if err != nil {
 		t.Fatalf("call: %v", err)
 	}
@@ -2270,11 +2350,29 @@ func TestExportEvents_MaxReturnBytesTruncatesWithoutLoss(t *testing.T) {
 		want[i] = mustAppend(t, sess, session.Event{Type: "note", Summary: strings.Repeat("n", 50)})
 	}
 
+	// C4: 예산 계상이 summary가 아니라 직렬화 전체이므로, 이벤트 1건 직렬화 크기(L)를 실측해
+	// 2건치 예산(2L)을 잡는다 — 1건은 항상 진행(무손실), 5건은 여러 배치로 절단된다.
+	big, err := cs.CallTool(ctx, &mcp.CallToolParams{Name: "ctr_export_events",
+		Arguments: ExportEventsInput{After: after, SessionID: sess.SessionID(), MaxReturnBytes: 1 << 20}})
+	if err != nil {
+		t.Fatalf("probe call: %v", err)
+	}
+	var bigOut ExportEventsOutput
+	remarshal(t, big.StructuredContent, &bigOut)
+	if len(bigOut.Events) != n {
+		t.Fatalf("probe: got %d events want %d", len(bigOut.Events), n)
+	}
+	evBytes, err := json.Marshal(bigOut.Events[0])
+	if err != nil {
+		t.Fatalf("marshal probe event: %v", err)
+	}
+	budget := 2 * len(evBytes)
+
 	var got []string
 	sawTruncated := false
 	for i := 0; i < 20; i++ { // 안전 상한(무한루프 방지)
 		res, err := cs.CallTool(ctx, &mcp.CallToolParams{Name: "ctr_export_events",
-			Arguments: ExportEventsInput{After: after, SessionID: sess.SessionID(), MaxReturnBytes: 120}})
+			Arguments: ExportEventsInput{After: after, SessionID: sess.SessionID(), MaxReturnBytes: budget}})
 		if err != nil {
 			t.Fatalf("call: %v", err)
 		}
@@ -2299,7 +2397,7 @@ func TestExportEvents_MaxReturnBytesTruncatesWithoutLoss(t *testing.T) {
 	}
 
 	if !sawTruncated {
-		t.Fatalf("120B 예산으로 50B 이벤트 5건을 실었는데 truncated=true가 한 번도 없었다 — 테스트 전제 오류")
+		t.Fatalf("2건치 예산(%dB)으로 5건을 실었는데 truncated=true가 한 번도 없었다 — 테스트 전제 오류", budget)
 	}
 	if len(got) != n {
 		t.Fatalf("got=%v(len=%d) want %d events(no loss under byte budget)", got, len(got), n)

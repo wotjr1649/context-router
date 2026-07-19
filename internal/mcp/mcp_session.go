@@ -32,6 +32,10 @@ const (
 	maxRelatedItemBytes = 512
 	maxEventTotalBytes  = 8192
 	redactedFieldMarker = "«REDACTED»" // attributes·related가 redaction 후 파싱 불가할 때의 강등 마커(평문)
+	// artifactURIBytes — 저장되는 정본 artifact URI 길이(결정적): "artifact://"(11) + session_id
+	// (UUIDv7 36) + "/sha256-"(8) + content_hash(sha256 hex 64) = 119바이트(설계 §3.1). 8KB
+	// 총합 계상에 해석 전(validate 시점)에도 이 상수로 미리 반영한다(C5).
+	artifactURIBytes = 119
 )
 
 var eventTypeRe = regexp.MustCompile(`^[a-z0-9_]+$`)
@@ -72,7 +76,9 @@ func validateRecordEventInput(in RecordEventInput, attrBytes []byte) error {
 	case len(in.RelatedResources) > maxRefsOrRelated:
 		return toolErr(codeInvalidArgument, "related_resources는 16개 이하여야 합니다")
 	}
-	total := len(in.EventType) + len(in.Summary) + len(attrBytes) + len(in.Supersedes)
+	// C5: 해석될 artifact URI(119B×refs)를 총합에 미리 가산한다 — 저장 시점 URI 길이는
+	// 결정적이므로 resolve 전에도 정확히 계상된다(해석 전 계상 순서 유지).
+	total := len(in.EventType) + len(in.Summary) + len(attrBytes) + len(in.Supersedes) + artifactURIBytes*len(in.ArtifactRefs)
 	for _, r := range in.RelatedResources {
 		if len(r) > maxRelatedItemBytes {
 			return toolErr(codeInvalidArgument, "related_resources 항목은 512바이트 이하여야 합니다")
@@ -189,6 +195,12 @@ func registerRecordEvent(srv *mcp.Server, st *store.Store, sess *session.DB) {
 		}
 		_, eventID, ts, err := sess.Append(ev)
 		if err != nil {
+			// C1(설계 §3.1 명문): supersedes 미존재는 INVALID_ARGUMENT(artifact_refs 미존재와
+			// 대칭) — Append가 store.ErrNotFound로 wrap하지만 toToolError의 NOT_FOUND로 흘리지
+			// 않는다(supersedes 이외 경로에서 Append는 ErrNotFound를 내지 않는다).
+			if errors.Is(err, store.ErrNotFound) {
+				return nil, RecordEventOutput{}, toolErr(codeInvalidArgument, "supersedes 이벤트가 존재하지 않습니다")
+			}
 			return nil, RecordEventOutput{}, toToolError(err)
 		}
 		out := RecordEventOutput{EventID: eventID, SessionID: sess.SessionID(), Ts: ts}
@@ -342,7 +354,9 @@ func registerSessionSummary(srv *mcp.Server, st *store.Store, sess *session.DB) 
 		start := time.Now()
 		sum, err := session.Summarize(ctx, sess.Reader(), in.SessionID, clampSummaryLimit(in.Limit))
 		if err != nil {
-			return nil, SessionSummaryOutput{}, toToolError(err)
+			// C2(Codex P2): startup 이후 훼손된 session.db의 raw SQLite 오류를 ErrCorrupt로
+			// 분류해 STORAGE_UNAVAILABLE로 매핑(INTERNAL 강등 방지, 단일점 매핑 유지).
+			return nil, SessionSummaryOutput{}, toToolError(session.ClassifyStorageErr(err))
 		}
 		out, err := buildSessionSummaryOutput(ctx, st, sum, in.MaxReturnBytes)
 		if err != nil {
@@ -387,13 +401,13 @@ func clampExportLimit(limit int) int {
 	}
 }
 
-// applyExportBudget — max_return_bytes 예산 내에서 앞에서부터 이벤트를 채운다(순수 Go 후처리,
-// buildSessionSummaryOutput과 동형 — 측정 단위는 summary 텍스트 길이만 쓰는 snippet-only 관례
-// 승계, ponytail: 필드별 정밀 JSON 바이트 계산은 하지 않는다). nextAfter는 항상 **실제로 포함된
-// 마지막 이벤트의 rowid**(EventV1.RowID)로 계산한다 — session.Export가 돌려준 배치 전체의
-// 마지막 행을 그대로 쓰면 예산 밖으로 밀려난 이벤트가 다음 호출에서 건너뛰어져 영구
-// 유실된다(무손실 재구성이 export의 존재 이유, §3.3). 이벤트가 없거나 첫 이벤트조차 예산을
-// 넘으면 nextAfter는 after 그대로(진행 없음).
+// applyExportBudget — max_return_bytes 예산 내에서 앞에서부터 이벤트를 채운다(순수 Go 후처리).
+// C4(Codex P2): 측정 단위는 summary가 아니라 **직렬화된 이벤트 전체 바이트**(attributes ≤4096B
+// 등 포함) — export는 전 필드를 그대로 내보내므로 summary만 계상하면 예산을 크게 초과할 수
+// 있었다. nextAfter는 항상 **실제로 포함된 마지막 이벤트의 rowid**(EventV1.RowID)로 계산한다 —
+// 배치 전체의 마지막 행을 그대로 쓰면 예산 밖으로 밀려난 이벤트가 다음 호출에서 건너뛰어져
+// 영구 유실된다(무손실 재구성이 export의 존재 이유, §3.3). 이벤트가 없거나 첫 이벤트조차
+// 예산을 넘으면 nextAfter는 after 그대로(진행 없음 — 커서 동작 불변).
 func applyExportBudget(events []session.EventV1, after int64, maxReturnBytes int) (kept []session.EventV1, truncated bool, nextAfter int64) {
 	budget := maxReturnBytes
 	if budget <= 0 {
@@ -403,11 +417,12 @@ func applyExportBudget(events []session.EventV1, after int64, maxReturnBytes int
 	nextAfter = after
 	remaining := budget
 	for _, ev := range events {
-		if len(ev.Summary) > remaining {
+		b, _ := json.Marshal(ev)
+		if len(b) > remaining {
 			return kept, true, nextAfter
 		}
 		kept = append(kept, ev)
-		remaining -= len(ev.Summary)
+		remaining -= len(b)
 		nextAfter = ev.RowID
 	}
 	return kept, false, nextAfter
@@ -423,7 +438,7 @@ func registerExportEvents(srv *mcp.Server, st *store.Store, sess *session.DB) {
 		start := time.Now()
 		events, _, err := session.Export(ctx, sess.Reader(), in.After, in.SessionID, clampExportLimit(in.Limit))
 		if err != nil {
-			return nil, ExportEventsOutput{}, toToolError(err)
+			return nil, ExportEventsOutput{}, toToolError(session.ClassifyStorageErr(err)) // C2: 런타임 훼손 → STORAGE_UNAVAILABLE
 		}
 		kept, truncated, nextAfter := applyExportBudget(events, in.After, in.MaxReturnBytes)
 		out := ExportEventsOutput{Events: kept, Truncated: truncated, NextAfter: nextAfter, Untrusted: true}

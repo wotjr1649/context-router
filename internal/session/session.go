@@ -449,6 +449,33 @@ func isBusy(err error) bool {
 	return code == 5 || code == 6
 }
 
+// isCantOpen — SQLITE_CANTOPEN(14) 여부(런타임에 파일이 사라지거나 열 수 없게 된 경우 —
+// isMalformed와 함께 "저장소 불용" 분류에 쓴다).
+func isCantOpen(err error) bool {
+	var se *sqlite.Error
+	if !errors.As(err, &se) {
+		return false
+	}
+	return se.Code()&0xff == 14
+}
+
+// ClassifyStorageErr — startup 이후 런타임에 session.db가 malformed/불용이 됐을 때, mcp가
+// raw SQLite 오류를 STORAGE_UNAVAILABLE로 매핑할 수 있게 분류한다(설계 §6.2, Codex P2). Open
+// 시점 quick_check는 통과했지만 이후 훼손된 DB에 Summarize/Export/QueryEvents가 던지는 원시
+// 오류(malformed/notadb/cantopen 계열)를 기존 ErrCorrupt로 wrap한다 — 신규 sentinel 없이
+// toToolError 단일 매핑을 재사용하기 위함(§6, D13). 그 외 오류·nil은 그대로 통과시켜 정상
+// 오류의 코드 매핑을 바꾸지 않는다. 원시 오류 상세는 재래핑하지 않는다(toToolError가 ErrCorrupt
+// 를 일반 문구로 뭉개므로 사용자에겐 노출되지 않고, 절대경로 유출 표면도 만들지 않는다).
+func ClassifyStorageErr(err error) error {
+	if err == nil {
+		return nil
+	}
+	if isMalformed(err) || isCantOpen(err) {
+		return fmt.Errorf("session: 런타임 저장 오류: %w", ErrCorrupt)
+	}
+	return err
+}
+
 // txRetry — store.go의 txRetry()와 동형(§2.1 "writer 1연결 + txRetry 동형"): BEGIN IMMEDIATE
 // 트랜잭션 1개로 fn 실행, BUSY/LOCKED면 지수 백오프(50/200/800ms)로 최대 3회 재시도.
 func (d *DB) txRetry(ctx context.Context, fn func(tx *sql.Tx) error) error {

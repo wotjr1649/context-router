@@ -239,27 +239,51 @@ func normalizeSearchScope(s string) (string, error) {
 
 // queryEventSection: in.Queries 각각에 search.QueryEvents(porter+trigram RRF, content과 동일
 // 패턴)를 호출해 wire 타입으로 변환한다. sess는 호출 전 nil이 아님이 registerSearch에서 이미
-// 보장된다(scope!=content 진입 조건).
-func queryEventSection(ctx context.Context, sess *session.DB, queries []string, limit int) ([][]eventHit, error) {
+// 보장된다(scope!=content 진입 조건). C3(Codex P2): budget(content 소진 후 남은 바이트) 안에서
+// 이벤트 summary 바이트를 앞에서부터 채우고, 넘치면 그 질의를 truncated로 표시한다 — content과
+// events가 하나의 예산을 공유한다(공유 pool, 질의 순서대로 소진). 측정 단위는 content
+// applyBudget의 snippet-only 관례와 동형(summary 길이). budget이 소진돼도 오류는 아니다.
+func queryEventSection(ctx context.Context, sess *session.DB, queries []string, limit, budget int) ([][]eventHit, []bool, error) {
 	out := make([][]eventHit, len(queries))
+	truncated := make([]bool, len(queries))
+	remaining := budget
 	for i, q := range queries {
 		hits, err := search.QueryEvents(ctx, sess.Reader(), q, limit)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
-		ev := make([]eventHit, len(hits))
-		for j, h := range hits {
-			ev[j] = toEventHit(h)
+		ev := make([]eventHit, 0, len(hits))
+		for _, h := range hits {
+			e := toEventHit(h)
+			if len(e.Summary) > remaining {
+				truncated[i] = true
+				break
+			}
+			ev = append(ev, e)
+			remaining -= len(e.Summary)
 		}
 		out[i] = ev
 	}
-	return out, nil
+	return out, truncated, nil
+}
+
+// contentBudgetUsed: content 검색이 실제 소진한 스니펫 바이트 합(search.applyBudget과 동일 단위).
+// events 섹션이 content와 예산을 공유하도록 남은 예산 계산에 쓴다(C3). qrs가 nil(scope=events)
+// 이면 0 — events가 전체 예산을 받는다.
+func contentBudgetUsed(qrs []search.QueryResult) int {
+	used := 0
+	for _, qr := range qrs {
+		for _, h := range qr.Hits {
+			used += len(h.Snippet)
+		}
+	}
+	return used
 }
 
 // buildSearchOutput: content 결과(qrs, scope=events면 nil)와 이벤트 결과(evs, scope=content면
 // nil)를 질의별로 합친다. Hits는 기존 계약대로 항상 빈 슬라이스 이상(null 금지), Events는
 // omitempty라 비어 있으면 생략된다.
-func buildSearchOutput(queries []string, qrs []search.QueryResult, evs [][]eventHit) SearchOutput {
+func buildSearchOutput(queries []string, qrs []search.QueryResult, evs [][]eventHit, evTrunc []bool) SearchOutput {
 	out := SearchOutput{Untrusted: true, Results: make([]searchQueryResult, len(queries))}
 	for i, q := range queries {
 		r := searchQueryResult{Query: q, Hits: []searchHit{}}
@@ -272,6 +296,9 @@ func buildSearchOutput(queries []string, qrs []search.QueryResult, evs [][]event
 		}
 		if evs != nil {
 			r.Events = evs[i]
+			if evTrunc[i] { // C3: 이벤트 절단도 기존 content truncated 관례로 동일 신호에 합류
+				r.Truncated = true
+			}
 		}
 		out.Results[i] = r
 	}
@@ -313,12 +340,15 @@ func registerSearch(srv *mcp.Server, st *store.Store, worktreeRoot string, sess 
 			}
 		}
 		var evs [][]eventHit
+		var evTrunc []bool
 		if scope != scopeContent {
-			if evs, err = queryEventSection(ctx, sess, in.Queries, limit); err != nil {
-				return nil, SearchOutput{}, toToolError(err)
+			// C3: content가 소진하고 남은 예산을 events가 이어받는다(결합 예산).
+			eventsBudget := max(0, budget-contentBudgetUsed(qrs))
+			if evs, evTrunc, err = queryEventSection(ctx, sess, in.Queries, limit, eventsBudget); err != nil {
+				return nil, SearchOutput{}, toToolError(session.ClassifyStorageErr(err)) // C2: 런타임 훼손 → STORAGE_UNAVAILABLE
 			}
 		}
-		out := buildSearchOutput(in.Queries, qrs, evs)
+		out := buildSearchOutput(in.Queries, qrs, evs, evTrunc)
 		st.LedgerAppend("ctr_search", 0, jsonLen(out), time.Since(start).Milliseconds())
 		return nil, out, nil
 	})
