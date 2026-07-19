@@ -78,24 +78,15 @@ func Recover(dir string) (RecoverResult, error) {
 			return RecoverResult{}, err
 		}
 	} else {
-		done, err := publishAlreadyComplete(dir)
-		if err != nil {
-			return RecoverResult{}, err
-		}
-		if done {
-			if rmErr := os.Remove(markerPath); rmErr != nil && !errors.Is(rmErr, os.ErrNotExist) {
-				return RecoverResult{}, sanitizeIOErr("recover marker remove", rmErr)
-			}
-			return RecoverResult{MarkerOnly: true}, nil
-		}
-
-		// 재리뷰(A2): 검증 완료된 인양본(tmp) 건강을 dbExists와 무관하게 최우선 판정한다.
-		// tmp가 건강하면(verifyRescued 통과 시점 그대로) 재인양 없이 게시만 마저 끝낸다 —
-		// 그렇지 않고 아래 공용 파이프라인으로 떨어지면, backupOriginal이 원본 -wal/-shm만
-		// 옮기고 main rename 전 crash한 경우(마커+db 잔존+건강 tmp) rescueAll이 건강 tmp를
-		// 폐기하고 -wal 없는 원본을 재인양해 WAL 꼬리 커밋을 조용히 잃는다(재리뷰 Important).
-		// 마커 하에서 DB는 §6.2상 서버 fail-closed로 read-only로만 열리므로 건강 tmp가 항상
-		// 최신·완전하다는 것이 이 우선순위의 근거다.
+		// 재리뷰(A2) + 재검증 Minor 2: 검증 완료된 인양본(tmp) 건강을 **publishAlreadyComplete
+		// 보다 최우선**으로 판정한다. tmp가 건강하면(verifyRescued 통과 시점 그대로) 재인양 없이
+		// 게시만 마저 끝낸다 — dbExists와 무관하게 tmp를 우선한다. 두 가지 근거: (1) 공용
+		// 파이프라인으로 떨어지면 backupOriginal이 원본 -wal/-shm만 옮기고 main rename 전 crash한
+		// 경우 rescueAll이 건강 tmp를 폐기하고 -wal 없는 원본을 재인양해 WAL 꼬리를 잃는다;
+		// (2) publishAlreadyComplete를 먼저 보면 "구세대 bak main + WAL-less 원본 main이 strict
+		// ok로 우연히 겹치는" 3중 상태에서 검증 완료 tmp를 폐기하고 MarkerOnly로 오판하는 창이
+		// 열린다. 마커 하 DB는 §6.2상 서버 fail-closed로 read-only로만 열리므로 건강 tmp가 항상
+		// 최신·완전하다.
 		healthy, err := tmpIsHealthy(dir)
 		if err != nil {
 			return RecoverResult{}, err
@@ -111,9 +102,22 @@ func Recover(dir string) (RecoverResult, error) {
 			return RecoverResult{RecoveredEvents: nEvents, RecoveredSessions: nSessions, BackupPrefix: backupPrefix}, nil
 		}
 
-		// tmp가 없거나 불건강. session.db가 없으면(게시 rename 도중 crash 이후 tmp까지 유실)
-		// 가장 최근 백업을 session.db 자리로 되돌려(restoreLatestBackup) 아래 공용 파이프라인이
-		// 처음부터 다시 인양·게시하게 한다. db가 남아 있으면 그대로 원본에서 재인양한다.
+		// tmp 없음/불건강: 게시가 이미 완료됐으면(건강 D + main bak) 마커만 삭제한다(N-2 회귀 —
+		// 게시 완료 후 마커 삭제 전 crash가 서버를 영구 fail-closed로 고착시키는 경로 차단).
+		done, err := publishAlreadyComplete(dir)
+		if err != nil {
+			return RecoverResult{}, err
+		}
+		if done {
+			if rmErr := os.Remove(markerPath); rmErr != nil && !errors.Is(rmErr, os.ErrNotExist) {
+				return RecoverResult{}, sanitizeIOErr("recover marker remove", rmErr)
+			}
+			return RecoverResult{MarkerOnly: true}, nil
+		}
+
+		// session.db가 없으면(게시 rename 도중 crash 이후 tmp까지 유실) 가장 최근 백업을 session.db
+		// 자리로 되돌려(restoreLatestBackup) 아래 공용 파이프라인이 처음부터 다시 인양·게시하게
+		// 한다. db가 남아 있으면 그대로 원본에서 재인양한다.
 		dbExists, err := fileExists(filepath.Join(dir, dbFileName))
 		if err != nil {
 			return RecoverResult{}, err
@@ -479,6 +483,16 @@ func tmpIsHealthy(dir string) (bool, error) {
 	}
 	if !exists {
 		return false, nil
+	}
+	// 재검증 Minor 1: 단일-파일 불변식(검증 완료 tmp ⇔ -wal/-shm 없음). verifyRescued가
+	// checkpoint(TRUNCATE)+삭제로 sidecar를 반드시 제거하므로, 남아 있으면 검증이 끝나지 않은
+	// 것 → 건강하지 않음(재인양 경로로).
+	for _, sc := range []string{tmpPath + "-wal", tmpPath + "-shm"} {
+		if scExists, scErr := fileExists(sc); scErr != nil {
+			return false, scErr
+		} else if scExists {
+			return false, nil
+		}
 	}
 	conn, err := openReadOnlyAt(tmpPath)
 	if err != nil {

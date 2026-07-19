@@ -201,7 +201,9 @@ func registerRecordEvent(srv *mcp.Server, st *store.Store, sess *session.DB) {
 			if errors.Is(err, store.ErrNotFound) {
 				return nil, RecordEventOutput{}, toolErr(codeInvalidArgument, "supersedes 이벤트가 존재하지 않습니다")
 			}
-			return nil, RecordEventOutput{}, toToolError(err)
+			// C2 대칭(재검증 Minor 3): supersedes 인터셉트 이후의 런타임 저장 오류도 질의 3곳과
+			// 동일하게 분류해 STORAGE_UNAVAILABLE로 매핑한다(INTERNAL 강등 방지).
+			return nil, RecordEventOutput{}, toToolError(session.ClassifyStorageErr(err))
 		}
 		out := RecordEventOutput{EventID: eventID, SessionID: sess.SessionID(), Ts: ts}
 		st.LedgerAppend("ctr_record_event", 0, jsonLen(out), time.Since(start).Milliseconds())
