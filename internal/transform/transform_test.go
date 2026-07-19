@@ -246,6 +246,28 @@ func TestRunWorker_RoundTrip(t *testing.T) {
 	}
 }
 
+// TestRlimitASBytes: linux self-apply(selfApplyMemLimit)가 RLIMIT_AS에 실제로 거는 값 —
+// CTR_WORKER_MEM(순수 캡)에 vaHeadroomBytes를 더한 값이어야 한다(D19-b). 상한 절삭(기존
+// hard limit이 더 낮으면 그 값 유지)은 selfApplyMemLimit이 이 함수의 반환값에 대해 그대로
+// 재사용하므로 여기서는 가산 자체만 검증한다.
+func TestRlimitASBytes(t *testing.T) {
+	cases := []struct {
+		name string
+		cap  int64
+		want int64
+	}{
+		{name: "256MB cap", cap: 256 << 20, want: 1024 << 20}, // 256MB + 768MB = 1GB
+		{name: "zero cap", cap: 0, want: vaHeadroomBytes},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := rlimitASBytes(c.cap); got != c.want {
+				t.Fatalf("rlimitASBytes(%d) = %d, want %d", c.cap, got, c.want)
+			}
+		})
+	}
+}
+
 func FuzzEval(f *testing.F) {
 	f.Add("emit(1)", "hello")
 	f.Add("def f():\n\tfor i in range(10):\n\t\temit(i)\n\nf()\n", "")

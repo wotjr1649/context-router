@@ -74,8 +74,12 @@ func selfApplyMemLimit() error {
 	if err := syscall.Getrlimit(syscall.RLIMIT_AS, &existing); err != nil {
 		return fmt.Errorf("transform: Getrlimit(RLIMIT_AS) 실패: %w", err)
 	}
-	lim := syscall.Rlimit{Cur: n, Max: existing.Max}
-	if lim.Cur > lim.Max { // 기존 hard limit이 요청값보다 낮으면 그 한도까지만
+	// D19-b: RLIMIT_AS는 n(순수 캡) 그대로가 아니라 rlimitASBytes(n)(n+vaHeadroomBytes)로
+	// 건다 — Go 런타임이 시동 시 예약하는 VA가 256MB 캡을 넘어 조기 사망하던 문제(ubuntu
+	// 실측: 할당 0, 8.4ms 사망)의 backstop. 실질 메모리 제어는 이제 GOMEMLIMIT(T2)이
+	// 담당하므로 여기서 RLIMIT_AS를 넉넉히 잡아도 메모리 안전성은 그대로 유지된다.
+	lim := syscall.Rlimit{Cur: uint64(rlimitASBytes(int64(n))), Max: existing.Max}
+	if lim.Cur > lim.Max { // 기존 hard limit이 요청값(headroom 포함)보다 낮으면 그 한도까지만
 		lim.Cur = lim.Max
 	}
 	if err := syscall.Setrlimit(syscall.RLIMIT_AS, &lim); err != nil {

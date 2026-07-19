@@ -69,6 +69,12 @@ const (
 	defaultMemLimitBytes  = 256 * 1024 * 1024 // 설계 §4.3 기본 상한 256MB
 	defaultWorkerTimeout  = 10 * time.Second  // 리뷰 Important: ctx에 deadline 없을 때 안전망
 	gomemlimitRatio       = 0.8               // D19-a: Job/RLIMIT 캡의 80%에서 GC 선제 발동
+
+	// vaHeadroomBytes: linux selfApplyMemLimit이 RLIMIT_AS에 얹는 가상주소공간 여유분 —
+	// ubuntu 실측(할당 0인데 8.4ms 사망 = Go 런타임 시동 시 VA 예약이 256MB 캡을 초과)을
+	// 상회하는 보수값(초기 768MB). CI 실측으로 조정 시 이 상수 1곳만 바꾼다(설계 §1.3
+	// D19-b). windows 경로는 이 상수를 쓰지 않는다(RLIMIT_AS 없음, Job Object 사용).
+	vaHeadroomBytes = 768 << 20
 )
 
 // gomemlimitBytes: 자식 worker의 GOMEMLIMIT 값(바이트) — Job Object/RLIMIT 캡(commit·가상
@@ -80,6 +86,17 @@ const (
 func gomemlimitBytes() int64 {
 	limitBytes := float64(defaultMemLimitBytes) // 변수 경유: 상수식 그대로면 214748364.8이
 	return int64(limitBytes * gomemlimitRatio)  // 정확한 int64로 안 떨어져 컴파일타임 변환 불가
+}
+
+// rlimitASBytes: linux selfApplyMemLimit이 RLIMIT_AS.Cur에 실제로 설정할 값 —
+// CTR_WORKER_MEM(cap, 순수 캡 — 이 함수 밖에서는 의미가 그대로 유지된다)에
+// vaHeadroomBytes를 더한다. 실질 메모리 제어는 이제 GOMEMLIMIT(gomemlimitBytes)이
+// 담당하고, RLIMIT_AS는 프로세스 완전 폭주를 막는 백스톱으로 후퇴했다(설계 §1.3 D19-b).
+// 순수 함수 — env/syscall 접근 없음. 기존 hard limit(Max) 절삭 로직은 이 함수의
+// 반환값에 대해 selfApplyMemLimit이 그대로 재사용한다(unix 전용, transform.go에 둔
+// 것은 windows 로컬에서도 단위 테스트가 돌아가게 하기 위함).
+func rlimitASBytes(cap int64) int64 {
+	return cap + vaHeadroomBytes
 }
 
 // Eval: 순수 함수 — 파일·네트워크·env·시계·난수 접근 없음. panic 없이 항상 Result를 반환한다.
