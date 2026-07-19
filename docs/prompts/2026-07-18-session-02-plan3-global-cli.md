@@ -80,5 +80,9 @@ Remaining before tag:
 - Reconcile the NOTICE upstream copyright vs context-mode package.json author (T7 carryover).
 - After PR merged + main CI GREEN + both smokes confirmed: git tag v0.0.1 && git push origin v0.0.1.
 
-Then v0.1 planning (session events) or the deferred backlog (macOS transform isolation, title dedup, semantic retrieval) per my direction. Reviews stay cross-model (Claude subagent + Codex). ultrathink
+Then v0.1 planning (session events) or the deferred backlog (macOS transform isolation, title dedup, semantic retrieval) per my direction. Reviews stay cross-model (Claude subagent + Codex).
+
+Model: keep Fable. Per my 2026-07-19 decision, keep security prose in your replies minimal/abstract (no dense enumeration of sensitive categories) to avoid Fable's dual-use refusal_fallback; route bulk security corpora/forensics through the sandbox with masking. See auto-memory `fable-security-prose-minimization`. ultrathink
 ```
+
+> **PR #2 is merged (main 78a7927).** The §6 prompt above supersedes any "start Plan 3" framing — Plan 3 is complete; the next session finalizes the v0.0.1 tag.
