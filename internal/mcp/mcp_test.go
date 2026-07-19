@@ -216,20 +216,25 @@ func TestNewServerProfileGating(t *testing.T) {
 	}
 }
 
-// maxToolSchemaBytes: 게이트 11(스키마 토큰 예산, 설계 §2.3) — NewServer 기본 프로필
-// (ProbeIsolation 성공 환경의 3-도구: ctr_search/ctr_fetch/ctr_transform)의 tools/list 결과
-// JSON 직렬화 바이트 상한. 태스크 7(ctr_search scope 확장 + ctr_fetch 문구, 설계 §3.4·§3.5)
-// 반영 후 재실측값 5139B × 1.2 = 6166.8 → 올림 6167로 재기준화한 값(이전 기준 4359B×1.2=5231) —
+// maxToolSchemaBytes: 게이트 11(스키마 토큰 예산, 설계 §2.3·§3.5) — v0.1의 기본 표면은
+// session.db가 정상 open된 6-도구(ctr_search/ctr_fetch/ctr_transform + ctr_record_event/
+// ctr_session_summary/ctr_export_events, ProbeIsolation 성공 환경)이므로 게이트도 그 표면을
+// 측정한다(코디네이터 판정, 설계 §3.5 "세션 3종+scope+문구를 반영해 재기준화" 문면 그대로 —
+// 이전 태스크7 1차 구현은 3-도구만 측정해 재작업). tools/list 결과 JSON 직렬화 바이트 상한.
+// 재실측값 10024B × 1.2 = 12028.8 → 올림 12029로 재기준화(이전 3-도구 기준 4359B×1.2=5231,
+// 태스크7 1차 3-도구 재측정 5139B×1.2=6167 — 둘 다 폐기, 완충 비율 1.2·올림 방식은 동일 유지) —
 // 회귀(설명 문구 비대화 등) 조기 감지용 상한이지 정밀 예산이 아니다. 실측값·근거는
-// docs/gates-v0.0.1-ko.md 게이트 11 항목 참조.
-const maxToolSchemaBytes = 6167
+// docs/gates-v0.0.1-ko.md 게이트 11 항목 참조(정식 갱신은 v0.1 게이트 문서 마일스톤에서).
+const maxToolSchemaBytes = 12029
 
 // TestSchemaTokenBudget: tools/list 결과(ListToolsResult 전체 — 실제 클라이언트가 받는
 // JSON 그대로) 직렬화 바이트가 maxToolSchemaBytes를 넘지 않는지 확인한다(게이트 11). 근사
 // 토큰 수 = bytes/4는 로그로만 남긴다 — Claude 정확 tokenizer는 비공개라 근사치일 뿐이고,
 // 실질 게이트는 바이트 상한 쪽이다.
 func TestSchemaTokenBudget(t *testing.T) {
-	cs, _ := newTestServer(t, nil) // Enable 없음 — 기본 프로필(ProbeIsolation 성공 시 3-도구)
+	// newRecordEventTestServer: Enable 없음(ingest/net 미등록) + Session 배선 — v0.1 기본
+	// 표면(6-도구)과 정확히 일치(기존 세션 헬퍼 재사용, 신규 헬퍼 불요).
+	cs, _, _, _ := newRecordEventTestServer(t)
 	lt, err := cs.ListTools(context.Background(), nil)
 	if err != nil {
 		t.Fatalf("list tools: %v", err)
