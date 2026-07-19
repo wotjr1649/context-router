@@ -18,7 +18,7 @@
 | 7 | **DB 동시성·내구성**: writer1+reader4, 프로세스 2개 동시 쓰기, CAS, dedup, kill 후 무결성, user_version 비파괴 거부 — 3 OS (심층: 최초 동시 기동 WAL 경합) | `internal/store/store_test.go` `TestRegister_CASRejectsStaleWriter`, `TestRegister_DedupTwoSourcesOneArtifact`, `TestOpen_NewerVersionRefusedNonDestructively`, `TestRegister_ConcurrentDistinctBlobsNoTmpLeftover`(8-goroutine 동시쓰기, tmp 잔존 없음); `cmd/context-router/main_test.go` `TestE2E_TwoProcessConcurrentIndex`(프로세스 2개 동시 색인, 3번째 프로세스로 무결성 확인); 심층(T1): `TestOpen_ConcurrentFirstMigration`(최초 동시 기동 WAL/migration 경합 — advisory lock으로 근본 수정). **신규 심층(계획3 T10 Fix R1, windows 로컬 실측 6회 반복 안정)**: `TestRegister_TwoProcessCASRace`(실 OS 프로세스 2개가 동일 URI·상이 콘텐츠로 구지문 기반 CAS 경쟁 → 정확히 1승1패, 최종 포인터가 과거로 회귀하지 않음+integrity-check 통과), `TestOpen_SurvivesWriteKillMidLoop`(자식이 5,000회 Register 루프 중 부모가 50ms 뒤 강제 kill — 실측 2~3건 커밋 후 kill, 재오픈 quick_check=ok+integrity-check 통과+커밋된 행 전부 무결), `TestConcurrency_Writer1Reader4`(writer 1 + reader 4 고루틴, FTS MATCH+ArtifactText 연속 수행, 오류 0 — race는 CI ubuntu `-race` 잡이 커버) | PASS |
 | 8 | **transform 상한**: 스텝/출력 초과, 거대 문자열·리스트 증식이 worker 메모리 상한으로 종료(서버 생존), timeout 시 트리 전멸 | `internal/transform/worker_test.go` `TestSpawn_MemoryExplosion`(메모리 상한 종료, 부모 생존), `TestSpawn_Timeout`(트리킬), `TestSpawn_DefaultTimeout`(ctx deadline 없을 때 10s 안전망); `internal/transform/transform_test.go` `TestBudgetExceeded`/`TestOutputLimitExceeded`; `internal/transform/worker_windows_test.go` `TestKillOrphan_KillsStartedProcess`(Windows 트리킬 원시 동작) | PASS |
 | 9 | **추출 충실도**: 대표 HTML corpus pre/code/table 보존 판정 + fail-open 전환 | `internal/netfetch/netfetch_test.go` `TestFetch_HTML_DocWithCodeAndTable`(코드펜스·표 보존, extraction=readability), `TestFetch_HTML_CodeHeavyStripped`(pre/code 보존율<50%→fail-open), `TestFetch_HTML_ShortNonArticle`(<500자→fail-open) | PASS |
-| 10 | **프로토콜 위생**: stdout 오염 0 + Claude Code·Codex 실 등록 스모크(tools/list·호출·cancellation) | 자동: `cmd/context-router/main_test.go` `TestE2E_StdioRoundTrip`(실 바이너리 stdio 왕복, 매 stdout 줄 JSON 유효성 검증), `internal/mcp/mcp_test.go` `TestServeStdoutPurity`(즉시 EOF 기준선), `TestServeStdoutPurityDuringErroringToolCall`(**신규, 계획3 T10** — store를 미리 Close해 tools/call 처리 도중 실제로 `slog.Error`가 stderr에 찍히는 그 순간에도 stdout이 JSON-RPC 줄만 유지되는지 확인, Task 8 minor "stdout purity 테스트 narrow(툴콜 중 오염 미검)" 해소). 수동(2건, 아래 §수동 스모크 참조): **사용자 확인 대기** | 자동 PASS / 수동 대기 |
+| 10 | **프로토콜 위생**: stdout 오염 0 + Claude Code·Codex 실 등록 스모크(tools/list·호출·cancellation) | 자동: `cmd/context-router/main_test.go` `TestE2E_StdioRoundTrip`(실 바이너리 stdio 왕복, 매 stdout 줄 JSON 유효성 검증), `internal/mcp/mcp_test.go` `TestServeStdoutPurity`(즉시 EOF 기준선), `TestServeStdoutPurityDuringErroringToolCall`(**신규, 계획3 T10** — store를 미리 Close해 tools/call 처리 도중 실제로 `slog.Error`가 stderr에 찍히는 그 순간에도 stdout이 JSON-RPC 줄만 유지되는지 확인, Task 8 minor "stdout purity 테스트 narrow(툴콜 중 오염 미검)" 해소). **신규(session-04, PR #5)**: `TestE2E_CallToolCancellation` — 서버 취소 계약 (3a)의 CI 상주 스모크(notifications/cancelled 결정적 주입 + worker 슬롯 해제 직접 관찰). 수동(2건, 아래 §수동 스모크 참조): **확인 완료(2026-07-19)** — cancellation은 확인 항목 3의 분리 판정((3a) 스크립트드 PASS 필수 + (3b) 실호스트 1회 재시도 기입, 비차단 협의) | PASS |
 | 11 | **스키마 토큰 예산**: 기본 3종 도구 정의 tokenizer 실측, 상한 기록 | `internal/mcp/mcp_test.go` `TestSchemaTokenBudget`(**신규, 계획3 T10**) — 기본 프로필(ctr_search/ctr_fetch/ctr_transform) tools/list 결과 직렬화 **4359 bytes**(근사 토큰 ~1089, bytes/4 — Claude 정확 tokenizer 비공개라 근사치, 바이트 상한이 실질 게이트). 상한 `maxToolSchemaBytes` = 최초 실측×1.2 반올림 = **5231 bytes**로 고정 | PASS |
 | 12 | **빌드**: `CGO_ENABLED=0` 6타깃 크로스빌드 + 크기 기록, memory-capped CI | `.github/workflows/ci.yml` — 3-OS(ubuntu/macos/windows) 테스트 매트릭스 + crossbuild 6타깃(6조합 GOOS/GOARCH) + 바이너리 크기를 `GITHUB_STEP_SUMMARY`에 기록. CI run: https://github.com/wotjr1649/context-router/actions/runs/29652804882 (GREEN) | PASS |
 | 13 | 전 게이트 통과 전 태그 금지 | 아래 §태그 절차 참조 | 절차 기록됨(태그는 PR 머지 후) |
@@ -75,14 +75,18 @@ go build -o ctr.exe ./cmd/context-router     # windows
 
 | 호스트 | 플랫폼 | tools/list 노출(기대 도구 수 일치) | 호출 1회 | cancellation | 확인일 | 비고 |
 |---|---|---|---|---|---|---|
-| Claude Code | windows | PASS (3종) | PASS | (3a) PASS(스크립트드, PR #5) / (3b) **대기** — 1회 재시도 예정(하단 경위) | 2026-07-19 | ctr_search 정상(빈 스토어 hits:[]) + ctr_transform 오류 경로(256MB 메모리 킬) — 서버 생존·후속 호출 정상. 참고(3b 판정 아님): (3b) 준비 호출 2회는 ESC 미입력으로 10s 상한 도달 — 그때도 서버 생존·후속 정상 |
+| Claude Code | windows | PASS (3종) | PASS | (3a) PASS(스크립트드, PR #5) / (3b) 시도 완료 — ESC가 실행 중 호출을 즉시 중단(10s 창 내), 서버 생존·후속 `ctr_search` 정상. 알림의 서버 도달 여부는 호스트 불투명 → 비차단(협의) | 2026-07-19 | ctr_search 정상(빈 스토어 hits:[]) + ctr_transform 오류 경로(256MB 메모리 킬) — 서버 생존·후속 호출 정상. 참고(3b 판정 아님): (3b) 준비 호출 2회는 ESC 미입력으로 10s 상한 도달 — 그때도 서버 생존·후속 정상 |
 | Codex | windows | PASS (3종) | PASS | (3a) PASS(스크립트드, PR #5 — 서버 계약은 호스트 무관) / (3b) 미시도(비차단, 하단 경위) | 2026-07-19 | ctr_search 정상 스키마 응답 + ctr_transform 오류 경로(10s 시간 상한) + 잘못된 인자 스키마 거부 — 서버 생존·후속 호출 정상 |
 
-**cancellation 이월 해소 경위 — (3a) 완료 / (3b) 대기 (2026-07-19, session-04)**: 위
+**cancellation 이월 해소 경위 — (3a)·(3b) 완료 (2026-07-19, session-04)**: 위
 (3a)/(3b) 분리 개정에 따라 스크립트드 스모크 `TestE2E_CallToolCancellation`을 작성·검증
-완료(최종판 로컬 windows 4/4 PASS + PR #5 CI windows 잡 PASS; 교차 리뷰 — 서브에이전트
-4라운드 + Codex 2패스 — 반영). (3b)는 실호스트 ESC 1회 재시도 후 결과를 그대로 기입하기로
-협의(위 확인 항목 3), 아직 시도 전이라 **대기**. 작성 과정의 실측 발견 2건:
+완료(최종판 로컬 windows 4/4 PASS + PR #5 CI 3-OS GREEN; 교차 리뷰 — 서브에이전트
+6라운드 + Codex 2패스 — 반영). **(3b) 결과**: 실호스트(Claude Code) 재시도 1회 수행 —
+등록 서버에 ~10s 워크로드 호출을 걸고 사용자가 ESC로 취소, 호출이 10s 상한 오류 대신
+즉시 중단됐고(실행 중 인터럽트 — 동일 도구가 세션 내 무프롬프트 2회 선실행돼 권한 단계
+아님) 직후 `ctr_search` 정상 응답으로 서버 생존 확인. notifications/cancelled의 서버 도달
+여부는 호스트 내부라 관측 불가(사전 협의대로 비차단 — 서버측 취소 계약은 (3a)가 보증).
+원 게이트 문언("호스트·서버 모두 비정상 종료 없이 처리")은 충족. 작성 과정의 실측 발견 2건:
 ① session-03 레시피의 bounded-churn 워크로드(8MB 가비지 반복 생성)가 worker를
 비결정적으로 조기 사망시키는 현상을 실측(windows, 20회 중 7회, 124ms~1.58s)하고 transform
 레이어 격리 재현으로 근본 원인 확정 — 상주 12MB에도 GC의 커밋 반환이 순간적으로 뒤처지면
