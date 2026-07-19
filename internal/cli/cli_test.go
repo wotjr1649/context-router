@@ -223,7 +223,7 @@ func TestRunPurge_OlderThanRejectsInvalidDuration(t *testing.T) {
 	for _, v := range []string{"-1h", "0s", "abc"} {
 		var out bytes.Buffer
 		args := []string{"--project", "whatever-id", "--force", "--older-than", v}
-		if err := runPurge(context.Background(), failReader{}, &out, t.TempDir(), args, false); err == nil {
+		if err := runPurge(context.Background(), failReader{}, &out, io.Discard,t.TempDir(), args, false); err == nil {
 			t.Fatalf("older-than=%q: want error, got nil", v)
 		}
 	}
@@ -237,7 +237,7 @@ func TestRunPurge_PhantomProjectRejected(t *testing.T) {
 	storeRoot := t.TempDir()
 	var out bytes.Buffer
 	args := []string{"--project", "does-not-exist-id", "--force", "--older-than", "1h"}
-	if err := runPurge(context.Background(), failReader{}, &out, storeRoot, args, false); err == nil {
+	if err := runPurge(context.Background(), failReader{}, &out, io.Discard,storeRoot, args, false); err == nil {
 		t.Fatal("want error for nonexistent project, got nil")
 	}
 	if _, err := os.Stat(filepath.Join(storeRoot, "projects", "does-not-exist-id")); !os.IsNotExist(err) {
@@ -322,6 +322,39 @@ func TestConfirmPurge(t *testing.T) {
 	}
 }
 
+// TestPurgeSessionFiles_SkipsWhenLeaseHeld — 최종리뷰 B1(Codex P1): 서버가 shared lease를
+// 보유 중인 worktree는 purge --sessions가 삭제하지 않고 스킵 + stderr 고지한다(unlink-while-open
+// 유실·recover 경합 방어). exclusive AcquireLock이 shared 보유와 경합해 즉시 실패하는 것을 이용.
+func TestPurgeSessionFiles_SkipsWhenLeaseHeld(t *testing.T) {
+	storeRoot := t.TempDir()
+	projDir := filepath.Join(storeRoot, "projects", "proj-b1")
+	st, err := store.Open(projDir, false) // content.db 생성(purge 대상 실재 판정 통과)
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatalf("store.Close: %v", err)
+	}
+	wtDir := filepath.Join(projDir, "worktrees", "wt-b1")
+	sess, err := session.Open(wtDir, session.Options{Producer: "context-router/test"}) // shared lease 보유
+	if err != nil {
+		t.Fatalf("session.Open: %v", err)
+	}
+	defer func() { _ = sess.Close() }()
+
+	var out, errOut bytes.Buffer
+	args := []string{"--project", "proj-b1", "--sessions", "--force"}
+	if err := runPurge(context.Background(), failReader{}, &out, &errOut, storeRoot, args, false); err != nil {
+		t.Fatalf("runPurge err=%v", err)
+	}
+	if _, statErr := os.Stat(filepath.Join(wtDir, "session.db")); statErr != nil {
+		t.Fatalf("session.db should remain (lease held → skip), stat err=%v", statErr)
+	}
+	if !strings.Contains(errOut.String(), "skip worktree") {
+		t.Fatalf("stderr missing skip notice: %q", errOut.String())
+	}
+}
+
 // TestRunPurge_E2E_OlderThanForce: 임시 store에 source 1건을 등록한 뒤 runPurge를
 // --project(경로 형태, purgeProjectID의 Canonicalize 분기까지 exercised) --force
 // --older-than 1ns로 호출한다. isTTY는 false로 명시 주입한다 — 이 값은 원래 Run()의 purge
@@ -355,7 +388,7 @@ func TestRunPurge_E2E_OlderThanForce(t *testing.T) {
 
 	var out bytes.Buffer
 	args := []string{"--project", projectRoot, "--force", "--older-than", "1ns"}
-	if err := runPurge(context.Background(), failReader{}, &out, storeRoot, args, false); err != nil {
+	if err := runPurge(context.Background(), failReader{}, &out, io.Discard,storeRoot, args, false); err != nil {
 		t.Fatalf("runPurge err=%v out=%s", err, out.String())
 	}
 
@@ -408,7 +441,7 @@ func TestRunPurge_E2E_MismatchLeavesDataIntact(t *testing.T) {
 
 	var out bytes.Buffer
 	args := []string{"--project", canon.ProjectID} // --older-than 미지정 → 성공했다면 전체 삭제였을 경로
-	err = runPurge(context.Background(), strings.NewReader("wrong-slug\n"), &out, storeRoot, args, true)
+	err = runPurge(context.Background(), strings.NewReader("wrong-slug\n"), &out, io.Discard, storeRoot, args, true)
 	if err == nil {
 		t.Fatal("want error for mismatched confirmation slug, got nil")
 	}
@@ -548,7 +581,7 @@ func TestRunPurge_SessionsTarget_StandaloneKeepsContentAndBackups(t *testing.T) 
 
 	var out bytes.Buffer
 	args := []string{"--project", projectRoot, "--force", "--sessions"}
-	if err := runPurge(context.Background(), failReader{}, &out, storeRoot, args, false); err != nil {
+	if err := runPurge(context.Background(), failReader{}, &out, io.Discard,storeRoot, args, false); err != nil {
 		t.Fatalf("runPurge err=%v out=%s", err, out.String())
 	}
 
@@ -615,7 +648,7 @@ func TestRunPurge_SessionsTarget_WithOlderThanAlsoPurgesContent(t *testing.T) {
 
 	var out bytes.Buffer
 	args := []string{"--project", projectRoot, "--force", "--older-than", "1ns", "--sessions"}
-	if err := runPurge(context.Background(), failReader{}, &out, storeRoot, args, false); err != nil {
+	if err := runPurge(context.Background(), failReader{}, &out, io.Discard,storeRoot, args, false); err != nil {
 		t.Fatalf("runPurge err=%v out=%s", err, out.String())
 	}
 
@@ -670,7 +703,7 @@ func TestRunPurge_All_ContextCanceledStopsBeforeAnyDeletion(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	var out bytes.Buffer
-	err := runPurge(ctx, failReader{}, &out, storeRoot, []string{"--all", "--force"}, false)
+	err := runPurge(ctx, failReader{}, &out, io.Discard, storeRoot, []string{"--all", "--force"}, false)
 	if err == nil {
 		t.Fatal("want error for canceled context, got nil")
 	}
@@ -729,7 +762,7 @@ func TestRunPurge_All_PartiallyCreatedDirRemovedNotFailStuck(t *testing.T) {
 	}
 
 	var out bytes.Buffer
-	if err := runPurge(context.Background(), failReader{}, &out, storeRoot, []string{"--all", "--force"}, false); err != nil {
+	if err := runPurge(context.Background(), failReader{}, &out, io.Discard,storeRoot, []string{"--all", "--force"}, false); err != nil {
 		t.Fatalf("runPurge --all --force: %v (out=%s)", err, out.String())
 	}
 
@@ -774,7 +807,7 @@ func TestRunPurge_All_Selective_PartiallyCreatedDirSkipped(t *testing.T) {
 
 	var out bytes.Buffer
 	args := []string{"--all", "--force", "--older-than", "1ns"}
-	if err := runPurge(context.Background(), failReader{}, &out, storeRoot, args, false); err != nil {
+	if err := runPurge(context.Background(), failReader{}, &out, io.Discard,storeRoot, args, false); err != nil {
 		t.Fatalf("runPurge: %v (out=%s)", err, out.String())
 	}
 	if _, statErr := os.Stat(brokenDir); statErr != nil {

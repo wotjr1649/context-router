@@ -58,7 +58,7 @@ func Run(ctx context.Context, sub string, args []string, storeRoot, projectRoot,
 		if fi, statErr := os.Stdin.Stat(); statErr == nil {
 			isTTY = fi.Mode()&os.ModeCharDevice != 0
 		}
-		return runPurge(ctx, os.Stdin, stdout, storeRoot, args, isTTY)
+		return runPurge(ctx, os.Stdin, stdout, stderr, storeRoot, args, isTTY)
 	case "session":
 		return runSession(ctx, stdout, stderr, args, storeRoot)
 	default:
@@ -275,7 +275,9 @@ func confirmPurge(in io.Reader, out io.Writer, isTTY bool, force bool, expected 
 		}
 		return nil
 	}
-	fmt.Fprintf(out, "purge: 삭제 대상을 확인합니다. 계속하려면 다음을 그대로 입력하세요: %s\n> ", expected)
+	// B2: 전체 프로젝트 삭제(--all/--project 무플래그)는 content.db·artifacts와 함께 세션
+	// 이벤트 데이터(session.db 계열)도 삭제한다 — 기존 전체삭제 의미론(행동 무변)을 명시만 한다.
+	fmt.Fprintf(out, "purge: 삭제 대상을 확인합니다(전체 삭제는 세션 이벤트 데이터를 포함합니다). 계속하려면 다음을 그대로 입력하세요: %s\n> ", expected)
 	sc := bufio.NewScanner(in)
 	if !sc.Scan() {
 		return errors.New("purge: 확인 입력을 읽지 못했습니다 — 삭제하지 않았습니다")
@@ -346,7 +348,7 @@ func listProjectDirs(storeRoot string) ([]string, error) {
 // 대상에 추가한다 — --older-than 없이 단독이면 "GC 단독"과 동형으로 content.db는 건드리지
 // 않고 세션 파일만 지우되(데이터 삭제라 확인은 생략하지 않는다), --older-than과 함께면
 // 선택 삭제 뒤에 이어서 지운다.
-func runPurge(ctx context.Context, in io.Reader, w io.Writer, storeRoot string, args []string, isTTY bool) error {
+func runPurge(ctx context.Context, in io.Reader, w, stderr io.Writer, storeRoot string, args []string, isTTY bool) error {
 	fs := flag.NewFlagSet("purge", flag.ContinueOnError)
 	project := fs.String("project", "", "purge 대상 프로젝트(ID 또는 경로)")
 	all := fs.Bool("all", false, "storeRoot 하위 전체 프로젝트 대상")
@@ -449,7 +451,7 @@ func runPurge(ctx context.Context, in io.Reader, w io.Writer, storeRoot string, 
 			// 세션 단독(older-than 없음, --gc 단독과 동형 선례) — content.db는 건드리지
 			// 않는다. §5 명문 계약: .bak-*·recover-pending 마커는 purgeSessionFiles가
 			// 애초에 대상으로 삼지 않으므로 잔존한다.
-			if err := purgeSessionFiles(projDir); err != nil {
+			if err := purgeSessionFiles(projDir, stderr); err != nil {
 				return err
 			}
 			if *gc {
@@ -474,7 +476,7 @@ func runPurge(ctx context.Context, in io.Reader, w io.Writer, storeRoot string, 
 		}
 		_, _, purgeErr := st.PurgeOlderThan(ctx, cutoffUnix)
 		if purgeErr == nil && *sessions {
-			purgeErr = purgeSessionFiles(projDir)
+			purgeErr = purgeSessionFiles(projDir, stderr)
 		}
 		if purgeErr == nil && *gc {
 			_, purgeErr = st.GCOrphanBlobs(ctx)
@@ -516,7 +518,7 @@ var sessionDBFiles = [3]string{"session.db", "session.db-wal", "session.db-shm"}
 // session.db`). worktrees/ 디렉터리가 아직 없으면(session 기능 미사용 프로젝트) 조용히
 // 통과한다. `.bak-<ts>` 파일·session.recover-pending 마커는 이름이 sessionDBFiles와 정확히
 // 일치하지 않으므로 자연히 보존된다(명문 계약, §5).
-func purgeSessionFiles(projDir string) error {
+func purgeSessionFiles(projDir string, stderr io.Writer) error {
 	root := filepath.Join(projDir, "worktrees")
 	entries, err := os.ReadDir(root)
 	if err != nil {
@@ -529,10 +531,32 @@ func purgeSessionFiles(projDir string) error {
 		if !e.IsDir() {
 			continue
 		}
-		for _, name := range sessionDBFiles {
-			if err := os.Remove(filepath.Join(root, e.Name(), name)); err != nil && !errors.Is(err, os.ErrNotExist) {
-				return errors.New("purge: session.db 삭제 실패")
-			}
+		wtDir := filepath.Join(root, e.Name())
+		// B1(Codex P1): 삭제 전 그 worktree의 session.lock에 exclusive를 시도한다 — 실패(서버가
+		// shared lease 보유 중·복구 CLI가 exclusive 보유 중)면 그 worktree는 스킵하고 stderr로
+		// 고지한다. unix의 unlink-while-open은 열린 서버가 계속 append하는 파일을 지워 이벤트를
+		// 유실시키고, 복구와도 경합하기 때문. release는 비멱등(store.AcquireLock 계약)이라 삭제
+		// 직후 정확히 1회 호출한다.
+		release, lockErr := store.AcquireLock(filepath.Join(wtDir, "session.lock"), false)
+		if lockErr != nil {
+			fmt.Fprintf(stderr, "purge: skip worktree %s (session.lock 점유 — 활성 서버/복구 중)\n", e.Name())
+			continue
+		}
+		delErr := removeSessionDBFiles(wtDir)
+		release()
+		if delErr != nil {
+			return delErr
+		}
+	}
+	return nil
+}
+
+// removeSessionDBFiles: 한 worktree에서 sessionDBFiles(session.db 계열)만 삭제한다 —
+// purgeSessionFiles가 exclusive lease를 잡은 상태에서만 호출한다.
+func removeSessionDBFiles(wtDir string) error {
+	for _, name := range sessionDBFiles {
+		if err := os.Remove(filepath.Join(wtDir, name)); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return errors.New("purge: session.db 삭제 실패")
 		}
 	}
 	return nil
