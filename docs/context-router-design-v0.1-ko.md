@@ -116,17 +116,17 @@ MCP stdio에는 프로토콜 수준 세션 식별자가 없다(go-sdk v1.6.1 실
 
 - 입력: `session_id?`(필터, 미지정 = worktree 전체), `limit?`(타입 그룹당, 기본 5·최대 20), `max_return_bytes?`(기본 8192).
 - 출력: `{ checkpoint?, groups: [{event_type, events: [{event_id, session_id, ts, summary, artifact_refs: [{uri, missing?}]}], truncated}], untrusted: true }`.
-  - `checkpoint` = 최신 **비superseded** `session_checkpoint` 이벤트 전문(groups에 중복 포함하지 않음). checkpoint도 `max_return_bytes` 예산에 포함 — 예산 우선순위 1번(초과 시 groups부터 절단).
+  - `checkpoint` = 최신 **비superseded** `session_checkpoint` 이벤트 전문(groups에 중복 포함하지 않음). checkpoint도 `max_return_bytes` 예산에 포함 — 예산 우선순위 1번(초과 시 groups부터 절단; checkpoint **단독**으로 예산을 초과하면 checkpoint를 생략하고 truncated 표기 — v0.0.1 §4.0 hard cap 유지).
   - 그룹 내 시간 역순, superseded 이벤트 제외, 그룹별 `truncated` 개별 표기(v0.0.1 §4.1 예산 규약 승계).
   - artifact 참조 해석 실패(purge·GC·재구축 이후)는 오류가 아니라 `missing: true` 동반 반환 — **hint 의미론**(D15). "무손실 복원"의 실체: 결정·오류의 의미(summary·payload)는 session.db가 무손실 보유, 대용량 바이트는 retention 계약 내에서만 회수 가능.
 - summary 텍스트는 자르지 않는다(이벤트 ≤8KB이므로 전문 반환 가능 — 별도 event-fetch 도구 불필요, YAGNI).
 
 ### 3.3 `ctr_export_events`
 
-- 입력: `after?`(event_id 커서), `session_id?`, `limit?`(기본 50·최대 200), `max_return_bytes?`.
+- 입력: `after?`(rowid 커서), `session_id?`, `limit?`(기본 50·최대 200), `max_return_bytes?`.
 - 출력: `{ events: []SessionEventV1, truncated, next_after }` — 원소 각각이 §26 camelCase 객체: **`schemaVersion: "1.0"`(상수 — §26 필수)**/eventId/sessionId/eventType/timestamp(RFC3339)/summary/artifactRefs/relatedResources/attributes/privacyLabel/producer + **optional 확장 `supersedes`·`redaction`**(§26이 optional 필드 추가를 명시 허용 — 교정 관계가 export에서 소실되지 않게).
 - export는 **무필터 전체 스트림**(superseded 포함 — append-only 원본 그대로; 소비자가 supersedes 필드로 교정 관계 재구성). 커서·정렬은 rowid(append 순서): `next_after` = 마지막 반환 행의 rowid.
-- `privacyLabel`은 v0.1 상수 `"internal"`(입력 표면 금지), `producer`는 **sessions 테이블에서 유도**(이벤트를 기록한 세션의 producer — 바이너리 업그레이드 후 과거 이벤트 오귀속 없음), `repository`는 미기입(§1.2).
+- `privacyLabel`은 v0.1 상수 `"internal"`(입력 표면 금지), `producer`는 **sessions 테이블에서 유도**(이벤트를 기록한 세션의 producer — 바이너리 업그레이드 후 과거 이벤트 오귀속 없음; sessions 행이 없으면(인양 유실 등) `version: "unknown"` 폴백), `repository`는 미기입(§1.2).
 - snake_case 내부 ↔ camelCase export 매핑은 `internal/session`의 wire struct **1곳**에서만(D16).
 
 ### 3.4 `ctr_search` 확장
@@ -175,7 +175,7 @@ MCP stdio에는 프로토콜 수준 세션 식별자가 없다(go-sdk v1.6.1 실
 `context-router session recover (--project <id|path>)`:
 
 1. `session.lock` exclusive 획득(실패 = 서버 실행 중 → 안내 후 종료).
-2. fresh connection quick_check 재확인(오탐이면 무작업 종료).
+2. fresh connection quick_check 재확인. 마커가 없고 오탐이면 무작업 종료. **마커가 존재하면 무작업 종료 금지** — 잔여 상태를 검증(bak 존재·현 DB 건강)하고 완료 상태로 확인되면 마커만 삭제 후 종료(게시 완료 후 마커 삭제 전 crash가 서버를 영구 fail-closed로 고착시키는 경로 차단).
 3. **복구 마커** `session.recover-pending` 생성 + fsync. **서버 open 계약 추가**: 마커가 존재하면 quick_check 결과와 무관하게 세션 기능 fail-closed(**빈 DB 신규 생성 금지** — 부분 게시 상태에서 이벤트를 조용히 유실하는 경로 차단) + recover 재실행을 stderr로 안내.
 4. 인양: 원본 family를 그대로 둔 채 임시 DB로 **rowid(id) 보존 복사**(export 커서·supersedes 안정성 유지). 손상 페이지에서 SELECT가 SQLITE_CORRUPT로 중단되면 마지막 성공 rowid 이후 구간을 건너뛰며 재개하는 루프(modernc.org/sqlite에는 `.recover` 상당 API가 없어 순수 SQL 인양 — 단일 SELECT가 아닌 구간 재시도). `sessions` 테이블도 동일 인양(소량).
 5. 인양본 검증: `wal_checkpoint(TRUNCATE)` + 연결 종료로 -wal/-shm 잔재 없는 **단일 파일**로 접은 뒤 quick_check + user_version·스키마 확인.
@@ -216,7 +216,7 @@ v0.1 신규 표면 게이트(초안 — 게이트 문서에서 확정):
 | G5 | 이벤트 FTS + scope(superseded 플래그, fail-closed 시 명시 오류) | 단위 + 통합 |
 | G6 | export 준수(§26 스키마·JSONL·커서 페이지네이션) | golden + round-trip(JSONL export → 파싱 → DB 내용 대조) |
 | G7 | retention 스윕 결정론 | 시계 주입 |
-| G8 | fail-closed + 수동 복구(lease 거부·복구 마커 중단 후 재개 포함) | 파일 바이트 훼손 + 2-프로세스 lease + 마커 잔존 시나리오 |
+| G8 | fail-closed + 수동 복구(lease 거부·복구 마커 중단 후 재개 포함) | 파일 바이트 훼손 + 2-프로세스 lease + 마커 잔존 시나리오(건강 DB + 마커 케이스 포함) |
 | G9 | 스키마 토큰 예산 재기준화(게이트 11 승계) | `TestSchemaTokenBudget` 신규 기준 |
 
 기존 v0.0.1 게이트: "main CI GREEN = 회귀 없음" 1줄로 승계, 재판정 금지. 교차 모델 리뷰는 현행 프로토콜(체크포인트당 Codex 1패스 상한) 유지.
