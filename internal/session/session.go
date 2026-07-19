@@ -260,29 +260,55 @@ func acquireInitLock(lockPath, dbPath string) (func(), error) {
 
 // migrate — store.go의 migrate()와 동형(설계 §2.1). PRAGMA user_version==0이면 스키마
 // 최초 적용, ==schemaVersion이면 멱등 통과, 그 외는 비파괴 거부.
+//
+// 두 오퍼레이션(user_version 조회·applySchemaV1) 모두 migrateBusyRetry로 감싼다(재리뷰
+// Important): 콜드스타트 경합에서 패자가 (a) acquireInitLock의 shortcut(승자가 이미 파일을
+// 만든 것을 감지해 락 없이 합류)으로 오거나 (b) Open() 최상단 os.Stat이 [파일 생성~스키마
+// 커밋] 사이의 좁은 창에 실행돼 애초에 isNew=false로 init.lock 자체를 건너뛰고 오거나, 두
+// 경로 모두 여기서 승자의 최초 WAL 전환/스키마 커밋을 busy 재시도로 기다린 뒤 user_version=1
+// 을 보고 멱등 통과해야 한다 — 그래야 store.go 주석의 WAL_RECOVER_LOCK(busy_timeout을
+// 우회하는 즉시-BUSY)을 만나도 즉시 전파하지 않는다.
 func (d *DB) migrate() error {
 	var v int
-	if err := d.writer.QueryRow("PRAGMA user_version").Scan(&v); err != nil {
-		if isMalformed(err) {
-			return fmt.Errorf("session migrate: %w", ErrCorrupt)
-		}
-		return fmt.Errorf("session migrate: %w", err)
+	if err := migrateBusyRetry(func() error {
+		return d.writer.QueryRow("PRAGMA user_version").Scan(&v)
+	}); err != nil {
+		return err
 	}
 	switch {
 	case v == 0:
-		if err := d.applySchemaV1(); err != nil {
-			if isMalformed(err) {
-				return fmt.Errorf("session migrate: %w", ErrCorrupt)
-			}
-			return fmt.Errorf("session migrate: %w", err)
-		}
-		return nil
+		return migrateBusyRetry(d.applySchemaV1)
 	case v == schemaVersion:
 		return nil
 	case v > schemaVersion:
 		return fmt.Errorf("session migrate: db user_version=%d > 지원 %d — 비파괴 거부: %w", v, schemaVersion, store.ErrUnavailable)
 	default:
 		return fmt.Errorf("session migrate: 알 수 없는 하위 버전 %d: %w", v, store.ErrUnavailable)
+	}
+}
+
+// migrateBusyRetry — quickCheck/lockStore와 동일 백오프(50/200/800ms, 최대 3회)로 op을
+// 재시도한다. isMalformed(SQLITE_CORRUPT=11/NOTADB=26)는 즉시 ErrCorrupt, isBusy(BUSY=5/
+// LOCKED=6)는 재시도, 그 외는 즉시 전파. 유계 소진 시 원시 오류를 그대로 흘리지 않고
+// ErrLeaseHeld로 wrap한다(T3 toToolError 매핑 계약 — 비-sentinel 원시 오류가 mcp 계층에서
+// 조용한 빈 결과로 뭉개지는 것을 방지).
+func migrateBusyRetry(op func() error) error {
+	delays := [3]time.Duration{50 * time.Millisecond, 200 * time.Millisecond, 800 * time.Millisecond}
+	for attempt := 0; ; attempt++ {
+		err := op()
+		if err == nil {
+			return nil
+		}
+		if isMalformed(err) {
+			return fmt.Errorf("session migrate: %w", ErrCorrupt)
+		}
+		if !isBusy(err) {
+			return fmt.Errorf("session migrate: %w", err)
+		}
+		if attempt >= len(delays)-1 {
+			return fmt.Errorf("session migrate: 최초 WAL 전환 대기 소진: %w: %v", ErrLeaseHeld, err)
+		}
+		time.Sleep(delays[attempt])
 	}
 }
 
