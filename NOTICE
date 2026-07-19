@@ -29,8 +29,8 @@ own LICENSE file in the local Go module cache (`go env GOMODCACHE`), matched
 to the exact version pinned in go.mod/go.sum.
 
 --------------------------------------------------------------------------------
-Module:    codeberg.org/readeck/go-readability
-Version:   v0.0.0-20260615104154-29522a0e224f
+Module:    codeberg.org/readeck/go-readability/v2
+Version:   v2.1.2
 License:   MIT
 Copyright: Copyright (c) 2019 Radhi Fadlillah
 
@@ -51,12 +51,6 @@ Module:    github.com/andybalholm/cascadia
 Version:   v1.3.4
 License:   BSD-2-Clause
 Copyright: Copyright (c) 2011 Andy Balholm. All rights reserved.
-
---------------------------------------------------------------------------------
-Module:    github.com/araddon/dateparse
-Version:   v0.0.0-20210429162001-6b43995a97de
-License:   MIT
-Copyright: Copyright (c) 2015-2017 Aaron Raddon
 
 --------------------------------------------------------------------------------
 Module:    github.com/dustin/go-humanize
@@ -82,6 +76,13 @@ Module:    github.com/google/jsonschema-go
 Version:   v0.4.3
 License:   MIT
 Copyright: Copyright (c) 2025 JSON Schema Go Project Authors
+
+--------------------------------------------------------------------------------
+Module:    github.com/itlightning/dateparse
+Version:   v0.2.1
+License:   MIT
+Copyright: Copyright (c) 2015-2017 Aaron Raddon
+           Copyright (c) 2023-2024 IT Lightning, LLC
 
 --------------------------------------------------------------------------------
 Module:    github.com/mattn/go-isatty

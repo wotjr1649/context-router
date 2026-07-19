@@ -18,7 +18,7 @@ import (
 	"strings"
 	"time"
 
-	readability "codeberg.org/readeck/go-readability"
+	readability "codeberg.org/readeck/go-readability/v2"
 	"github.com/JohannesKaufmann/html-to-markdown/v2/converter"
 	"github.com/JohannesKaufmann/html-to-markdown/v2/plugin/base"
 	"github.com/JohannesKaufmann/html-to-markdown/v2/plugin/commonmark"
@@ -477,16 +477,21 @@ const (
 
 // convertToMarkdown: D12 파이프라인 — readability 추출 → 충실도 판정 → html-to-markdown 변환.
 // pageURL은 readability가 상대 링크를 절대화하는 데 사용. title은 readability가 추출에
-// 성공하면(fidelityOK 결과와 무관하게) article.Title, 실패하면 "".
+// 성공하면(fidelityOK 결과와 무관하게) article.Title(), 실패하면 "".
 func convertToMarkdown(rawHTML []byte, pageURL *url.URL) ([]byte, string, string, error) {
 	contentHTML := string(rawHTML)
 	extraction := "full"
 	title := ""
 	if article, err := readability.FromReader(bytes.NewReader(rawHTML), pageURL); err == nil {
-		title = article.Title
+		title = article.Title()
 		if fidelityOK(rawHTML, article) {
-			contentHTML = article.Content
-			extraction = "readability"
+			// /v2는 Content 문자열 대신 Node 렌더링 — 실패(Node nil)면 fail-open(full) 유지.
+			// fidelityOK가 참이면 RenderText가 이미 성공했으므로 사실상 도달하지 않는 가드다.
+			var buf bytes.Buffer
+			if article.RenderHTML(&buf) == nil {
+				contentHTML = buf.String()
+				extraction = "readability"
+			}
 		}
 	}
 	md, err := htmlToMarkdown(contentHTML)
@@ -499,7 +504,12 @@ func convertToMarkdown(rawHTML []byte, pageURL *url.URL) ([]byte, string, string
 // fidelityOK: 설계 §4.5 D12 — 아래 중 하나라도 참이면 false(=full 전환):
 // 빈 추출·<500자·가시 텍스트 비율<30%·pre+code 보존율<50%.
 func fidelityOK(rawHTML []byte, article readability.Article) bool {
-	text := strings.TrimSpace(article.TextContent)
+	// /v2는 TextContent 필드 대신 RenderText — Node가 없으면 오류 = 빈 추출과 동일 취급.
+	var textBuf bytes.Buffer
+	if article.RenderText(&textBuf) != nil {
+		return false
+	}
+	text := strings.TrimSpace(textBuf.String())
 	if text == "" || len([]rune(text)) < fidelityMinChars {
 		return false
 	}
