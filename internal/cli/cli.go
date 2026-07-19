@@ -338,7 +338,10 @@ func listProjectDirs(storeRoot string) ([]string, error) {
 // ("GC 단독", 설계 §7) 삭제를 전혀 하지 않고 orphan blob GC만 수행하며 확인을 생략한다 —
 // 고아 blob은 정의상 미참조 데이터라 삭제 확인 규칙(데이터 삭제 대상) 밖이다. 그 외 모든
 // 경로는 삭제 전 confirmPurge로 확인해야 하며, --gc가 --older-than과 함께면 확인 후
-// 삭제→GC 순서로 수행한다.
+// 삭제→GC 순서로 수행한다. --sessions(설계 §5)는 session.db 파일 계열(purgeSessionFiles)을
+// 대상에 추가한다 — --older-than 없이 단독이면 "GC 단독"과 동형으로 content.db는 건드리지
+// 않고 세션 파일만 지우되(데이터 삭제라 확인은 생략하지 않는다), --older-than과 함께면
+// 선택 삭제 뒤에 이어서 지운다.
 func runPurge(ctx context.Context, in io.Reader, w io.Writer, storeRoot string, args []string, isTTY bool) error {
 	fs := flag.NewFlagSet("purge", flag.ContinueOnError)
 	project := fs.String("project", "", "purge 대상 프로젝트(ID 또는 경로)")
@@ -346,6 +349,7 @@ func runPurge(ctx context.Context, in io.Reader, w io.Writer, storeRoot string, 
 	olderThanFlag := fs.String("older-than", "", "time.ParseDuration 형식 — 지정 시 선택 삭제, 미지정 시 전체 삭제")
 	gc := fs.Bool("gc", false, "orphan blob GC 수행")
 	force := fs.Bool("force", false, "비TTY 환경에서 확인을 생략(자동화 전용)")
+	sessions := fs.Bool("sessions", false, "session.db 파일(계열, -wal/-shm 포함) 삭제 대상 포함 — .bak-*·recover-pending 마커는 제외(설계 §5)")
 	if err := fs.Parse(args); err != nil {
 		return fmt.Errorf("purge: 플래그 파싱 실패: %w", err)
 	}
@@ -378,7 +382,10 @@ func runPurge(ctx context.Context, in io.Reader, w io.Writer, storeRoot string, 
 	}
 
 	selective := *olderThanFlag != ""
-	gcOnly := *gc && !selective
+	// --sessions는 §5상 데이터 삭제이므로 "확인 생략" 전용인 gcOnly 모드에는 포함하지
+	// 않는다(고아 blob GC와 달리 session 이벤트는 참조되는 1차 데이터) — sessions가
+	// 주어지면 selective 여부와 무관하게 항상 confirmPurge를 거친다.
+	gcOnly := *gc && !selective && !*sessions
 	var cutoffUnix int64
 	if selective {
 		// 리뷰 P2-1: 파싱 실패 오류는 사용자 입력(*olderThanFlag)을 담은 err를 %w로 감싸지
@@ -428,17 +435,23 @@ func runPurge(ctx context.Context, in io.Reader, w io.Writer, storeRoot string, 
 		}
 
 		if gcOnly {
-			st, err := store.Open(projDir, true) // read-only — GC는 DB 쓰기가 없다
-			if err != nil {
+			if err := runGCOrphan(ctx, projDir); err != nil {
 				return err
 			}
-			_, gcErr := st.GCOrphanBlobs(ctx)
-			closeErr := st.Close()
-			if gcErr != nil {
-				return gcErr
+			continue
+		}
+
+		if !selective && *sessions {
+			// 세션 단독(older-than 없음, --gc 단독과 동형 선례) — content.db는 건드리지
+			// 않는다. §5 명문 계약: .bak-*·recover-pending 마커는 purgeSessionFiles가
+			// 애초에 대상으로 삼지 않으므로 잔존한다.
+			if err := purgeSessionFiles(projDir); err != nil {
+				return err
 			}
-			if closeErr != nil {
-				return closeErr
+			if *gc {
+				if err := runGCOrphan(ctx, projDir); err != nil {
+					return err
+				}
 			}
 			continue
 		}
@@ -450,12 +463,15 @@ func runPurge(ctx context.Context, in io.Reader, w io.Writer, storeRoot string, 
 			continue
 		}
 
-		// 선택 삭제 (+ 후속 --gc)
+		// 선택 삭제 (+ 후속 --sessions, + 후속 --gc)
 		st, err := store.Open(projDir, false)
 		if err != nil {
 			return err
 		}
 		_, _, purgeErr := st.PurgeOlderThan(ctx, cutoffUnix)
+		if purgeErr == nil && *sessions {
+			purgeErr = purgeSessionFiles(projDir)
+		}
 		if purgeErr == nil && *gc {
 			_, purgeErr = st.GCOrphanBlobs(ctx)
 		}
@@ -465,6 +481,54 @@ func runPurge(ctx context.Context, in io.Reader, w io.Writer, storeRoot string, 
 		}
 		if closeErr != nil {
 			return closeErr
+		}
+	}
+	return nil
+}
+
+// runGCOrphan: read-only store로 orphan blob GC만 수행한다(gcOnly·세션 단독+--gc 두 경로
+// 공용 — 둘 다 DB 쓰기가 없는 조회 기반 삭제라 read-only로 충분하다).
+func runGCOrphan(ctx context.Context, projDir string) error {
+	st, err := store.Open(projDir, true)
+	if err != nil {
+		return err
+	}
+	_, gcErr := st.GCOrphanBlobs(ctx)
+	closeErr := st.Close()
+	if gcErr != nil {
+		return gcErr
+	}
+	return closeErr
+}
+
+// sessionDBFiles: session.db 파일 계열(설계 §5 "session.db 파일 삭제 계열(-wal/-shm 포함)").
+// session.lock/session.init.lock(활성 프로세스 조정 파일)과 session.db.bak-<ts>·
+// session.recover-pending(수동 복구 자산)은 의도적으로 이 목록에 없다 — purgeSessionFiles는
+// 정확히 이 3개 이름만 지운다(글롭·접두사 매칭 없음 — 우발적 확장 삭제 방지).
+var sessionDBFiles = [3]string{"session.db", "session.db-wal", "session.db-shm"}
+
+// purgeSessionFiles: projDir/worktrees/*/ 하위 각 worktree 디렉터리에서 sessionDBFiles만
+// 삭제한다(설계 §5 purge 확장 — 경로 관례는 설계 §2.1 `projects/<pid>/worktrees/<wid>/
+// session.db`). worktrees/ 디렉터리가 아직 없으면(session 기능 미사용 프로젝트) 조용히
+// 통과한다. `.bak-<ts>` 파일·session.recover-pending 마커는 이름이 sessionDBFiles와 정확히
+// 일치하지 않으므로 자연히 보존된다(명문 계약, §5).
+func purgeSessionFiles(projDir string) error {
+	root := filepath.Join(projDir, "worktrees")
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return errors.New("purge: worktrees 목록 조회 실패")
+	}
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		for _, name := range sessionDBFiles {
+			if err := os.Remove(filepath.Join(root, e.Name(), name)); err != nil && !errors.Is(err, os.ErrNotExist) {
+				return errors.New("purge: session.db 삭제 실패")
+			}
 		}
 	}
 	return nil

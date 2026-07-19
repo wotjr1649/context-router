@@ -23,6 +23,7 @@ import (
 	sdk "github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/wotjr1649/context-router/internal/ident"
 	"github.com/wotjr1649/context-router/internal/mcp"
+	"github.com/wotjr1649/context-router/internal/session"
 	"github.com/wotjr1649/context-router/internal/store"
 )
 
@@ -95,6 +96,98 @@ func TestParseFlags_Projects(t *testing.T) {
 	}
 	if len(def.Projects) != 0 {
 		t.Fatalf("default Projects=%v want empty", def.Projects)
+	}
+}
+
+// TestParseRetentionEventsFlag — 브리프 Step1 ⑥: time.ParseDuration 표준 동작 그대로("720h"
+// OK, "30d"는 커스텀 단위라 오류) + 기본 off(빈 문자열=0)·음수 거부(설계 §5).
+func TestParseRetentionEventsFlag(t *testing.T) {
+	tests := []struct {
+		name    string
+		in      string
+		want    time.Duration
+		wantErr bool
+	}{
+		{"default_empty_is_off", "", 0, false},
+		{"720h_ok", "720h", 720 * time.Hour, false},
+		{"30d_rejected_no_custom_units", "30d", 0, true},
+		{"negative_rejected", "-1h", 0, true},
+		{"garbage_rejected", "abc", 0, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := parseRetentionEventsFlag(tt.in)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("err=%v wantErr=%v", err, tt.wantErr)
+			}
+			if err == nil && got != tt.want {
+				t.Fatalf("got=%v want=%v", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestRetentionSecFromDuration: --retention-events → session.Options.RetentionSec(초) 변환.
+func TestRetentionSecFromDuration(t *testing.T) {
+	if got := retentionSecFromDuration(720 * time.Hour); got != 720*3600 {
+		t.Fatalf("got=%d want %d", got, 720*3600)
+	}
+	if got := retentionSecFromDuration(0); got != 0 {
+		t.Fatalf("got=%d want 0", got)
+	}
+}
+
+// TestParseFlags_RetentionEvents: --retention-events가 parseFlags를 거쳐 serverFlags에
+// 실리고, 파싱 실패("30d")는 parseFlags 자체를 기동 거부시킨다(설계 §5).
+func TestParseFlags_RetentionEvents(t *testing.T) {
+	got, err := parseFlags([]string{"--retention-events", "720h"})
+	if err != nil {
+		t.Fatalf("err=%v", err)
+	}
+	if got.RetentionEvents != 720*time.Hour {
+		t.Fatalf("RetentionEvents=%v want 720h", got.RetentionEvents)
+	}
+
+	if _, err := parseFlags([]string{"--retention-events", "30d"}); err == nil {
+		t.Fatal("want error for \"30d\" (time.ParseDuration 표준 동작 — 커스텀 단위 미지원)")
+	}
+}
+
+// TestSweepSessionRetentionAtStart_LogsCountOnSuccess: 세션 DB가 열려 있을 때 시작 시 1회
+// 스윕 헬퍼가 삭제 건수를 stderr 1줄로 고지한다(설계 §5 "조용한 삭제 금지").
+func TestSweepSessionRetentionAtStart_LogsCountOnSuccess(t *testing.T) {
+	dir := t.TempDir()
+	d, err := session.Open(dir, session.Options{Producer: "test", RetentionSec: 1})
+	if err != nil {
+		t.Fatalf("session.Open: %v", err)
+	}
+	defer d.Close()
+
+	var stderr bytes.Buffer
+	sweepSessionRetentionAtStart(context.Background(), d, time.Now().Add(time.Hour), &stderr)
+	if !strings.Contains(stderr.String(), "session retention sweep") {
+		t.Fatalf("stderr=%q want mention of sweep result", stderr.String())
+	}
+}
+
+// TestSweepSessionRetentionAtStart_LogAndContinueOnFailure: Sweep이 실패해도(취소된 ctx로
+// 강제) 헬퍼는 오류를 반환하지 않고(반환값 없음 시그니처) stderr에만 실패를 남긴다
+// (log-and-continue, 설계 §5 "시작을 막지 않는다").
+func TestSweepSessionRetentionAtStart_LogAndContinueOnFailure(t *testing.T) {
+	dir := t.TempDir()
+	d, err := session.Open(dir, session.Options{Producer: "test", RetentionSec: 1})
+	if err != nil {
+		t.Fatalf("session.Open: %v", err)
+	}
+	defer d.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // 즉시 취소 — Sweep이 오류를 반환하도록 강제
+
+	var stderr bytes.Buffer
+	sweepSessionRetentionAtStart(ctx, d, time.Now(), &stderr)
+	if !strings.Contains(stderr.String(), "실패") {
+		t.Fatalf("stderr=%q want 실패 문구(log-and-continue)", stderr.String())
 	}
 }
 

@@ -498,6 +498,140 @@ func TestRunPurge_E2E_GCOnlyNoConfirm(t *testing.T) {
 	}
 }
 
+// TestRunPurge_SessionsTarget_StandaloneKeepsContentAndBackups: 브리프 Step1 ⑤ — --sessions
+// 단독(--older-than 없음)은 session.db 파일 계열(-wal/-shm 포함)만 지우고, content.db
+// 데이터·`.bak-<ts>` 파일·session.recover-pending 마커는 건드리지 않는다(설계 §5 명문 계약,
+// --gc 단독과 동형인 "세션 단독" 모드).
+func TestRunPurge_SessionsTarget_StandaloneKeepsContentAndBackups(t *testing.T) {
+	storeRoot := t.TempDir()
+	projectRoot := t.TempDir()
+	canon, err := ident.Canonicalize(projectRoot)
+	if err != nil {
+		t.Fatalf("canonicalize: %v", err)
+	}
+	projDir := filepath.Join(storeRoot, "projects", canon.ProjectID)
+	st, err := store.Open(projDir, false)
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	if _, err := st.Register(t.Context(), store.Registration{
+		StoredBytes: []byte("keep me"), MediaType: "text/plain",
+		Source: store.SourceMeta{URI: "/keep.txt", Kind: "file", SrcHash: "h-keep-sessions"},
+		Chunks: []store.Chunk{{Ordinal: 0, Text: "keep me"}},
+	}); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	wtDir := filepath.Join(projDir, "worktrees", "wt1")
+	if err := os.MkdirAll(wtDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"session.db", "session.db-wal", "session.db-shm"} {
+		if err := os.WriteFile(filepath.Join(wtDir, name), []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	const backupName = "session.db.bak-20260101T000000Z"
+	if err := os.WriteFile(filepath.Join(wtDir, backupName), []byte("backup"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(wtDir, "session.recover-pending"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	args := []string{"--project", projectRoot, "--force", "--sessions"}
+	if err := runPurge(context.Background(), failReader{}, &out, storeRoot, args, false); err != nil {
+		t.Fatalf("runPurge err=%v out=%s", err, out.String())
+	}
+
+	for _, name := range []string{"session.db", "session.db-wal", "session.db-shm"} {
+		if _, statErr := os.Stat(filepath.Join(wtDir, name)); !os.IsNotExist(statErr) {
+			t.Fatalf("%s 잔존: err=%v", name, statErr)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(wtDir, backupName)); err != nil {
+		t.Fatalf("백업 파일이 삭제됨: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(wtDir, "session.recover-pending")); err != nil {
+		t.Fatalf("recover-pending 마커가 삭제됨: %v", err)
+	}
+
+	st2, err := store.Open(projDir, true)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer st2.Close()
+	var n int
+	if err := st2.Reader().QueryRow("SELECT count(*) FROM sources").Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Fatalf("sources=%d want 1(세션 단독은 content를 건드리지 않음)", n)
+	}
+}
+
+// TestRunPurge_SessionsTarget_WithOlderThanAlsoPurgesContent: --sessions와 --older-than을
+// 함께 주면 선택 content 삭제(PurgeOlderThan) 뒤에 이어서 session.db 파일 계열도 지운다
+// (additive — "기존 purge 의미론에 정합", 브리프 Interfaces 문구).
+func TestRunPurge_SessionsTarget_WithOlderThanAlsoPurgesContent(t *testing.T) {
+	storeRoot := t.TempDir()
+	projectRoot := t.TempDir()
+	canon, err := ident.Canonicalize(projectRoot)
+	if err != nil {
+		t.Fatalf("canonicalize: %v", err)
+	}
+	projDir := filepath.Join(storeRoot, "projects", canon.ProjectID)
+	st, err := store.Open(projDir, false)
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	if _, err := st.Register(t.Context(), store.Registration{
+		StoredBytes: []byte("purge me too"), MediaType: "text/plain",
+		Source: store.SourceMeta{URI: "/purge2.txt", Kind: "file", SrcHash: "h-purge-sessions"},
+		Chunks: []store.Chunk{{Ordinal: 0, Text: "purge me too"}},
+	}); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	time.Sleep(1100 * time.Millisecond) // indexed_at은 unix 초 — --older-than 1ns가 경계를 넘도록
+
+	wtDir := filepath.Join(projDir, "worktrees", "wt1")
+	if err := os.MkdirAll(wtDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(wtDir, "session.db"), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	args := []string{"--project", projectRoot, "--force", "--older-than", "1ns", "--sessions"}
+	if err := runPurge(context.Background(), failReader{}, &out, storeRoot, args, false); err != nil {
+		t.Fatalf("runPurge err=%v out=%s", err, out.String())
+	}
+
+	if _, err := os.Stat(filepath.Join(wtDir, "session.db")); !os.IsNotExist(err) {
+		t.Fatalf("session.db 잔존: err=%v", err)
+	}
+	st2, err := store.Open(projDir, true)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer st2.Close()
+	var n int
+	if err := st2.Reader().QueryRow("SELECT count(*) FROM sources").Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Fatalf("sources=%d want 0(선택 삭제도 함께 수행돼야 함)", n)
+	}
+}
+
 // TestRunPurge_All_ContextCanceledStopsBeforeAnyDeletion: --all로 프로젝트 2개를 대상할 때
 // 이미 취소된 ctx를 주면 순회 첫 반복에서 즉시 멈춰야 한다(설계 §7 review 항목 — 다중 프로젝트
 // 순회의 주기적 ctx 검사) — 오류를 반환하고, 두 프로젝트 중 어느 쪽도 삭제되지 않아야 한다.

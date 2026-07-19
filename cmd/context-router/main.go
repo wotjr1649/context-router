@@ -16,10 +16,12 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/wotjr1649/context-router/internal/cli"
 	"github.com/wotjr1649/context-router/internal/ident"
 	"github.com/wotjr1649/context-router/internal/mcp"
+	"github.com/wotjr1649/context-router/internal/session"
 	"github.com/wotjr1649/context-router/internal/store"
 	"github.com/wotjr1649/context-router/internal/transform"
 )
@@ -32,6 +34,7 @@ type serverFlags struct {
 	Projects                    []string // --projects: global-search 전용 allowlist (설계 §8)
 	NetAllowLocal               bool
 	NetPorts                    []int
+	RetentionEvents             time.Duration // --retention-events: 0 = off/무기한 (설계 §5, D17)
 }
 
 func parseFlags(args []string) (serverFlags, error) {
@@ -53,6 +56,8 @@ func parseFlags(args []string) (serverFlags, error) {
 	fs.StringVar(&netPorts, "net-ports", "", "extra allowed ports for fetch_and_index (comma-separated)")
 	var projects string
 	fs.StringVar(&projects, "projects", "", "global-search project allowlist (comma-separated paths or IDs, required for --profile global-search)")
+	var retentionEvents string
+	fs.StringVar(&retentionEvents, "retention-events", "", "session event retention (time.ParseDuration format, e.g. 720h); default off (unlimited, 설계 §5)")
 	if err := fs.Parse(args); err != nil {
 		return serverFlags{}, err
 	}
@@ -81,7 +86,51 @@ func parseFlags(args []string) (serverFlags, error) {
 			f.NetPorts = append(f.NetPorts, n)
 		}
 	}
+	d, err := parseRetentionEventsFlag(retentionEvents)
+	if err != nil {
+		return serverFlags{}, err
+	}
+	f.RetentionEvents = d
 	return f, nil
+}
+
+// parseRetentionEventsFlag — --retention-events 값을 검증한다(설계 §5, D17). 빈 문자열(플래그
+// 미지정, 기본값)은 0(=off=무기한)으로 통과한다. time.ParseDuration 표준 동작을 그대로 쓴다 —
+// 커스텀 단위(예: "d")를 추가하지 않는다("30d"는 표준대로 오류, "720h"처럼 시간 단위로
+// 환산해서 써야 한다 — 기존 --older-than 선례와 동일 관례). 파싱 오류·음수 기간은 기동
+// 거부(사용자 입력 원문은 %w로 감싸지 않는다, cli 패키지 --older-than과 동일한 위생 관례).
+func parseRetentionEventsFlag(s string) (time.Duration, error) {
+	if s == "" {
+		return 0, nil
+	}
+	d, err := time.ParseDuration(s)
+	if err != nil {
+		return 0, errors.New("ctr: --retention-events 값이 유효한 기간이 아닙니다")
+	}
+	if d < 0 {
+		return 0, errors.New("ctr: --retention-events 값이 유효한 기간이 아닙니다")
+	}
+	return d, nil
+}
+
+// retentionSecFromDuration — 파싱된 --retention-events → session.Options.RetentionSec(초)
+// 변환(설계 §5). 0 Duration은 그대로 0(무기한/정책 미표명)으로 매핑된다.
+func retentionSecFromDuration(d time.Duration) int64 {
+	return int64(d / time.Second)
+}
+
+// sweepSessionRetentionAtStart — 서버 시작 시 1회 retention 스윕을 수행하는 헬퍼(설계 §5:
+// "시작 시 1회 트랜잭션 + 삭제 건수 stderr 1줄 고지, 실패는 log-and-continue"). now는 값
+// 주입(G7 결정론). 호출부는 아직 없다 — 현재 main.run()은 session.Open을 배선하지 않으므로
+// (mcp.Config.Session은 nil) 이 헬퍼를 부를 *session.DB가 없다. T10이 session.Open 조립을
+// 추가할 때 이 헬퍼를 그 자리에 합류시킨다(구조 결정 — task-8-report.md 참고).
+func sweepSessionRetentionAtStart(ctx context.Context, d *session.DB, now time.Time, stderr io.Writer) {
+	deleted, err := session.Sweep(ctx, d, now)
+	if err != nil {
+		fmt.Fprintf(stderr, "ctr: session retention sweep 실패(계속 진행): %v\n", err)
+		return
+	}
+	fmt.Fprintf(stderr, "ctr: session retention sweep: %d개 이벤트 삭제\n", deleted)
 }
 
 // validProfile: v0.0.1이 실제로 지원하는 두 형태뿐(mcp.NewServer가 Profile로 도구를

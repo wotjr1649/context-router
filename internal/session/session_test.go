@@ -641,3 +641,102 @@ func mustAppendID(t *testing.T, d *DB, ev Event) int64 {
 	}
 	return id
 }
+
+// --- Sweep (태스크 8, 설계 §5/D17) ---
+
+// TestSweep_PerSessionClockInjected — 브리프 Step1 ①②: 세션 A(retention 1h)·세션 B(미표명,
+// retention_sec=0) 시드 후 now+2h로 Sweep → A의 이벤트만 삭제되고(Open 자동 session_start 1건
+// + 수동 append 1건 = 2건), B는 불가침(G7 시계 주입 + M-4 회귀 — 전역 컷오프로 미표명 세션을
+// 뭉개지 않는다).
+func TestSweep_PerSessionClockInjected(t *testing.T) {
+	dir := t.TempDir()
+	dA := openT(t, dir, Options{Producer: "a", RetentionSec: 3600}) // 1h 표명
+	dB := openT(t, dir, Options{Producer: "b"})                     // 미표명(0)
+
+	idA := mustAppendID(t, dA, Event{Type: "note", Summary: "a-event"})
+	idB := mustAppendID(t, dB, Event{Type: "note", Summary: "b-event"})
+
+	deleted, err := Sweep(context.Background(), dA, time.Now().Add(2*time.Hour))
+	if err != nil {
+		t.Fatalf("Sweep: %v", err)
+	}
+	if deleted != 2 { // session_start(Open 자동) + a-event, 둘 다 A 소속
+		t.Fatalf("deleted=%d want 2(A의 session_start+a-event)", deleted)
+	}
+
+	var existsA, existsB int
+	if err := dA.Reader().QueryRow("SELECT COUNT(*) FROM session_events WHERE id=?", idA).Scan(&existsA); err != nil {
+		t.Fatal(err)
+	}
+	if existsA != 0 {
+		t.Fatal("A(retention 표명) 이벤트가 스윕 후에도 남아있음")
+	}
+	if err := dA.Reader().QueryRow("SELECT COUNT(*) FROM session_events WHERE id=?", idB).Scan(&existsB); err != nil {
+		t.Fatal(err)
+	}
+	if existsB != 1 {
+		t.Fatal("B(미표명) 이벤트가 삭제됨 — M-4 회귀(전역 컷오프 금지)")
+	}
+}
+
+// TestSweep_AllUndeclaredReturnsZero — 브리프 Step1 ③: 모든 세션이 retention 미표명이면
+// 아무리 먼 미래 now로 Sweep해도 삭제 0건.
+func TestSweep_AllUndeclaredReturnsZero(t *testing.T) {
+	dir := t.TempDir()
+	d := openT(t, dir, Options{Producer: "p"}) // retention 미표명
+	mustAppend(t, d, Event{Type: "note", Summary: "x"})
+
+	deleted, err := Sweep(context.Background(), d, time.Now().Add(999*time.Hour))
+	if err != nil {
+		t.Fatalf("Sweep: %v", err)
+	}
+	if deleted != 0 {
+		t.Fatalf("deleted=%d want 0(모든 세션 미표명 — off와 동치)", deleted)
+	}
+}
+
+// TestSweep_DanglingSupersedesAllowed — 브리프 Step1 ④: 교정 이벤트(B, A를 supersede)가
+// 스윕으로 삭제되면 원래 superseded였던 A가 Summarize에 재등장한다(설계 §5 — dangling
+// supersedes 허용, superseded 판정은 잔존 행 기준). B만 오래된 ts로 백데이트해 스윕이 B만
+// 지우고 A(최근)는 살리도록 구성한다.
+func TestSweep_DanglingSupersedesAllowed(t *testing.T) {
+	dir := t.TempDir()
+	d := openT(t, dir, Options{Producer: "p", RetentionSec: 3600}) // 1h 표명
+
+	aID := mustAppend(t, d, Event{Type: "decision", Summary: "first take"})
+	bRowID, bID, _, err := d.Append(Event{Type: "decision", Summary: "corrected", Supersedes: aID})
+	if err != nil {
+		t.Fatalf("append B: %v", err)
+	}
+
+	sumBefore, err := Summarize(context.Background(), d.Reader(), "", 5)
+	if err != nil {
+		t.Fatalf("Summarize(before): %v", err)
+	}
+	decisionsBefore := findGroup(sumBefore, "decision")
+	if decisionsBefore == nil || len(decisionsBefore.Events) != 1 || decisionsBefore.Events[0].EventID != bID {
+		t.Fatalf("스윕 전 decision group=%+v want 정확히 [%s](B)", decisionsBefore, bID)
+	}
+
+	old := time.Now().Add(-2 * time.Hour).Unix()
+	if _, err := d.writer.Exec("UPDATE session_events SET ts=? WHERE id=?", old, bRowID); err != nil {
+		t.Fatal(err)
+	}
+
+	deleted, err := Sweep(context.Background(), d, time.Now())
+	if err != nil {
+		t.Fatalf("Sweep: %v", err)
+	}
+	if deleted != 1 {
+		t.Fatalf("deleted=%d want 1(B만)", deleted)
+	}
+
+	sumAfter, err := Summarize(context.Background(), d.Reader(), "", 5)
+	if err != nil {
+		t.Fatalf("Summarize(after): %v", err)
+	}
+	decisionsAfter := findGroup(sumAfter, "decision")
+	if decisionsAfter == nil || len(decisionsAfter.Events) != 1 || decisionsAfter.Events[0].EventID != aID {
+		t.Fatalf("스윕 후 decision group=%+v want 정확히 [%s](A, dangling supersedes 복귀)", decisionsAfter, aID)
+	}
+}
