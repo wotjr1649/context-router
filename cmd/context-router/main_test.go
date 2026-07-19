@@ -113,6 +113,8 @@ func TestParseRetentionEventsFlag(t *testing.T) {
 		{"30d_rejected_no_custom_units", "30d", 0, true},
 		{"negative_rejected", "-1h", 0, true},
 		{"garbage_rejected", "abc", 0, true},
+		{"sub_second_positive_rejected", "500ms", 0, true}, // D4: 양수 sub-초는 0 절삭(무기한) 대신 거부
+		{"exactly_one_second_ok", "1s", time.Second, false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

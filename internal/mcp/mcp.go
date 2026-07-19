@@ -25,7 +25,7 @@ import (
 	"github.com/wotjr1649/context-router/internal/transform"
 )
 
-const serverVersion = "0.0.1"
+const serverVersion = "0.1.0"
 
 // Config — Serve/NewServer 입력 (설계 §4, §8).
 type Config struct {
@@ -794,6 +794,11 @@ func registerGlobalSearch(srv *mcp.Server, projects []GlobalProject) {
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, in SearchInput) (*mcp.CallToolResult, GlobalSearchOutput, error) {
 		if len(in.Queries) < 1 || len(in.Queries) > 8 {
 			return nil, GlobalSearchOutput{}, toolErr(codeInvalidArgument, "queries는 1~8개여야 합니다")
+		}
+		// E1(fable): 공유 SearchInput의 scope는 global-search에서 미지원 — 조용히 무시하지 않고
+		// 명시 거부한다(events/all은 세션 저장소 개념이 없는 global 표면에서 의미 없음).
+		if in.Scope != "" {
+			return nil, GlobalSearchOutput{}, toolErr(codeInvalidArgument, "global-search는 scope를 지원하지 않습니다")
 		}
 		limit := in.Limit
 		if limit <= 0 {

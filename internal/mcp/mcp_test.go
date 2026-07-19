@@ -1198,6 +1198,39 @@ func TestNewGlobalServerEmptyProjectsErrors(t *testing.T) {
 	}
 }
 
+// TestGlobalSearchRejectsScope — 최종리뷰 E1(fable): 공유 SearchInput의 scope는 global-search가
+// 지원하지 않으므로 조용히 무시하지 않고 INVALID_ARGUMENT로 거부한다.
+func TestGlobalSearchRejectsScope(t *testing.T) {
+	ctx := context.Background()
+	p := newGlobalTestProject(t, "proj-scope", "needle content\n")
+	srv, err := NewGlobalServer(GlobalConfig{Projects: []GlobalProject{p}})
+	if err != nil {
+		t.Fatalf("new global server: %v", err)
+	}
+	srvT, cliT := mcp.NewInMemoryTransports()
+	if _, err := srv.Connect(ctx, srvT, nil); err != nil {
+		t.Fatalf("server connect: %v", err)
+	}
+	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "0"}, nil)
+	cs, err := client.Connect(ctx, cliT, nil)
+	if err != nil {
+		t.Fatalf("client connect: %v", err)
+	}
+	defer cs.Close()
+
+	res, err := cs.CallTool(ctx, &mcp.CallToolParams{Name: "ctr_global_search",
+		Arguments: SearchInput{Queries: []string{"needle"}, Scope: "events"}})
+	if err != nil {
+		t.Fatalf("call: %v", err)
+	}
+	if !res.IsError {
+		t.Fatalf("want IsError=true for scope on global-search, got %+v", res.StructuredContent)
+	}
+	if text := res.Content[0].(*mcp.TextContent).Text; !strings.HasPrefix(text, "["+codeInvalidArgument+"]") {
+		t.Fatalf("want %s prefix, got %q", codeInvalidArgument, text)
+	}
+}
+
 // TestCtrFetchAndIndexDenied: AllowLocal=false에서 사설/루프백 목적지는 NETWORK_DENIED.
 func TestCtrFetchAndIndexDenied(t *testing.T) {
 	cs, _, _ := newNetTestServer(t, false, nil)

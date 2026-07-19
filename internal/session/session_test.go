@@ -73,6 +73,42 @@ func TestOpen_ReopenIdempotent(t *testing.T) {
 	}
 }
 
+// TestOpen_SessionStartWorktreeRoot — D3(fable, 설계 §2.2): session_start payload의
+// worktree_root는 Options.WorktreeRoot(사용자 worktree 경로)를 기록하고, 미주입 시 store 내부
+// dir로 폴백한다.
+func TestOpen_SessionStartWorktreeRoot(t *testing.T) {
+	readWorktreeRoot := func(t *testing.T, d *DB) string {
+		t.Helper()
+		var payload string
+		if err := d.Reader().QueryRow("SELECT payload FROM session_events WHERE event_type=? AND session_id=?",
+			eventTypeSessionStart, d.SessionID()).Scan(&payload); err != nil {
+			t.Fatalf("payload query: %v", err)
+		}
+		var p struct {
+			WorktreeRoot string `json:"worktree_root"`
+		}
+		if err := json.Unmarshal([]byte(payload), &p); err != nil {
+			t.Fatalf("payload unmarshal: %v", err)
+		}
+		return p.WorktreeRoot
+	}
+
+	t.Run("injected", func(t *testing.T) {
+		dir := t.TempDir()
+		d := openT(t, dir, Options{Producer: "context-router/test", WorktreeRoot: "/user/worktree/root"})
+		if got := readWorktreeRoot(t, d); got != "/user/worktree/root" {
+			t.Fatalf("worktree_root=%q want /user/worktree/root", got)
+		}
+	})
+	t.Run("fallback_to_dir", func(t *testing.T) {
+		dir := t.TempDir()
+		d := openT(t, dir, Options{Producer: "context-router/test"})
+		if got := readWorktreeRoot(t, d); got != dir {
+			t.Fatalf("worktree_root=%q want dir fallback %q", got, dir)
+		}
+	})
+}
+
 // TestOpen_SessionStartAndSessionsRow — 브리프 Step1 ③: session_start 자동 기록 +
 // sessions 행(producer·retention_sec)이 불변 메타로 남는다.
 func TestOpen_SessionStartAndSessionsRow(t *testing.T) {

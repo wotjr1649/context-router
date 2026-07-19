@@ -107,8 +107,11 @@ func parseRetentionEventsFlag(s string) (time.Duration, error) {
 	if err != nil {
 		return 0, errors.New("ctr: --retention-events 값이 유효한 기간이 아닙니다")
 	}
-	if d < 0 {
-		return 0, errors.New("ctr: --retention-events 값이 유효한 기간이 아닙니다")
+	// D4(Codex P2): 음수는 물론, 1초 미만 양수도 거부한다 — retentionSecFromDuration이 초 단위로
+	// 절삭해 500ms 같은 양수 기간이 0(무기한)으로 조용히 뭉개지는 경로를 차단한다(0=off는 빈
+	// 문자열로만 표현, 위에서 이미 처리).
+	if d < 0 || (d > 0 && d < time.Second) {
+		return 0, errors.New("ctr: --retention-events 값이 유효한 기간이 아닙니다 (1초 미만 양수 금지)")
 	}
 	return d, nil
 }
@@ -428,7 +431,11 @@ func run(ctx context.Context, args []string, stderr io.Writer) error {
 	// fail-closed(openSessionDB가 nil+stderr 경고로 흡수, content 도구는 영향 없음).
 	sessDB := openSessionDB(
 		filepath.Join(storeRoot, "projects", canon.ProjectID, "worktrees", canon.WorktreeID),
-		session.Options{RetentionSec: retentionSecFromDuration(f.RetentionEvents), Producer: fmt.Sprintf("context-router/%s", version)},
+		session.Options{
+			RetentionSec: retentionSecFromDuration(f.RetentionEvents),
+			Producer:     fmt.Sprintf("context-router/%s", version),
+			WorktreeRoot: canon.WorktreeRoot, // D3: session_start payload에 사용자 worktree 경로 주입(설계 §2.2)
+		},
 		stderr)
 	if sessDB != nil {
 		defer sessDB.Close() // lease 해제 — release 비멱등 1회(session.DB.Close 계약)

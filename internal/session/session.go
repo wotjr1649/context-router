@@ -103,6 +103,9 @@ type sessionStartPayload struct {
 type Options struct {
 	RetentionSec int64  // 0 = 무기한(정책 미표명)
 	Producer     string // "context-router/<version>" — sessions.producer로 불변 기록
+	// WorktreeRoot — session_start payload에 기록할 **사용자 worktree 경로**(설계 §2.2 의도).
+	// 빈 값이면 Open의 dir(store 내부 경로)로 폴백해 기존 동작을 유지한다(D3, fable).
+	WorktreeRoot string
 }
 
 // Event — ctr_record_event 입력 표현(redaction·검증 완료본, 설계 §3.1). Append가 event_id·
@@ -241,7 +244,12 @@ func Open(dir string, opts Options) (*DB, error) {
 		return nil, fmt.Errorf("session Open: sessions 행 삽입 실패: %w", txErr)
 	}
 
-	payload, _ := json.Marshal(sessionStartPayload{WorktreeRoot: dir, RetentionSec: opts.RetentionSec})
+	// D3: 사용자 worktree 경로를 기록한다(설계 §2.2). 미주입 시 store 내부 dir로 폴백.
+	worktreeRoot := opts.WorktreeRoot
+	if worktreeRoot == "" {
+		worktreeRoot = dir
+	}
+	payload, _ := json.Marshal(sessionStartPayload{WorktreeRoot: worktreeRoot, RetentionSec: opts.RetentionSec})
 	if _, _, _, appendErr := d.Append(Event{Type: eventTypeSessionStart, Summary: "session started", Attributes: payload}); appendErr != nil {
 		return nil, fmt.Errorf("session Open: session_start 이벤트 기록 실패: %w", appendErr)
 	}

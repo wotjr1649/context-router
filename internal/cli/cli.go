@@ -877,7 +877,7 @@ permissions (.claude/settings.json 예시 — ingest/net/global은 기본 ask):
 [mcp_servers.ctr]
 command = "context-router"
 args = []
-enabled_tools = ["ctr_search", "ctr_fetch", "ctr_transform"]
+enabled_tools = ["ctr_search", "ctr_fetch", "ctr_transform", "ctr_record_event", "ctr_session_summary", "ctr_export_events"]
 # ingest/net 활성화 시 권장: default_tools_approval_mode = "prompt"
 `
 
