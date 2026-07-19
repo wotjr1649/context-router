@@ -223,7 +223,7 @@ func TestRunPurge_OlderThanRejectsInvalidDuration(t *testing.T) {
 	for _, v := range []string{"-1h", "0s", "abc"} {
 		var out bytes.Buffer
 		args := []string{"--project", "whatever-id", "--force", "--older-than", v}
-		if err := runPurge(context.Background(), failReader{}, &out, io.Discard,t.TempDir(), args, false); err == nil {
+		if err := runPurge(context.Background(), failReader{}, &out, io.Discard, t.TempDir(), args, false); err == nil {
 			t.Fatalf("older-than=%q: want error, got nil", v)
 		}
 	}
@@ -237,7 +237,7 @@ func TestRunPurge_PhantomProjectRejected(t *testing.T) {
 	storeRoot := t.TempDir()
 	var out bytes.Buffer
 	args := []string{"--project", "does-not-exist-id", "--force", "--older-than", "1h"}
-	if err := runPurge(context.Background(), failReader{}, &out, io.Discard,storeRoot, args, false); err == nil {
+	if err := runPurge(context.Background(), failReader{}, &out, io.Discard, storeRoot, args, false); err == nil {
 		t.Fatal("want error for nonexistent project, got nil")
 	}
 	if _, err := os.Stat(filepath.Join(storeRoot, "projects", "does-not-exist-id")); !os.IsNotExist(err) {
@@ -388,7 +388,7 @@ func TestRunPurge_E2E_OlderThanForce(t *testing.T) {
 
 	var out bytes.Buffer
 	args := []string{"--project", projectRoot, "--force", "--older-than", "1ns"}
-	if err := runPurge(context.Background(), failReader{}, &out, io.Discard,storeRoot, args, false); err != nil {
+	if err := runPurge(context.Background(), failReader{}, &out, io.Discard, storeRoot, args, false); err != nil {
 		t.Fatalf("runPurge err=%v out=%s", err, out.String())
 	}
 
@@ -581,7 +581,7 @@ func TestRunPurge_SessionsTarget_StandaloneKeepsContentAndBackups(t *testing.T) 
 
 	var out bytes.Buffer
 	args := []string{"--project", projectRoot, "--force", "--sessions"}
-	if err := runPurge(context.Background(), failReader{}, &out, io.Discard,storeRoot, args, false); err != nil {
+	if err := runPurge(context.Background(), failReader{}, &out, io.Discard, storeRoot, args, false); err != nil {
 		t.Fatalf("runPurge err=%v out=%s", err, out.String())
 	}
 
@@ -648,7 +648,7 @@ func TestRunPurge_SessionsTarget_WithOlderThanAlsoPurgesContent(t *testing.T) {
 
 	var out bytes.Buffer
 	args := []string{"--project", projectRoot, "--force", "--older-than", "1ns", "--sessions"}
-	if err := runPurge(context.Background(), failReader{}, &out, io.Discard,storeRoot, args, false); err != nil {
+	if err := runPurge(context.Background(), failReader{}, &out, io.Discard, storeRoot, args, false); err != nil {
 		t.Fatalf("runPurge err=%v out=%s", err, out.String())
 	}
 
@@ -762,7 +762,7 @@ func TestRunPurge_All_PartiallyCreatedDirRemovedNotFailStuck(t *testing.T) {
 	}
 
 	var out bytes.Buffer
-	if err := runPurge(context.Background(), failReader{}, &out, io.Discard,storeRoot, []string{"--all", "--force"}, false); err != nil {
+	if err := runPurge(context.Background(), failReader{}, &out, io.Discard, storeRoot, []string{"--all", "--force"}, false); err != nil {
 		t.Fatalf("runPurge --all --force: %v (out=%s)", err, out.String())
 	}
 
@@ -807,7 +807,7 @@ func TestRunPurge_All_Selective_PartiallyCreatedDirSkipped(t *testing.T) {
 
 	var out bytes.Buffer
 	args := []string{"--all", "--force", "--older-than", "1ns"}
-	if err := runPurge(context.Background(), failReader{}, &out, io.Discard,storeRoot, args, false); err != nil {
+	if err := runPurge(context.Background(), failReader{}, &out, io.Discard, storeRoot, args, false); err != nil {
 		t.Fatalf("runPurge: %v (out=%s)", err, out.String())
 	}
 	if _, statErr := os.Stat(brokenDir); statErr != nil {

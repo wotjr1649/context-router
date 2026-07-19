@@ -11,7 +11,8 @@ import (
 // 고정 값으로 직접 삽입한다(같은 패키지 white-box 접근, 브리프 지시 — "테스트 헬퍼로 행을
 // 직접 삽입"). 컬럼 순서는 schemaV1과 동일. 반환값은 삽입된 행의 rowid(id).
 func insertRawEvent(t *testing.T, d *DB, eventID, sessionID, eventType string, ts int64, summary string,
-	payload, artifactRefs, related []byte, redaction, supersedes string) int64 {
+	payload, artifactRefs, related []byte, redaction, supersedes string,
+) int64 {
 	t.Helper()
 	res, err := d.writer.Exec(`INSERT INTO session_events(event_id, session_id, event_type, ts, summary, payload, artifact_refs, related, redaction, supersedes)
 		VALUES(?,?,?,?,?,?,?,?,?,?)`,
@@ -283,9 +284,11 @@ func TestExport_WireJSONShape(t *testing.T) {
 		t.Fatalf("unmarshal to map: %v", err)
 	}
 
-	wantKeys := []string{"schemaVersion", "eventId", "sessionId", "eventType", "timestamp",
+	wantKeys := []string{
+		"schemaVersion", "eventId", "sessionId", "eventType", "timestamp",
 		"summary", "artifactRefs", "relatedResources", "attributes", "privacyLabel",
-		"producer", "supersedes", "redaction"}
+		"producer", "supersedes", "redaction",
+	}
 	if len(m) != len(wantKeys) {
 		t.Fatalf("json=%s has %d keys want %d(%v)", b, len(m), len(wantKeys), wantKeys)
 	}

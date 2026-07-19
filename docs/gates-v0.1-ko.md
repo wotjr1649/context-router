@@ -55,3 +55,6 @@
   §3.4 "fail-closed의 도구 미등록 판정은 시작 시 1회 — 가동 중 발생한 손상은 등록된
   도구의 해당 호출 실패로 표면화된다"). 가동 중 손상 시나리오는 이번 게이트 범위 밖(T3·
   T7이 이미 STORAGE_UNAVAILABLE 매핑을 커버).
+- `openSessionDB`는 sentinel 3종(ErrCorrupt·ErrRecoverPending·ErrLeaseHeld)뿐 아니라 **비-
+  sentinel 예기치 못한 오류도 nil+계속으로 흡수**한다(원오류는 stderr 1줄 기록) — 세션 표면만
+  미등록되고 content 도구는 정상 서빙되는 가용성 트레이드오프(설계 §6.2). 최종리뷰 편승 명시.

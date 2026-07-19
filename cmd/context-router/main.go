@@ -436,7 +436,8 @@ func run(ctx context.Context, args []string, stderr io.Writer) error {
 			Producer:     fmt.Sprintf("context-router/%s", version),
 			WorktreeRoot: canon.WorktreeRoot, // D3: session_start payload에 사용자 worktree 경로 주입(설계 §2.2)
 		},
-		stderr)
+		stderr,
+	)
 	if sessDB != nil {
 		defer sessDB.Close() // lease 해제 — release 비멱등 1회(session.DB.Close 계약)
 		sweepSessionRetentionAtStart(ctx, sessDB, time.Now(), stderr)

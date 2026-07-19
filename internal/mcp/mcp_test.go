@@ -1218,8 +1218,10 @@ func TestGlobalSearchRejectsScope(t *testing.T) {
 	}
 	defer cs.Close()
 
-	res, err := cs.CallTool(ctx, &mcp.CallToolParams{Name: "ctr_global_search",
-		Arguments: SearchInput{Queries: []string{"needle"}, Scope: "events"}})
+	res, err := cs.CallTool(ctx, &mcp.CallToolParams{
+		Name:      "ctr_global_search",
+		Arguments: SearchInput{Queries: []string{"needle"}, Scope: "events"},
+	})
 	if err != nil {
 		t.Fatalf("call: %v", err)
 	}
@@ -1336,8 +1338,10 @@ func TestSearchScopeEvents(t *testing.T) {
 	origID := mustAppend(t, sess, session.Event{Type: "decision", Summary: "adopt widgetfoo approach"})
 	newID := mustAppend(t, sess, session.Event{Type: "decision", Summary: "revise widgetfoo approach", Supersedes: origID})
 
-	res, err := cs.CallTool(context.Background(), &mcp.CallToolParams{Name: "ctr_search",
-		Arguments: SearchInput{Queries: []string{"widgetfoo"}, Scope: "events"}})
+	res, err := cs.CallTool(context.Background(), &mcp.CallToolParams{
+		Name:      "ctr_search",
+		Arguments: SearchInput{Queries: []string{"widgetfoo"}, Scope: "events"},
+	})
 	if err != nil {
 		t.Fatalf("call: %v", err)
 	}
@@ -1387,8 +1391,10 @@ func TestSearchScopeEventsBudget(t *testing.T) {
 		mustAppend(t, sess, session.Event{Type: "note", Summary: summary})
 	}
 
-	res, err := cs.CallTool(context.Background(), &mcp.CallToolParams{Name: "ctr_search",
-		Arguments: SearchInput{Queries: []string{"budgettoken"}, Scope: "events", Limit: n, MaxReturnBytes: 300}})
+	res, err := cs.CallTool(context.Background(), &mcp.CallToolParams{
+		Name:      "ctr_search",
+		Arguments: SearchInput{Queries: []string{"budgettoken"}, Scope: "events", Limit: n, MaxReturnBytes: 300},
+	})
 	if err != nil {
 		t.Fatalf("call: %v", err)
 	}
@@ -1413,8 +1419,10 @@ func TestSearchScopeAll(t *testing.T) {
 	indexNeedle(t, cs, canon, "gizmoqux")
 	mustAppend(t, sess, session.Event{Type: "note", Summary: "gizmoqux discussion recap"})
 
-	res, err := cs.CallTool(context.Background(), &mcp.CallToolParams{Name: "ctr_search",
-		Arguments: SearchInput{Queries: []string{"gizmoqux"}, Scope: "all"}})
+	res, err := cs.CallTool(context.Background(), &mcp.CallToolParams{
+		Name:      "ctr_search",
+		Arguments: SearchInput{Queries: []string{"gizmoqux"}, Scope: "all"},
+	})
 	if err != nil {
 		t.Fatalf("call: %v", err)
 	}
@@ -1443,8 +1451,10 @@ func TestSearchScopeRequiresSessionForEventsAndAll(t *testing.T) {
 
 	for _, scope := range []string{"events", "all"} {
 		t.Run(scope, func(t *testing.T) {
-			res, err := cs.CallTool(ctx, &mcp.CallToolParams{Name: "ctr_search",
-				Arguments: SearchInput{Queries: []string{"anything"}, Scope: scope}})
+			res, err := cs.CallTool(ctx, &mcp.CallToolParams{
+				Name:      "ctr_search",
+				Arguments: SearchInput{Queries: []string{"anything"}, Scope: scope},
+			})
 			if err != nil {
 				t.Fatalf("call: %v", err)
 			}
@@ -1647,7 +1657,7 @@ func TestRecordEventCapViolations(t *testing.T) {
 			EventType:        "note",                          // 4
 			Summary:          strings.Repeat("s", 2048),       // 2048
 			Attributes:       mapAttrsOfSize(4000),            // 4000
-			RelatedResources: []string{item, item},           // 948 → 소계 7000
+			RelatedResources: []string{item, item},            // 948 → 소계 7000
 			ArtifactRefs:     make([]int64, maxRefsOrRelated), // +119×16 = 1904 → 8904
 		}
 		recordEventErrPrefix(t, cs, in, codeInvalidArgument)
@@ -2207,8 +2217,10 @@ func mustAppend(t *testing.T, sess *session.DB, ev session.Event) string {
 // 추가로 append하기 전 현재 세션의 next_after를 조회해 커서 시작점으로 쓴다.
 func exportBaseline(t *testing.T, cs *mcp.ClientSession, sessionID string) int64 {
 	t.Helper()
-	res, err := cs.CallTool(context.Background(), &mcp.CallToolParams{Name: "ctr_export_events",
-		Arguments: ExportEventsInput{SessionID: sessionID, Limit: maxExportLimit}})
+	res, err := cs.CallTool(context.Background(), &mcp.CallToolParams{
+		Name:      "ctr_export_events",
+		Arguments: ExportEventsInput{SessionID: sessionID, Limit: maxExportLimit},
+	})
 	if err != nil {
 		t.Fatalf("exportBaseline call: %v", err)
 	}
@@ -2336,8 +2348,10 @@ func TestExportEvents_CursorPagination(t *testing.T) {
 	var got []string
 	lastAfter := after
 	for i := 0; i < 10; i++ { // 안전 상한(무한루프 방지)
-		res, err := cs.CallTool(ctx, &mcp.CallToolParams{Name: "ctr_export_events",
-			Arguments: ExportEventsInput{After: after, SessionID: sess.SessionID(), Limit: 2}})
+		res, err := cs.CallTool(ctx, &mcp.CallToolParams{
+			Name:      "ctr_export_events",
+			Arguments: ExportEventsInput{After: after, SessionID: sess.SessionID(), Limit: 2},
+		})
 		if err != nil {
 			t.Fatalf("call: %v", err)
 		}
@@ -2385,8 +2399,10 @@ func TestExportEvents_MaxReturnBytesTruncatesWithoutLoss(t *testing.T) {
 
 	// C4: 예산 계상이 summary가 아니라 직렬화 전체이므로, 이벤트 1건 직렬화 크기(L)를 실측해
 	// 2건치 예산(2L)을 잡는다 — 1건은 항상 진행(무손실), 5건은 여러 배치로 절단된다.
-	big, err := cs.CallTool(ctx, &mcp.CallToolParams{Name: "ctr_export_events",
-		Arguments: ExportEventsInput{After: after, SessionID: sess.SessionID(), MaxReturnBytes: 1 << 20}})
+	big, err := cs.CallTool(ctx, &mcp.CallToolParams{
+		Name:      "ctr_export_events",
+		Arguments: ExportEventsInput{After: after, SessionID: sess.SessionID(), MaxReturnBytes: 1 << 20},
+	})
 	if err != nil {
 		t.Fatalf("probe call: %v", err)
 	}
@@ -2404,8 +2420,10 @@ func TestExportEvents_MaxReturnBytesTruncatesWithoutLoss(t *testing.T) {
 	var got []string
 	sawTruncated := false
 	for i := 0; i < 20; i++ { // 안전 상한(무한루프 방지)
-		res, err := cs.CallTool(ctx, &mcp.CallToolParams{Name: "ctr_export_events",
-			Arguments: ExportEventsInput{After: after, SessionID: sess.SessionID(), MaxReturnBytes: budget}})
+		res, err := cs.CallTool(ctx, &mcp.CallToolParams{
+			Name:      "ctr_export_events",
+			Arguments: ExportEventsInput{After: after, SessionID: sess.SessionID(), MaxReturnBytes: budget},
+		})
 		if err != nil {
 			t.Fatalf("call: %v", err)
 		}
@@ -2450,8 +2468,10 @@ func TestExportEvents_IncludesSuperseded(t *testing.T) {
 	oldID := mustAppend(t, sess, session.Event{Type: "decision", Summary: "first take"})
 	newID := mustAppend(t, sess, session.Event{Type: "decision", Summary: "corrected", Supersedes: oldID})
 
-	res, err := cs.CallTool(ctx, &mcp.CallToolParams{Name: "ctr_export_events",
-		Arguments: ExportEventsInput{SessionID: sess.SessionID()}})
+	res, err := cs.CallTool(ctx, &mcp.CallToolParams{
+		Name:      "ctr_export_events",
+		Arguments: ExportEventsInput{SessionID: sess.SessionID()},
+	})
 	if err != nil {
 		t.Fatalf("call: %v", err)
 	}
