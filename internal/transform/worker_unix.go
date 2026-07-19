@@ -96,7 +96,7 @@ func selfApplyMemLimit() error {
 		return fmt.Errorf("transform: /proc/self/statm 파싱 실패: %w", err)
 	}
 	lim := syscall.Rlimit{Cur: uint64(rlimitASBytes(currentVA, int64(n))), Max: existing.Max}
-	if lim.Cur > lim.Max { // 기존 hard limit이 요청값(headroom 포함)보다 낮으면 그 한도까지만
+	if lim.Cur > lim.Max { // 기존 hard limit이 요청값(currentVA+cap)보다 낮으면 그 한도까지만
 		lim.Cur = lim.Max
 	}
 	if err := syscall.Setrlimit(syscall.RLIMIT_AS, &lim); err != nil {
