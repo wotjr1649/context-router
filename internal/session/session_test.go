@@ -1,6 +1,7 @@
 package session
 
 import (
+	"context"
 	"errors"
 	"os"
 	"path/filepath"
@@ -392,5 +393,152 @@ func TestOpen_ColdStartInitLockContention(t *testing.T) {
 	dbPath := filepath.Join(dir, dbFileName)
 	if _, err := os.Stat(dbPath); err != nil {
 		t.Fatalf("session.db 없음: %v", err)
+	}
+}
+
+// --- Summarize (태스크 4, 설계 §3.2) ---
+
+func mustAppend(t *testing.T, d *DB, ev Event) string {
+	t.Helper()
+	_, eventID, _, err := d.Append(ev)
+	if err != nil {
+		t.Fatalf("append(%+v): %v", ev, err)
+	}
+	return eventID
+}
+
+func findGroup(sum Summary, eventType string) *EventGroup {
+	for i := range sum.Groups {
+		if sum.Groups[i].EventType == eventType {
+			return &sum.Groups[i]
+		}
+	}
+	return nil
+}
+
+// TestSummarize_GroupsByTypeTimeDescendingAcrossSessions — 브리프 Step1 ①: 3세션(별도 Open)
+// 분량 시드 후 session_id 무필터 Summarize → 타입별 그룹, 그룹 내 시간(삽입) 역순, 세션 경계를
+// 넘어 worktree 전체가 기본 범위(설계 §2.4).
+func TestSummarize_GroupsByTypeTimeDescendingAcrossSessions(t *testing.T) {
+	dir := t.TempDir()
+	d1 := openT(t, dir, Options{Producer: "test/s1"})
+	d2 := openT(t, dir, Options{Producer: "test/s2"})
+	d3 := openT(t, dir, Options{Producer: "test/s3"})
+
+	e1 := mustAppend(t, d1, Event{Type: "note", Summary: "n1-from-s1", ArtifactRefs: []string{"artifact://x/sha256-abc"}})
+	e2 := mustAppend(t, d2, Event{Type: "note", Summary: "n2-from-s2"})
+	e3 := mustAppend(t, d3, Event{Type: "note", Summary: "n3-from-s3"})
+	dID := mustAppend(t, d1, Event{Type: "decision", Summary: "picked A"})
+
+	sum, err := Summarize(context.Background(), d3.Reader(), "", 5)
+	if err != nil {
+		t.Fatalf("Summarize: %v", err)
+	}
+	if sum.Checkpoint != nil {
+		t.Fatalf("Checkpoint=%+v want nil (no session_checkpoint seeded)", sum.Checkpoint)
+	}
+
+	notes := findGroup(sum, "note")
+	if notes == nil || len(notes.Events) != 3 {
+		t.Fatalf("note group=%+v want 3 events", notes)
+	}
+	gotIDs := []string{notes.Events[0].EventID, notes.Events[1].EventID, notes.Events[2].EventID}
+	wantIDs := []string{e3, e2, e1} // 삽입 역순(가장 최근 먼저)
+	for i := range wantIDs {
+		if gotIDs[i] != wantIDs[i] {
+			t.Fatalf("note group order=%v want %v", gotIDs, wantIDs)
+		}
+	}
+	if len(notes.Events[2].ArtifactRefs) != 1 || notes.Events[2].ArtifactRefs[0] != "artifact://x/sha256-abc" {
+		t.Fatalf("e1.ArtifactRefs=%v want [artifact://x/sha256-abc]", notes.Events[2].ArtifactRefs)
+	}
+
+	decisions := findGroup(sum, "decision")
+	if decisions == nil || len(decisions.Events) != 1 || decisions.Events[0].EventID != dID {
+		t.Fatalf("decision group=%+v want 1 event id=%s", decisions, dID)
+	}
+}
+
+// TestSummarize_SessionIDFilter — 브리프 Step1 ②: session_id 지정 시 해당 세션 이벤트만.
+func TestSummarize_SessionIDFilter(t *testing.T) {
+	dir := t.TempDir()
+	d1 := openT(t, dir, Options{Producer: "test/s1"})
+	d2 := openT(t, dir, Options{Producer: "test/s2"})
+
+	mustAppend(t, d1, Event{Type: "note", Summary: "from-s1"})
+	mustAppend(t, d2, Event{Type: "note", Summary: "from-s2"})
+
+	sum, err := Summarize(context.Background(), d1.Reader(), d1.SessionID(), 5)
+	if err != nil {
+		t.Fatalf("Summarize: %v", err)
+	}
+	notes := findGroup(sum, "note")
+	if notes == nil || len(notes.Events) != 1 || notes.Events[0].Summary != "from-s1" {
+		t.Fatalf("note group=%+v want exactly [from-s1]", notes)
+	}
+}
+
+// TestSummarize_SupersededExcluded — 브리프 Step1 ③: A를 B가 supersede → A는 그룹에서 제외,
+// B만 남는다(idx_ev_sup 활용 질의).
+func TestSummarize_SupersededExcluded(t *testing.T) {
+	dir := t.TempDir()
+	d := openT(t, dir, Options{Producer: "test/sup"})
+
+	aID := mustAppend(t, d, Event{Type: "decision", Summary: "first take"})
+	bID := mustAppend(t, d, Event{Type: "decision", Summary: "corrected", Supersedes: aID})
+
+	sum, err := Summarize(context.Background(), d.Reader(), "", 5)
+	if err != nil {
+		t.Fatalf("Summarize: %v", err)
+	}
+	decisions := findGroup(sum, "decision")
+	if decisions == nil || len(decisions.Events) != 1 || decisions.Events[0].EventID != bID {
+		t.Fatalf("decision group=%+v want exactly [%s] (A superseded)", decisions, bID)
+	}
+}
+
+// TestSummarize_CheckpointSelection — 브리프 Step1 ④ 세션 계층 몫: 최신 비superseded
+// session_checkpoint 선정(더 늦게 append됐지만 superseded된 것은 무시) + groups 비중복(선정된
+// checkpoint는 자신의 타입 그룹에서 제외되고, 나머지 비superseded checkpoint는 그룹에 남는다).
+func TestSummarize_CheckpointSelection(t *testing.T) {
+	dir := t.TempDir()
+	d := openT(t, dir, Options{Producer: "test/cp"})
+
+	cpOld := mustAppend(t, d, Event{Type: "session_checkpoint", Summary: "cp-old"})
+	cpSuperseded := mustAppend(t, d, Event{Type: "session_checkpoint", Summary: "cp-superseded"})
+	cpFinal := mustAppend(t, d, Event{Type: "session_checkpoint", Summary: "cp-final", Supersedes: cpSuperseded})
+
+	sum, err := Summarize(context.Background(), d.Reader(), "", 5)
+	if err != nil {
+		t.Fatalf("Summarize: %v", err)
+	}
+	if sum.Checkpoint == nil || sum.Checkpoint.EventID != cpFinal {
+		t.Fatalf("Checkpoint=%+v want event_id=%s(cp-final)", sum.Checkpoint, cpFinal)
+	}
+	grp := findGroup(sum, "session_checkpoint")
+	if grp == nil || len(grp.Events) != 1 || grp.Events[0].EventID != cpOld {
+		t.Fatalf("session_checkpoint group=%+v want exactly [%s(cp-old)] (cp-final deduped, cp-superseded excluded)", grp, cpOld)
+	}
+}
+
+// TestSummarize_LimitPerTypeClamps — limitPerType이 그대로 타입별 반환 개수 상한으로
+// 작동한다(가장 최근 N개, 클램프 자체는 mcp 소관 — 여기선 값 전달만 검증).
+func TestSummarize_LimitPerTypeClamps(t *testing.T) {
+	dir := t.TempDir()
+	d := openT(t, dir, Options{Producer: "test/limit"})
+	var last string
+	for i := 0; i < 7; i++ {
+		last = mustAppend(t, d, Event{Type: "note", Summary: "n"})
+	}
+	sum, err := Summarize(context.Background(), d.Reader(), "", 3)
+	if err != nil {
+		t.Fatalf("Summarize: %v", err)
+	}
+	notes := findGroup(sum, "note")
+	if notes == nil || len(notes.Events) != 3 {
+		t.Fatalf("note group len=%v want 3(limitPerType)", notes)
+	}
+	if notes.Events[0].EventID != last {
+		t.Fatalf("note group[0]=%s want most recent %s", notes.Events[0].EventID, last)
 	}
 }

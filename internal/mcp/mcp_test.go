@@ -1501,3 +1501,356 @@ func TestRecordEventSchemaGating(t *testing.T) {
 		}
 	}
 }
+
+// --- ctr_session_summary (태스크 4, 설계 §3.2) ---
+
+// newSummaryTestServer: newRecordEventTestServer와 동형이지만 sessionDir·storeDir을 모두
+// 반환한다(session_id 필터 테스트가 같은 session.db를 가리키는 2번째 session.Open을 필요로
+// 하고, ledger 테스트가 storeDir을 필요로 함 — 기존 헬퍼 시그니처는 7개 호출부를 건드리게 돼
+// 별도로 둔다).
+func newSummaryTestServer(t *testing.T) (cs *mcp.ClientSession, st *store.Store, sess *session.DB, sessionDir, storeDir string) {
+	t.Helper()
+	canon, err := ident.Canonicalize(t.TempDir())
+	if err != nil {
+		t.Fatalf("canonicalize: %v", err)
+	}
+	storeDir = t.TempDir()
+	st, err = store.Open(storeDir, false)
+	if err != nil {
+		t.Fatalf("store open: %v", err)
+	}
+	t.Cleanup(func() { st.Close() })
+	sessionDir = t.TempDir()
+	sess, err = session.Open(sessionDir, session.Options{Producer: "test/session-summary"})
+	if err != nil {
+		t.Fatalf("session open: %v", err)
+	}
+	t.Cleanup(func() { sess.Close() })
+
+	srv, err := NewServer(Config{Canon: canon, Store: st, SelfExe: testSelfExe(t), Session: sess})
+	if err != nil {
+		t.Fatalf("new server: %v", err)
+	}
+	srvT, cliT := mcp.NewInMemoryTransports()
+	ctx := context.Background()
+	if _, err := srv.Connect(ctx, srvT, nil); err != nil {
+		t.Fatalf("server connect: %v", err)
+	}
+	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "0"}, nil)
+	cs, err = client.Connect(ctx, cliT, nil)
+	if err != nil {
+		t.Fatalf("client connect: %v", err)
+	}
+	t.Cleanup(func() { cs.Close() })
+	return cs, st, sess, sessionDir, storeDir
+}
+
+// findSummaryGroup: 응답 groups에서 event_type이 일치하는 그룹을 찾는다(테스트 공용 헬퍼).
+func findSummaryGroup(out SessionSummaryOutput, eventType string) *summaryGroup {
+	for i := range out.Groups {
+		if out.Groups[i].EventType == eventType {
+			return &out.Groups[i]
+		}
+	}
+	return nil
+}
+
+// TestSummary_RoundTrip: 브리프 Step1 ①⑦ — 타입 그룹·시간 역순·artifact_refs 왕복·untrusted:true.
+func TestSummary_RoundTrip(t *testing.T) {
+	cs, _, sess, _, _ := newSummaryTestServer(t)
+	ctx := context.Background()
+
+	mustAppend(t, sess, session.Event{Type: "decision", Summary: "chose A"})
+	mustAppend(t, sess, session.Event{Type: "decision", Summary: "chose B"})
+	mustAppend(t, sess, session.Event{Type: "note", Summary: "fyi"})
+
+	res, err := cs.CallTool(ctx, &mcp.CallToolParams{Name: "ctr_session_summary", Arguments: SessionSummaryInput{}})
+	if err != nil {
+		t.Fatalf("call: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("summary error: %+v", res.Content)
+	}
+	var out SessionSummaryOutput
+	remarshal(t, res.StructuredContent, &out)
+
+	if !out.Untrusted {
+		t.Fatalf("Untrusted=false want true")
+	}
+	decisions := findSummaryGroup(out, "decision")
+	if decisions == nil || len(decisions.Events) != 2 {
+		t.Fatalf("decision group=%+v want 2 events", decisions)
+	}
+	if decisions.Events[0].Summary != "chose B" || decisions.Events[1].Summary != "chose A" {
+		t.Fatalf("decision order=%+v want [chose B, chose A] (time desc)", decisions.Events)
+	}
+	notes := findSummaryGroup(out, "note")
+	if notes == nil || len(notes.Events) != 1 || notes.Events[0].Summary != "fyi" {
+		t.Fatalf("note group=%+v want exactly [fyi]", notes)
+	}
+}
+
+// TestSummary_SessionIDFilter: 브리프 Step1 ② — session_id 지정 시 다른 세션 이벤트가 섞이지
+// 않는다(같은 worktree session.db에 2번째 session.Open으로 별도 세션을 만든다).
+func TestSummary_SessionIDFilter(t *testing.T) {
+	cs, _, sess1, sessionDir, _ := newSummaryTestServer(t)
+	ctx := context.Background()
+	mustAppend(t, sess1, session.Event{Type: "note", Summary: "from-sess1"})
+
+	sess2, err := session.Open(sessionDir, session.Options{Producer: "test/session-summary-2"})
+	if err != nil {
+		t.Fatalf("session2 open: %v", err)
+	}
+	t.Cleanup(func() { sess2.Close() })
+	mustAppend(t, sess2, session.Event{Type: "note", Summary: "from-sess2"})
+
+	res, err := cs.CallTool(ctx, &mcp.CallToolParams{Name: "ctr_session_summary", Arguments: SessionSummaryInput{SessionID: sess1.SessionID()}})
+	if err != nil {
+		t.Fatalf("call: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("summary error: %+v", res.Content)
+	}
+	var out SessionSummaryOutput
+	remarshal(t, res.StructuredContent, &out)
+
+	notes := findSummaryGroup(out, "note")
+	if notes == nil || len(notes.Events) != 1 || notes.Events[0].Summary != "from-sess1" {
+		t.Fatalf("note group=%+v want exactly [from-sess1]", notes)
+	}
+}
+
+// TestSummary_CheckpointIncludedAndDedupedFromGroups: 브리프 Step1 ④(1/2) — 최신 checkpoint가
+// checkpoint 필드에 실리고 groups에는 중복되지 않는다.
+func TestSummary_CheckpointIncludedAndDedupedFromGroups(t *testing.T) {
+	cs, _, sess, _, _ := newSummaryTestServer(t)
+	ctx := context.Background()
+	mustAppend(t, sess, session.Event{Type: "session_checkpoint", Summary: "cp-old"})
+	cpID := mustAppend(t, sess, session.Event{Type: "session_checkpoint", Summary: "cp-latest"})
+
+	res, err := cs.CallTool(ctx, &mcp.CallToolParams{Name: "ctr_session_summary", Arguments: SessionSummaryInput{}})
+	if err != nil {
+		t.Fatalf("call: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("summary error: %+v", res.Content)
+	}
+	var out SessionSummaryOutput
+	remarshal(t, res.StructuredContent, &out)
+
+	if out.Checkpoint == nil || out.Checkpoint.EventID != cpID || out.Checkpoint.Summary != "cp-latest" {
+		t.Fatalf("checkpoint=%+v want event_id=%s(cp-latest)", out.Checkpoint, cpID)
+	}
+	grp := findSummaryGroup(out, "session_checkpoint")
+	for _, e := range grp.Events {
+		if e.EventID == cpID {
+			t.Fatalf("checkpoint event duplicated in groups: %+v", grp)
+		}
+	}
+}
+
+// TestSummary_CheckpointBudgetOmitted: 브리프 Step1 ④(2/2) — checkpoint 단독으로
+// max_return_bytes를 초과하면 생략되고(checkpoint 필드 없음) checkpoint_truncated로 표시한다
+// (hard cap 유지 — 예산을 넘겨 싣지 않음, 설계 §3.2).
+func TestSummary_CheckpointBudgetOmitted(t *testing.T) {
+	cs, _, sess, _, _ := newSummaryTestServer(t)
+	ctx := context.Background()
+	mustAppend(t, sess, session.Event{Type: "session_checkpoint", Summary: strings.Repeat("c", 100)})
+
+	res, err := cs.CallTool(ctx, &mcp.CallToolParams{Name: "ctr_session_summary", Arguments: SessionSummaryInput{MaxReturnBytes: 10}})
+	if err != nil {
+		t.Fatalf("call: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("summary error: %+v", res.Content)
+	}
+	var out SessionSummaryOutput
+	remarshal(t, res.StructuredContent, &out)
+
+	if out.Checkpoint != nil {
+		t.Fatalf("checkpoint=%+v want nil(omitted, 100B > 10B budget)", out.Checkpoint)
+	}
+	if !out.CheckpointTruncated {
+		t.Fatalf("CheckpointTruncated=false want true")
+	}
+}
+
+// TestSummary_GroupTruncatedUnderBudget: 브리프 Step1 ⑥ — 그룹별 truncated 개별 표기(예산
+// 소진 지점의 그룹만 truncated:true, 하드캡 유지로 예산 초과 없이 절단).
+func TestSummary_GroupTruncatedUnderBudget(t *testing.T) {
+	cs, _, sess, _, _ := newSummaryTestServer(t)
+	ctx := context.Background()
+	for i := 0; i < 5; i++ {
+		mustAppend(t, sess, session.Event{Type: "note", Summary: strings.Repeat("n", 50)})
+	}
+
+	res, err := cs.CallTool(ctx, &mcp.CallToolParams{Name: "ctr_session_summary", Arguments: SessionSummaryInput{MaxReturnBytes: 120}})
+	if err != nil {
+		t.Fatalf("call: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("summary error: %+v", res.Content)
+	}
+	var out SessionSummaryOutput
+	remarshal(t, res.StructuredContent, &out)
+
+	notes := findSummaryGroup(out, "note")
+	if notes == nil {
+		t.Fatalf("note group missing: %+v", out)
+	}
+	if !notes.Truncated {
+		t.Fatalf("note.Truncated=false want true(5x50B > 120B budget)")
+	}
+	if len(notes.Events) == 0 || len(notes.Events) >= 5 {
+		t.Fatalf("note.Events len=%d want 0<n<5(budget-limited)", len(notes.Events))
+	}
+}
+
+// TestSummary_MissingArtifactRef: 브리프 Step1 ⑤ — content.db에 없는 hash를 가리키는
+// artifact_refs는 missing:true(D15 hint, 오류 아님 — 호출 자체는 성공한다).
+func TestSummary_MissingArtifactRef(t *testing.T) {
+	cs, st, sess, _, _ := newSummaryTestServer(t)
+	ctx := context.Background()
+
+	id, err := st.Register(ctx, store.Registration{
+		StoredBytes: []byte("present"), MediaType: "text/plain",
+		Source: store.SourceMeta{URI: "/p.txt", Kind: "file", SrcHash: "h1"},
+	})
+	if err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	presentHash, err := st.ArtifactHashByID(ctx, id)
+	if err != nil {
+		t.Fatalf("hash: %v", err)
+	}
+	presentURI := "artifact://" + sess.SessionID() + "/sha256-" + presentHash
+	missingURI := "artifact://" + sess.SessionID() + "/sha256-" + strings.Repeat("0", 64)
+
+	mustAppend(t, sess, session.Event{Type: "note", Summary: "refs", ArtifactRefs: []string{presentURI, missingURI}})
+
+	res, err := cs.CallTool(ctx, &mcp.CallToolParams{Name: "ctr_session_summary", Arguments: SessionSummaryInput{}})
+	if err != nil {
+		t.Fatalf("call: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("summary error(missing는 hint여야지 오류가 아님): %+v", res.Content)
+	}
+	var out SessionSummaryOutput
+	remarshal(t, res.StructuredContent, &out)
+
+	notes := findSummaryGroup(out, "note")
+	if notes == nil || len(notes.Events) != 1 || len(notes.Events[0].ArtifactRefs) != 2 {
+		t.Fatalf("note group=%+v want 1 event with 2 refs", notes)
+	}
+	refs := notes.Events[0].ArtifactRefs
+	if refs[0].URI != presentURI || refs[0].Missing {
+		t.Fatalf("present ref=%+v want missing=false", refs[0])
+	}
+	if refs[1].URI != missingURI || !refs[1].Missing {
+		t.Fatalf("missing ref=%+v want missing=true", refs[1])
+	}
+}
+
+// TestSummary_LimitClamp: limit 기본 5·최대 20(초과 클램프).
+func TestSummary_LimitClamp(t *testing.T) {
+	cs, _, sess, _, _ := newSummaryTestServer(t)
+	ctx := context.Background()
+	for i := 0; i < 25; i++ {
+		mustAppend(t, sess, session.Event{Type: "note", Summary: fmt.Sprintf("n%02d", i)})
+	}
+
+	res, err := cs.CallTool(ctx, &mcp.CallToolParams{Name: "ctr_session_summary", Arguments: SessionSummaryInput{}})
+	if err != nil {
+		t.Fatalf("call: %v", err)
+	}
+	var out SessionSummaryOutput
+	remarshal(t, res.StructuredContent, &out)
+	if notes := findSummaryGroup(out, "note"); notes == nil || len(notes.Events) != 5 {
+		t.Fatalf("default limit note group len=%v want 5", notes)
+	}
+
+	res2, err := cs.CallTool(ctx, &mcp.CallToolParams{Name: "ctr_session_summary", Arguments: SessionSummaryInput{Limit: 999}})
+	if err != nil {
+		t.Fatalf("call: %v", err)
+	}
+	var out2 SessionSummaryOutput
+	remarshal(t, res2.StructuredContent, &out2)
+	if notes := findSummaryGroup(out2, "note"); notes == nil || len(notes.Events) != 20 {
+		t.Fatalf("limit=999 note group len=%v want 20(clamped)", notes)
+	}
+}
+
+// TestSummary_SchemaGating: Session이 있으면 기본 표면에 등장(ReadOnlyHint=true)하고, 없으면
+// 등장하지 않는다(registerRecordEvent와 동일 게이트).
+func TestSummary_SchemaGating(t *testing.T) {
+	cs, _, _, _, _ := newSummaryTestServer(t)
+	lt, err := cs.ListTools(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("list tools: %v", err)
+	}
+	var tool *mcp.Tool
+	for _, tl := range lt.Tools {
+		if tl.Name == "ctr_session_summary" {
+			tool = tl
+		}
+	}
+	if tool == nil {
+		t.Fatalf("ctr_session_summary not in tools/list: %+v", lt.Tools)
+	}
+	if tool.Annotations == nil || !tool.Annotations.ReadOnlyHint {
+		t.Fatalf("ctr_session_summary ReadOnlyHint want true, got %+v", tool.Annotations)
+	}
+
+	csNoSession, _ := newTestServer(t, nil)
+	lt2, err := csNoSession.ListTools(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("list tools (no session): %v", err)
+	}
+	for _, tl := range lt2.Tools {
+		if tl.Name == "ctr_session_summary" {
+			t.Fatalf("ctr_session_summary should not be registered when Session is nil")
+		}
+	}
+}
+
+// TestSummary_LedgerAppend: 호출마다 LedgerAppend(ctr_record_event 패턴 승계).
+func TestSummary_LedgerAppend(t *testing.T) {
+	cs, _, sess, _, storeDir := newSummaryTestServer(t)
+	ctx := context.Background()
+	mustAppend(t, sess, session.Event{Type: "note", Summary: "s"})
+
+	res, err := cs.CallTool(ctx, &mcp.CallToolParams{Name: "ctr_session_summary", Arguments: SessionSummaryInput{}})
+	if err != nil {
+		t.Fatalf("call: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("summary error: %+v", res.Content)
+	}
+
+	stats, err := store.LedgerStats(storeDir)
+	if err != nil {
+		t.Fatalf("LedgerStats: %v", err)
+	}
+	found := false
+	for _, s := range stats {
+		if s.Tool == "ctr_session_summary" {
+			found = true
+			if s.Calls != 1 {
+				t.Fatalf("ctr_session_summary calls=%d want 1", s.Calls)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("ctr_session_summary ledger row missing: %+v", stats)
+	}
+}
+
+// mustAppend: session.DB.Append의 테스트 공용 래퍼(event_id만 필요한 호출부용).
+func mustAppend(t *testing.T, sess *session.DB, ev session.Event) string {
+	t.Helper()
+	_, eventID, _, err := sess.Append(ev)
+	if err != nil {
+		t.Fatalf("append(%+v): %v", ev, err)
+	}
+	return eventID
+}

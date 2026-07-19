@@ -8,8 +8,6 @@ import (
 	"fmt"
 	"io/fs"
 	"log/slog"
-	"net/url"
-	"regexp"
 	"slices"
 	"sort"
 	"strings"
@@ -87,6 +85,7 @@ func NewServer(cfg Config) (*mcp.Server, error) {
 	}
 	if cfg.Session != nil {
 		registerRecordEvent(srv, cfg.Store, cfg.Session)
+		registerSessionSummary(srv, cfg.Store, cfg.Session)
 	}
 	return srv, nil
 }
@@ -588,181 +587,6 @@ func registerFetchAndIndex(srv *mcp.Server, st *store.Store, allowLocal bool, ex
 			Untrusted: true,
 		}
 		st.LedgerAppend("ctr_fetch_and_index", rep.ByteLength, jsonLen(out), time.Since(start).Milliseconds())
-		return nil, out, nil
-	})
-}
-
-// --- ctr_record_event (설계 §3.1) ---
-
-const (
-	maxEventTypeBytes   = 64
-	maxSummaryBytes     = 2048
-	maxAttributesBytes  = 4096
-	maxRefsOrRelated    = 16 // artifact_refs·related_resources 공용 개수 상한
-	maxRelatedItemBytes = 512
-	maxEventTotalBytes  = 8192
-	redactedFieldMarker = "«REDACTED»" // attributes·related가 redaction 후 파싱 불가할 때의 강등 마커(평문)
-)
-
-var eventTypeRe = regexp.MustCompile(`^[a-z0-9_]+$`)
-
-// RecordEventInput.Attributes는 map[string]any다(json.RawMessage가 아님) — jsonschema-go의
-// 타입 추론이 []byte 기반 json.RawMessage를 "byte 배열"로 잘못 유추해 object 입력을 거부하는
-// 문제를 피한다(실측: mcp.AddTool 반사 스키마가 attributes를 array로 선언해 정상 JSON 객체
-// 호출이 클라이언트 측 스키마 검증에서 거부됨). map[string]any는 jsonschema-go에서 object로
-// 정확히 추론된다.
-type RecordEventInput struct {
-	EventType        string         `json:"event_type" jsonschema:"이벤트 타입, [a-z0-9_]+, 최대 64바이트"`
-	Summary          string         `json:"summary" jsonschema:"요약, 1~2048바이트"`
-	Attributes       map[string]any `json:"attributes,omitempty" jsonschema:"JSON 객체, 직렬화 최대 4096바이트"`
-	ArtifactRefs     []int64        `json:"artifact_refs,omitempty" jsonschema:"참조할 artifact ID, 최대 16개"`
-	RelatedResources []string       `json:"related_resources,omitempty" jsonschema:"관련 리소스 URI(스킴 필수), 최대 16개·항목당 512바이트"`
-	Supersedes       string         `json:"supersedes,omitempty" jsonschema:"교정 대상 event_id(기록 시점 존재 검증)"`
-}
-
-type RecordEventOutput struct {
-	EventID   string `json:"event_id"`
-	SessionID string `json:"session_id"`
-	Ts        int64  `json:"ts"`
-}
-
-// validateRecordEventInput: 형식·상한 검증(설계 §3.1 Global Constraints) — event_type·summary·
-// attributes(직렬화된 attrBytes)·artifact_refs 개수를 먼저 확인한 뒤, related_resources 각
-// 항목의 길이·URI 스킴을 검사하며 이벤트 직렬화 총합(≤8KB)을 누적한다.
-func validateRecordEventInput(in RecordEventInput, attrBytes []byte) error {
-	switch {
-	case len(in.EventType) > maxEventTypeBytes || !eventTypeRe.MatchString(in.EventType):
-		return toolErr(codeInvalidArgument, "event_type은 [a-z0-9_]+이고 64바이트 이하여야 합니다")
-	case len(in.Summary) == 0 || len(in.Summary) > maxSummaryBytes:
-		return toolErr(codeInvalidArgument, "summary는 1~2048바이트여야 합니다")
-	case len(attrBytes) > maxAttributesBytes:
-		return toolErr(codeInvalidArgument, "attributes는 4096바이트 이하여야 합니다")
-	case len(in.ArtifactRefs) > maxRefsOrRelated:
-		return toolErr(codeInvalidArgument, "artifact_refs는 16개 이하여야 합니다")
-	case len(in.RelatedResources) > maxRefsOrRelated:
-		return toolErr(codeInvalidArgument, "related_resources는 16개 이하여야 합니다")
-	}
-	total := len(in.EventType) + len(in.Summary) + len(attrBytes) + len(in.Supersedes)
-	for _, r := range in.RelatedResources {
-		if len(r) > maxRelatedItemBytes {
-			return toolErr(codeInvalidArgument, "related_resources 항목은 512바이트 이하여야 합니다")
-		}
-		if u, err := url.Parse(r); err != nil || u.Scheme == "" {
-			return toolErr(codeInvalidArgument, "related_resources 항목은 스킴을 포함한 URI여야 합니다")
-		}
-		total += len(r)
-	}
-	if total > maxEventTotalBytes {
-		return toolErr(codeInvalidArgument, "이벤트 직렬화 총합이 8192바이트를 초과했습니다")
-	}
-	return nil
-}
-
-// resolveArtifactRefs: artifact_id → content_hash(store.ArtifactHashByID) → 정본 URI
-// `artifact://<session_id>/sha256-<hash>`(설계 §3.1 — 세션 성분은 출처 표시일 뿐, 해석 시에는
-// hash만 쓴다). 미존재 id는 INVALID_ARGUMENT(store.ErrNotFound를 NOT_FOUND로 흘려보내지 않음
-// — supersedes의 NOT_FOUND와 의미가 다르다).
-func resolveArtifactRefs(ctx context.Context, st *store.Store, sessionID string, ids []int64) ([]string, error) {
-	if len(ids) == 0 {
-		return nil, nil
-	}
-	uris := make([]string, len(ids))
-	for i, id := range ids {
-		hash, err := st.ArtifactHashByID(ctx, id)
-		if errors.Is(err, store.ErrNotFound) {
-			return nil, toolErr(codeInvalidArgument, fmt.Sprintf("artifact_refs[%d]=%d 없음", i, id))
-		}
-		if err != nil {
-			return nil, toToolError(err)
-		}
-		uris[i] = fmt.Sprintf("artifact://%s/sha256-%s", sessionID, hash)
-	}
-	return uris, nil
-}
-
-// redactEventFields: summary(원문)·attributes(직렬화된 JSON)·related_resources(직렬화된 JSON
-// 배열)에 각각 ingest.Redact를 적용한다(설계 §3.1·§4). attributes는 redaction 후 json.Valid로
-// 재검증해 실패 시 필드 전체를 단일 redacted 문자열로 강등한다(브리프 T3 이관 계약). spans
-// 합계가 하나라도 있으면 전체 이벤트 redaction을 "spans"로 표시한다.
-func redactEventFields(summary string, attributes []byte, related []string) (redSummary string, redAttrs json.RawMessage, redRelated []string, redaction string) {
-	sOut, spans := ingest.Redact([]byte(summary))
-	redSummary = string(sOut)
-
-	if len(attributes) > 0 {
-		aOut, n := ingest.Redact(attributes)
-		spans += n
-		if !json.Valid(aOut) {
-			aOut, _ = json.Marshal(redactedFieldMarker) // 강등 — 유효 JSON 문자열 보장
-		}
-		redAttrs = aOut
-	}
-
-	if len(related) > 0 {
-		raw, _ := json.Marshal(related)
-		rOut, n := ingest.Redact(raw)
-		spans += n
-		var parsed []string
-		if json.Unmarshal(rOut, &parsed) == nil {
-			redRelated = parsed
-		} else {
-			redRelated = []string{redactedFieldMarker}
-		}
-	}
-
-	redaction = "none"
-	if spans > 0 {
-		redaction = "spans"
-	}
-	return redSummary, redAttrs, redRelated, redaction
-}
-
-// recordEventFromInput: attributes(map) 직렬화→검증→artifact_refs 해석→redaction까지 마친
-// session.Event를 만든다(registerRecordEvent 핸들러의 ≤2 구체 호출 규약 — 여기 1개 +
-// sess.Append 1개). attributes가 비어 있으면 attrBytes는 nil(직렬화 생략, "attributes 없음"과
-// "attributes={}"를 구분하지 않는다 — YAGNI).
-func recordEventFromInput(ctx context.Context, st *store.Store, sessionID string, in RecordEventInput) (session.Event, error) {
-	var attrBytes []byte
-	if len(in.Attributes) > 0 {
-		b, err := json.Marshal(in.Attributes)
-		if err != nil {
-			return session.Event{}, toolErr(codeInvalidArgument, "attributes 직렬화에 실패했습니다")
-		}
-		attrBytes = b
-	}
-	if err := validateRecordEventInput(in, attrBytes); err != nil {
-		return session.Event{}, err
-	}
-	refs, err := resolveArtifactRefs(ctx, st, sessionID, in.ArtifactRefs)
-	if err != nil {
-		return session.Event{}, err
-	}
-	summary, attrs, related, redaction := redactEventFields(in.Summary, attrBytes, in.RelatedResources)
-	return session.Event{
-		Type: in.EventType, Summary: summary, Attributes: attrs,
-		ArtifactRefs: refs, Related: related, Supersedes: in.Supersedes,
-		Redaction: redaction,
-	}, nil
-}
-
-func registerRecordEvent(srv *mcp.Server, st *store.Store, sess *session.DB) {
-	destructive := false
-	mcp.AddTool(srv, &mcp.Tool{
-		Name: "ctr_record_event",
-		Description: "세션 이벤트 1건을 기록한다 — 이벤트는 요약+포인터다: 대용량은 ctr_index로 " +
-			"저장하고 artifact_refs로 가리킨다(이벤트 직렬화 총합 8192바이트 이하).",
-		Annotations: &mcp.ToolAnnotations{DestructiveHint: &destructive},
-	}, func(ctx context.Context, _ *mcp.CallToolRequest, in RecordEventInput) (*mcp.CallToolResult, RecordEventOutput, error) {
-		start := time.Now()
-		ev, err := recordEventFromInput(ctx, st, sess.SessionID(), in)
-		if err != nil {
-			return nil, RecordEventOutput{}, err
-		}
-		_, eventID, ts, err := sess.Append(ev)
-		if err != nil {
-			return nil, RecordEventOutput{}, toToolError(err)
-		}
-		out := RecordEventOutput{EventID: eventID, SessionID: sess.SessionID(), Ts: ts}
-		st.LedgerAppend("ctr_record_event", 0, jsonLen(out), time.Since(start).Milliseconds())
 		return nil, out, nil
 	})
 }

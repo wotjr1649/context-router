@@ -422,6 +422,25 @@ func Query(ctx context.Context, st *store.Store, projectRoot string, queries []s
 	return results, nil
 }
 
+// ArtifactHashExists: content.db(store)에 content_hash가 존재하는지(ctr_session_summary의
+// artifact_refs missing 힌트 판정, 설계 §3.2·D15). store 패키지의 조회 표면에는 hash→존재
+// 여부 API가 없고(설계 §8 "store 변경은 소형 예외 2건만" — 둘 다 T1에서 이미 소진: 잠금
+// shared 모드·ArtifactHashByID), session 패키지는 "session→store 조회만"(raw SQL로 store
+// 스키마를 유출하지 않음, §8)이라 이 조회를 가질 수 없다. search 패키지는 이미 st.Reader()로
+// artifacts 테이블에 raw SQL을 실행하는 기존 패턴(Query, 위)을 갖고 있고 설계 §8이 "search에
+// 이벤트 질의 함수 추가"까지 예고하므로, store를 변경하지 않고 이 조회의 자연스러운 소유자다.
+func ArtifactHashExists(ctx context.Context, st *store.Store, hash string) (bool, error) {
+	var exists int
+	err := st.Reader().QueryRowContext(ctx, "SELECT 1 FROM artifacts WHERE content_hash=? LIMIT 1", hash).Scan(&exists)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
 // applyBudget: hits(이미 점수순 정렬됨)를 순서대로 채우다 스니펫 바이트 누적합이 share를
 // 초과하는 hit을 만나면 그 hit부터 절단한다(설계 §4.1 예산 배분).
 func applyBudget(hits []Hit, share int) (kept []Hit, used int, truncated bool) {
