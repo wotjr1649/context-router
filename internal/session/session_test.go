@@ -7,6 +7,7 @@ import (
 	"sort"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/wotjr1649/context-router/internal/store"
 )
@@ -123,16 +124,24 @@ func TestOpen_RecoverMarkerBlocks(t *testing.T) {
 	release()
 }
 
-// TestOpen_CorruptHeaderFailsClosed — 브리프 Step1 ⑤ / G8 전반부: DB 파일 헤더 훼손 후
-// Open → ErrCorrupt, 원본 파일 바이트는 불변.
+// TestOpen_CorruptHeaderFailsClosed — 브리프 Step1 ⑤ / G8: DB 파일 헤더 훼손 후 Open →
+// ErrCorrupt, family(session.db + -wal/-shm) 전체 바이트가 불변(설계 §6.2 fail-closed:
+// "원본 DB family 일체 불변"). openT 대신 직접 Open/Close — t.Cleanup 이중 Close 방지
+// (리뷰 Minor: Close는 DB당 정확히 1회만).
 func TestOpen_CorruptHeaderFailsClosed(t *testing.T) {
 	dir := t.TempDir()
-	d := openT(t, dir, Options{Producer: "p"})
+	d, err := Open(dir, Options{Producer: "p"})
+	if err != nil {
+		t.Fatal(err)
+	}
 	if err := d.Close(); err != nil {
 		t.Fatal(err)
 	}
 
 	dbPath := filepath.Join(dir, dbFileName)
+	walPath := dbPath + "-wal"
+	shmPath := dbPath + "-shm"
+
 	f, err := os.OpenFile(dbPath, os.O_WRONLY, 0o600)
 	if err != nil {
 		t.Fatal(err)
@@ -144,10 +153,9 @@ func TestOpen_CorruptHeaderFailsClosed(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	before, err := os.ReadFile(dbPath)
-	if err != nil {
-		t.Fatal(err)
-	}
+	beforeDB := readFileOrNil(t, dbPath)
+	beforeWAL, beforeWALErr := os.ReadFile(walPath)
+	beforeSHM, beforeSHMErr := os.ReadFile(shmPath)
 
 	d2, err := Open(dir, Options{Producer: "p"})
 	if d2 != nil {
@@ -157,13 +165,27 @@ func TestOpen_CorruptHeaderFailsClosed(t *testing.T) {
 		t.Fatalf("err=%v want ErrCorrupt", err)
 	}
 
-	after, err := os.ReadFile(dbPath)
+	afterDB := readFileOrNil(t, dbPath)
+	if !bytesEqual(beforeDB, afterDB) {
+		t.Fatal("session.db 바이트가 실패한 Open 시도 중 변경됨 — 원본 불변 위반")
+	}
+	afterWAL, afterWALErr := os.ReadFile(walPath)
+	if (beforeWALErr == nil) != (afterWALErr == nil) || !bytesEqual(beforeWAL, afterWAL) {
+		t.Fatal("session.db-wal이 실패한 Open 시도 중 생성/변경됨 — family 불변 위반")
+	}
+	afterSHM, afterSHMErr := os.ReadFile(shmPath)
+	if (beforeSHMErr == nil) != (afterSHMErr == nil) || !bytesEqual(beforeSHM, afterSHM) {
+		t.Fatal("session.db-shm이 실패한 Open 시도 중 생성/변경됨 — family 불변 위반")
+	}
+}
+
+func readFileOrNil(t *testing.T, path string) []byte {
+	t.Helper()
+	b, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !bytesEqual(before, after) {
-		t.Fatal("session.db 바이트가 실패한 Open 시도 중 변경됨 — 원본 불변 위반")
-	}
+	return b
 }
 
 func bytesEqual(a, b []byte) bool {
@@ -275,5 +297,70 @@ func TestAppend_ConcurrentAcrossConnections(t *testing.T) {
 	}
 	if total != perConn*2 {
 		t.Fatalf("session_events(g2_test) 행 수=%d want %d", total, perConn*2)
+	}
+}
+
+// TestOpen_ColdStartInitLockContention — 리뷰 Important 회귀: 두 호스트가 같은 신규(파일
+// 없는) worktree를 동시 콜드스타트하면 둘 다 isNew=true로 session.init.lock을 다투는데,
+// 예전 코드는 재시도가 없어 패자의 Open() 자체가 실패했다(설계 §6.2 ②는 init.lock을
+// "기존 lockStore 패턴" — 대기 후 진행 — 으로 명시). 경합이 우연에 기대지 않도록, 테스트가
+// 먼저 session.init.lock을 선점해 두 Open() 고루틴을 강제로 재시도 루프에 들어가게 한 뒤
+// 놓아준다 — 그래야 실제 경합 창이 보장된다("형식적 테스트 금지").
+func TestOpen_ColdStartInitLockContention(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	// 두 Open() 모두 session.db가 없는 상태에서 시작하도록, init.lock을 테스트가 먼저 잡아
+	// 두 고루틴 모두 acquireInitLock의 재시도 루프에 들어갈 수밖에 없게 만든다.
+	release, err := store.AcquireLock(filepath.Join(dir, initLockFileName), false)
+	if err != nil {
+		t.Fatalf("사전 점유 실패: %v", err)
+	}
+
+	type result struct {
+		d   *DB
+		err error
+	}
+	results := make(chan result, 2)
+	launch := func() {
+		d, err := Open(dir, Options{Producer: "p"})
+		results <- result{d, err}
+	}
+	go launch()
+	go launch()
+
+	// acquireInitLock의 초기 백오프는 10ms — 50ms면 두 고루틴 모두 최소 1회 이상 실패를
+	// 겪고 재시도 대기 중임을 보장하기에 충분하다(store.go lockStore와 동일 백오프 수치).
+	time.Sleep(50 * time.Millisecond)
+	release()
+
+	r1 := <-results
+	r2 := <-results
+
+	if r1.err != nil {
+		t.Fatalf("첫 번째 Open 실패: %v", r1.err)
+	}
+	if r2.err != nil {
+		t.Fatalf("두 번째 Open 실패(콜드스타트 경합 패자 구제 실패 — 리뷰 Important 회귀): %v", r2.err)
+	}
+	defer r1.d.Close()
+	defer r2.d.Close()
+
+	if r1.d.SessionID() == "" || r2.d.SessionID() == "" || r1.d.SessionID() == r2.d.SessionID() {
+		t.Fatalf("session_id 이상: r1=%q r2=%q (서로 다른 비어있지 않은 값이어야 함)", r1.d.SessionID(), r2.d.SessionID())
+	}
+
+	if _, _, _, err := r1.d.Append(Event{Type: "note", Summary: "from d1"}); err != nil {
+		t.Fatalf("d1 append: %v", err)
+	}
+	if _, _, _, err := r2.d.Append(Event{Type: "note", Summary: "from d2"}); err != nil {
+		t.Fatalf("d2 append: %v", err)
+	}
+
+	dbPath := filepath.Join(dir, dbFileName)
+	if _, err := os.Stat(dbPath); err != nil {
+		t.Fatalf("session.db 없음: %v", err)
 	}
 }

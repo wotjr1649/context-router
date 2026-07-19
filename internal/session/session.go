@@ -153,11 +153,11 @@ func Open(dir string, opts Options) (*DB, error) {
 
 	var initRelease func()
 	if isNew {
-		rel, initLockErr := store.AcquireLock(filepath.Join(dir, initLockFileName), false)
-		if initLockErr != nil {
-			return nil, fmt.Errorf("session Open: session.init.lock 배타 잠금 획득 실패: %w", initLockErr)
+		rel, initErr := acquireInitLock(filepath.Join(dir, initLockFileName), dbPath)
+		if initErr != nil {
+			return nil, initErr
 		}
-		initRelease = rel
+		initRelease = rel // nil이면 경합 승자가 이미 생성을 끝낸 것을 감지해 락 없이 합류
 	}
 	defer func() {
 		if initRelease != nil {
@@ -229,6 +229,33 @@ func Open(dir string, opts Options) (*DB, error) {
 	d.leaseRelease = leaseRelease
 	ok = true
 	return d, nil
+}
+
+// acquireInitLock — session.init.lock을 store.go의 lockStore()와 동일한 유계 백오프(10ms→
+// 20→40→80→160ms 유지, 총 5초)로 재시도한다(설계 §6.2 ②: "기존 lockStore 패턴" — 대기 없는
+// 즉시 거부는 계약 미달, 리뷰 Important). 두 호스트가 같은 신규 worktree를 동시 콜드스타트하면
+// 패자는 매 실패 후 dbPath를 재확인해, 승자가 이미 생성을 끝냈으면(파일 존재) 락 없이
+// nil,nil을 반환해 호출자가 기존 파일 경로(isNew=false와 동형)로 합류하게 한다. 유계 초과 시
+// ErrLeaseHeld로 표면화(toToolError가 매핑 가능하도록 신규 sentinel 대신 기존 3종 재사용).
+func acquireInitLock(lockPath, dbPath string) (func(), error) {
+	deadline := time.Now().Add(5 * time.Second)
+	delay := 10 * time.Millisecond
+	for {
+		release, err := store.AcquireLock(lockPath, false)
+		if err == nil {
+			return release, nil
+		}
+		if _, statErr := os.Stat(dbPath); statErr == nil {
+			return nil, nil // 승자가 이미 생성 완료 — 락 없이 기존 파일 경로로 합류
+		}
+		if time.Now().After(deadline) {
+			return nil, fmt.Errorf("session Open: session.init.lock 대기 초과: %w: %v", ErrLeaseHeld, err)
+		}
+		time.Sleep(delay)
+		if delay < 160*time.Millisecond {
+			delay *= 2
+		}
+	}
 }
 
 // migrate — store.go의 migrate()와 동형(설계 §2.1). PRAGMA user_version==0이면 스키마
