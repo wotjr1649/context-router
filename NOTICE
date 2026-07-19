@@ -136,7 +136,7 @@ Copyright: Copyright (c) 2017 The Bazel Authors. All rights reserved.
 
 --------------------------------------------------------------------------------
 Module:    golang.org/x/net
-Version:   v0.55.0
+Version:   v0.57.0
 License:   BSD-3-Clause
 Copyright: Copyright 2009 The Go Authors.
 
@@ -148,13 +148,13 @@ Copyright: Copyright 2009 The Go Authors.
 
 --------------------------------------------------------------------------------
 Module:    golang.org/x/sys
-Version:   v0.46.0
+Version:   v0.47.0
 License:   BSD-3-Clause
 Copyright: Copyright 2009 The Go Authors.
 
 --------------------------------------------------------------------------------
 Module:    golang.org/x/text
-Version:   v0.37.0
+Version:   v0.40.0
 License:   BSD-3-Clause
 Copyright: Copyright 2009 The Go Authors.
 
