@@ -1,1 +1,6 @@
 .superpowers/
+
+# 게이트 10 수동 스모크 산출물 — 로컬 빌드 바이너리와 머신 경로가 박힌 호스트 등록 파일
+ctr
+ctr.exe
+.mcp.json

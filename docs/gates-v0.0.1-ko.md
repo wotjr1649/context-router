@@ -59,8 +59,22 @@ go build -o ctr.exe ./cmd/context-router     # windows
 
 | 호스트 | 플랫폼 | tools/list 노출(기대 도구 수 일치) | 호출 1회 | cancellation | 확인일 | 비고 |
 |---|---|---|---|---|---|---|
-| Claude Code | | 대기 | 대기 | 대기 | | |
-| Codex | | 대기 | 대기 | 대기 | | |
+| Claude Code | windows | PASS (3종) | PASS | **이월** (하단 경위) | 2026-07-19 | ctr_search 정상(빈 스토어 hits:[]) + ctr_transform 오류 경로(256MB 메모리 킬) — 서버 생존·후속 호출 정상 |
+| Codex | windows | PASS (3종) | PASS | **이월** (하단 경위) | 2026-07-19 | ctr_search 정상 스키마 응답 + ctr_transform 오류 경로(10s 시간 상한) + 잘못된 인자 스키마 거부 — 서버 생존·후속 호출 정상 |
+
+**cancellation 이월 경위 (2026-07-19, session-03)**: 수동 ESC 취소를 4회 시도했으나
+전부 취소 창 확보에 실패 — ① 원시 스크립트 프롬프트가 호스트 모델 세이프가드에 플래그,
+② 순수 루프는 스텝 예산(5M)에 즉시 도달, ③ ctr_fetch를 웹 fetch로 오인(절차 오류),
+④ 워크로드가 메모리 상한/10s 시간 상한에 취소보다 먼저 도달. 호스트 ESC→cancellation
+전달 자체의 비결정성(호스트측 알려진 이슈)도 확인됨. **간접 증거는 확보**: go-sdk의
+notifications/cancelled 수신→핸들러 ctx 취소(SDK 자체 TestCancellation), 3개 도구
+핸들러의 ctx 전파(transform→exec.CommandContext, search/fetch→QueryContext),
+toToolError의 context.Canceled 정상 처리, 그리고 위 표의 워커 킬 2회에서 서버 생존·후속
+호출 정상 관측. **마감 방법(다음 세션)**: go-sdk 클라이언트(ClientSession+CommandTransport,
+ctx 취소 시 notifications/cancelled 자동 송신 — SDK transport.go:229-235 확인)로 ctr.exe를
+스폰해 취소를 결정적으로 주입하는 스크립트드 스모크를 작성하고, 본 게이트 확인 항목 3을
+"(3a) 서버 취소 계약(스크립트드) / (3b) 실호스트 취소 전달(수동)"로 분리 개정해 판정한다.
+**이 이월분이 해소되기 전에는 게이트 13 태그를 만들지 않는다.**
 
 ## 태그 절차 (게이트 13)
 
@@ -90,9 +104,11 @@ go build -o ctr.exe ./cmd/context-router     # windows
   전략 재설계는 §14 후속(T9 실측 발견, CI run 29652804882).
 - **title dedup**: 현재 소스 재색인 시 title 갱신이 스키마상 source-단위가 아니라 v0.1에서
   스키마 확장과 함께 정리 예정(계획 2 T6 이월).
-- **oracle LICENSE 저작권자 확인 필요**: upstream `oracle`(ctxscribe/context-mode) LICENSE
-  저작권자(Mert Koseoglu)와 `package.json` author 불일치 — 릴리스 전 사용자 확인 필요
-  (계획 3 T7 발견, 미해결 시 태그 보류 사유가 될 수 있음 — §태그 절차 전 재확인 권장).
+- **oracle LICENSE 저작권자 확인 — 해결(2026-07-19, PR #3)**: 조사 결과 upstream
+  `wotjr1649/ctxscribe`는 `mksglu/context-mode`의 ELv2 fork로, LICENSE의 'Mert Koseoglu'는
+  원본 context-mode 원저작자 표기라 정당(불일치의 원인은 fork의 package.json author가
+  fork 유지자 Kim Jae Seok인 것). NOTICE에 원본↔fork 계보를 분리 명시(문안 사용자 승인,
+  커밋 ef4ace7) — 태그 보류 사유 해소. (계획 3 T7 발견 이월분)
 - **TOCTOU 완전판(openat2)**: 현재 경로 검증은 Abs+EvalSymlinks+재확인 방식 — 커널 수준
   openat2(RESOLVE_NO_SYMLINKS 등) 기반 완전판은 계획 1 이월, 미착수.
 - **nested-job Assign CI 실측**: Windows Job Object 중첩(부모 프로세스가 이미 Job에 속한
