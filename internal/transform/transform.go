@@ -248,10 +248,23 @@ func Spawn(ctx context.Context, selfExe string, req Request) (Result, error) {
 	waitErr := cmd.Wait()
 	var res Result
 	if waitErr != nil {
-		return Result{ErrKind: "script", ErrSummary: "worker killed (memory/time limit)"}, nil
+		// 사유 구분(D19-c): 호출자가 취소한 것인지, ctx deadline을 넘긴 것인지, 그 외
+		// 비정상 종료(OS 메모리 상한 kill·Go 런타임 OOM abort 등)인지를 접미사로만 구분한다
+		// — "worker killed" 접두사는 main_test.go:1026,1077·mcp_test.go의 부분 문자열
+		// 단언 전제이므로 불변.
+		reason := "memory or crash"
+		switch ctx.Err() {
+		case context.Canceled:
+			reason = "cancelled"
+		case context.DeadlineExceeded:
+			reason = "time limit"
+		}
+		return Result{ErrKind: "script", ErrSummary: "worker killed (" + reason + ")"}, nil
 	}
 	if err := json.Unmarshal(stdout.Bytes(), &res); err != nil {
-		return Result{ErrKind: "script", ErrSummary: "worker killed (memory/time limit)"}, nil
+		// ctx는 정상 종료(취소도 timeout도 아님)인데 stdout이 깨진 경우 — kill 사유가 아니라
+		// 출력 파싱 실패이므로 별도 접미사로 구분한다.
+		return Result{ErrKind: "script", ErrSummary: "worker killed (bad output)"}, nil
 	}
 	if res.ErrKind == "no_isolation" {
 		// worker가 자기 격리 적용에 실패해 Eval을 거부했다(리뷰 B2) — 격리 실패는 in-process
