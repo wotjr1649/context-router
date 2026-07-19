@@ -7,7 +7,11 @@ with or endorsed by the upstream authors.
 
 Upstream reference (oracle, not incorporated or redistributed):
   ctxscribe v1.3.0 — https://github.com/wotjr1649/ctxscribe
-  Copyright 2026 Mert Koseoglu, licensed under the Elastic License 2.0.
+  (an Elastic License 2.0 fork of context-mode, maintained by
+  Kim Jae Seok), derived from:
+  context-mode — https://github.com/mksglu/context-mode
+  Copyright 2026 Mert Koseoglu, licensed under the Elastic
+  License 2.0.
 context-router shares no source code with ctxscribe; it independently
 reimplements the observed tool contract (see README.md for the name
 mapping).
