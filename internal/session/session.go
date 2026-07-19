@@ -376,6 +376,9 @@ func (d *DB) applySchemaV1() error {
 // SQLITE_CORRUPT/NOTADB, 혹은 quick_check가 정상 실행되어 "ok" 아닌 결과를 반환하면
 // ErrCorrupt로 확정한다.
 func quickCheck(reader *sql.DB) error {
+	// delays[2](800ms)는 실제 sleep에 쓰이지 않는 quirk다: 루프가 attempt>=len-1(=2)에서 sleep
+	// 전에 반환하므로 attempt 0·1만 delays[0]·delays[1]을 sleep한다(migrateBusyRetry도 동형 —
+	// txRetry만 len(delays) 상한이라 셋 다 사용). 배열 크기를 재시도 횟수 표기로 유지한다.
 	delays := [3]time.Duration{50 * time.Millisecond, 200 * time.Millisecond, 800 * time.Millisecond}
 	for attempt := 0; ; attempt++ {
 		var result string
@@ -391,6 +394,34 @@ func quickCheck(reader *sql.DB) error {
 		}
 		if attempt >= len(delays)-1 {
 			return nil // 미확정 — 손상 취급하지 않음(§6.2 보수 판정)
+		}
+		time.Sleep(delays[attempt])
+	}
+}
+
+// quickCheckStrict — recover 경로 전용 엄격 변형(A4, 재리뷰 Codex P1). quickCheck의 §6.2 보수
+// 판정(미확정=통과)과 정반대로, "ok"를 명시적으로 확인하지 못하면(malformed는 물론 BUSY·일시
+// I/O 재시도 소진까지) ErrCorrupt로 확정한다. recover의 완료 선언(publishAlreadyComplete·
+// probeHealthyStrict)과 인양본 건강 판정(checkRescuedHealth→verifyRescued·tmpIsHealthy)이 이걸
+// 쓴다 — 미확정을 건강으로 오인하면 마커를 조기 삭제하거나 미검증 tmp를 게시해 데이터를
+// 유실시키기 때문. 서버 Open(§6.2)은 살아있는 바쁜 DB를 손상으로 오분류하지 않으려 quickCheck
+// (보수)를 그대로 유지한다 — 두 경로의 위험 방향이 반대다.
+func quickCheckStrict(reader *sql.DB) error {
+	delays := [3]time.Duration{50 * time.Millisecond, 200 * time.Millisecond, 800 * time.Millisecond}
+	for attempt := 0; ; attempt++ {
+		var result string
+		err := reader.QueryRow("PRAGMA quick_check").Scan(&result)
+		if err == nil {
+			if result == "ok" {
+				return nil
+			}
+			return fmt.Errorf("session quickCheck: %q: %w", result, ErrCorrupt)
+		}
+		if isMalformed(err) {
+			return fmt.Errorf("session quickCheck: %w", ErrCorrupt)
+		}
+		if attempt >= len(delays)-1 {
+			return fmt.Errorf("session quickCheck: 미확정(재시도 소진) — recover strict 판정상 손상 취급: %w", ErrCorrupt)
 		}
 		time.Sleep(delays[attempt])
 	}

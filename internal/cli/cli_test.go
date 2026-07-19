@@ -1367,3 +1367,74 @@ func TestRunSessionRecover_ServerRunning_RejectsImmediately(t *testing.T) {
 		t.Fatalf("err=%v want session.ErrLeaseHeld (out=%s stderr=%s)", err, out.String(), errOut.String())
 	}
 }
+
+// TestRunSessionRecover_PublishInterrupted_DelegatesDespiteMissingDB — 최종리뷰 A1(Critical)
+// 회귀: 게시(⑥) rename 도중 crash로 session.db만 사라졌지만 복구 자산(백업 main + 마커)이
+// 남은 상태에서 CLI recover가 "session.db 없음"으로 거부하지 않고 session.Recover에 위임해
+// 완료해야 한다(수정 전엔 session.db stat 실패로 재개 분기가 CLI로 도달 불가 → 영구 wedge).
+// session 패키지의 unexported 인양본을 만들 수 없으므로, 건강 DB를 백업 family로 rename해
+// restoreLatestBackup 경로로 재개가 성립하는 등가 상태를 주입한다.
+func TestRunSessionRecover_PublishInterrupted_DelegatesDespiteMissingDB(t *testing.T) {
+	storeRoot := t.TempDir()
+	projectRoot := t.TempDir()
+	canon, err := ident.Canonicalize(projectRoot)
+	if err != nil {
+		t.Fatalf("canonicalize: %v", err)
+	}
+	dbDir := filepath.Join(storeRoot, "projects", canon.ProjectID, "worktrees", canon.WorktreeID)
+
+	// 1) 건강한 session.db를 만든다(단일 파일 — Close가 wal_checkpoint(TRUNCATE)).
+	d, err := session.Open(dbDir, session.Options{Producer: "context-router/test"})
+	if err != nil {
+		t.Fatalf("session.Open: %v", err)
+	}
+	for i := 0; i < 5; i++ {
+		if _, _, _, err := d.Append(session.Event{Type: "note", Summary: fmt.Sprintf("evt-%d", i)}); err != nil {
+			t.Fatalf("append: %v", err)
+		}
+	}
+	if err := d.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	// 2) 게시 중단 상태 주입: session.db family를 백업 main으로 rename(→ session.db 부재) +
+	//    복구 마커 생성. bak ts 포맷은 backupOriginal과 동일(사전순=시간순 정렬 가능).
+	bakMain := "session.db.bak-20260101T000000.000000000Z"
+	for _, suffix := range []string{"", "-wal", "-shm"} {
+		src := filepath.Join(dbDir, "session.db"+suffix)
+		if _, statErr := os.Stat(src); statErr == nil {
+			if err := os.Rename(src, filepath.Join(dbDir, bakMain+suffix)); err != nil {
+				t.Fatalf("rename %s: %v", suffix, err)
+			}
+		}
+	}
+	if err := os.WriteFile(filepath.Join(dbDir, "session.recover-pending"), nil, 0o600); err != nil {
+		t.Fatalf("marker: %v", err)
+	}
+	if _, statErr := os.Stat(filepath.Join(dbDir, "session.db")); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("precondition: session.db should be absent, stat err=%v", statErr)
+	}
+
+	// 3) CLI recover — session.db 부재에도 위임·완료해야 한다.
+	var out, errOut bytes.Buffer
+	args := []string{"recover", "--project", projectRoot, "--worktree", canon.WorktreeID}
+	if err := Run(context.Background(), "session", args, storeRoot, projectRoot, "0.0.1-dev", &out, &errOut); err != nil {
+		t.Fatalf("Run session recover err=%v stderr=%s", err, errOut.String())
+	}
+	if !strings.Contains(errOut.String(), "인양 완료") {
+		t.Fatalf("stderr missing recovery report: %s", errOut.String())
+	}
+	if _, statErr := os.Stat(filepath.Join(dbDir, "session.recover-pending")); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("marker should be gone after recover, stat err=%v", statErr)
+	}
+	// 게시된 session.db가 건강해야 한다.
+	reader, err := session.OpenReadOnly(dbDir)
+	if err != nil {
+		t.Fatalf("OpenReadOnly: %v", err)
+	}
+	defer func() { _ = reader.Close() }()
+	var qc string
+	if err := reader.QueryRow("PRAGMA quick_check").Scan(&qc); err != nil || qc != "ok" {
+		t.Fatalf("published db quick_check=%q err=%v want ok", qc, err)
+	}
+}

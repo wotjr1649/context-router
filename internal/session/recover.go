@@ -3,8 +3,12 @@
 // 태스크9b 명문 경계). 각 단계를 별도 함수로 분리한 이유는 두 가지: (1) 설계 §6.3 1~7단계와
 // 1:1 대응시켜 리뷰 가능하게, (2) crash-then-resume(G8)을 테스트가 "게시 직전까지만 직접
 // 호출→중단"으로 주입할 수 있게(recover_test.go 참고). 원본 family는 rescue/verify 단계 내내
-// read-only로만 열리므로(OpenReadOnly) publish(⑥) 전까지 몇 번을 재시도해도 항상 안전 —
-// "재개"에 별도의 진행 상태 저장이 필요 없다(단순 재실행 = 안전한 재개).
+// read-only로만 열리므로(OpenReadOnly) publish(⑥) 전까지 몇 번을 재시도해도 항상 안전.
+// "재개"는 진행 상태를 별도로 저장하지 않고 재실행 시점의 잔여 상태(마커·인양본·백업)를
+// 감지해 이어간다 — 단, 재리뷰(A2) 이후 "재실행=처음부터 재인양"이 아니라 **검증 완료된
+// 인양본(tmp)이 남아 있으면 그것을 최우선으로 게시**한다: 마커 하에서 원본 DB는 §6.2상 서버가
+// fail-closed라 read-only로만 열리므로 verifyRescued를 통과한 tmp가 항상 최신·완전하고, 원본에서
+// 재인양하면 backupOriginal이 이미 분리해 간 원본 -wal 꼬리 커밋을 잃는다.
 package session
 
 import (
@@ -85,42 +89,41 @@ func Recover(dir string) (RecoverResult, error) {
 			return RecoverResult{MarkerOnly: true}, nil
 		}
 
-		// 재리뷰 Critical 수정: session.db 부재는 "게시(⑥) rename 도중 crash"를 뜻할 수 있다
-		// (backupOriginal은 끝났지만 finishPublish 전) — 이 경우 아래 공용 파이프라인으로 그냥
-		// 떨어지면 rescueAll이 이미 검증 완료된 인양본을 지우고 부재한 session.db를 열려다
-		// 영구 wedge된다(설계 §6.3 ⑦ "재실행이 잔여 상태를 감지해 이어서 완료" 위반). 여기서
-		// 먼저 감지·분기한다.
+		// 재리뷰(A2): 검증 완료된 인양본(tmp) 건강을 dbExists와 무관하게 최우선 판정한다.
+		// tmp가 건강하면(verifyRescued 통과 시점 그대로) 재인양 없이 게시만 마저 끝낸다 —
+		// 그렇지 않고 아래 공용 파이프라인으로 떨어지면, backupOriginal이 원본 -wal/-shm만
+		// 옮기고 main rename 전 crash한 경우(마커+db 잔존+건강 tmp) rescueAll이 건강 tmp를
+		// 폐기하고 -wal 없는 원본을 재인양해 WAL 꼬리 커밋을 조용히 잃는다(재리뷰 Important).
+		// 마커 하에서 DB는 §6.2상 서버 fail-closed로 read-only로만 열리므로 건강 tmp가 항상
+		// 최신·완전하다는 것이 이 우선순위의 근거다.
+		healthy, err := tmpIsHealthy(dir)
+		if err != nil {
+			return RecoverResult{}, err
+		}
+		if healthy {
+			nEvents, nSessions, backupPrefix, err := resumePublishFromTmp(dir)
+			if err != nil {
+				return RecoverResult{}, err
+			}
+			if err := os.Remove(markerPath); err != nil {
+				return RecoverResult{}, sanitizeIOErr("recover marker remove", err)
+			}
+			return RecoverResult{RecoveredEvents: nEvents, RecoveredSessions: nSessions, BackupPrefix: backupPrefix}, nil
+		}
+
+		// tmp가 없거나 불건강. session.db가 없으면(게시 rename 도중 crash 이후 tmp까지 유실)
+		// 가장 최근 백업을 session.db 자리로 되돌려(restoreLatestBackup) 아래 공용 파이프라인이
+		// 처음부터 다시 인양·게시하게 한다. db가 남아 있으면 그대로 원본에서 재인양한다.
 		dbExists, err := fileExists(filepath.Join(dir, dbFileName))
 		if err != nil {
 			return RecoverResult{}, err
 		}
 		if !dbExists {
-			healthy, err := tmpIsHealthy(dir)
-			if err != nil {
-				return RecoverResult{}, err
-			}
-			if healthy {
-				nEvents, nSessions, err := resumePublishOnly(dir)
-				if err != nil {
-					return RecoverResult{}, err
-				}
-				backupPrefix, _, err := latestBackupMain(dir) // 이미 있는 백업 그대로 보고(새로 만들지 않음)
-				if err != nil {
-					return RecoverResult{}, err
-				}
-				if err := os.Remove(markerPath); err != nil {
-					return RecoverResult{}, sanitizeIOErr("recover marker remove", err)
-				}
-				return RecoverResult{RecoveredEvents: nEvents, RecoveredSessions: nSessions, BackupPrefix: backupPrefix}, nil
-			}
-			// tmp가 없거나 불건강 — 방어 분기: 가장 최근 백업을 session.db 자리로 되돌려
-			// "훼손된 원본이 다시 그 자리에 있는" 상태로 만든 뒤, 아래 공용 파이프라인이
-			// 처음부터 다시 인양·게시하게 한다.
 			if err := restoreLatestBackup(dir); err != nil {
 				return RecoverResult{}, err
 			}
 		}
-		// 마커는 있으나 게시 미완료 — ④부터 이어서 진행(단순 재실행, 위 패키지 주석 참고).
+		// 마커는 있으나 게시 미완료 — ④부터 이어서 진행(위 패키지 주석 참고).
 	}
 
 	nEvents, nSessions, err := rescueAll(dir)
@@ -175,9 +178,15 @@ func probeCorrupt(dir string) (bool, error) {
 }
 
 // publishAlreadyComplete — 마커 존재 상태의 잔여 검증(설계 §6.3 ②, N-2 회귀): 현재 session.db가
-// 건강하고(quick_check ok) .bak-<ts> family가 하나 이상 있으면 게시가 이미 끝난 것으로 판단한다
-// — session.Open은 마커 존재 시 quick_check 결과와 무관하게 거부하므로(§6.2), 마커가 남아있는
-// 동안 session.db가 건강해질 수 있는 유일한 경로는 recover 자신의 게시뿐이다.
+// 건강하고(strict quick_check ok) .bak-<ts> **main** 멤버가 하나 이상 있으면 게시가 이미 끝난
+// 것으로 판단한다 — session.Open은 마커 존재 시 quick_check 결과와 무관하게 거부하므로(§6.2),
+// 마커가 남아있는 동안 session.db가 건강해질 수 있는 유일한 경로는 recover 자신의 게시뿐이다.
+//
+// A4(strict): 건강 판정은 probeHealthyStrict — 미확정(BUSY/일시 오류 재시도 소진)을 건강으로
+// 오인하면 부분 게시 상태를 "완료"로 선언해 마커를 조기 삭제하므로, "명시적 ok"만 healthy로
+// 취급한다. A3②(Codex P1): sidecar 고아(-wal/-shm만)로는 family 성립을 인정하지 않고 백업
+// main 파일 실재(latestBackupMain)를 요건으로 요구한다 — 그렇지 않으면 부분 이동 잔재만으로
+// "원본이 이미 .bak로 옮겨졌다"는 게시 완료를 오판한다.
 func publishAlreadyComplete(dir string) (bool, error) {
 	exists, err := fileExists(filepath.Join(dir, dbFileName))
 	if err != nil {
@@ -186,28 +195,34 @@ func publishAlreadyComplete(dir string) (bool, error) {
 	if !exists {
 		return false, nil
 	}
-	corrupt, err := probeCorrupt(dir)
+	healthy, err := probeHealthyStrict(dir)
 	if err != nil {
 		return false, err
 	}
-	if corrupt {
+	if !healthy {
 		return false, nil
 	}
-	return hasBackupFamily(dir)
+	_, found, err := latestBackupMain(dir)
+	return found, err
 }
 
-func hasBackupFamily(dir string) (bool, error) {
-	entries, err := os.ReadDir(dir)
+// probeHealthyStrict — fresh read-only 연결로 strict quick_check(A4). 명시적 "ok"만 healthy로
+// 판정하고 malformed·미확정은 모두 not-healthy(false)로 돌린다 — probeCorrupt(§6.2 보수 판정,
+// 미확정=손상 아님)와 정반대 방향으로, recover의 완료/tmp 게시 판정 전용이다(미확정을 건강으로
+// 흘려 데이터를 유실시키지 않기 위해).
+func probeHealthyStrict(dir string) (bool, error) {
+	reader, err := OpenReadOnly(dir)
 	if err != nil {
-		return false, sanitizeIOErr("recover dir read", err)
+		return false, fmt.Errorf("session recover: %w", err)
 	}
-	prefix := dbFileName + bakInfix
-	for _, e := range entries {
-		if !e.IsDir() && strings.HasPrefix(e.Name(), prefix) {
-			return true, nil
+	defer func() { _ = reader.Close() }()
+	if err := quickCheckStrict(reader); err != nil {
+		if errors.Is(err, ErrCorrupt) {
+			return false, nil
 		}
+		return false, err
 	}
-	return false, nil
+	return true, nil
 }
 
 // createMarker — session.recover-pending 생성 + fsync(설계 §6.3 ③). 이미 존재해도 그대로
@@ -438,7 +453,7 @@ func verifyRescued(dir string) error {
 // 이미 열려 있는 읽기 전용 연결. verifyRescued(최초 검증)와 tmpIsHealthy(게시 crash 재개
 // 분기가 이전에 검증된 tmp를 재확인할 때)가 공유한다 — 재리뷰 Critical 수정으로 분리.
 func checkRescuedHealth(conn *sql.DB) error {
-	if err := quickCheck(conn); err != nil {
+	if err := quickCheckStrict(conn); err != nil { // A4: 인양본은 미확정도 손상 취급(strict)
 		return fmt.Errorf("session recover: 인양본 quick_check 실패: %w", err)
 	}
 	var uv int
@@ -517,7 +532,11 @@ func restoreLatestBackup(dir string) error {
 	if !found {
 		return errors.New("session recover: 게시 중단 감지됐으나 인양본·백업 모두 없음 — 수동 확인 필요")
 	}
-	for _, suffix := range []string{"", "-wal", "-shm"} {
+	// A3①: main을 **마지막**에 복원한다(-wal→-shm→main). 불변식: main 복원 완료 전까지
+	// dbExists=false를 유지해야 한다 — 그렇지 않으면(main 먼저 복원 후 crash) 재실행이 dbExists=
+	// true로 판정해 -wal 없는 main을 재인양하고 WAL 꼬리를 잃는다. main이 마지막이므로 어느
+	// 시점에 crash해도 재실행은 dbExists=false를 보고 이 복원을 처음부터 다시 완료한다.
+	for _, suffix := range []string{"-wal", "-shm", ""} {
 		src := filepath.Join(dir, main+suffix)
 		exists, err := fileExists(src)
 		if err != nil {
@@ -584,11 +603,39 @@ func finishPublish(dir string) error {
 	return syncDir(dir)
 }
 
-// resumePublishOnly — 게시(⑥) crash 재개 경로(재리뷰 Critical 수정, 설계 §6.3 ⑦):
-// session.db가 없고(직전 실행이 backupOriginal까지 끝내고 crash) 검증된 인양본이 여전히
-// 건강하면, 재인양 없이 게시만 마저 끝낸다. 반환하는 건수는 tmp를 직접 세어 §6.3 ⑦의 "인양
-// 건수 보고"를 재인양 없이도 지킨다.
-func resumePublishOnly(dir string) (events, sessionsN int64, err error) {
+// resumePublishFromTmp — 마커 하 tmp-우선 재개(A2, 설계 §6.3 ⑦): 검증 완료된 인양본(tmp)이
+// 건강하면 재인양 없이 게시만 마저 끝낸다. 원본 session.db가 아직 남아 있으면(backupOriginal이
+// 원본 -wal/-shm만 옮기고 main rename 전 crash) 남은 원본 family를 backupOriginal로 마저
+// 백업한 뒤(존재하는 멤버만 옮기므로 부분 이동 family는 포렌식 잔재로 남는다) finishPublish로
+// tmp를 게시한다 — 원본에서 재인양하면 이미 분리돼 나간 -wal 꼬리를 잃으므로 tmp를 그대로
+// 게시하는 것이 핵심이다. 원본이 이미 없으면(직전 실행이 backupOriginal까지 끝냄) 기존 백업을
+// 그대로 보고한다. 반환 건수는 tmp를 직접 세어 §6.3 ⑦의 "인양 건수 보고"를 재인양 없이 지킨다.
+func resumePublishFromTmp(dir string) (events, sessionsN int64, backupPrefix string, err error) {
+	events, sessionsN, err = countTmpRows(dir)
+	if err != nil {
+		return 0, 0, "", err
+	}
+	dbExists, err := fileExists(filepath.Join(dir, dbFileName))
+	if err != nil {
+		return 0, 0, "", err
+	}
+	if dbExists {
+		backupPrefix, err = backupOriginal(dir) // 남은 원본 family를 마저 백업(신규 ts)
+	} else {
+		backupPrefix, _, err = latestBackupMain(dir) // 이미 백업됨 — 기존 백업 그대로 보고
+	}
+	if err != nil {
+		return 0, 0, "", err
+	}
+	if err := finishPublish(dir); err != nil {
+		return 0, 0, "", err
+	}
+	return events, sessionsN, backupPrefix, nil
+}
+
+// countTmpRows — 인양본(tmp)의 session_events·sessions 행 수를 센다(재개 시 재인양 없이 §6.3 ⑦
+// 건수 보고용).
+func countTmpRows(dir string) (events, sessionsN int64, err error) {
 	tmpPath := filepath.Join(dir, recoverTmpName)
 	conn, err := openReadOnlyAt(tmpPath)
 	if err != nil {
@@ -602,10 +649,26 @@ func resumePublishOnly(dir string) (events, sessionsN int64, err error) {
 	if countErr != nil {
 		return 0, 0, fmt.Errorf("session recover: 재개 인양본 건수 조회 실패: %w", countErr)
 	}
-	if err := finishPublish(dir); err != nil {
-		return 0, 0, err
-	}
 	return events, sessionsN, nil
+}
+
+// HasRecoverArtifacts — cli(session recover)가 session.db 부재 시 "복구할 잔여 상태가 있는가"를
+// 판정하는 헬퍼(A1). 마커·인양본(tmp)·백업 main 중 하나라도 있으면 true — session.db가 없어도
+// Recover에 위임해야 함을 뜻한다(게시 rename 도중 crash로 session.db만 사라진 상태에서 CLI가
+// "session.db 없음"으로 거부해 영구 wedge되던 경로 차단). 세 잔여 상태의 파일명은 이 패키지가
+// 소유하므로 cli가 문자열을 하드코딩하지 않도록 여기서 노출한다(D13).
+func HasRecoverArtifacts(dir string) (bool, error) {
+	for _, name := range []string{recoverMarkerName, recoverTmpName} {
+		exists, err := fileExists(filepath.Join(dir, name))
+		if err != nil {
+			return false, err
+		}
+		if exists {
+			return true, nil
+		}
+	}
+	_, found, err := latestBackupMain(dir)
+	return found, err
 }
 
 // syncDir — 디렉터리 fsync(설계 §6.3 ⑥, publish 원자성 보강 — defense-in-depth일 뿐 정확성의

@@ -588,8 +588,19 @@ func runSessionRecover(stderr io.Writer, args []string, storeRoot string) error 
 	}
 	dbDir := filepath.Join(projDir, "worktrees", wid)
 
-	if fi, statErr := os.Stat(filepath.Join(dbDir, "session.db")); statErr != nil || fi.IsDir() {
-		return errors.New("session recover: session.db 없음")
+	// 최종리뷰 A1(Critical): session.db가 없어도 복구 자산(마커·인양본·백업 main)이 있으면
+	// 게시(⑥) rename 도중 crash로 session.db만 사라진 상태이므로 session.Recover에 위임한다
+	// (Recover가 모든 잔여 상태 판정을 소유 — T9b 재개 분기가 CLI로 도달 가능해야 영구 wedge가
+	// 재도입되지 않는다). 어느 자산도 없을 때만 "없음"으로 거부한다.
+	fi, statErr := os.Stat(filepath.Join(dbDir, "session.db"))
+	if statErr != nil || fi.IsDir() {
+		hasAssets, artErr := session.HasRecoverArtifacts(dbDir)
+		if artErr != nil {
+			return errors.New("session recover: 복구 자산 확인 실패")
+		}
+		if !hasAssets {
+			return errors.New("session recover: session.db 없음")
+		}
 	}
 
 	result, err := session.Recover(dbDir)
