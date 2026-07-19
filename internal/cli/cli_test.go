@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -15,6 +16,7 @@ import (
 	"time"
 
 	"github.com/wotjr1649/context-router/internal/ident"
+	"github.com/wotjr1649/context-router/internal/session"
 	"github.com/wotjr1649/context-router/internal/store"
 )
 
@@ -1060,4 +1062,208 @@ func TestRunDoctor_StoreRootIsFile_Rejected(t *testing.T) {
 	if !strings.Contains(buf.String(), "[1] store-root: exists=true writable=false") {
 		t.Fatalf("out missing exists=true writable=false: %s", buf.String())
 	}
+}
+
+// TestRunSessionExport_JSONLRoundTrip: 태스크9a Step1 ① — export가 stdout에 낸 JSONL 각 행을
+// EventV1으로 파싱하면 session.Export를 직접 호출한 결과와 정확히 일치해야 한다(G6 CLI 측
+// round-trip). session.Open으로 시드한 뒤 Close하고, Run(ctx,"session",["export",...])이 그
+// DB를 session.OpenReadOnly로 다시 열어(별도 연결) JSONL을 낸다.
+func TestRunSessionExport_JSONLRoundTrip(t *testing.T) {
+	storeRoot := t.TempDir()
+	projectRoot := t.TempDir()
+	canon, err := ident.Canonicalize(projectRoot)
+	if err != nil {
+		t.Fatalf("canonicalize: %v", err)
+	}
+	dbDir := filepath.Join(storeRoot, "projects", canon.ProjectID, "worktrees", canon.WorktreeID)
+	d, err := session.Open(dbDir, session.Options{Producer: "context-router/0.1.0-test"})
+	if err != nil {
+		t.Fatalf("session.Open: %v", err)
+	}
+	if _, _, _, err := d.Append(session.Event{Type: "note", Summary: "first note"}); err != nil {
+		t.Fatalf("append 1: %v", err)
+	}
+	if _, _, _, err := d.Append(session.Event{Type: "decision", Summary: "second note"}); err != nil {
+		t.Fatalf("append 2: %v", err)
+	}
+	want, _, err := session.Export(context.Background(), d.Reader(), 0, "", 100)
+	if err != nil {
+		t.Fatalf("Export(direct): %v", err)
+	}
+	if err := d.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	var out, errOut bytes.Buffer
+	args := []string{"export", "--project", projectRoot, "--worktree", canon.WorktreeID}
+	if err := Run(context.Background(), "session", args, storeRoot, projectRoot, "0.0.1-dev", &out, &errOut); err != nil {
+		t.Fatalf("Run session export err=%v stderr=%s", err, errOut.String())
+	}
+
+	trimmed := strings.TrimRight(out.String(), "\n")
+	if trimmed == "" {
+		t.Fatalf("out empty, want %d JSONL lines", len(want))
+	}
+	lines := strings.Split(trimmed, "\n")
+	if len(lines) != len(want) {
+		t.Fatalf("got %d JSONL lines want %d: out=%s", len(lines), len(want), out.String())
+	}
+	for i, line := range lines {
+		var ev session.EventV1
+		if err := json.Unmarshal([]byte(line), &ev); err != nil {
+			t.Fatalf("line %d unmarshal: %v (line=%s)", i, err, line)
+		}
+		if ev.EventID != want[i].EventID || ev.Summary != want[i].Summary || ev.EventType != want[i].EventType {
+			t.Fatalf("line %d = %+v want %+v", i, ev, want[i])
+		}
+		if ev.SchemaVersion != "1.0" {
+			t.Fatalf("line %d schemaVersion=%q want 1.0", i, ev.SchemaVersion)
+		}
+	}
+	for _, forbidden := range []string{`"RowID"`, `"rowID"`, `"row_id"`, `"rowid"`} {
+		if strings.Contains(out.String(), forbidden) {
+			t.Fatalf("JSONL leaks internal cursor field %s: %s", forbidden, out.String())
+		}
+	}
+}
+
+// TestRunSessionExport_WorktreeContract: 태스크9a Step1 ② — worktree가 2개면 --worktree 없이는
+// 후보 목록을 stderr에 출력하고 오류(설계 §7 worktree 특정 계약), 1개면 생략 허용.
+func TestRunSessionExport_WorktreeContract(t *testing.T) {
+	t.Run("multiple_without_flag_lists_candidates_and_errors", func(t *testing.T) {
+		storeRoot := t.TempDir()
+		projectRoot := t.TempDir()
+		canon, err := ident.Canonicalize(projectRoot)
+		if err != nil {
+			t.Fatalf("canonicalize: %v", err)
+		}
+		projDir := filepath.Join(storeRoot, "projects", canon.ProjectID)
+		for _, wid := range []string{"wt-a", "wt-b"} {
+			d, err := session.Open(filepath.Join(projDir, "worktrees", wid), session.Options{Producer: "context-router/test"})
+			if err != nil {
+				t.Fatalf("session.Open(%s): %v", wid, err)
+			}
+			if err := d.Close(); err != nil {
+				t.Fatalf("close(%s): %v", wid, err)
+			}
+		}
+
+		var out, errOut bytes.Buffer
+		args := []string{"export", "--project", projectRoot}
+		if err := Run(context.Background(), "session", args, storeRoot, projectRoot, "0.0.1-dev", &out, &errOut); err == nil {
+			t.Fatalf("want error for ambiguous worktree, got nil (out=%s)", out.String())
+		}
+		for _, wid := range []string{"wt-a", "wt-b"} {
+			if !strings.Contains(errOut.String(), wid) {
+				t.Fatalf("stderr missing candidate %q: %s", wid, errOut.String())
+			}
+		}
+	})
+
+	t.Run("single_without_flag_allowed", func(t *testing.T) {
+		storeRoot := t.TempDir()
+		projectRoot := t.TempDir()
+		canon, err := ident.Canonicalize(projectRoot)
+		if err != nil {
+			t.Fatalf("canonicalize: %v", err)
+		}
+		dbDir := filepath.Join(storeRoot, "projects", canon.ProjectID, "worktrees", canon.WorktreeID)
+		d, err := session.Open(dbDir, session.Options{Producer: "context-router/test"})
+		if err != nil {
+			t.Fatalf("session.Open: %v", err)
+		}
+		if err := d.Close(); err != nil {
+			t.Fatalf("close: %v", err)
+		}
+
+		var out, errOut bytes.Buffer
+		args := []string{"export", "--project", projectRoot}
+		if err := Run(context.Background(), "session", args, storeRoot, projectRoot, "0.0.1-dev", &out, &errOut); err != nil {
+			t.Fatalf("Run session export(single worktree, no --worktree) err=%v stderr=%s", err, errOut.String())
+		}
+	})
+}
+
+// TestRunDoctor_SessionItems: 태스크9a Step1 ⑦ — doctor가 session.db quick_check·lease shared
+// 프로브·session.recover-pending 마커 존재 3항목을 출력한다(설계 §7).
+func TestRunDoctor_SessionItems(t *testing.T) {
+	t.Run("not_initialized_is_informational_not_failure", func(t *testing.T) {
+		storeRoot := t.TempDir()
+		projectRoot := t.TempDir()
+		var buf bytes.Buffer
+		if err := runDoctor(context.Background(), &buf, storeRoot, projectRoot); err != nil {
+			t.Fatalf("runDoctor err=%v out=%s", err, buf.String())
+		}
+		out := buf.String()
+		for _, want := range []string{
+			"[6] session.db: not initialized",
+			"[7] session.lock: not initialized",
+			"[8] session.recover-pending: not initialized",
+		} {
+			if !strings.Contains(out, want) {
+				t.Fatalf("out missing %q: %s", want, out)
+			}
+		}
+	})
+
+	t.Run("healthy_session_all_three_pass", func(t *testing.T) {
+		storeRoot := t.TempDir()
+		projectRoot := t.TempDir()
+		canon, err := ident.Canonicalize(projectRoot)
+		if err != nil {
+			t.Fatalf("canonicalize: %v", err)
+		}
+		dbDir := filepath.Join(storeRoot, "projects", canon.ProjectID, "worktrees", canon.WorktreeID)
+		d, err := session.Open(dbDir, session.Options{Producer: "context-router/test"})
+		if err != nil {
+			t.Fatalf("session.Open: %v", err)
+		}
+		if err := d.Close(); err != nil {
+			t.Fatalf("close: %v", err)
+		}
+
+		var buf bytes.Buffer
+		if err := runDoctor(context.Background(), &buf, storeRoot, projectRoot); err != nil {
+			t.Fatalf("runDoctor err=%v out=%s", err, buf.String())
+		}
+		out := buf.String()
+		for _, want := range []string{
+			"[6] session.db: quick_check=ok",
+			"[7] session.lock: shared 획득 가능",
+			"[8] session.recover-pending: 없음",
+		} {
+			if !strings.Contains(out, want) {
+				t.Fatalf("out missing %q: %s", want, out)
+			}
+		}
+	})
+
+	t.Run("recover_marker_present_counts_as_failure", func(t *testing.T) {
+		storeRoot := t.TempDir()
+		projectRoot := t.TempDir()
+		canon, err := ident.Canonicalize(projectRoot)
+		if err != nil {
+			t.Fatalf("canonicalize: %v", err)
+		}
+		dbDir := filepath.Join(storeRoot, "projects", canon.ProjectID, "worktrees", canon.WorktreeID)
+		d, err := session.Open(dbDir, session.Options{Producer: "context-router/test"})
+		if err != nil {
+			t.Fatalf("session.Open: %v", err)
+		}
+		if err := d.Close(); err != nil {
+			t.Fatalf("close: %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(dbDir, "session.recover-pending"), nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+
+		var buf bytes.Buffer
+		err = runDoctor(context.Background(), &buf, storeRoot, projectRoot)
+		if err == nil {
+			t.Fatalf("want error(진단 실패 항목 존재), got nil: %s", buf.String())
+		}
+		if !strings.Contains(buf.String(), "[8] session.recover-pending: 존재") {
+			t.Fatalf("out missing marker-present line: %s", buf.String())
+		}
+	})
 }

@@ -395,6 +395,27 @@ func TestMainDispatch_CLI(t *testing.T) {
 	}
 }
 
+// TestMainDispatch_Session: "session" 서브커맨드가 cliSubcommands를 통과해 cli.Run까지
+// 위임되는지 확인한다(태스크9a, 설계 §7 — main.go: sub "session" 허용). 이 프로젝트에는
+// worktree가 없어 export 자체는 실패하지만(handled=true·err!=nil), 그 오류가 "미지
+// 서브커맨드"가 아니어야 한다 — dispatchCLI가 session을 정상적으로 cli.Run에 위임했다는
+// 증거(recover 등 하위 서브커맨드 자리는 cli.Run 내부 소관, 여기서는 최상위 라우팅만 검증).
+func TestMainDispatch_Session(t *testing.T) {
+	proj := t.TempDir()
+	storeRoot := filepath.Join(t.TempDir(), "storeroot")
+	args := []string{"context-router", "session", "export", "--project", proj, "--root", proj, "--store-root", storeRoot}
+	handled, err := dispatchCLI(context.Background(), args)
+	if !handled {
+		t.Fatal("want handled=true for session subcommand")
+	}
+	if err == nil {
+		t.Fatal("want error (no worktree exists yet), got nil")
+	}
+	if strings.Contains(err.Error(), "미지 서브커맨드") {
+		t.Fatalf("session must not be rejected as unknown subcommand: %v", err)
+	}
+}
+
 // TestMainDispatch_NotHandled: 서브커맨드가 아닌(MCP 서버용) 인자는 dispatchCLI가 손대지
 // 않아야 한다 — 미지 단어가 cli로 잘못 흡수되지 않는지의 반대쪽 보증(설계 §7).
 func TestMainDispatch_NotHandled(t *testing.T) {
@@ -404,8 +425,8 @@ func TestMainDispatch_NotHandled(t *testing.T) {
 	}
 }
 
-// TestMainDispatch_UnknownSubcommandRejected: "-"로 시작하지 않으면서 4개 서브커맨드도
-// 아닌 첫 인자(예: "stats"의 오타 "stat")는 조용히 MCP 서버 경로로 흘러가면 안 된다 —
+// TestMainDispatch_UnknownSubcommandRejected: "-"로 시작하지 않으면서 cliSubcommands 중
+// 어느 것도 아닌 첫 인자(예: "stats"의 오타 "stat")는 조용히 MCP 서버 경로로 흘러가면 안 된다 —
 // handled=true와 명시 오류를 반환해야 한다(리뷰 Fix Round 3, item 1). 진짜 서버 플래그
 // (--profile 등, "-" 시작)는 여전히 handled=false로 통과한다(TestMainDispatch_NotHandled).
 func TestMainDispatch_UnknownSubcommandRejected(t *testing.T) {

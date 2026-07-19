@@ -251,6 +251,23 @@ func Open(dir string, opts Options) (*DB, error) {
 	return d, nil
 }
 
+// OpenReadOnly — session.db를 읽기 전용으로 연다(태스크 9a: CLI `session export`·doctor 전용
+// 최소 헬퍼). Open()과 달리 lease 취득·마커 확인·신규 생성·sessions 행 INSERT·session_start
+// 자동 append를 전혀 하지 않는다 — 조회 전용 배치 경로(export)가 대상 DB를 오염시키지 않기
+// 위해서다(브리프 명시 지침: "session.Open을 export 경로에 쓰지 마라"). DSN은 store.go의
+// read-only 관례(D9 PRAGMA + mode=ro&_pragma=query_only(ON))와 동일 형태 — session.db가 없으면
+// sql.Open 자체는 성공하고(지연 연결) 첫 쿼리에서 오류가 난다, 존재 확인은 호출자 책임.
+// 호출자가 Close 책임진다.
+func OpenReadOnly(dir string) (*sql.DB, error) {
+	dbPath := filepath.Join(dir, dbFileName)
+	dsn := "file:" + filepath.ToSlash(dbPath) + pragmas + "&mode=ro&_pragma=query_only(ON)"
+	db, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		return nil, fmt.Errorf("session OpenReadOnly: %w", err)
+	}
+	return db, nil
+}
+
 // acquireInitLock — session.init.lock을 store.go의 lockStore()와 동일한 유계 백오프(10ms→
 // 20→40→80→160ms 유지, 총 5초)로 재시도한다(설계 §6.2 ②: "기존 lockStore 패턴" — 대기 없는
 // 즉시 거부는 계약 미달, 리뷰 Important). 두 호스트가 같은 신규 worktree를 동시 콜드스타트하면
