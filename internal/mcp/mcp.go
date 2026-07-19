@@ -20,11 +20,12 @@ import (
 	"github.com/wotjr1649/context-router/internal/ingest"
 	"github.com/wotjr1649/context-router/internal/netfetch"
 	"github.com/wotjr1649/context-router/internal/search"
+	"github.com/wotjr1649/context-router/internal/session"
 	"github.com/wotjr1649/context-router/internal/store"
 	"github.com/wotjr1649/context-router/internal/transform"
 )
 
-const serverVersion = "0.0.1"
+const serverVersion = "0.1.0"
 
 // Config — Serve/NewServer 입력 (설계 §4, §8).
 type Config struct {
@@ -36,6 +37,9 @@ type Config struct {
 	AllowPaths    []string // 이미 canonicalize된 ctr_index 허용 root (cmd가 검증 — §4.4)
 	NetAllowLocal bool     // --net-allow-local (§4.5, ctr_fetch_and_index)
 	NetPorts      []int    // --net-ports 추가 허용 포트 (§4.5)
+	// Session: 이미 연 worktree Session DB(T2 session.Open). nil이면 ctr_record_event를
+	// 등록하지 않는다(Enable 플래그 불요 — nil 자체가 게이팅 신호, main.go 배선은 T10).
+	Session *session.DB
 	// TransformTimeout: ctr_transform 핸들러가 Spawn에 씌우는 마감(0이면 NewServer가
 	// 10s로 채운다). transform.go의 defaultWorkerTimeout 안전망(호출자 ctx에 deadline이
 	// 없을 때만 적용)과 별개로, registerTransform은 항상 이 값으로 WithTimeout한다.
@@ -64,7 +68,7 @@ func NewServer(cfg Config) (*mcp.Server, error) {
 	// 경로 허용(ingest root)·상대화(search/fetch relativize) 기준 = WorktreeRoot — linked git
 	// worktree에서 ProjectRoot(주 checkout)를 쓰면 현재 worktree 파일이 WORKSPACE_VIOLATION이
 	// 된다(저장소 디렉터리 명명 ProjectID는 ProjectRoot 기반 그대로, main.go 참조).
-	registerSearch(srv, cfg.Store, cfg.Canon.WorktreeRoot)
+	registerSearch(srv, cfg.Store, cfg.Canon.WorktreeRoot, cfg.Session)
 	registerFetch(srv, cfg.Store, cfg.Canon.WorktreeRoot)
 	// ProbeIsolation: OS 메모리 격리가 안 되는 환경에서는 ctr_transform 자체를 미등록한다
 	// (in-process fallback 금지, 설계 §4.3/§5.3) — 첫 실제 호출에서야 실패를 알리지 않는다.
@@ -78,6 +82,11 @@ func NewServer(cfg Config) (*mcp.Server, error) {
 	}
 	if slices.Contains(cfg.Enable, "net") {
 		registerFetchAndIndex(srv, cfg.Store, cfg.NetAllowLocal, cfg.NetPorts)
+	}
+	if cfg.Session != nil {
+		registerRecordEvent(srv, cfg.Store, cfg.Session)
+		registerSessionSummary(srv, cfg.Store, cfg.Session)
+		registerExportEvents(srv, cfg.Store, cfg.Session)
 	}
 	return srv, nil
 }
@@ -111,6 +120,8 @@ func toToolError(err error) error {
 		return toolErr(codeInvalidArgument, "잘못된 선택자입니다")
 	case errors.Is(err, store.ErrUnavailable):
 		return toolErr(codeStorageUnavailable, "저장소를 사용할 수 없습니다")
+	case errors.Is(err, session.ErrLeaseHeld), errors.Is(err, session.ErrRecoverPending), errors.Is(err, session.ErrCorrupt):
+		return toolErr(codeStorageUnavailable, "세션 저장소를 사용할 수 없습니다")
 	case errors.Is(err, transform.ErrNoIsolation):
 		return toolErr(codeStorageUnavailable, "격리 실행을 사용할 수 없습니다")
 	case errors.Is(err, transform.ErrBudget):
@@ -152,6 +163,7 @@ type SearchInput struct {
 	Queries        []string `json:"queries" jsonschema:"검색 질의 1~8개"`
 	Limit          int      `json:"limit,omitempty" jsonschema:"질의당 최대 히트 수, 기본 3, 최대 10"`
 	MaxReturnBytes int      `json:"max_return_bytes,omitempty" jsonschema:"스니펫 바이트 예산, 기본 8192"`
+	Scope          string   `json:"scope,omitempty" jsonschema:"검색 범위 content(기본)|events|all — events/all은 세션 이벤트 포함, 세션 저장소 불용 시 오류"`
 }
 
 type searchHit struct {
@@ -167,9 +179,21 @@ type searchHit struct {
 	SourceCoordsExact bool    `json:"source_coords_exact"`
 }
 
+// eventHit — search.EventHit의 mcp wire 표현(snake_case, 설계 §3.4). 필드 그대로 직렬화 —
+// EventID/SessionID/EventType/TS/Summary/Superseded.
+type eventHit struct {
+	EventID    string `json:"event_id"`
+	SessionID  string `json:"session_id"`
+	EventType  string `json:"event_type"`
+	TS         int64  `json:"ts"`
+	Summary    string `json:"summary"`
+	Superseded bool   `json:"superseded"`
+}
+
 type searchQueryResult struct {
 	Query     string      `json:"query"`
 	Hits      []searchHit `json:"hits"`
+	Events    []eventHit  `json:"events,omitempty"`
 	Truncated bool        `json:"truncated"`
 }
 
@@ -187,15 +211,117 @@ func toSearchHit(h search.Hit) searchHit {
 	}
 }
 
-func registerSearch(srv *mcp.Server, st *store.Store, worktreeRoot string) {
+func toEventHit(h search.EventHit) eventHit {
+	return eventHit{
+		EventID: h.EventID, SessionID: h.SessionID, EventType: h.EventType,
+		TS: h.TS, Summary: h.Summary, Superseded: h.Superseded,
+	}
+}
+
+const (
+	scopeContent = "content"
+	scopeEvents  = "events"
+	scopeAll     = "all"
+)
+
+// normalizeSearchScope: 생략("")은 content(후방 호환, 설계 §3.4). 그 외 미지 값은 INVALID_ARGUMENT
+// (신규 오류 코드 없음 — 기존 코드 재사용).
+func normalizeSearchScope(s string) (string, error) {
+	switch s {
+	case "":
+		return scopeContent, nil
+	case scopeContent, scopeEvents, scopeAll:
+		return s, nil
+	default:
+		return "", toolErr(codeInvalidArgument, "scope는 content|events|all 중 하나여야 합니다")
+	}
+}
+
+// queryEventSection: in.Queries 각각에 search.QueryEvents(porter+trigram RRF, content과 동일
+// 패턴)를 호출해 wire 타입으로 변환한다. sess는 호출 전 nil이 아님이 registerSearch에서 이미
+// 보장된다(scope!=content 진입 조건). C3(Codex P2): budget(content 소진 후 남은 바이트) 안에서
+// 이벤트 summary 바이트를 앞에서부터 채우고, 넘치면 그 질의를 truncated로 표시한다 — content과
+// events가 하나의 예산을 공유한다(공유 pool, 질의 순서대로 소진). 측정 단위는 content
+// applyBudget의 snippet-only 관례와 동형(summary 길이). budget이 소진돼도 오류는 아니다.
+func queryEventSection(ctx context.Context, sess *session.DB, queries []string, limit, budget int) ([][]eventHit, []bool, error) {
+	out := make([][]eventHit, len(queries))
+	truncated := make([]bool, len(queries))
+	remaining := budget
+	for i, q := range queries {
+		hits, err := search.QueryEvents(ctx, sess.Reader(), q, limit)
+		if err != nil {
+			return nil, nil, err
+		}
+		ev := make([]eventHit, 0, len(hits))
+		for _, h := range hits {
+			e := toEventHit(h)
+			if len(e.Summary) > remaining {
+				truncated[i] = true
+				break
+			}
+			ev = append(ev, e)
+			remaining -= len(e.Summary)
+		}
+		out[i] = ev
+	}
+	return out, truncated, nil
+}
+
+// contentBudgetUsed: content 검색이 실제 소진한 스니펫 바이트 합(search.applyBudget과 동일 단위).
+// events 섹션이 content와 예산을 공유하도록 남은 예산 계산에 쓴다(C3). qrs가 nil(scope=events)
+// 이면 0 — events가 전체 예산을 받는다.
+func contentBudgetUsed(qrs []search.QueryResult) int {
+	used := 0
+	for _, qr := range qrs {
+		for _, h := range qr.Hits {
+			used += len(h.Snippet)
+		}
+	}
+	return used
+}
+
+// buildSearchOutput: content 결과(qrs, scope=events면 nil)와 이벤트 결과(evs, scope=content면
+// nil)를 질의별로 합친다. Hits는 기존 계약대로 항상 빈 슬라이스 이상(null 금지), Events는
+// omitempty라 비어 있으면 생략된다.
+func buildSearchOutput(queries []string, qrs []search.QueryResult, evs [][]eventHit, evTrunc []bool) SearchOutput {
+	out := SearchOutput{Untrusted: true, Results: make([]searchQueryResult, len(queries))}
+	for i, q := range queries {
+		r := searchQueryResult{Query: q, Hits: []searchHit{}}
+		if qrs != nil {
+			hits := make([]searchHit, len(qrs[i].Hits))
+			for j, h := range qrs[i].Hits {
+				hits[j] = toSearchHit(h)
+			}
+			r.Hits, r.Truncated = hits, qrs[i].Truncated
+		}
+		if evs != nil {
+			r.Events = evs[i]
+			if evTrunc[i] { // C3: 이벤트 절단도 기존 content truncated 관례로 동일 신호에 합류
+				r.Truncated = true
+			}
+		}
+		out.Results[i] = r
+	}
+	return out
+}
+
+func registerSearch(srv *mcp.Server, st *store.Store, worktreeRoot string, sess *session.DB) {
 	mcp.AddTool(srv, &mcp.Tool{
-		Name:        "ctr_search",
-		Description: "프로젝트 색인을 BM25+RRF로 검색해 스니펫을 반환한다.",
+		Name: "ctr_search",
+		Description: "프로젝트 색인을 BM25+RRF로 검색해 스니펫을 반환한다. scope로 content(기본)/" +
+			"events/all을 선택한다 — events/all은 세션 이벤트도 함께 검색한다(세션 저장소 불용 시 STORAGE_UNAVAILABLE).",
 		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true},
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, in SearchInput) (*mcp.CallToolResult, SearchOutput, error) {
 		start := time.Now()
 		if len(in.Queries) < 1 || len(in.Queries) > 8 {
 			return nil, SearchOutput{}, toolErr(codeInvalidArgument, "queries는 1~8개여야 합니다")
+		}
+		scope, err := normalizeSearchScope(in.Scope)
+		if err != nil {
+			return nil, SearchOutput{}, err
+		}
+		if scope != scopeContent && sess == nil {
+			return nil, SearchOutput{}, toolErr(codeStorageUnavailable, "세션 저장소를 사용할 수 없습니다")
 		}
 		limit := in.Limit
 		if limit <= 0 {
@@ -207,18 +333,22 @@ func registerSearch(srv *mcp.Server, st *store.Store, worktreeRoot string) {
 		if budget <= 0 {
 			budget = 8192
 		}
-		qrs, err := search.Query(ctx, st, worktreeRoot, in.Queries, limit, budget)
-		if err != nil {
-			return nil, SearchOutput{}, toToolError(err)
-		}
-		out := SearchOutput{Untrusted: true, Results: make([]searchQueryResult, len(qrs))}
-		for i, qr := range qrs {
-			hits := make([]searchHit, len(qr.Hits))
-			for j, h := range qr.Hits {
-				hits[j] = toSearchHit(h)
+		var qrs []search.QueryResult
+		if scope != scopeEvents {
+			if qrs, err = search.Query(ctx, st, worktreeRoot, in.Queries, limit, budget); err != nil {
+				return nil, SearchOutput{}, toToolError(err)
 			}
-			out.Results[i] = searchQueryResult{Query: qr.Query, Hits: hits, Truncated: qr.Truncated}
 		}
+		var evs [][]eventHit
+		var evTrunc []bool
+		if scope != scopeContent {
+			// C3: content가 소진하고 남은 예산을 events가 이어받는다(결합 예산).
+			eventsBudget := max(0, budget-contentBudgetUsed(qrs))
+			if evs, evTrunc, err = queryEventSection(ctx, sess, in.Queries, limit, eventsBudget); err != nil {
+				return nil, SearchOutput{}, toToolError(session.ClassifyStorageErr(err)) // C2: 런타임 훼손 → STORAGE_UNAVAILABLE
+			}
+		}
+		out := buildSearchOutput(in.Queries, qrs, evs, evTrunc)
 		st.LedgerAppend("ctr_search", 0, jsonLen(out), time.Since(start).Milliseconds())
 		return nil, out, nil
 	})
@@ -335,8 +465,9 @@ func applyFetchBudget(res store.RangeResult, maxBytes int) (text []byte, byteEnd
 
 func registerFetch(srv *mcp.Server, st *store.Store, worktreeRoot string) {
 	mcp.AddTool(srv, &mcp.Tool{
-		Name:        "ctr_fetch",
-		Description: "artifact 저장본에서 선택자 범위를 그대로 회수한다.",
+		Name: "ctr_fetch",
+		Description: "artifact 저장본에서 선택자 범위를 그대로 회수한다 — 저장된 artifact의 " +
+			"byte-exact 조회이며 웹 fetch가 아니다(웹은 ctr_fetch_and_index).",
 		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true},
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, in FetchInput) (*mcp.CallToolResult, FetchOutput, error) {
 		start := time.Now()
@@ -663,6 +794,11 @@ func registerGlobalSearch(srv *mcp.Server, projects []GlobalProject) {
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, in SearchInput) (*mcp.CallToolResult, GlobalSearchOutput, error) {
 		if len(in.Queries) < 1 || len(in.Queries) > 8 {
 			return nil, GlobalSearchOutput{}, toolErr(codeInvalidArgument, "queries는 1~8개여야 합니다")
+		}
+		// E1(fable): 공유 SearchInput의 scope는 global-search에서 미지원 — 조용히 무시하지 않고
+		// 명시 거부한다(events/all은 세션 저장소 개념이 없는 global 표면에서 의미 없음).
+		if in.Scope != "" {
+			return nil, GlobalSearchOutput{}, toolErr(codeInvalidArgument, "global-search는 scope를 지원하지 않습니다")
 		}
 		limit := in.Limit
 		if limit <= 0 {

@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/wotjr1649/context-router/internal/ident"
+	"github.com/wotjr1649/context-router/internal/session"
 	"github.com/wotjr1649/context-router/internal/store"
 )
 
@@ -27,10 +28,11 @@ import (
 const releaseURL = "https://api.github.com/repos/wotjr1649/context-router/releases/latest"
 
 // Run: cli 서브커맨드 단일 진입점. storeRoot·projectRoot는 main이 이미 결정해 넘긴다(cli는
-// 재도출하지 않는다 — 설계서 §7 Produces). sub은 main이 4개 이름 중 하나임을 이미 확인했다.
-// args는 doctor·upgrade에서 미사용, stats가 --provider 고유 플래그 파싱에 쓴다(전용
-// flag.NewFlagSet, 설계 §7 — main의 serverFlags와 별개). stderr는 아직 어떤 서브커맨드도
-// 쓰지 않는다(의도적 미사용, 시그니처는 4개 서브커맨드 공통).
+// 재도출하지 않는다 — 설계서 §7 Produces). sub은 main이 5개 이름(doctor·upgrade·stats·purge·
+// session) 중 하나임을 이미 확인했다. args는 doctor·upgrade에서 미사용, stats가 --provider
+// 고유 플래그 파싱에 쓴다(전용 flag.NewFlagSet, 설계 §7 — main의 serverFlags와 별개). stderr는
+// session export의 worktree 후보 목록·진단 안내 전용(태스크9, §7 stdout purity 게이트 선례 —
+// 그 외 서브커맨드는 여전히 미사용).
 func Run(ctx context.Context, sub string, args []string, storeRoot, projectRoot, version string, stdout, stderr io.Writer) error {
 	switch sub {
 	case "doctor":
@@ -56,7 +58,9 @@ func Run(ctx context.Context, sub string, args []string, storeRoot, projectRoot,
 		if fi, statErr := os.Stdin.Stat(); statErr == nil {
 			isTTY = fi.Mode()&os.ModeCharDevice != 0
 		}
-		return runPurge(ctx, os.Stdin, stdout, storeRoot, args, isTTY)
+		return runPurge(ctx, os.Stdin, stdout, stderr, storeRoot, args, isTTY)
+	case "session":
+		return runSession(ctx, stdout, stderr, args, storeRoot)
 	default:
 		return fmt.Errorf("cli: 미지 서브커맨드: %s", sub)
 	}
@@ -271,7 +275,9 @@ func confirmPurge(in io.Reader, out io.Writer, isTTY bool, force bool, expected 
 		}
 		return nil
 	}
-	fmt.Fprintf(out, "purge: 삭제 대상을 확인합니다. 계속하려면 다음을 그대로 입력하세요: %s\n> ", expected)
+	// B2: 전체 프로젝트 삭제(--all/--project 무플래그)는 content.db·artifacts와 함께 세션
+	// 이벤트 데이터(session.db 계열)도 삭제한다 — 기존 전체삭제 의미론(행동 무변)을 명시만 한다.
+	fmt.Fprintf(out, "purge: 삭제 대상을 확인합니다(전체 삭제는 세션 이벤트 데이터를 포함합니다). 계속하려면 다음을 그대로 입력하세요: %s\n> ", expected)
 	sc := bufio.NewScanner(in)
 	if !sc.Scan() {
 		return errors.New("purge: 확인 입력을 읽지 못했습니다 — 삭제하지 않았습니다")
@@ -338,14 +344,18 @@ func listProjectDirs(storeRoot string) ([]string, error) {
 // ("GC 단독", 설계 §7) 삭제를 전혀 하지 않고 orphan blob GC만 수행하며 확인을 생략한다 —
 // 고아 blob은 정의상 미참조 데이터라 삭제 확인 규칙(데이터 삭제 대상) 밖이다. 그 외 모든
 // 경로는 삭제 전 confirmPurge로 확인해야 하며, --gc가 --older-than과 함께면 확인 후
-// 삭제→GC 순서로 수행한다.
-func runPurge(ctx context.Context, in io.Reader, w io.Writer, storeRoot string, args []string, isTTY bool) error {
+// 삭제→GC 순서로 수행한다. --sessions(설계 §5)는 session.db 파일 계열(purgeSessionFiles)을
+// 대상에 추가한다 — --older-than 없이 단독이면 "GC 단독"과 동형으로 content.db는 건드리지
+// 않고 세션 파일만 지우되(데이터 삭제라 확인은 생략하지 않는다), --older-than과 함께면
+// 선택 삭제 뒤에 이어서 지운다.
+func runPurge(ctx context.Context, in io.Reader, w, stderr io.Writer, storeRoot string, args []string, isTTY bool) error {
 	fs := flag.NewFlagSet("purge", flag.ContinueOnError)
 	project := fs.String("project", "", "purge 대상 프로젝트(ID 또는 경로)")
 	all := fs.Bool("all", false, "storeRoot 하위 전체 프로젝트 대상")
 	olderThanFlag := fs.String("older-than", "", "time.ParseDuration 형식 — 지정 시 선택 삭제, 미지정 시 전체 삭제")
 	gc := fs.Bool("gc", false, "orphan blob GC 수행")
 	force := fs.Bool("force", false, "비TTY 환경에서 확인을 생략(자동화 전용)")
+	sessions := fs.Bool("sessions", false, "session.db 파일(계열, -wal/-shm 포함) 삭제 대상 포함 — .bak-*·recover-pending 마커는 제외(설계 §5)")
 	if err := fs.Parse(args); err != nil {
 		return fmt.Errorf("purge: 플래그 파싱 실패: %w", err)
 	}
@@ -378,7 +388,10 @@ func runPurge(ctx context.Context, in io.Reader, w io.Writer, storeRoot string, 
 	}
 
 	selective := *olderThanFlag != ""
-	gcOnly := *gc && !selective
+	// --sessions는 §5상 데이터 삭제이므로 "확인 생략" 전용인 gcOnly 모드에는 포함하지
+	// 않는다(고아 blob GC와 달리 session 이벤트는 참조되는 1차 데이터) — sessions가
+	// 주어지면 selective 여부와 무관하게 항상 confirmPurge를 거친다.
+	gcOnly := *gc && !selective && !*sessions
 	var cutoffUnix int64
 	if selective {
 		// 리뷰 P2-1: 파싱 실패 오류는 사용자 입력(*olderThanFlag)을 담은 err를 %w로 감싸지
@@ -428,17 +441,23 @@ func runPurge(ctx context.Context, in io.Reader, w io.Writer, storeRoot string, 
 		}
 
 		if gcOnly {
-			st, err := store.Open(projDir, true) // read-only — GC는 DB 쓰기가 없다
-			if err != nil {
+			if err := runGCOrphan(ctx, projDir); err != nil {
 				return err
 			}
-			_, gcErr := st.GCOrphanBlobs(ctx)
-			closeErr := st.Close()
-			if gcErr != nil {
-				return gcErr
+			continue
+		}
+
+		if !selective && *sessions {
+			// 세션 단독(older-than 없음, --gc 단독과 동형 선례) — content.db는 건드리지
+			// 않는다. §5 명문 계약: .bak-*·recover-pending 마커는 purgeSessionFiles가
+			// 애초에 대상으로 삼지 않으므로 잔존한다.
+			if err := purgeSessionFiles(projDir, stderr); err != nil {
+				return err
 			}
-			if closeErr != nil {
-				return closeErr
+			if *gc {
+				if err := runGCOrphan(ctx, projDir); err != nil {
+					return err
+				}
 			}
 			continue
 		}
@@ -450,12 +469,15 @@ func runPurge(ctx context.Context, in io.Reader, w io.Writer, storeRoot string, 
 			continue
 		}
 
-		// 선택 삭제 (+ 후속 --gc)
+		// 선택 삭제 (+ 후속 --sessions, + 후속 --gc)
 		st, err := store.Open(projDir, false)
 		if err != nil {
 			return err
 		}
 		_, _, purgeErr := st.PurgeOlderThan(ctx, cutoffUnix)
+		if purgeErr == nil && *sessions {
+			purgeErr = purgeSessionFiles(projDir, stderr)
+		}
 		if purgeErr == nil && *gc {
 			_, purgeErr = st.GCOrphanBlobs(ctx)
 		}
@@ -468,6 +490,306 @@ func runPurge(ctx context.Context, in io.Reader, w io.Writer, storeRoot string, 
 		}
 	}
 	return nil
+}
+
+// runGCOrphan: read-only store로 orphan blob GC만 수행한다(gcOnly·세션 단독+--gc 두 경로
+// 공용 — 둘 다 DB 쓰기가 없는 조회 기반 삭제라 read-only로 충분하다).
+func runGCOrphan(ctx context.Context, projDir string) error {
+	st, err := store.Open(projDir, true)
+	if err != nil {
+		return err
+	}
+	_, gcErr := st.GCOrphanBlobs(ctx)
+	closeErr := st.Close()
+	if gcErr != nil {
+		return gcErr
+	}
+	return closeErr
+}
+
+// sessionDBFiles: session.db 파일 계열(설계 §5 "session.db 파일 삭제 계열(-wal/-shm 포함)").
+// session.lock/session.init.lock(활성 프로세스 조정 파일)과 session.db.bak-<ts>·
+// session.recover-pending(수동 복구 자산)은 의도적으로 이 목록에 없다 — purgeSessionFiles는
+// 정확히 이 3개 이름만 지운다(글롭·접두사 매칭 없음 — 우발적 확장 삭제 방지).
+var sessionDBFiles = [3]string{"session.db", "session.db-wal", "session.db-shm"}
+
+// purgeSessionFiles: projDir/worktrees/*/ 하위 각 worktree 디렉터리에서 sessionDBFiles만
+// 삭제한다(설계 §5 purge 확장 — 경로 관례는 설계 §2.1 `projects/<pid>/worktrees/<wid>/
+// session.db`). worktrees/ 디렉터리가 아직 없으면(session 기능 미사용 프로젝트) 조용히
+// 통과한다. `.bak-<ts>` 파일·session.recover-pending 마커는 이름이 sessionDBFiles와 정확히
+// 일치하지 않으므로 자연히 보존된다(명문 계약, §5).
+func purgeSessionFiles(projDir string, stderr io.Writer) error {
+	root := filepath.Join(projDir, "worktrees")
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return errors.New("purge: worktrees 목록 조회 실패")
+	}
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		wtDir := filepath.Join(root, e.Name())
+		// B1(Codex P1): 삭제 전 그 worktree의 session.lock에 exclusive를 시도한다 — 실패(서버가
+		// shared lease 보유 중·복구 CLI가 exclusive 보유 중)면 그 worktree는 스킵하고 stderr로
+		// 고지한다. unix의 unlink-while-open은 열린 서버가 계속 append하는 파일을 지워 이벤트를
+		// 유실시키고, 복구와도 경합하기 때문. release는 비멱등(store.AcquireLock 계약)이라 삭제
+		// 직후 정확히 1회 호출한다.
+		release, lockErr := store.AcquireLock(filepath.Join(wtDir, "session.lock"), false)
+		if lockErr != nil {
+			fmt.Fprintf(stderr, "purge: skip worktree %s (session.lock 점유 — 활성 서버/복구 중)\n", e.Name())
+			continue
+		}
+		delErr := removeSessionDBFiles(wtDir)
+		release()
+		if delErr != nil {
+			return delErr
+		}
+	}
+	return nil
+}
+
+// removeSessionDBFiles: 한 worktree에서 sessionDBFiles(session.db 계열)만 삭제한다 —
+// purgeSessionFiles가 exclusive lease를 잡은 상태에서만 호출한다.
+func removeSessionDBFiles(wtDir string) error {
+	for _, name := range sessionDBFiles {
+		if err := os.Remove(filepath.Join(wtDir, name)); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return errors.New("purge: session.db 삭제 실패")
+		}
+	}
+	return nil
+}
+
+// runSession: "session" 서브커맨드 내부 디스패치(설계 §6.3·§7, 태스크9). args[0]이 하위
+// 서브커맨드 이름이다 — 9a는 "export", 9b는 "recover"를 구현한다.
+func runSession(ctx context.Context, stdout, stderr io.Writer, args []string, storeRoot string) error {
+	if len(args) == 0 {
+		return errors.New("cli: session: 서브커맨드 필요 (export|recover)")
+	}
+	sub, rest := args[0], args[1:]
+	switch sub {
+	case "export":
+		return runSessionExport(ctx, stdout, stderr, rest, storeRoot)
+	case "recover":
+		return runSessionRecover(stderr, rest, storeRoot)
+	default:
+		return fmt.Errorf("cli: session: 미지 서브커맨드: %s", sub)
+	}
+}
+
+// runSessionRecover: session recover 서브커맨드(설계 §6.3 7단계·§7). --project는 필수,
+// --worktree는 worktree가 정확히 1개일 때만 생략 가능(export와 동일한 worktree 특정 계약,
+// resolveWorktreeID 재사용). 실제 마커·인양·게시 루프는 session.Recover가 소유한다(cli는
+// 플래그 해석·프로젝트/worktree 배선·결과를 stderr 문구로 조립하는 것까지만 — 규약 소유
+// 경계, 태스크9b). stdout에는 아무것도 쓰지 않는다(CLI 결과 전용 규약상 recover는 stdout
+// 출력이 없는 것이 안전 기본, stderr에만 진행 보고).
+func runSessionRecover(stderr io.Writer, args []string, storeRoot string) error {
+	fs := flag.NewFlagSet("session recover", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	project := fs.String("project", "", "대상 프로젝트(ID 또는 경로)")
+	worktree := fs.String("worktree", "", "대상 worktree(ID 또는 경로) — 생략은 worktree가 1개일 때만 허용")
+	if err := fs.Parse(args); err != nil {
+		return fmt.Errorf("session recover: 플래그 파싱 실패: %w", err)
+	}
+	if rest := fs.Args(); len(rest) > 0 {
+		return fmt.Errorf("session recover: 예상치 않은 인자 %d개", len(rest))
+	}
+	if *project == "" {
+		return errors.New("session recover: --project 필수")
+	}
+
+	pid, err := purgeProjectID(storeRoot, *project)
+	if err != nil {
+		return errors.New("session recover: 프로젝트 식별 실패")
+	}
+	projDir := filepath.Join(storeRoot, "projects", pid)
+
+	wid, err := resolveWorktreeID(stderr, projDir, *worktree)
+	if err != nil {
+		return err
+	}
+	dbDir := filepath.Join(projDir, "worktrees", wid)
+
+	// 최종리뷰 A1(Critical): session.db가 없어도 복구 자산(마커·인양본·백업 main)이 있으면
+	// 게시(⑥) rename 도중 crash로 session.db만 사라진 상태이므로 session.Recover에 위임한다
+	// (Recover가 모든 잔여 상태 판정을 소유 — T9b 재개 분기가 CLI로 도달 가능해야 영구 wedge가
+	// 재도입되지 않는다). 어느 자산도 없을 때만 "없음"으로 거부한다.
+	fi, statErr := os.Stat(filepath.Join(dbDir, "session.db"))
+	if statErr != nil || fi.IsDir() {
+		hasAssets, artErr := session.HasRecoverArtifacts(dbDir)
+		if artErr != nil {
+			return errors.New("session recover: 복구 자산 확인 실패")
+		}
+		if !hasAssets {
+			return errors.New("session recover: session.db 없음")
+		}
+	}
+
+	result, err := session.Recover(dbDir)
+	if err != nil {
+		// session.Recover의 오류는 이미 "session recover: ..."로 자기서술적이다(recover.go) —
+		// 여기서 다시 감싸면 접두사가 중복된다(runSessionExport가 session.OpenReadOnly를 감쌀
+		// 때와 달리, 이 경우는 서브커맨드 이름이 완전히 동일해 추가 문맥이 없다).
+		return err
+	}
+
+	switch {
+	case result.NoOp:
+		fmt.Fprintln(stderr, "session recover: 손상 아님 — 조치 없음")
+	case result.MarkerOnly:
+		fmt.Fprintln(stderr, "session recover: 이미 게시 완료 — 마커만 삭제했습니다")
+	default:
+		fmt.Fprintf(stderr, "session recover: 인양 완료 — events=%d sessions=%d backup=%s\n",
+			result.RecoveredEvents, result.RecoveredSessions, result.BackupPrefix)
+	}
+	return nil
+}
+
+// runSessionExport: session export 서브커맨드(설계 §6.3 export 부분·§7). --project는 필수
+// (purge와 동일한 자체 flag.NewFlagSet 관례 — main이 prescan한 --root는 session에 쓰지 않는다).
+// --worktree는 해당 프로젝트에 worktree가 정확히 1개일 때만 생략할 수 있다(resolveWorktreeID —
+// worktree 특정 계약). stdout에는 EventV1 JSONL만 쓴다(UTF-8 no BOM, LF) — 진단·후보 목록은
+// stderr(stdout purity 게이트 선례). session.Open이 아니라 session.OpenReadOnly로 열어 export
+// 대상 DB에 session_start 이벤트가 섞이지 않게 한다(브리프 명시 지침).
+func runSessionExport(ctx context.Context, stdout, stderr io.Writer, args []string, storeRoot string) error {
+	fs := flag.NewFlagSet("session export", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	project := fs.String("project", "", "대상 프로젝트(ID 또는 경로)")
+	worktree := fs.String("worktree", "", "대상 worktree(ID 또는 경로) — 생략은 worktree가 1개일 때만 허용")
+	sessionID := fs.String("session", "", "세션 ID 필터, 생략 시 worktree 전체")
+	after := fs.Int64("after", 0, "커서(rowid), 생략 시 처음부터")
+	if err := fs.Parse(args); err != nil {
+		return fmt.Errorf("session export: 플래그 파싱 실패: %w", err)
+	}
+	if rest := fs.Args(); len(rest) > 0 {
+		return fmt.Errorf("session export: 예상치 않은 인자 %d개", len(rest))
+	}
+	if *project == "" {
+		return errors.New("session export: --project 필수")
+	}
+
+	pid, err := purgeProjectID(storeRoot, *project) // 기존 --project 해석 헬퍼 재사용(브리프 지침)
+	if err != nil {
+		return errors.New("session export: 프로젝트 식별 실패")
+	}
+	projDir := filepath.Join(storeRoot, "projects", pid)
+
+	wid, err := resolveWorktreeID(stderr, projDir, *worktree)
+	if err != nil {
+		return err
+	}
+	dbDir := filepath.Join(projDir, "worktrees", wid)
+
+	if fi, statErr := os.Stat(filepath.Join(dbDir, "session.db")); statErr != nil || fi.IsDir() {
+		return errors.New("session export: session.db 없음")
+	}
+
+	reader, err := session.OpenReadOnly(dbDir)
+	if err != nil {
+		return fmt.Errorf("session export: %w", err)
+	}
+	defer func() { _ = reader.Close() }() // read-only export 전용 — 닫기 실패해도 데이터 유실 없음
+
+	return exportJSONL(ctx, stdout, reader, *sessionID, *after)
+}
+
+// exportJSONL: session.Export를 rowid 커서로 반복 호출해(전량 소진까지) EventV1을 행당
+// json.Marshal → w에 JSONL로 쓴다(설계 §7 — MCP 도구의 max_return_bytes 예산 절단은 CLI
+// export에는 없다, 매핑은 EventV1 1곳, D16).
+func exportJSONL(ctx context.Context, w io.Writer, reader *sql.DB, sessionID string, after int64) error {
+	const batchLimit = 500 // ponytail: 배치 크기 상수 — 튜닝 필요해지면 그때 플래그화
+	cur := after
+	for {
+		events, next, err := session.Export(ctx, reader, cur, sessionID, batchLimit)
+		if err != nil {
+			return fmt.Errorf("session export: %w", err)
+		}
+		for _, ev := range events {
+			b, mErr := json.Marshal(ev)
+			if mErr != nil {
+				return fmt.Errorf("session export: JSON 인코딩 실패: %w", mErr)
+			}
+			b = append(b, '\n')
+			if _, wErr := w.Write(b); wErr != nil {
+				return fmt.Errorf("session export: 출력 실패: %w", wErr)
+			}
+		}
+		if len(events) == 0 || next == cur {
+			return nil
+		}
+		cur = next
+	}
+}
+
+// resolveWorktreeID: --worktree 값(ID 또는 경로)을 worktrees/ 하위 디렉터리 이름으로
+// 정규화한다(설계 §7 worktree 특정 계약 — main.resolveProjectEntry·cli.purgeProjectID와 동형인
+// "ID 우선, 그다음 경로" 판별, D13상 각자 소유). entry가 비어 있으면 projDir/worktrees/ 하위
+// 후보가 정확히 1개일 때만 그 이름을 쓰고, 0개나 다중이면 후보 목록을 stderr에 출력한 뒤
+// 오류를 반환한다 — --project만으로는 대상 session.db가 결정되지 않는다.
+func resolveWorktreeID(stderr io.Writer, projDir, entry string) (string, error) {
+	if entry != "" {
+		hasSep := strings.ContainsAny(entry, `/\`)
+		if !hasSep {
+			if fi, statErr := os.Stat(filepath.Join(projDir, "worktrees", entry)); statErr == nil && fi.IsDir() {
+				return entry, nil // 이미 worktree ID로 확정 — 경로 해석 생략
+			}
+		}
+		looksLikePath := hasSep
+		if !looksLikePath {
+			if fi, statErr := os.Stat(entry); statErr == nil && fi.IsDir() {
+				looksLikePath = true
+			}
+		}
+		if !looksLikePath {
+			return entry, nil // ID 문자열 그대로(미존재면 후속 session.db 오픈에서 오류로 표면화)
+		}
+		canon, err := ident.Canonicalize(entry)
+		if err != nil {
+			// Canonicalize의 원인은 *fs.PathError라 절대경로를 담는다(§12 canary) — 원문을
+			// 감싸지 않고 정적 메시지만 남긴다(runStatsLocal·purgeProjectID 호출부와 동일 관례).
+			return "", errors.New("session: worktree 식별 실패")
+		}
+		return canon.WorktreeID, nil
+	}
+
+	ids, err := listWorktreeDirs(projDir)
+	if err != nil {
+		return "", err
+	}
+	switch len(ids) {
+	case 0:
+		return "", errors.New("session: 이 프로젝트에 worktree가 없습니다")
+	case 1:
+		return ids[0], nil
+	default:
+		fmt.Fprintln(stderr, "session: worktree가 여럿입니다 — --worktree 지정 필요, 후보:")
+		for _, id := range ids {
+			fmt.Fprintf(stderr, "  %s\n", id)
+		}
+		return "", errors.New("session: worktree가 여럿입니다 — --worktree 지정 필요")
+	}
+}
+
+// listWorktreeDirs: projDir/worktrees/ 하위 디렉터리 이름(=worktree ID) 목록. listProjectDirs와
+// 동형(대상 하위경로만 다름) — worktrees/ 자체가 없으면(session 기능 미사용 프로젝트) 빈
+// 목록+nil.
+func listWorktreeDirs(projDir string) ([]string, error) {
+	entries, err := os.ReadDir(filepath.Join(projDir, "worktrees"))
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, nil
+		}
+		return nil, errors.New("session: worktrees 목록 조회 실패")
+	}
+	var ids []string
+	for _, e := range entries {
+		if e.IsDir() {
+			ids = append(ids, e.Name())
+		}
+	}
+	return ids, nil
 }
 
 // probeWritable: dir에 임시 파일을 만들고 즉시 지워 쓰기 가능 여부만 확인한다 — dir 자체를
@@ -555,7 +877,7 @@ permissions (.claude/settings.json 예시 — ingest/net/global은 기본 ask):
 [mcp_servers.ctr]
 command = "context-router"
 args = []
-enabled_tools = ["ctr_search", "ctr_fetch", "ctr_transform"]
+enabled_tools = ["ctr_search", "ctr_fetch", "ctr_transform", "ctr_record_event", "ctr_session_summary", "ctr_export_events"]
 # ingest/net 활성화 시 권장: default_tools_approval_mode = "prompt"
 `
 
@@ -641,6 +963,73 @@ func runDoctor(ctx context.Context, w io.Writer, storeRoot, projectRoot string) 
 		failed = append(failed, "fts5")
 	} else {
 		fmt.Fprintln(w, "[4] fts5: 가능")
+	}
+
+	// [6]-[8] 세션 진단(설계 §7, 태스크9a): session.db quick_check·lease shared 프로브·
+	// session.recover-pending 마커 존재. worktree 디렉터리(projects/<pid>/worktrees/<wid>,
+	// canon.WorktreeID — doctor는 cwd/--root 자체가 이미 특정 worktree이므로 export와 달리
+	// --worktree 다중 후보 모호성이 없다)가 아직 없으면(session 기능 미사용) 3항목 모두
+	// "not initialized"로 정보성 표시하고 실패로 세지 않는다(content.db [3] 분기와 동일
+	// 원칙 — no-create: 이 블록도 sessDir을 만들지 않는다).
+	sessDirFI, sessDirErr := os.Stat(filepath.Join(storeRoot, "projects", canon.ProjectID, "worktrees", canon.WorktreeID))
+	switch {
+	case canon.ProjectID == "":
+		fmt.Fprintln(w, "[6] session.db: skip (project 식별 실패)")
+		fmt.Fprintln(w, "[7] session.lock: skip (project 식별 실패)")
+		fmt.Fprintln(w, "[8] session.recover-pending: skip (project 식별 실패)")
+	case sessDirErr != nil || !sessDirFI.IsDir():
+		fmt.Fprintln(w, "[6] session.db: not initialized")
+		fmt.Fprintln(w, "[7] session.lock: not initialized")
+		fmt.Fprintln(w, "[8] session.recover-pending: not initialized")
+	default:
+		sessDir := filepath.Join(storeRoot, "projects", canon.ProjectID, "worktrees", canon.WorktreeID)
+
+		// [6] session.db quick_check — read-only(session.OpenReadOnly는 store.Open(dir,true)의
+		// mode=ro&query_only(ON) 선례와 동형 DSN, doctor no-create 원칙상 session.Open은 쓰지
+		// 않는다).
+		if fi, statErr := os.Stat(filepath.Join(sessDir, "session.db")); statErr != nil || fi.IsDir() {
+			fmt.Fprintln(w, "[6] session.db: not initialized")
+		} else if reader, openErr := session.OpenReadOnly(sessDir); openErr != nil {
+			fmt.Fprintf(w, "[6] session.db: open 실패: %v\n", openErr)
+			failed = append(failed, "session.db")
+		} else {
+			var quickCheck string
+			qcErr := reader.QueryRowContext(ctx, "PRAGMA quick_check").Scan(&quickCheck)
+			closeErr := reader.Close()
+			switch {
+			case qcErr != nil || quickCheck != "ok":
+				fmt.Fprintf(w, "[6] session.db: quick_check 실패 (quick_check=%q)\n", quickCheck)
+				failed = append(failed, "session.db")
+			case closeErr != nil:
+				fmt.Fprintf(w, "[6] session.db: quick_check=ok (close 경고: %v)\n", closeErr)
+			default:
+				fmt.Fprintln(w, "[6] session.db: quick_check=ok")
+			}
+		}
+
+		// [7] lease shared 프로브(설계 §6.2) — 시도-즉시-해제. exclusive 프로브는 하지 않는다
+		// (시작 중인 서버의 shared 획득과 경합해 오분기시키는 경로 차단, 설계 §6.2 명문 계약).
+		if release, lockErr := store.AcquireLock(filepath.Join(sessDir, "session.lock"), true); lockErr != nil {
+			fmt.Fprintf(w, "[7] session.lock: shared 획득 실패: %v\n", lockErr)
+			failed = append(failed, "session.lock")
+		} else {
+			release()
+			fmt.Fprintln(w, "[7] session.lock: shared 획득 가능")
+		}
+
+		// [8] 복구 마커 존재(설계 §6.3) — 존재하면 서버가 fail-closed 상태이므로 실패 항목에
+		// 센다(session recover 재실행 필요를 doctor가 능동적으로 알림).
+		_, markerErr := os.Stat(filepath.Join(sessDir, "session.recover-pending"))
+		switch {
+		case markerErr == nil:
+			fmt.Fprintln(w, "[8] session.recover-pending: 존재 (session recover 필요)")
+			failed = append(failed, "session.recover-pending")
+		case errors.Is(markerErr, os.ErrNotExist):
+			fmt.Fprintln(w, "[8] session.recover-pending: 없음")
+		default:
+			fmt.Fprintf(w, "[8] session.recover-pending: 확인 실패: %v\n", markerErr)
+			failed = append(failed, "session.recover-pending")
+		}
 	}
 
 	fmt.Fprintln(w)

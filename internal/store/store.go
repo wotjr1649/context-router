@@ -58,7 +58,7 @@ func lockStore(dir string) (func(), error) {
 	deadline := time.Now().Add(5 * time.Second)
 	delay := 10 * time.Millisecond
 	for {
-		release, err := tryLockFile(path)
+		release, err := tryLockFile(path, false) // exclusive
 		if err == nil {
 			return release, nil
 		}
@@ -73,6 +73,16 @@ func lockStore(dir string) (func(), error) {
 			delay *= 2
 		}
 	}
+}
+
+// AcquireLock: path에 대한 논블로킹 파일 잠금 공개 API(v0.1 session DB — internal/session,
+// 설계 §8 예외 2건 중 1건). shared=false는 exclusive, shared=true는 shared — 실패는
+// lockStore와 달리 재시도 없이 즉시 error로 반환한다(호출자가 재시도 정책을 정한다).
+// unix/windows 구현은 각각 store_lock_unix.go/store_lock_windows.go의 tryLockFile을
+// 그대로 재사용(위 lockStore도 동일 함수를 exclusive 모드로 경유). path의 부모 디렉터리는
+// 호출자가 미리 만들어둬야 한다(O_CREATE는 파일만 생성, 디렉터리는 생성하지 않음).
+func AcquireLock(path string, shared bool) (release func(), err error) {
+	return tryLockFile(path, shared)
 }
 
 func Open(dir string, readOnly bool) (*Store, error) {
@@ -599,6 +609,20 @@ func (s *Store) ArtifactText(ctx context.Context, artifactID int64, maxBytes int
 		return "", err
 	}
 	return string(blob), nil
+}
+
+// ArtifactHashByID: artifacts.content_hash 단일 조회(v0.1 session DB — internal/session,
+// 설계 §8 예외 2건 중 1건 — artifact 참조 무결성 확인용). 미존재 id는 ErrNotFound.
+func (s *Store) ArtifactHashByID(ctx context.Context, id int64) (string, error) {
+	var hash string
+	err := s.reader.QueryRowContext(ctx, "SELECT content_hash FROM artifacts WHERE id=?", id).Scan(&hash)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", fmt.Errorf("store ArtifactHashByID: artifact 없음: %w", ErrNotFound)
+	}
+	if err != nil {
+		return "", fmt.Errorf("store ArtifactHashByID: %w", err)
+	}
+	return hash, nil
 }
 
 // ReadRange: Selector.Kind 하나로 chunk 저장 좌표, blob 라인 스캔, blob UTF-8 스냅 바이트

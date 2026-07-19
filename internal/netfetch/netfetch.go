@@ -55,7 +55,7 @@ var ErrDenied = errors.New("netfetch: destination denied")
 const (
 	defaultMaxBytes  = 10 << 20 // 10MB — 설계 §4.5 fetch_and_index 기본과 정합.
 	defaultTimeout   = 30 * time.Second
-	defaultUserAgent = "context-router/0.0.1"
+	defaultUserAgent = "context-router/0.1.0"
 	maxRedirects     = 5
 )
 

@@ -1,8 +1,15 @@
 # Context Router 구현 규약 — 아키텍처·코드 컨벤션
 
-> 문서 상태: 확정 (2026-07-17) — 3채널 브레인스토밍(웹 1차 소스 리서치 · 아키텍처 합성 · Codex 교차 모델) 병합
-> 지위: 구현 계획(writing-plans)과 모든 코드 리뷰의 판정 기준. 설계서(§ 참조는 `context-router-design-v0.0.1-ko.md`)와 충돌 시 설계서 개정이 선행한다
+> 문서 상태: 확정 (2026-07-17) — 3채널 브레인스토밍(웹 1차 소스 리서치 · 아키텍처 합성 · Codex 교차 모델) 병합. 개정 4항(2026-07-20, v0.1 설계 §8 — session 패키지 그래프·D16 wire 예외·store 예외 2건 근거·§ 매핑) 반영.
+> 지위: 구현 계획(writing-plans)과 모든 코드 리뷰의 판정 기준. 설계서와 충돌 시 설계서 개정이 선행한다.
 > 준수: D8(의존성 7·프레임워크 금지) · D13(반파편화) · HANDOFF 최소화 원칙(ponytail full)
+
+**설계서 § 매핑** (v0.1부터 설계서가 2개 문서로 분리되며 §번호가 겹친다 — 예: 양쪽 다 §8을 가짐):
+
+| 접두어 | 문서 |
+|---|---|
+| "설계 §N" (접두어 없음) | `context-router-design-v0.0.1-ko.md` |
+| "v0.1 설계 §N" | `context-router-design-v0.1-ko.md` (델타 문서 — 여기 없는 계약은 v0.0.1이 그대로 유효) |
 
 ## 1. 원칙 서열과 근거
 
@@ -12,20 +19,26 @@
 
 ```text
 cmd ──┬─ mcp ─┬─ search ──→ store
+      │       ├─ session → store          # 조회만 — v0.1, 아래 "session 신설" 참조
       │       ├─ ingest ──→ store, ident
       │       ├─ transform → store        # blob 경로 조회용
       │       ├─ netfetch                 # leaf — 저장하지 않는다
       │       └─ store, ident             # Config 배선(Store 포인터·Canon)
-      ├─ cli ─────────────→ store, ident
+      ├─ cli ─────────────→ store, ident, session   # session — v0.1, export/recover 서브커맨드
       ├─ store                            # store.Open 직접 호출
       └─ ident                            # leaf, 순수 함수
 store · ident · netfetch · transform : internal 상호 의존 0 (leaf)
+search → session: 없음(의도) — search.QueryEvents(v0.1)는 *sql.DB reader를 인자로만 받는다,
+                  session 타입을 import하지 않는다(D16 "search→session 타입 의존 없음").
 ```
 
 - **단방향 규칙**: 표에 없는 import는 전부 금지. 어떤 패키지도 `mcp`를 import하지 않는다.
 - **순환 차단 3규칙**: ① store는 스키마·트랜잭션·blob 원시 연산만 — 청킹·redaction·랭킹을 모른다(완성된 행을 받는다). ② netfetch는 바이트+메타(`Result{Raw, Body, MediaType, Extraction, FinalURL}`)만 반환 — "fetch 후 ingest" 배선은 mcp 핸들러가 한다. ③ 오류 코드 변환은 mcp에만 있다(§6).
 - **search·store 분리 유지 판정**: Google "항상 같이 import되면 합쳐라" 기준은 불성립(cli·ingest가 store를 단독 사용). 합치면 store God-package 부패 경로와 충돌 — 분리 유지(2:1 판정).
-- 책임 1줄: **ident** canonicalization·ID(설계 §3.2) / **store** DB 수명·PRAGMA·단일 트랜잭션 계약·blob IO(§3.3~3.5) / **search** FTS 질의→BM25→RRF→스니펫·예산(§4.1) / **ingest** §3.0 파이프라인+경로 정책(§4.4) / **netfetch** SSRF 불변식+readability+html→md(§5.2·§4.5) / **transform** starlark 엔진·worker 프로토콜·OS 상한(§4.3) / **mcp** 도구 스키마·등록·핸들러(§4) / **cli** doctor·stats·purge·upgrade(§7).
+- **session 신설(v0.1, 설계 §8)**: Session DB(worktree당 1개, content.db와 물리 분리 — D10 승계)의 스키마·PRAGMA·lease·append·조회·§26 wire 표현(`EventV1`, D16) 전담. store로 합치지 않는 이유는 search·store 판정과 동일 논리 연장 — 소유 스키마가 다른 DB는 패키지도 분리한다. session→store 의존은 **조회 전용**(`AcquireLock` 재사용, `ArtifactHashByID` 호출)뿐이고 store→session 의존은 0.
+- **store 소형 예외 2건의 근거(v0.1, 설계 §8)**: ① `AcquireLock(path string, shared bool)` 공개화(`store.go`) — 기존 `lockStore`가 내부적으로 쓰던 unix/windows `tryLockFile` OS별 잠금 원시 코드를 session의 lease 2파일(lifetime·init lock)이 그대로 재사용한다(OS별 잠금 코드 중복 금지, D13). ② `ArtifactHashByID(ctx, id) (string, error)` 신설 — artifact_id→content_hash 단일 조회. session이 이 조회를 raw SQL로 직접 하면 store가 소유한 artifacts 스키마 지식이 session으로 유출된다(캡슐화 역행) — 좁은 조회 메서드 1개를 store에 추가하는 편이 §10 "store 만능화 방지"(기능 질의 조립 금지)와 상충하지 않으면서 더 낫다. 이 2건 외 content.db 마이그레이션은 0건.
+- **이벤트 FTS 질의는 search 소유, `ArtifactHashExists`도 search 소유(v0.1, 설계 §8 정신의 확장 — T4 리뷰 판정)**: `search.QueryEvents`(porter+trigram RRF, session.db reader 인자)는 설계 §8이 명시적으로 예고한 이동. `search.ArtifactHashExists(ctx, st *store.Store, hash) (bool, error)`(ctr_session_summary의 artifact_refs missing 힌트 판정용)는 설계 §8이 이름을 못 박지 않았지만, store 예외가 이미 2건 소진됐고 session은 "조회만" 원칙상 가질 수 없어 — search가 이미 `st.Reader()`로 artifacts에 raw SQL을 실행하는 기존 패턴을 갖고 있다는 점에서 store 불변 유지 + 자연스러운 소유자로 T4 리뷰가 판정했다.
+- 책임 1줄: **ident** canonicalization·ID(설계 §3.2) / **store** DB 수명·PRAGMA·단일 트랜잭션 계약·blob IO(§3.3~3.5) / **search** FTS 질의→BM25→RRF→스니펫·예산(§4.1) + 이벤트 질의(v0.1 설계 §8) / **session** Session DB 수명·스키마·append·lease·§26 wire·복구(v0.1 설계 §2·§3·§6) / **ingest** §3.0 파이프라인+경로 정책(§4.4) / **netfetch** SSRF 불변식+readability+html→md(§5.2·§4.5) / **transform** starlark 엔진·worker 프로토콜·OS 상한(§4.3) / **mcp** 도구 스키마·등록·핸들러(§4) / **cli** doctor·stats·purge·upgrade(§7) + session export/recover(v0.1 설계 §6.3·§7).
 
 ## 3. 타입 소유권
 
@@ -36,6 +49,7 @@ store · ident · netfetch · transform : internal 상호 의존 0 (leaf)
 | `Result` | netfetch | fetch 산출물 |
 | worker `Request`/`Result` | transform | stdin/stdout JSON 프로토콜 양단의 단일 정의 |
 | MCP 요청/응답 struct (jsonschema 태그) | mcp | 내부 타입→wire 변환은 각 도구 핸들러 1곳. 내부 타입에 MCP 태그 부착 금지 |
+| `session.EventV1`(SessionEvent v1 export wire) | **session — D16 예외(v0.1)** | "wire 타입은 mcp 소유" 규약의 유일한 예외. `ctr_export_events`(MCP, camelCase JSON+커서)와 CLI `session export`(JSONL) 양쪽이 공유하는 wire 표현이라 mcp에 두면 cli→mcp 의존이 생긴다(금지, §2 단방향 규칙) — session에 두면 매핑 지점이 1곳으로 유지된다. mcp 핸들러는 이 타입을 그대로 반환만 하고 자체 변환을 하지 않는다(다른 MCP 요청/응답 struct와 달리 핸들러 내부 wire 변환이 없음) |
 
 공유 `types`/`models`/`domain` 패키지 금지.
 
@@ -54,6 +68,8 @@ store · ident · netfetch · transform : internal 상호 의존 0 (leaf)
 - **금지**: 타입별 1파일, doc.go 단독 파일(패키지 주석은 주 파일 상단 — 내용은 "1줄 책임 + 설계서 §번호"), helpers.go/utils.go, 함수 하나짜리 파일.
 - **선호 밴드 300~1,000줄** (상한은 초대형 파일의 역효과 방지). **v0.0.1 목표 ≈12~15 소스 파일**(테스트 제외).
 - store가 밴드를 넘을 때의 **사전 승인된 이음새**: `schema` / `blob` / `recovery` (그 전까지 store.go 하나). 사전 분할 금지.
+- **mcp 실제 분리(v0.1, 사전 승인 ② 적용 — 새 이음새 목록 아님)**: 세션 도구 3종 추가로 `mcp.go`가 밴드를 넘어 `mcp_session.go`(ctr_record_event·ctr_session_summary·ctr_export_events, 응집된 이음새)로 분리했다. `mcp.go`는 도구 스키마·등록·핵심 핸들러+`toToolError`를 유지.
+- **session(v0.1) 실제 구성 — 5파일**(예상 1~2파일에서 실제 응집 경계에 맞춰 확장, 사전 승인 ②): `session.go`(스키마·PRAGMA·lease 2파일·UUIDv7·append) / `summary.go`(`ctr_session_summary` 집계) / `export.go`(§26 `EventV1` wire·export 페이지네이션, D16) / `retention.go`(스윕 엔진, §5) / `recover.go`(fail-closed 판정·수동 복구 7단계, §6). 각 파일이 독립 기능 경계(스키마/요약/export/retention/복구)를 가져 병합이 오히려 응집도를 해친다 — 추가 분할은 금지, 현 5파일이 안정 상태.
 
 ## 6. 오류 규약
 

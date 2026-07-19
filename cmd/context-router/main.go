@@ -16,15 +16,17 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/wotjr1649/context-router/internal/cli"
 	"github.com/wotjr1649/context-router/internal/ident"
 	"github.com/wotjr1649/context-router/internal/mcp"
+	"github.com/wotjr1649/context-router/internal/session"
 	"github.com/wotjr1649/context-router/internal/store"
 	"github.com/wotjr1649/context-router/internal/transform"
 )
 
-const version = "0.0.1"
+const version = "0.1.0"
 
 type serverFlags struct {
 	Root, StoreRoot, LogLevel   string
@@ -32,6 +34,7 @@ type serverFlags struct {
 	Projects                    []string // --projects: global-search 전용 allowlist (설계 §8)
 	NetAllowLocal               bool
 	NetPorts                    []int
+	RetentionEvents             time.Duration // --retention-events: 0 = off/무기한 (설계 §5, D17)
 }
 
 func parseFlags(args []string) (serverFlags, error) {
@@ -53,6 +56,8 @@ func parseFlags(args []string) (serverFlags, error) {
 	fs.StringVar(&netPorts, "net-ports", "", "extra allowed ports for fetch_and_index (comma-separated)")
 	var projects string
 	fs.StringVar(&projects, "projects", "", "global-search project allowlist (comma-separated paths or IDs, required for --profile global-search)")
+	var retentionEvents string
+	fs.StringVar(&retentionEvents, "retention-events", "", "session event retention (time.ParseDuration format, e.g. 720h); default off (unlimited, 설계 §5)")
 	if err := fs.Parse(args); err != nil {
 		return serverFlags{}, err
 	}
@@ -81,7 +86,71 @@ func parseFlags(args []string) (serverFlags, error) {
 			f.NetPorts = append(f.NetPorts, n)
 		}
 	}
+	d, err := parseRetentionEventsFlag(retentionEvents)
+	if err != nil {
+		return serverFlags{}, err
+	}
+	f.RetentionEvents = d
 	return f, nil
+}
+
+// parseRetentionEventsFlag — --retention-events 값을 검증한다(설계 §5, D17). 빈 문자열(플래그
+// 미지정, 기본값)은 0(=off=무기한)으로 통과한다. time.ParseDuration 표준 동작을 그대로 쓴다 —
+// 커스텀 단위(예: "d")를 추가하지 않는다("30d"는 표준대로 오류, "720h"처럼 시간 단위로
+// 환산해서 써야 한다 — 기존 --older-than 선례와 동일 관례). 파싱 오류·음수 기간은 기동
+// 거부(사용자 입력 원문은 %w로 감싸지 않는다, cli 패키지 --older-than과 동일한 위생 관례).
+func parseRetentionEventsFlag(s string) (time.Duration, error) {
+	if s == "" {
+		return 0, nil
+	}
+	d, err := time.ParseDuration(s)
+	if err != nil {
+		return 0, errors.New("ctr: --retention-events 값이 유효한 기간이 아닙니다")
+	}
+	// D4(Codex P2): 음수는 물론, 1초 미만 양수도 거부한다 — retentionSecFromDuration이 초 단위로
+	// 절삭해 500ms 같은 양수 기간이 0(무기한)으로 조용히 뭉개지는 경로를 차단한다(0=off는 빈
+	// 문자열로만 표현, 위에서 이미 처리).
+	if d < 0 || (d > 0 && d < time.Second) {
+		return 0, errors.New("ctr: --retention-events 값이 유효한 기간이 아닙니다 (1초 미만 양수 금지)")
+	}
+	return d, nil
+}
+
+// retentionSecFromDuration — 파싱된 --retention-events → session.Options.RetentionSec(초)
+// 변환(설계 §5). 0 Duration은 그대로 0(무기한/정책 미표명)으로 매핑된다.
+func retentionSecFromDuration(d time.Duration) int64 {
+	return int64(d / time.Second)
+}
+
+// sweepSessionRetentionAtStart — 서버 시작 시 1회 retention 스윕을 수행하는 헬퍼(설계 §5:
+// "시작 시 1회 트랜잭션 + 삭제 건수 stderr 1줄 고지, 실패는 log-and-continue"). now는 값
+// 주입(G7 결정론). run()이 openSessionDB로 session.Open을 배선한 직후(sessDB!=nil일 때만)
+// 호출한다(T10, task-8-report.md의 구조 결정 그대로 이 자리에 합류).
+func sweepSessionRetentionAtStart(ctx context.Context, d *session.DB, now time.Time, stderr io.Writer) {
+	deleted, err := session.Sweep(ctx, d, now)
+	if err != nil {
+		fmt.Fprintf(stderr, "ctr: session retention sweep 실패(계속 진행): %v\n", err)
+		return
+	}
+	fmt.Fprintf(stderr, "ctr: session retention sweep: %d개 이벤트 삭제\n", deleted)
+}
+
+// openSessionDB — session.Open을 배선한다(설계 §6.2 fail-closed, T10). sentinel 3종
+// (ErrCorrupt·ErrRecoverPending·ErrLeaseHeld) 및 그 외 예기치 못한 오류 전부를 동일하게
+// 처리한다: nil을 반환하고 stderr에 1줄 경고만 남긴 뒤 서버 시작은 계속 진행한다(§6.2
+// "가용성 트레이드오프 수용" — content 도구는 정상 서빙, 세션 표면만 미등록이 NewServer의
+// cfg.Session==nil 분기로 이어진다). ErrCorrupt·ErrRecoverPending은 수동 복구 CLI 안내를
+// 추가로 남긴다(§6.3 "recover 재실행을 stderr로 안내").
+func openSessionDB(dir string, opts session.Options, stderr io.Writer) *session.DB {
+	d, err := session.Open(dir, opts)
+	if err != nil {
+		fmt.Fprintf(stderr, "ctr: session.db 사용 불가 — 세션 도구 비활성(content 도구는 정상 진행): %v\n", err)
+		if errors.Is(err, session.ErrCorrupt) || errors.Is(err, session.ErrRecoverPending) {
+			fmt.Fprintln(stderr, "ctr: 복구하려면 `context-router session recover`를 실행하세요")
+		}
+		return nil
+	}
+	return d
 }
 
 // validProfile: v0.0.1이 실제로 지원하는 두 형태뿐(mcp.NewServer가 Profile로 도구를
@@ -358,6 +427,22 @@ func run(ctx context.Context, args []string, stderr io.Writer) error {
 	}
 	defer st.Close()
 
+	// session.db 배선(설계 §2.1 경로 예약: projects/<pid>/worktrees/<wid>) — 실패는
+	// fail-closed(openSessionDB가 nil+stderr 경고로 흡수, content 도구는 영향 없음).
+	sessDB := openSessionDB(
+		filepath.Join(storeRoot, "projects", canon.ProjectID, "worktrees", canon.WorktreeID),
+		session.Options{
+			RetentionSec: retentionSecFromDuration(f.RetentionEvents),
+			Producer:     fmt.Sprintf("context-router/%s", version),
+			WorktreeRoot: canon.WorktreeRoot, // D3: session_start payload에 사용자 worktree 경로 주입(설계 §2.2)
+		},
+		stderr,
+	)
+	if sessDB != nil {
+		defer sessDB.Close() // lease 해제 — release 비멱등 1회(session.DB.Close 계약)
+		sweepSessionRetentionAtStart(ctx, sessDB, time.Now(), stderr)
+	}
+
 	selfExe, err := os.Executable()
 	if err != nil {
 		return err
@@ -366,6 +451,7 @@ func run(ctx context.Context, args []string, stderr io.Writer) error {
 		Canon: canon, Store: st, SelfExe: selfExe,
 		Profile: f.Profile, Enable: f.Enable, AllowPaths: allowPaths,
 		NetAllowLocal: f.NetAllowLocal, NetPorts: f.NetPorts,
+		Session: sessDB,
 	})
 }
 
@@ -373,9 +459,11 @@ func run(ctx context.Context, args []string, stderr io.Writer) error {
 // 먼저 분기해야 한다 — stdout은 Result JSON 1건이어야 하고 배너·로그가 섞이면 안 된다.
 const transformWorkerArg = "__transform-worker"
 
-// cliSubcommands: internal/cli가 처리하는 4개 서브커맨드 이름(설계 §7). 이 중 하나가 아닌
-// 첫 인자는 dispatchCLI의 관심사가 아니다 — MCP 서버 플래그로 그대로 흘려보낸다.
-var cliSubcommands = map[string]bool{"doctor": true, "stats": true, "purge": true, "upgrade": true}
+// cliSubcommands: internal/cli가 처리하는 서브커맨드 이름(설계 §7). 이 중 하나가 아닌 첫
+// 인자는 dispatchCLI의 관심사가 아니다 — MCP 서버 플래그로 그대로 흘려보낸다. "session"은
+// v0.1 태스크9 추가(§6.3·§7) — export(9a)·recover(9b) 두 하위 서브커맨드를 cli.Run이 내부
+// 디스패치한다(이 맵은 최상위 이름 1개만 안다, T4-plan3 미지 서브커맨드 MCP 오기동 차단 정합).
+var cliSubcommands = map[string]bool{"doctor": true, "stats": true, "purge": true, "upgrade": true, "session": true}
 
 // prescanRootFlags: cli 서브커맨드 args에서 --root/--store-root(단대시 -root/-store-root,
 // "--f v"·"--f=v" 두 형태 모두)만 수동으로 뽑아내고 그 토큰을 제거한 나머지를 반환한다.

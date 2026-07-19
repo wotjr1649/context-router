@@ -23,7 +23,7 @@ Third-Party Notices
 context-router is written in Go and statically links into a single binary.
 The table below lists every Go module dependency actually reachable from the
 compiled binary (direct and indirect, per `go list -deps -f '{{if .Module}}
-{{.Module.Path}} {{.Module.Version}}{{end}}' ./cmd/context-router`), 25 in
+{{.Module.Path}} {{.Module.Version}}{{end}}' ./cmd/context-router`), 26 in
 total. License type and copyright holder were verified against each module's
 own LICENSE file in the local Go module cache (`go env GOMODCACHE`), matched
 to the exact version pinned in go.mod/go.sum.
@@ -76,6 +76,12 @@ Module:    github.com/google/jsonschema-go
 Version:   v0.4.3
 License:   MIT
 Copyright: Copyright (c) 2025 JSON Schema Go Project Authors
+
+--------------------------------------------------------------------------------
+Module:    github.com/google/uuid
+Version:   v1.6.0
+License:   BSD-3-Clause
+Copyright: Copyright (c) 2009,2014 Google Inc. All rights reserved.
 
 --------------------------------------------------------------------------------
 Module:    github.com/itlightning/dateparse

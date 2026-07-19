@@ -5,6 +5,9 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -15,6 +18,7 @@ import (
 	"time"
 
 	"github.com/wotjr1649/context-router/internal/ident"
+	"github.com/wotjr1649/context-router/internal/session"
 	"github.com/wotjr1649/context-router/internal/store"
 )
 
@@ -219,7 +223,7 @@ func TestRunPurge_OlderThanRejectsInvalidDuration(t *testing.T) {
 	for _, v := range []string{"-1h", "0s", "abc"} {
 		var out bytes.Buffer
 		args := []string{"--project", "whatever-id", "--force", "--older-than", v}
-		if err := runPurge(context.Background(), failReader{}, &out, t.TempDir(), args, false); err == nil {
+		if err := runPurge(context.Background(), failReader{}, &out, io.Discard, t.TempDir(), args, false); err == nil {
 			t.Fatalf("older-than=%q: want error, got nil", v)
 		}
 	}
@@ -233,7 +237,7 @@ func TestRunPurge_PhantomProjectRejected(t *testing.T) {
 	storeRoot := t.TempDir()
 	var out bytes.Buffer
 	args := []string{"--project", "does-not-exist-id", "--force", "--older-than", "1h"}
-	if err := runPurge(context.Background(), failReader{}, &out, storeRoot, args, false); err == nil {
+	if err := runPurge(context.Background(), failReader{}, &out, io.Discard, storeRoot, args, false); err == nil {
 		t.Fatal("want error for nonexistent project, got nil")
 	}
 	if _, err := os.Stat(filepath.Join(storeRoot, "projects", "does-not-exist-id")); !os.IsNotExist(err) {
@@ -318,6 +322,39 @@ func TestConfirmPurge(t *testing.T) {
 	}
 }
 
+// TestPurgeSessionFiles_SkipsWhenLeaseHeld — 최종리뷰 B1(Codex P1): 서버가 shared lease를
+// 보유 중인 worktree는 purge --sessions가 삭제하지 않고 스킵 + stderr 고지한다(unlink-while-open
+// 유실·recover 경합 방어). exclusive AcquireLock이 shared 보유와 경합해 즉시 실패하는 것을 이용.
+func TestPurgeSessionFiles_SkipsWhenLeaseHeld(t *testing.T) {
+	storeRoot := t.TempDir()
+	projDir := filepath.Join(storeRoot, "projects", "proj-b1")
+	st, err := store.Open(projDir, false) // content.db 생성(purge 대상 실재 판정 통과)
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatalf("store.Close: %v", err)
+	}
+	wtDir := filepath.Join(projDir, "worktrees", "wt-b1")
+	sess, err := session.Open(wtDir, session.Options{Producer: "context-router/test"}) // shared lease 보유
+	if err != nil {
+		t.Fatalf("session.Open: %v", err)
+	}
+	defer func() { _ = sess.Close() }()
+
+	var out, errOut bytes.Buffer
+	args := []string{"--project", "proj-b1", "--sessions", "--force"}
+	if err := runPurge(context.Background(), failReader{}, &out, &errOut, storeRoot, args, false); err != nil {
+		t.Fatalf("runPurge err=%v", err)
+	}
+	if _, statErr := os.Stat(filepath.Join(wtDir, "session.db")); statErr != nil {
+		t.Fatalf("session.db should remain (lease held → skip), stat err=%v", statErr)
+	}
+	if !strings.Contains(errOut.String(), "skip worktree") {
+		t.Fatalf("stderr missing skip notice: %q", errOut.String())
+	}
+}
+
 // TestRunPurge_E2E_OlderThanForce: 임시 store에 source 1건을 등록한 뒤 runPurge를
 // --project(경로 형태, purgeProjectID의 Canonicalize 분기까지 exercised) --force
 // --older-than 1ns로 호출한다. isTTY는 false로 명시 주입한다 — 이 값은 원래 Run()의 purge
@@ -351,7 +388,7 @@ func TestRunPurge_E2E_OlderThanForce(t *testing.T) {
 
 	var out bytes.Buffer
 	args := []string{"--project", projectRoot, "--force", "--older-than", "1ns"}
-	if err := runPurge(context.Background(), failReader{}, &out, storeRoot, args, false); err != nil {
+	if err := runPurge(context.Background(), failReader{}, &out, io.Discard, storeRoot, args, false); err != nil {
 		t.Fatalf("runPurge err=%v out=%s", err, out.String())
 	}
 
@@ -404,7 +441,7 @@ func TestRunPurge_E2E_MismatchLeavesDataIntact(t *testing.T) {
 
 	var out bytes.Buffer
 	args := []string{"--project", canon.ProjectID} // --older-than 미지정 → 성공했다면 전체 삭제였을 경로
-	err = runPurge(context.Background(), strings.NewReader("wrong-slug\n"), &out, storeRoot, args, true)
+	err = runPurge(context.Background(), strings.NewReader("wrong-slug\n"), &out, io.Discard, storeRoot, args, true)
 	if err == nil {
 		t.Fatal("want error for mismatched confirmation slug, got nil")
 	}
@@ -498,6 +535,140 @@ func TestRunPurge_E2E_GCOnlyNoConfirm(t *testing.T) {
 	}
 }
 
+// TestRunPurge_SessionsTarget_StandaloneKeepsContentAndBackups: 브리프 Step1 ⑤ — --sessions
+// 단독(--older-than 없음)은 session.db 파일 계열(-wal/-shm 포함)만 지우고, content.db
+// 데이터·`.bak-<ts>` 파일·session.recover-pending 마커는 건드리지 않는다(설계 §5 명문 계약,
+// --gc 단독과 동형인 "세션 단독" 모드).
+func TestRunPurge_SessionsTarget_StandaloneKeepsContentAndBackups(t *testing.T) {
+	storeRoot := t.TempDir()
+	projectRoot := t.TempDir()
+	canon, err := ident.Canonicalize(projectRoot)
+	if err != nil {
+		t.Fatalf("canonicalize: %v", err)
+	}
+	projDir := filepath.Join(storeRoot, "projects", canon.ProjectID)
+	st, err := store.Open(projDir, false)
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	if _, err := st.Register(t.Context(), store.Registration{
+		StoredBytes: []byte("keep me"), MediaType: "text/plain",
+		Source: store.SourceMeta{URI: "/keep.txt", Kind: "file", SrcHash: "h-keep-sessions"},
+		Chunks: []store.Chunk{{Ordinal: 0, Text: "keep me"}},
+	}); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	wtDir := filepath.Join(projDir, "worktrees", "wt1")
+	if err := os.MkdirAll(wtDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"session.db", "session.db-wal", "session.db-shm"} {
+		if err := os.WriteFile(filepath.Join(wtDir, name), []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	const backupName = "session.db.bak-20260101T000000Z"
+	if err := os.WriteFile(filepath.Join(wtDir, backupName), []byte("backup"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(wtDir, "session.recover-pending"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	args := []string{"--project", projectRoot, "--force", "--sessions"}
+	if err := runPurge(context.Background(), failReader{}, &out, io.Discard, storeRoot, args, false); err != nil {
+		t.Fatalf("runPurge err=%v out=%s", err, out.String())
+	}
+
+	for _, name := range []string{"session.db", "session.db-wal", "session.db-shm"} {
+		if _, statErr := os.Stat(filepath.Join(wtDir, name)); !os.IsNotExist(statErr) {
+			t.Fatalf("%s 잔존: err=%v", name, statErr)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(wtDir, backupName)); err != nil {
+		t.Fatalf("백업 파일이 삭제됨: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(wtDir, "session.recover-pending")); err != nil {
+		t.Fatalf("recover-pending 마커가 삭제됨: %v", err)
+	}
+
+	st2, err := store.Open(projDir, true)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer st2.Close()
+	var n int
+	if err := st2.Reader().QueryRow("SELECT count(*) FROM sources").Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Fatalf("sources=%d want 1(세션 단독은 content를 건드리지 않음)", n)
+	}
+}
+
+// TestRunPurge_SessionsTarget_WithOlderThanAlsoPurgesContent: --sessions와 --older-than을
+// 함께 주면 선택 content 삭제(PurgeOlderThan) 뒤에 이어서 session.db 파일 계열도 지운다
+// (additive — "기존 purge 의미론에 정합", 브리프 Interfaces 문구).
+func TestRunPurge_SessionsTarget_WithOlderThanAlsoPurgesContent(t *testing.T) {
+	storeRoot := t.TempDir()
+	projectRoot := t.TempDir()
+	canon, err := ident.Canonicalize(projectRoot)
+	if err != nil {
+		t.Fatalf("canonicalize: %v", err)
+	}
+	projDir := filepath.Join(storeRoot, "projects", canon.ProjectID)
+	st, err := store.Open(projDir, false)
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	if _, err := st.Register(t.Context(), store.Registration{
+		StoredBytes: []byte("purge me too"), MediaType: "text/plain",
+		Source: store.SourceMeta{URI: "/purge2.txt", Kind: "file", SrcHash: "h-purge-sessions"},
+		Chunks: []store.Chunk{{Ordinal: 0, Text: "purge me too"}},
+	}); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	time.Sleep(1100 * time.Millisecond) // indexed_at은 unix 초 — --older-than 1ns가 경계를 넘도록
+
+	wtDir := filepath.Join(projDir, "worktrees", "wt1")
+	if err := os.MkdirAll(wtDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(wtDir, "session.db"), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	args := []string{"--project", projectRoot, "--force", "--older-than", "1ns", "--sessions"}
+	if err := runPurge(context.Background(), failReader{}, &out, io.Discard, storeRoot, args, false); err != nil {
+		t.Fatalf("runPurge err=%v out=%s", err, out.String())
+	}
+
+	if _, err := os.Stat(filepath.Join(wtDir, "session.db")); !os.IsNotExist(err) {
+		t.Fatalf("session.db 잔존: err=%v", err)
+	}
+	st2, err := store.Open(projDir, true)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer st2.Close()
+	var n int
+	if err := st2.Reader().QueryRow("SELECT count(*) FROM sources").Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Fatalf("sources=%d want 0(선택 삭제도 함께 수행돼야 함)", n)
+	}
+}
+
 // TestRunPurge_All_ContextCanceledStopsBeforeAnyDeletion: --all로 프로젝트 2개를 대상할 때
 // 이미 취소된 ctx를 주면 순회 첫 반복에서 즉시 멈춰야 한다(설계 §7 review 항목 — 다중 프로젝트
 // 순회의 주기적 ctx 검사) — 오류를 반환하고, 두 프로젝트 중 어느 쪽도 삭제되지 않아야 한다.
@@ -532,7 +703,7 @@ func TestRunPurge_All_ContextCanceledStopsBeforeAnyDeletion(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	var out bytes.Buffer
-	err := runPurge(ctx, failReader{}, &out, storeRoot, []string{"--all", "--force"}, false)
+	err := runPurge(ctx, failReader{}, &out, io.Discard, storeRoot, []string{"--all", "--force"}, false)
 	if err == nil {
 		t.Fatal("want error for canceled context, got nil")
 	}
@@ -591,7 +762,7 @@ func TestRunPurge_All_PartiallyCreatedDirRemovedNotFailStuck(t *testing.T) {
 	}
 
 	var out bytes.Buffer
-	if err := runPurge(context.Background(), failReader{}, &out, storeRoot, []string{"--all", "--force"}, false); err != nil {
+	if err := runPurge(context.Background(), failReader{}, &out, io.Discard, storeRoot, []string{"--all", "--force"}, false); err != nil {
 		t.Fatalf("runPurge --all --force: %v (out=%s)", err, out.String())
 	}
 
@@ -636,7 +807,7 @@ func TestRunPurge_All_Selective_PartiallyCreatedDirSkipped(t *testing.T) {
 
 	var out bytes.Buffer
 	args := []string{"--all", "--force", "--older-than", "1ns"}
-	if err := runPurge(context.Background(), failReader{}, &out, storeRoot, args, false); err != nil {
+	if err := runPurge(context.Background(), failReader{}, &out, io.Discard, storeRoot, args, false); err != nil {
 		t.Fatalf("runPurge: %v (out=%s)", err, out.String())
 	}
 	if _, statErr := os.Stat(brokenDir); statErr != nil {
@@ -925,5 +1096,378 @@ func TestRunDoctor_StoreRootIsFile_Rejected(t *testing.T) {
 	}
 	if !strings.Contains(buf.String(), "[1] store-root: exists=true writable=false") {
 		t.Fatalf("out missing exists=true writable=false: %s", buf.String())
+	}
+}
+
+// TestRunSessionExport_JSONLRoundTrip: 태스크9a Step1 ① — export가 stdout에 낸 JSONL 각 행을
+// EventV1으로 파싱하면 session.Export를 직접 호출한 결과와 정확히 일치해야 한다(G6 CLI 측
+// round-trip). session.Open으로 시드한 뒤 Close하고, Run(ctx,"session",["export",...])이 그
+// DB를 session.OpenReadOnly로 다시 열어(별도 연결) JSONL을 낸다.
+func TestRunSessionExport_JSONLRoundTrip(t *testing.T) {
+	storeRoot := t.TempDir()
+	projectRoot := t.TempDir()
+	canon, err := ident.Canonicalize(projectRoot)
+	if err != nil {
+		t.Fatalf("canonicalize: %v", err)
+	}
+	dbDir := filepath.Join(storeRoot, "projects", canon.ProjectID, "worktrees", canon.WorktreeID)
+	d, err := session.Open(dbDir, session.Options{Producer: "context-router/0.1.0-test"})
+	if err != nil {
+		t.Fatalf("session.Open: %v", err)
+	}
+	if _, _, _, err := d.Append(session.Event{Type: "note", Summary: "first note"}); err != nil {
+		t.Fatalf("append 1: %v", err)
+	}
+	if _, _, _, err := d.Append(session.Event{Type: "decision", Summary: "second note"}); err != nil {
+		t.Fatalf("append 2: %v", err)
+	}
+	want, _, err := session.Export(context.Background(), d.Reader(), 0, "", 100)
+	if err != nil {
+		t.Fatalf("Export(direct): %v", err)
+	}
+	if err := d.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	var out, errOut bytes.Buffer
+	args := []string{"export", "--project", projectRoot, "--worktree", canon.WorktreeID}
+	if err := Run(context.Background(), "session", args, storeRoot, projectRoot, "0.0.1-dev", &out, &errOut); err != nil {
+		t.Fatalf("Run session export err=%v stderr=%s", err, errOut.String())
+	}
+
+	trimmed := strings.TrimRight(out.String(), "\n")
+	if trimmed == "" {
+		t.Fatalf("out empty, want %d JSONL lines", len(want))
+	}
+	lines := strings.Split(trimmed, "\n")
+	if len(lines) != len(want) {
+		t.Fatalf("got %d JSONL lines want %d: out=%s", len(lines), len(want), out.String())
+	}
+	for i, line := range lines {
+		var ev session.EventV1
+		if err := json.Unmarshal([]byte(line), &ev); err != nil {
+			t.Fatalf("line %d unmarshal: %v (line=%s)", i, err, line)
+		}
+		if ev.EventID != want[i].EventID || ev.Summary != want[i].Summary || ev.EventType != want[i].EventType {
+			t.Fatalf("line %d = %+v want %+v", i, ev, want[i])
+		}
+		if ev.SchemaVersion != "1.0" {
+			t.Fatalf("line %d schemaVersion=%q want 1.0", i, ev.SchemaVersion)
+		}
+	}
+	for _, forbidden := range []string{`"RowID"`, `"rowID"`, `"row_id"`, `"rowid"`} {
+		if strings.Contains(out.String(), forbidden) {
+			t.Fatalf("JSONL leaks internal cursor field %s: %s", forbidden, out.String())
+		}
+	}
+}
+
+// TestRunSessionExport_WorktreeContract: 태스크9a Step1 ② — worktree가 2개면 --worktree 없이는
+// 후보 목록을 stderr에 출력하고 오류(설계 §7 worktree 특정 계약), 1개면 생략 허용.
+func TestRunSessionExport_WorktreeContract(t *testing.T) {
+	t.Run("multiple_without_flag_lists_candidates_and_errors", func(t *testing.T) {
+		storeRoot := t.TempDir()
+		projectRoot := t.TempDir()
+		canon, err := ident.Canonicalize(projectRoot)
+		if err != nil {
+			t.Fatalf("canonicalize: %v", err)
+		}
+		projDir := filepath.Join(storeRoot, "projects", canon.ProjectID)
+		for _, wid := range []string{"wt-a", "wt-b"} {
+			d, err := session.Open(filepath.Join(projDir, "worktrees", wid), session.Options{Producer: "context-router/test"})
+			if err != nil {
+				t.Fatalf("session.Open(%s): %v", wid, err)
+			}
+			if err := d.Close(); err != nil {
+				t.Fatalf("close(%s): %v", wid, err)
+			}
+		}
+
+		var out, errOut bytes.Buffer
+		args := []string{"export", "--project", projectRoot}
+		if err := Run(context.Background(), "session", args, storeRoot, projectRoot, "0.0.1-dev", &out, &errOut); err == nil {
+			t.Fatalf("want error for ambiguous worktree, got nil (out=%s)", out.String())
+		}
+		for _, wid := range []string{"wt-a", "wt-b"} {
+			if !strings.Contains(errOut.String(), wid) {
+				t.Fatalf("stderr missing candidate %q: %s", wid, errOut.String())
+			}
+		}
+	})
+
+	t.Run("single_without_flag_allowed", func(t *testing.T) {
+		storeRoot := t.TempDir()
+		projectRoot := t.TempDir()
+		canon, err := ident.Canonicalize(projectRoot)
+		if err != nil {
+			t.Fatalf("canonicalize: %v", err)
+		}
+		dbDir := filepath.Join(storeRoot, "projects", canon.ProjectID, "worktrees", canon.WorktreeID)
+		d, err := session.Open(dbDir, session.Options{Producer: "context-router/test"})
+		if err != nil {
+			t.Fatalf("session.Open: %v", err)
+		}
+		if err := d.Close(); err != nil {
+			t.Fatalf("close: %v", err)
+		}
+
+		var out, errOut bytes.Buffer
+		args := []string{"export", "--project", projectRoot}
+		if err := Run(context.Background(), "session", args, storeRoot, projectRoot, "0.0.1-dev", &out, &errOut); err != nil {
+			t.Fatalf("Run session export(single worktree, no --worktree) err=%v stderr=%s", err, errOut.String())
+		}
+	})
+}
+
+// TestRunDoctor_SessionItems: 태스크9a Step1 ⑦ — doctor가 session.db quick_check·lease shared
+// 프로브·session.recover-pending 마커 존재 3항목을 출력한다(설계 §7).
+func TestRunDoctor_SessionItems(t *testing.T) {
+	t.Run("not_initialized_is_informational_not_failure", func(t *testing.T) {
+		storeRoot := t.TempDir()
+		projectRoot := t.TempDir()
+		var buf bytes.Buffer
+		if err := runDoctor(context.Background(), &buf, storeRoot, projectRoot); err != nil {
+			t.Fatalf("runDoctor err=%v out=%s", err, buf.String())
+		}
+		out := buf.String()
+		for _, want := range []string{
+			"[6] session.db: not initialized",
+			"[7] session.lock: not initialized",
+			"[8] session.recover-pending: not initialized",
+		} {
+			if !strings.Contains(out, want) {
+				t.Fatalf("out missing %q: %s", want, out)
+			}
+		}
+	})
+
+	t.Run("healthy_session_all_three_pass", func(t *testing.T) {
+		storeRoot := t.TempDir()
+		projectRoot := t.TempDir()
+		canon, err := ident.Canonicalize(projectRoot)
+		if err != nil {
+			t.Fatalf("canonicalize: %v", err)
+		}
+		dbDir := filepath.Join(storeRoot, "projects", canon.ProjectID, "worktrees", canon.WorktreeID)
+		d, err := session.Open(dbDir, session.Options{Producer: "context-router/test"})
+		if err != nil {
+			t.Fatalf("session.Open: %v", err)
+		}
+		if err := d.Close(); err != nil {
+			t.Fatalf("close: %v", err)
+		}
+
+		var buf bytes.Buffer
+		if err := runDoctor(context.Background(), &buf, storeRoot, projectRoot); err != nil {
+			t.Fatalf("runDoctor err=%v out=%s", err, buf.String())
+		}
+		out := buf.String()
+		for _, want := range []string{
+			"[6] session.db: quick_check=ok",
+			"[7] session.lock: shared 획득 가능",
+			"[8] session.recover-pending: 없음",
+		} {
+			if !strings.Contains(out, want) {
+				t.Fatalf("out missing %q: %s", want, out)
+			}
+		}
+	})
+
+	t.Run("recover_marker_present_counts_as_failure", func(t *testing.T) {
+		storeRoot := t.TempDir()
+		projectRoot := t.TempDir()
+		canon, err := ident.Canonicalize(projectRoot)
+		if err != nil {
+			t.Fatalf("canonicalize: %v", err)
+		}
+		dbDir := filepath.Join(storeRoot, "projects", canon.ProjectID, "worktrees", canon.WorktreeID)
+		d, err := session.Open(dbDir, session.Options{Producer: "context-router/test"})
+		if err != nil {
+			t.Fatalf("session.Open: %v", err)
+		}
+		if err := d.Close(); err != nil {
+			t.Fatalf("close: %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(dbDir, "session.recover-pending"), nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+
+		var buf bytes.Buffer
+		err = runDoctor(context.Background(), &buf, storeRoot, projectRoot)
+		if err == nil {
+			t.Fatalf("want error(진단 실패 항목 존재), got nil: %s", buf.String())
+		}
+		if !strings.Contains(buf.String(), "[8] session.recover-pending: 존재") {
+			t.Fatalf("out missing marker-present line: %s", buf.String())
+		}
+	})
+}
+
+// corruptSessionEvents — 태스크9b CLI 레벨 recover 테스트 전용 손상 헬퍼. session 패키지의
+// recover_test.go seedAndCorruptEvents와 동일한 기법(session_events 루트 페이지의 셀 포인터
+// 배열 영역 훼손 — 실측 확인: quick_check는 malformed를 보고하지만 앞부분 다수 행은 여전히
+// SELECT 가능)을 cli 패키지에서 재현한다. session의 unexported 상수(dbFileName 등)에는 접근할
+// 수 없으므로 session.OpenReadOnly로 필요한 값(page_size·rootpage)만 조회한다.
+func corruptSessionEvents(t *testing.T, dbDir string, n int) {
+	t.Helper()
+	d, err := session.Open(dbDir, session.Options{Producer: "context-router/test"})
+	if err != nil {
+		t.Fatalf("session.Open: %v", err)
+	}
+	for i := 0; i < n; i++ {
+		if _, _, _, err := d.Append(session.Event{Type: "note", Summary: fmt.Sprintf("evt-%d-%s", i, strings.Repeat("pad", 30))}); err != nil {
+			t.Fatalf("append: %v", err)
+		}
+	}
+	var pageSize, rootPage int
+	if err := d.Reader().QueryRow("PRAGMA page_size").Scan(&pageSize); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Reader().QueryRow("SELECT rootpage FROM sqlite_master WHERE name='session_events'").Scan(&rootPage); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	dbPath := filepath.Join(dbDir, "session.db")
+	raw, err := os.ReadFile(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	off := (rootPage-1)*pageSize + 50
+	if off+40 > len(raw) {
+		t.Fatalf("corrupt helper: offset out of range (size=%d off=%d)", len(raw), off)
+	}
+	cp := append([]byte(nil), raw...)
+	for i := 0; i < 40; i++ {
+		cp[off+i] = 0xEE
+	}
+	if err := os.WriteFile(dbPath, cp, 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestRunSessionRecover_HappyPath — 태스크9b: 훼손 DB → `session recover` CLI 경로가 인양·게시를
+// 완료하고 stderr에 결과를 보고한다. stdout은 비어 있어야 한다(recover는 CLI 결과 전용 규약상
+// stdout 출력이 없는 것이 안전 기본, 진행 보고는 stderr 전용).
+func TestRunSessionRecover_HappyPath(t *testing.T) {
+	storeRoot := t.TempDir()
+	projectRoot := t.TempDir()
+	canon, err := ident.Canonicalize(projectRoot)
+	if err != nil {
+		t.Fatalf("canonicalize: %v", err)
+	}
+	dbDir := filepath.Join(storeRoot, "projects", canon.ProjectID, "worktrees", canon.WorktreeID)
+	corruptSessionEvents(t, dbDir, 400)
+
+	var out, errOut bytes.Buffer
+	args := []string{"recover", "--project", projectRoot, "--worktree", canon.WorktreeID}
+	if err := Run(context.Background(), "session", args, storeRoot, projectRoot, "0.0.1-dev", &out, &errOut); err != nil {
+		t.Fatalf("Run session recover err=%v stderr=%s", err, errOut.String())
+	}
+	if out.Len() != 0 {
+		t.Fatalf("stdout should be empty for recover, got %q", out.String())
+	}
+	if !strings.Contains(errOut.String(), "인양 완료") {
+		t.Fatalf("stderr missing recovery report: %s", errOut.String())
+	}
+	if _, statErr := os.Stat(filepath.Join(dbDir, "session.recover-pending")); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("marker should be gone after recover, stat err=%v", statErr)
+	}
+}
+
+// TestRunSessionRecover_ServerRunning_RejectsImmediately — 태스크9b: 서버(shared lease 보유)
+// 실행 중이면 `session recover`가 즉시 거부돼야 한다(대기 없음).
+func TestRunSessionRecover_ServerRunning_RejectsImmediately(t *testing.T) {
+	storeRoot := t.TempDir()
+	projectRoot := t.TempDir()
+	canon, err := ident.Canonicalize(projectRoot)
+	if err != nil {
+		t.Fatalf("canonicalize: %v", err)
+	}
+	dbDir := filepath.Join(storeRoot, "projects", canon.ProjectID, "worktrees", canon.WorktreeID)
+	d, err := session.Open(dbDir, session.Options{Producer: "context-router/test"})
+	if err != nil {
+		t.Fatalf("session.Open: %v", err)
+	}
+	defer func() { _ = d.Close() }()
+
+	var out, errOut bytes.Buffer
+	args := []string{"recover", "--project", projectRoot, "--worktree", canon.WorktreeID}
+	err = Run(context.Background(), "session", args, storeRoot, projectRoot, "0.0.1-dev", &out, &errOut)
+	if !errors.Is(err, session.ErrLeaseHeld) {
+		t.Fatalf("err=%v want session.ErrLeaseHeld (out=%s stderr=%s)", err, out.String(), errOut.String())
+	}
+}
+
+// TestRunSessionRecover_PublishInterrupted_DelegatesDespiteMissingDB — 최종리뷰 A1(Critical)
+// 회귀: 게시(⑥) rename 도중 crash로 session.db만 사라졌지만 복구 자산(백업 main + 마커)이
+// 남은 상태에서 CLI recover가 "session.db 없음"으로 거부하지 않고 session.Recover에 위임해
+// 완료해야 한다(수정 전엔 session.db stat 실패로 재개 분기가 CLI로 도달 불가 → 영구 wedge).
+// session 패키지의 unexported 인양본을 만들 수 없으므로, 건강 DB를 백업 family로 rename해
+// restoreLatestBackup 경로로 재개가 성립하는 등가 상태를 주입한다.
+func TestRunSessionRecover_PublishInterrupted_DelegatesDespiteMissingDB(t *testing.T) {
+	storeRoot := t.TempDir()
+	projectRoot := t.TempDir()
+	canon, err := ident.Canonicalize(projectRoot)
+	if err != nil {
+		t.Fatalf("canonicalize: %v", err)
+	}
+	dbDir := filepath.Join(storeRoot, "projects", canon.ProjectID, "worktrees", canon.WorktreeID)
+
+	// 1) 건강한 session.db를 만든다(단일 파일 — Close가 wal_checkpoint(TRUNCATE)).
+	d, err := session.Open(dbDir, session.Options{Producer: "context-router/test"})
+	if err != nil {
+		t.Fatalf("session.Open: %v", err)
+	}
+	for i := 0; i < 5; i++ {
+		if _, _, _, err := d.Append(session.Event{Type: "note", Summary: fmt.Sprintf("evt-%d", i)}); err != nil {
+			t.Fatalf("append: %v", err)
+		}
+	}
+	if err := d.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	// 2) 게시 중단 상태 주입: session.db family를 백업 main으로 rename(→ session.db 부재) +
+	//    복구 마커 생성. bak ts 포맷은 backupOriginal과 동일(사전순=시간순 정렬 가능).
+	bakMain := "session.db.bak-20260101T000000.000000000Z"
+	for _, suffix := range []string{"", "-wal", "-shm"} {
+		src := filepath.Join(dbDir, "session.db"+suffix)
+		if _, statErr := os.Stat(src); statErr == nil {
+			if err := os.Rename(src, filepath.Join(dbDir, bakMain+suffix)); err != nil {
+				t.Fatalf("rename %s: %v", suffix, err)
+			}
+		}
+	}
+	if err := os.WriteFile(filepath.Join(dbDir, "session.recover-pending"), nil, 0o600); err != nil {
+		t.Fatalf("marker: %v", err)
+	}
+	if _, statErr := os.Stat(filepath.Join(dbDir, "session.db")); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("precondition: session.db should be absent, stat err=%v", statErr)
+	}
+
+	// 3) CLI recover — session.db 부재에도 위임·완료해야 한다.
+	var out, errOut bytes.Buffer
+	args := []string{"recover", "--project", projectRoot, "--worktree", canon.WorktreeID}
+	if err := Run(context.Background(), "session", args, storeRoot, projectRoot, "0.0.1-dev", &out, &errOut); err != nil {
+		t.Fatalf("Run session recover err=%v stderr=%s", err, errOut.String())
+	}
+	if !strings.Contains(errOut.String(), "인양 완료") {
+		t.Fatalf("stderr missing recovery report: %s", errOut.String())
+	}
+	if _, statErr := os.Stat(filepath.Join(dbDir, "session.recover-pending")); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("marker should be gone after recover, stat err=%v", statErr)
+	}
+	// 게시된 session.db가 건강해야 한다.
+	reader, err := session.OpenReadOnly(dbDir)
+	if err != nil {
+		t.Fatalf("OpenReadOnly: %v", err)
+	}
+	defer func() { _ = reader.Close() }()
+	var qc string
+	if err := reader.QueryRow("PRAGMA quick_check").Scan(&qc); err != nil || qc != "ok" {
+		t.Fatalf("published db quick_check=%q err=%v want ok", qc, err)
 	}
 }

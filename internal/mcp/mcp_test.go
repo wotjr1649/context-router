@@ -30,6 +30,7 @@ import (
 	"github.com/wotjr1649/context-router/internal/ident"
 	"github.com/wotjr1649/context-router/internal/ingest"
 	"github.com/wotjr1649/context-router/internal/netfetch"
+	"github.com/wotjr1649/context-router/internal/session"
 	"github.com/wotjr1649/context-router/internal/store"
 	"github.com/wotjr1649/context-router/internal/transform"
 )
@@ -97,6 +98,9 @@ func TestToToolError(t *testing.T) {
 		{"unsupported_media", netfetch.ErrUnsupportedMedia, codeUnsupportedFile},
 		{"not_exist", fs.ErrNotExist, codeNotFound},
 		{"not_exist_wrapped", fmt.Errorf("ingest: canonicalize: %w", fs.ErrNotExist), codeNotFound},
+		{"session_lease_held", session.ErrLeaseHeld, codeStorageUnavailable},
+		{"session_recover_pending", session.ErrRecoverPending, codeStorageUnavailable},
+		{"session_corrupt", session.ErrCorrupt, codeStorageUnavailable},
 		{"unknown", errors.New("boom"), codeInternal},
 	}
 	for _, tt := range tests {
@@ -212,19 +216,25 @@ func TestNewServerProfileGating(t *testing.T) {
 	}
 }
 
-// maxToolSchemaBytes: 게이트 11(스키마 토큰 예산, 설계 §2.3) — NewServer 기본 프로필
-// (ProbeIsolation 성공 환경의 3-도구: ctr_search/ctr_fetch/ctr_transform)의 tools/list 결과
-// JSON 직렬화 바이트 상한. 최초 실측값 4359B × 1.2 = 5230.8 → 반올림 5231로 고정한 값 —
+// maxToolSchemaBytes: 게이트 11(스키마 토큰 예산, 설계 §2.3·§3.5) — v0.1의 기본 표면은
+// session.db가 정상 open된 6-도구(ctr_search/ctr_fetch/ctr_transform + ctr_record_event/
+// ctr_session_summary/ctr_export_events, ProbeIsolation 성공 환경)이므로 게이트도 그 표면을
+// 측정한다(코디네이터 판정, 설계 §3.5 "세션 3종+scope+문구를 반영해 재기준화" 문면 그대로 —
+// 이전 태스크7 1차 구현은 3-도구만 측정해 재작업). tools/list 결과 JSON 직렬화 바이트 상한.
+// 재실측값 10024B × 1.2 = 12028.8 → 올림 12029로 재기준화(이전 3-도구 기준 4359B×1.2=5231,
+// 태스크7 1차 3-도구 재측정 5139B×1.2=6167 — 둘 다 폐기, 완충 비율 1.2·올림 방식은 동일 유지) —
 // 회귀(설명 문구 비대화 등) 조기 감지용 상한이지 정밀 예산이 아니다. 실측값·근거는
-// docs/gates-v0.0.1-ko.md 게이트 11 항목 참조.
-const maxToolSchemaBytes = 5231
+// docs/gates-v0.0.1-ko.md 게이트 11 항목 참조(정식 갱신은 v0.1 게이트 문서 마일스톤에서).
+const maxToolSchemaBytes = 12029
 
 // TestSchemaTokenBudget: tools/list 결과(ListToolsResult 전체 — 실제 클라이언트가 받는
 // JSON 그대로) 직렬화 바이트가 maxToolSchemaBytes를 넘지 않는지 확인한다(게이트 11). 근사
 // 토큰 수 = bytes/4는 로그로만 남긴다 — Claude 정확 tokenizer는 비공개라 근사치일 뿐이고,
 // 실질 게이트는 바이트 상한 쪽이다.
 func TestSchemaTokenBudget(t *testing.T) {
-	cs, _ := newTestServer(t, nil) // Enable 없음 — 기본 프로필(ProbeIsolation 성공 시 3-도구)
+	// newRecordEventTestServer: Enable 없음(ingest/net 미등록) + Session 배선 — v0.1 기본
+	// 표면(6-도구)과 정확히 일치(기존 세션 헬퍼 재사용, 신규 헬퍼 불요).
+	cs, _, _, _ := newRecordEventTestServer(t)
 	lt, err := cs.ListTools(context.Background(), nil)
 	if err != nil {
 		t.Fatalf("list tools: %v", err)
@@ -1188,6 +1198,41 @@ func TestNewGlobalServerEmptyProjectsErrors(t *testing.T) {
 	}
 }
 
+// TestGlobalSearchRejectsScope — 최종리뷰 E1(fable): 공유 SearchInput의 scope는 global-search가
+// 지원하지 않으므로 조용히 무시하지 않고 INVALID_ARGUMENT로 거부한다.
+func TestGlobalSearchRejectsScope(t *testing.T) {
+	ctx := context.Background()
+	p := newGlobalTestProject(t, "proj-scope", "needle content\n")
+	srv, err := NewGlobalServer(GlobalConfig{Projects: []GlobalProject{p}})
+	if err != nil {
+		t.Fatalf("new global server: %v", err)
+	}
+	srvT, cliT := mcp.NewInMemoryTransports()
+	if _, err := srv.Connect(ctx, srvT, nil); err != nil {
+		t.Fatalf("server connect: %v", err)
+	}
+	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "0"}, nil)
+	cs, err := client.Connect(ctx, cliT, nil)
+	if err != nil {
+		t.Fatalf("client connect: %v", err)
+	}
+	defer cs.Close()
+
+	res, err := cs.CallTool(ctx, &mcp.CallToolParams{
+		Name:      "ctr_global_search",
+		Arguments: SearchInput{Queries: []string{"needle"}, Scope: "events"},
+	})
+	if err != nil {
+		t.Fatalf("call: %v", err)
+	}
+	if !res.IsError {
+		t.Fatalf("want IsError=true for scope on global-search, got %+v", res.StructuredContent)
+	}
+	if text := res.Content[0].(*mcp.TextContent).Text; !strings.HasPrefix(text, "["+codeInvalidArgument+"]") {
+		t.Fatalf("want %s prefix, got %q", codeInvalidArgument, text)
+	}
+}
+
 // TestCtrFetchAndIndexDenied: AllowLocal=false에서 사설/루프백 목적지는 NETWORK_DENIED.
 func TestCtrFetchAndIndexDenied(t *testing.T) {
 	cs, _, _ := newNetTestServer(t, false, nil)
@@ -1202,5 +1247,1308 @@ func TestCtrFetchAndIndexDenied(t *testing.T) {
 	text := res.Content[0].(*mcp.TextContent).Text
 	if !strings.HasPrefix(text, "["+codeNetworkDenied+"]") {
 		t.Fatalf("want %s prefix, got %q", codeNetworkDenied, text)
+	}
+}
+
+// --- ctr_search scope 확장 + ctr_fetch 문구 (태스크 7, 설계 §3.4·§3.5) ---
+
+// newSearchScopeTestServer: newTestServer(ingest)와 newRecordEventTestServer를 합친 형태 —
+// content 색인(ctr_index)과 세션 이벤트(sess.Append)를 같은 서버에서 함께 검증해야 하는
+// scope=all 테스트를 위해 별도로 둔다(기존 헬퍼 시그니처 변경은 다른 태스크의 호출부를 건드림).
+func newSearchScopeTestServer(t *testing.T) (cs *mcp.ClientSession, canon ident.Canon, sess *session.DB) {
+	t.Helper()
+	var err error
+	canon, err = ident.Canonicalize(t.TempDir())
+	if err != nil {
+		t.Fatalf("canonicalize: %v", err)
+	}
+	st, err := store.Open(t.TempDir(), false)
+	if err != nil {
+		t.Fatalf("store open: %v", err)
+	}
+	t.Cleanup(func() { st.Close() })
+	sess, err = session.Open(t.TempDir(), session.Options{Producer: "test/search-scope"})
+	if err != nil {
+		t.Fatalf("session open: %v", err)
+	}
+	t.Cleanup(func() { sess.Close() })
+
+	srv, err := NewServer(Config{Canon: canon, Store: st, SelfExe: testSelfExe(t), Enable: []string{"ingest"}, Session: sess})
+	if err != nil {
+		t.Fatalf("new server: %v", err)
+	}
+	srvT, cliT := mcp.NewInMemoryTransports()
+	ctx := context.Background()
+	if _, err := srv.Connect(ctx, srvT, nil); err != nil {
+		t.Fatalf("server connect: %v", err)
+	}
+	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "0"}, nil)
+	cs, err = client.Connect(ctx, cliT, nil)
+	if err != nil {
+		t.Fatalf("client connect: %v", err)
+	}
+	t.Cleanup(func() { cs.Close() })
+	return cs, canon, sess
+}
+
+// indexNeedle: canon.ProjectRoot 아래 파일 1개를 needle 텍스트로 써서 ctr_index로 색인한다
+// (scope 테스트들의 공용 content 시드 헬퍼).
+func indexNeedle(t *testing.T, cs *mcp.ClientSession, canon ident.Canon, needle string) {
+	t.Helper()
+	tmpFile := filepath.Join(canon.ProjectRoot, "note.txt")
+	if err := os.WriteFile(tmpFile, []byte(needle+" content in file\n"), 0o644); err != nil {
+		t.Fatalf("write tmp file: %v", err)
+	}
+	res, err := cs.CallTool(context.Background(), &mcp.CallToolParams{Name: "ctr_index", Arguments: IndexInput{Path: tmpFile}})
+	if err != nil {
+		t.Fatalf("ctr_index call: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("ctr_index error: %+v", res.Content)
+	}
+}
+
+// TestSearchScopeDefaultContent — 브리프 Step1 ①: scope 생략 시 기존 content-only 동작과
+// 동일(이벤트 섹션 비어 있음) — 기존 호출 무변 계약의 명시적 회귀 케이스.
+func TestSearchScopeDefaultContent(t *testing.T) {
+	cs, canon, _ := newSearchScopeTestServer(t)
+	indexNeedle(t, cs, canon, "needle")
+
+	res, err := cs.CallTool(context.Background(), &mcp.CallToolParams{Name: "ctr_search", Arguments: SearchInput{Queries: []string{"needle"}}})
+	if err != nil {
+		t.Fatalf("call: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("search error: %+v", res.Content)
+	}
+	var out SearchOutput
+	remarshal(t, res.StructuredContent, &out)
+	if len(out.Results) != 1 || len(out.Results[0].Hits) == 0 {
+		t.Fatalf("no content hits: %+v", out.Results)
+	}
+	if len(out.Results[0].Events) != 0 {
+		t.Fatalf("events want empty for default scope, got %+v", out.Results[0].Events)
+	}
+}
+
+// TestSearchScopeEvents — 브리프 Step1 ②: scope=events는 content hits 없이 EventHit만
+// 반환하고, 교정된(superseded) 이벤트도 포함하되 플래그로 구분한다(§2.3 색인 미제거 대칭).
+func TestSearchScopeEvents(t *testing.T) {
+	cs, _, sess := newSearchScopeTestServer(t)
+	origID := mustAppend(t, sess, session.Event{Type: "decision", Summary: "adopt widgetfoo approach"})
+	newID := mustAppend(t, sess, session.Event{Type: "decision", Summary: "revise widgetfoo approach", Supersedes: origID})
+
+	res, err := cs.CallTool(context.Background(), &mcp.CallToolParams{
+		Name:      "ctr_search",
+		Arguments: SearchInput{Queries: []string{"widgetfoo"}, Scope: "events"},
+	})
+	if err != nil {
+		t.Fatalf("call: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("search error: %+v", res.Content)
+	}
+	var out SearchOutput
+	remarshal(t, res.StructuredContent, &out)
+	if len(out.Results) != 1 || len(out.Results[0].Hits) != 0 {
+		t.Fatalf("results=%+v want 1 result with empty content hits", out.Results)
+	}
+	events := out.Results[0].Events
+	if len(events) != 2 {
+		t.Fatalf("events=%+v want 2", events)
+	}
+	var sawOrig, sawNew bool
+	for _, e := range events {
+		if e.SessionID != sess.SessionID() || e.EventType != "decision" {
+			t.Fatalf("event fields=%+v", e)
+		}
+		switch e.EventID {
+		case origID:
+			sawOrig = true
+			if !e.Superseded {
+				t.Fatalf("orig event want superseded=true: %+v", e)
+			}
+		case newID:
+			sawNew = true
+			if e.Superseded {
+				t.Fatalf("new event want superseded=false: %+v", e)
+			}
+		}
+	}
+	if !sawOrig || !sawNew {
+		t.Fatalf("want both orig+new event, got %+v", events)
+	}
+}
+
+// TestSearchScopeEventsBudget — 최종리뷰 C3(Codex P2): scope=events에서 max_return_bytes가
+// 이벤트 섹션에도 적용된다 — 예산을 작게 잡으면 일부 이벤트만 실리고 truncated=true로 신호한다
+// (이전엔 이벤트 섹션이 예산 무시로 무제한이었다).
+func TestSearchScopeEventsBudget(t *testing.T) {
+	cs, _, sess := newSearchScopeTestServer(t)
+	const n = 5
+	summary := "budgettoken " + strings.Repeat("x", 200) // 212B
+	for i := 0; i < n; i++ {
+		mustAppend(t, sess, session.Event{Type: "note", Summary: summary})
+	}
+
+	res, err := cs.CallTool(context.Background(), &mcp.CallToolParams{
+		Name:      "ctr_search",
+		Arguments: SearchInput{Queries: []string{"budgettoken"}, Scope: "events", Limit: n, MaxReturnBytes: 300},
+	})
+	if err != nil {
+		t.Fatalf("call: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("search error: %+v", res.Content)
+	}
+	var out SearchOutput
+	remarshal(t, res.StructuredContent, &out)
+	events := out.Results[0].Events
+	if len(events) == 0 || len(events) >= n {
+		t.Fatalf("events len=%d want 0<n<%d (예산 절단)", len(events), n)
+	}
+	if !out.Results[0].Truncated {
+		t.Fatalf("Truncated=false want true(이벤트 예산 초과 절단): %+v", out.Results[0])
+	}
+}
+
+// TestSearchScopeAll — 브리프 Step1 ③: scope=all은 같은 질의 결과에 content hits와 이벤트
+// 섹션이 동시에 실린다.
+func TestSearchScopeAll(t *testing.T) {
+	cs, canon, sess := newSearchScopeTestServer(t)
+	indexNeedle(t, cs, canon, "gizmoqux")
+	mustAppend(t, sess, session.Event{Type: "note", Summary: "gizmoqux discussion recap"})
+
+	res, err := cs.CallTool(context.Background(), &mcp.CallToolParams{
+		Name:      "ctr_search",
+		Arguments: SearchInput{Queries: []string{"gizmoqux"}, Scope: "all"},
+	})
+	if err != nil {
+		t.Fatalf("call: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("search error: %+v", res.Content)
+	}
+	var out SearchOutput
+	remarshal(t, res.StructuredContent, &out)
+	if len(out.Results) != 1 {
+		t.Fatalf("results=%+v want 1", out.Results)
+	}
+	if len(out.Results[0].Hits) == 0 {
+		t.Fatalf("want content hits in scope=all, got none: %+v", out.Results[0])
+	}
+	if len(out.Results[0].Events) == 0 {
+		t.Fatalf("want events in scope=all, got none: %+v", out.Results[0])
+	}
+}
+
+// TestSearchScopeRequiresSessionForEventsAndAll — 브리프 Step1 ④: session.db 불용(T10 배선
+// 전이므로 Session=nil 주입)에서 events/all은 조용한 빈 결과가 아니라 STORAGE_UNAVAILABLE로
+// 실패해야 한다(설계 §3.4). content scope는 세션과 무관하게 정상이어야 하므로 함께 확인한다.
+func TestSearchScopeRequiresSessionForEventsAndAll(t *testing.T) {
+	cs, _ := newTestServer(t, nil) // Session=nil(base profile)
+	ctx := context.Background()
+
+	for _, scope := range []string{"events", "all"} {
+		t.Run(scope, func(t *testing.T) {
+			res, err := cs.CallTool(ctx, &mcp.CallToolParams{
+				Name:      "ctr_search",
+				Arguments: SearchInput{Queries: []string{"anything"}, Scope: scope},
+			})
+			if err != nil {
+				t.Fatalf("call: %v", err)
+			}
+			if !res.IsError {
+				t.Fatalf("want IsError=true for scope=%s without session, got %+v", scope, res)
+			}
+			text := res.Content[0].(*mcp.TextContent).Text
+			if !strings.HasPrefix(text, "["+codeStorageUnavailable+"]") {
+				t.Fatalf("want %s prefix, got %q", codeStorageUnavailable, text)
+			}
+		})
+	}
+
+	res, err := cs.CallTool(ctx, &mcp.CallToolParams{Name: "ctr_search", Arguments: SearchInput{Queries: []string{"anything"}}})
+	if err != nil {
+		t.Fatalf("call: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("content scope without session should still succeed, got error: %+v", res.Content)
+	}
+}
+
+// TestSearchScopeInvalidValue: 미지의 scope 값은 신규 코드 없이 기존 INVALID_ARGUMENT로 거부.
+func TestSearchScopeInvalidValue(t *testing.T) {
+	cs, _ := newTestServer(t, nil)
+	res, err := cs.CallTool(context.Background(), &mcp.CallToolParams{Name: "ctr_search", Arguments: SearchInput{Queries: []string{"x"}, Scope: "bogus"}})
+	if err != nil {
+		t.Fatalf("call: %v", err)
+	}
+	if !res.IsError {
+		t.Fatalf("want IsError=true for invalid scope")
+	}
+	text := res.Content[0].(*mcp.TextContent).Text
+	if !strings.HasPrefix(text, "["+codeInvalidArgument+"]") {
+		t.Fatalf("want %s prefix, got %q", codeInvalidArgument, text)
+	}
+}
+
+// TestFetchDescriptionMentionsByteExactNotWebFetch — 브리프 Step1 ⑤: ctr_fetch 설명에
+// "byte-exact"·"웹 fetch"·"ctr_fetch_and_index" 문구가 있는지 확인한다(설계 §3.5).
+func TestFetchDescriptionMentionsByteExactNotWebFetch(t *testing.T) {
+	cs, _ := newTestServer(t, nil)
+	lt, err := cs.ListTools(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("list tools: %v", err)
+	}
+	var desc string
+	for _, tl := range lt.Tools {
+		if tl.Name == "ctr_fetch" {
+			desc = tl.Description
+		}
+	}
+	if desc == "" {
+		t.Fatalf("ctr_fetch not found in tools/list")
+	}
+	for _, want := range []string{"byte-exact", "웹 fetch", "ctr_fetch_and_index"} {
+		if !strings.Contains(desc, want) {
+			t.Fatalf("ctr_fetch description=%q want to contain %q", desc, want)
+		}
+	}
+}
+
+// --- ctr_record_event (태스크 3, 설계 §3.1) ---
+
+// newRecordEventTestServer: newTestServer와 동형이지만 Session DB까지 배선해 ctr_record_event를
+// 기본 표면에 등록한다. storeDir을 함께 반환한다(LedgerStats(dir) 재조회용, ⑥).
+func newRecordEventTestServer(t *testing.T) (cs *mcp.ClientSession, st *store.Store, sess *session.DB, storeDir string) {
+	t.Helper()
+	canon, err := ident.Canonicalize(t.TempDir())
+	if err != nil {
+		t.Fatalf("canonicalize: %v", err)
+	}
+	storeDir = t.TempDir()
+	st, err = store.Open(storeDir, false)
+	if err != nil {
+		t.Fatalf("store open: %v", err)
+	}
+	t.Cleanup(func() { st.Close() })
+	sess, err = session.Open(t.TempDir(), session.Options{Producer: "test/record-event"})
+	if err != nil {
+		t.Fatalf("session open: %v", err)
+	}
+	t.Cleanup(func() { sess.Close() })
+
+	srv, err := NewServer(Config{Canon: canon, Store: st, SelfExe: testSelfExe(t), Session: sess})
+	if err != nil {
+		t.Fatalf("new server: %v", err)
+	}
+	srvT, cliT := mcp.NewInMemoryTransports()
+	ctx := context.Background()
+	if _, err := srv.Connect(ctx, srvT, nil); err != nil {
+		t.Fatalf("server connect: %v", err)
+	}
+	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "0"}, nil)
+	cs, err = client.Connect(ctx, cliT, nil)
+	if err != nil {
+		t.Fatalf("client connect: %v", err)
+	}
+	t.Cleanup(func() { cs.Close() })
+	return cs, st, sess, storeDir
+}
+
+// recordEventErrPrefix: ctr_record_event 호출이 IsError=true이고 원하는 코드 prefix를 갖는지
+// 확인한다(반복되는 오류 케이스 어서션 공용 헬퍼).
+func recordEventErrPrefix(t *testing.T, cs *mcp.ClientSession, in RecordEventInput, wantCode string) {
+	t.Helper()
+	res, err := cs.CallTool(context.Background(), &mcp.CallToolParams{Name: "ctr_record_event", Arguments: in})
+	if err != nil {
+		t.Fatalf("call: %v", err)
+	}
+	if !res.IsError {
+		t.Fatalf("want IsError=true, got %+v", res)
+	}
+	text := res.Content[0].(*mcp.TextContent).Text
+	if !strings.HasPrefix(text, "["+wantCode+"]") {
+		t.Fatalf("want %s prefix, got %q", wantCode, text)
+	}
+}
+
+// mapAttrsOfSize: {"k":"aaa..."} 형태로 마샬링 시 정확히 n바이트가 되는 attributes map을
+// 만든다(n>=8, 단일 키 "k" — json.Marshal(map[string]any)의 결정적 출력에 의존).
+func mapAttrsOfSize(n int) map[string]any {
+	const overhead = len(`{"k":""}`)
+	return map[string]any{"k": strings.Repeat("a", n-overhead)}
+}
+
+// TestRecordEventRoundTrip: 브리프 Step1 ① — record → {event_id, session_id, ts} 반환 → Reader
+// 직조회로 행 검증.
+func TestRecordEventRoundTrip(t *testing.T) {
+	cs, _, sess, _ := newRecordEventTestServer(t)
+	ctx := context.Background()
+
+	res, err := cs.CallTool(ctx, &mcp.CallToolParams{Name: "ctr_record_event", Arguments: RecordEventInput{
+		EventType: "decision", Summary: "chose approach A",
+	}})
+	if err != nil {
+		t.Fatalf("call: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("record_event error: %+v", res.Content)
+	}
+	var out RecordEventOutput
+	remarshal(t, res.StructuredContent, &out)
+	if out.EventID == "" || out.SessionID != sess.SessionID() || out.Ts <= 0 {
+		t.Fatalf("out=%+v want non-empty event_id, session_id=%q, ts>0", out, sess.SessionID())
+	}
+
+	var gotSummary, gotType, gotRedaction string
+	if err := sess.Reader().QueryRow("SELECT summary, event_type, redaction FROM session_events WHERE event_id=?", out.EventID).
+		Scan(&gotSummary, &gotType, &gotRedaction); err != nil {
+		t.Fatalf("row query: %v", err)
+	}
+	if gotSummary != "chose approach A" || gotType != "decision" || gotRedaction != "none" {
+		t.Fatalf("row=(%q,%q,%q) want (chose approach A, decision, none)", gotSummary, gotType, gotRedaction)
+	}
+}
+
+// TestRecordEventCapViolations: 브리프 Step1 ② — 상한 위반 각 1건(type 65B·summary 2049B·
+// attributes 4097B·refs 17개) → INVALID_ARGUMENT. 개별 필드는 상한 이내인데 총합만 8KB를
+// 넘는 경우도 별도로 검증한다.
+func TestRecordEventCapViolations(t *testing.T) {
+	cs, _, _, _ := newRecordEventTestServer(t)
+
+	tests := []struct {
+		name string
+		in   RecordEventInput
+	}{
+		{"event_type_65B", RecordEventInput{EventType: strings.Repeat("a", 65), Summary: "s"}},
+		{"summary_2049B", RecordEventInput{EventType: "note", Summary: strings.Repeat("s", 2049)}},
+		{"attributes_4097B", RecordEventInput{EventType: "note", Summary: "s", Attributes: mapAttrsOfSize(4097)}},
+		{"refs_17", RecordEventInput{EventType: "note", Summary: "s", ArtifactRefs: make([]int64, 17)}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			recordEventErrPrefix(t, cs, tt.in, codeInvalidArgument)
+		})
+	}
+
+	t.Run("total_8KB", func(t *testing.T) {
+		related := make([]string, 6)
+		for i := range related {
+			related[i] = "https://example.com/" + strings.Repeat("a", 512-len("https://example.com/"))
+		}
+		in := RecordEventInput{
+			EventType:        "note",
+			Summary:          strings.Repeat("s", maxSummaryBytes),
+			Attributes:       mapAttrsOfSize(4000),
+			RelatedResources: related,
+		}
+		recordEventErrPrefix(t, cs, in, codeInvalidArgument)
+	})
+
+	// C5: 개별 필드·related는 상한 이내이고 refs 없이는 총합 7000B(≤8192)로 통과하지만,
+	// 해석될 artifact URI(119B×16=1904)를 더하면 8904B로 초과해야 한다. refs가 계상되지 않으면
+	// 7000B로 통과해 이 테스트가 실패하므로, 가산 회귀를 정확히 잡는다(refs는 해석 전 거부되어
+	// 실재하지 않아도 됨).
+	t.Run("total_8KB_with_artifact_uris", func(t *testing.T) {
+		item := "https://example.com/" + strings.Repeat("a", 474-len("https://example.com/")) // 474B×2 = 948
+		in := RecordEventInput{
+			EventType:        "note",                          // 4
+			Summary:          strings.Repeat("s", 2048),       // 2048
+			Attributes:       mapAttrsOfSize(4000),            // 4000
+			RelatedResources: []string{item, item},            // 948 → 소계 7000
+			ArtifactRefs:     make([]int64, maxRefsOrRelated), // +119×16 = 1904 → 8904
+		}
+		recordEventErrPrefix(t, cs, in, codeInvalidArgument)
+	})
+}
+
+// TestRecordEventSecretCanaryRedacted: 브리프 Step1 ③(G4 기록 경로) — summary·attributes·
+// related_resources에 분할 리터럴 canary → 저장 행에 원문 부재 + redaction='spans'.
+func TestRecordEventSecretCanaryRedacted(t *testing.T) {
+	cs, _, sess, _ := newRecordEventTestServer(t)
+	ctx := context.Background()
+
+	// 런타임 분할 리터럴 — 소스에 연속 secret 토큰 금지(규약 §8).
+	canary := "xox" + "b-1234567890ABCDEF"
+
+	in := RecordEventInput{
+		EventType:        "note",
+		Summary:          "leaked: " + canary,
+		Attributes:       map[string]any{"token": canary},
+		RelatedResources: []string{"https://example.com/?token=" + canary},
+	}
+	res, err := cs.CallTool(ctx, &mcp.CallToolParams{Name: "ctr_record_event", Arguments: in})
+	if err != nil {
+		t.Fatalf("call: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("record_event error: %+v", res.Content)
+	}
+	var out RecordEventOutput
+	remarshal(t, res.StructuredContent, &out)
+
+	var summary, payload, related, redaction string
+	if err := sess.Reader().QueryRow("SELECT summary, payload, related, redaction FROM session_events WHERE event_id=?", out.EventID).
+		Scan(&summary, &payload, &related, &redaction); err != nil {
+		t.Fatalf("row query: %v", err)
+	}
+	if strings.Contains(summary, canary) || strings.Contains(payload, canary) || strings.Contains(related, canary) {
+		t.Fatalf("canary leaked: summary=%q payload=%q related=%q", summary, payload, related)
+	}
+	if redaction != "spans" {
+		t.Fatalf("redaction=%q want spans", redaction)
+	}
+	if !strings.Contains(summary, "REDACTED") || !strings.Contains(payload, "REDACTED") || !strings.Contains(related, "REDACTED") {
+		t.Fatalf("redaction marker missing: summary=%q payload=%q related=%q", summary, payload, related)
+	}
+}
+
+// TestRecordEventArtifactRefs: 브리프 Step1 ④ — 유효 id는 정본 URI(artifact://<session_id>/
+// sha256-<hash>)로 저장되고, 미존재 id는 INVALID_ARGUMENT.
+func TestRecordEventArtifactRefs(t *testing.T) {
+	cs, st, sess, _ := newRecordEventTestServer(t)
+	ctx := context.Background()
+
+	id, err := st.Register(ctx, store.Registration{
+		StoredBytes: []byte("artifact body"), MediaType: "text/plain",
+		Source: store.SourceMeta{URI: "/a.txt", Kind: "file", SrcHash: "h1"},
+	})
+	if err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	hash, err := st.ArtifactHashByID(ctx, id)
+	if err != nil {
+		t.Fatalf("hash: %v", err)
+	}
+	wantURI := "artifact://" + sess.SessionID() + "/sha256-" + hash
+
+	res, err := cs.CallTool(ctx, &mcp.CallToolParams{Name: "ctr_record_event", Arguments: RecordEventInput{
+		EventType: "note", Summary: "s", ArtifactRefs: []int64{id},
+	}})
+	if err != nil {
+		t.Fatalf("call: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("record_event error: %+v", res.Content)
+	}
+	var out RecordEventOutput
+	remarshal(t, res.StructuredContent, &out)
+
+	var refsJSON string
+	if err := sess.Reader().QueryRow("SELECT artifact_refs FROM session_events WHERE event_id=?", out.EventID).Scan(&refsJSON); err != nil {
+		t.Fatalf("row query: %v", err)
+	}
+	var refs []string
+	if err := json.Unmarshal([]byte(refsJSON), &refs); err != nil {
+		t.Fatalf("unmarshal artifact_refs: %v", err)
+	}
+	if len(refs) != 1 || refs[0] != wantURI {
+		t.Fatalf("artifact_refs=%v want [%q]", refs, wantURI)
+	}
+
+	recordEventErrPrefix(t, cs, RecordEventInput{EventType: "note", Summary: "s", ArtifactRefs: []int64{999999}}, codeInvalidArgument)
+}
+
+// TestRecordEventSupersedesMissingIsInvalidArgument: 최종리뷰 C1(설계 §3.1 명문) — supersedes
+// 미존재는 INVALID_ARGUMENT(artifact_refs 미존재와 대칭). 이전 구현은 NOT_FOUND였으나 설계서
+// 우선 규칙으로 교정(플랜 T3 문면 교정 필요).
+func TestRecordEventSupersedesMissingIsInvalidArgument(t *testing.T) {
+	cs, _, _, _ := newRecordEventTestServer(t)
+	recordEventErrPrefix(t, cs, RecordEventInput{
+		EventType: "decision", Summary: "corrected", Supersedes: "00000000-0000-7000-8000-000000000000",
+	}, codeInvalidArgument)
+}
+
+// TestRecordEventLedgerAppend: 브리프 Step1 ⑥ — 호출마다 LedgerAppend(ctr_fetch/ctr_search
+// 패턴 승계) → ledger.db에 1행.
+func TestRecordEventLedgerAppend(t *testing.T) {
+	cs, _, _, storeDir := newRecordEventTestServer(t)
+	ctx := context.Background()
+
+	res, err := cs.CallTool(ctx, &mcp.CallToolParams{Name: "ctr_record_event", Arguments: RecordEventInput{
+		EventType: "note", Summary: "s",
+	}})
+	if err != nil {
+		t.Fatalf("call: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("record_event error: %+v", res.Content)
+	}
+
+	stats, err := store.LedgerStats(storeDir)
+	if err != nil {
+		t.Fatalf("LedgerStats: %v", err)
+	}
+	found := false
+	for _, s := range stats {
+		if s.Tool == "ctr_record_event" {
+			found = true
+			if s.Calls != 1 {
+				t.Fatalf("ctr_record_event calls=%d want 1", s.Calls)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("ctr_record_event ledger row missing: %+v", stats)
+	}
+}
+
+// TestRecordEventSchemaGating: 브리프 Step1 ⑦(이 태스크 시점 — ctr_record_event 1종). Session이
+// 있으면 기본 표면에 등장(DestructiveHint=false)하고, Session이 nil이면 등장하지 않는다.
+func TestRecordEventSchemaGating(t *testing.T) {
+	cs, _, _, _ := newRecordEventTestServer(t)
+	lt, err := cs.ListTools(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("list tools: %v", err)
+	}
+	var tool *mcp.Tool
+	for _, tl := range lt.Tools {
+		if tl.Name == "ctr_record_event" {
+			tool = tl
+		}
+	}
+	if tool == nil {
+		t.Fatalf("ctr_record_event not in tools/list: %+v", lt.Tools)
+	}
+	if tool.Annotations == nil || tool.Annotations.DestructiveHint == nil || *tool.Annotations.DestructiveHint {
+		t.Fatalf("ctr_record_event DestructiveHint want &false, got %+v", tool.Annotations)
+	}
+
+	csNoSession, _ := newTestServer(t, nil)
+	lt2, err := csNoSession.ListTools(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("list tools (no session): %v", err)
+	}
+	for _, tl := range lt2.Tools {
+		if tl.Name == "ctr_record_event" {
+			t.Fatalf("ctr_record_event should not be registered when Session is nil")
+		}
+	}
+}
+
+// --- ctr_session_summary (태스크 4, 설계 §3.2) ---
+
+// newSummaryTestServer: newRecordEventTestServer와 동형이지만 sessionDir·storeDir을 모두
+// 반환한다(session_id 필터 테스트가 같은 session.db를 가리키는 2번째 session.Open을 필요로
+// 하고, ledger 테스트가 storeDir을 필요로 함 — 기존 헬퍼 시그니처는 7개 호출부를 건드리게 돼
+// 별도로 둔다).
+func newSummaryTestServer(t *testing.T) (cs *mcp.ClientSession, st *store.Store, sess *session.DB, sessionDir, storeDir string) {
+	t.Helper()
+	canon, err := ident.Canonicalize(t.TempDir())
+	if err != nil {
+		t.Fatalf("canonicalize: %v", err)
+	}
+	storeDir = t.TempDir()
+	st, err = store.Open(storeDir, false)
+	if err != nil {
+		t.Fatalf("store open: %v", err)
+	}
+	t.Cleanup(func() { st.Close() })
+	sessionDir = t.TempDir()
+	sess, err = session.Open(sessionDir, session.Options{Producer: "test/session-summary"})
+	if err != nil {
+		t.Fatalf("session open: %v", err)
+	}
+	t.Cleanup(func() { sess.Close() })
+
+	srv, err := NewServer(Config{Canon: canon, Store: st, SelfExe: testSelfExe(t), Session: sess})
+	if err != nil {
+		t.Fatalf("new server: %v", err)
+	}
+	srvT, cliT := mcp.NewInMemoryTransports()
+	ctx := context.Background()
+	if _, err := srv.Connect(ctx, srvT, nil); err != nil {
+		t.Fatalf("server connect: %v", err)
+	}
+	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "0"}, nil)
+	cs, err = client.Connect(ctx, cliT, nil)
+	if err != nil {
+		t.Fatalf("client connect: %v", err)
+	}
+	t.Cleanup(func() { cs.Close() })
+	return cs, st, sess, sessionDir, storeDir
+}
+
+// findSummaryGroup: 응답 groups에서 event_type이 일치하는 그룹을 찾는다(테스트 공용 헬퍼).
+func findSummaryGroup(out SessionSummaryOutput, eventType string) *summaryGroup {
+	for i := range out.Groups {
+		if out.Groups[i].EventType == eventType {
+			return &out.Groups[i]
+		}
+	}
+	return nil
+}
+
+// TestSessionRuntimeStorageErrorMapsToStorageUnavailable — 최종리뷰 C2(Codex P2): startup 이후
+// session.db가 malformed/불용이 됐을 때 세션 질의가 던지는 raw SQLite 오류가 INTERNAL로
+// 떨어지지 않고 STORAGE_UNAVAILABLE로 매핑돼야 한다. 세 핸들러(summary/export/search-events)가
+// 공통으로 쓰는 매핑 조합 `toToolError(session.ClassifyStorageErr(err))`를, 실제 훼손 파일에
+// 대한 실 SQLite 오류로 검증한다 — 열린 연결을 in-place로 훼손하는 방식은 WAL 그림자와 Windows
+// 의 -shm 메모리 매핑 때문에 이식성이 없어(실측), 프레시 훼손 파일로 동일 오류 경로를 재현한다.
+func TestSessionRuntimeStorageErrorMapsToStorageUnavailable(t *testing.T) {
+	dir := t.TempDir()
+	// 헤더 없는 쓰레기 바이트 = SQLITE_NOTADB(=26). session.OpenReadOnly는 지연 연결이라
+	// 첫 쿼리에서 오류가 표면화된다.
+	if err := os.WriteFile(filepath.Join(dir, "session.db"), bytes.Repeat([]byte{0xEE}, 4096), 0o600); err != nil {
+		t.Fatalf("write garbage: %v", err)
+	}
+	reader, err := session.OpenReadOnly(dir)
+	if err != nil {
+		t.Fatalf("OpenReadOnly: %v", err)
+	}
+	defer func() { _ = reader.Close() }()
+	var s string
+	qErr := reader.QueryRow("PRAGMA quick_check").Scan(&s)
+	if qErr == nil {
+		t.Fatalf("expected a SQLite storage error from garbage db, got quick_check=%q", s)
+	}
+
+	mapped := toToolError(session.ClassifyStorageErr(qErr))
+	if !strings.HasPrefix(mapped.Error(), "["+codeStorageUnavailable+"]") {
+		t.Fatalf("mapped=%q want %s prefix", mapped.Error(), codeStorageUnavailable)
+	}
+}
+
+// TestSummary_RoundTrip: 브리프 Step1 ①⑦ — 타입 그룹·시간 역순·artifact_refs 왕복·untrusted:true.
+func TestSummary_RoundTrip(t *testing.T) {
+	cs, _, sess, _, _ := newSummaryTestServer(t)
+	ctx := context.Background()
+
+	mustAppend(t, sess, session.Event{Type: "decision", Summary: "chose A"})
+	mustAppend(t, sess, session.Event{Type: "decision", Summary: "chose B"})
+	mustAppend(t, sess, session.Event{Type: "note", Summary: "fyi"})
+
+	res, err := cs.CallTool(ctx, &mcp.CallToolParams{Name: "ctr_session_summary", Arguments: SessionSummaryInput{}})
+	if err != nil {
+		t.Fatalf("call: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("summary error: %+v", res.Content)
+	}
+	var out SessionSummaryOutput
+	remarshal(t, res.StructuredContent, &out)
+
+	if !out.Untrusted {
+		t.Fatalf("Untrusted=false want true")
+	}
+	decisions := findSummaryGroup(out, "decision")
+	if decisions == nil || len(decisions.Events) != 2 {
+		t.Fatalf("decision group=%+v want 2 events", decisions)
+	}
+	if decisions.Events[0].Summary != "chose B" || decisions.Events[1].Summary != "chose A" {
+		t.Fatalf("decision order=%+v want [chose B, chose A] (time desc)", decisions.Events)
+	}
+	notes := findSummaryGroup(out, "note")
+	if notes == nil || len(notes.Events) != 1 || notes.Events[0].Summary != "fyi" {
+		t.Fatalf("note group=%+v want exactly [fyi]", notes)
+	}
+}
+
+// TestSummary_SessionIDFilter: 브리프 Step1 ② — session_id 지정 시 다른 세션 이벤트가 섞이지
+// 않는다(같은 worktree session.db에 2번째 session.Open으로 별도 세션을 만든다).
+func TestSummary_SessionIDFilter(t *testing.T) {
+	cs, _, sess1, sessionDir, _ := newSummaryTestServer(t)
+	ctx := context.Background()
+	mustAppend(t, sess1, session.Event{Type: "note", Summary: "from-sess1"})
+
+	sess2, err := session.Open(sessionDir, session.Options{Producer: "test/session-summary-2"})
+	if err != nil {
+		t.Fatalf("session2 open: %v", err)
+	}
+	t.Cleanup(func() { sess2.Close() })
+	mustAppend(t, sess2, session.Event{Type: "note", Summary: "from-sess2"})
+
+	res, err := cs.CallTool(ctx, &mcp.CallToolParams{Name: "ctr_session_summary", Arguments: SessionSummaryInput{SessionID: sess1.SessionID()}})
+	if err != nil {
+		t.Fatalf("call: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("summary error: %+v", res.Content)
+	}
+	var out SessionSummaryOutput
+	remarshal(t, res.StructuredContent, &out)
+
+	notes := findSummaryGroup(out, "note")
+	if notes == nil || len(notes.Events) != 1 || notes.Events[0].Summary != "from-sess1" {
+		t.Fatalf("note group=%+v want exactly [from-sess1]", notes)
+	}
+}
+
+// TestSummary_CheckpointIncludedAndDedupedFromGroups: 브리프 Step1 ④(1/2) — 최신 checkpoint가
+// checkpoint 필드에 실리고 groups에는 중복되지 않는다.
+func TestSummary_CheckpointIncludedAndDedupedFromGroups(t *testing.T) {
+	cs, _, sess, _, _ := newSummaryTestServer(t)
+	ctx := context.Background()
+	mustAppend(t, sess, session.Event{Type: "session_checkpoint", Summary: "cp-old"})
+	cpID := mustAppend(t, sess, session.Event{Type: "session_checkpoint", Summary: "cp-latest"})
+
+	res, err := cs.CallTool(ctx, &mcp.CallToolParams{Name: "ctr_session_summary", Arguments: SessionSummaryInput{}})
+	if err != nil {
+		t.Fatalf("call: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("summary error: %+v", res.Content)
+	}
+	var out SessionSummaryOutput
+	remarshal(t, res.StructuredContent, &out)
+
+	if out.Checkpoint == nil || out.Checkpoint.EventID != cpID || out.Checkpoint.Summary != "cp-latest" {
+		t.Fatalf("checkpoint=%+v want event_id=%s(cp-latest)", out.Checkpoint, cpID)
+	}
+	grp := findSummaryGroup(out, "session_checkpoint")
+	for _, e := range grp.Events {
+		if e.EventID == cpID {
+			t.Fatalf("checkpoint event duplicated in groups: %+v", grp)
+		}
+	}
+}
+
+// TestSummary_CheckpointBudgetOmitted: 브리프 Step1 ④(2/2) — checkpoint 단독으로
+// max_return_bytes를 초과하면 생략되고(checkpoint 필드 없음) checkpoint_truncated로 표시한다
+// (hard cap 유지 — 예산을 넘겨 싣지 않음, 설계 §3.2).
+func TestSummary_CheckpointBudgetOmitted(t *testing.T) {
+	cs, _, sess, _, _ := newSummaryTestServer(t)
+	ctx := context.Background()
+	mustAppend(t, sess, session.Event{Type: "session_checkpoint", Summary: strings.Repeat("c", 100)})
+
+	res, err := cs.CallTool(ctx, &mcp.CallToolParams{Name: "ctr_session_summary", Arguments: SessionSummaryInput{MaxReturnBytes: 10}})
+	if err != nil {
+		t.Fatalf("call: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("summary error: %+v", res.Content)
+	}
+	var out SessionSummaryOutput
+	remarshal(t, res.StructuredContent, &out)
+
+	if out.Checkpoint != nil {
+		t.Fatalf("checkpoint=%+v want nil(omitted, 100B > 10B budget)", out.Checkpoint)
+	}
+	if !out.CheckpointTruncated {
+		t.Fatalf("CheckpointTruncated=false want true")
+	}
+}
+
+// TestSummary_GroupTruncatedUnderBudget: 브리프 Step1 ⑥ — 그룹별 truncated 개별 표기(예산
+// 소진 지점의 그룹만 truncated:true, 하드캡 유지로 예산 초과 없이 절단).
+func TestSummary_GroupTruncatedUnderBudget(t *testing.T) {
+	cs, _, sess, _, _ := newSummaryTestServer(t)
+	ctx := context.Background()
+	for i := 0; i < 5; i++ {
+		mustAppend(t, sess, session.Event{Type: "note", Summary: strings.Repeat("n", 50)})
+	}
+
+	res, err := cs.CallTool(ctx, &mcp.CallToolParams{Name: "ctr_session_summary", Arguments: SessionSummaryInput{MaxReturnBytes: 120}})
+	if err != nil {
+		t.Fatalf("call: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("summary error: %+v", res.Content)
+	}
+	var out SessionSummaryOutput
+	remarshal(t, res.StructuredContent, &out)
+
+	notes := findSummaryGroup(out, "note")
+	if notes == nil {
+		t.Fatalf("note group missing: %+v", out)
+	}
+	if !notes.Truncated {
+		t.Fatalf("note.Truncated=false want true(5x50B > 120B budget)")
+	}
+	if len(notes.Events) == 0 || len(notes.Events) >= 5 {
+		t.Fatalf("note.Events len=%d want 0<n<5(budget-limited)", len(notes.Events))
+	}
+}
+
+// TestSummary_MissingArtifactRef: 브리프 Step1 ⑤ — content.db에 없는 hash를 가리키는
+// artifact_refs는 missing:true(D15 hint, 오류 아님 — 호출 자체는 성공한다).
+func TestSummary_MissingArtifactRef(t *testing.T) {
+	cs, st, sess, _, _ := newSummaryTestServer(t)
+	ctx := context.Background()
+
+	id, err := st.Register(ctx, store.Registration{
+		StoredBytes: []byte("present"), MediaType: "text/plain",
+		Source: store.SourceMeta{URI: "/p.txt", Kind: "file", SrcHash: "h1"},
+	})
+	if err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	presentHash, err := st.ArtifactHashByID(ctx, id)
+	if err != nil {
+		t.Fatalf("hash: %v", err)
+	}
+	presentURI := "artifact://" + sess.SessionID() + "/sha256-" + presentHash
+	missingURI := "artifact://" + sess.SessionID() + "/sha256-" + strings.Repeat("0", 64)
+
+	mustAppend(t, sess, session.Event{Type: "note", Summary: "refs", ArtifactRefs: []string{presentURI, missingURI}})
+
+	res, err := cs.CallTool(ctx, &mcp.CallToolParams{Name: "ctr_session_summary", Arguments: SessionSummaryInput{}})
+	if err != nil {
+		t.Fatalf("call: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("summary error(missing는 hint여야지 오류가 아님): %+v", res.Content)
+	}
+	var out SessionSummaryOutput
+	remarshal(t, res.StructuredContent, &out)
+
+	notes := findSummaryGroup(out, "note")
+	if notes == nil || len(notes.Events) != 1 || len(notes.Events[0].ArtifactRefs) != 2 {
+		t.Fatalf("note group=%+v want 1 event with 2 refs", notes)
+	}
+	refs := notes.Events[0].ArtifactRefs
+	if refs[0].URI != presentURI || refs[0].Missing {
+		t.Fatalf("present ref=%+v want missing=false", refs[0])
+	}
+	if refs[1].URI != missingURI || !refs[1].Missing {
+		t.Fatalf("missing ref=%+v want missing=true", refs[1])
+	}
+}
+
+// TestSummary_LimitClamp: limit 기본 5·최대 20(초과 클램프).
+func TestSummary_LimitClamp(t *testing.T) {
+	cs, _, sess, _, _ := newSummaryTestServer(t)
+	ctx := context.Background()
+	for i := 0; i < 25; i++ {
+		mustAppend(t, sess, session.Event{Type: "note", Summary: fmt.Sprintf("n%02d", i)})
+	}
+
+	res, err := cs.CallTool(ctx, &mcp.CallToolParams{Name: "ctr_session_summary", Arguments: SessionSummaryInput{}})
+	if err != nil {
+		t.Fatalf("call: %v", err)
+	}
+	var out SessionSummaryOutput
+	remarshal(t, res.StructuredContent, &out)
+	if notes := findSummaryGroup(out, "note"); notes == nil || len(notes.Events) != 5 {
+		t.Fatalf("default limit note group len=%v want 5", notes)
+	}
+
+	res2, err := cs.CallTool(ctx, &mcp.CallToolParams{Name: "ctr_session_summary", Arguments: SessionSummaryInput{Limit: 999}})
+	if err != nil {
+		t.Fatalf("call: %v", err)
+	}
+	var out2 SessionSummaryOutput
+	remarshal(t, res2.StructuredContent, &out2)
+	if notes := findSummaryGroup(out2, "note"); notes == nil || len(notes.Events) != 20 {
+		t.Fatalf("limit=999 note group len=%v want 20(clamped)", notes)
+	}
+}
+
+// TestSummary_SchemaGating: Session이 있으면 기본 표면에 등장(ReadOnlyHint=true)하고, 없으면
+// 등장하지 않는다(registerRecordEvent와 동일 게이트).
+func TestSummary_SchemaGating(t *testing.T) {
+	cs, _, _, _, _ := newSummaryTestServer(t)
+	lt, err := cs.ListTools(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("list tools: %v", err)
+	}
+	var tool *mcp.Tool
+	for _, tl := range lt.Tools {
+		if tl.Name == "ctr_session_summary" {
+			tool = tl
+		}
+	}
+	if tool == nil {
+		t.Fatalf("ctr_session_summary not in tools/list: %+v", lt.Tools)
+	}
+	if tool.Annotations == nil || !tool.Annotations.ReadOnlyHint {
+		t.Fatalf("ctr_session_summary ReadOnlyHint want true, got %+v", tool.Annotations)
+	}
+
+	csNoSession, _ := newTestServer(t, nil)
+	lt2, err := csNoSession.ListTools(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("list tools (no session): %v", err)
+	}
+	for _, tl := range lt2.Tools {
+		if tl.Name == "ctr_session_summary" {
+			t.Fatalf("ctr_session_summary should not be registered when Session is nil")
+		}
+	}
+}
+
+// TestSummary_LedgerAppend: 호출마다 LedgerAppend(ctr_record_event 패턴 승계).
+func TestSummary_LedgerAppend(t *testing.T) {
+	cs, _, sess, _, storeDir := newSummaryTestServer(t)
+	ctx := context.Background()
+	mustAppend(t, sess, session.Event{Type: "note", Summary: "s"})
+
+	res, err := cs.CallTool(ctx, &mcp.CallToolParams{Name: "ctr_session_summary", Arguments: SessionSummaryInput{}})
+	if err != nil {
+		t.Fatalf("call: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("summary error: %+v", res.Content)
+	}
+
+	stats, err := store.LedgerStats(storeDir)
+	if err != nil {
+		t.Fatalf("LedgerStats: %v", err)
+	}
+	found := false
+	for _, s := range stats {
+		if s.Tool == "ctr_session_summary" {
+			found = true
+			if s.Calls != 1 {
+				t.Fatalf("ctr_session_summary calls=%d want 1", s.Calls)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("ctr_session_summary ledger row missing: %+v", stats)
+	}
+}
+
+// mustAppend: session.DB.Append의 테스트 공용 래퍼(event_id만 필요한 호출부용).
+func mustAppend(t *testing.T, sess *session.DB, ev session.Event) string {
+	t.Helper()
+	_, eventID, _, err := sess.Append(ev)
+	if err != nil {
+		t.Fatalf("append(%+v): %v", ev, err)
+	}
+	return eventID
+}
+
+// --- ctr_export_events (태스크 5, 설계 §3.3, D16) ---
+
+// exportBaseline: session_start 자동 이벤트(Open 시점 기록)를 건너뛰기 위해, 테스트가 이벤트를
+// 추가로 append하기 전 현재 세션의 next_after를 조회해 커서 시작점으로 쓴다.
+func exportBaseline(t *testing.T, cs *mcp.ClientSession, sessionID string) int64 {
+	t.Helper()
+	res, err := cs.CallTool(context.Background(), &mcp.CallToolParams{
+		Name:      "ctr_export_events",
+		Arguments: ExportEventsInput{SessionID: sessionID, Limit: maxExportLimit},
+	})
+	if err != nil {
+		t.Fatalf("exportBaseline call: %v", err)
+	}
+	var out ExportEventsOutput
+	remarshal(t, res.StructuredContent, &out)
+	return out.NextAfter
+}
+
+// findExportEvent: 응답 events에서 event_id로 찾는 테스트 공용 헬퍼.
+func findExportEvent(out ExportEventsOutput, eventID string) *session.EventV1 {
+	for i := range out.Events {
+		if out.Events[i].EventID == eventID {
+			return &out.Events[i]
+		}
+	}
+	return nil
+}
+
+// TestExportEvents_RoundTrip: record_event로 기록한 이벤트가 export에서 §26 전 필드로
+// 왕복한다(schemaVersion·privacyLabel 상수, producer 유도, artifact_refs/related/attributes
+// 보존, untrusted:true).
+func TestExportEvents_RoundTrip(t *testing.T) {
+	cs, _, sess, _, _ := newSummaryTestServer(t)
+	ctx := context.Background()
+	eid := mustAppend(t, sess, session.Event{
+		Type: "decision", Summary: "chose approach A",
+		Attributes:   json.RawMessage(`{"k":"v"}`),
+		ArtifactRefs: []string{"artifact://" + sess.SessionID() + "/sha256-abc"},
+		Related:      []string{"symbol://x"},
+	})
+
+	res, err := cs.CallTool(ctx, &mcp.CallToolParams{Name: "ctr_export_events", Arguments: ExportEventsInput{}})
+	if err != nil {
+		t.Fatalf("call: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("export error: %+v", res.Content)
+	}
+	var out ExportEventsOutput
+	remarshal(t, res.StructuredContent, &out)
+
+	if !out.Untrusted {
+		t.Fatalf("Untrusted=false want true")
+	}
+	ev := findExportEvent(out, eid)
+	if ev == nil {
+		t.Fatalf("event %s not found in export: %+v", eid, out.Events)
+	}
+	if ev.SchemaVersion != "1.0" || ev.PrivacyLabel != "internal" {
+		t.Fatalf("ev=%+v want schemaVersion=1.0 privacyLabel=internal", ev)
+	}
+	if ev.SessionID != sess.SessionID() || ev.EventType != "decision" || ev.Summary != "chose approach A" {
+		t.Fatalf("ev identity=%+v", ev)
+	}
+	if ev.Producer.Name != "context-router" {
+		t.Fatalf("ev.Producer=%+v want name=context-router", ev.Producer)
+	}
+	if len(ev.ArtifactRefs) != 1 || ev.ArtifactRefs[0] != "artifact://"+sess.SessionID()+"/sha256-abc" {
+		t.Fatalf("ev.ArtifactRefs=%v", ev.ArtifactRefs)
+	}
+	if len(ev.RelatedResources) != 1 || ev.RelatedResources[0] != "symbol://x" {
+		t.Fatalf("ev.RelatedResources=%v", ev.RelatedResources)
+	}
+	attrs, ok := ev.Attributes.(map[string]any)
+	if !ok || attrs["k"] != "v" {
+		t.Fatalf("ev.Attributes=%v want {k:v}", ev.Attributes)
+	}
+}
+
+// TestExportEvents_DefaultLimitClamp: limit 미지정 시 기본 50건까지만 반환(브리프 설계 §3.3).
+func TestExportEvents_DefaultLimitClamp(t *testing.T) {
+	cs, _, sess, _, _ := newSummaryTestServer(t)
+	ctx := context.Background()
+	for i := 0; i < 60; i++ {
+		mustAppend(t, sess, session.Event{Type: "note", Summary: fmt.Sprintf("n%02d", i)})
+	}
+
+	// C4: 예산 계상이 직렬화 전체 바이트가 된 뒤로 기본 예산(8192)이 50건 전에 절단하므로,
+	// limit 클램프(50)만 격리 검증하도록 예산을 크게 준다.
+	res, err := cs.CallTool(ctx, &mcp.CallToolParams{Name: "ctr_export_events", Arguments: ExportEventsInput{MaxReturnBytes: 1 << 20}})
+	if err != nil {
+		t.Fatalf("call: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("export error: %+v", res.Content)
+	}
+	var out ExportEventsOutput
+	remarshal(t, res.StructuredContent, &out)
+	if len(out.Events) != 50 {
+		t.Fatalf("default limit len=%d want 50", len(out.Events))
+	}
+}
+
+// TestClampExportLimit: 기본 50·최대 200(초과 클램프), 0 이하는 기본값(순수 함수 단위 테스트).
+func TestClampExportLimit(t *testing.T) {
+	cases := []struct{ in, want int }{
+		{0, defaultExportLimit},
+		{-5, defaultExportLimit},
+		{10, 10},
+		{200, 200},
+		{201, maxExportLimit},
+		{9999, maxExportLimit},
+	}
+	for _, c := range cases {
+		if got := clampExportLimit(c.in); got != c.want {
+			t.Fatalf("clampExportLimit(%d)=%d want %d", c.in, got, c.want)
+		}
+	}
+}
+
+// TestExportEvents_CursorPagination: limit=2로 도구를 반복 호출하면 시드된 이벤트 전부를
+// 정확히 한 번씩, 삽입 순서대로 방문하고 next_after가 매 호출 단조 증가한다(session_id로
+// 필터해 session_start 자동 이벤트와 섞이지 않게 한다).
+func TestExportEvents_CursorPagination(t *testing.T) {
+	cs, _, sess, _, _ := newSummaryTestServer(t)
+	ctx := context.Background()
+	after := exportBaseline(t, cs, sess.SessionID()) // session_start 자동 이벤트를 건너뛴다.
+
+	const n = 5
+	want := make([]string, n)
+	for i := 0; i < n; i++ {
+		want[i] = mustAppend(t, sess, session.Event{Type: "note", Summary: fmt.Sprintf("n%d", i)})
+	}
+
+	var got []string
+	lastAfter := after
+	for i := 0; i < 10; i++ { // 안전 상한(무한루프 방지)
+		res, err := cs.CallTool(ctx, &mcp.CallToolParams{
+			Name:      "ctr_export_events",
+			Arguments: ExportEventsInput{After: after, SessionID: sess.SessionID(), Limit: 2},
+		})
+		if err != nil {
+			t.Fatalf("call: %v", err)
+		}
+		if res.IsError {
+			t.Fatalf("export error: %+v", res.Content)
+		}
+		var out ExportEventsOutput
+		remarshal(t, res.StructuredContent, &out)
+		if len(out.Events) == 0 {
+			break
+		}
+		if out.NextAfter <= lastAfter {
+			t.Fatalf("iter %d: next_after=%d want > %d(단조 증가)", i, out.NextAfter, lastAfter)
+		}
+		for _, ev := range out.Events {
+			got = append(got, ev.EventID)
+		}
+		after = out.NextAfter
+		lastAfter = out.NextAfter
+	}
+
+	if len(got) != n {
+		t.Fatalf("got=%v(len=%d) want %d events", got, len(got), n)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("got[%d]=%s want %s(순서/중복 위반)", i, got[i], want[i])
+		}
+	}
+}
+
+// TestExportEvents_MaxReturnBytesTruncatesWithoutLoss: max_return_bytes를 작게 잡아 배치를
+// 강제로 절단시켜도, next_after를 따라 반복 호출하면 이벤트가 하나도 유실되지 않는다(mcp
+// 계층 applyExportBudget의 존재 이유 — RowID 기반 next_after 정확성 회귀 검증).
+func TestExportEvents_MaxReturnBytesTruncatesWithoutLoss(t *testing.T) {
+	cs, _, sess, _, _ := newSummaryTestServer(t)
+	ctx := context.Background()
+	after := exportBaseline(t, cs, sess.SessionID()) // session_start 자동 이벤트를 건너뛴다.
+
+	const n = 5
+	want := make([]string, n)
+	for i := 0; i < n; i++ {
+		want[i] = mustAppend(t, sess, session.Event{Type: "note", Summary: strings.Repeat("n", 50)})
+	}
+
+	// C4: 예산 계상이 summary가 아니라 직렬화 전체이므로, 이벤트 1건 직렬화 크기(L)를 실측해
+	// 2건치 예산(2L)을 잡는다 — 1건은 항상 진행(무손실), 5건은 여러 배치로 절단된다.
+	big, err := cs.CallTool(ctx, &mcp.CallToolParams{
+		Name:      "ctr_export_events",
+		Arguments: ExportEventsInput{After: after, SessionID: sess.SessionID(), MaxReturnBytes: 1 << 20},
+	})
+	if err != nil {
+		t.Fatalf("probe call: %v", err)
+	}
+	var bigOut ExportEventsOutput
+	remarshal(t, big.StructuredContent, &bigOut)
+	if len(bigOut.Events) != n {
+		t.Fatalf("probe: got %d events want %d", len(bigOut.Events), n)
+	}
+	evBytes, err := json.Marshal(bigOut.Events[0])
+	if err != nil {
+		t.Fatalf("marshal probe event: %v", err)
+	}
+	budget := 2 * len(evBytes)
+
+	var got []string
+	sawTruncated := false
+	for i := 0; i < 20; i++ { // 안전 상한(무한루프 방지)
+		res, err := cs.CallTool(ctx, &mcp.CallToolParams{
+			Name:      "ctr_export_events",
+			Arguments: ExportEventsInput{After: after, SessionID: sess.SessionID(), MaxReturnBytes: budget},
+		})
+		if err != nil {
+			t.Fatalf("call: %v", err)
+		}
+		if res.IsError {
+			t.Fatalf("export error: %+v", res.Content)
+		}
+		var out ExportEventsOutput
+		remarshal(t, res.StructuredContent, &out)
+		if len(out.Events) == 0 {
+			break
+		}
+		if out.Truncated {
+			sawTruncated = true
+		}
+		if out.NextAfter <= after {
+			t.Fatalf("next_after=%d want > %d(진행 없음 — 무손실 재구성 위반)", out.NextAfter, after)
+		}
+		for _, ev := range out.Events {
+			got = append(got, ev.EventID)
+		}
+		after = out.NextAfter
+	}
+
+	if !sawTruncated {
+		t.Fatalf("2건치 예산(%dB)으로 5건을 실었는데 truncated=true가 한 번도 없었다 — 테스트 전제 오류", budget)
+	}
+	if len(got) != n {
+		t.Fatalf("got=%v(len=%d) want %d events(no loss under byte budget)", got, len(got), n)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("got[%d]=%s want %s(순서/중복/유실 위반)", i, got[i], want[i])
+		}
+	}
+}
+
+// TestExportEvents_IncludesSuperseded: export는 무필터라 superseded 이벤트도 포함한다
+// (ctr_session_summary와의 핵심 차이).
+func TestExportEvents_IncludesSuperseded(t *testing.T) {
+	cs, _, sess, _, _ := newSummaryTestServer(t)
+	ctx := context.Background()
+	oldID := mustAppend(t, sess, session.Event{Type: "decision", Summary: "first take"})
+	newID := mustAppend(t, sess, session.Event{Type: "decision", Summary: "corrected", Supersedes: oldID})
+
+	res, err := cs.CallTool(ctx, &mcp.CallToolParams{
+		Name:      "ctr_export_events",
+		Arguments: ExportEventsInput{SessionID: sess.SessionID()},
+	})
+	if err != nil {
+		t.Fatalf("call: %v", err)
+	}
+	var out ExportEventsOutput
+	remarshal(t, res.StructuredContent, &out)
+
+	if findExportEvent(out, oldID) == nil {
+		t.Fatalf("superseded event %s missing from export(무필터 위반): %+v", oldID, out.Events)
+	}
+	newEv := findExportEvent(out, newID)
+	if newEv == nil || newEv.Supersedes != oldID {
+		t.Fatalf("newEv=%+v want Supersedes=%s", newEv, oldID)
+	}
+}
+
+// TestExportEvents_SchemaGating: Session이 있으면 기본 표면에 등장(ReadOnlyHint=true)하고,
+// 없으면 등장하지 않는다(registerRecordEvent/registerSessionSummary와 동일 게이트).
+func TestExportEvents_SchemaGating(t *testing.T) {
+	cs, _, _, _, _ := newSummaryTestServer(t)
+	lt, err := cs.ListTools(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("list tools: %v", err)
+	}
+	var tool *mcp.Tool
+	for _, tl := range lt.Tools {
+		if tl.Name == "ctr_export_events" {
+			tool = tl
+		}
+	}
+	if tool == nil {
+		t.Fatalf("ctr_export_events not in tools/list: %+v", lt.Tools)
+	}
+	if tool.Annotations == nil || !tool.Annotations.ReadOnlyHint {
+		t.Fatalf("ctr_export_events ReadOnlyHint want true, got %+v", tool.Annotations)
+	}
+
+	csNoSession, _ := newTestServer(t, nil)
+	lt2, err := csNoSession.ListTools(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("list tools (no session): %v", err)
+	}
+	for _, tl := range lt2.Tools {
+		if tl.Name == "ctr_export_events" {
+			t.Fatalf("ctr_export_events should not be registered when Session is nil")
+		}
+	}
+}
+
+// TestExportEvents_LedgerAppend: 호출마다 LedgerAppend(ctr_record_event/ctr_session_summary
+// 패턴 승계).
+func TestExportEvents_LedgerAppend(t *testing.T) {
+	cs, _, sess, _, storeDir := newSummaryTestServer(t)
+	ctx := context.Background()
+	mustAppend(t, sess, session.Event{Type: "note", Summary: "s"})
+
+	res, err := cs.CallTool(ctx, &mcp.CallToolParams{Name: "ctr_export_events", Arguments: ExportEventsInput{}})
+	if err != nil {
+		t.Fatalf("call: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("export error: %+v", res.Content)
+	}
+
+	stats, err := store.LedgerStats(storeDir)
+	if err != nil {
+		t.Fatalf("LedgerStats: %v", err)
+	}
+	found := false
+	for _, s := range stats {
+		if s.Tool == "ctr_export_events" {
+			found = true
+			if s.Calls != 1 {
+				t.Fatalf("ctr_export_events calls=%d want 1", s.Calls)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("ctr_export_events ledger row missing: %+v", stats)
 	}
 }
