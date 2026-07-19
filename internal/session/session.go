@@ -259,8 +259,14 @@ func Open(dir string, opts Options) (*DB, error) {
 // sql.Open 자체는 성공하고(지연 연결) 첫 쿼리에서 오류가 난다, 존재 확인은 호출자 책임.
 // 호출자가 Close 책임진다.
 func OpenReadOnly(dir string) (*sql.DB, error) {
-	dbPath := filepath.Join(dir, dbFileName)
-	dsn := "file:" + filepath.ToSlash(dbPath) + pragmas + "&mode=ro&_pragma=query_only(ON)"
+	return openReadOnlyAt(filepath.Join(dir, dbFileName))
+}
+
+// openReadOnlyAt — OpenReadOnly의 DSN 조립을 임의 경로에 적용한다(recover.go의 인양본
+// 검증(§6.3 ⑤)이 dir/dbFileName이 아닌 임시 인양본 경로를 읽어야 해서 필요 — 새 패키지
+// 인터페이스 없이 같은 패키지 내부 헬퍼로 공유, D13).
+func openReadOnlyAt(path string) (*sql.DB, error) {
+	dsn := "file:" + filepath.ToSlash(path) + pragmas + "&mode=ro&_pragma=query_only(ON)"
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("session OpenReadOnly: %w", err)

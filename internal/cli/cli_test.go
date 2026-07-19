@@ -6,6 +6,8 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -1266,4 +1268,102 @@ func TestRunDoctor_SessionItems(t *testing.T) {
 			t.Fatalf("out missing marker-present line: %s", buf.String())
 		}
 	})
+}
+
+// corruptSessionEvents — 태스크9b CLI 레벨 recover 테스트 전용 손상 헬퍼. session 패키지의
+// recover_test.go seedAndCorruptEvents와 동일한 기법(session_events 루트 페이지의 셀 포인터
+// 배열 영역 훼손 — 실측 확인: quick_check는 malformed를 보고하지만 앞부분 다수 행은 여전히
+// SELECT 가능)을 cli 패키지에서 재현한다. session의 unexported 상수(dbFileName 등)에는 접근할
+// 수 없으므로 session.OpenReadOnly로 필요한 값(page_size·rootpage)만 조회한다.
+func corruptSessionEvents(t *testing.T, dbDir string, n int) {
+	t.Helper()
+	d, err := session.Open(dbDir, session.Options{Producer: "context-router/test"})
+	if err != nil {
+		t.Fatalf("session.Open: %v", err)
+	}
+	for i := 0; i < n; i++ {
+		if _, _, _, err := d.Append(session.Event{Type: "note", Summary: fmt.Sprintf("evt-%d-%s", i, strings.Repeat("pad", 30))}); err != nil {
+			t.Fatalf("append: %v", err)
+		}
+	}
+	var pageSize, rootPage int
+	if err := d.Reader().QueryRow("PRAGMA page_size").Scan(&pageSize); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Reader().QueryRow("SELECT rootpage FROM sqlite_master WHERE name='session_events'").Scan(&rootPage); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	dbPath := filepath.Join(dbDir, "session.db")
+	raw, err := os.ReadFile(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	off := (rootPage-1)*pageSize + 50
+	if off+40 > len(raw) {
+		t.Fatalf("corrupt helper: offset out of range (size=%d off=%d)", len(raw), off)
+	}
+	cp := append([]byte(nil), raw...)
+	for i := 0; i < 40; i++ {
+		cp[off+i] = 0xEE
+	}
+	if err := os.WriteFile(dbPath, cp, 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestRunSessionRecover_HappyPath — 태스크9b: 훼손 DB → `session recover` CLI 경로가 인양·게시를
+// 완료하고 stderr에 결과를 보고한다. stdout은 비어 있어야 한다(recover는 CLI 결과 전용 규약상
+// stdout 출력이 없는 것이 안전 기본, 진행 보고는 stderr 전용).
+func TestRunSessionRecover_HappyPath(t *testing.T) {
+	storeRoot := t.TempDir()
+	projectRoot := t.TempDir()
+	canon, err := ident.Canonicalize(projectRoot)
+	if err != nil {
+		t.Fatalf("canonicalize: %v", err)
+	}
+	dbDir := filepath.Join(storeRoot, "projects", canon.ProjectID, "worktrees", canon.WorktreeID)
+	corruptSessionEvents(t, dbDir, 400)
+
+	var out, errOut bytes.Buffer
+	args := []string{"recover", "--project", projectRoot, "--worktree", canon.WorktreeID}
+	if err := Run(context.Background(), "session", args, storeRoot, projectRoot, "0.0.1-dev", &out, &errOut); err != nil {
+		t.Fatalf("Run session recover err=%v stderr=%s", err, errOut.String())
+	}
+	if out.Len() != 0 {
+		t.Fatalf("stdout should be empty for recover, got %q", out.String())
+	}
+	if !strings.Contains(errOut.String(), "인양 완료") {
+		t.Fatalf("stderr missing recovery report: %s", errOut.String())
+	}
+	if _, statErr := os.Stat(filepath.Join(dbDir, "session.recover-pending")); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("marker should be gone after recover, stat err=%v", statErr)
+	}
+}
+
+// TestRunSessionRecover_ServerRunning_RejectsImmediately — 태스크9b: 서버(shared lease 보유)
+// 실행 중이면 `session recover`가 즉시 거부돼야 한다(대기 없음).
+func TestRunSessionRecover_ServerRunning_RejectsImmediately(t *testing.T) {
+	storeRoot := t.TempDir()
+	projectRoot := t.TempDir()
+	canon, err := ident.Canonicalize(projectRoot)
+	if err != nil {
+		t.Fatalf("canonicalize: %v", err)
+	}
+	dbDir := filepath.Join(storeRoot, "projects", canon.ProjectID, "worktrees", canon.WorktreeID)
+	d, err := session.Open(dbDir, session.Options{Producer: "context-router/test"})
+	if err != nil {
+		t.Fatalf("session.Open: %v", err)
+	}
+	defer func() { _ = d.Close() }()
+
+	var out, errOut bytes.Buffer
+	args := []string{"recover", "--project", projectRoot, "--worktree", canon.WorktreeID}
+	err = Run(context.Background(), "session", args, storeRoot, projectRoot, "0.0.1-dev", &out, &errOut)
+	if !errors.Is(err, session.ErrLeaseHeld) {
+		t.Fatalf("err=%v want session.ErrLeaseHeld (out=%s stderr=%s)", err, out.String(), errOut.String())
+	}
 }

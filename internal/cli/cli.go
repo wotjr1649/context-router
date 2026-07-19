@@ -539,19 +539,77 @@ func purgeSessionFiles(projDir string) error {
 }
 
 // runSession: "session" 서브커맨드 내부 디스패치(설계 §6.3·§7, 태스크9). args[0]이 하위
-// 서브커맨드 이름이다 — 9a는 "export"만 구현한다. "recover"(9b 소관)는 아직 여기 없지만 이
-// switch 구조 자체가 그 자리를 막지 않는다: 9b는 새 case 하나만 추가하면 된다.
+// 서브커맨드 이름이다 — 9a는 "export", 9b는 "recover"를 구현한다.
 func runSession(ctx context.Context, stdout, stderr io.Writer, args []string, storeRoot string) error {
 	if len(args) == 0 {
-		return errors.New("cli: session: 서브커맨드 필요 (export)")
+		return errors.New("cli: session: 서브커맨드 필요 (export|recover)")
 	}
 	sub, rest := args[0], args[1:]
 	switch sub {
 	case "export":
 		return runSessionExport(ctx, stdout, stderr, rest, storeRoot)
+	case "recover":
+		return runSessionRecover(stderr, rest, storeRoot)
 	default:
 		return fmt.Errorf("cli: session: 미지 서브커맨드: %s", sub)
 	}
+}
+
+// runSessionRecover: session recover 서브커맨드(설계 §6.3 7단계·§7). --project는 필수,
+// --worktree는 worktree가 정확히 1개일 때만 생략 가능(export와 동일한 worktree 특정 계약,
+// resolveWorktreeID 재사용). 실제 마커·인양·게시 루프는 session.Recover가 소유한다(cli는
+// 플래그 해석·프로젝트/worktree 배선·결과를 stderr 문구로 조립하는 것까지만 — 규약 소유
+// 경계, 태스크9b). stdout에는 아무것도 쓰지 않는다(CLI 결과 전용 규약상 recover는 stdout
+// 출력이 없는 것이 안전 기본, stderr에만 진행 보고).
+func runSessionRecover(stderr io.Writer, args []string, storeRoot string) error {
+	fs := flag.NewFlagSet("session recover", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	project := fs.String("project", "", "대상 프로젝트(ID 또는 경로)")
+	worktree := fs.String("worktree", "", "대상 worktree(ID 또는 경로) — 생략은 worktree가 1개일 때만 허용")
+	if err := fs.Parse(args); err != nil {
+		return fmt.Errorf("session recover: 플래그 파싱 실패: %w", err)
+	}
+	if rest := fs.Args(); len(rest) > 0 {
+		return fmt.Errorf("session recover: 예상치 않은 인자 %d개", len(rest))
+	}
+	if *project == "" {
+		return errors.New("session recover: --project 필수")
+	}
+
+	pid, err := purgeProjectID(storeRoot, *project)
+	if err != nil {
+		return errors.New("session recover: 프로젝트 식별 실패")
+	}
+	projDir := filepath.Join(storeRoot, "projects", pid)
+
+	wid, err := resolveWorktreeID(stderr, projDir, *worktree)
+	if err != nil {
+		return err
+	}
+	dbDir := filepath.Join(projDir, "worktrees", wid)
+
+	if fi, statErr := os.Stat(filepath.Join(dbDir, "session.db")); statErr != nil || fi.IsDir() {
+		return errors.New("session recover: session.db 없음")
+	}
+
+	result, err := session.Recover(dbDir)
+	if err != nil {
+		// session.Recover의 오류는 이미 "session recover: ..."로 자기서술적이다(recover.go) —
+		// 여기서 다시 감싸면 접두사가 중복된다(runSessionExport가 session.OpenReadOnly를 감쌀
+		// 때와 달리, 이 경우는 서브커맨드 이름이 완전히 동일해 추가 문맥이 없다).
+		return err
+	}
+
+	switch {
+	case result.NoOp:
+		fmt.Fprintln(stderr, "session recover: 손상 아님 — 조치 없음")
+	case result.MarkerOnly:
+		fmt.Fprintln(stderr, "session recover: 이미 게시 완료 — 마커만 삭제했습니다")
+	default:
+		fmt.Fprintf(stderr, "session recover: 인양 완료 — events=%d sessions=%d backup=%s\n",
+			result.RecoveredEvents, result.RecoveredSessions, result.BackupPrefix)
+	}
+	return nil
 }
 
 // runSessionExport: session export 서브커맨드(설계 §6.3 export 부분·§7). --project는 필수
