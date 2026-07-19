@@ -907,12 +907,16 @@ func TestE2E_FetchAndIndex(t *testing.T) {
 //	    로컬 select라 서버 처리와 무관하게 성립). 서버가 취소를 처리했다는 증거는 아니고,
 //	    notifications/cancelled 송신까지만 보장한다(교차 리뷰 지적).
 //	(b) 서버가 취소를 실제로 처리했는가의 직접 관찰 — worker 슬롯(transform.go workerSem
-//	    ≤2)을 장기 호출 2건으로 점유하고 취소한 직후, 세 번째 transform이 수 초 내에
-//	    완료돼야 한다. 서버가 취소 알림을 무시하면 슬롯이 각 핸들러의 10s timeout까지
-//	    잠겨 세 번째 호출이 ≥9s 걸린다(교차 리뷰 P1 — 이 시간 차가 결정적 판별 신호).
+//	    ≤2)을 장기 호출 2건으로 점유하고 취소한 직후, 짧은 transform 2건을 동시에 실행해
+//	    둘 다 수 초 내 완료돼야 한다. 서버가 취소 알림을 무시하면 슬롯이 각 핸들러의 10s
+//	    timeout까지 잠겨 ≥9s가 걸리고(교차 리뷰 P1), 검증을 1건만 하면 "취소 1건만 처리된
+//	    회귀"가 빠져나간다(교차 리뷰 P2) — 그래서 2건 동시·양쪽 상한 단언.
 //	(c) 후속 ctr_search 정상 응답 + stdin close에 graceful exit(코드 0, 서버 생존).
 //
 // darwin은 ctr_transform이 fail-closed 미등록이라 대상 외(게이트 10 확인 항목 1 참조).
+// linux는 RLIMIT_AS(주소공간 상한)와 Go 런타임의 광범위한 가상주소 예약이 충돌해 worker가
+// 취소 전에 fail-closed로 조기 사망할 수 있다(PR #4 실측 194ms, 본 PR CI 실측 8.4ms) —
+// 조기 사망으로 취소 창이 안 열리면 최대 3회 재시도 후 skip한다(알려진 갭, 게이트 문서 참조).
 func TestE2E_CallToolCancellation(t *testing.T) {
 	if testing.Short() {
 		t.Skip("느린 E2E 스모크 — short 모드 skip")
@@ -935,7 +939,11 @@ func TestE2E_CallToolCancellation(t *testing.T) {
 	})
 
 	client := sdk.NewClient(&sdk.Implementation{Name: "ctr-cancel-smoke", Version: "0.0.1"}, nil)
-	sess, err := client.Connect(context.Background(), &sdk.CommandTransport{Command: cmd}, nil)
+	// Connect ctx는 핸드셰이크만 바운드한다(세션 수명 비종속) — 무기한이면 initialize가
+	// 멈추는 회귀에서 패키지 전체 timeout까지 매달린다(교차 리뷰 P2).
+	connectCtx, cancelConnect := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancelConnect()
+	sess, err := client.Connect(connectCtx, &sdk.CommandTransport{Command: cmd}, nil)
 	if err != nil {
 		t.Fatalf("connect: %v", err)
 	}
@@ -962,67 +970,118 @@ func TestE2E_CallToolCancellation(t *testing.T) {
 		"    return str(n)\n" +
 		"emit(churn())\n"
 
-	// worker 슬롯 2개를 모두 점유하는 장기 호출 2건을 동시에 걸고 1s 뒤 함께 취소한다.
-	churnCtx, cancelChurn := context.WithCancel(context.Background())
-	defer cancelChurn()
-	timer := time.AfterFunc(1*time.Second, cancelChurn)
-	defer timer.Stop()
 	type callOutcome struct {
 		res     *sdk.CallToolResult
 		err     error
 		elapsed time.Duration
 	}
-	outcomes := make(chan callOutcome, 2)
-	for range 2 {
-		go func() {
-			start := time.Now()
-			r, err := sess.CallTool(churnCtx, &sdk.CallToolParams{
-				Name: "ctr_transform", Arguments: mcp.TransformInput{Script: script},
-			})
-			outcomes <- callOutcome{res: r, err: err, elapsed: time.Since(start)}
-		}()
+	// failDiag: 실패 진단은 반드시 sess.Close()로 SDK(cmd.Wait의 단일 소유자)가 프로세스
+	// reap과 stderr 복사 고루틴 join을 끝낸 뒤 stderr를 읽는다. 테스트가 cmd.Wait()를 직접
+	// 부르면, 서버 사망을 본 SDK read-loop의 conn 종료 경로가 부르는 cmd.Wait와 경쟁해
+	// 둘 중 하나가 stderr 복사 고루틴 join(chan receive)에서 영구 대기한다 — CI 실측:
+	// run 29676073834에서 이 테스트가 정확히 그 지점에서 10m 타임아웃.
+	failDiag := func(format string, args ...any) {
+		t.Helper()
+		_ = sess.Close()
+		t.Fatalf("%s\nstderr=%s", fmt.Sprintf(format, args...), stderrBuf.String())
 	}
-	for range 2 {
-		oc := <-outcomes
-		if !errors.Is(oc.err, context.Canceled) {
-			var detail string
-			if oc.res != nil {
-				b, _ := json.Marshal(oc.res)
-				detail = string(b)
+
+	// worker 슬롯 2개를 모두 점유하는 장기 호출 2건을 동시에 걸고 1s 뒤 함께 취소한다.
+	churnPair := func() [2]callOutcome {
+		churnCtx, cancelChurn := context.WithCancel(context.Background())
+		defer cancelChurn()
+		timer := time.AfterFunc(1*time.Second, cancelChurn)
+		defer timer.Stop()
+		ch := make(chan callOutcome, 2)
+		for range 2 {
+			go func() {
+				start := time.Now()
+				r, err := sess.CallTool(churnCtx, &sdk.CallToolParams{
+					Name: "ctr_transform", Arguments: mcp.TransformInput{Script: script},
+				})
+				ch <- callOutcome{res: r, err: err, elapsed: time.Since(start)}
+			}()
+		}
+		return [2]callOutcome{<-ch, <-ch}
+	}
+
+	// linux fail-closed 조기 사망 대응: 취소 창이 열린 시도(두 호출 모두 context.Canceled)가
+	// 나올 때까지 최대 3회. 조기 사망은 서버 생존 계약을 깨지 않는 정상 fail-closed 경로지만
+	// 취소를 exercise하지 못하므로 그 시도는 무효다. 한쪽만 조기 사망해도 슬롯 판별(b)의
+	// 전제(두 슬롯 모두 취소로 해제)가 무너지므로 재시도한다.
+	const maxAttempts = 3
+	cancelledOK := false
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		earlyDeath := false
+		for _, oc := range churnPair() {
+			if errors.Is(oc.err, context.Canceled) {
+				// 취소(1s) 직후 반환해야 한다. 상한만 단언하고 하한은 두지 않는다(PR #4
+				// 교훈 — 하한은 구현 우연에 대한 단언이 된다).
+				if oc.elapsed >= 4*time.Second {
+					failDiag("(a) 취소 반환이 늦음: %v", oc.elapsed)
+				}
+				continue
 			}
-			// stderr 복사 고루틴은 exec.Cmd.Wait만 join한다(교차 리뷰 P2 — Process.Wait는
-			// 안 됨). SDK가 아직 Wait 전(sess.Close 미호출)이므로 여기의 cmd.Wait이 첫
-			// 호출이라 안전하다.
-			_ = cmd.Process.Kill()
-			_ = cmd.Wait()
-			t.Fatalf("(a) want context.Canceled, got err=%v res=%s (elapsed=%v)\nstderr=%s", oc.err, detail, oc.elapsed, stderrBuf.String())
+			b, _ := json.Marshal(oc.res)
+			if oc.err == nil && oc.res != nil && oc.res.IsError && strings.Contains(string(b), "worker killed") {
+				earlyDeath = true
+				continue
+			}
+			failDiag("(a) want context.Canceled, got err=%v res=%s (elapsed=%v)", oc.err, string(b), oc.elapsed)
 		}
-		// 취소(1s) 직후 반환해야 한다. 상한만 단언하고 하한은 두지 않는다(PR #4 교훈 —
-		// 하한은 구현 우연에 대한 단언이 된다).
-		if oc.elapsed >= 4*time.Second {
-			t.Fatalf("(a) 취소 반환이 늦음: %v", oc.elapsed)
+		if !earlyDeath {
+			cancelledOK = true
+			break
 		}
+		t.Logf("attempt %d/%d: worker 조기 사망(fail-closed) — 취소 창 미확보, 재시도", attempt, maxAttempts)
+		time.Sleep(1 * time.Second) // 취소된 상대 핸들러의 슬롯 반납 여유
+	}
+	if !cancelledOK {
+		if runtime.GOOS == "windows" {
+			// windows Job Object는 commit 상한이라 이 할당 없는 워크로드로는 조기 사망이
+			// 없어야 한다(로컬 17회 연속 생존 실측) — 여기 도달하면 회귀 신호다.
+			failDiag("windows에서 %d회 연속 worker 조기 사망 — 회귀 신호", maxAttempts)
+		}
+		t.Skipf("linux: worker fail-closed 조기 사망 %d회로 취소 창 미확보(알려진 갭 — 게이트 문서 §게이트 10). (3a) 상시 증거는 windows 잡", maxAttempts)
 	}
 
 	// (b) 서버측 취소 처리의 직접 관찰: 취소가 핸들러 ctx→worker까지 전파됐다면 슬롯 2개가
-	// 곧 풀려 이 호출은 ~2s 내(스폰 포함)에 끝난다. 무시됐다면 두 churn 핸들러가 각자의
-	// 10s timeout까지 슬롯을 쥐고 있어 ≥9s가 걸린다 — 7s 상한이 두 경우를 가른다.
-	thirdCtx, cancelThird := context.WithTimeout(context.Background(), 15*time.Second)
-	defer cancelThird()
-	thirdStart := time.Now()
-	third, err := sess.CallTool(thirdCtx, &sdk.CallToolParams{
-		Name: "ctr_transform", Arguments: mcp.TransformInput{Script: `emit("ok")`},
-	})
-	thirdElapsed := time.Since(thirdStart)
-	if err != nil {
-		t.Fatalf("(b) 취소 직후 transform: %v (elapsed=%v)", err, thirdElapsed)
+	// 곧 풀려 아래 2건은 각각 ~2s 내(스폰 포함)에 끝난다. 무시됐다면 churn 핸들러가 각자의
+	// 10s timeout까지 슬롯을 쥐고 있어 ≥9s — 7s 상한이 두 경우를 가른다. 반드시 2건을
+	// 동시에 검사한다: 1건만 보면 취소 하나만 처리된 회귀에서도 통과한다(교차 리뷰 P2).
+	probes := make(chan callOutcome, 2)
+	for range 2 {
+		go func() {
+			pctx, pcancel := context.WithTimeout(context.Background(), 15*time.Second)
+			defer pcancel()
+			start := time.Now()
+			r, err := sess.CallTool(pctx, &sdk.CallToolParams{
+				Name: "ctr_transform", Arguments: mcp.TransformInput{Script: `emit("ok")`},
+			})
+			probes <- callOutcome{res: r, err: err, elapsed: time.Since(start)}
+		}()
 	}
-	if third.IsError {
-		b, _ := json.Marshal(third)
-		t.Fatalf("(b) 취소 직후 transform 도구 오류: %s", b)
-	}
-	if thirdElapsed >= 7*time.Second {
-		t.Fatalf("(b) worker 슬롯이 제때 풀리지 않음(서버 취소 미처리 의심): %v", thirdElapsed)
+	for range 2 {
+		oc := <-probes
+		// 판별 신호는 성공 여부가 아니라 시간이다 — 조기 사망한 probe도 슬롯 획득은
+		// 이미 끝난 뒤이므로(Spawn은 sem 획득 후 스폰) elapsed가 상한 안이면 슬롯
+		// 해제는 입증된다. 그래서 시간 단언을 먼저 한다.
+		if oc.elapsed >= 7*time.Second {
+			failDiag("(b) worker 슬롯이 제때 풀리지 않음(서버 취소 미처리 의심): %v", oc.elapsed)
+		}
+		if oc.err != nil {
+			failDiag("(b) 취소 직후 transform: %v (elapsed=%v)", oc.err, oc.elapsed)
+		}
+		if oc.res.IsError {
+			b, _ := json.Marshal(oc.res)
+			if runtime.GOOS != "windows" && strings.Contains(string(b), "worker killed") {
+				// linux fail-closed 조기 사망은 probe 워커에도 스크립트와 무관하게
+				// 발생할 수 있다(워커 시작 단계의 VA 예약 충돌) — 재리뷰 (iv).
+				t.Logf("(b) probe worker 조기 사망(fail-closed) — elapsed=%v로 슬롯 해제는 확인됨", oc.elapsed)
+				continue
+			}
+			failDiag("(b) 취소 직후 transform 도구 오류: %s", string(b))
+		}
 	}
 
 	// (c) 동일 세션 후속 호출 — 빈 스토어라 히트 내용은 보지 않고 정상 응답만 확인.

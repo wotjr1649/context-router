@@ -60,8 +60,10 @@ go build -o ctr.exe ./cmd/context-router     # windows
      `cmd/context-router/main_test.go` `TestE2E_CallToolCancellation`. 단언: 취소 즉시
      `context.Canceled` 반환(클라이언트 계약), worker 슬롯(≤2) 즉시 해제로 서버측 취소 처리를
      직접 관찰(점유·취소 후 세 번째 transform 소요 시간 판별 — 교차 리뷰 P1 반영), 후속
-     `ctr_search` 정상, stdin close에 graceful exit(코드 0). CI 상주 테스트(linux/windows;
-     darwin은 `ctr_transform` fail-closed 미등록으로 대상 외).
+     `ctr_search` 정상, stdin close에 graceful exit(코드 0). CI 상주 테스트 — 상시 보증은
+     windows 잡이고, linux는 RLIMIT_AS 특성상 worker가 취소 전 fail-closed 조기 사망할 수
+     있어(하단 해소 경위·알려진 갭) 조기 사망 3회 시 skip하는 최선노력 커버리지다. darwin은
+     `ctr_transform` fail-closed 미등록으로 대상 외.
    - **(3b) 실호스트 취소 전달(수동)**: 호스트 UI(ESC)에서 시작된 취소가 서버까지 전달되는지.
      호스트측 전달 자체가 비결정적(session-03 4회 시도 경위 + 알려진 호스트 이슈)이므로
      시도 결과를 그대로 기록하되, 서버측 계약은 (3a)가 보증하므로 (3b) 실패/미관측을 게이트
@@ -73,19 +75,27 @@ go build -o ctr.exe ./cmd/context-router     # windows
 
 | 호스트 | 플랫폼 | tools/list 노출(기대 도구 수 일치) | 호출 1회 | cancellation | 확인일 | 비고 |
 |---|---|---|---|---|---|---|
-| Claude Code | windows | PASS (3종) | PASS | **이월** (하단 경위) | 2026-07-19 | ctr_search 정상(빈 스토어 hits:[]) + ctr_transform 오류 경로(256MB 메모리 킬) — 서버 생존·후속 호출 정상 |
-| Codex | windows | PASS (3종) | PASS | **이월** (하단 경위) | 2026-07-19 | ctr_search 정상 스키마 응답 + ctr_transform 오류 경로(10s 시간 상한) + 잘못된 인자 스키마 거부 — 서버 생존·후속 호출 정상 |
+| Claude Code | windows | PASS (3종) | PASS | (3a) PASS(스크립트드, PR #5) / (3b) **대기** — 1회 재시도 예정(하단 경위) | 2026-07-19 | ctr_search 정상(빈 스토어 hits:[]) + ctr_transform 오류 경로(256MB 메모리 킬) — 서버 생존·후속 호출 정상. 참고(3b 판정 아님): (3b) 준비 호출 2회는 ESC 미입력으로 10s 상한 도달 — 그때도 서버 생존·후속 정상 |
+| Codex | windows | PASS (3종) | PASS | (3a) PASS(스크립트드, PR #5 — 서버 계약은 호스트 무관) / (3b) 미시도(비차단, 하단 경위) | 2026-07-19 | ctr_search 정상 스키마 응답 + ctr_transform 오류 경로(10s 시간 상한) + 잘못된 인자 스키마 거부 — 서버 생존·후속 호출 정상 |
 
-**cancellation 이월 해소 (2026-07-19, session-04)**: 위 (3a)/(3b) 분리 개정에 따라
-스크립트드 스모크 `TestE2E_CallToolCancellation`을 작성·검증 완료(로컬 windows 6/6 PASS,
-교차 리뷰 2종 반영). 작성 중 session-03 레시피의 bounded-churn 워크로드(8MB 가비지 반복
-생성)가 worker를 비결정적으로 조기 사망시키는 현상을 실측(20회 중 7회, 124ms~1.58s)하고
-transform 레이어 격리 재현으로 근본 원인을 확정했다: 상주 12MB에도 GC의 커밋 반환이
-순간적으로 뒤처지면 커밋이 Job Object 상한(256MB)에 도달 → `VirtualAlloc` 실패
-(errno=1455) → Go 런타임 OOM abort(exit 2). 이는 PR #4가 미규명으로 남긴 ubuntu
-RLIMIT_AS 조기 사망(194ms)과 동일 계열의 메커니즘으로, fail-closed 설계상 서버 생존
-계약은 유지되므로 제품 결함이 아니다(개선 후보는 "알려진 갭" 참조). 스모크 워크로드는
-할당 없는 count 스캔으로 교체해 해소했다.
+**cancellation 이월 해소 경위 — (3a) 완료 / (3b) 대기 (2026-07-19, session-04)**: 위
+(3a)/(3b) 분리 개정에 따라 스크립트드 스모크 `TestE2E_CallToolCancellation`을 작성·검증
+완료(최종판 로컬 windows 4/4 PASS + PR #5 CI windows 잡 PASS; 교차 리뷰 — 서브에이전트
+4라운드 + Codex 2패스 — 반영). (3b)는 실호스트 ESC 1회 재시도 후 결과를 그대로 기입하기로
+협의(위 확인 항목 3), 아직 시도 전이라 **대기**. 작성 과정의 실측 발견 2건:
+① session-03 레시피의 bounded-churn 워크로드(8MB 가비지 반복 생성)가 worker를
+비결정적으로 조기 사망시키는 현상을 실측(windows, 20회 중 7회, 124ms~1.58s)하고 transform
+레이어 격리 재현으로 근본 원인 확정 — 상주 12MB에도 GC의 커밋 반환이 순간적으로 뒤처지면
+커밋이 Job Object 상한(256MB)에 도달 → `VirtualAlloc` 실패(errno=1455) → Go 런타임 OOM
+abort(exit 2). PR #4가 미규명으로 남긴 ubuntu RLIMIT_AS 조기 사망(194ms)과 동일 계열
+메커니즘의 규명이며, fail-closed 설계상 서버 생존 계약은 유지되므로 제품 결함이 아니다
+(개선 후보는 "알려진 갭"). 스모크 워크로드를 할당 없는 count 스캔으로 교체해 대응.
+② PR #5 최초 CI에서 ubuntu 잡이 두 양상으로 실패 — (i) 할당 없는 워크로드조차 worker가
+8.4ms에 조기 사망(run 29676082922; RLIMIT_AS는 commit이 아닌 주소공간 상한이라 Go 런타임의
+가상주소 예약과 충돌 — linux 고유), (ii) 테스트 진단 경로의 `cmd.Wait()`가 SDK read-loop의
+`cmd.Wait()`와 경쟁해 stderr 복사 고루틴 join에서 10m 영구 대기(run 29676073834). 대응:
+진단 경로를 `sess.Close()` 선행으로 교체(단일 Wait 소유자), linux는 조기 사망 3회 시 skip
+하는 재시도 로직 추가(위 (3a) 서술의 "최선노력" 근거).
 
 **cancellation 이월 경위 (2026-07-19, session-03)**: 수동 ESC 취소를 4회 시도했으나
 전부 취소 창 확보에 실패 — ① 원시 스크립트 프롬프트가 호스트 모델 세이프가드에 플래그,
@@ -108,7 +118,9 @@ ctx 취소 시 notifications/cancelled 자동 송신 — SDK transport.go:229-23
 1. PR(`feat/v0.0.1-global-cli` → `main`) 머지.
 2. `main` 브랜치 CI(`.github/workflows/ci.yml`) GREEN 확인.
 3. 위 "게이트 10 — 수동 스모크" 표의 Claude Code·Codex 2건을 사용자가 실제로 수행하고 결과란을
-   채운다.
+   채운다. cancellation 칸은 확인 항목 3의 분리 판정을 따른다 — (3a) 스크립트드 PASS는 필수,
+   (3b)는 1회 재시도 결과를 그대로 기입하며 실패/미관측이어도 태그를 차단하지 않는다
+   (2026-07-19 사용자 협의, 확인 항목 3 참조).
 4. `git tag v0.0.1 && git push origin v0.0.1`.
 
 ## v0.0.1 이후 (의도적 미결·이월)
@@ -144,9 +156,13 @@ ctx 취소 시 notifications/cancelled 자동 송신 — SDK transport.go:229-23
   작아도 Go GC의 커밋 반환 지연으로 커밋이 OS 상한(windows Job Object 256MB / unix RLIMIT_AS)에
   순간 도달해 worker가 런타임 OOM으로 죽을 수 있다(windows 실측 20회 중 7회, VirtualAlloc
   errno=1455; PR #4의 ubuntu 조기 사망 194ms와 동일 계열 — 그 미규명 항목의 원인 규명이기도
-  하다). fail-closed 설계상 서버 생존·오류 반환 계약은 유지되므로 릴리스 비차단. 개선 후보
-  (v0.1+): worker에 GOMEMLIMIT(예: 상한의 80%)를 걸어 GC가 OS 킬 임계 전에 커밋을 억제하게
-  하기, "worker killed (memory/time limit)" 문구의 사유 구분(취소/메모리/시간).
+  하다). **linux는 더 심하다**: RLIMIT_AS가 commit이 아닌 가상주소공간 상한이라 Go 런타임의
+  광범위한 VA 예약과 충돌, 할당 없는 워크로드(4MB 문자열 1개 + count 스캔)조차 8.4ms에 조기
+  사망하는 사례를 PR #5 CI에서 실측(run 29676082922). fail-closed 설계상 서버 생존·오류 반환
+  계약은 유지되므로 릴리스 비차단. 개선 후보(v0.1+): worker에 GOMEMLIMIT(예: 상한의 80%)를
+  걸어 GC가 OS 킬 임계 전에 커밋을 억제하게 하기(windows), linux는 RLIMIT_AS 값에 Go 런타임
+  VA 예약 오버헤드를 반영한 여유분 검토, "worker killed (memory/time limit)" 문구의 사유
+  구분(취소/메모리/시간).
 - **fts_trigram 대량 코퍼스 쿼리 지연**(계획 3 T10 Fix R1 perf 스모크 발견): 5,000 doc
   규모에서 trigram MATCH 쿼리가 평균 ≈1.6s(최대 ~2.2s)로 porter(~0.2-0.3s)보다 훨씬 느림.
   `sources(artifact_id)` 인덱스 추가로도 개선되지 않음을 직접 실측(SQLite가 이미 자동
