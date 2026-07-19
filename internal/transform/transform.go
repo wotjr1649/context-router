@@ -72,9 +72,12 @@ const (
 
 	// vaHeadroomBytes: linux selfApplyMemLimit이 RLIMIT_AS에 얹는 가상주소공간 여유분 —
 	// ubuntu 실측(할당 0인데 8.4ms 사망 = Go 런타임 시동 시 VA 예약이 256MB 캡을 초과)을
-	// 상회하는 보수값(초기 768MB). CI 실측으로 조정 시 이 상수 1곳만 바꾼다(설계 §1.3
-	// D19-b). windows 경로는 이 상수를 쓰지 않는다(RLIMIT_AS 없음, Job Object 사용).
-	vaHeadroomBytes = 768 << 20
+	// 상회하는 보수값. CI 실측으로 조정 시 이 상수 1곳만 바꾼다(설계 §1.3 D19-b). windows
+	// 경로는 이 상수를 쓰지 않는다(RLIMIT_AS 없음, Job Object 사용).
+	// CI 실측(2026-07-19): 768MB(총 1GB)로는 취소 스모크 9/9 조기 사망(fail-closed,
+	// t.Skipf) — linux Go 런타임의 시동 시점 VSZ 기준선이 pagealloc summary 예약 등으로
+	// 통상 ~1GB를 넘어 부족했다. 1536MB(총 1.5GB)로 ×2 증액.
+	vaHeadroomBytes = 1536 << 20
 )
 
 // gomemlimitBytes: 자식 worker의 GOMEMLIMIT 값(바이트) — Job Object/RLIMIT 캡(commit·가상
