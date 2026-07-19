@@ -30,6 +30,7 @@ import (
 	"github.com/wotjr1649/context-router/internal/ident"
 	"github.com/wotjr1649/context-router/internal/ingest"
 	"github.com/wotjr1649/context-router/internal/netfetch"
+	"github.com/wotjr1649/context-router/internal/session"
 	"github.com/wotjr1649/context-router/internal/store"
 	"github.com/wotjr1649/context-router/internal/transform"
 )
@@ -97,6 +98,9 @@ func TestToToolError(t *testing.T) {
 		{"unsupported_media", netfetch.ErrUnsupportedMedia, codeUnsupportedFile},
 		{"not_exist", fs.ErrNotExist, codeNotFound},
 		{"not_exist_wrapped", fmt.Errorf("ingest: canonicalize: %w", fs.ErrNotExist), codeNotFound},
+		{"session_lease_held", session.ErrLeaseHeld, codeStorageUnavailable},
+		{"session_recover_pending", session.ErrRecoverPending, codeStorageUnavailable},
+		{"session_corrupt", session.ErrCorrupt, codeStorageUnavailable},
 		{"unknown", errors.New("boom"), codeInternal},
 	}
 	for _, tt := range tests {
@@ -1202,5 +1206,298 @@ func TestCtrFetchAndIndexDenied(t *testing.T) {
 	text := res.Content[0].(*mcp.TextContent).Text
 	if !strings.HasPrefix(text, "["+codeNetworkDenied+"]") {
 		t.Fatalf("want %s prefix, got %q", codeNetworkDenied, text)
+	}
+}
+
+// --- ctr_record_event (태스크 3, 설계 §3.1) ---
+
+// newRecordEventTestServer: newTestServer와 동형이지만 Session DB까지 배선해 ctr_record_event를
+// 기본 표면에 등록한다. storeDir을 함께 반환한다(LedgerStats(dir) 재조회용, ⑥).
+func newRecordEventTestServer(t *testing.T) (cs *mcp.ClientSession, st *store.Store, sess *session.DB, storeDir string) {
+	t.Helper()
+	canon, err := ident.Canonicalize(t.TempDir())
+	if err != nil {
+		t.Fatalf("canonicalize: %v", err)
+	}
+	storeDir = t.TempDir()
+	st, err = store.Open(storeDir, false)
+	if err != nil {
+		t.Fatalf("store open: %v", err)
+	}
+	t.Cleanup(func() { st.Close() })
+	sess, err = session.Open(t.TempDir(), session.Options{Producer: "test/record-event"})
+	if err != nil {
+		t.Fatalf("session open: %v", err)
+	}
+	t.Cleanup(func() { sess.Close() })
+
+	srv, err := NewServer(Config{Canon: canon, Store: st, SelfExe: testSelfExe(t), Session: sess})
+	if err != nil {
+		t.Fatalf("new server: %v", err)
+	}
+	srvT, cliT := mcp.NewInMemoryTransports()
+	ctx := context.Background()
+	if _, err := srv.Connect(ctx, srvT, nil); err != nil {
+		t.Fatalf("server connect: %v", err)
+	}
+	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "0"}, nil)
+	cs, err = client.Connect(ctx, cliT, nil)
+	if err != nil {
+		t.Fatalf("client connect: %v", err)
+	}
+	t.Cleanup(func() { cs.Close() })
+	return cs, st, sess, storeDir
+}
+
+// recordEventErrPrefix: ctr_record_event 호출이 IsError=true이고 원하는 코드 prefix를 갖는지
+// 확인한다(반복되는 오류 케이스 어서션 공용 헬퍼).
+func recordEventErrPrefix(t *testing.T, cs *mcp.ClientSession, in RecordEventInput, wantCode string) {
+	t.Helper()
+	res, err := cs.CallTool(context.Background(), &mcp.CallToolParams{Name: "ctr_record_event", Arguments: in})
+	if err != nil {
+		t.Fatalf("call: %v", err)
+	}
+	if !res.IsError {
+		t.Fatalf("want IsError=true, got %+v", res)
+	}
+	text := res.Content[0].(*mcp.TextContent).Text
+	if !strings.HasPrefix(text, "["+wantCode+"]") {
+		t.Fatalf("want %s prefix, got %q", wantCode, text)
+	}
+}
+
+// mapAttrsOfSize: {"k":"aaa..."} 형태로 마샬링 시 정확히 n바이트가 되는 attributes map을
+// 만든다(n>=8, 단일 키 "k" — json.Marshal(map[string]any)의 결정적 출력에 의존).
+func mapAttrsOfSize(n int) map[string]any {
+	const overhead = len(`{"k":""}`)
+	return map[string]any{"k": strings.Repeat("a", n-overhead)}
+}
+
+// TestRecordEventRoundTrip: 브리프 Step1 ① — record → {event_id, session_id, ts} 반환 → Reader
+// 직조회로 행 검증.
+func TestRecordEventRoundTrip(t *testing.T) {
+	cs, _, sess, _ := newRecordEventTestServer(t)
+	ctx := context.Background()
+
+	res, err := cs.CallTool(ctx, &mcp.CallToolParams{Name: "ctr_record_event", Arguments: RecordEventInput{
+		EventType: "decision", Summary: "chose approach A",
+	}})
+	if err != nil {
+		t.Fatalf("call: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("record_event error: %+v", res.Content)
+	}
+	var out RecordEventOutput
+	remarshal(t, res.StructuredContent, &out)
+	if out.EventID == "" || out.SessionID != sess.SessionID() || out.Ts <= 0 {
+		t.Fatalf("out=%+v want non-empty event_id, session_id=%q, ts>0", out, sess.SessionID())
+	}
+
+	var gotSummary, gotType, gotRedaction string
+	if err := sess.Reader().QueryRow("SELECT summary, event_type, redaction FROM session_events WHERE event_id=?", out.EventID).
+		Scan(&gotSummary, &gotType, &gotRedaction); err != nil {
+		t.Fatalf("row query: %v", err)
+	}
+	if gotSummary != "chose approach A" || gotType != "decision" || gotRedaction != "none" {
+		t.Fatalf("row=(%q,%q,%q) want (chose approach A, decision, none)", gotSummary, gotType, gotRedaction)
+	}
+}
+
+// TestRecordEventCapViolations: 브리프 Step1 ② — 상한 위반 각 1건(type 65B·summary 2049B·
+// attributes 4097B·refs 17개) → INVALID_ARGUMENT. 개별 필드는 상한 이내인데 총합만 8KB를
+// 넘는 경우도 별도로 검증한다.
+func TestRecordEventCapViolations(t *testing.T) {
+	cs, _, _, _ := newRecordEventTestServer(t)
+
+	tests := []struct {
+		name string
+		in   RecordEventInput
+	}{
+		{"event_type_65B", RecordEventInput{EventType: strings.Repeat("a", 65), Summary: "s"}},
+		{"summary_2049B", RecordEventInput{EventType: "note", Summary: strings.Repeat("s", 2049)}},
+		{"attributes_4097B", RecordEventInput{EventType: "note", Summary: "s", Attributes: mapAttrsOfSize(4097)}},
+		{"refs_17", RecordEventInput{EventType: "note", Summary: "s", ArtifactRefs: make([]int64, 17)}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			recordEventErrPrefix(t, cs, tt.in, codeInvalidArgument)
+		})
+	}
+
+	t.Run("total_8KB", func(t *testing.T) {
+		related := make([]string, 6)
+		for i := range related {
+			related[i] = "https://example.com/" + strings.Repeat("a", 512-len("https://example.com/"))
+		}
+		in := RecordEventInput{
+			EventType:        "note",
+			Summary:          strings.Repeat("s", maxSummaryBytes),
+			Attributes:       mapAttrsOfSize(4000),
+			RelatedResources: related,
+		}
+		recordEventErrPrefix(t, cs, in, codeInvalidArgument)
+	})
+}
+
+// TestRecordEventSecretCanaryRedacted: 브리프 Step1 ③(G4 기록 경로) — summary·attributes·
+// related_resources에 분할 리터럴 canary → 저장 행에 원문 부재 + redaction='spans'.
+func TestRecordEventSecretCanaryRedacted(t *testing.T) {
+	cs, _, sess, _ := newRecordEventTestServer(t)
+	ctx := context.Background()
+
+	// 런타임 분할 리터럴 — 소스에 연속 secret 토큰 금지(규약 §8).
+	canary := "xox" + "b-1234567890ABCDEF"
+
+	in := RecordEventInput{
+		EventType:        "note",
+		Summary:          "leaked: " + canary,
+		Attributes:       map[string]any{"token": canary},
+		RelatedResources: []string{"https://example.com/?token=" + canary},
+	}
+	res, err := cs.CallTool(ctx, &mcp.CallToolParams{Name: "ctr_record_event", Arguments: in})
+	if err != nil {
+		t.Fatalf("call: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("record_event error: %+v", res.Content)
+	}
+	var out RecordEventOutput
+	remarshal(t, res.StructuredContent, &out)
+
+	var summary, payload, related, redaction string
+	if err := sess.Reader().QueryRow("SELECT summary, payload, related, redaction FROM session_events WHERE event_id=?", out.EventID).
+		Scan(&summary, &payload, &related, &redaction); err != nil {
+		t.Fatalf("row query: %v", err)
+	}
+	if strings.Contains(summary, canary) || strings.Contains(payload, canary) || strings.Contains(related, canary) {
+		t.Fatalf("canary leaked: summary=%q payload=%q related=%q", summary, payload, related)
+	}
+	if redaction != "spans" {
+		t.Fatalf("redaction=%q want spans", redaction)
+	}
+	if !strings.Contains(summary, "REDACTED") || !strings.Contains(payload, "REDACTED") || !strings.Contains(related, "REDACTED") {
+		t.Fatalf("redaction marker missing: summary=%q payload=%q related=%q", summary, payload, related)
+	}
+}
+
+// TestRecordEventArtifactRefs: 브리프 Step1 ④ — 유효 id는 정본 URI(artifact://<session_id>/
+// sha256-<hash>)로 저장되고, 미존재 id는 INVALID_ARGUMENT.
+func TestRecordEventArtifactRefs(t *testing.T) {
+	cs, st, sess, _ := newRecordEventTestServer(t)
+	ctx := context.Background()
+
+	id, err := st.Register(ctx, store.Registration{
+		StoredBytes: []byte("artifact body"), MediaType: "text/plain",
+		Source: store.SourceMeta{URI: "/a.txt", Kind: "file", SrcHash: "h1"},
+	})
+	if err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	hash, err := st.ArtifactHashByID(ctx, id)
+	if err != nil {
+		t.Fatalf("hash: %v", err)
+	}
+	wantURI := "artifact://" + sess.SessionID() + "/sha256-" + hash
+
+	res, err := cs.CallTool(ctx, &mcp.CallToolParams{Name: "ctr_record_event", Arguments: RecordEventInput{
+		EventType: "note", Summary: "s", ArtifactRefs: []int64{id},
+	}})
+	if err != nil {
+		t.Fatalf("call: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("record_event error: %+v", res.Content)
+	}
+	var out RecordEventOutput
+	remarshal(t, res.StructuredContent, &out)
+
+	var refsJSON string
+	if err := sess.Reader().QueryRow("SELECT artifact_refs FROM session_events WHERE event_id=?", out.EventID).Scan(&refsJSON); err != nil {
+		t.Fatalf("row query: %v", err)
+	}
+	var refs []string
+	if err := json.Unmarshal([]byte(refsJSON), &refs); err != nil {
+		t.Fatalf("unmarshal artifact_refs: %v", err)
+	}
+	if len(refs) != 1 || refs[0] != wantURI {
+		t.Fatalf("artifact_refs=%v want [%q]", refs, wantURI)
+	}
+
+	recordEventErrPrefix(t, cs, RecordEventInput{EventType: "note", Summary: "s", ArtifactRefs: []int64{999999}}, codeInvalidArgument)
+}
+
+// TestRecordEventSupersedesMissingIsNotFound: 브리프 Step1 ⑤ — supersedes 미존재 → NOT_FOUND.
+func TestRecordEventSupersedesMissingIsNotFound(t *testing.T) {
+	cs, _, _, _ := newRecordEventTestServer(t)
+	recordEventErrPrefix(t, cs, RecordEventInput{
+		EventType: "decision", Summary: "corrected", Supersedes: "00000000-0000-7000-8000-000000000000",
+	}, codeNotFound)
+}
+
+// TestRecordEventLedgerAppend: 브리프 Step1 ⑥ — 호출마다 LedgerAppend(ctr_fetch/ctr_search
+// 패턴 승계) → ledger.db에 1행.
+func TestRecordEventLedgerAppend(t *testing.T) {
+	cs, _, _, storeDir := newRecordEventTestServer(t)
+	ctx := context.Background()
+
+	res, err := cs.CallTool(ctx, &mcp.CallToolParams{Name: "ctr_record_event", Arguments: RecordEventInput{
+		EventType: "note", Summary: "s",
+	}})
+	if err != nil {
+		t.Fatalf("call: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("record_event error: %+v", res.Content)
+	}
+
+	stats, err := store.LedgerStats(storeDir)
+	if err != nil {
+		t.Fatalf("LedgerStats: %v", err)
+	}
+	found := false
+	for _, s := range stats {
+		if s.Tool == "ctr_record_event" {
+			found = true
+			if s.Calls != 1 {
+				t.Fatalf("ctr_record_event calls=%d want 1", s.Calls)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("ctr_record_event ledger row missing: %+v", stats)
+	}
+}
+
+// TestRecordEventSchemaGating: 브리프 Step1 ⑦(이 태스크 시점 — ctr_record_event 1종). Session이
+// 있으면 기본 표면에 등장(DestructiveHint=false)하고, Session이 nil이면 등장하지 않는다.
+func TestRecordEventSchemaGating(t *testing.T) {
+	cs, _, _, _ := newRecordEventTestServer(t)
+	lt, err := cs.ListTools(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("list tools: %v", err)
+	}
+	var tool *mcp.Tool
+	for _, tl := range lt.Tools {
+		if tl.Name == "ctr_record_event" {
+			tool = tl
+		}
+	}
+	if tool == nil {
+		t.Fatalf("ctr_record_event not in tools/list: %+v", lt.Tools)
+	}
+	if tool.Annotations == nil || tool.Annotations.DestructiveHint == nil || *tool.Annotations.DestructiveHint {
+		t.Fatalf("ctr_record_event DestructiveHint want &false, got %+v", tool.Annotations)
+	}
+
+	csNoSession, _ := newTestServer(t, nil)
+	lt2, err := csNoSession.ListTools(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("list tools (no session): %v", err)
+	}
+	for _, tl := range lt2.Tools {
+		if tl.Name == "ctr_record_event" {
+			t.Fatalf("ctr_record_event should not be registered when Session is nil")
+		}
 	}
 }
