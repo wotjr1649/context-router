@@ -252,6 +252,36 @@ func TestAppend_EventIDsAreTimeOrdered(t *testing.T) {
 	}
 }
 
+// TestAppend_RedactionColumn — T3 이관 계약: Event.Redaction이 그대로 행에 기록되고,
+// 빈 문자열은 'none'으로 정규화된다(mcp 핸들러가 spans>0일 때만 "spans"를 채운다).
+func TestAppend_RedactionColumn(t *testing.T) {
+	dir := t.TempDir()
+	d := openT(t, dir, Options{Producer: "p"})
+
+	id1, _, _, err := d.Append(Event{Type: "note", Summary: "plain"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	id2, _, _, err := d.Append(Event{Type: "note", Summary: "has secret", Redaction: "spans"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var got1, got2 string
+	if err := d.Reader().QueryRow("SELECT redaction FROM session_events WHERE id=?", id1).Scan(&got1); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Reader().QueryRow("SELECT redaction FROM session_events WHERE id=?", id2).Scan(&got2); err != nil {
+		t.Fatal(err)
+	}
+	if got1 != "none" {
+		t.Fatalf("redaction(빈 값)=%q want none", got1)
+	}
+	if got2 != "spans" {
+		t.Fatalf("redaction(spans)=%q want spans", got2)
+	}
+}
+
 // TestAppend_ConcurrentAcrossConnections — G2: 같은 dir을 가리키는 별도 *DB(별도 연결) 2개가
 // 각 100건씩 동시 append해도 무손실(총 200건, event_id 전유일)이어야 한다.
 func TestAppend_ConcurrentAcrossConnections(t *testing.T) {

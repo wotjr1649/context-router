@@ -88,12 +88,14 @@ type Options struct {
 }
 
 // Event — ctr_record_event 입력 표현(redaction·검증 완료본, 설계 §3.1). Append가 event_id·
-// session_id·ts·redaction(기본값)을 서버 측에서 기입한다.
+// session_id·ts를 서버 측에서 기입한다. Redaction은 호출자(mcp 핸들러)가 ingest.Redact 적용
+// 결과로 채운다 — 빈 값이면 Append가 'none'으로 기입한다(T3 이관 계약).
 type Event struct {
 	Type, Summary         string
 	Attributes            json.RawMessage
 	ArtifactRefs, Related []string
 	Supersedes            string // nullable event_id — 존재하면 append 시점에 존재 검증
+	Redaction             string // "none"|"spans" — 빈 문자열은 'none'으로 정규화(Append)
 }
 
 // DB — 열린 session.db 핸들. writer 1연결(SetMaxOpenConns(1), _txlock=immediate) + reader
@@ -432,6 +434,11 @@ func (d *DB) Append(ev Event) (id int64, eventID string, ts int64, err error) {
 		payload = string(ev.Attributes)
 	}
 
+	redaction := ev.Redaction
+	if redaction == "" {
+		redaction = "none"
+	}
+
 	txErr := d.txRetry(context.Background(), func(tx *sql.Tx) error {
 		if ev.Supersedes != "" {
 			var exists int
@@ -443,9 +450,9 @@ func (d *DB) Append(ev Event) (id int64, eventID string, ts int64, err error) {
 				return qErr
 			}
 		}
-		res, execErr := tx.Exec(`INSERT INTO session_events(event_id, session_id, event_type, ts, summary, payload, artifact_refs, related, supersedes)
-			VALUES(?,?,?,?,?,?,?,?,?)`,
-			eventID, d.sessionID, ev.Type, ts, ev.Summary, payload, artifactRefsJSON, relatedJSON, nullIfEmpty(ev.Supersedes))
+		res, execErr := tx.Exec(`INSERT INTO session_events(event_id, session_id, event_type, ts, summary, payload, artifact_refs, related, redaction, supersedes)
+			VALUES(?,?,?,?,?,?,?,?,?,?)`,
+			eventID, d.sessionID, ev.Type, ts, ev.Summary, payload, artifactRefsJSON, relatedJSON, redaction, nullIfEmpty(ev.Supersedes))
 		if execErr != nil {
 			return execErr
 		}
