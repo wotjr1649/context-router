@@ -26,7 +26,10 @@ import (
 // cmd.Process.Pid를 호출 시점에 지연 읽어 pgid를 얻는다 — watchCtx는 Start()가 c.Process를
 // 채운 뒤에야 띄워지므로(Start() 내부 순서: StartProcess → watcher goroutine 기동) 안전하다.
 func applyMemLimit(cmd *exec.Cmd, bytes int64) (func(), error) {
-	cmd.Env = append(os.Environ(), "CTR_WORKER_MEM="+strconv.FormatInt(bytes, 10))
+	cmd.Env = append(os.Environ(),
+		"CTR_WORKER_MEM="+strconv.FormatInt(bytes, 10),
+		"GOMEMLIMIT="+strconv.FormatInt(gomemlimitBytes(), 10), // D19-a: soft limit, RLIMIT_AS 하드 캡은 그대로
+	)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
 	kill := func() {

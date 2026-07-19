@@ -68,7 +68,19 @@ const (
 	defaultMaxOutputBytes = 32768
 	defaultMemLimitBytes  = 256 * 1024 * 1024 // 설계 §4.3 기본 상한 256MB
 	defaultWorkerTimeout  = 10 * time.Second  // 리뷰 Important: ctx에 deadline 없을 때 안전망
+	gomemlimitRatio       = 0.8               // D19-a: Job/RLIMIT 캡의 80%에서 GC 선제 발동
 )
+
+// gomemlimitBytes: 자식 worker의 GOMEMLIMIT 값(바이트) — Job Object/RLIMIT 캡(commit·가상
+// 주소공간 기준, defaultMemLimitBytes)의 80%. windows 사망 원인은 GC의 commit 반환 지연 —
+// GOMEMLIMIT이 이 소프트 한도에서 GC를 선제 발동시켜 commit이 Job 캡(256MB)에 도달하기 전에
+// 회수시킨다. Go 공식 가이드는 5-10% 여유를 권장하나 Job은 RSS가 아닌 commit을 재므로 보수적
+// 80%(설계 §1.3 D19-a, 최종 수치는 실측으로 확정). 어디까지나 GC용 soft limit — Job
+// Object/RLIMIT 하드 백스톱은 그대로 유지된다(제거하지 않는다).
+func gomemlimitBytes() int64 {
+	limitBytes := float64(defaultMemLimitBytes) // 변수 경유: 상수식 그대로면 214748364.8이
+	return int64(limitBytes * gomemlimitRatio)  // 정확한 int64로 안 떨어져 컴파일타임 변환 불가
+}
 
 // Eval: 순수 함수 — 파일·네트워크·env·시계·난수 접근 없음. panic 없이 항상 Result를 반환한다.
 func Eval(req Request) (result Result) {
