@@ -18,6 +18,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/wotjr1649/context-router/internal/hook"
 	"github.com/wotjr1649/context-router/internal/ident"
 	"github.com/wotjr1649/context-router/internal/session"
 	"github.com/wotjr1649/context-router/internal/store"
@@ -28,8 +29,8 @@ import (
 const releaseURL = "https://api.github.com/repos/wotjr1649/context-router/releases/latest"
 
 // Run: cli 서브커맨드 단일 진입점. storeRoot·projectRoot는 main이 이미 결정해 넘긴다(cli는
-// 재도출하지 않는다 — 설계서 §7 Produces). sub은 main이 5개 이름(doctor·upgrade·stats·purge·
-// session) 중 하나임을 이미 확인했다. args는 doctor·upgrade에서 미사용, stats가 --provider
+// 재도출하지 않는다 — 설계서 §7 Produces). sub은 main이 6개 이름(doctor·upgrade·stats·purge·
+// session·hook) 중 하나임을 이미 확인했다. args는 doctor·upgrade에서 미사용, stats가 --provider
 // 고유 플래그 파싱에 쓴다(전용 flag.NewFlagSet, 설계 §7 — main의 serverFlags와 별개). stderr는
 // session export의 worktree 후보 목록·진단 안내 전용(태스크9, §7 stdout purity 게이트 선례 —
 // 그 외 서브커맨드는 여전히 미사용).
@@ -61,6 +62,16 @@ func Run(ctx context.Context, sub string, args []string, storeRoot, projectRoot,
 		return runPurge(ctx, os.Stdin, stdout, stderr, storeRoot, args, isTTY)
 	case "session":
 		return runSession(ctx, stdout, stderr, args, storeRoot)
+	case "hook":
+		// install/uninstall 하위 인자는 T8 — 지금은 무인자 hook만 처리한다(브리프 §Interfaces).
+		// hook.Run은 항상 0(fail-open, 설계 §2.3)이라 반환 int을 버리고 nil을 돌려준다 — main이
+		// os.Exit(1)로 오분기하지 않게. stdin은 purge 선례대로 os.Stdin을 직접 넘긴다(hook은
+		// projectRoot를 안 쓰고 stdin cwd로 세션 dir을 재도출한다).
+		if len(args) > 0 {
+			return fmt.Errorf("cli: hook: 예상치 않은 인자 %d개 (install/uninstall은 T8)", len(args))
+		}
+		hook.Run(ctx, os.Stdin, stdout, storeRoot, version, os.Getenv)
+		return nil
 	default:
 		return fmt.Errorf("cli: 미지 서브커맨드: %s", sub)
 	}

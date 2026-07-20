@@ -24,7 +24,8 @@ cmd ──┬─ mcp ─┬─ search ──→ store
       │       ├─ transform → store        # blob 경로 조회용
       │       ├─ netfetch                 # leaf — 저장하지 않는다
       │       └─ store, ident             # Config 배선(Store 포인터·Canon)
-      ├─ cli ─────────────→ store, ident, session   # session — v0.1, export/recover 서브커맨드
+      ├─ cli ─┬───────────→ store, ident, session   # session — v0.1, export/recover 서브커맨드
+      │       └─ hook ─────→ session, ident, store, ingest  # v0.2 §2 — 훅 서브커맨드 위임(store·ingest는 T5~T7 소비)
       ├─ store                            # store.Open 직접 호출
       └─ ident                            # leaf, 순수 함수
 store · ident · netfetch · transform : internal 상호 의존 0 (leaf)
@@ -38,7 +39,7 @@ search → session: 없음(의도) — search.QueryEvents(v0.1)는 *sql.DB reade
 - **session 신설(v0.1, 설계 §8)**: Session DB(worktree당 1개, content.db와 물리 분리 — D10 승계)의 스키마·PRAGMA·lease·append·조회·§26 wire 표현(`EventV1`, D16) 전담. store로 합치지 않는 이유는 search·store 판정과 동일 논리 연장 — 소유 스키마가 다른 DB는 패키지도 분리한다. session→store 의존은 **조회 전용**(`AcquireLock` 재사용, `ArtifactHashByID` 호출)뿐이고 store→session 의존은 0.
 - **store 소형 예외 2건의 근거(v0.1, 설계 §8)**: ① `AcquireLock(path string, shared bool)` 공개화(`store.go`) — 기존 `lockStore`가 내부적으로 쓰던 unix/windows `tryLockFile` OS별 잠금 원시 코드를 session의 lease 2파일(lifetime·init lock)이 그대로 재사용한다(OS별 잠금 코드 중복 금지, D13). ② `ArtifactHashByID(ctx, id) (string, error)` 신설 — artifact_id→content_hash 단일 조회. session이 이 조회를 raw SQL로 직접 하면 store가 소유한 artifacts 스키마 지식이 session으로 유출된다(캡슐화 역행) — 좁은 조회 메서드 1개를 store에 추가하는 편이 §10 "store 만능화 방지"(기능 질의 조립 금지)와 상충하지 않으면서 더 낫다. 이 2건 외 content.db 마이그레이션은 0건.
 - **이벤트 FTS 질의는 search 소유, `ArtifactHashExists`도 search 소유(v0.1, 설계 §8 정신의 확장 — T4 리뷰 판정)**: `search.QueryEvents`(porter+trigram RRF, session.db reader 인자)는 설계 §8이 명시적으로 예고한 이동. `search.ArtifactHashExists(ctx, st *store.Store, hash) (bool, error)`(ctr_session_summary의 artifact_refs missing 힌트 판정용)는 설계 §8이 이름을 못 박지 않았지만, store 예외가 이미 2건 소진됐고 session은 "조회만" 원칙상 가질 수 없어 — search가 이미 `st.Reader()`로 artifacts에 raw SQL을 실행하는 기존 패턴을 갖고 있다는 점에서 store 불변 유지 + 자연스러운 소유자로 T4 리뷰가 판정했다.
-- 책임 1줄: **ident** canonicalization·ID(설계 §3.2) / **store** DB 수명·PRAGMA·단일 트랜잭션 계약·blob IO(§3.3~3.5) / **search** FTS 질의→BM25→RRF→스니펫·예산(§4.1) + 이벤트 질의(v0.1 설계 §8) / **session** Session DB 수명·스키마·append·lease·§26 wire·복구(v0.1 설계 §2·§3·§6) / **ingest** §3.0 파이프라인+경로 정책(§4.4) / **netfetch** SSRF 불변식+readability+html→md(§5.2·§4.5) / **transform** starlark 엔진·worker 프로토콜·OS 상한(§4.3) / **mcp** 도구 스키마·등록·핸들러(§4) / **cli** doctor·stats·purge·upgrade(§7) + session export/recover(v0.1 설계 §6.3·§7).
+- 책임 1줄: **ident** canonicalization·ID(설계 §3.2) / **store** DB 수명·PRAGMA·단일 트랜잭션 계약·blob IO(§3.3~3.5) / **search** FTS 질의→BM25→RRF→스니펫·예산(§4.1) + 이벤트 질의(v0.1 설계 §8) / **session** Session DB 수명·스키마·append·lease·§26 wire·복구(v0.1 설계 §2·§3·§6) / **ingest** §3.0 파이프라인+경로 정책(§4.4) / **netfetch** SSRF 불변식+readability+html→md(§5.2·§4.5) / **transform** starlark 엔진·worker 프로토콜·OS 상한(§4.3) / **mcp** 도구 스키마·등록·핸들러(§4) / **cli** doctor·stats·purge·upgrade(§7) + session export/recover(v0.1 설계 §6.3·§7) / **hook** 훅 서브프로세스 진입점 — stdin JSON→cc: 세션 append·fail-open·deadline·drops 사이드카(v0.2 설계 §2), 계측 매핑은 T5~T7.
 
 ## 3. 타입 소유권
 

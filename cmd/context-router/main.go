@@ -463,7 +463,8 @@ const transformWorkerArg = "__transform-worker"
 // 인자는 dispatchCLI의 관심사가 아니다 — MCP 서버 플래그로 그대로 흘려보낸다. "session"은
 // v0.1 태스크9 추가(§6.3·§7) — export(9a)·recover(9b) 두 하위 서브커맨드를 cli.Run이 내부
 // 디스패치한다(이 맵은 최상위 이름 1개만 안다, T4-plan3 미지 서브커맨드 MCP 오기동 차단 정합).
-var cliSubcommands = map[string]bool{"doctor": true, "stats": true, "purge": true, "upgrade": true, "session": true}
+// "hook"은 v0.2 추가(설계 §2) — Claude Code 훅 서브프로세스(stdin JSON 1건→cc: 세션 append).
+var cliSubcommands = map[string]bool{"doctor": true, "stats": true, "purge": true, "upgrade": true, "session": true, "hook": true}
 
 // prescanRootFlags: cli 서브커맨드 args에서 --root/--store-root(단대시 -root/-store-root,
 // "--f v"·"--f=v" 두 형태 모두)만 수동으로 뽑아내고 그 토큰을 제거한 나머지를 반환한다.

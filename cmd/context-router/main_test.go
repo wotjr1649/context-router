@@ -508,6 +508,32 @@ func captureStdout(t *testing.T, fn func()) string {
 	return string(out)
 }
 
+// TestMainDispatch_Hook: "hook" 서브커맨드가 cliSubcommands를 통과해 cli.Run까지 위임되는지
+// 확인한다(v0.2 설계 §2 — main.go: sub "hook" 등재). internal/hook만 테스트하면 맵 등재
+// 누락에도 GREEN이 되는 사각을 막는다(브리프 ⑨). hook.Run은 stdin을 읽으므로(fail-open) os.Stdin을
+// 즉시 EOF인 파이프로 잠시 대체해 ReadAll이 블록하지 않게 한다 — 빈 stdin은 bad-input drop 후
+// exit 0(→ cli.Run nil)이라 dispatchCLI는 handled=true·err=nil을 반환해야 한다.
+func TestMainDispatch_Hook(t *testing.T) {
+	storeRoot := filepath.Join(t.TempDir(), "storeroot")
+
+	origStdin := os.Stdin
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe: %v", err)
+	}
+	_ = w.Close() // 즉시 EOF
+	os.Stdin = r
+	defer func() { os.Stdin = origStdin; _ = r.Close() }()
+
+	handled, err := dispatchCLI(context.Background(), []string{"context-router", "hook", "--store-root", storeRoot})
+	if !handled {
+		t.Fatal("want handled=true for hook subcommand")
+	}
+	if err != nil {
+		t.Fatalf("hook dispatch err=%v (must not be rejected as unknown subcommand)", err)
+	}
+}
+
 // TestMainDispatch_Stats_Provider: 실제 dispatchCLI 경로로 `stats --provider <jsonl>`이
 // (--root/--store-root 없이) 끝까지 동작해 실측 토큰 합계를 출력하는지 확인한다(설계 §7 —
 // Task4 Fix Round 1: 이전에는 main의 서버 flagset이 --provider를 몰라 여기서 항상
