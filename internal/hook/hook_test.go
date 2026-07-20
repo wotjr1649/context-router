@@ -746,3 +746,196 @@ func TestShadowStoreLockDeadline(t *testing.T) {
 		t.Fatalf("drops=%q want shadow-store", got)
 	}
 }
+
+// ─── T7: large-read guard 4조건 판정 (설계 §4) ────────────────────────────────
+
+// guardSetup — session_start를 발화해 세션을 선재시키고 (storeRoot, cwd, contentDir, sdir)를
+// 반환한다. 가드는 SessionExists 통과 후 동작하므로 세션이 있어야 한다(shadowSetup과 동형).
+func guardSetup(t *testing.T) (storeRoot, cwd, contentDir, sdir string) {
+	t.Helper()
+	storeRoot = filepath.Join(t.TempDir(), "storeroot")
+	cwd = t.TempDir()
+	if rc := runHook(t, storeRoot, fixtureWith(t, "sessionstart.json", map[string]any{"cwd": cwd}), nil); rc != 0 {
+		t.Fatalf("sessionstart rc=%d want 0", rc)
+	}
+	canon, err := ident.Canonicalize(cwd)
+	if err != nil {
+		t.Fatalf("canonicalize: %v", err)
+	}
+	contentDir = filepath.Join(storeRoot, "projects", canon.ProjectID)
+	sdir = filepath.Join(contentDir, "worktrees", canon.WorktreeID)
+	return
+}
+
+// runGuard — pretooluse-read.json에 overrides(cwd·tool_input 필수 재정의 — 픽스처의 하드코딩
+// file_path는 호스트 의존적)를 적용해 Run을 호출하고 stdout(=deny JSON 또는 빈 문자열)을 캡처한다.
+func runGuard(t *testing.T, storeRoot string, overrides map[string]any, env map[string]string) string {
+	t.Helper()
+	in := fixtureWith(t, "pretooluse-read.json", overrides)
+	var out bytes.Buffer
+	rc := Run(context.Background(), bytes.NewReader(in), &out, storeRoot, "test", func(k string) string { return env[k] })
+	if rc != 0 {
+		t.Fatalf("guard rc=%d want 0", rc)
+	}
+	return out.String()
+}
+
+// writeSized — path에 size바이트('a') 파일을 쓴다(strings.Repeat 생성 — 대용량 리터럴 금지 규율).
+func writeSized(t *testing.T, path string, size int) {
+	t.Helper()
+	if err := os.WriteFile(path, []byte(strings.Repeat("a", size)), 0o600); err != nil {
+		t.Fatalf("write %s: %v", path, err)
+	}
+}
+
+// ① 경계 밖 대형 파일 → allow(stdout 무출력). ingest가 ErrWorkspace로 색인 불가 → Indexed==0.
+func TestGuardOutsideBoundaryAllows(t *testing.T) {
+	storeRoot, cwd, _, _ := guardSetup(t)
+	outside := filepath.Join(t.TempDir(), "big.txt") // cwd와 형제 — 경계 밖
+	writeSized(t, outside, 300*1024)
+	out := runGuard(t, storeRoot, map[string]any{
+		"cwd":        cwd,
+		"tool_input": map[string]any{"file_path": outside},
+	}, nil)
+	if out != "" {
+		t.Fatalf("stdout=%q want empty (경계 밖 = allow)", out)
+	}
+}
+
+// ② offset/limit 부분 읽기 → allow(임계 초과·경계 내여도 통과).
+func TestGuardPartialReadAllows(t *testing.T) {
+	storeRoot, cwd, _, _ := guardSetup(t)
+	big := filepath.Join(cwd, "big.txt")
+	writeSized(t, big, 300*1024)
+	out := runGuard(t, storeRoot, map[string]any{
+		"cwd":        cwd,
+		"tool_input": map[string]any{"file_path": big, "offset": 1, "limit": 100},
+	}, nil)
+	if out != "" {
+		t.Fatalf("stdout=%q want empty (부분 읽기 = allow)", out)
+	}
+}
+
+// ③ 임계 이하 → allow.
+func TestGuardUnderThresholdAllows(t *testing.T) {
+	storeRoot, cwd, _, _ := guardSetup(t)
+	small := filepath.Join(cwd, "small.txt")
+	writeSized(t, small, 1024) // 1KiB < 256KiB
+	out := runGuard(t, storeRoot, map[string]any{
+		"cwd":        cwd,
+		"tool_input": map[string]any{"file_path": small},
+	}, nil)
+	if out != "" {
+		t.Fatalf("stdout=%q want empty (임계 이하 = allow)", out)
+	}
+}
+
+// ④ denylist 파일(.env, Indexed=0 Skipped) → allow + 거짓 "이미 인덱스됨" 안내 부재.
+// err==nil인데 Indexed==0인 케이스 — err 검사만으로는 부족함을 게이트한다(브리프 ④).
+func TestGuardDenylistAllowsNoFalseIndexed(t *testing.T) {
+	storeRoot, cwd, contentDir, _ := guardSetup(t)
+	env := filepath.Join(cwd, ".env")
+	writeSized(t, env, 300*1024) // 임계 초과라 ③ 통과 → denylist라 Skipped(Indexed==0)
+	out := runGuard(t, storeRoot, map[string]any{
+		"cwd":        cwd,
+		"tool_input": map[string]any{"file_path": env},
+	}, nil)
+	if out != "" {
+		t.Fatalf("stdout=%q want empty — denylist는 Skipped(Indexed==0)라 deny 금지", out)
+	}
+	if strings.Contains(out, "이미 인덱스됨") {
+		t.Fatalf("거짓 '이미 인덱스됨' 안내 출력됨: %q", out)
+	}
+	// .env는 색인되지 않아야 한다(denylist).
+	if n := contentArtifacts(t, contentDir); n > 0 {
+		t.Fatalf("artifacts=%d want 0/-1(.env 미색인)", n)
+	}
+}
+
+// ⑤ 정상 대형 파일 → deny JSON 스키마 일치 + content.db 아티팩트 1건 + warning 이벤트 1건.
+func TestGuardLargeFileDenies(t *testing.T) {
+	storeRoot, cwd, contentDir, sdir := guardSetup(t)
+	big := filepath.Join(cwd, "big.txt")
+	writeSized(t, big, 300*1024)
+	out := runGuard(t, storeRoot, map[string]any{
+		"cwd":        cwd,
+		"tool_input": map[string]any{"file_path": big},
+	}, nil)
+
+	// deny JSON 스키마(T0 검증) — 모든 하위 값이 문자열이라 중첩 맵으로 디코드.
+	var got map[string]map[string]string
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatalf("deny stdout이 유효 JSON 아님: %v (out=%q)", err, out)
+	}
+	hso := got["hookSpecificOutput"]
+	if hso["hookEventName"] != "PreToolUse" {
+		t.Fatalf("hookEventName=%q want PreToolUse", hso["hookEventName"])
+	}
+	if hso["permissionDecision"] != "deny" {
+		t.Fatalf("permissionDecision=%q want deny", hso["permissionDecision"])
+	}
+	if !strings.Contains(hso["permissionDecisionReason"], "이미 인덱스됨") {
+		t.Fatalf("reason=%q want 포함 '이미 인덱스됨'", hso["permissionDecisionReason"])
+	}
+	if !strings.Contains(hso["permissionDecisionReason"], "ctr_search") || !strings.Contains(hso["permissionDecisionReason"], "ctr_fetch") {
+		t.Fatalf("reason=%q want ctr_search·ctr_fetch 안내", hso["permissionDecisionReason"])
+	}
+
+	// 현장 인덱싱 아티팩트 존재.
+	if n := contentArtifacts(t, contentDir); n != 1 {
+		t.Fatalf("artifacts=%d want 1(현장 인덱싱 성공)", n)
+	}
+
+	// warning 이벤트 1건 + 차단 파일 상대 경로·크기 포함.
+	reader, err := session.OpenReadOnly(sdir)
+	if err != nil {
+		t.Fatalf("open session.db: %v", err)
+	}
+	defer func() { _ = reader.Close() }()
+	var n int
+	var summary string
+	if err := reader.QueryRow("SELECT count(*), coalesce(max(summary),'') FROM session_events WHERE event_type='warning'").Scan(&n, &summary); err != nil {
+		t.Fatalf("count warning: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("warning events=%d want 1", n)
+	}
+	if !strings.Contains(summary, "big.txt") || !strings.Contains(summary, "307200") {
+		t.Fatalf("warning summary=%q want 상대경로 big.txt·크기 307200 포함", summary)
+	}
+	if strings.Contains(summary, cwd) {
+		t.Fatalf("warning summary가 절대경로 누출: %q", summary)
+	}
+}
+
+// ⑥ 인덱싱 실패 주입(content store 잠금) → allow(무출력) + drops(guard-store). deadline
+// 예산 안에서 포기(5초 하드 대기 금지).
+func TestGuardIndexFailureAllows(t *testing.T) {
+	storeRoot, cwd, contentDir, sdir := guardSetup(t)
+	if err := os.MkdirAll(contentDir, 0o700); err != nil {
+		t.Fatalf("mkdir contentDir: %v", err)
+	}
+	release, err := store.AcquireLock(filepath.Join(contentDir, "content.db.rebuild.lock"), false) // 배타 선점
+	if err != nil {
+		t.Fatalf("선점 잠금: %v", err)
+	}
+	defer release()
+
+	big := filepath.Join(cwd, "big.txt")
+	writeSized(t, big, 300*1024)
+	start := time.Now()
+	out := runGuard(t, storeRoot, map[string]any{
+		"cwd":        cwd,
+		"tool_input": map[string]any{"file_path": big},
+	}, map[string]string{"CTR_HOOK_DEADLINE_MS": "300"})
+	elapsed := time.Since(start)
+	if out != "" {
+		t.Fatalf("stdout=%q want empty (인덱싱 실패 = allow)", out)
+	}
+	if elapsed > 2*time.Second {
+		t.Fatalf("deadline 미관측 의심 — %v 소요", elapsed)
+	}
+	if got := readDrops(t, sdir); !strings.Contains(got, "guard-store") {
+		t.Fatalf("drops=%q want guard-store", got)
+	}
+}

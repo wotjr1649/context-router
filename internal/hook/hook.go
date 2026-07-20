@@ -21,6 +21,7 @@ import (
 	"github.com/wotjr1649/context-router/internal/ident"
 	"github.com/wotjr1649/context-router/internal/ingest"
 	"github.com/wotjr1649/context-router/internal/session"
+	"github.com/wotjr1649/context-router/internal/store"
 )
 
 // hookInput — Claude Code 훅 stdin JSON(설계 §2, T0 골든 픽스처 형태 그대로). tool_input·
@@ -84,14 +85,14 @@ func Run(ctx context.Context, stdin io.Reader, stdout io.Writer, storeRoot, vers
 
 	ctx, cancel := context.WithTimeout(ctx, deadline(getenv))
 	defer cancel()
-	dispatch(ctx, in, dir, contentDir, canon.WorktreeRoot, "cc:"+in.SessionID, version, getenv)
+	dispatch(ctx, in, dir, contentDir, canon.WorktreeRoot, "cc:"+in.SessionID, version, getenv, stdout)
 	return 0
 }
 
 // dispatch — 세션 식별 완료 후의 open·branch 경로(설계 §2.2). Run에서 분리해 핸들러 길이 규율
 // (≤50줄, D13)을 지키고 T5~T7이 합류할 단일 이음새를 만든다. 모든 실패는 drop 후 조용히 반환한다
 // (Run이 항상 0을 반환하는 fail-open 계약의 연장).
-func dispatch(ctx context.Context, in hookInput, dir, contentDir, worktreeRoot, external, version string, getenv func(string) string) {
+func dispatch(ctx context.Context, in hookInput, dir, contentDir, worktreeRoot, external, version string, getenv func(string) string, stdout io.Writer) {
 	ad, err := session.OpenAppend(ctx, dir, session.AppendOptions{
 		ExternalSessionID: external,
 		Producer:          fmt.Sprintf("context-router/%s", version),
@@ -119,8 +120,14 @@ func dispatch(ctx context.Context, in hookInput, dir, contentDir, worktreeRoot, 
 		appendDrop(dir, "unknown-session") // 미지 세션의 후속 이벤트는 drop(설계 §2.2)
 		return
 	}
-	// PostToolUse/PostToolUseFailure만 기본 이벤트 1건으로 기록한다(1 호출 = 1 이벤트; PreToolUse는
-	// T7 guard 몫이라 여기서 tool_call로 중복 계상하지 않는다). 설계 §3·§2.2 "true → 처리".
+	// PreToolUse(Read)는 T7 large-read guard 몫 — tool_call로 중복 계상하지 않고 별도 분기로
+	// 처리한다(설계 §4). matcher가 Read라 여기 오는 건 사실상 Read뿐이지만 guardRead가 재확인한다.
+	if in.HookEventName == "PreToolUse" {
+		guardRead(ctx, ad, in, dir, contentDir, worktreeRoot, getenv, stdout)
+		return
+	}
+	// PostToolUse/PostToolUseFailure만 기본 이벤트 1건으로 기록한다(1 호출 = 1 이벤트).
+	// 설계 §3·§2.2 "true → 처리".
 	if in.HookEventName == "PostToolUse" || in.HookEventName == "PostToolUseFailure" {
 		if ev, ok := buildEvent(in); ok {
 			if _, _, _, err := ad.Append(ctx, ev); err != nil {
@@ -133,6 +140,88 @@ func dispatch(ctx context.Context, in hookInput, dir, contentDir, worktreeRoot, 
 			shadowCapture(ctx, ad, in, dir, contentDir, external, getenv)
 		}
 	}
+}
+
+const defaultGuardReadMax = 262144 // 256KiB — large-read guard 임계 기본값(CTR_GUARD_READ_MAX, 설계 §4)
+
+// readGuardInput — Read tool_input 중 가드가 보는 필드. offset/limit은 *포인터*라 "부재"와
+// "명시적 0"을 구분한다(설계 §4 ② — offset/limit이 존재하면 부분 읽기로 보고 통과).
+type readGuardInput struct {
+	FilePath string `json:"file_path"`
+	Offset   *int64 `json:"offset"`
+	Limit    *int64 `json:"limit"`
+}
+
+// guardRead — PreToolUse(Read) large-read guard(설계 §4 D25). **deny는 4조건 전부 성립 시만**:
+// ① 대상이 워크스페이스 경계 내(경계 밖은 ingest가 ErrWorkspace로 색인 불가 → 통과), ② 전체-파일
+// 읽기(offset/limit 존재 = 부분 읽기 → 통과), ③ 크기 > 임계(기본 256KiB, CTR_GUARD_READ_MAX),
+// ④ 현장 인덱싱 성공 확인 Indexed==1(denylist·oversize는 무오류 Skipped라 err 검사만으론 부족).
+// 하나라도 불성립 → allow(stdout 무출력·이벤트 없음). worktreeRoot가 경계 기준이다 — 설계 §4의
+// "projectRoot만"은 서버의 allow-path를 제외한다는 뜻이고, 경계 식별자는 ingest 관례(mcp.go)와
+// 동일하게 WorktreeRoot다(ProjectRoot를 쓰면 linked worktree의 현재 파일이 경계 밖으로 오판됨).
+// content store 열기 실패(락 경합 등) = 인덱싱 불가 → allow + drops(가드 판정은 색인 성공에만 발화).
+func guardRead(ctx context.Context, ad *session.AppendDB, in hookInput, dir, contentDir, worktreeRoot string, getenv func(string) string, stdout io.Writer) {
+	if in.ToolName != "Read" {
+		return // matcher는 Read지만 stdin은 비신뢰 — 방어적 재확인, 그 외 도구는 통과
+	}
+	var f readGuardInput
+	if json.Unmarshal(in.ToolInput, &f) != nil || f.FilePath == "" {
+		return // 파싱 불가·경로 부재 → 통과
+	}
+	if f.Offset != nil || f.Limit != nil {
+		return // ② 부분 읽기 → 통과
+	}
+	info, err := os.Stat(f.FilePath)
+	if err != nil || info.IsDir() || info.Size() <= guardReadMax(getenv) {
+		return // ③ 임계 이하·stat 불가·디렉터리 → 통과
+	}
+	st, err := store.OpenContext(ctx, contentDir, false)
+	if err != nil {
+		appendDrop(dir, "guard-store") // 인덱싱 불가(락 경합·손상) — deadline 예산 안에서 포기
+		return
+	}
+	defer func() { _ = st.Close() }()
+
+	// 현장 인덱싱 — 전체 파이프라인(denylist·캡·경계 검증 포함). 경계 밖은 ErrWorkspace(err!=nil),
+	// denylist·oversize는 err==nil·Indexed==0(Skipped)이라 반드시 Indexed==1까지 확인한다(④).
+	rep, err := ingest.Run(ctx, st, worktreeRoot, nil, ingest.Request{Path: f.FilePath})
+	if err != nil || rep.Indexed != 1 {
+		return // ①④ 경계 밖·denylist·oversize·색인 실패 → 통과
+	}
+	denyRead(ctx, ad, in, dir, worktreeRoot, f.FilePath, info.Size(), stdout)
+}
+
+// denyRead — 4조건 성립 시 deny 출력 헬퍼(설계 §4). stdout에 permissionDecision JSON(T0 검증
+// 스키마)을 **먼저** 쓰고 그다음 warning 이벤트(차단 파일 상대 경로·크기)를 best-effort로 append
+// 한다 — 이벤트 기록 실패는 deny 판정에 영향 없다(fail-open은 기록 경로에만; 가드 판정은 DB 없이
+// 성립, §4). stdout은 deny JSON 전용이라(Claude Code가 exit 0 stdout을 파싱) 그 외 바이트는 쓰지 않는다.
+func denyRead(ctx context.Context, ad *session.AppendDB, in hookInput, dir, worktreeRoot, filePath string, size int64, stdout io.Writer) {
+	out := map[string]any{"hookSpecificOutput": map[string]any{
+		"hookEventName":            "PreToolUse",
+		"permissionDecision":       "deny",
+		"permissionDecisionReason": "이미 인덱스됨 — ctr_search로 검색, ctr_fetch로 바이트 정확 조회",
+	}}
+	if b, err := json.Marshal(out); err == nil {
+		_, _ = stdout.Write(b)
+	}
+	// summary는 allowlist 조립(도구명 + 워크스페이스 상대 경로 + 바이트 크기) — 원문 미운반, §3 상대
+	// 경로 기준은 in.CWD(worktreeRoot와 동일 워크스페이스). 조립 후 Redact 2차 방어 + 상한 절단.
+	summary := summaryLine("Read", workspaceRel(in.CWD, filePath)+" "+strconv.FormatInt(size, 10)+"B")
+	if red, spans := ingest.Redact([]byte(summary)); spans > 0 {
+		summary = string(red)
+	}
+	summary = truncateUTF8(summary, session.MaxSummaryBytes)
+	if _, _, _, err := ad.Append(ctx, session.Event{Type: "warning", Summary: summary}); err != nil {
+		appendDrop(dir, "guard-append") // 기록 실패 — deny는 이미 확정, drops 1줄만
+	}
+}
+
+// guardReadMax — 가드 임계(설계 §4, CTR_GUARD_READ_MAX 기본 256KiB). 양수만 채택(deadline과 동형).
+func guardReadMax(getenv func(string) string) int64 {
+	if v, err := strconv.ParseInt(getenv("CTR_GUARD_READ_MAX"), 10, 64); err == nil && v > 0 {
+		return v
+	}
+	return defaultGuardReadMax
 }
 
 // toolInputFields — classify가 소비하는 tool_input 하위 필드만(allowlist). command는 Bash,
