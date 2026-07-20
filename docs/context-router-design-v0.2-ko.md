@@ -103,6 +103,7 @@
 - 저장 시 `artifact_created` 이벤트 + 기본 이벤트에 더해 `tool_result_summary` 이벤트(artifact ref, 결과 요지)를 append.
 - 가치 축은 **컴팩션·다음 세션 후의 재소환**이다 — PostToolUse 시점에 출력은 이미 모델 컨텍스트에 들어가 있으므로, 이 채널은 현재 턴 절약이 아니라 재독(re-read) 절약을 만든다. 현재 턴 절약은 §4 guard와 기존 MCP 자발 경로의 몫.
 - content.db 다중 프로세스 쓰기(훅 프로세스 vs MCP 서버): WAL + writer 1연결 + txRetry의 기존 규율(v0.0.1 §3.5)로 지원. 동시 쓰기 테스트를 게이트에 포함(§10).
+- **알려진 한계(v0.2, T6 리뷰 확정)**: shadow 저장 URI가 `inline:<도구명>`이라 같은 도구의 서로 다른 대용량 응답이 sources 단일 행을 clobber — 구 아티팩트는 다음 purge에서 **나이 무관 무조건** orphan-GC된다(`PurgeOlderThan`의 orphan 삭제는 cutoff 비게이트). 오염 아님(dangling ref는 D15 "missing" 힌트, 해시 재소환 유효). ingest 최소 diff(2필드) 제약 안에서는 무해결 — URI 키 재설계는 §12 이월, §6 A/B에서 재소환 손실 실측 후 판단.
 - 동의 경계: **`hook install` 행위 자체가 패시브 인덱싱의 명시적 opt-in**이다(가드만 원하면 `install --no-shadow` 또는 `CTR_SHADOW_OFF=1`). MCP 표면 `ctr_index`/`ctr_fetch_and_index`의 프로필 게이트(opt-in)는 별도 장치로 그대로 유지 — 그쪽은 모델 주도 수집을 묻는 게이트다(D26). 호스트가 훅을 발화했다는 사실이 tool_response **내용**의 신뢰를 만들지는 않으므로, 내용 방어는 위 캡·denylist 대조·`Redact()`가 담당한다.
 
 ## 6. 측정 (D27)
@@ -143,7 +144,7 @@
 
 ## 12. 의도적 미결 (v0.3+ 후보)
 
-- spill journal(drop 데이터로 필요성 판정 — D23), 무작위 A/B 하네스·OTel 어댑터(D27), Codex 훅 `cx:`(D28), plugin manifest, Bash/Grep 출력 가드, exec 3종(별도 트랙 — D21), `repository{}` 기입, `invalidates`, payload 필드 조회(virtual generated column), title dedup, semantic 보강(recall@k 기준선 후).
+- spill journal(drop 데이터로 필요성 판정 — D23), 무작위 A/B 하네스·OTel 어댑터(D27), Codex 훅 `cx:`(D28), plugin manifest, Bash/Grep 출력 가드, exec 3종(별도 트랙 — D21), `repository{}` 기입, `invalidates`, payload 필드 조회(virtual generated column), title dedup, semantic 보강(recall@k 기준선 후), shadow 저장 URI 키 재설계(§5 한계 — inline:<도구명> clobber).
 
 ## 13. 적대 검증 처리 기록 (2026-07-20, 설계 체크포인트)
 
