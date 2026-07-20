@@ -216,6 +216,7 @@ type SessionSummaryOutput struct {
 	Checkpoint          *summaryEvent  `json:"checkpoint,omitempty"`
 	CheckpointTruncated bool           `json:"checkpoint_truncated,omitempty"`
 	Groups              []summaryGroup `json:"groups"`
+	GroupsTruncated     bool           `json:"groups_truncated,omitempty"` // 구별 event_type 수가 fan-out 상한(§9) 초과 → 그룹 목록 절단
 	Untrusted           bool           `json:"untrusted"`
 }
 
@@ -276,7 +277,7 @@ func buildSessionSummaryOutput(ctx context.Context, st *store.Store, sum session
 	if budget <= 0 {
 		budget = defaultSummaryMaxBytes
 	}
-	out := SessionSummaryOutput{Untrusted: true, Groups: []summaryGroup{}}
+	out := SessionSummaryOutput{Untrusted: true, Groups: []summaryGroup{}, GroupsTruncated: sum.GroupsTruncated}
 	remaining := budget
 
 	if sum.Checkpoint != nil {

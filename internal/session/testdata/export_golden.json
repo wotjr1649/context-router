@@ -1,0 +1,40 @@
+[
+  {
+    "schemaVersion": "1.0",
+    "eventId": "evt-min",
+    "sessionId": "cc:00000000-0000-7000-8000-0000000000aa",
+    "eventType": "tool_call",
+    "timestamp": "2023-11-14T22:13:21Z",
+    "summary": "ran ctr_search",
+    "privacyLabel": "internal",
+    "producer": {
+      "name": "context-router",
+      "version": "0.2.0"
+    }
+  },
+  {
+    "schemaVersion": "1.0",
+    "eventId": "evt-full",
+    "sessionId": "cc:00000000-0000-7000-8000-0000000000aa",
+    "eventType": "test_run",
+    "timestamp": "2023-11-14T22:13:22Z",
+    "summary": "3 integration tests failed",
+    "artifactRefs": [
+      "artifact://cc:00000000-0000-7000-8000-0000000000aa/sha256-abc123"
+    ],
+    "relatedResources": [
+      "symbol://csharp/Lib.Db.PostgreSqlProvider"
+    ],
+    "attributes": {
+      "exitCode": 1,
+      "failed": 3
+    },
+    "privacyLabel": "internal",
+    "producer": {
+      "name": "context-router",
+      "version": "0.2.0"
+    },
+    "supersedes": "evt-min",
+    "redaction": "spans"
+  }
+]

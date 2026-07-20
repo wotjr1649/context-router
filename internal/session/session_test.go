@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
@@ -684,6 +685,44 @@ func TestSummarize_LimitPerTypeClamps(t *testing.T) {
 	}
 	if notes.Events[0].EventID != last {
 		t.Fatalf("note group[0]=%s want most recent %s", notes.Events[0].EventID, last)
+	}
+}
+
+// TestSummarize_TypeFanOutCap — 부채 ①(설계 §9, Codex P2-4): 구별 event_type이
+// maxSummaryGroups를 초과하면 그룹 수를 상한까지 자르고 GroupsTruncated=true로 표기한다
+// (per-type 질의 fan-out 하드 상한). session_start 자동 이벤트까지 더해 확실히 상한을 넘긴다.
+func TestSummarize_TypeFanOutCap(t *testing.T) {
+	dir := t.TempDir()
+	d := openT(t, dir, Options{Producer: "test/fanout"})
+	for i := 0; i <= maxSummaryGroups; i++ { // maxSummaryGroups+1개 커스텀 타입(+ session_start)
+		mustAppend(t, d, Event{Type: fmt.Sprintf("type_%d", i), Summary: "s"})
+	}
+
+	sum, err := Summarize(context.Background(), d.Reader(), "", 5)
+	if err != nil {
+		t.Fatalf("Summarize: %v", err)
+	}
+	if len(sum.Groups) != maxSummaryGroups {
+		t.Fatalf("len(Groups)=%d want %d(fan-out 상한까지 절단)", len(sum.Groups), maxSummaryGroups)
+	}
+	if !sum.GroupsTruncated {
+		t.Fatalf("GroupsTruncated=false want true(구별 타입 > %d 상한)", maxSummaryGroups)
+	}
+}
+
+// TestSummarize_TypeFanOutUnderCap — 상한 이하(정상 세션)에서는 절단하지 않는다.
+func TestSummarize_TypeFanOutUnderCap(t *testing.T) {
+	dir := t.TempDir()
+	d := openT(t, dir, Options{Producer: "test/fanout-under"})
+	mustAppend(t, d, Event{Type: "note", Summary: "s"})
+	mustAppend(t, d, Event{Type: "decision", Summary: "s"})
+
+	sum, err := Summarize(context.Background(), d.Reader(), "", 5)
+	if err != nil {
+		t.Fatalf("Summarize: %v", err)
+	}
+	if sum.GroupsTruncated {
+		t.Fatalf("GroupsTruncated=true want false(구별 타입 3개 <= %d 상한)", maxSummaryGroups)
 	}
 }
 

@@ -1,8 +1,11 @@
 package session
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -301,6 +304,100 @@ func TestExport_WireJSONShape(t *testing.T) {
 		if _, ok := m[forbidden]; ok {
 			t.Fatalf("json=%s leaked internal cursor field %q", b, forbidden)
 		}
+	}
+}
+
+// TestExport_OmitemptyEmptyFieldsGolden — 부채 ③(설계 §9, §26): 빈 필드 훅 이벤트를 export하면
+// omitempty optional 키(artifactRefs·relatedResources·attributes·supersedes·redaction)는 wire에서
+// 아예 빠진다 — §26의 "키 상시 존재"를 wire 형식이 강제하지 않으며 소비자는 키 부재를 허용해야
+// 한다는 계약을 고정한다(비-omitempty 상시 키만 남는다). TestExport_WireJSONShape(전 필드 채움)의
+// 빈 필드 대칭 짝.
+func TestExport_OmitemptyEmptyFieldsGolden(t *testing.T) {
+	dir := t.TempDir()
+	d := openT(t, dir, Options{Producer: "context-router/0.2.0"})
+	after := lastEventID(t, d)
+	// 훅 최소 이벤트: attributes/refs/related/supersedes 전부 비고 redaction=none.
+	insertRawEvent(t, d, "evt-min", d.SessionID(), "tool_call", 1700000000, "ran ctr_search",
+		nil, nil, nil, "none", "")
+
+	events, _, err := Export(context.Background(), d.Reader(), after, "", 10)
+	if err != nil {
+		t.Fatalf("Export: %v", err)
+	}
+	if len(events) != 1 {
+		t.Fatalf("len(events)=%d want 1", len(events))
+	}
+	b, err := json.Marshal(events[0])
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(b, &m); err != nil {
+		t.Fatalf("unmarshal to map: %v", err)
+	}
+
+	wantPresent := []string{"schemaVersion", "eventId", "sessionId", "eventType", "timestamp", "summary", "privacyLabel", "producer"}
+	wantAbsent := []string{"artifactRefs", "relatedResources", "attributes", "supersedes", "redaction"}
+	if len(m) != len(wantPresent) {
+		t.Fatalf("json=%s has %d keys want %d(빈 omitempty 필드 제거)", b, len(m), len(wantPresent))
+	}
+	for _, k := range wantPresent {
+		if _, ok := m[k]; !ok {
+			t.Fatalf("json=%s missing 상시 키 %q", b, k)
+		}
+	}
+	for _, k := range wantAbsent {
+		if _, ok := m[k]; ok {
+			t.Fatalf("json=%s 빈 omitempty 키 %q 존재(§26 상시 존재 요구 아님을 위반)", b, k)
+		}
+	}
+}
+
+// TestExport_ByteExactGolden — 부채 ④(설계 §9, v0.1 최종리뷰 요구): 고정 cc: 세션·고정
+// event_id/ts로 시드한 훅 이벤트(빈 필드 1건 + 전 필드 1건)를 export한 바이트를 testdata 골든과
+// 바이트 단위로 비교한다 — 필드 순서·키 이름·타임스탬프 형식·omitempty 드롭의 어떤 표류도 잡는다.
+// session_id는 고정 리터럴, producer는 sessions 행으로 고정해 완전 결정적. 골든 재생성:
+// `UPDATE_GOLDEN=1 go test -run TestExport_ByteExactGolden ./internal/session/`.
+func TestExport_ByteExactGolden(t *testing.T) {
+	dir := t.TempDir()
+	d := openT(t, dir, Options{Producer: "context-router/0.2.0"})
+
+	const sid = "cc:00000000-0000-7000-8000-0000000000aa"
+	if _, err := d.writer.Exec(`INSERT INTO sessions(session_id, started_at, producer, retention_sec) VALUES(?,?,?,?)`,
+		sid, int64(1700000000), "context-router/0.2.0", 0); err != nil {
+		t.Fatalf("insert sessions row: %v", err)
+	}
+	insertRawEvent(t, d, "evt-min", sid, "tool_call", 1700000001, "ran ctr_search",
+		nil, nil, nil, "none", "")
+	insertRawEvent(t, d, "evt-full", sid, "test_run", 1700000002, "3 integration tests failed",
+		[]byte(`{"exitCode":1,"failed":3}`),
+		[]byte(`["artifact://`+sid+`/sha256-abc123"]`),
+		[]byte(`["symbol://csharp/Lib.Db.PostgreSqlProvider"]`),
+		"spans", "evt-min")
+
+	// sid 필터로 자동 session_start(실제 UUID 세션)를 제외 → 시드 2건만 결정적으로 반환.
+	events, _, err := Export(context.Background(), d.Reader(), 0, sid, 10)
+	if err != nil {
+		t.Fatalf("Export: %v", err)
+	}
+	got, err := json.MarshalIndent(events, "", "  ")
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	got = append(got, '\n')
+
+	goldenPath := filepath.Join("testdata", "export_golden.json")
+	if os.Getenv("UPDATE_GOLDEN") != "" {
+		if err := os.WriteFile(goldenPath, got, 0o644); err != nil {
+			t.Fatalf("write golden: %v", err)
+		}
+	}
+	want, err := os.ReadFile(goldenPath)
+	if err != nil {
+		t.Fatalf("read golden(%s): %v — 최초 생성은 UPDATE_GOLDEN=1", goldenPath, err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("byte-exact golden 불일치:\n got=%q\nwant=%q", got, want)
 	}
 }
 

@@ -21,6 +21,15 @@ const eventTypeSessionCheckpoint = "session_checkpoint"
 // (설계 §3.2: "event_id NOT IN (SELECT supersedes ... WHERE supersedes IS NOT NULL)").
 const supersededExclusion = `event_id NOT IN (SELECT supersedes FROM session_events WHERE supersedes IS NOT NULL)`
 
+// maxSummaryGroups — Summarize가 반환하는 event_type 그룹 수의 하드 상한(설계 §9, Codex P2-4
+// 이월). event_type은 CHECK 없는 자유 어휘(§26 미지 타입 보존)라, 노이즈 많은/위조된 훅 스트림이
+// 서로 다른 타입을 무한정 만들면 타입당 1개씩의 per-type 질의 fan-out과 응답 그룹 수가 상한
+// 없이 커진다. 정상 세션의 구별 타입은 계측 매핑 9종 + 고정 어휘(session_start·
+// session_checkpoint) + 모델 주도 record_event 소수 = 대략 10여 개이므로, 32는 정상 범위에 넉넉한
+// 여유를 두면서(오탐 절단 회피) 병리적 fan-out만 차단한다. 상한 초과 시 event_type 오름차순
+// (queryEventTypes의 결정적 순서) 앞에서 상한까지만 취하고 Summary.GroupsTruncated로 표기한다.
+const maxSummaryGroups = 32
+
 // SummaryEvent — Summarize가 반환하는 이벤트 1건(mcp가 wire 타입으로 변환·직렬화한다, D16과
 // 동형 — search.Hit/toSearchHit 패턴 승계). ArtifactRefs는 저장된 정본 URI 문자열 그대로다;
 // missing 힌트 판정(content.db 조회)은 session 소관이 아니다(session→store 조회만, 설계 §8).
@@ -37,10 +46,12 @@ type EventGroup struct {
 }
 
 // Summary — Summarize의 반환값(설계 §3.2). Checkpoint가 nil이면 비superseded
-// session_checkpoint 이벤트가 없다는 뜻.
+// session_checkpoint 이벤트가 없다는 뜻. GroupsTruncated는 구별 event_type 수가
+// maxSummaryGroups를 넘어 그룹 목록을 상한까지 잘랐다는 신호(§9 fan-out 캡).
 type Summary struct {
-	Checkpoint *SummaryEvent
-	Groups     []EventGroup
+	Checkpoint      *SummaryEvent
+	Groups          []EventGroup
+	GroupsTruncated bool
 }
 
 // Summarize — 설계 §3.2: session_id(빈 문자열이면 worktree 전체, §2.4 기본 범위) 기준으로
@@ -57,10 +68,11 @@ func Summarize(ctx context.Context, r *sql.DB, sessionID string, limitPerType in
 	}
 	sum.Checkpoint = ckpt
 
-	types, err := queryEventTypes(ctx, r, sessionID)
+	types, truncated, err := queryEventTypes(ctx, r, sessionID)
 	if err != nil {
 		return Summary{}, err
 	}
+	sum.GroupsTruncated = truncated
 	for _, t := range types {
 		evs, err := queryEventsByType(ctx, r, sessionID, t, limitPerType)
 		if err != nil {
@@ -97,31 +109,35 @@ func queryCheckpoint(ctx context.Context, r *sql.DB, sessionID string) (*Summary
 }
 
 // queryEventTypes — superseded 제외 후 남는(=summary에 실제로 등장할 수 있는) event_type의
-// 오름차순 목록(그룹 순서 기준 — 결정적 출력).
-func queryEventTypes(ctx context.Context, r *sql.DB, sessionID string) ([]string, error) {
+// 오름차순 목록(그룹 순서 기준 — 결정적 출력). fan-out 캡(§9): maxSummaryGroups+1까지만
+// 질의해 초과 여부를 감지하고, 초과 시 상한까지 자른 뒤 truncated=true를 반환한다.
+func queryEventTypes(ctx context.Context, r *sql.DB, sessionID string) (types []string, truncated bool, err error) {
 	where := supersededExclusion
 	args := []any{}
 	if sessionID != "" {
 		where += " AND session_id = ?"
 		args = append(args, sessionID)
 	}
-	rows, err := r.QueryContext(ctx, `SELECT DISTINCT event_type FROM session_events WHERE `+where+` ORDER BY event_type`, args...)
+	args = append(args, maxSummaryGroups+1) // +1: 상한 초과 감지용 프로브
+	rows, err := r.QueryContext(ctx, `SELECT DISTINCT event_type FROM session_events WHERE `+where+` ORDER BY event_type LIMIT ?`, args...)
 	if err != nil {
-		return nil, fmt.Errorf("session Summarize: 타입 목록 조회 실패: %w", err)
+		return nil, false, fmt.Errorf("session Summarize: 타입 목록 조회 실패: %w", err)
 	}
 	defer rows.Close()
-	var types []string
 	for rows.Next() {
 		var t string
 		if err := rows.Scan(&t); err != nil {
-			return nil, fmt.Errorf("session Summarize: 타입 스캔 실패: %w", err)
+			return nil, false, fmt.Errorf("session Summarize: 타입 스캔 실패: %w", err)
 		}
 		types = append(types, t)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("session Summarize: 타입 목록 순회 실패: %w", err)
+		return nil, false, fmt.Errorf("session Summarize: 타입 목록 순회 실패: %w", err)
 	}
-	return types, nil
+	if len(types) > maxSummaryGroups {
+		return types[:maxSummaryGroups], true, nil
+	}
+	return types, false, nil
 }
 
 // queryEventsByType — idx_ev_type(event_type, id) 활용: 타입 1개의 이벤트를 id 역순(=시간
