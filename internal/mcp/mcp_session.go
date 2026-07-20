@@ -10,7 +10,6 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
-	"regexp"
 	"strings"
 	"time"
 
@@ -25,20 +24,13 @@ import (
 // --- ctr_record_event (설계 §3.1) ---
 
 const (
-	maxEventTypeBytes   = 64
-	maxSummaryBytes     = 2048
-	maxAttributesBytes  = 4096
-	maxRefsOrRelated    = 16 // artifact_refs·related_resources 공용 개수 상한
-	maxRelatedItemBytes = 512
-	maxEventTotalBytes  = 8192
+	// 이벤트 상한 규칙·값의 정본은 session.ValidateEvent이다(T3 이관). 여기 둘은 mcp 테스트가
+	// 참조하는 값이라 session 정본을 별칭해 값 중복을 없앤다(단일 소스). 나머지 상한(type·
+	// attributes·related item·total)과 event_type 정규식은 session.ValidateEvent 안에만 있다.
+	maxSummaryBytes     = session.MaxSummaryBytes
+	maxRefsOrRelated    = session.MaxRefsOrRelated
 	redactedFieldMarker = "«REDACTED»" // attributes·related가 redaction 후 파싱 불가할 때의 강등 마커(평문)
-	// artifactURIBytes — 저장되는 정본 artifact URI 길이(결정적): "artifact://"(11) + session_id
-	// (UUIDv7 36) + "/sha256-"(8) + content_hash(sha256 hex 64) = 119바이트(설계 §3.1). 8KB
-	// 총합 계상에 해석 전(validate 시점)에도 이 상수로 미리 반영한다(C5).
-	artifactURIBytes = 119
 )
-
-var eventTypeRe = regexp.MustCompile(`^[a-z0-9_]+$`)
 
 // RecordEventInput.Attributes는 map[string]any다(json.RawMessage가 아님) — jsonschema-go의
 // 타입 추론이 []byte 기반 json.RawMessage를 "byte 배열"로 잘못 유추해 object 입력을 거부하는
@@ -58,40 +50,6 @@ type RecordEventOutput struct {
 	EventID   string `json:"event_id"`
 	SessionID string `json:"session_id"`
 	Ts        int64  `json:"ts"`
-}
-
-// validateRecordEventInput: 형식·상한 검증(설계 §3.1 Global Constraints) — event_type·summary·
-// attributes(직렬화된 attrBytes)·artifact_refs 개수를 먼저 확인한 뒤, related_resources 각
-// 항목의 길이·URI 스킴을 검사하며 이벤트 직렬화 총합(≤8KB)을 누적한다.
-func validateRecordEventInput(in RecordEventInput, attrBytes []byte) error {
-	switch {
-	case len(in.EventType) > maxEventTypeBytes || !eventTypeRe.MatchString(in.EventType):
-		return toolErr(codeInvalidArgument, "event_type은 [a-z0-9_]+이고 64바이트 이하여야 합니다")
-	case len(in.Summary) == 0 || len(in.Summary) > maxSummaryBytes:
-		return toolErr(codeInvalidArgument, "summary는 1~2048바이트여야 합니다")
-	case len(attrBytes) > maxAttributesBytes:
-		return toolErr(codeInvalidArgument, "attributes는 4096바이트 이하여야 합니다")
-	case len(in.ArtifactRefs) > maxRefsOrRelated:
-		return toolErr(codeInvalidArgument, "artifact_refs는 16개 이하여야 합니다")
-	case len(in.RelatedResources) > maxRefsOrRelated:
-		return toolErr(codeInvalidArgument, "related_resources는 16개 이하여야 합니다")
-	}
-	// C5: 해석될 artifact URI(119B×refs)를 총합에 미리 가산한다 — 저장 시점 URI 길이는
-	// 결정적이므로 resolve 전에도 정확히 계상된다(해석 전 계상 순서 유지).
-	total := len(in.EventType) + len(in.Summary) + len(attrBytes) + len(in.Supersedes) + artifactURIBytes*len(in.ArtifactRefs)
-	for _, r := range in.RelatedResources {
-		if len(r) > maxRelatedItemBytes {
-			return toolErr(codeInvalidArgument, "related_resources 항목은 512바이트 이하여야 합니다")
-		}
-		if u, err := url.Parse(r); err != nil || u.Scheme == "" {
-			return toolErr(codeInvalidArgument, "related_resources 항목은 스킴을 포함한 URI여야 합니다")
-		}
-		total += len(r)
-	}
-	if total > maxEventTotalBytes {
-		return toolErr(codeInvalidArgument, "이벤트 직렬화 총합이 8192바이트를 초과했습니다")
-	}
-	return nil
 }
 
 // resolveArtifactRefs: artifact_id → content_hash(store.ArtifactHashByID) → 정본 URI
@@ -165,19 +123,28 @@ func recordEventFromInput(ctx context.Context, st *store.Store, sessionID string
 		}
 		attrBytes = b
 	}
-	if err := validateRecordEventInput(in, attrBytes); err != nil {
-		return session.Event{}, err
-	}
+	// wire 변환: int64 refs → 정본 URI, related URI 스킴 검증(형식 — 상한 규칙 아님).
 	refs, err := resolveArtifactRefs(ctx, st, sessionID, in.ArtifactRefs)
 	if err != nil {
 		return session.Event{}, err
 	}
+	for _, r := range in.RelatedResources {
+		if u, err := url.Parse(r); err != nil || u.Scheme == "" {
+			return session.Event{}, toolErr(codeInvalidArgument, "related_resources 항목은 스킴을 포함한 URI여야 합니다")
+		}
+	}
 	summary, attrs, related, redaction := redactEventFields(in.Summary, attrBytes, in.RelatedResources)
-	return session.Event{
+	ev := session.Event{
 		Type: in.EventType, Summary: summary, Attributes: attrs,
 		ArtifactRefs: refs, Related: related, Supersedes: in.Supersedes,
 		Redaction: redaction,
-	}, nil
+	}
+	// 상한·형식 규칙은 session.ValidateEvent 단일 정본(T3 이관, 규칙 중복 금지). 저장될 변환
+	// 완료본을 검증한다 — 반환 문구는 사용자 대면이라 INVALID_ARGUMENT로 그대로 노출한다.
+	if vErr := session.ValidateEvent(ev); vErr != nil {
+		return session.Event{}, toolErr(codeInvalidArgument, vErr.Error())
+	}
+	return ev, nil
 }
 
 func registerRecordEvent(srv *mcp.Server, st *store.Store, sess *session.DB) {

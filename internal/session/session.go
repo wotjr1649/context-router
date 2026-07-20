@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"time"
 
 	"github.com/google/uuid"
@@ -95,6 +96,7 @@ const eventTypeSessionStart = "session_start"
 // sessionStartPayload — session_start 이벤트의 payload(설계 §2.2: "가변 세션 상태는 컬럼이
 // 아니라 이벤트로 기록" — worktree root·보존 정책 플래그 요약).
 type sessionStartPayload struct {
+	Source       string `json:"source,omitempty"` // 훅 SessionStart의 source(§2.2 EnsureSession). Open()은 미주입(omitempty로 생략).
 	WorktreeRoot string `json:"worktree_root"`
 	RetentionSec int64  `json:"retention_sec"`
 }
@@ -119,6 +121,55 @@ type Event struct {
 	Redaction             string // "none"|"spans" — 빈 문자열은 'none'으로 정규화(Append)
 }
 
+// 이벤트 상한 상수(설계 §3.1 Global Constraints) — 정본 위치. mcp `validateRecordEventInput`
+// 에서 이관(규칙·값 단일 소스). mcp는 테스트가 참조하는 둘(MaxSummaryBytes·MaxRefsOrRelated)만
+// 별칭 참조해 값 중복을 없앤다.
+const (
+	MaxEventTypeBytes   = 64
+	MaxSummaryBytes     = 2048
+	MaxAttributesBytes  = 4096
+	MaxRefsOrRelated    = 16 // artifact_refs·related 공용 개수 상한
+	MaxRelatedItemBytes = 512
+	MaxEventTotalBytes  = 8192
+)
+
+var eventTypeRe = regexp.MustCompile(`^[a-z0-9_]+$`)
+
+// ValidateEvent — 이벤트 상한·형식 검증(설계 §3.1). mcp `validateRecordEventInput`에서 이관한
+// 단일 정본이다(규칙 중복 금지) — mcp는 wire 변환(refs URI 해석·redaction) 후 이 함수를 호출해
+// INVALID_ARGUMENT로 매핑하고, AppendDB.Append는 저장 전 항상 호출한다. ev는 이미 변환 완료본
+// 이라 ArtifactRefs는 정본 URI 문자열(각 119B 결정적)이므로 총합에 실제 바이트를 계상한다(구
+// mcp의 artifactURIBytes×개수와 동치). 반환 문구는 mcp가 사용자에게 그대로 노출하므로 내부 오류
+// prefix를 붙이지 않는다(사용자 대면 메시지).
+func ValidateEvent(ev Event) error {
+	switch {
+	case len(ev.Type) > MaxEventTypeBytes || !eventTypeRe.MatchString(ev.Type):
+		return errors.New("event_type은 [a-z0-9_]+이고 64바이트 이하여야 합니다")
+	case len(ev.Summary) == 0 || len(ev.Summary) > MaxSummaryBytes:
+		return errors.New("summary는 1~2048바이트여야 합니다")
+	case len(ev.Attributes) > MaxAttributesBytes:
+		return errors.New("attributes는 4096바이트 이하여야 합니다")
+	case len(ev.ArtifactRefs) > MaxRefsOrRelated:
+		return errors.New("artifact_refs는 16개 이하여야 합니다")
+	case len(ev.Related) > MaxRefsOrRelated:
+		return errors.New("related_resources는 16개 이하여야 합니다")
+	}
+	total := len(ev.Type) + len(ev.Summary) + len(ev.Attributes) + len(ev.Supersedes)
+	for _, r := range ev.ArtifactRefs {
+		total += len(r)
+	}
+	for _, r := range ev.Related {
+		if len(r) > MaxRelatedItemBytes {
+			return errors.New("related_resources 항목은 512바이트 이하여야 합니다")
+		}
+		total += len(r)
+	}
+	if total > MaxEventTotalBytes {
+		return errors.New("이벤트 직렬화 총합이 8192바이트를 초과했습니다")
+	}
+	return nil
+}
+
 // DB — 열린 session.db 핸들. writer 1연결(SetMaxOpenConns(1), _txlock=immediate) + reader
 // (store.go와 동형, 설계 §2.1). leaseRelease는 Close에서 1회만 호출한다(store.AcquireLock의
 // release는 idempotent가 아니다 — 두 번 호출 금지).
@@ -141,14 +192,10 @@ type DB struct {
 //  5. quick_check 보수적 판정(§6.2) — 명시적 malformed만 ErrCorrupt.
 //  6. session_id(UUIDv7) 발급, sessions 행 INSERT, session_start 이벤트 자동 append.
 func Open(dir string, opts Options) (*DB, error) {
-	if mkErr := os.MkdirAll(dir, 0o700); mkErr != nil {
-		return nil, sanitizeIOErr("open mkdir", mkErr)
-	}
-
-	// ① lifetime lease — 프로세스 종료까지 보유, 실패 시 재시도 없이 즉시 fail-closed.
-	leaseRelease, lockErr := store.AcquireLock(filepath.Join(dir, lockFileName), true)
+	// ① lifetime lease(MkdirAll 포함) — 프로세스 종료까지 보유, 실패 시 재시도 없이 즉시 fail-closed.
+	leaseRelease, lockErr := acquireSharedLease(dir, "session Open")
 	if lockErr != nil {
-		return nil, fmt.Errorf("session Open: session.lock 공유 잠금 획득 실패: %w: %v", ErrLeaseHeld, lockErr)
+		return nil, lockErr
 	}
 	ok := false
 	defer func() {
@@ -158,10 +205,8 @@ func Open(dir string, opts Options) (*DB, error) {
 	}()
 
 	// ② 복구 마커 — 존재하면 quick_check 결과와 무관하게 fail-closed.
-	if _, statErr := os.Stat(filepath.Join(dir, recoverMarkerName)); statErr == nil {
-		return nil, fmt.Errorf("session Open: %w", ErrRecoverPending)
-	} else if !errors.Is(statErr, os.ErrNotExist) {
-		return nil, sanitizeIOErr("recover marker stat", statErr)
+	if markerErr := checkRecoverMarker(dir, "session Open"); markerErr != nil {
+		return nil, markerErr
 	}
 
 	// ③ 신규 생성 직렬화 — 파일이 이미 있으면 생략(다중 프로세스 동시 append는 지원 토폴로지,
@@ -188,24 +233,13 @@ func Open(dir string, opts Options) (*DB, error) {
 		}
 	}()
 
-	dsn := "file:" + filepath.ToSlash(dbPath) + pragmas
-	w, err := sql.Open("sqlite", dsn+"&_txlock=immediate")
-	if err != nil {
-		return nil, fmt.Errorf("session Open: %w", err)
+	w, r, connErr := openWriterReader(dbPath, pragmas, 4)
+	if connErr != nil {
+		return nil, fmt.Errorf("session Open: %w", connErr)
 	}
-	w.SetMaxOpenConns(1)
 	defer func() {
 		if !ok {
 			w.Close()
-		}
-	}()
-	r, err := sql.Open("sqlite", dsn)
-	if err != nil {
-		return nil, fmt.Errorf("session Open: %w", err)
-	}
-	r.SetMaxOpenConns(4)
-	defer func() {
-		if !ok {
 			r.Close()
 		}
 	}()
@@ -282,6 +316,51 @@ func openReadOnlyAt(path string) (*sql.DB, error) {
 	return db, nil
 }
 
+// acquireSharedLease — MkdirAll(dir) 후 session.lock을 shared·논블로킹으로 취득한다(Open·
+// OpenAppend 공통 ①, 중복 금지). 실패 시 ErrLeaseHeld로 wrap한다. op은 오류 문구 prefix(slog
+// 전용, sentinel은 불변).
+func acquireSharedLease(dir, op string) (func(), error) {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return nil, sanitizeIOErr("open mkdir", err)
+	}
+	release, err := store.AcquireLock(filepath.Join(dir, lockFileName), true)
+	if err != nil {
+		return nil, fmt.Errorf("%s: session.lock 공유 잠금 획득 실패: %w: %v", op, ErrLeaseHeld, err)
+	}
+	return release, nil
+}
+
+// checkRecoverMarker — recover 마커(session.recover-pending) 존재 시 ErrRecoverPending(Open·
+// OpenAppend 공통 ②). quick_check 결과와 무관하게 fail-closed — 부분 게시 상태에서 빈 DB를
+// 신규 생성하지 않는다(§6.3). op은 오류 문구 prefix.
+func checkRecoverMarker(dir, op string) error {
+	if _, statErr := os.Stat(filepath.Join(dir, recoverMarkerName)); statErr == nil {
+		return fmt.Errorf("%s: %w", op, ErrRecoverPending)
+	} else if !errors.Is(statErr, os.ErrNotExist) {
+		return sanitizeIOErr("recover marker stat", statErr)
+	}
+	return nil
+}
+
+// openWriterReader — writer(1연결·_txlock=immediate)와 reader 풀을 pragmasStr DSN으로 연다
+// (Open·OpenAppend 공통 ④ 연결 부분, 중복 금지). Open은 pragmas(busy_timeout 5000), OpenAppend는
+// hookPragmas(500ms)를 넘긴다. r 생성 실패 시 이미 연 w를 닫아 누수를 막는다.
+func openWriterReader(dbPath, pragmasStr string, readerConns int) (w, r *sql.DB, err error) {
+	dsn := "file:" + filepath.ToSlash(dbPath) + pragmasStr
+	w, err = sql.Open("sqlite", dsn+"&_txlock=immediate")
+	if err != nil {
+		return nil, nil, err
+	}
+	w.SetMaxOpenConns(1)
+	r, err = sql.Open("sqlite", dsn)
+	if err != nil {
+		_ = w.Close()
+		return nil, nil, err
+	}
+	r.SetMaxOpenConns(readerConns)
+	return w, r, nil
+}
+
 // acquireInitLock — session.init.lock을 store.go의 lockStore()와 동일한 유계 백오프(10ms→
 // 20→40→80→160ms 유지, 총 5초)로 재시도한다(설계 §6.2 ②: "기존 lockStore 패턴" — 대기 없는
 // 즉시 거부는 계약 미달, 리뷰 Important). 두 호스트가 같은 신규 worktree를 동시 콜드스타트하면
@@ -309,6 +388,34 @@ func acquireInitLock(lockPath, dbPath string) (func(), error) {
 	}
 }
 
+// acquireInitLockCtx — acquireInitLock의 ctx-aware 변형(설계 §2.3, 훅 전용). 현행 acquireInitLock은
+// 최대 5s를 무조건 sleep으로 소진해 훅 deadline 예산을 위반하므로 재사용 불가 — 대기 종료 조건을
+// time.Now().After(deadline)가 아니라 ctx.Done()으로 바꿔 예산을 관측하며 폴링한다. 백오프(10ms→
+// 160ms)·shortcut(승자가 이미 파일 생성 시 nil,nil로 락 없이 합류)·ErrLeaseHeld wrap은 동일하다.
+func acquireInitLockCtx(ctx context.Context, lockPath, dbPath string) (func(), error) {
+	delay := 10 * time.Millisecond
+	for {
+		release, err := store.AcquireLock(lockPath, false)
+		if err == nil {
+			return release, nil
+		}
+		if _, statErr := os.Stat(dbPath); statErr == nil {
+			return nil, nil // 승자가 이미 생성 완료 — 락 없이 기존 파일 경로로 합류
+		}
+		if ctx.Err() != nil {
+			return nil, fmt.Errorf("session OpenAppend: session.init.lock 대기 예산 초과: %w: %v", ErrLeaseHeld, err)
+		}
+		select {
+		case <-time.After(delay):
+		case <-ctx.Done():
+			return nil, fmt.Errorf("session OpenAppend: session.init.lock 대기 예산 초과: %w: %v", ErrLeaseHeld, ctx.Err())
+		}
+		if delay < 160*time.Millisecond {
+			delay *= 2
+		}
+	}
+}
+
 // migrate — store.go의 migrate()와 동형(설계 §2.1). PRAGMA user_version==0이면 스키마
 // 최초 적용, ==schemaVersion이면 멱등 통과, 그 외는 비파괴 거부.
 //
@@ -319,16 +426,21 @@ func acquireInitLock(lockPath, dbPath string) (func(), error) {
 // 경로 모두 여기서 승자의 최초 WAL 전환/스키마 커밋을 busy 재시도로 기다린 뒤 user_version=1
 // 을 보고 멱등 통과해야 한다 — 그래야 store.go 주석의 WAL_RECOVER_LOCK(busy_timeout을
 // 우회하는 즉시-BUSY)을 만나도 즉시 전파하지 않는다.
-func (d *DB) migrate() error {
+func (d *DB) migrate() error { return migrateWriter(d.writer) }
+
+// migrateWriter — migrate()의 writer 인자화(OpenAppend가 AppendDB의 writer에도 쓴다, 중복 금지).
+// busy_timeout은 연결 DSN이 정하므로(Open=5000·OpenAppend=500) DSN-무관하게 동일 로직이 두
+// 경로를 커버한다.
+func migrateWriter(w *sql.DB) error {
 	var v int
 	if err := migrateBusyRetry(func() error {
-		return d.writer.QueryRow("PRAGMA user_version").Scan(&v)
+		return w.QueryRow("PRAGMA user_version").Scan(&v)
 	}); err != nil {
 		return err
 	}
 	switch {
 	case v == 0:
-		return migrateBusyRetry(d.applySchemaV1)
+		return migrateBusyRetry(func() error { return applySchemaV1(w) })
 	case v == schemaVersion:
 		return nil
 	case v > schemaVersion:
@@ -366,8 +478,8 @@ func migrateBusyRetry(op func() error) error {
 // applySchemaV1 — store.go의 applySchemaV1()과 동형: 단일 트랜잭션으로 스키마+user_version을
 // 적용해 중도 실패로 인한 부분 스키마(user_version=0 그대로 일부만 생성)를 방지한다. 모든
 // 문(IF NOT EXISTS)이 멱등이라 롤백 후 재시도해도 안전하다.
-func (d *DB) applySchemaV1() error {
-	tx, err := d.writer.Begin()
+func applySchemaV1(w *sql.DB) error {
+	tx, err := w.Begin()
 	if err != nil {
 		return err
 	}
@@ -487,9 +599,16 @@ func ClassifyStorageErr(err error) error {
 // txRetry — store.go의 txRetry()와 동형(§2.1 "writer 1연결 + txRetry 동형"): BEGIN IMMEDIATE
 // 트랜잭션 1개로 fn 실행, BUSY/LOCKED면 지수 백오프(50/200/800ms)로 최대 3회 재시도.
 func (d *DB) txRetry(ctx context.Context, fn func(tx *sql.Tx) error) error {
+	return txRetryWriter(ctx, d.writer, fn)
+}
+
+// txRetryWriter — txRetry의 writer 인자화(AppendDB.Append·EnsureSession이 ctx를 전파해 쓴다,
+// 중복 금지). 즉시 취소된 ctx면 BeginTx가 곧장 ctx.Err()를 반환하고 !isBusy라 재시도 없이 즉시
+// 표면화된다(블로킹 없음).
+func txRetryWriter(ctx context.Context, w *sql.DB, fn func(tx *sql.Tx) error) error {
 	delays := [3]time.Duration{50 * time.Millisecond, 200 * time.Millisecond, 800 * time.Millisecond}
 	for attempt := 0; ; attempt++ {
-		err := d.runTx(ctx, fn)
+		err := runTxWriter(ctx, w, fn)
 		if err == nil || !isBusy(err) {
 			return err
 		}
@@ -504,8 +623,8 @@ func (d *DB) txRetry(ctx context.Context, fn func(tx *sql.Tx) error) error {
 	}
 }
 
-func (d *DB) runTx(ctx context.Context, fn func(tx *sql.Tx) error) error {
-	tx, err := d.writer.BeginTx(ctx, nil)
+func runTxWriter(ctx context.Context, w *sql.DB, fn func(tx *sql.Tx) error) error {
+	tx, err := w.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
@@ -521,6 +640,14 @@ func (d *DB) runTx(ctx context.Context, fn func(tx *sql.Tx) error) error {
 // 검증한다(§2.2: FK 없음 — 애플리케이션 검증으로 대체). 미존재면 store.ErrNotFound로 wrap
 // (신규 sentinel 대신 기존 패턴 재사용, D13).
 func (d *DB) Append(ev Event) (id int64, eventID string, ts int64, err error) {
+	return appendEvent(context.Background(), d.writer, d.sessionID, ev)
+}
+
+// appendEvent — Append의 직렬화+INSERT 코어(ctx·writer·sessionID 인자화). DB.Append(무-ctx,
+// 미검증)와 AppendDB.Append(ctx·사전 ValidateEvent)가 공유한다(중복 금지). ctx를 txRetry에
+// 전파해 데드라인 초과 시 즉시 표면화한다(드롭 판정은 호출자). 상한 검증은 하지 않는다 —
+// DB.Append는 미검증 승계, AppendDB.Append가 호출 전에 ValidateEvent를 돌린다.
+func appendEvent(ctx context.Context, w *sql.DB, sessionID string, ev Event) (id int64, eventID string, ts int64, err error) {
 	eid, uuidErr := uuid.NewV7()
 	if uuidErr != nil {
 		return 0, "", 0, fmt.Errorf("session Append: event_id 발급 실패: %w", uuidErr)
@@ -546,7 +673,7 @@ func (d *DB) Append(ev Event) (id int64, eventID string, ts int64, err error) {
 		redaction = "none"
 	}
 
-	txErr := d.txRetry(context.Background(), func(tx *sql.Tx) error {
+	txErr := txRetryWriter(ctx, w, func(tx *sql.Tx) error {
 		if ev.Supersedes != "" {
 			var exists int
 			qErr := tx.QueryRow("SELECT 1 FROM session_events WHERE event_id=?", ev.Supersedes).Scan(&exists)
@@ -559,7 +686,7 @@ func (d *DB) Append(ev Event) (id int64, eventID string, ts int64, err error) {
 		}
 		res, execErr := tx.Exec(`INSERT INTO session_events(event_id, session_id, event_type, ts, summary, payload, artifact_refs, related, redaction, supersedes)
 			VALUES(?,?,?,?,?,?,?,?,?,?)`,
-			eventID, d.sessionID, ev.Type, ts, ev.Summary, payload, artifactRefsJSON, relatedJSON, redaction, nullIfEmpty(ev.Supersedes))
+			eventID, sessionID, ev.Type, ts, ev.Summary, payload, artifactRefsJSON, relatedJSON, redaction, nullIfEmpty(ev.Supersedes))
 		if execErr != nil {
 			return execErr
 		}
@@ -606,6 +733,184 @@ func (d *DB) Close() error {
 	readerErr := d.reader.Close()
 	writerErr := d.writer.Close()
 	d.leaseRelease()
+	return errors.Join(checkpointErr, readerErr, writerErr)
+}
+
+// --- 훅 전용 append API (설계 §2.1~§2.3, MCP 표면 비노출) ---
+
+// hookPragmas — pragmas와 동일 세트이나 busy_timeout을 500ms로 낮춘 훅 전용 DSN 조각(설계 §2.3:
+// 훅 deadline 예산 안으로 모든 DB 대기를 상계). pragmas 상수(busy_timeout 5000)는 직접 재사용 불가.
+const hookPragmas = "?_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)&_pragma=busy_timeout(500)&_pragma=foreign_keys(ON)"
+
+// AppendOptions — OpenAppend의 훅 세션 정책(설계 §2.2). ExternalSessionID는 "cc:<uuid>" 완성형
+// (canonical UUID 형식 검증은 호출자 = hook의 책임, T4). Producer·RetentionSec은 EnsureSession이
+// sessions 행에 기입한다.
+type AppendOptions struct {
+	ExternalSessionID string
+	Producer          string
+	RetentionSec      int64
+}
+
+// AppendDB — 훅 전용 append 핸들(설계 §2.1). *DB를 임베드하지 않는다 — 무-ctx DB.Append(ev)와
+// ctx-수용 AppendDB.Append(ctx,ev)의 시그니처 그림자화 위험을 피하려 필드를 재사용한다.
+type AppendDB struct {
+	writer, reader *sql.DB
+	sessionID      string // = opts.ExternalSessionID("cc:" 접두사 완성형)
+	producer       string
+	retentionSec   int64
+	leaseRelease   func()
+}
+
+// OpenAppend — 훅 전용 append 표면을 연다(설계 §2.1~§2.3). Open()과 달리 ⑤ quick_check·⑥
+// sessions INSERT·session_start 자동 append를 하지 않는다(세션 생성은 EnsureSession 전용). ctx
+// deadline을 init-lock 대기와 이후 append에 전파하고 busy_timeout 500ms DSN을 써 모든 DB 대기를
+// 훅 예산 안으로 상계한다. 손상은 여기서 감지하지 않고 첫 Append의 오류 분류로 사후 감지한다.
+//
+//	① shared lease(논블로킹) — 실패 시 ErrLeaseHeld
+//	② recover 마커 → ErrRecoverPending(quick_check 결과 무관 fail-closed)
+//	③ DB 미존재 시 ctx-aware init lock으로 최초 WAL 전환 직렬화
+//	④ PRAGMA+멱등 DDL(500ms DSN)
+//	⑤ quick_check 생략
+//	⑥ sessions·session_start 미생성
+func OpenAppend(ctx context.Context, dir string, opts AppendOptions) (*AppendDB, error) {
+	leaseRelease, lockErr := acquireSharedLease(dir, "session OpenAppend")
+	if lockErr != nil {
+		return nil, lockErr
+	}
+	ok := false
+	defer func() {
+		if !ok {
+			leaseRelease()
+		}
+	}()
+
+	if markerErr := checkRecoverMarker(dir, "session OpenAppend"); markerErr != nil {
+		return nil, markerErr
+	}
+
+	dbPath := filepath.Join(dir, dbFileName)
+	isNew := false
+	if _, statErr := os.Stat(dbPath); errors.Is(statErr, os.ErrNotExist) {
+		isNew = true
+	} else if statErr != nil {
+		return nil, sanitizeIOErr("session.db stat", statErr)
+	}
+
+	var initRelease func()
+	if isNew {
+		rel, initErr := acquireInitLockCtx(ctx, filepath.Join(dir, initLockFileName), dbPath)
+		if initErr != nil {
+			return nil, initErr
+		}
+		initRelease = rel // nil이면 승자가 이미 생성을 끝낸 것 — 락 없이 합류
+	}
+	defer func() {
+		if initRelease != nil {
+			initRelease()
+		}
+	}()
+
+	w, r, connErr := openWriterReader(dbPath, hookPragmas, 4)
+	if connErr != nil {
+		return nil, fmt.Errorf("session OpenAppend: %w", connErr)
+	}
+	defer func() {
+		if !ok {
+			w.Close()
+			r.Close()
+		}
+	}()
+
+	// ④ PRAGMA+멱등 DDL. migrateBusyRetry의 유계 sleep(≤250ms)은 예산 내라 ctx-aware화하지
+	// 않는다 — 5s 무조건 sleep이던 init-lock과 busy_timeout(500ms 하향)이 초과 위험의 본체였다.
+	if migrateErr := migrateWriter(w); migrateErr != nil {
+		return nil, migrateErr
+	}
+	if initRelease != nil {
+		initRelease() // "완료 후 해제"
+		initRelease = nil
+	}
+
+	ad := &AppendDB{
+		writer:       w,
+		reader:       r,
+		sessionID:    opts.ExternalSessionID,
+		producer:     opts.Producer,
+		retentionSec: opts.RetentionSec,
+		leaseRelease: leaseRelease,
+	}
+	ok = true
+	return ad, nil
+}
+
+// EnsureSession — sessions 행 INSERT OR IGNORE와, 행이 신규 삽입된 경우에만의 session_start
+// append를 **단일 트랜잭션**으로 수행한다(설계 §2.2, 리뷰 반영). 단명 프로세스가 두 작업 사이에서
+// kill돼 sessions 행만 남고 session_start가 영구 누락되는 경로를 차단한다 — session_start INSERT가
+// 실패하면 sessions 행도 함께 롤백된다. 재호출(clear/compact 재발화) 시 이미 존재하면 created=false·
+// 재발행 없음. session_start는 서버 발행 고정 이벤트라 ValidateEvent를 거치지 않는다(Open()과 동형).
+func (ad *AppendDB) EnsureSession(ctx context.Context, source, worktreeRoot string) (created bool, err error) {
+	startedAt := time.Now().Unix()
+	eid, uuidErr := uuid.NewV7()
+	if uuidErr != nil {
+		return false, fmt.Errorf("session EnsureSession: event_id 발급 실패: %w", uuidErr)
+	}
+	payload, _ := json.Marshal(sessionStartPayload{Source: source, WorktreeRoot: worktreeRoot, RetentionSec: ad.retentionSec})
+
+	txErr := txRetryWriter(ctx, ad.writer, func(tx *sql.Tx) error {
+		created = false // BUSY 재시도 시 이전 롤백분의 잔상 방지 — 매 시도 재평가
+		res, execErr := tx.Exec(`INSERT OR IGNORE INTO sessions(session_id, started_at, producer, retention_sec) VALUES(?,?,?,?)`,
+			ad.sessionID, startedAt, ad.producer, ad.retentionSec)
+		if execErr != nil {
+			return execErr
+		}
+		if n, _ := res.RowsAffected(); n == 0 {
+			return nil // 이미 존재 — session_start 재발행 안 함
+		}
+		if _, insErr := tx.Exec(`INSERT INTO session_events(event_id, session_id, event_type, ts, summary, payload, artifact_refs, related, redaction, supersedes)
+			VALUES(?,?,?,?,?,?,?,?,?,?)`,
+			eid.String(), ad.sessionID, eventTypeSessionStart, startedAt, "session started", string(payload), nil, nil, "none", nil); insErr != nil {
+			return insErr // session_start 실패 → tx 롤백 → sessions 행도 원복(원자성)
+		}
+		created = true
+		return nil
+	})
+	if txErr != nil {
+		return false, txErr
+	}
+	return created, nil
+}
+
+// SessionExists — 이 핸들의 ExternalSessionID로 sessions 행이 존재하는지 조회한다(미지 세션
+// drop 판정용, 설계 §2.2).
+func (ad *AppendDB) SessionExists(ctx context.Context) (bool, error) {
+	var one int
+	err := ad.reader.QueryRowContext(ctx, "SELECT 1 FROM sessions WHERE session_id=?", ad.sessionID).Scan(&one)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// Append — 이벤트 1건을 ExternalSessionID로 기록한다. 저장 전 항상 ValidateEvent를 돌리고(상한·
+// 형식 단일 정본), ctx deadline을 txRetry에 전파한다 — 초과 시 context.DeadlineExceeded 계열을
+// 즉시 반환한다(드롭 판정은 호출자, 설계 §2.3).
+func (ad *AppendDB) Append(ctx context.Context, ev Event) (id int64, eventID string, ts int64, err error) {
+	if vErr := ValidateEvent(ev); vErr != nil {
+		return 0, "", 0, vErr
+	}
+	return appendEvent(ctx, ad.writer, ad.sessionID, ev)
+}
+
+// Close — writer/reader를 닫고 lifetime lease를 해제한다(DB.Close와 동형). leaseRelease는
+// idempotent가 아니므로 한 핸들당 정확히 1회만 호출해야 한다.
+func (ad *AppendDB) Close() error {
+	_, checkpointErr := ad.writer.Exec("PRAGMA wal_checkpoint(TRUNCATE)")
+	readerErr := ad.reader.Close()
+	writerErr := ad.writer.Close()
+	ad.leaseRelease()
 	return errors.Join(checkpointErr, readerErr, writerErr)
 }
 

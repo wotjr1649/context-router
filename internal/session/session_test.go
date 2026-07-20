@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -879,5 +880,377 @@ func TestSweep_DanglingSupersedesAllowed(t *testing.T) {
 	decisionsAfter := findGroup(sumAfter, "decision")
 	if decisionsAfter == nil || len(decisionsAfter.Events) != 1 || decisionsAfter.Events[0].EventID != aID {
 		t.Fatalf("스윕 후 decision group=%+v want 정확히 [%s](A, dangling supersedes 복귀)", decisionsAfter, aID)
+	}
+}
+
+// --- 훅 전용 append API (태스크 3, 설계 §2.1~§2.3) ---
+
+// testCCSessionID — 훅 stdin의 canonical UUID를 cc: 네임스페이스로 채택한 완성형 예시(형식
+// 검증은 호출자=hook의 책임이라 OpenAppend는 문자열을 그대로 수용, §2.2).
+const testCCSessionID = "cc:01890000-0000-7000-8000-0000000000aa"
+
+func openAppendT(t *testing.T, dir string, opts AppendOptions) *AppendDB {
+	t.Helper()
+	ad, err := OpenAppend(context.Background(), dir, opts)
+	if err != nil {
+		t.Fatalf("OpenAppend: %v", err)
+	}
+	t.Cleanup(func() { ad.Close() })
+	return ad
+}
+
+// TestOpenAppend_NoSessionRowNoSessionStart — 시나리오 ①: OpenAppend는 sessions 행도
+// session_start 이벤트도 만들지 않는다(세션 생성은 EnsureSession 전용, §2.1 ⑥).
+func TestOpenAppend_NoSessionRowNoSessionStart(t *testing.T) {
+	dir := t.TempDir()
+	ad := openAppendT(t, dir, AppendOptions{ExternalSessionID: testCCSessionID, Producer: "context-router/test"})
+
+	var sessions, starts int
+	if err := ad.reader.QueryRow("SELECT COUNT(*) FROM sessions").Scan(&sessions); err != nil {
+		t.Fatal(err)
+	}
+	if err := ad.reader.QueryRow("SELECT COUNT(*) FROM session_events WHERE event_type=?", eventTypeSessionStart).Scan(&starts); err != nil {
+		t.Fatal(err)
+	}
+	if sessions != 0 || starts != 0 {
+		t.Fatalf("OpenAppend가 상태를 만듦: sessions=%d session_start=%d want 0/0", sessions, starts)
+	}
+}
+
+// TestEnsureSession_CreatesOnceReentrant — 시나리오 ②③: 첫 EnsureSession은 created=true +
+// sessions 행 + session_start 1건이고 SessionExists가 false→true로 전이한다. 재호출(clear/
+// compact 재발화 모사)은 created=false이며 session_start는 여전히 1건(중복 금지).
+func TestEnsureSession_CreatesOnceReentrant(t *testing.T) {
+	dir := t.TempDir()
+	ad := openAppendT(t, dir, AppendOptions{ExternalSessionID: testCCSessionID, Producer: "context-router/test", RetentionSec: 42})
+	ctx := context.Background()
+
+	if exists, err := ad.SessionExists(ctx); err != nil || exists {
+		t.Fatalf("SessionExists(before)=%v,%v want false,nil", exists, err)
+	}
+
+	created, err := ad.EnsureSession(ctx, "startup", "/user/wt")
+	if err != nil || !created {
+		t.Fatalf("EnsureSession(1st)=%v,%v want true,nil", created, err)
+	}
+	if exists, err := ad.SessionExists(ctx); err != nil || !exists {
+		t.Fatalf("SessionExists(after)=%v,%v want true,nil", exists, err)
+	}
+
+	var producer string
+	var retention int64
+	if err := ad.reader.QueryRow("SELECT producer, retention_sec FROM sessions WHERE session_id=?", testCCSessionID).Scan(&producer, &retention); err != nil {
+		t.Fatalf("sessions row: %v", err)
+	}
+	if producer != "context-router/test" || retention != 42 {
+		t.Fatalf("sessions row=(%q,%d) want (context-router/test,42)", producer, retention)
+	}
+
+	var payload string
+	if err := ad.reader.QueryRow("SELECT payload FROM session_events WHERE event_type=? AND session_id=?",
+		eventTypeSessionStart, testCCSessionID).Scan(&payload); err != nil {
+		t.Fatalf("session_start payload: %v", err)
+	}
+	var p sessionStartPayload
+	if err := json.Unmarshal([]byte(payload), &p); err != nil {
+		t.Fatal(err)
+	}
+	if p.Source != "startup" || p.WorktreeRoot != "/user/wt" {
+		t.Fatalf("payload=%+v want source=startup worktree_root=/user/wt", p)
+	}
+
+	created2, err := ad.EnsureSession(ctx, "compact", "/user/wt")
+	if err != nil || created2 {
+		t.Fatalf("EnsureSession(2nd)=%v,%v want false,nil (재발화)", created2, err)
+	}
+	var starts int
+	if err := ad.reader.QueryRow("SELECT COUNT(*) FROM session_events WHERE event_type=? AND session_id=?",
+		eventTypeSessionStart, testCCSessionID).Scan(&starts); err != nil {
+		t.Fatal(err)
+	}
+	if starts != 1 {
+		t.Fatalf("session_start count=%d want 1 (clear/compact 재발화 시 중복 금지)", starts)
+	}
+}
+
+// TestOpenAppend_AppendUsesExternalSessionID — 시나리오 ④: Append가 ExternalSessionID로
+// 기록한다(cc: 세션 조회로 검증).
+func TestOpenAppend_AppendUsesExternalSessionID(t *testing.T) {
+	dir := t.TempDir()
+	ad := openAppendT(t, dir, AppendOptions{ExternalSessionID: testCCSessionID, Producer: "context-router/test"})
+
+	_, eventID, _, err := ad.Append(context.Background(), Event{Type: "tool_call", Summary: "Bash: git status"})
+	if err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+	var gotSID string
+	if err := ad.reader.QueryRow("SELECT session_id FROM session_events WHERE event_id=?", eventID).Scan(&gotSID); err != nil {
+		t.Fatalf("query: %v", err)
+	}
+	if gotSID != testCCSessionID {
+		t.Fatalf("session_id=%q want %q", gotSID, testCCSessionID)
+	}
+}
+
+// TestOpenAppend_RecoverMarkerBlocks — 시나리오 ⑤: recover 마커 존재 시 ErrRecoverPending
+// (quick_check 결과 무관 fail-closed). 실패 후 shared lease 누수 없음.
+func TestOpenAppend_RecoverMarkerBlocks(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, recoverMarkerName), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ad, err := OpenAppend(context.Background(), dir, AppendOptions{ExternalSessionID: testCCSessionID})
+	if ad != nil {
+		t.Fatal("want nil *AppendDB on ErrRecoverPending")
+	}
+	if !errors.Is(err, ErrRecoverPending) {
+		t.Fatalf("err=%v want ErrRecoverPending", err)
+	}
+	release, lockErr := store.AcquireLock(filepath.Join(dir, lockFileName), false)
+	if lockErr != nil {
+		t.Fatalf("lease 누수 의심: exclusive 재취득 실패: %v", lockErr)
+	}
+	release()
+}
+
+// TestOpenAppend_AppendCancelledCtxImmediate — 시나리오 ⑥: 이미 만료된 ctx로 Append하면
+// 블로킹 없이 즉시 context.DeadlineExceeded를 반환하고 아무것도 저장하지 않는다(드롭 판정은 호출자).
+func TestOpenAppend_AppendCancelledCtxImmediate(t *testing.T) {
+	dir := t.TempDir()
+	ad := openAppendT(t, dir, AppendOptions{ExternalSessionID: testCCSessionID, Producer: "p"})
+
+	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Hour))
+	defer cancel()
+
+	start := time.Now()
+	_, _, _, err := ad.Append(ctx, Event{Type: "tool_call", Summary: "x"})
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("err=%v want context.DeadlineExceeded", err)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("Append가 %v 블로킹 — 즉시 반환해야 함", elapsed)
+	}
+	var n int
+	if err := ad.reader.QueryRow("SELECT COUNT(*) FROM session_events").Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Fatalf("session_events=%d want 0 (취소 시 미저장)", n)
+	}
+}
+
+// TestOpenAppend_CoexistWithOpen — 시나리오 ⑦: 같은 dir을 Open() 세션(자체 UUIDv7)과 OpenAppend
+// 세션(cc:)이 shared+shared lease로 공존하며 동시 append해도 무손실이고, 각자 자기 session_id로
+// 기록한다.
+func TestOpenAppend_CoexistWithOpen(t *testing.T) {
+	dir := t.TempDir()
+	d := openT(t, dir, Options{Producer: "mcp/test"})
+	ad := openAppendT(t, dir, AppendOptions{ExternalSessionID: testCCSessionID, Producer: "hook/test"})
+
+	const perConn = 50
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	var appendErrs []error
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < perConn; i++ {
+			if _, _, _, err := d.Append(Event{Type: "coexist", Summary: "from-open"}); err != nil {
+				mu.Lock()
+				appendErrs = append(appendErrs, err)
+				mu.Unlock()
+			}
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for i := 0; i < perConn; i++ {
+			if _, _, _, err := ad.Append(context.Background(), Event{Type: "coexist", Summary: "from-hook"}); err != nil {
+				mu.Lock()
+				appendErrs = append(appendErrs, err)
+				mu.Unlock()
+			}
+		}
+	}()
+	wg.Wait()
+
+	if len(appendErrs) != 0 {
+		t.Fatalf("append 오류 %d건 (첫: %v)", len(appendErrs), appendErrs[0])
+	}
+	var total, fromHook int
+	if err := d.Reader().QueryRow("SELECT COUNT(*) FROM session_events WHERE event_type='coexist'").Scan(&total); err != nil {
+		t.Fatal(err)
+	}
+	if total != perConn*2 {
+		t.Fatalf("coexist 이벤트=%d want %d (무손실 위반)", total, perConn*2)
+	}
+	if err := d.Reader().QueryRow("SELECT COUNT(*) FROM session_events WHERE event_type='coexist' AND session_id=?", testCCSessionID).Scan(&fromHook); err != nil {
+		t.Fatal(err)
+	}
+	if fromHook != perConn {
+		t.Fatalf("hook(cc:) 세션 이벤트=%d want %d", fromHook, perConn)
+	}
+}
+
+// corruptEventsRootHeader — session_events b-tree 루트 페이지의 **헤더(오프셋 0: 페이지 타입
+// 바이트)**를 훼손한다. seedAndCorruptEvents(오프셋 +50, 셀 영역)은 quick_check(전수 스캔)는
+// 잡지만 append의 오른쪽-끝 삽입 경로는 우회할 수 있어 INSERT가 성공해 버린다 — 페이지 타입
+// 바이트를 무효화하면 루트를 로드하는 모든 접근(읽기·쓰기)이 로드 즉시 SQLITE_CORRUPT가 된다.
+// page1(DB 헤더·sqlite_master)은 건드리지 않으므로 migrate의 user_version 읽기는 통과한다.
+func corruptEventsRootHeader(t *testing.T, dir string) {
+	t.Helper()
+	d, err := Open(dir, Options{Producer: "test/corrupt"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 200; i++ { // 다단 b-tree가 되도록 시드(루트를 실 내부 페이지로)
+		if _, _, _, err := d.Append(Event{Type: "note", Summary: strings.Repeat("padtext ", 20)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var pageSize, rootPage int
+	if err := d.Reader().QueryRow("PRAGMA page_size").Scan(&pageSize); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Reader().QueryRow("SELECT rootpage FROM sqlite_master WHERE name='session_events'").Scan(&rootPage); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	dbPath := filepath.Join(dir, dbFileName)
+	raw, err := os.ReadFile(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	off := (rootPage - 1) * pageSize // 페이지 시작 = 헤더(타입 바이트 포함)
+	if off+200 > len(raw) {
+		t.Fatalf("corrupt helper: out of range (size=%d off=%d)", len(raw), off)
+	}
+	for i := 0; i < 200; i++ {
+		raw[off+i] = 0xEE // 0xEE는 유효 페이지 타입(2/5/10/13)이 아니다 → 로드 시 CORRUPT
+	}
+	if err := os.WriteFile(dbPath, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestOpenAppend_QuickCheckSkipped — 시나리오 ⑧: session_events 루트가 손상된 상태에서도
+// OpenAppend 자체는 성공하고(quick_check 미실행 — Open()은 여기서 ErrCorrupt), 손상은 첫
+// Append에서 오류로 사후 감지·분류된다(ClassifyStorageErr→ErrCorrupt).
+func TestOpenAppend_QuickCheckSkipped(t *testing.T) {
+	dir := t.TempDir()
+	corruptEventsRootHeader(t, dir) // page1은 온전 → migrate 통과, quick_check라면 여기서 ErrCorrupt
+
+	ad, err := OpenAppend(context.Background(), dir, AppendOptions{ExternalSessionID: testCCSessionID, Producer: "p"})
+	if err != nil {
+		t.Fatalf("OpenAppend는 quick_check를 생략하므로 성공해야 함, got %v", err)
+	}
+	defer ad.Close()
+
+	_, _, _, appendErr := ad.Append(context.Background(), Event{Type: "note", Summary: "x"})
+	if appendErr == nil {
+		t.Fatal("손상된 session_events에 append는 오류여야 함(append 시점 사후 감지)")
+	}
+	if !errors.Is(ClassifyStorageErr(appendErr), ErrCorrupt) {
+		t.Fatalf("appendErr=%v — ClassifyStorageErr로 ErrCorrupt 분류 가능해야 함", appendErr)
+	}
+}
+
+// TestValidateEvent_Boundaries — 시나리오 ⑨: 경계 이내(type 64B·summary 2048B·attributes
+// 4096B)는 통과, 위반(type 65B·타입 정규식·summary 2049B·attributes 4097B·총 8KB 초과)은 오류.
+func TestValidateEvent_Boundaries(t *testing.T) {
+	okCases := []struct {
+		name string
+		ev   Event
+	}{
+		{"type_64B", Event{Type: strings.Repeat("a", 64), Summary: "s"}},
+		{"summary_2048B", Event{Type: "note", Summary: strings.Repeat("s", 2048)}},
+		{"attributes_4096B", Event{Type: "note", Summary: "s", Attributes: json.RawMessage(strings.Repeat("a", 4096))}},
+	}
+	for _, tt := range okCases {
+		t.Run("ok_"+tt.name, func(t *testing.T) {
+			if err := ValidateEvent(tt.ev); err != nil {
+				t.Fatalf("ValidateEvent=%v want nil (경계 이내)", err)
+			}
+		})
+	}
+
+	bigRelated := make([]string, 5) // 5×512 = 2560 → type4+summary2048+attrs4096+2560 = 8708 > 8192
+	for i := range bigRelated {
+		bigRelated[i] = strings.Repeat("r", 512)
+	}
+	badCases := []struct {
+		name string
+		ev   Event
+	}{
+		{"type_65B", Event{Type: strings.Repeat("a", 65), Summary: "s"}},
+		{"type_regex", Event{Type: "Bad-Type", Summary: "s"}},
+		{"summary_2049B", Event{Type: "note", Summary: strings.Repeat("s", 2049)}},
+		{"attributes_4097B", Event{Type: "note", Summary: "s", Attributes: json.RawMessage(strings.Repeat("a", 4097))}},
+		{"total_8KB", Event{Type: "note", Summary: strings.Repeat("s", 2048), Attributes: json.RawMessage(strings.Repeat("a", 4096)), Related: bigRelated}},
+	}
+	for _, tt := range badCases {
+		t.Run("bad_"+tt.name, func(t *testing.T) {
+			if err := ValidateEvent(tt.ev); err == nil {
+				t.Fatalf("ValidateEvent=nil want 오류 (%s)", tt.name)
+			}
+		})
+	}
+}
+
+// TestOpenAppend_AppendRejectsInvalidStoresNothing — 시나리오 ⑨(저장 0건): AppendDB.Append는
+// 저장 전 ValidateEvent를 돌려 위반 이벤트를 거부하고 아무것도 저장하지 않는다.
+func TestOpenAppend_AppendRejectsInvalidStoresNothing(t *testing.T) {
+	dir := t.TempDir()
+	ad := openAppendT(t, dir, AppendOptions{ExternalSessionID: testCCSessionID, Producer: "p"})
+
+	_, _, _, err := ad.Append(context.Background(), Event{Type: "Bad Type!", Summary: "x"})
+	if err == nil {
+		t.Fatal("정규식 위반 event_type인데 Append 성공 — ValidateEvent 미호출?")
+	}
+	var n int
+	if err := ad.reader.QueryRow("SELECT COUNT(*) FROM session_events").Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Fatalf("session_events=%d want 0 (검증 실패 시 미저장)", n)
+	}
+}
+
+// TestEnsureSession_AtomicRollback — 시나리오 ⑩: session_start append 실패를 주입하면 sessions
+// 행도 함께 롤백된다(둘 다 부재). BEFORE INSERT 트리거로 session_start INSERT를 결정적으로
+// ABORT시켜 실제 단일-트랜잭션 롤백 경로를 강제한다("형식적 테스트 금지").
+func TestEnsureSession_AtomicRollback(t *testing.T) {
+	dir := t.TempDir()
+	ad := openAppendT(t, dir, AppendOptions{ExternalSessionID: testCCSessionID, Producer: "p"})
+
+	if _, err := ad.writer.Exec(`CREATE TRIGGER inject_fail BEFORE INSERT ON session_events
+		WHEN NEW.event_type='session_start' BEGIN SELECT RAISE(ABORT,'injected'); END;`); err != nil {
+		t.Fatalf("트리거 주입: %v", err)
+	}
+
+	created, err := ad.EnsureSession(context.Background(), "startup", "/wt")
+	if err == nil {
+		t.Fatal("EnsureSession err=nil want 주입 실패 표면화")
+	}
+	if created {
+		t.Fatal("created=true인데 롤백돼야 함")
+	}
+
+	var sessions, starts int
+	if err := ad.reader.QueryRow("SELECT COUNT(*) FROM sessions WHERE session_id=?", testCCSessionID).Scan(&sessions); err != nil {
+		t.Fatal(err)
+	}
+	if err := ad.reader.QueryRow("SELECT COUNT(*) FROM session_events WHERE session_id=? AND event_type=?",
+		testCCSessionID, eventTypeSessionStart).Scan(&starts); err != nil {
+		t.Fatal(err)
+	}
+	if sessions != 0 || starts != 0 {
+		t.Fatalf("원자성 위반: sessions=%d session_start=%d want 0/0 (둘 다 롤백)", sessions, starts)
 	}
 }
