@@ -126,8 +126,8 @@ context-router는 AI 코딩 에이전트 세션에서 발생하는 대형 원문
 | M0 설계서 | 12질문 전부 답하는 설계문서 + golden fixtures 목록 | 사용자 승인 |
 | v0.0.1 | **재정의 계약(D10)**: `ctr_search`/`ctr_fetch`/`ctr_transform` 기본 + `ctr_index`/`ctr_fetch_and_index` 옵트인 + `ctr_global_search` 별도 등록 + CLI 4종(doctor/stats/purge/upgrade) + 1-S 저장 | HANDOFF §14 acceptance gate(재정의 범위 적용). 전 범위 완료 전 태그 금지 |
 | v0.1 | **완료(구현 랜딩, 태그 대기)** — 세션 이벤트/복구(`ctr_record_event`·`ctr_session_summary`·`ctr_export_events`) — 피치는 "무손실 복원" | 설계 기준서 Part A MVP 기준 |
-| v0.2 | Claude Code/Codex 훅·플러그인 패키징 — 패시브 인덱싱(Shadow Recall), large-read guard 등 **강제 채널** 활성화 (T1의 본론) + exec 3종 구현·fixture·노출(실질 격리 + §8.3 계약, D10) | provider usage 기반 무작위 A/B 측정 |
-| v0.3+ | OS 샌드박스 재평가, global search UX, graph-engine 연동(ContextPack 소비) | 별도 결정 |
+| v0.2 | Claude Code 훅 패키징 — 패시브 인덱싱(Shadow Recall)·large-read guard·자동 계측 9종 등 **강제 채널** 활성화 (T1의 본론). exec 3종·Codex 훅은 분리(D21, 2026-07-20 개정 — v0.2 설계서) | 수동 A/B 측정 결과 기록(무작위 하네스는 후속, D27) |
+| v0.3+ | exec 3종(OS 격리 별도 트랙, §8.3 계약·D10), Codex 훅, 무작위 A/B·OTel, OS 샌드박스 재평가, global search UX, graph-engine 연동(ContextPack 소비) | 별도 결정 |
 
 핵심: **v0.0.1은 "코어 표면", v0.2가 "실제 절약이 발생하는 강제 채널"**이다. ADR-0008이 증명했듯 훅 없는 MCP 단독은 자발 채택의 한계(3.82%)에 갇힌다. 이 사실을 로드맵에 정직하게 반영한다.
 
