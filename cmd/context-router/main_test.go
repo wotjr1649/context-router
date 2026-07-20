@@ -534,6 +534,75 @@ func TestMainDispatch_Hook(t *testing.T) {
 	}
 }
 
+// TestMainDispatch_HookInstall_ExplicitStoreRoot: 브리프 ⑧ — main dispatch가 `--store-root`
+// 명시 여부(storeRootExplicit)와 원시값(storeRootRaw)을 cli.Run에 전달해, 명시된 경우에만 훅
+// 명령 args에 `--store-root <원시값>`이 주입되는지 실경로로 확인한다. prescanRootFlags가
+// 토큰을 소비하므로 이 전달이 없으면 cli.Run은 명시/기본을 구분할 수 없다(리뷰 반영).
+func TestMainDispatch_HookInstall_ExplicitStoreRoot(t *testing.T) {
+	readCommand := func(t *testing.T, proj string) string {
+		t.Helper()
+		data, err := os.ReadFile(filepath.Join(proj, ".claude", "settings.json"))
+		if err != nil {
+			t.Fatalf("read settings: %v", err)
+		}
+		var s struct {
+			Hooks map[string][]struct {
+				Hooks []struct {
+					Command string `json:"command"`
+				} `json:"hooks"`
+			} `json:"hooks"`
+		}
+		if err := json.Unmarshal(data, &s); err != nil {
+			t.Fatalf("parse: %v\n%s", err, data)
+		}
+		g := s.Hooks["SessionStart"]
+		if len(g) == 0 || len(g[0].Hooks) == 0 {
+			t.Fatalf("no SessionStart command: %s", data)
+		}
+		return g[0].Hooks[0].Command
+	}
+
+	t.Run("explicit_injects_raw_store_root", func(t *testing.T) {
+		proj := t.TempDir()
+		storeRoot := filepath.Join(t.TempDir(), "storeroot")
+		var handled bool
+		var derr error
+		captureStdout(t, func() {
+			handled, derr = dispatchCLI(context.Background(), []string{
+				"context-router", "hook", "install", "--root", proj, "--store-root", storeRoot,
+			})
+		})
+		if !handled {
+			t.Fatal("want handled=true")
+		}
+		if derr != nil {
+			t.Fatalf("hook install dispatch err=%v", derr)
+		}
+		cmd := readCommand(t, proj)
+		if !strings.Contains(cmd, "--store-root") || !strings.Contains(cmd, storeRoot) {
+			t.Fatalf("cmd=%q must inject explicit --store-root %q", cmd, storeRoot)
+		}
+	})
+
+	t.Run("default_omits_store_root", func(t *testing.T) {
+		proj := t.TempDir()
+		var handled bool
+		var derr error
+		captureStdout(t, func() {
+			handled, derr = dispatchCLI(context.Background(), []string{
+				"context-router", "hook", "install", "--root", proj,
+			})
+		})
+		if !handled || derr != nil {
+			t.Fatalf("handled=%v err=%v", handled, derr)
+		}
+		cmd := readCommand(t, proj)
+		if strings.Contains(cmd, "--store-root") {
+			t.Fatalf("cmd=%q must not inject store-root when not explicitly given", cmd)
+		}
+	})
+}
+
 // TestMainDispatch_Stats_Provider: 실제 dispatchCLI 경로로 `stats --provider <jsonl>`이
 // (--root/--store-root 없이) 끝까지 동작해 실측 토큰 합계를 출력하는지 확인한다(설계 §7 —
 // Task4 Fix Round 1: 이전에는 main의 서버 flagset이 --provider를 몰라 여기서 항상

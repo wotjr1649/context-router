@@ -546,7 +546,11 @@ func dispatchCLI(ctx context.Context, args []string) (handled bool, err error) {
 	if err != nil {
 		return true, err
 	}
-	return true, cli.Run(ctx, sub, rest, storeRoot, root, version, os.Stdout, os.Stderr)
+	// storeRootExplicit: prescanRootFlags가 --store-root 토큰을 소비하므로 cli는 명시/기본을
+	// 구분할 수 없다 — 여기서 판별해(원시값 비어있지 않음) 넘긴다. hook install이 명시된 경우에만
+	// 훅 명령 args에 --store-root <원시값>을 주입한다(설계 §7).
+	storeRootExplicit := storeRootRaw != ""
+	return true, cli.Run(ctx, sub, rest, storeRoot, root, version, storeRootExplicit, storeRootRaw, os.Stdout, os.Stderr)
 }
 
 func main() {

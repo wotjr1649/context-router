@@ -13,12 +13,12 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strings"
 	"time"
 
-	"github.com/wotjr1649/context-router/internal/hook"
 	"github.com/wotjr1649/context-router/internal/ident"
 	"github.com/wotjr1649/context-router/internal/session"
 	"github.com/wotjr1649/context-router/internal/store"
@@ -33,8 +33,10 @@ const releaseURL = "https://api.github.com/repos/wotjr1649/context-router/releas
 // session·hook) 중 하나임을 이미 확인했다. args는 doctor·upgrade에서 미사용, stats가 --provider
 // 고유 플래그 파싱에 쓴다(전용 flag.NewFlagSet, 설계 §7 — main의 serverFlags와 별개). stderr는
 // session export의 worktree 후보 목록·진단 안내 전용(태스크9, §7 stdout purity 게이트 선례 —
-// 그 외 서브커맨드는 여전히 미사용).
-func Run(ctx context.Context, sub string, args []string, storeRoot, projectRoot, version string, stdout, stderr io.Writer) error {
+// 그 외 서브커맨드는 여전히 미사용). storeRootExplicit/storeRootRaw는 hook install이 --store-root를
+// 명시된 경우에만 훅 명령 args에 주입하기 위한 것이다(prescanRootFlags가 토큰을 소비해 cli는
+// 명시/기본을 구분할 수 없으므로 main이 전달, 설계 §7).
+func Run(ctx context.Context, sub string, args []string, storeRoot, projectRoot, version string, storeRootExplicit bool, storeRootRaw string, stdout, stderr io.Writer) error {
 	switch sub {
 	case "doctor":
 		if len(args) > 0 {
@@ -63,15 +65,9 @@ func Run(ctx context.Context, sub string, args []string, storeRoot, projectRoot,
 	case "session":
 		return runSession(ctx, stdout, stderr, args, storeRoot)
 	case "hook":
-		// install/uninstall 하위 인자는 T8 — 지금은 무인자 hook만 처리한다(브리프 §Interfaces).
-		// hook.Run은 항상 0(fail-open, 설계 §2.3)이라 반환 int을 버리고 nil을 돌려준다 — main이
-		// os.Exit(1)로 오분기하지 않게. stdin은 purge 선례대로 os.Stdin을 직접 넘긴다(hook은
-		// projectRoot를 안 쓰고 stdin cwd로 세션 dir을 재도출한다).
-		if len(args) > 0 {
-			return fmt.Errorf("cli: hook: 예상치 않은 인자 %d개 (install/uninstall은 T8)", len(args))
-		}
-		hook.Run(ctx, os.Stdin, stdout, storeRoot, version, os.Getenv)
-		return nil
+		// install/uninstall + 러닝 훅(무인자/--no-shadow) 디스패치는 runHook이 소유한다(설계 §7,
+		// hook_install.go). 러닝 훅은 항상 exit 0(fail-open §2.3).
+		return runHook(ctx, args, storeRoot, storeRootRaw, storeRootExplicit, projectRoot, version, stdout)
 	default:
 		return fmt.Errorf("cli: 미지 서브커맨드: %s", sub)
 	}
@@ -942,8 +938,19 @@ func runDoctor(ctx context.Context, w io.Writer, storeRoot, projectRoot string) 
 	}
 
 	var reader *sql.DB // [3]에서 열린 read-only reader — 성공하면 [4]에서 재사용
+	// [4] fts5는 [3]과 [5] 사이(오름차순, §9 부채 정렬)에 출력한다 — reader는 [3] 성공 시 재사용,
+	// 미초기화/식별 실패면 nil(:memory: 프로브). 두 분기 같은 위치에 찍으려고 클로저로 묶는다.
+	doFTS5 := func() {
+		if err := probeFTS5(ctx, reader); err != nil {
+			fmt.Fprintf(w, "[4] fts5: 불가 (%v)\n", err)
+			failed = append(failed, "fts5")
+		} else {
+			fmt.Fprintln(w, "[4] fts5: 가능")
+		}
+	}
 	if canon.ProjectID == "" {
 		fmt.Fprintln(w, "[3] content.db: skip (project 식별 실패)")
+		doFTS5()
 		fmt.Fprintln(w, "[5] ledger.db: skip (project 식별 실패)")
 	} else {
 		projDir := filepath.Join(storeRoot, "projects", canon.ProjectID)
@@ -970,6 +977,7 @@ func runDoctor(ctx context.Context, w io.Writer, storeRoot, projectRoot string) 
 				}
 			}
 		}
+		doFTS5()
 
 		// [5] ledger.db 존재 여부(정보성 — 실패로 취급하지 않는다, ledger는 best-effort)
 		ledgerExists := false
@@ -977,14 +985,6 @@ func runDoctor(ctx context.Context, w io.Writer, storeRoot, projectRoot string) 
 			ledgerExists = true
 		}
 		fmt.Fprintf(w, "[5] ledger.db: exists=%v\n", ledgerExists)
-	}
-
-	// [4] FTS5 가용성
-	if err := probeFTS5(ctx, reader); err != nil {
-		fmt.Fprintf(w, "[4] fts5: 불가 (%v)\n", err)
-		failed = append(failed, "fts5")
-	} else {
-		fmt.Fprintln(w, "[4] fts5: 가능")
 	}
 
 	// [6]-[8] 세션 진단(설계 §7, 태스크9a): session.db quick_check·lease shared 프로브·
@@ -1054,6 +1054,44 @@ func runDoctor(ctx context.Context, w io.Writer, storeRoot, projectRoot string) 
 		}
 	}
 
+	// [9]-[13] 훅/사이드카 진단(설계 §7·§9 확장). 전부 정보성 — 미설치·미해석·drops 존재는
+	// 정상 상태라 실패로 세지 않는다(진단 본문에는 절대경로 허용, §12 canary는 반환 오류 전용).
+	settingsPath := filepath.Join(projectRoot, ".claude", "settings.json")
+	switch n, hookErr := countRegisteredHooks(settingsPath); {
+	case hookErr != nil:
+		fmt.Fprintln(w, "[9] hooks: 프로젝트 settings 파싱 실패")
+	case n == 0:
+		fmt.Fprintln(w, "[9] hooks: 미등록 (context-router hook install)")
+	default:
+		fmt.Fprintf(w, "[9] hooks: 등록됨 (%d개 이벤트)\n", n)
+	}
+
+	if p, lookErr := exec.LookPath(hookBinaryName); lookErr != nil {
+		fmt.Fprintln(w, "[10] context-router: PATH 미해석 (설치 후 훅 실행 가능)")
+	} else {
+		fmt.Fprintf(w, "[10] context-router: %s\n", p)
+	}
+
+	fmt.Fprintf(w, "[11] store-root path: %s\n", storeRoot)
+
+	// [12] drops 건수 — 두 위치 합산(T4 결정): <storeRoot>/드롭(식별 전) + <sessionDir>/드롭(worktree별).
+	rootDrops := countDropsLog(filepath.Join(storeRoot, dropsFileName))
+	wtDrops := 0
+	if canon.ProjectID != "" && canon.WorktreeID != "" {
+		wtDrops = countDropsLog(filepath.Join(storeRoot, "projects", canon.ProjectID, "worktrees", canon.WorktreeID, dropsFileName))
+	}
+	fmt.Fprintf(w, "[12] drops: store-root=%d worktree=%d total=%d\n", rootDrops, wtDrops, rootDrops+wtDrops)
+
+	// [13] 사이드카(drops.log) 기록 가능 여부 — worktree 세션 dir이 실재하면 그걸, 아니면
+	// store-root를 프로브한다(식별 전 drops는 store-root, 이후는 worktree dir, §2.3).
+	sidecarDir := storeRoot
+	if canon.ProjectID != "" && canon.WorktreeID != "" {
+		if wt := filepath.Join(storeRoot, "projects", canon.ProjectID, "worktrees", canon.WorktreeID); dirExistsCLI(wt) {
+			sidecarDir = wt
+		}
+	}
+	fmt.Fprintf(w, "[13] sidecar writable: %v\n", dirExistsCLI(sidecarDir) && probeWritable(sidecarDir))
+
 	fmt.Fprintln(w)
 	fmt.Fprint(w, hostSnippet)
 
@@ -1061,4 +1099,11 @@ func runDoctor(ctx context.Context, w io.Writer, storeRoot, projectRoot string) 
 		return fmt.Errorf("doctor: 진단 실패 항목 %d개", len(failed))
 	}
 	return nil
+}
+
+// dirExistsCLI — path가 실재하는 디렉터리인지(doctor 사이드카 프로브 보조 — probeWritable은
+// 존재하는 dir을 요구한다).
+func dirExistsCLI(path string) bool {
+	fi, err := os.Stat(path)
+	return err == nil && fi.IsDir()
 }
