@@ -612,6 +612,17 @@ func runSessionRecover(stderr io.Writer, args []string, storeRoot string) error 
 	}
 	dbDir := filepath.Join(projDir, "worktrees", wid)
 
+	// 부채정리 ④: 지정한 worktree 디렉터리가 아예 없으면(잘못된 --worktree id) 아래 session.db·
+	// 복구 자산 판정이 opaque하게 실패하므로(HasRecoverArtifacts의 dir 읽기 실패), 먼저 후보
+	// worktree id를 안내한다(listWorktreeDirs 재사용, resolveWorktreeID 다중 후보 분기와 동형).
+	if fi, statErr := os.Stat(dbDir); statErr != nil || !fi.IsDir() {
+		ids, _ := listWorktreeDirs(projDir)
+		if len(ids) > 0 {
+			return fmt.Errorf("session recover: worktree %q 없음 — 후보: %s", wid, strings.Join(ids, ", "))
+		}
+		return fmt.Errorf("session recover: worktree %q 없음 — 이 프로젝트에 worktree가 없습니다", wid)
+	}
+
 	// 최종리뷰 A1(Critical): session.db가 없어도 복구 자산(마커·인양본·백업 main)이 있으면
 	// 게시(⑥) rename 도중 crash로 session.db만 사라진 상태이므로 session.Recover에 위임한다
 	// (Recover가 모든 잔여 상태 판정을 소유 — T9b 재개 분기가 CLI로 도달 가능해야 영구 wedge가

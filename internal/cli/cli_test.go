@@ -1471,3 +1471,32 @@ func TestRunSessionRecover_PublishInterrupted_DelegatesDespiteMissingDB(t *testi
 		t.Fatalf("published db quick_check=%q err=%v want ok", qc, err)
 	}
 }
+
+// TestRecover_UnknownWorktreeListsCandidates — 부채정리 ④: 존재하지 않는 --worktree id로
+// recover 시 오류 문구가 실제 worktree 후보 id를 안내해야 한다(listWorktreeDirs 재사용). 수정
+// 전에는 opaque하게 "복구 자산 확인 실패"로 끝났다.
+func TestRecover_UnknownWorktreeListsCandidates(t *testing.T) {
+	storeRoot := t.TempDir()
+	projectRoot := t.TempDir()
+	canon, err := ident.Canonicalize(projectRoot)
+	if err != nil {
+		t.Fatalf("canonicalize: %v", err)
+	}
+	// 실제 worktree 하나를 만들어 후보가 존재하게 한다.
+	dbDir := filepath.Join(storeRoot, "projects", canon.ProjectID, "worktrees", canon.WorktreeID)
+	d, err := session.Open(dbDir, session.Options{Producer: "context-router/test"})
+	if err != nil {
+		t.Fatalf("session.Open: %v", err)
+	}
+	_ = d.Close()
+
+	var out, errOut bytes.Buffer
+	args := []string{"recover", "--project", projectRoot, "--worktree", "nonexistent-wid"}
+	err = Run(context.Background(), "session", args, storeRoot, projectRoot, "0.0.1-dev", &out, &errOut)
+	if err == nil {
+		t.Fatal("want error for nonexistent worktree id")
+	}
+	if !strings.Contains(err.Error(), canon.WorktreeID) {
+		t.Fatalf("error should list candidate worktree id %q, got %q", canon.WorktreeID, err.Error())
+	}
+}

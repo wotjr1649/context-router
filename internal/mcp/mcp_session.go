@@ -185,7 +185,8 @@ func registerRecordEvent(srv *mcp.Server, st *store.Store, sess *session.DB) {
 	mcp.AddTool(srv, &mcp.Tool{
 		Name: "ctr_record_event",
 		Description: "세션 이벤트 1건을 기록한다 — 이벤트는 요약+포인터다: 대용량은 ctr_index로 " +
-			"저장하고 artifact_refs로 가리킨다(이벤트 직렬화 총합 8192바이트 이하).",
+			"저장하고 artifact_refs로 가리킨다(이벤트 직렬화 총합 8192바이트 이하). " +
+			"attributes의 JSON 숫자는 float64로 디코딩되므로 큰 정수는 정밀도를 잃을 수 있다 — 정밀이 필요한 정수는 문자열로 담아라.",
 		Annotations: &mcp.ToolAnnotations{DestructiveHint: &destructive},
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, in RecordEventInput) (*mcp.CallToolResult, RecordEventOutput, error) {
 		start := time.Now()

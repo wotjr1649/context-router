@@ -1517,6 +1517,28 @@ func TestFetchDescriptionMentionsByteExactNotWebFetch(t *testing.T) {
 	}
 }
 
+// TestRecordEventSchemaAttributesFloat64Caveat — 부채정리 ③: ctr_record_event 설명에 JSON
+// 숫자가 float64로 디코딩돼 큰 정수는 정밀도를 잃는다는 attributes 캐비앗이 있어야 한다.
+func TestRecordEventSchemaAttributesFloat64Caveat(t *testing.T) {
+	cs, _, _, _ := newRecordEventTestServer(t)
+	lt, err := cs.ListTools(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("list tools: %v", err)
+	}
+	var desc string
+	for _, tl := range lt.Tools {
+		if tl.Name == "ctr_record_event" {
+			desc = tl.Description
+		}
+	}
+	if desc == "" {
+		t.Fatal("ctr_record_event not found in tools/list")
+	}
+	if !strings.Contains(desc, "float64") {
+		t.Fatalf("ctr_record_event description missing attributes float64 caveat: %q", desc)
+	}
+}
+
 // --- ctr_record_event (태스크 3, 설계 §3.1) ---
 
 // newRecordEventTestServer: newTestServer와 동형이지만 Session DB까지 배선해 ctr_record_event를

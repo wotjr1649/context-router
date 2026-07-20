@@ -607,14 +607,59 @@ func backupOriginal(dir string) (string, error) {
 	return backupName, nil
 }
 
-// finishPublish — 설계 §6.3 ⑥ 후반부: 인양본(단일 파일) → session.db, 디렉터리 fsync.
+// finishPublish — 설계 §6.3 ⑥ 후반부: 인양본(단일 파일) → session.db, 불완전 백업 고아 스윕,
+// 디렉터리 fsync.
 func finishPublish(dir string) error {
 	tmpPath := filepath.Join(dir, recoverTmpName)
 	dbPath := filepath.Join(dir, dbFileName)
 	if err := os.Rename(tmpPath, dbPath); err != nil {
 		return sanitizeIOErr("recover publish rename", err)
 	}
+	if err := sweepOrphanBackups(dir); err != nil {
+		return err
+	}
 	return syncDir(dir)
+}
+
+// sweepOrphanBackups — 부분 이동으로 남은 .bak-<ts> sidecar 고아(-wal/-shm만 있고 main 멤버가
+// 없는 것)를 제거한다. backupOriginal은 -shm→-wal→main 순으로 옮기므로 main rename 전 crash
+// 시 sidecar만 옮겨진 불완전 ts family가 잔재로 남는다(resumePublishFromTmp 주석의 "포렌식
+// 잔재"). WAL/SHM은 짝이 되는 main 없이는 무의미하므로 게시(main 확정) 직후 스윕한다 — main을
+// 가진 완전한 백업 family는 건드리지 않는다.
+func sweepOrphanBackups(dir string) error {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return sanitizeIOErr("recover dir read", err)
+	}
+	prefix := dbFileName + bakInfix
+	mains := make(map[string]bool) // ts → main 멤버 존재
+	for _, e := range entries {
+		name := e.Name()
+		if strings.HasPrefix(name, prefix) && !strings.HasSuffix(name, "-wal") && !strings.HasSuffix(name, "-shm") {
+			mains[strings.TrimPrefix(name, prefix)] = true
+		}
+	}
+	for _, e := range entries {
+		name := e.Name()
+		if !strings.HasPrefix(name, prefix) {
+			continue
+		}
+		var ts string
+		switch {
+		case strings.HasSuffix(name, "-wal"):
+			ts = strings.TrimSuffix(strings.TrimPrefix(name, prefix), "-wal")
+		case strings.HasSuffix(name, "-shm"):
+			ts = strings.TrimSuffix(strings.TrimPrefix(name, prefix), "-shm")
+		default:
+			continue // main 멤버 — 스윕 대상 아님
+		}
+		if !mains[ts] {
+			if err := os.Remove(filepath.Join(dir, name)); err != nil && !errors.Is(err, os.ErrNotExist) {
+				return sanitizeIOErr("recover orphan backup cleanup", err)
+			}
+		}
+	}
+	return nil
 }
 
 // resumePublishFromTmp — 마커 하 tmp-우선 재개(A2, 설계 §6.3 ⑦): 검증 완료된 인양본(tmp)이

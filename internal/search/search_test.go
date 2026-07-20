@@ -1,9 +1,11 @@
 package search
 
 import (
+	"database/sql"
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -530,5 +532,47 @@ func TestQuery_SnippetStemPrefixFallback(t *testing.T) {
 	}
 	if snip == text[:500] {
 		t.Fatalf("want snippet != 앞 500B fallback(증명: 중반 배치), got equal")
+	}
+}
+
+// TestFilterShortTokenCandidates_Direct — 부채정리 ①: content(chunks/text)·events
+// (session_events/summary) 두 near-clone을 흡수한 파라미터화 헬퍼를 임의 table/text-column으로
+// 직접 검증한다. 순서 보존·짧은토큰 리터럴(대소문자 무시) 필터·orphan id skip·shortToks 단락.
+func TestFilterShortTokenCandidates_Direct(t *testing.T) {
+	db, err := sql.Open("sqlite", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.SetMaxOpenConns(1) // :memory:는 연결별 독립 DB — 단일 연결로 고정해야 CREATE/SELECT가 같은 DB
+	t.Cleanup(func() { _ = db.Close() })
+	if _, err := db.Exec("CREATE TABLE docs(id INTEGER PRIMARY KEY, body TEXT)"); err != nil {
+		t.Fatal(err)
+	}
+	for _, r := range []struct {
+		id   int64
+		body string
+	}{
+		{1, "go service layer"},
+		{2, "rust service layer"},
+		{3, "GO uppercase match"},
+	} {
+		if _, err := db.Exec("INSERT INTO docs(id, body) VALUES(?,?)", r.id, r.body); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// shortToks=["go"]: id2("rust..." 리터럴 go 없음) 제외, id1·id3(대소문자 무시) 유지.
+	// 입력 순서(3,1,99,2)를 보존하고 존재하지 않는 id 99(orphan)는 조용히 skip.
+	got, err := filterShortTokenCandidates(t.Context(), db, "docs", "body", []int64{3, 1, 99, 2}, []string{"go"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := []int64{3, 1}; !slices.Equal(got, want) {
+		t.Fatalf("got %v want %v (순서 보존·리터럴 필터·orphan skip)", got, want)
+	}
+
+	// shortToks 없으면 입력 그대로 통과(단락).
+	if got, err := filterShortTokenCandidates(t.Context(), db, "docs", "body", []int64{1, 2}, nil); err != nil || !slices.Equal(got, []int64{1, 2}) {
+		t.Fatalf("empty shortToks should pass through, got %v err=%v", got, err)
 	}
 }
