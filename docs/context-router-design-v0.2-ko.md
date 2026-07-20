@@ -42,6 +42,7 @@
 
 - v0.1.0 코드 기반(main 334442b). 스키마 변경 없음 — event_type은 이미 자유 문자열(≤64B `[a-z0-9_]+`), 상한(summary ≤2048B, 이벤트 ≤8KB)도 승계.
 - **[plan 검증]** Claude Code 훅 현행 문서 확인 5건: ① PostToolUse가 도구 실패 시에도 발화하는지 + `tool_response` 오류 신호의 실제 형태, ② PreToolUse `permissionDecision` JSON 스키마 현행, ③ SessionStart payload(`source` 등), ④ settings.json `hooks` 스키마, ⑤ PostToolUse stdin `tool_response`의 최대 크기·절단 정책 실측(Shadow Recall의 "전문 확보" 전제 검증). 훅 stdin 골든 픽스처는 확인된 실페이로드 형태로 고정.
+- **T0 검증 결과(2026-07-21, 계약 상세 `internal/hook/testdata/README.md`)**: ① **불일치** — 도구 실패는 PostToolUse가 아니라 별도 이벤트 **`PostToolUseFailure`**(payload `error` 문자열 + `is_interrupt`(옵션 bool) + `duration_ms`, `tool_response` 없음)로 발화하고 PostToolUse는 성공 전용 → §3 매핑·§7 등록 개정. ②③ 확인(② `permissionDecision`은 {allow,deny,ask,defer}로 확장돼 있음 — 본 설계는 deny만 사용). ④ 확인 + 부수: settings `timeout` 단위는 **초**(command 기본 600). ⑤ 문서 침묵 → 전문 전달 가정 유지, T11 실측.
 
 ## 2. 훅 아키텍처
 
@@ -77,14 +78,14 @@
 | PostToolUse | Bash: git diff/commit/merge 계열 | `git_diff` |
 | PostToolUse | Bash: 빌드 명령 패턴표 | `build_run` |
 | PostToolUse | Bash: 테스트 명령 패턴표 | `test_run` |
-| PostToolUse | tool_response 오류 신호 | `error` |
+| PostToolUseFailure | — (도구 실패 시 발화: `error` 문자열 + `is_interrupt`; `tool_response` 없음 — T0 확인) | `error` |
 | PostToolUse | Shadow Recall 임계 초과로 인덱스됨 | `tool_result_summary` (기본 이벤트에 추가, artifact ref 포함) |
 | (Shadow Recall 저장 시) | content.db 아티팩트 생성 | `artifact_created` |
 | (guard 발화 시) | Read deny | `warning` |
 
-- 분류 우선순위: `error` > `git_diff`/`build_run`/`test_run`/`file_edit` > `tool_call`. 1 호출 = 기본 이벤트 1건(+조건부 `tool_result_summary`·`artifact_created`).
+- 분류 우선순위: `error`(판정은 이벤트명 `PostToolUseFailure` 기준 — 응답 파싱 아님, T0 확인) > `git_diff`/`build_run`/`test_run`/`file_edit` > `tool_call`. 1 호출 = 기본 이벤트 1건(+조건부 `tool_result_summary`·`artifact_created`).
 - Bash 분류는 선언적 패턴표(정규식 슬라이스, 테이블 테스트로 고정): git 계열(`git diff` `git commit` `git merge` `git rebase` 등), 빌드(`go build` `dotnet build` `npm run build` `msbuild` 등), 테스트(`go test` `dotnet test` `pytest` `vitest` `npm test` 등). 미매치는 `tool_call`.
-- **summary·payload는 allowlist 조립 계약**(summary는 FTS 색인 대상이라 비밀 운반 차단이 1차 방어): summary = `<도구명>: <허용 요소>`로만 조립한다. 허용 요소 — ① Bash: 분류 결과 + 명령 첫 토큰이 **명령 단어 형태(`[A-Za-z0-9_./-]+`)일 때만**(env 할당 `KEY=값`·비정형 토큰은 `<arg>`로 마스킹), ② 파일 도구: 워크스페이스 상대 경로, ③ 공통: 종료코드·바이트 크기·매치 패턴명. 원시 인자 전문·오류 문구 전문·tool_response 본문은 summary에 넣지 않는다(오류는 정규화된 분류·코드로). payload(attributes)도 같은 allowlist 필드만. 조립 후 ingest `Redact()`를 2차 방어로 통과시키고 redaction 상태 기록. 비밀 문자열의 FTS 미회수를 canary 테스트로 게이트(§10). 기존 상한(≤2048B) 안에서 절단.
+- **summary·payload는 allowlist 조립 계약**(summary는 FTS 색인 대상이라 비밀 운반 차단이 1차 방어): summary = `<도구명>: <허용 요소>`로만 조립한다. 허용 요소 — ① Bash: 분류 결과 + 명령 첫 토큰이 **명령 단어 형태(`[A-Za-z0-9_./-]+`)일 때만**(env 할당 `KEY=값`·비정형 토큰은 `<arg>`로 마스킹), ② 파일 도구: 워크스페이스 상대 경로, ③ 공통: 종료코드·바이트 크기·매치 패턴명. 원시 인자 전문·오류 문구 전문·tool_response 본문은 summary에 넣지 않는다(오류는 `PostToolUseFailure`의 `error` 문자열을 정규화한 분류·코드로만; `is_interrupt`는 attributes 허용 필드). payload(attributes)도 같은 allowlist 필드만. 조립 후 ingest `Redact()`를 2차 방어로 통과시키고 redaction 상태 기록. 비밀 문자열의 FTS 미회수를 canary 테스트로 게이트(§10). 기존 상한(≤2048B) 안에서 절단.
 - 볼륨 억제: 기존 이벤트 상한 + 훅 세션 기본 retention 30일(§2.2)이 담당 — 별도 카운트 캡은 두지 않는다(drop 카운터·실측으로 재평가).
 - 어휘는 여전히 스키마 비강제(§26 미지 타입 보존 의무 승계). v0.1 §2.2의 "권장 어휘" 목록에 9종을 추가하고, `warning`의 1급 event_type 승격은 v0.1 §2.2 "warning은 error payload로" 문면의 **명시 개정**임을 함께 기록.
 
@@ -113,7 +114,7 @@
 
 ## 7. 패키징·설치 (D28)
 
-- `context-router hook install [--user]`: 프로젝트 `.claude/settings.json`(기본) 또는 `--user`로 사용자 설정에 훅 등록을 멱등 병합. **병합 계약**: 기존 JSON 파싱 → 해당 훅 이벤트 배열에만 자기 항목 append/치환(식별은 명령 문자열 `context-router hook` + 버전 마커) → temp 파일 + rename **원자 쓰기**. 미지 키·타 도구의 훅 항목은 왕복 보존(보존 자체가 테스트 게이트, §10). `uninstall`이 대칭 제거. 등록 항목: SessionStart, PreToolUse(Read), PostToolUse(전 도구) + timeout 10s.
+- `context-router hook install [--user]`: 프로젝트 `.claude/settings.json`(기본) 또는 `--user`로 사용자 설정에 훅 등록을 멱등 병합. **병합 계약**: 기존 JSON 파싱 → 해당 훅 이벤트 배열에만 자기 항목 append/치환(식별은 명령 문자열 `context-router hook` + 버전 마커) → temp 파일 + rename **원자 쓰기**. 미지 키·타 도구의 훅 항목은 왕복 보존(보존 자체가 테스트 게이트, §10). `uninstall`이 대칭 제거. 등록 항목: SessionStart, PreToolUse(Read), PostToolUse(전 도구), PostToolUseFailure(전 도구) + timeout 10(단위 **초** — T0 확인, command 기본 600초).
 - 훅 명령은 PATH의 **`context-router`**(실행 파일명 — `ctr`은 MCP 등록 키일 뿐이다). **store-root 정합**: `.mcp.json` args의 `--store-root`는 훅 프로세스에 전파되지 않으므로(우선순위 플래그>`CTR_STORE_ROOT`>OS 기본, main 현행), 커스텀 store-root는 `CTR_STORE_ROOT` env 규약으로 통일하고 `install --store-root <p>`가 주어지면 훅 명령 args에 명시 주입한다. doctor 확장: 훅 등록 상태(설정 파일 파싱)·`context-router` PATH 해석·해석된 store-root·drops 건수를 항목으로 추가하고, 기존 항목 순서 nit([3]→[5]→[4])를 함께 정렬(§9 편승).
 - Claude Code plugin manifest(마켓플레이스형)는 이월 — 로컬 우선 단일 바이너리에는 settings 병합이 최소완결. Codex 훅(`cx:`)은 Claude Code 계약 안정 후(§12).
 
@@ -153,3 +154,5 @@
 **미채택(근거)**: ① 출처 인증(IPC/capability) — 로컬 단일 사용자 위협 모델에서 session.db 파일 자체가 같은 권한으로 쓰기 가능하므로 과잉설계; 형식 검증+생성 규칙+untrusted 표시로 한정. ② summary에서 경로·명령어 전면 제거 — 재소환 유용성이 제품 피치의 전제라 allowlist+`Redact()` 절충. ③ Shadow Recall 기본 비활성/프로필 게이트 편입 — `hook install` 행위가 동의 경계이며 `--no-shadow` 옵트아웃 제공으로 절충(강제 채널 테제 유지).
 
 **2차(플랜 체크포인트, 같은 날)**: 서브에이전트 11건 + Codex 12건 → 계획 수정으로 대부분 흡수, 설계 역전파 2건 — §4 guard 경계를 v0.2는 projectRoot만으로 축소 승인(훅이 서버 플래그를 알 수 없음), §10 스모크 명령 `--enable ingest` 정정. 계획에 반영된 계약 보강: 이벤트 상한 검증의 session 계층 이관(`ValidateEvent` — mcp 전용이던 것을 훅 경로가 공유), EnsureSession 단일 트랜잭션 원자성, init-lock·store open-lock의 ctx-aware 대기(무제한 sleep은 deadline 예산 위반), `ingest.Report.Hash` 추가(artifact URI 정본 해시 확보), uninstall 정확 일치 매칭, CTR_HOOKS_OFF stdin drain.
+
+**T0 실행 검증 반영(2026-07-21)**: [plan 검증] ① 불일치 확정 — 실패 계측 소스를 `PostToolUseFailure`(`error` 문자열·`is_interrupt`)로 개정(§1.3 결과 기록, §3 매핑표·분류 우선순위·allowlist 문면, §7 등록 4항목). ④ 부수 확인 — settings `timeout` 단위는 초(command 기본 600). ②③⑤ 가정 유지(⑤는 T11 실측). 골든 픽스처·stdin 키 계약: `internal/hook/testdata/README.md`.
