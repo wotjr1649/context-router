@@ -90,7 +90,7 @@
 
 ## 4. large-read guard (D25)
 
-- PreToolUse(matcher: Read) — **deny는 다음 4조건이 모두 성립할 때만**: ① 대상이 워크스페이스 경계 내(projectRoot+allowPaths — 경계 밖은 ingest가 `ErrWorkspace`로 색인 불가하므로 통과), ② 전체-파일 읽기(offset/limit으로 임계 미만 범위를 지정한 부분 읽기는 통과), ③ 파일 크기 > 임계(기본 256KiB, `CTR_GUARD_READ_MAX`), ④ 현장 인덱싱의 **성공 확인**(`Indexed==1` — denylist·oversize 파일은 ingest가 오류 없이 `Skipped`로 돌려주므로 err 검사만으로는 부족하다). 성립 시 stdout JSON `permissionDecision: "deny"` + "이미 인덱스됨 — `ctr_search`로 검색, `ctr_fetch`로 바이트 정확 조회" 안내.
+- PreToolUse(matcher: Read) — **deny는 다음 4조건이 모두 성립할 때만**: ① 대상이 워크스페이스 경계 내(**v0.2는 projectRoot만** — 훅 프로세스는 서버 플래그 `--allow-path`를 알 수 없으므로 allow-path 하위 파일은 통과시킨다(보수 방향 축소, 훅 설정 통일 시 v0.3 재검토); 경계 밖은 ingest가 `ErrWorkspace`로 색인 불가하므로 통과), ② 전체-파일 읽기(offset/limit으로 임계 미만 범위를 지정한 부분 읽기는 통과), ③ 파일 크기 > 임계(기본 256KiB, `CTR_GUARD_READ_MAX`), ④ 현장 인덱싱의 **성공 확인**(`Indexed==1` — denylist·oversize 파일은 ingest가 오류 없이 `Skipped`로 돌려주므로 err 검사만으로는 부족하다). 성립 시 stdout JSON `permissionDecision: "deny"` + "이미 인덱스됨 — `ctr_search`로 검색, `ctr_fetch`로 바이트 정확 조회" 안내.
 - ①~④ 중 하나라도 불성립이면 **allow 통과** — 색인되지 않은 파일을 막으면 Read도 `ctr_fetch`도 불가능한 접근 사각지대가 된다(deny 사유의 "이미 인덱스됨"은 실제 색인 성공 시에만 참). 시나리오(경계 밖·denylist·oversize·부분 읽기 = allow / 정상 대형 파일 = deny)는 §10 게이트.
 - 발화 시 `warning` 이벤트 기록(차단 파일·크기·안내 요지) — 가드 활동이 세션 DB에서 측정 가능. 이벤트 기록 실패는 deny 판정에 영향 없음(fail-open은 기록 경로에만 적용 — 가드 판정은 DB 없이 성립).
 - deny는 모델에 피드백되는 소프트 강제다. 사용자 복귀 경로: `CTR_HOOKS_OFF`, 임계 상향, `context-router hook uninstall`.
@@ -132,7 +132,7 @@
 
 - 단위: Bash 분류 패턴표 테이블 테스트, 분류 우선순위, summary allowlist 조립(env 할당 마스킹 포함), fail-open 경로(락 점유 중 exit 0 + drops 1줄), **deadline 예산**(경합·지연 주입 시 예산 내 drops 기록 후 exit 0 — 결정론적), 임계 경계(guard·shadow), settings 병합 멱등성 + **타 도구 항목·미지 키 왕복 보존**.
 - 통합: 훅 stdin 골든(§1.3 검증 후 실페이로드 형태로 고정), content.db 동시 쓰기(훅+서버), guard 판정 시나리오(경계 밖·denylist·oversize·부분 읽기 = allow / 정상 대형 파일 = deny + `Indexed==1` 확인) + deny stdout JSON 형식, **비밀 FTS 미회수 canary**(session summary·shadow 아티팩트 양쪽), `cc:` 세션의 summary/export 왕복(미지 세션 drop·session_start 1회 규칙 포함).
-- 실호스트 스모크: 본 저장소에서 `context-router hook install` 후 실제 세션 1회 — 최소 `session_start`/`tool_call`/`file_edit`/`test_run` 관측 + doctor GREEN(훅 항목 포함). 이때 `--profile ingest` fetch 정상 경로 스모크(session-08 §4.2 이월)를 함께 소화.
+- 실호스트 스모크: 본 저장소에서 `context-router hook install` 후 실제 세션 1회 — 최소 `session_start`/`tool_call`/`file_edit`/`test_run` 관측 + doctor GREEN(훅 항목 포함). 이때 `--enable ingest`로 fetch 정상 경로 스모크(session-08 §4.2 이월 — ingest는 프로필이 아니라 `--enable` 옵트인이다, v0.0.1 §4.4)를 함께 소화.
 - Go 테스트는 `-p 1` 메모리 캡 규율 유지. CI gofumpt·lint 기존 게이트 승계.
 
 ## 11. 마일스톤 스케치 (상세는 writing-plans)
@@ -151,3 +151,5 @@
 **주요 반영**: 훅 전용 session append API 신설(§2.1 — 현행 `Open()` 재사용 불가를 코드로 확정), Shadow Recall 자체 캡·denylist 대조(§5 — `runInline` 무검사 경로 확정), 훅 deadline 예산(§2.3 — 대기 합이 훅 timeout 10s 초과 가능 경로 확정), guard 4조건 판정(§4 — `Indexed==1` 확인·경계 밖/부분 읽기 통과), summary·payload allowlist 조립(§3), 세션 생성 SessionStart 한정 + 미지 세션 drop + UUID 형식 검증(§2.2), 훅 세션 기본 retention 30일(§2.2), settings 병합 원자성·타 도구 보존(§7), 훅 명령 `context-router` 정정·store-root env 규약(§7), 측정 대상 분리(§6), [plan 검증] ⑤ tool_response 절단 정책(§1.3), drops 사이드카 실패 도메인 한계(§2.3).
 
 **미채택(근거)**: ① 출처 인증(IPC/capability) — 로컬 단일 사용자 위협 모델에서 session.db 파일 자체가 같은 권한으로 쓰기 가능하므로 과잉설계; 형식 검증+생성 규칙+untrusted 표시로 한정. ② summary에서 경로·명령어 전면 제거 — 재소환 유용성이 제품 피치의 전제라 allowlist+`Redact()` 절충. ③ Shadow Recall 기본 비활성/프로필 게이트 편입 — `hook install` 행위가 동의 경계이며 `--no-shadow` 옵트아웃 제공으로 절충(강제 채널 테제 유지).
+
+**2차(플랜 체크포인트, 같은 날)**: 서브에이전트 11건 + Codex 12건 → 계획 수정으로 대부분 흡수, 설계 역전파 2건 — §4 guard 경계를 v0.2는 projectRoot만으로 축소 승인(훅이 서버 플래그를 알 수 없음), §10 스모크 명령 `--enable ingest` 정정. 계획에 반영된 계약 보강: 이벤트 상한 검증의 session 계층 이관(`ValidateEvent` — mcp 전용이던 것을 훅 경로가 공유), EnsureSession 단일 트랜잭션 원자성, init-lock·store open-lock의 ctx-aware 대기(무제한 sleep은 deadline 예산 위반), `ingest.Report.Hash` 추가(artifact URI 정본 해시 확보), uninstall 정확 일치 매칭, CTR_HOOKS_OFF stdin drain.
