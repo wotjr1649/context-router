@@ -1,0 +1,11 @@
+{
+  "session_id": "3f2504e0-4f89-41d3-9a0c-0305e82c3301",
+  "transcript_path": "C:\\Users\\js\\.claude\\projects\\C--Users-js-Documents-AI-DEV-context-router\\3f2504e0-4f89-41d3-9a0c-0305e82c3301.jsonl",
+  "cwd": "C:\\Users\\js\\Documents\\AI_DEV\\context-router",
+  "permission_mode": "default",
+  "hook_event_name": "PreToolUse",
+  "tool_name": "Read",
+  "tool_input": {
+    "file_path": "C:\\Users\\js\\Documents\\AI_DEV\\context-router\\docs\\context-router-design-v0.2-ko.md"
+  }
+}
