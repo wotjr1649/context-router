@@ -15,12 +15,26 @@ does not survive a machine move or `git clean`. Record-writing convention:
 
 ## Design & rules (read on demand, not auto-loaded)
 
-- Design spec (v0.0.1): `docs/context-router-design-v0.0.1-ko.md`
+- Design specs (delta chain): `docs/context-router-design-v0.0.1-ko.md` →
+  `-v0.1-ko.md` (D14–D20) → `-v0.2-ko.md` (D21–D28).
 - Code architecture / conventions: `docs/context-router-code-architecture-ko.md`
   — zero self-defined interfaces, D13 anti-fragmentation, dependency graph,
   single-point error mapping, corruption-prevention contracts.
 - Decisions D1–D13, tool audit, vision: `docs/context-router-vision-proposal-ko.md`,
   `docs/context-router-tool-audit-ko.md`.
+
+## Docs layout (directory convention, 2026-07-20)
+
+Two tiers, matching the ADR/KEP/RFC industry split — do not conflate:
+
+- `docs/*.md` — **living canonical contracts**: versioned design specs
+  (`context-router-design-v0.X-ko.md`), vision, architecture. Amended in place,
+  no date stamp. Brainstorm output that becomes a product contract is written
+  here directly (project override of the superpowers skill's default spec path).
+  Immutable decision history lives inside these docs as D-numbers.
+- `docs/superpowers/specs/` + `plans/` — **dated immutable process records**:
+  one-off/auxiliary specs and implementation plans (lowercase paths).
+- `docs/prompts/` — session handoff records (own CLAUDE.md, append-only).
 
 ## Standing protocols
 
