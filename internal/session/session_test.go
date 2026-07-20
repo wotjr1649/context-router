@@ -218,6 +218,26 @@ func TestOpen_CorruptHeaderFailsClosed(t *testing.T) {
 	}
 }
 
+// TestOpen_CorruptMiddlePageFailsClosed — 설계 §9 부채: 기존 헤더 훼손 fixture
+// (TestOpen_CorruptHeaderFailsClosed)는 첫 쿼리에서 SQLITE_NOTADB를 내는 거친 케이스라
+// modernc 질의 계획에 덜 민감했다. 여기서는 파일 헤더/페이지1은 온전한 채 session_events
+// b-tree의 중간(루트) 페이지만 훼손해도(recover_test의 seedAndCorruptEvents 재사용) Open의
+// quick_check 판정이 여전히 fail-closed(ErrCorrupt)로 안정적임을 고정한다 — migrate()의
+// user_version 읽기(페이지1)는 통과하고 ⑤ quick_check가 잡는 경로(§6.2). 헤더 스매시가 아닌
+// 서브틀한 손상에도 판정이 흔들리지 않는다는 것이 이 게이트의 몫.
+func TestOpen_CorruptMiddlePageFailsClosed(t *testing.T) {
+	dir := t.TempDir()
+	seedAndCorruptEvents(t, dir, 400) // 헤더가 아닌 session_events 중간 페이지 훼손(반환 매핑은 불요)
+
+	d, err := Open(dir, Options{Producer: "p"})
+	if d != nil {
+		t.Fatal("want nil *DB on ErrCorrupt")
+	}
+	if !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("err=%v want ErrCorrupt (중간 페이지 훼손 — quick_check fail-closed 판정 불안정)", err)
+	}
+}
+
 func readFileOrNil(t *testing.T, path string) []byte {
 	t.Helper()
 	b, err := os.ReadFile(path)
@@ -431,6 +451,91 @@ func TestOpen_ColdStartInitLockContention(t *testing.T) {
 	dbPath := filepath.Join(dir, dbFileName)
 	if _, err := os.Stat(dbPath); err != nil {
 		t.Fatalf("session.db 없음: %v", err)
+	}
+}
+
+// --- migrateBusyRetry 분기 게이트 (설계 §9 부채) ---
+// migrateBusyRetry는 session.go에 있는 unexported 함수라 분기 단위 테스트는 store_test.go가
+// 아닌 이 파일(package session)에만 놓을 수 있다(브리프 파일 배정 ②의 store_test.go 표기는
+// 오기 — 함수 위치와 불일치). malformed→ErrCorrupt 분기는 이미 TestOpen_CorruptHeaderFails
+// Closed가 migrate()의 첫 user_version 읽기를 통해 간접 커버한다. 여기서는 브리프가 명시한
+// BUSY 재시도 경로·소진 경로만 직접 게이트한다.
+
+// newBusyError — 진짜 SQLITE_BUSY(*sqlite.Error, code 5)를 잡아 반환한다. sqlite.Error는 필드가
+// 비공개이고 생성자도 없어 합성할 수 없다 — WAL은 writer 1명만 허용하므로 한 연결이 BEGIN
+// IMMEDIATE로 writer 락을 쥔 상태에서 busy_timeout(0)인 두 번째 연결이 BEGIN IMMEDIATE를
+// 시도하면 즉시 BUSY가 난다(결정적). 반환 오류는 연결이 닫혀도 유효한 값 객체다.
+func newBusyError(t *testing.T) error {
+	t.Helper()
+	dbPath := filepath.Join(t.TempDir(), "busy.db")
+	dsn := "file:" + filepath.ToSlash(dbPath) + "?_pragma=journal_mode(WAL)&_pragma=busy_timeout(0)&_txlock=immediate"
+	a, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	a.SetMaxOpenConns(1)
+	b, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+	b.SetMaxOpenConns(1)
+	if _, err := a.Exec("CREATE TABLE t(x)"); err != nil { // 첫 쓰기 — WAL 전환 확립
+		t.Fatal(err)
+	}
+	txA, err := a.BeginTx(context.Background(), nil) // _txlock=immediate → BEGIN IMMEDIATE, writer 락 점유
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer txA.Rollback()
+	_, busyErr := b.BeginTx(context.Background(), nil) // busy_timeout(0) → 즉시 BUSY
+	if busyErr == nil {
+		t.Fatal("두 번째 writer BeginTx가 성공 — SQLITE_BUSY 유도 실패")
+	}
+	if !isBusy(busyErr) {
+		t.Fatalf("isBusy=false — 잡은 오류가 SQLITE_BUSY/LOCKED가 아님: %v", busyErr)
+	}
+	return busyErr
+}
+
+// TestMigrateBusyRetry_RetryThenSucceed — BUSY 재시도 경로: op이 첫 호출엔 BUSY, 다음엔 nil이면
+// migrateBusyRetry는 재시도 후 성공(nil)하고 op을 정확히 2회 호출해야 한다(1회 재시도 —
+// vacuous 아님을 호출 횟수로 고정).
+func TestMigrateBusyRetry_RetryThenSucceed(t *testing.T) {
+	busy := newBusyError(t)
+	calls := 0
+	op := func() error {
+		calls++
+		if calls == 1 {
+			return busy
+		}
+		return nil
+	}
+	if err := migrateBusyRetry(op); err != nil {
+		t.Fatalf("migrateBusyRetry=%v want nil(재시도 후 성공)", err)
+	}
+	if calls != 2 {
+		t.Fatalf("op 호출=%d want 2(BUSY 1회→재시도→성공)", calls)
+	}
+}
+
+// TestMigrateBusyRetry_ExhaustionWrapsLeaseHeld — 소진 경로: op이 항상 BUSY면 유계 재시도(3회)를
+// 소진하고 ErrLeaseHeld로 wrap된 오류를 표면화해야 한다(원시 BUSY를 그대로 흘리지 않음 — T3
+// toToolError 매핑 계약). op은 정확히 len(delays)=3회 호출된다(무한 재시도 아님).
+func TestMigrateBusyRetry_ExhaustionWrapsLeaseHeld(t *testing.T) {
+	busy := newBusyError(t)
+	calls := 0
+	op := func() error {
+		calls++
+		return busy
+	}
+	err := migrateBusyRetry(op)
+	if !errors.Is(err, ErrLeaseHeld) {
+		t.Fatalf("err=%v want ErrLeaseHeld wrap on 재시도 소진", err)
+	}
+	if calls != 3 {
+		t.Fatalf("op 호출=%d want 3(유계 재시도 소진)", calls)
 	}
 }
 
