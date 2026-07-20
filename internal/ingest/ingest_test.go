@@ -765,3 +765,53 @@ func TestRunWeb_TitleCapped(t *testing.T) {
 		t.Fatalf("stored title = %d bytes, want <= %d", len(gotTitle.String), maxWebTitleBytes)
 	}
 }
+
+// TestSourceKindHookFlows: 시나리오 ⑦ — Request.SourceKind="hook"가 inline 경로에서
+// sources.source_kind로 저장된다. 빈 SourceKind는 기본 "inline"으로 유지(무해 회귀).
+func TestSourceKindHookFlows(t *testing.T) {
+	st, _ := openStoreT(t)
+	if _, err := Run(context.Background(), st, "", nil, Request{Content: "hook body\n", Title: "Read", SourceKind: "hook"}); err != nil {
+		t.Fatal(err)
+	}
+	var kind string
+	if err := st.Reader().QueryRow("SELECT source_kind FROM sources WHERE uri=?", "inline:Read").Scan(&kind); err != nil {
+		t.Fatalf("query source_kind: %v", err)
+	}
+	if kind != "hook" {
+		t.Fatalf("source_kind=%q want hook", kind)
+	}
+	// 기본값 회귀: SourceKind 미지정 → "inline".
+	if _, err := Run(context.Background(), st, "", nil, Request{Content: "inline body\n", Title: "Other"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Reader().QueryRow("SELECT source_kind FROM sources WHERE uri=?", "inline:Other").Scan(&kind); err != nil {
+		t.Fatalf("query default source_kind: %v", err)
+	}
+	if kind != "inline" {
+		t.Fatalf("default source_kind=%q want inline", kind)
+	}
+}
+
+// TestReportHashMatchesContentHash: inline 경로의 Report.Hash가 저장된 artifacts.content_hash
+// (=redact 후 저장본 sha256)와 일치한다 — artifact ref 조립의 정합 근거(§5, 시나리오 ⑨ 저수준).
+func TestReportHashMatchesContentHash(t *testing.T) {
+	st, _ := openStoreT(t)
+	body := "some response body\n"
+	rep, err := Run(context.Background(), st, "", nil, Request{Content: body, Title: "Read", SourceKind: "hook"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rep.Hash == "" {
+		t.Fatal("Report.Hash 비어있음 — inline 경로가 저장 해시를 반환해야 함")
+	}
+	var got string
+	if err := st.Reader().QueryRow("SELECT content_hash FROM artifacts LIMIT 1").Scan(&got); err != nil {
+		t.Fatalf("query content_hash: %v", err)
+	}
+	if rep.Hash != got {
+		t.Fatalf("Report.Hash=%q != artifacts.content_hash=%q", rep.Hash, got)
+	}
+	if rep.Hash != sha256hex(t, []byte(body)) {
+		t.Fatalf("Report.Hash가 저장본(redact 없음) sha256과 불일치")
+	}
+}

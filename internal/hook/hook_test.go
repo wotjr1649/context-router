@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/wotjr1649/context-router/internal/ident"
 	"github.com/wotjr1649/context-router/internal/session"
@@ -436,5 +437,312 @@ func TestHookInstrumentationCanaryGate(t *testing.T) {
 	}
 	if !errors.Is(qErr, sql.ErrNoRows) {
 		t.Fatalf("fts query: %v", qErr)
+	}
+}
+
+// ─── T6: Shadow Recall (설계 §5) ─────────────────────────────────────────────
+
+// shadowSetup — session_start를 발화해 세션을 만들고 (storeRoot, cwd, contentDir, sessDir)를
+// 반환한다. contentDir=<storeRoot>/projects/<pid>(content.db 위치, main·§5 join과 동일).
+func shadowSetup(t *testing.T) (storeRoot, cwd, contentDir, sdir string) {
+	t.Helper()
+	storeRoot = filepath.Join(t.TempDir(), "storeroot")
+	cwd = t.TempDir()
+	if rc := runHook(t, storeRoot, fixtureWith(t, "sessionstart.json", map[string]any{"cwd": cwd}), nil); rc != 0 {
+		t.Fatalf("sessionstart rc=%d want 0", rc)
+	}
+	canon, err := ident.Canonicalize(cwd)
+	if err != nil {
+		t.Fatalf("canonicalize: %v", err)
+	}
+	contentDir = filepath.Join(storeRoot, "projects", canon.ProjectID)
+	sdir = filepath.Join(contentDir, "worktrees", canon.WorktreeID)
+	return
+}
+
+// bigStdout — n바이트 'a'로 채운 tool_response 오브젝트 override(strings.Repeat 생성 —
+// 16KiB+ 리터럴 금지 규율). 직렬화 크기는 key/quote 오버헤드로 n보다 약간 크다.
+func bigStdout(n int) map[string]any {
+	return map[string]any{"stdout": strings.Repeat("a", n), "stderr": ""}
+}
+
+// contentArtifacts — contentDir의 content.db(read-only)에서 artifacts 행 수를 센다.
+// content.db 미존재(=Shadow 미저장)면 -1.
+func contentArtifacts(t *testing.T, contentDir string) int {
+	t.Helper()
+	if _, err := os.Stat(filepath.Join(contentDir, "content.db")); os.IsNotExist(err) {
+		return -1
+	}
+	st, err := store.Open(contentDir, true)
+	if err != nil {
+		t.Fatalf("open content.db ro: %v", err)
+	}
+	defer func() { _ = st.Close() }()
+	var n int
+	if err := st.Reader().QueryRow("SELECT count(*) FROM artifacts").Scan(&n); err != nil {
+		t.Fatalf("count artifacts: %v", err)
+	}
+	return n
+}
+
+// eventRefs — sdir/session.db에서 event_type 첫 행의 artifact_refs(JSON 배열)를 읽는다.
+func eventRefs(t *testing.T, sdir, eventType string) []string {
+	t.Helper()
+	reader, err := session.OpenReadOnly(sdir)
+	if err != nil {
+		t.Fatalf("open session.db: %v", err)
+	}
+	defer func() { _ = reader.Close() }()
+	var refsJSON sql.NullString
+	if err := reader.QueryRow("SELECT artifact_refs FROM session_events WHERE event_type=? LIMIT 1", eventType).Scan(&refsJSON); err != nil {
+		t.Fatalf("query %s refs: %v", eventType, err)
+	}
+	var refs []string
+	if refsJSON.Valid && refsJSON.String != "" {
+		if err := json.Unmarshal([]byte(refsJSON.String), &refs); err != nil {
+			t.Fatalf("unmarshal refs %q: %v", refsJSON.String, err)
+		}
+	}
+	return refs
+}
+
+// ① tool_response ≤ CTR_SHADOW_MIN(기본 16KiB) → 미저장(content.db 미생성).
+func TestShadowUnderMinSkips(t *testing.T) {
+	storeRoot, cwd, contentDir, _ := shadowSetup(t)
+	// 기본 픽스처(작은 tool_response)로 PostToolUse 발화.
+	in := fixtureWith(t, "posttooluse-bash.json", map[string]any{"cwd": cwd})
+	if rc := runHook(t, storeRoot, in, nil); rc != 0 {
+		t.Fatalf("rc=%d want 0", rc)
+	}
+	if n := contentArtifacts(t, contentDir); n != -1 {
+		t.Fatalf("artifacts=%d want -1(미저장) — MIN 이하는 Shadow 미저장", n)
+	}
+}
+
+// ② tool_response > MIN → content.db 아티팩트 + artifact_created + tool_result_summary,
+// tool_result_summary는 artifact ref(artifact://cc:<uuid>/sha256-<64hex>) 형식을 담는다.
+func TestShadowOverMinStores(t *testing.T) {
+	storeRoot, cwd, contentDir, sdir := shadowSetup(t)
+	in := fixtureWith(t, "posttooluse-bash.json", map[string]any{
+		"cwd":           cwd,
+		"tool_response": bigStdout(20000), // >16384
+	})
+	if rc := runHook(t, storeRoot, in, nil); rc != 0 {
+		t.Fatalf("rc=%d want 0", rc)
+	}
+	if n := contentArtifacts(t, contentDir); n != 1 {
+		t.Fatalf("artifacts=%d want 1", n)
+	}
+	reader, err := session.OpenReadOnly(sdir)
+	if err != nil {
+		t.Fatalf("open session.db: %v", err)
+	}
+	for _, et := range []string{"artifact_created", "tool_result_summary"} {
+		var n int
+		if err := reader.QueryRow("SELECT count(*) FROM session_events WHERE event_type=?", et).Scan(&n); err != nil {
+			_ = reader.Close()
+			t.Fatalf("count %s: %v", et, err)
+		}
+		if n != 1 {
+			_ = reader.Close()
+			t.Fatalf("%s events=%d want 1", et, n)
+		}
+	}
+	_ = reader.Close()
+
+	refs := eventRefs(t, sdir, "tool_result_summary")
+	if len(refs) != 1 {
+		t.Fatalf("tool_result_summary refs=%v want 1개", refs)
+	}
+	want := "artifact://cc:3f2504e0-4f89-41d3-9a0c-0305e82c3301/sha256-"
+	if !strings.HasPrefix(refs[0], want) {
+		t.Fatalf("ref=%q want prefix %q", refs[0], want)
+	}
+	hash := strings.TrimPrefix(refs[0], want)
+	if len(hash) != 64 {
+		t.Fatalf("ref hash 길이=%d want 64(hex sha256)", len(hash))
+	}
+}
+
+// ③ tool_response > CTR_SHADOW_MAX → 미저장 + drops(shadow-oversize). MAX를 env로 낮춰
+// 대용량 리터럴 없이 게이트를 검증한다.
+func TestShadowOversizeDrops(t *testing.T) {
+	storeRoot, cwd, contentDir, sdir := shadowSetup(t)
+	in := fixtureWith(t, "posttooluse-bash.json", map[string]any{
+		"cwd":           cwd,
+		"tool_response": bigStdout(25000),
+	})
+	env := map[string]string{"CTR_SHADOW_MIN": "100", "CTR_SHADOW_MAX": "20000"}
+	if rc := runHook(t, storeRoot, in, env); rc != 0 {
+		t.Fatalf("rc=%d want 0", rc)
+	}
+	if n := contentArtifacts(t, contentDir); n != -1 {
+		t.Fatalf("artifacts=%d want -1(oversize 미저장)", n)
+	}
+	if got := readDrops(t, sdir); !strings.Contains(got, "shadow-oversize") {
+		t.Fatalf("drops=%q want shadow-oversize", got)
+	}
+}
+
+// ④ 파일 유래 도구(Read) + denylist 경로(.env) → 미저장 + drops(shadow-denylist).
+func TestShadowDenylistSkips(t *testing.T) {
+	storeRoot, cwd, contentDir, sdir := shadowSetup(t)
+	in := fixtureWith(t, "posttooluse-bash.json", map[string]any{
+		"cwd":           cwd,
+		"tool_name":     "Read",
+		"tool_input":    map[string]any{"file_path": filepath.Join(cwd, ".env")},
+		"tool_response": bigStdout(20000), // MIN 통과해야 denylist 게이트 도달
+	})
+	if rc := runHook(t, storeRoot, in, nil); rc != 0 {
+		t.Fatalf("rc=%d want 0", rc)
+	}
+	if n := contentArtifacts(t, contentDir); n != -1 {
+		t.Fatalf("artifacts=%d want -1(denylist 미저장)", n)
+	}
+	if got := readDrops(t, sdir); !strings.Contains(got, "shadow-denylist") {
+		t.Fatalf("drops=%q want shadow-denylist", got)
+	}
+}
+
+// ⑤ NUL 바이트를 담은 tool_response(바이너리) → 미저장. 유효 JSON은 raw NUL을 못 담으므로
+// (json은 로 escape) shadowCapture를 직접 호출해 raw NUL을 주입한다.
+func TestShadowBinarySkips(t *testing.T) {
+	_, _, contentDir, sdir := shadowSetup(t)
+	ad, err := session.OpenAppend(context.Background(), sdir, session.AppendOptions{
+		ExternalSessionID: "cc:3f2504e0-4f89-41d3-9a0c-0305e82c3301",
+		Producer:          "context-router/test",
+	})
+	if err != nil {
+		t.Fatalf("OpenAppend: %v", err)
+	}
+	defer func() { _ = ad.Close() }()
+	body := append(bytes.Repeat([]byte("a"), 20000), 0x00) // raw NUL → 바이너리
+	in := hookInput{HookEventName: "PostToolUse", ToolName: "Bash", ToolResponse: json.RawMessage(body)}
+	shadowCapture(context.Background(), ad, in, sdir, contentDir, "cc:3f2504e0-4f89-41d3-9a0c-0305e82c3301", func(string) string { return "" })
+	if n := contentArtifacts(t, contentDir); n != -1 {
+		t.Fatalf("artifacts=%d want -1(바이너리 미저장)", n)
+	}
+}
+
+// ⑥ §10 canary 게이트(shadow 측): 응답 본문의 secret(분할 리터럴)이 저장 아티팩트에서
+// redaction=spans로 가려지고 FTS(trigram)에서 미회수.
+func TestShadowCanaryRedacted(t *testing.T) {
+	storeRoot, cwd, contentDir, _ := shadowSetup(t)
+	canary := "xox" + "b-Ca" + "naryLeak0123456789" // 런타임 조립 slack 형태
+	in := fixtureWith(t, "posttooluse-bash.json", map[string]any{
+		"cwd":           cwd,
+		"tool_response": map[string]any{"stdout": strings.Repeat("a", 20000) + " " + canary, "stderr": ""},
+	})
+	if rc := runHook(t, storeRoot, in, nil); rc != 0 {
+		t.Fatalf("rc=%d want 0", rc)
+	}
+	st, err := store.Open(contentDir, true)
+	if err != nil {
+		t.Fatalf("open content.db ro: %v", err)
+	}
+	defer func() { _ = st.Close() }()
+	var redaction string
+	if err := st.Reader().QueryRow("SELECT redaction FROM artifacts LIMIT 1").Scan(&redaction); err != nil {
+		t.Fatalf("query redaction: %v", err)
+	}
+	if redaction != "spans" {
+		t.Fatalf("redaction=%q want spans", redaction)
+	}
+	leak := "nary" + "Leak0123456789" // canary alnum 꼬리의 부분열
+	var rowid int64
+	qErr := st.Reader().QueryRow("SELECT rowid FROM fts_trigram WHERE fts_trigram MATCH ?", leak).Scan(&rowid)
+	if qErr == nil {
+		t.Fatalf("canary가 content.db FTS에서 회수됨 — 저장본 redaction 실패")
+	}
+	if !errors.Is(qErr, sql.ErrNoRows) {
+		t.Fatalf("fts query: %v", qErr)
+	}
+}
+
+// ⑧ 콘텐츠 해시 dedup — 같은 응답 2회 → 아티팩트 1개.
+func TestShadowDedup(t *testing.T) {
+	storeRoot, cwd, contentDir, _ := shadowSetup(t)
+	mk := func() []byte {
+		return fixtureWith(t, "posttooluse-bash.json", map[string]any{
+			"cwd":           cwd,
+			"tool_response": bigStdout(20000),
+		})
+	}
+	for i := 0; i < 2; i++ {
+		if rc := runHook(t, storeRoot, mk(), nil); rc != 0 {
+			t.Fatalf("call %d rc=%d want 0", i, rc)
+		}
+	}
+	if n := contentArtifacts(t, contentDir); n != 1 {
+		t.Fatalf("artifacts=%d want 1(해시 dedup)", n)
+	}
+}
+
+// ⑨ URI 해시 정합 — 조립한 ref의 hash == store.ArtifactHashByID(저장 artifact).
+func TestShadowRefHashMatches(t *testing.T) {
+	storeRoot, cwd, contentDir, sdir := shadowSetup(t)
+	in := fixtureWith(t, "posttooluse-bash.json", map[string]any{
+		"cwd":           cwd,
+		"tool_response": bigStdout(20000),
+	})
+	if rc := runHook(t, storeRoot, in, nil); rc != 0 {
+		t.Fatalf("rc=%d want 0", rc)
+	}
+	refs := eventRefs(t, sdir, "tool_result_summary")
+	if len(refs) != 1 {
+		t.Fatalf("refs=%v want 1", refs)
+	}
+	refHash := refs[0][strings.LastIndex(refs[0], "sha256-")+len("sha256-"):]
+
+	st, err := store.Open(contentDir, true)
+	if err != nil {
+		t.Fatalf("open content.db ro: %v", err)
+	}
+	defer func() { _ = st.Close() }()
+	var artID int64
+	if err := st.Reader().QueryRow("SELECT id FROM artifacts LIMIT 1").Scan(&artID); err != nil {
+		t.Fatalf("query artifact id: %v", err)
+	}
+	dbHash, err := st.ArtifactHashByID(context.Background(), artID)
+	if err != nil {
+		t.Fatalf("ArtifactHashByID: %v", err)
+	}
+	if refHash != dbHash {
+		t.Fatalf("ref hash=%q != ArtifactHashByID=%q", refHash, dbHash)
+	}
+}
+
+// ⑩ content store open-lock 점유 상태에서 deadline 300ms 내 실패 + drops(shadow-store) —
+// ctx-aware OpenContext 변형이 5초 하드 대기 대신 예산 안에서 포기한다.
+func TestShadowStoreLockDeadline(t *testing.T) {
+	storeRoot, cwd, contentDir, sdir := shadowSetup(t)
+	if err := os.MkdirAll(contentDir, 0o700); err != nil {
+		t.Fatalf("mkdir contentDir: %v", err)
+	}
+	// content.db.rebuild.lock을 외부 배타 선점(store 내부 상수와 동일 파일명).
+	release, err := store.AcquireLock(filepath.Join(contentDir, "content.db.rebuild.lock"), false)
+	if err != nil {
+		t.Fatalf("선점 잠금: %v", err)
+	}
+	defer release()
+
+	in := fixtureWith(t, "posttooluse-bash.json", map[string]any{
+		"cwd":           cwd,
+		"tool_response": bigStdout(20000),
+	})
+	start := time.Now()
+	rc := runHook(t, storeRoot, in, map[string]string{"CTR_HOOK_DEADLINE_MS": "300"})
+	elapsed := time.Since(start)
+	if rc != 0 {
+		t.Fatalf("rc=%d want 0(fail-open)", rc)
+	}
+	if elapsed > 2*time.Second {
+		t.Fatalf("deadline 미관측 의심 — %v 소요(5초 하드 대기 추정)", elapsed)
+	}
+	if n := contentArtifacts(t, contentDir); n > 0 {
+		t.Fatalf("artifacts=%d want 0/-1(락 점유로 미저장)", n)
+	}
+	if got := readDrops(t, sdir); !strings.Contains(got, "shadow-store") {
+		t.Fatalf("drops=%q want shadow-store", got)
 	}
 }

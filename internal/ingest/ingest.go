@@ -33,6 +33,9 @@ type Request struct {
 	Path, Content, Title string
 	Include, Exclude     []string
 	MaxFileBytes         int64
+	// SourceKind: inline 경로(Content 지정)의 provenance. ""=기본 "inline"; 훅 Shadow Recall은
+	// "hook"을 넘겨 SourceMeta.Kind로 전달한다(설계 §5). 파일/디렉터리 경로는 무시(항상 "file").
+	SourceKind string
 }
 
 type SkipEntry struct{ Path, Reason string }
@@ -41,6 +44,10 @@ type Report struct {
 	Indexed     int
 	BytesStored int64
 	Skipped     []SkipEntry
+	// Hash: inline 단건 경로에서 저장된 콘텐츠 해시(=artifacts.content_hash, redact 후 저장본의
+	// sha256). artifact ref(`artifact://…/sha256-<Hash>`) 조립에 쓴다(설계 §5). 파일/디렉터리
+	// 경로(다건)에서는 미설정(빈 문자열).
+	Hash string
 }
 
 const defaultMaxFileBytes = 5 << 20 // 5MB (§4.4 기본값)
@@ -664,12 +671,16 @@ func runInline(ctx context.Context, st *store.Store, req Request) (Report, error
 	if md {
 		mediaType = "text/markdown"
 	}
+	kind := req.SourceKind
+	if kind == "" {
+		kind = "inline"
+	}
 	_, err := st.Register(ctx, store.Registration{
 		StoredBytes: stored,
 		MediaType:   mediaType,
 		Redaction:   redaction,
 		Source: store.SourceMeta{
-			URI: "inline:" + req.Title, Kind: "inline",
+			URI: "inline:" + req.Title, Kind: kind,
 			Size: int64(len(raw)), SrcHash: srcHash,
 		},
 		Chunks: ChunkText(string(stored), md),
@@ -677,7 +688,11 @@ func runInline(ctx context.Context, st *store.Store, req Request) (Report, error
 	if err != nil {
 		return Report{}, fmt.Errorf("ingest: run: %w", err)
 	}
-	return Report{Indexed: 1, BytesStored: int64(len(stored))}, nil
+	// content_hash = redact 후 저장본의 sha256 (store.Register가 계산·저장하는 값과 동일 —
+	// 콘텐츠 주소라 결정적). Register가 반환하지 않으므로 여기서 동일 규칙으로 재계산해
+	// Report.Hash로 노출한다(artifact ref 조립용, 설계 §5).
+	csum := sha256.Sum256(stored)
+	return Report{Indexed: 1, BytesStored: int64(len(stored)), Hash: hex.EncodeToString(csum[:])}, nil
 }
 
 // Run ingests req.Path(파일|디렉터리) 또는 req.Content(inline)를 §3.0 파이프라인으로

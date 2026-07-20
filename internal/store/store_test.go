@@ -1541,3 +1541,28 @@ func FuzzSnapUTF8(f *testing.F) {
 		}
 	})
 }
+
+// TestOpenContextLockDeadline: writable OpenContext의 open-lock 대기가 ctx deadline을 관측해
+// 5초 하드 한도 이전에 ErrUnavailable로 포기한다(훅 deadline 예산, 설계 §2.3 — D13 예외 변형).
+// Open(=OpenContext(background))의 무기한(5초까지) 대기 기본 동작은 불변이다.
+func TestOpenContextLockDeadline(t *testing.T) {
+	dir := t.TempDir()
+	// content.db.rebuild.lock을 외부에서 배타 선점 — writable OpenContext의 lockStoreCtx가 경합.
+	release, err := AcquireLock(filepath.Join(dir, lockFileName), false)
+	if err != nil {
+		t.Fatalf("선점 잠금: %v", err)
+	}
+	defer release()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	_, err = OpenContext(ctx, dir, false)
+	elapsed := time.Since(start)
+	if !errors.Is(err, ErrUnavailable) {
+		t.Fatalf("err=%v want ErrUnavailable(ctx deadline 관측)", err)
+	}
+	if elapsed > 2*time.Second {
+		t.Fatalf("ctx 미관측 의심 — %v 소요(5초 하드 대기 추정)", elapsed)
+	}
+}

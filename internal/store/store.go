@@ -54,6 +54,15 @@ var errLockBusy = errors.New("store: lock busy")
 // 프로세스 크래시 → 커널이 잠금 자동 해제(stale lock 없음) / 마이그레이션 중 크래시 →
 // 다음 프로세스가 멱등 스키마 재실행. 잠금 해제 후 파일 자체는 삭제하지 않는다.
 func lockStore(dir string) (func(), error) {
+	return lockStoreCtx(context.Background(), dir)
+}
+
+// lockStoreCtx: lockStore의 ctx 관측 변형. 백오프 sleep 구간에서 ctx.Done()도 함께 감시해
+// deadline/취소 시 5s 하드 한도 이전에 ErrUnavailable로 포기한다(훅 deadline 예산 — 설계 §2.3).
+// context.Background()로 부르면 ctx.Done()이 절대 발화하지 않아 기존 lockStore와 완전히 동일하게
+// 동작한다(time.Sleep→select{time.After}는 무경합 시 동형). D13 예외: Open에 시그니처를 강제
+// 전파(전 호출부 40여 곳 파급)하는 대신 ctx-aware 대기 변형 1건만 추가한다(arch §2 등재).
+func lockStoreCtx(ctx context.Context, dir string) (func(), error) {
 	path := filepath.Join(dir, lockFileName)
 	deadline := time.Now().Add(5 * time.Second)
 	delay := 10 * time.Millisecond
@@ -68,7 +77,11 @@ func lockStore(dir string) (func(), error) {
 		if time.Now().After(deadline) {
 			return nil, fmt.Errorf("store open: 잠금 대기 초과: %w", ErrUnavailable)
 		}
-		time.Sleep(delay)
+		select {
+		case <-ctx.Done():
+			return nil, fmt.Errorf("store open: 잠금 대기 취소: %w", ErrUnavailable)
+		case <-time.After(delay):
+		}
 		if delay < 160*time.Millisecond {
 			delay *= 2
 		}
@@ -86,6 +99,14 @@ func AcquireLock(path string, shared bool) (release func(), err error) {
 }
 
 func Open(dir string, readOnly bool) (*Store, error) {
+	return OpenContext(context.Background(), dir, readOnly)
+}
+
+// OpenContext: Open과 동일하되 writable 오픈의 open-lock 대기(lockStoreCtx)를 ctx로 관측한다 —
+// deadline/취소 시 5s 하드 한도 이전에 ErrUnavailable로 포기시켜 훅 deadline 예산을 지킨다
+// (설계 §2.3). readOnly 경로는 잠금 대기가 없어 ctx를 쓰지 않는다. Open은 background ctx로
+// 위임해 기존 무기한(5s까지) 대기 동작을 그대로 유지한다.
+func OpenContext(ctx context.Context, dir string, readOnly bool) (*Store, error) {
 	if !readOnly {
 		// 0o700: store 루트+artifacts 모두 이 한 호출로 생성(MkdirAll이 만드는 모든 중간
 		// 디렉터리에 동일 perm 적용) — Windows는 Unix perm bit 무시(§10 no-op, 주석만).
@@ -93,7 +114,7 @@ func Open(dir string, readOnly bool) (*Store, error) {
 			return nil, sanitizeIOErr("open mkdir", err)
 		}
 		// migrate()·ledger.db DDL까지 포함해 Open 반환 시점(defer)까지 보유 — 아래 lockStore 주석 참조.
-		release, err := lockStore(dir)
+		release, err := lockStoreCtx(ctx, dir)
 		if err != nil {
 			return nil, err
 		}

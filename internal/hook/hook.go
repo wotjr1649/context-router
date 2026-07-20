@@ -79,17 +79,19 @@ func Run(ctx context.Context, stdin io.Reader, stdout io.Writer, storeRoot, vers
 		return 0
 	}
 	dir := filepath.Join(storeRoot, "projects", canon.ProjectID, "worktrees", canon.WorktreeID)
+	// content store dir는 프로젝트 레벨(worktree 하위 아님) — main의 content.db join과 동일(설계 §5).
+	contentDir := filepath.Join(storeRoot, "projects", canon.ProjectID)
 
 	ctx, cancel := context.WithTimeout(ctx, deadline(getenv))
 	defer cancel()
-	dispatch(ctx, in, dir, canon.WorktreeRoot, "cc:"+in.SessionID, version, getenv)
+	dispatch(ctx, in, dir, contentDir, canon.WorktreeRoot, "cc:"+in.SessionID, version, getenv)
 	return 0
 }
 
 // dispatch — 세션 식별 완료 후의 open·branch 경로(설계 §2.2). Run에서 분리해 핸들러 길이 규율
 // (≤50줄, D13)을 지키고 T5~T7이 합류할 단일 이음새를 만든다. 모든 실패는 drop 후 조용히 반환한다
 // (Run이 항상 0을 반환하는 fail-open 계약의 연장).
-func dispatch(ctx context.Context, in hookInput, dir, worktreeRoot, external, version string, getenv func(string) string) {
+func dispatch(ctx context.Context, in hookInput, dir, contentDir, worktreeRoot, external, version string, getenv func(string) string) {
 	ad, err := session.OpenAppend(ctx, dir, session.AppendOptions{
 		ExternalSessionID: external,
 		Producer:          fmt.Sprintf("context-router/%s", version),
@@ -117,14 +119,18 @@ func dispatch(ctx context.Context, in hookInput, dir, worktreeRoot, external, ve
 		appendDrop(dir, "unknown-session") // 미지 세션의 후속 이벤트는 drop(설계 §2.2)
 		return
 	}
-	// T5(계측 매핑) 이음새 — PostToolUse/PostToolUseFailure만 기본 이벤트 1건으로 기록한다(1 호출 =
-	// 1 이벤트; PreToolUse는 T7 guard 몫이라 여기서 tool_call로 중복 계상하지 않는다). T6 Shadow
-	// Recall·T7 guard가 이 분기에 합류한다(이음새 유지, 설계 §3·§2.2 "true → 처리").
+	// PostToolUse/PostToolUseFailure만 기본 이벤트 1건으로 기록한다(1 호출 = 1 이벤트; PreToolUse는
+	// T7 guard 몫이라 여기서 tool_call로 중복 계상하지 않는다). 설계 §3·§2.2 "true → 처리".
 	if in.HookEventName == "PostToolUse" || in.HookEventName == "PostToolUseFailure" {
 		if ev, ok := buildEvent(in); ok {
 			if _, _, _, err := ad.Append(ctx, ev); err != nil {
 				appendDrop(dir, "append-failed")
 			}
+		}
+		// T6 Shadow Recall — 성공 이벤트만(PostToolUseFailure는 tool_response가 없다). 기본 이벤트에
+		// 더해 조건부 artifact_created·tool_result_summary를 append한다(설계 §5). T7 guard도 합류 예정.
+		if in.HookEventName == "PostToolUse" {
+			shadowCapture(ctx, ad, in, dir, contentDir, external, getenv)
 		}
 	}
 }
