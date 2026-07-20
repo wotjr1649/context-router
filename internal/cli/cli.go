@@ -29,8 +29,8 @@ import (
 const releaseURL = "https://api.github.com/repos/wotjr1649/context-router/releases/latest"
 
 // Run: cli 서브커맨드 단일 진입점. storeRoot·projectRoot는 main이 이미 결정해 넘긴다(cli는
-// 재도출하지 않는다 — 설계서 §7 Produces). sub은 main이 6개 이름(doctor·upgrade·stats·purge·
-// session·hook) 중 하나임을 이미 확인했다. args는 doctor·upgrade에서 미사용, stats가 --provider
+// 재도출하지 않는다 — 설계서 §7 Produces). sub은 main이 7개 이름(doctor·upgrade·stats·purge·
+// session·hook·usage) 중 하나임을 이미 확인했다. args는 doctor·upgrade에서 미사용, stats가 --provider
 // 고유 플래그 파싱에 쓴다(전용 flag.NewFlagSet, 설계 §7 — main의 serverFlags와 별개). stderr는
 // session export의 worktree 후보 목록·진단 안내 전용(태스크9, §7 stdout purity 게이트 선례 —
 // 그 외 서브커맨드는 여전히 미사용). storeRootExplicit/storeRootRaw는 hook install이 --store-root를
@@ -53,6 +53,9 @@ func Run(ctx context.Context, sub string, args []string, storeRoot, projectRoot,
 		return runUpgrade(stdout, client, releaseURL, version)
 	case "stats":
 		return runStats(ctx, stdout, args, storeRoot, projectRoot)
+	case "usage":
+		// transcript 세션별 토큰 집계 + cc: 스트림 대조(hooks on/off) — 읽기 전용(설계 §6, 태스크9).
+		return runUsage(ctx, stdout, args, storeRoot, projectRoot)
 	case "purge":
 		// TTY 판정은 여기서만 한다(cli.Run 시그니처는 불변 — confirmPurge는 그 결과값만
 		// 받는 순수 함수, 설계 §7). os.Stdin.Stat() 실패는 TTY 아님으로 취급(비대화형 파이프
@@ -209,12 +212,57 @@ func readTranscriptLine(br *bufio.Reader, max int) (line []byte, truncated bool,
 // 반드시 취소를 반영한다.
 const cancelCheckLines = 256
 
-// runStatsProvider: path의 Claude Code transcript JSONL을 한 줄씩 스캔해 message.usage의 4개
-// 토큰 필드를 합산하고 usage 보유 레코드 수를 센다(설계 §6). 파싱 불가 줄·message.usage 없는
-// 줄·maxProviderLine을 넘는 줄은 로그 없이 skipped 카운트만 올린다(마지막 경우는 명령을
-// 중단시키지 않고 계속 진행). 실측 합계만 출력한다 — 절약 주장·비교 문구 없음. ctx가 취소되면
-// (cancelCheckLines줄마다 확인) 그 시점까지 읽은 결과를 버리고 오류로 중단한다 — 아주 큰
-// transcript를 스캔하는 동안 상위 호출자가 취소할 길을 남겨둔다.
+// usageSums — transcript 한 파일의 usage 합계(설계 §6). runStatsProvider(단일 파일 실측)와
+// runUsage(디렉터리 세션별 집계, 태스크9)가 공유한다 — 합산 로직은 sumTranscript 한 곳에만
+// 둔다(재구현 금지, 브리프 파서 재사용 계약).
+type usageSums struct {
+	input, output, cacheRead, cacheCreate, records, skipped int64
+}
+
+// sumTranscript: br(한 transcript 파일)을 개행 단위로 스캔해 message.usage의 4개 토큰 필드를
+// 합산하고 usage 보유 레코드 수를 센다(설계 §6). 파싱 불가 줄·message.usage 없는 줄·
+// maxProviderLine을 넘는 줄은 로그 없이 skipped 카운트만 올린다(마지막 경우는 스캔을
+// 중단시키지 않고 계속 진행). readTranscriptLine·providerUsageLine을 재사용한다. ctx가 취소되면
+// (cancelCheckLines줄마다 확인) 그 시점까지의 결과와 함께 ctx.Err()를 반환한다 — 오류 문구
+// 조립은 호출자 몫이다(runStatsProvider·sumTranscriptFile이 각자의 접두사로 사상).
+func sumTranscript(ctx context.Context, br *bufio.Reader) (usageSums, error) {
+	var s usageSums
+	for lineNo := 0; ; lineNo++ {
+		if lineNo%cancelCheckLines == 0 {
+			if cerr := ctx.Err(); cerr != nil {
+				return s, cerr
+			}
+		}
+		raw, truncated, ferr := readTranscriptLine(br, maxProviderLine)
+		switch {
+		case truncated:
+			s.skipped++
+		case len(raw) > 0:
+			var line providerUsageLine
+			if jsonErr := json.Unmarshal(bytes.TrimRight(raw, "\r\n"), &line); jsonErr != nil || line.Message.Usage == nil {
+				s.skipped++
+			} else {
+				u := line.Message.Usage
+				s.input += u.InputTokens
+				s.output += u.OutputTokens
+				s.cacheRead += u.CacheReadInputTokens
+				s.cacheCreate += u.CacheCreationInputTokens
+				s.records++
+			}
+		}
+		if ferr != nil {
+			if errors.Is(ferr, io.EOF) {
+				return s, nil
+			}
+			return s, ferr
+		}
+	}
+}
+
+// runStatsProvider: path의 Claude Code transcript JSONL을 sumTranscript로 스캔·합산해 실측
+// 합계만 출력한다 — 절약 주장·비교 문구 없음(설계 §6). ctx가 취소되면 오류로 중단한다(아주 큰
+// transcript 스캔 중 상위 호출자가 취소할 길). 파일 부재·기타 열기 실패·스캔 실패는 반환 오류에
+// 절대경로를 담지 않는다(§12 canary).
 func runStatsProvider(ctx context.Context, w io.Writer, path string) error {
 	f, err := os.Open(path)
 	if err != nil {
@@ -228,45 +276,149 @@ func runStatsProvider(ctx context.Context, w io.Writer, path string) error {
 	}
 	defer func() { _ = f.Close() }() // 읽기 전용 — 닫기 실패해도 데이터 유실 없음
 
-	var input, output, cacheRead, cacheCreate, records, skipped int64
-	br := bufio.NewReaderSize(f, 64*1024)
-	for lineNo := 0; ; lineNo++ {
-		if lineNo%cancelCheckLines == 0 {
-			if cerr := ctx.Err(); cerr != nil {
-				return fmt.Errorf("stats provider: 취소됨: %w", cerr)
-			}
+	s, err := sumTranscript(ctx, bufio.NewReaderSize(f, 64*1024))
+	if err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return fmt.Errorf("stats provider: 취소됨: %w", err)
 		}
-		raw, truncated, ferr := readTranscriptLine(br, maxProviderLine)
-		switch {
-		case truncated:
-			skipped++
-		case len(raw) > 0:
-			var line providerUsageLine
-			if jsonErr := json.Unmarshal(bytes.TrimRight(raw, "\r\n"), &line); jsonErr != nil || line.Message.Usage == nil {
-				skipped++
-			} else {
-				u := line.Message.Usage
-				input += u.InputTokens
-				output += u.OutputTokens
-				cacheRead += u.CacheReadInputTokens
-				cacheCreate += u.CacheCreationInputTokens
-				records++
-			}
-		}
-		if ferr != nil {
-			if errors.Is(ferr, io.EOF) {
-				break
-			}
-			return errors.New("stats provider: 스캔 실패")
-		}
+		return errors.New("stats provider: 스캔 실패")
 	}
 
-	fmt.Fprintf(w, "input_tokens: %d\n", input)
-	fmt.Fprintf(w, "output_tokens: %d\n", output)
-	fmt.Fprintf(w, "cache_read_input_tokens: %d\n", cacheRead)
-	fmt.Fprintf(w, "cache_creation_input_tokens: %d\n", cacheCreate)
-	fmt.Fprintf(w, "usage records: %d\n", records)
-	fmt.Fprintf(w, "skipped: %d\n", skipped)
+	fmt.Fprintf(w, "input_tokens: %d\n", s.input)
+	fmt.Fprintf(w, "output_tokens: %d\n", s.output)
+	fmt.Fprintf(w, "cache_read_input_tokens: %d\n", s.cacheRead)
+	fmt.Fprintf(w, "cache_creation_input_tokens: %d\n", s.cacheCreate)
+	fmt.Fprintf(w, "usage records: %d\n", s.records)
+	fmt.Fprintf(w, "skipped: %d\n", s.skipped)
+	return nil
+}
+
+// transcriptDirRe: Claude Code가 cwd를 transcript 디렉터리명으로 바꾸는 규칙(태스크9 Step 1
+// 실측 확정) — **영숫자가 아닌 모든 문자를 '-'로 치환**한다(예: C:\Users\js\Documents\AI_DEV\
+// context-router → C--Users-js-Documents-AI-DEV-context-router). plan의 "경로 구분자·콜론만"
+// 규칙과 다르다: 밑줄('_')·점('.')도 '-'가 된다(브리프 Step 1 — 실측이 plan과 어긋나면 실측을
+// 따른다).
+var transcriptDirRe = regexp.MustCompile(`[^A-Za-z0-9]`)
+
+// transcriptDirFor: projectRoot로부터 ~/.claude/projects/<치환명>을 유도한다(--transcripts
+// 미지정 시, 설계 §6). Claude Code의 리터럴 문자열 치환을 그대로 재현하므로 ident.Canonicalize
+// (심링크 해석)를 쓰지 않는다 — 디스크의 실제 디렉터리명은 심링크 미해석 cwd로 만들어졌다.
+// HomeDir 실패 시 빈 경로를 돌려주면 후속 os.ReadDir가 명확한 오류로 표면화한다.
+func transcriptDirFor(projectRoot string) string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	abs, err := filepath.Abs(projectRoot)
+	if err != nil {
+		abs = projectRoot // Abs 실패는 사실상 없음 — 그래도 원본으로 치환은 진행
+	}
+	return filepath.Join(home, ".claude", "projects", transcriptDirRe.ReplaceAllString(abs, "-"))
+}
+
+// loadCCSessions: 현재 worktree의 session.db에서 cc: 세션 식별자 집합을 읽는다(설계 §6 —
+// transcript 파일명 UUID가 cc:<uuid>로 존재 = 그 세션에 훅 스트림이 있었다는 정확 신호).
+// session.db가 없거나(훅 미사용) 열기·조회에 실패하면 빈 집합을 돌려준다 — 훅 스트림 증거가
+// 없으면 hooks:off로 수렴하는 것이 정확한 읽기(fail-soft). read-only(session.OpenReadOnly)라
+// 대상 DB를 오염시키지 않는다. projectRoot는 session.db 경로(pid/wid) 유도에만 쓰며 여기서는
+// ident.Canonicalize(정본 식별)를 쓴다 — transcriptDirFor의 리터럴 치환과 목적이 다르다.
+func loadCCSessions(ctx context.Context, storeRoot, projectRoot string) map[string]bool {
+	canon, err := ident.Canonicalize(projectRoot)
+	if err != nil || canon.ProjectID == "" {
+		return nil
+	}
+	sessDir := filepath.Join(storeRoot, "projects", canon.ProjectID, "worktrees", canon.WorktreeID)
+	if fi, statErr := os.Stat(filepath.Join(sessDir, "session.db")); statErr != nil || fi.IsDir() {
+		return nil // session.db 없음 → 전부 hooks:off
+	}
+	db, err := session.OpenReadOnly(sessDir)
+	if err != nil {
+		return nil
+	}
+	defer func() { _ = db.Close() }()
+	rows, err := db.QueryContext(ctx, "SELECT session_id FROM sessions WHERE session_id LIKE 'cc:%'")
+	if err != nil {
+		return nil
+	}
+	defer func() { _ = rows.Close() }()
+	set := make(map[string]bool)
+	for rows.Next() {
+		var id string
+		if rows.Scan(&id) == nil {
+			set[id] = true
+		}
+	}
+	return set
+}
+
+// sumTranscriptFile: path 파일을 열어 sumTranscript로 합산한다(runUsage 디렉터리 순회 보조 —
+// 파일마다 자체 defer Close로 즉시 닫아 다중 파일에서 fd가 함수 종료까지 쌓이지 않게 한다).
+// ctx 취소는 그대로 전파, 그 외 열기·스캔 실패는 정적 메시지로 사상한다(§12 canary).
+func sumTranscriptFile(ctx context.Context, path string) (usageSums, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return usageSums{}, errors.New("usage: transcript 파일 열기 실패")
+	}
+	defer func() { _ = f.Close() }()
+	s, err := sumTranscript(ctx, bufio.NewReaderSize(f, 64*1024))
+	if err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return usageSums{}, fmt.Errorf("usage: 취소됨: %w", err)
+		}
+		return usageSums{}, errors.New("usage: transcript 스캔 실패")
+	}
+	return s, nil
+}
+
+// runUsage: `context-router usage [--transcripts <dir>]` — 읽기 전용 측정 리포트(설계 §6·D27).
+// transcript 디렉터리(미지정 시 cwd에서 transcriptDirFor로 유도)의 각 <uuid>.jsonl(= 호스트
+// 세션 1개)을 sumTranscript로 스캔해 usage 토큰을 세션별로 합산하고, 파일명 UUID가 현재
+// worktree session.db에 cc:<uuid>로 존재하면 hooks:on, 아니면 hooks:off로 표기해 TSV 표로
+// 출력한다. 네트워크 없음. 토큰·달러 환산·절약률 주장 없음(§6 — 실측 합계만). 손상 줄은
+// sumTranscript 내부에서 skip되어 명령을 중단시키지 않는다.
+func runUsage(ctx context.Context, w io.Writer, args []string, storeRoot, projectRoot string) error {
+	fs := flag.NewFlagSet("usage", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	transcripts := fs.String("transcripts", "", "Claude Code transcript 디렉터리(생략 시 cwd에서 유도)")
+	if err := fs.Parse(args); err != nil {
+		return fmt.Errorf("usage: 플래그 파싱 실패: %w", err)
+	}
+	if rest := fs.Args(); len(rest) > 0 {
+		return fmt.Errorf("usage: 예상치 않은 인자 %d개", len(rest))
+	}
+
+	dir := *transcripts
+	if dir == "" {
+		dir = transcriptDirFor(projectRoot)
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		// §12 canary: os.ReadDir의 *fs.PathError는 절대경로를 담는다 — 원문을 %w로 감싸지
+		// 않고 정적 메시지만(runStatsProvider의 파일 부재 처리와 동일 관례).
+		if errors.Is(err, os.ErrNotExist) {
+			return errors.New("usage: transcript 디렉터리가 없습니다")
+		}
+		return errors.New("usage: transcript 디렉터리 열기 실패")
+	}
+
+	ccSet := loadCCSessions(ctx, storeRoot, projectRoot)
+
+	fmt.Fprintln(w, "session\tinput\toutput\tcache_read\tcache_creation\trecords\thooks")
+	for _, e := range entries { // os.ReadDir는 파일명 오름차순 정렬을 보장(결정론)
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".jsonl") {
+			continue
+		}
+		s, sumErr := sumTranscriptFile(ctx, filepath.Join(dir, e.Name()))
+		if sumErr != nil {
+			return sumErr // ctx 취소·I/O 오류만 여기 도달(손상 줄은 sumTranscript 내부에서 skip)
+		}
+		uuid := strings.TrimSuffix(e.Name(), ".jsonl")
+		hooks := "hooks:off"
+		if ccSet["cc:"+uuid] {
+			hooks = "hooks:on"
+		}
+		fmt.Fprintf(w, "%s\t%d\t%d\t%d\t%d\t%d\t%s\n", uuid, s.input, s.output, s.cacheRead, s.cacheCreate, s.records, hooks)
+	}
 	return nil
 }
 
