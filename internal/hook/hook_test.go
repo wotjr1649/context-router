@@ -331,8 +331,8 @@ func TestClassify(t *testing.T) {
 		{"test_pytest", "PostToolUse", "pytest -q", "test_run"},
 		{"default_ls", "PostToolUse", "ls -la", "tool_call"},
 		{"default_echo", "PostToolUse", "echo hi", "tool_call"},
-		{"neg_grep_go_test", "PostToolUse", `grep -R "go test" .`, "tool_call"},  // F8: 인자 속 부분열 미분류
-		{"neg_echo_npm_build", "PostToolUse", "echo npm run build", "tool_call"}, // F8: 인자 속 부분열 미분류
+		{"neg_grep_go_test", "PostToolUse", `grep -R "go test" .`, "tool_call"},    // F8: 인자 속 부분열 미분류
+		{"neg_echo_npm_build", "PostToolUse", "echo npm run build", "tool_call"},   // F8: 인자 속 부분열 미분류
 		{"sep_cd_and_go_test", "PostToolUse", "cd x && go test ./...", "test_run"}, // F8: 셸 구분자 직후는 분류
 		{"priority_failure_over_test", "PostToolUseFailure", "go test ./...", "error"},
 	}

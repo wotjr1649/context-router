@@ -1934,9 +1934,9 @@ func TestE2E_HookForcedChannel(t *testing.T) {
 	}
 	// PostToolUse 3건.
 	posts := [][]byte{
-		hookFixture(t, "posttooluse-bash.json", map[string]any{"cwd": proj}),                                        // test_run(소)
-		hookFixture(t, "posttooluse-write.json", map[string]any{"cwd": proj}),                                       // file_edit
-		hookFixture(t, "posttooluse-bash.json", map[string]any{"cwd": proj, "tool_response": bigToolResponse()}),    // test_run + shadow
+		hookFixture(t, "posttooluse-bash.json", map[string]any{"cwd": proj}),                                     // test_run(소)
+		hookFixture(t, "posttooluse-write.json", map[string]any{"cwd": proj}),                                    // file_edit
+		hookFixture(t, "posttooluse-bash.json", map[string]any{"cwd": proj, "tool_response": bigToolResponse()}), // test_run + shadow
 	}
 	for i, p := range posts {
 		if rc, _ := runHookOneShot(t, bin, storeRoot, p, nil); rc != 0 {
