@@ -252,6 +252,28 @@ func TestHookHooksOffDrainsStdin(t *testing.T) {
 	}
 }
 
+// ⑨ stdin이 상한(maxStdinBytes) 초과 → drop(stdin-oversize)·세션 DB 미생성·stdin EOF까지 drain
+// (fail-open 봉인, 거대 payload OOM 방지). payload는 strings.Repeat 생성(리터럴 금지).
+func TestHookStdinOversize(t *testing.T) {
+	storeRoot := filepath.Join(t.TempDir(), "storeroot")
+	cwd := t.TempDir()
+	payload := []byte(strings.Repeat("a", maxStdinBytes+4096)) // 상한 초과 + drain할 잉여
+	cr := &countReader{r: bytes.NewReader(payload)}
+	rc := Run(context.Background(), cr, io.Discard, storeRoot, "test", func(string) string { return "" })
+	if rc != 0 {
+		t.Fatalf("rc=%d want 0", rc)
+	}
+	if got := readDrops(t, storeRoot); !strings.Contains(got, "stdin-oversize") {
+		t.Fatalf("drops=%q want stdin-oversize", got)
+	}
+	if cr.n != len(payload) {
+		t.Fatalf("drained %d bytes, want %d (stdin not drained to EOF)", cr.n, len(payload))
+	}
+	if _, err := os.Stat(filepath.Join(sessDir(t, storeRoot, cwd), "session.db")); !os.IsNotExist(err) {
+		t.Fatalf("session.db must not exist on oversize stdin, stat err=%v", err)
+	}
+}
+
 // ─── T5: 계측 매핑 + summary allowlist (설계 §3) ──────────────────────────────
 
 // bashEvent — Bash tool_input(command)을 담은 hookInput을 만든다(classify 순수 함수 입력).
@@ -277,6 +299,9 @@ func TestClassify(t *testing.T) {
 		{"test_pytest", "PostToolUse", "pytest -q", "test_run"},
 		{"default_ls", "PostToolUse", "ls -la", "tool_call"},
 		{"default_echo", "PostToolUse", "echo hi", "tool_call"},
+		{"neg_grep_go_test", "PostToolUse", `grep -R "go test" .`, "tool_call"},  // F8: 인자 속 부분열 미분류
+		{"neg_echo_npm_build", "PostToolUse", "echo npm run build", "tool_call"}, // F8: 인자 속 부분열 미분류
+		{"sep_cd_and_go_test", "PostToolUse", "cd x && go test ./...", "test_run"}, // F8: 셸 구분자 직후는 분류
 		{"priority_failure_over_test", "PostToolUseFailure", "go test ./...", "error"},
 	}
 	for _, tc := range cmds {

@@ -556,6 +556,48 @@ func TestMainDispatch_Hook(t *testing.T) {
 	}
 }
 
+// TestMainDispatch_Hook_AbsorbsPreprocError: F2 — 실행 훅(install/uninstall 아님)의 전처리
+// 실패는 exit 1이 아니라 흡수돼야 한다(설계 §2 always-exit-0). store-root 기본값 도출을 OS별
+// env를 비워 실패시키는 seam으로 주입하고, dispatchCLI가 handled=true·err=nil을 반환하는지 본다.
+// install은 종전대로 오류를 전파해야 한다(흡수 대상은 실행 훅 한정).
+func TestMainDispatch_Hook_AbsorbsPreprocError(t *testing.T) {
+	// storeRootFor → defaultStoreRoot 실패 강제(3-OS): windows LOCALAPPDATA, linux XDG/HOME,
+	// darwin HOME 모두 비운다(CTR_STORE_ROOT도 비워 env 우선순위 우회 차단).
+	t.Setenv("CTR_STORE_ROOT", "")
+	t.Setenv("LOCALAPPDATA", "")
+	t.Setenv("XDG_DATA_HOME", "")
+	t.Setenv("HOME", "")
+
+	t.Run("running_hook_absorbs", func(t *testing.T) {
+		origStdin := os.Stdin
+		r, w, err := os.Pipe()
+		if err != nil {
+			t.Fatalf("pipe: %v", err)
+		}
+		_ = w.Close() // 즉시 EOF — 흡수 경로가 stdin을 drain
+		os.Stdin = r
+		defer func() { os.Stdin = origStdin; _ = r.Close() }()
+
+		handled, err := dispatchCLI(context.Background(), []string{"context-router", "hook"})
+		if !handled {
+			t.Fatal("want handled=true for hook subcommand")
+		}
+		if err != nil {
+			t.Fatalf("running hook preproc error must be absorbed (exit 0), got err=%v", err)
+		}
+	})
+
+	t.Run("install_still_errors", func(t *testing.T) {
+		handled, err := dispatchCLI(context.Background(), []string{"context-router", "hook", "install", "--root", t.TempDir()})
+		if !handled {
+			t.Fatal("want handled=true for hook install")
+		}
+		if err == nil {
+			t.Fatal("install preproc error must NOT be absorbed, got nil")
+		}
+	})
+}
+
 // TestMainDispatch_HookInstall_ExplicitStoreRoot: 브리프 ⑧ — main dispatch가 `--store-root`
 // 명시 여부(storeRootExplicit)와 원시값(storeRootRaw)을 cli.Run에 전달해, 명시된 경우에만 훅
 // 명령 args에 `--store-root <원시값>`이 주입되는지 실경로로 확인한다. prescanRootFlags가

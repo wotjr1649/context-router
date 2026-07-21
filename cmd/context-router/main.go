@@ -515,6 +515,20 @@ func prescanRootFlags(args []string) (root, storeRoot string, rest []string, err
 // handled=false면 호출자가 평소대로 MCP 서버 경로(run)로 진행해야 한다 — cli는 storeRoot를
 // 재도출하지 않는다(설계 §7 Produces). --root/--store-root를 제외한 나머지 args는 그대로
 // cli.Run에 넘겨 서브커맨드 전용 flagset(stats의 --provider 등)이 스스로 파싱한다.
+// absorbHookPreprocErr — 실행 훅(install/uninstall이 아닌 `hook`)의 전처리 오류를 fail-open으로
+// 흡수한다(설계 §2 always-exit-0): stdin을 EOF까지 소비(broken pipe 방지)하고 stderr 1줄
+// (절대경로·비밀 미포함)만 남긴 뒤 nil(exit 0)을 돌려준다. install/uninstall·그 외 서브커맨드는
+// 원래 오류를 그대로 전파해 기존 exit 1 동작을 유지한다.
+func absorbHookPreprocErr(sub string, rest []string, err error) error {
+	isRunningHook := sub == "hook" && (len(rest) == 0 || (rest[0] != "install" && rest[0] != "uninstall"))
+	if !isRunningHook {
+		return err
+	}
+	_, _ = io.Copy(io.Discard, os.Stdin)
+	fmt.Fprintln(os.Stderr, "ctr: hook 전처리 실패 — 이벤트 무시(exit 0)")
+	return nil
+}
+
 func dispatchCLI(ctx context.Context, args []string) (handled bool, err error) {
 	if len(args) < 2 {
 		return false, nil
@@ -536,16 +550,16 @@ func dispatchCLI(ctx context.Context, args []string) (handled bool, err error) {
 	}
 	if root == "" {
 		if root, err = os.Getwd(); err != nil {
-			return true, err
+			return true, absorbHookPreprocErr(sub, rest, err)
 		}
 	}
 	storeRoot, err := storeRootFor(serverFlags{StoreRoot: storeRootRaw})
 	if err != nil {
-		return true, err
+		return true, absorbHookPreprocErr(sub, rest, err)
 	}
 	storeRoot, err = canonicalizeStoreRoot(storeRoot)
 	if err != nil {
-		return true, err
+		return true, absorbHookPreprocErr(sub, rest, err)
 	}
 	// storeRootExplicit: prescanRootFlags가 --store-root 토큰을 소비하므로 cli는 명시/기본을
 	// 구분할 수 없다 — 여기서 판별해(원시값 비어있지 않음) 넘긴다. hook install이 명시된 경우에만

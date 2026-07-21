@@ -102,7 +102,7 @@
 **Interfaces:**
 - Consumes: T4 골격(PostToolUse 분기에서 호출), `ingest.Redact`(2차 방어).
 - Produces:
-  - `func classify(in hookInput) (eventType, summary string, attrs map[string]any)` — 우선순위 error(`hook_event_name=="PostToolUseFailure"` 이벤트명 기준 — T0 확인) > git_diff/build_run/test_run(Bash 패턴표) > file_edit(Write/Edit/NotebookEdit) > tool_call. 패턴표는 패키지 var 정규식 슬라이스 3종(git: `^git (diff|commit|merge|rebase|log|status)`, build: `go build|dotnet build|npm run build|msbuild|make(\s|$)`, test: `go test|dotnet test|pytest|vitest|npm test`) — 테이블 테스트가 계약.
+  - `func classify(in hookInput) (eventType, summary string, attrs map[string]any)` — 우선순위 error(`hook_event_name=="PostToolUseFailure"` 이벤트명 기준 — T0 확인) > git_diff/build_run/test_run(Bash 패턴표) > file_edit(Write/Edit/NotebookEdit) > tool_call. 패턴표는 패키지 var 정규식 슬라이스 3종(git: `^git (diff|commit|merge|rebase|log|status)`, build: `(?:^|[;&|\n]\s*)(?:go build|dotnet build|npm run build|msbuild|make(\s|$))`, test: `(?:^|[;&|\n]\s*)(?:go test|dotnet test|pytest|vitest|npm test)`) — 테이블 테스트가 계약. build/test는 명령 시작 또는 셸 구분자(;&|·개행) 직후에만 매치해 인자 속 부분열 오분류를 막는다(통합 체크포인트 개정 2026-07-21 — 사용자 승인 앵커링).
   - summary allowlist 조립: `<도구명>: <허용 요소>` — Bash 첫 토큰은 `^[A-Za-z0-9_./-]+$` 일치 시만 원문, 불일치(env 할당 `KEY=값` 등) → `<arg>`. 파일 도구는 워크스페이스 상대 경로. 오류는 정규화 분류·코드만. 조립 후 `ingest.Redact` 통과 + redaction 상태 기록. attrs도 allowlist 필드만(exit_code·bytes·matched_pattern·relative_path·is_interrupt).
   - error 판정: `hook_event_name == "PostToolUseFailure"`(T0 검증 — `tool_response` 파싱 아님) → event_type=error(분류 최우선). summary는 `error` 문자열의 정규화 분류·코드만(전문 미수용, 설계 §3), attrs에 `is_interrupt`(존재 시).
 

@@ -48,6 +48,7 @@ const (
 	defaultDeadlineMS   = 2000
 	defaultRetentionSec = 2592000 // 30일 — 훅 세션 기본 retention(설계 §2.2)
 	dropsLogName        = "session.drops.log"
+	maxStdinBytes       = 8 << 20 // stdin 읽기 상한(fail-open 봉인) — CTR_SHADOW_MAX 1MiB + JSON 이스케이프·대형 Write tool_input 여유
 )
 
 // Run — 훅 이벤트 1건을 처리한다(설계 §2). **항상 0을 반환한다**(fail-open §2.3): 어떤 실패도
@@ -60,9 +61,14 @@ func Run(ctx context.Context, stdin io.Reader, stdout io.Writer, storeRoot, vers
 		_, _ = io.Copy(io.Discard, stdin) // 소비 후 exit — broken pipe 방지(설계 §2.3)
 		return 0
 	}
-	data, err := io.ReadAll(stdin) // ReadAll이 EOF까지 소비 → broken pipe 방지 + 파싱 입력 확보
+	data, err := io.ReadAll(io.LimitReader(stdin, maxStdinBytes+1)) // 상한+1로 초과 감지, 정상 크기는 EOF까지 소비
 	if err != nil {
 		appendDrop(storeRoot, "bad-input")
+		return 0
+	}
+	if len(data) > maxStdinBytes { // deadline·파싱 이전에 봉인 — 거대 payload OOM 방지(fail-open)
+		_, _ = io.Copy(io.Discard, stdin) // 남은 stdin drain → broken pipe 방지(HOOKS_OFF와 동형)
+		appendDrop(storeRoot, "stdin-oversize")
 		return 0
 	}
 	var in hookInput
@@ -234,13 +240,15 @@ type toolInputFields struct {
 
 // bashClassifiers — Bash 명령 → event_type 분류 패턴표(설계 §3, 테이블 테스트가 계약). 슬라이스
 // 순서가 우선순위다(git > build > test). 미매치는 tool_call. RE2 컴파일이라 ReDoS 없음.
+// build/test는 명령 시작(^) 또는 셸 구분자(;&|·개행) 직후에만 매치한다 — `grep "go test"`·
+// `echo npm run build` 같은 인자 속 부분열 오분류를 막아 §6 사용량 계측 오염을 차단한다.
 var bashClassifiers = []struct {
 	re        *regexp.Regexp
 	eventType string
 }{
 	{regexp.MustCompile(`^git (diff|commit|merge|rebase|log|status)`), "git_diff"},
-	{regexp.MustCompile(`go build|dotnet build|npm run build|msbuild|make(\s|$)`), "build_run"},
-	{regexp.MustCompile(`go test|dotnet test|pytest|vitest|npm test`), "test_run"},
+	{regexp.MustCompile(`(?:^|[;&|\n]\s*)(?:go build|dotnet build|npm run build|msbuild|make(\s|$))`), "build_run"},
+	{regexp.MustCompile(`(?:^|[;&|\n]\s*)(?:go test|dotnet test|pytest|vitest|npm test)`), "test_run"},
 }
 
 // bashTokenRe — Bash 첫 토큰이 명령 단어 형태([A-Za-z0-9_./-]+)인지. env 할당 `KEY=값`·비정형
