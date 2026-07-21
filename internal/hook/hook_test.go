@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -42,10 +43,89 @@ func fixtureWith(t *testing.T, name string, overrides map[string]any) []byte {
 	return out
 }
 
-// runHook — Run을 결정론 입력(env 맵·io.Discard stdout)으로 호출한다.
+// runHook — Run을 결정론 입력(env 맵·io.Discard stdout)으로 호출한다(cc 기본).
 func runHook(t *testing.T, storeRoot string, in []byte, env map[string]string) int {
 	t.Helper()
-	return Run(context.Background(), bytes.NewReader(in), io.Discard, storeRoot, "test", func(k string) string { return env[k] })
+	return runHookHost(t, HostClaude, storeRoot, in, env)
+}
+
+// runHookHost — 호스트 경계 주입 변형(D35).
+func runHookHost(t *testing.T, host Host, storeRoot string, in []byte, env map[string]string) int {
+	t.Helper()
+	return Run(context.Background(), bytes.NewReader(in), io.Discard, storeRoot, "test", host, func(k string) string { return env[k] })
+}
+
+// D35 — 동일 UUID의 cc/cx 오귀속 금지: cc SessionStart 후 같은 UUID의 cx 이벤트는
+// unknown-session drop, cx SessionStart를 거쳐야 cx 이벤트가 기록된다(네임스페이스 격리).
+func TestHookHostIsolation(t *testing.T) {
+	storeRoot := t.TempDir()
+	cwd := evalLong(t, t.TempDir())
+	// 느린 CI 러너에서 기본 2s 데드라인이 fail-open drop을 유발 — 테스트는 러너 속도 무의존이어야 함.
+	env := map[string]string{"CTR_HOOK_DEADLINE_MS": "60000"}
+	start := fixtureWith(t, "sessionstart.json", map[string]any{"cwd": cwd})
+	post := fixtureWith(t, "posttooluse-codex-bash.json", map[string]any{"cwd": cwd})
+
+	if rc := runHook(t, storeRoot, start, env); rc != 0 { // cc 세션 등록
+		t.Fatalf("cc SessionStart rc=%d", rc)
+	}
+	if rc := runHookHost(t, HostCodex, storeRoot, post, env); rc != 0 { // 같은 UUID의 cx 이벤트
+		t.Fatalf("cx PostToolUse rc=%d", rc)
+	}
+	sdir := sessDir(t, storeRoot, cwd)
+	if got := readDrops(t, sdir); !strings.Contains(got, "unknown-session") {
+		t.Fatalf("drops=%q want unknown-session (cx 미등록 — cc로 오귀속 금지)", got)
+	}
+	if rc := runHookHost(t, HostCodex, storeRoot, start, env); rc != 0 { // cx 세션 등록
+		t.Fatalf("cx SessionStart rc=%d", rc)
+	}
+	if rc := runHookHost(t, HostCodex, storeRoot, post, env); rc != 0 {
+		t.Fatalf("cx PostToolUse(등록 후) rc=%d", rc)
+	}
+	reader, err := session.OpenReadOnly(sdir)
+	if err != nil {
+		t.Fatalf("open session.db: %v", err)
+	}
+	defer func() { _ = reader.Close() }()
+	var cc, cx, cxEv int
+	if err := reader.QueryRow(`SELECT
+		(SELECT count(*) FROM sessions WHERE session_id LIKE 'cc:%'),
+		(SELECT count(*) FROM sessions WHERE session_id LIKE 'cx:%'),
+		(SELECT count(*) FROM session_events WHERE session_id LIKE 'cx:%')`).Scan(&cc, &cx, &cxEv); err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	if cc != 1 || cx != 1 || cxEv == 0 {
+		t.Fatalf("cc=%d cx=%d cxEv=%d want 1,1,>0 (네임스페이스 격리)", cc, cx, cxEv)
+	}
+
+	// 결정표 행 1 수용(§11.1 G1) — cx 이벤트도 shadow 캡처되고 artifact ref가 cx: 네임스페이스를
+	// 운반한다(D35+D30, 기존 dispatch·shadowCapture 재사용 경로의 계약 고정).
+	bigPost := fixtureWith(t, "posttooluse-codex-bash.json", map[string]any{
+		"cwd": cwd, "tool_response": bigStdout(20000),
+	})
+	if rc := runHookHost(t, HostCodex, storeRoot, bigPost, env); rc != 0 {
+		t.Fatalf("cx big PostToolUse rc=%d", rc)
+	}
+	var refs string
+	if err := reader.QueryRow(`SELECT coalesce(max(artifact_refs),'') FROM session_events
+		WHERE session_id LIKE 'cx:%' AND event_type='artifact_created'`).Scan(&refs); err != nil {
+		t.Fatalf("refs: %v", err)
+	}
+	if !strings.Contains(refs, "artifact://cx:") {
+		t.Fatalf("refs=%q want artifact://cx: 접두(D35 네임스페이스 운반)", refs)
+	}
+}
+
+// D35 — 미지 host는 오귀속 대신 drop(bad-host, storeRoot 사이드카) + exit 0.
+func TestHookBadHostDrops(t *testing.T) {
+	storeRoot := t.TempDir()
+	cwd := evalLong(t, t.TempDir())
+	in := fixtureWith(t, "sessionstart.json", map[string]any{"cwd": cwd})
+	if rc := runHookHost(t, Host("zz"), storeRoot, in, nil); rc != 0 {
+		t.Fatalf("rc=%d want 0(fail-open)", rc)
+	}
+	if got := readDrops(t, storeRoot); !strings.Contains(got, "bad-host") {
+		t.Fatalf("drops=%q want bad-host", got)
+	}
 }
 
 // sessDir — Run과 동일한 규칙으로 storeRoot·cwd에서 worktree 세션 디렉터리를 도출한다(main과
@@ -319,7 +399,7 @@ func TestHookHooksOffDrainsStdin(t *testing.T) {
 	storeRoot := filepath.Join(t.TempDir(), "storeroot")
 	payload := []byte(`{"hook_event_name":"SessionStart","session_id":"x","cwd":"y","source":"startup"}`)
 	cr := &countReader{r: bytes.NewReader(payload)}
-	rc := Run(context.Background(), cr, io.Discard, storeRoot, "test", func(k string) string {
+	rc := Run(context.Background(), cr, io.Discard, storeRoot, "test", HostClaude, func(k string) string {
 		if k == "CTR_HOOKS_OFF" {
 			return "1"
 		}
@@ -340,7 +420,7 @@ func TestHookStdinOversize(t *testing.T) {
 	cwd := t.TempDir()
 	payload := []byte(strings.Repeat("a", maxStdinBytes+4096)) // 상한 초과 + drain할 잉여
 	cr := &countReader{r: bytes.NewReader(payload)}
-	rc := Run(context.Background(), cr, io.Discard, storeRoot, "test", func(string) string { return "" })
+	rc := Run(context.Background(), cr, io.Discard, storeRoot, "test", HostClaude, func(string) string { return "" })
 	if rc != 0 {
 		t.Fatalf("rc=%d want 0", rc)
 	}
@@ -730,6 +810,83 @@ func TestShadowDenylistSkips(t *testing.T) {
 	}
 }
 
+// D39-① Bash `cat .env`(정적 증명 덤프, denylist 파일) → 미저장 + drops shadow-denylist.
+// 응답 본문에 런타임 분할 canary를 실어 "비밀이 store에 없다"까지 겸증한다(§8).
+func TestShadowCommandDenylistSkipsBash(t *testing.T) {
+	storeRoot, cwd, contentDir, sdir := shadowSetup(t)
+	canary := "xox" + "b-1234567890-ABCDEFGHIJKLMNOP" // 런타임 조립 — 소스에 연속 토큰 금지
+	in := fixtureWith(t, "posttooluse-bash.json", map[string]any{
+		"cwd":           cwd,
+		"tool_input":    map[string]any{"command": "cat .env"},
+		"tool_response": map[string]any{"stdout": canary + strings.Repeat("x", 20000), "stderr": ""},
+	})
+	if rc := runHook(t, storeRoot, in, nil); rc != 0 {
+		t.Fatalf("rc=%d want 0", rc)
+	}
+	if n := contentArtifacts(t, contentDir); n != -1 {
+		t.Fatalf("artifacts=%d want -1(denylist 미저장 — content.db 미생성)", n)
+	}
+	if got := readDrops(t, sdir); !strings.Contains(got, "shadow-denylist") {
+		t.Fatalf("drops=%q want shadow-denylist", got)
+	}
+}
+
+// D39-② PowerShell `Get-Content .env` — Bash와 대칭.
+func TestShadowCommandDenylistSkipsPowerShell(t *testing.T) {
+	storeRoot, cwd, contentDir, sdir := shadowSetup(t)
+	in := fixtureWith(t, "posttooluse-bash.json", map[string]any{
+		"cwd":           cwd,
+		"tool_name":     "PowerShell",
+		"tool_input":    map[string]any{"command": "Get-Content .env"},
+		"tool_response": bigStdout(20000),
+	})
+	if rc := runHook(t, storeRoot, in, nil); rc != 0 {
+		t.Fatalf("rc=%d want 0", rc)
+	}
+	if n := contentArtifacts(t, contentDir); n != -1 {
+		t.Fatalf("artifacts=%d want -1(denylist 미저장)", n)
+	}
+	if got := readDrops(t, sdir); !strings.Contains(got, "shadow-denylist") {
+		t.Fatalf("drops=%q want shadow-denylist", got)
+	}
+}
+
+// D39-④ 점 세그먼트 변형도 정규화 후 대조된다 — `.docker/config.json` 접미 규칙 우회 봉쇄
+// (계획 리뷰 F2).
+func TestShadowCommandDenylistNormalizes(t *testing.T) {
+	storeRoot, cwd, contentDir, sdir := shadowSetup(t)
+	in := fixtureWith(t, "posttooluse-bash.json", map[string]any{
+		"cwd":           cwd,
+		"tool_input":    map[string]any{"command": "cat ./.docker/./config.json"},
+		"tool_response": bigStdout(20000),
+	})
+	if rc := runHook(t, storeRoot, in, nil); rc != 0 {
+		t.Fatalf("rc=%d want 0", rc)
+	}
+	if n := contentArtifacts(t, contentDir); n != -1 {
+		t.Fatalf("artifacts=%d want -1(정규화 후 denylist 대조)", n)
+	}
+	if got := readDrops(t, sdir); !strings.Contains(got, "shadow-denylist") {
+		t.Fatalf("drops=%q want shadow-denylist", got)
+	}
+}
+
+// D39-③ 증명 불가 출력(파이프)은 현행대로 색인 — 커버리지 급감 방지(설계 §7 잔여 한계).
+func TestShadowCommandUnprovenStillIndexes(t *testing.T) {
+	storeRoot, cwd, contentDir, _ := shadowSetup(t)
+	in := fixtureWith(t, "posttooluse-bash.json", map[string]any{
+		"cwd":           cwd,
+		"tool_input":    map[string]any{"command": "cat .env | head"},
+		"tool_response": bigStdout(20000),
+	})
+	if rc := runHook(t, storeRoot, in, nil); rc != 0 {
+		t.Fatalf("rc=%d want 0", rc)
+	}
+	if n := contentArtifacts(t, contentDir); n != 1 {
+		t.Fatalf("artifacts=%d want 1(증명 불가 = 현행 색인 유지)", n)
+	}
+}
+
 // ⑤ NUL 바이트를 담은 tool_response(바이너리) → 미저장. 유효 JSON은 raw NUL을 못 담으므로
 // (json은 로 escape) shadowCapture를 직접 호출해 raw NUL을 주입한다.
 func TestShadowBinarySkips(t *testing.T) {
@@ -986,7 +1143,7 @@ func runGuard(t *testing.T, storeRoot string, overrides map[string]any, env map[
 	t.Helper()
 	in := fixtureWith(t, "pretooluse-read.json", overrides)
 	var out bytes.Buffer
-	rc := Run(context.Background(), bytes.NewReader(in), &out, storeRoot, "test", func(k string) string { return env[k] })
+	rc := Run(context.Background(), bytes.NewReader(in), &out, storeRoot, "test", HostClaude, func(k string) string { return env[k] })
 	if rc != 0 {
 		t.Fatalf("guard rc=%d want 0", rc)
 	}
@@ -1226,6 +1383,61 @@ func TestDumpAbsPath(t *testing.T) {
 	}
 }
 
+// TestPsDumpArg: D36 어휘 판정(bashDumpArg 자매) — "대소문자 무시 덤프 토큰(Get-Content·gc·
+// cat·type) + 위치 인자 정확히 1개"만 경로를 반환, 나머지는 전부 ""(allow). 오탐 deny 차단이
+// 목적이라 거부 케이스가 본론이다. G2 실측(설계 §11.1): 입력은 tool_input.command.
+func TestPsDumpArg(t *testing.T) {
+	cases := []struct{ cmd, want string }{
+		{`Get-Content C:\big\file.log`, `C:\big\file.log`}, // 백슬래시는 PS 경로 구분자 — 허용(bash와 차이)
+		{"get-content C:/big/file.log", "C:/big/file.log"}, // 대소문자 무시
+		{"gc C:/big/file.log", "C:/big/file.log"},          // alias
+		{"cat C:/big/file.log", "C:/big/file.log"},         // pwsh alias
+		{"type C:/big/file.log", "C:/big/file.log"},        // cmd 유래 alias(PS에선 Get-Content)
+		{"Get-Content file.log", "file.log"},               // 어휘상 후보 — 절대 판정은 psAbsPath 몫
+		{"Get-Content -TotalCount 5 C:/f", ""},             // 부분 읽기 — 인자 3개
+		{"gc C:/f -Tail 10", ""},                           // 부분 읽기(후위)
+		{"gc -Raw C:/f", ""},                               // 대시 토큰
+		{"gc -Path C:/f", ""},                              // 명명 파라미터
+		{"gc C:/a,C:/b", ""},                               // 콤마 배열 — 제외
+		{"gc C:/*.log", ""},                                // 와일드카드 — 제외
+		{"gc $env:TEMP/f", ""},                             // 변수 전개 — 제외
+		{"gc C:/f | Select-Object -First 5", ""},           // 파이프 — 제외
+		{"gc C:/f; ls", ""},                                // 복합식 — 제외
+		{"Get-Content 'C:/f'", ""},                         // 인용 — 제외(보수)
+		{"gc `C:/f`", ""},                                  // 백틱(PS 이스케이프) — 제외
+		{"gc C:/한글.log", ""},                               // 비ASCII — 전면 판정 포기
+		{"gc ~/f", ""},                                     // ~ 홈 확장 — 제외
+		{"gc @(C:/f)", ""},                                 // @ 서브식/배열 — 제외
+		{"Set-Content C:/f", ""},                           // 덤프 아닌 명령
+		{"", ""},
+	}
+	for _, c := range cases {
+		if got := psDumpArg(c.cmd); got != c.want {
+			t.Fatalf("psDumpArg(%q)=%q want %q", c.cmd, got, c.want)
+		}
+	}
+}
+
+// TestPsAbsPath: psDumpArg 인자의 절대 판정 — bash용 MSYS /x/ 변환을 승계하지 않는다
+// (설계 §11.1 파생 ②: PS에서 /c/x는 현재 드라이브 루트 상대라 변환 시 오파일 판정 위험).
+func TestPsAbsPath(t *testing.T) {
+	cases := []struct{ goos, arg, want string }{
+		{"windows", `C:\big\f.log`, "C:/big/f.log"}, // ToSlash 정규화
+		{"windows", "C:/big/f.log", "C:/big/f.log"},
+		{"windows", "/c/big/f.log", ""},  // MSYS형 — PS에선 드라이브 상대, 비절대(allow)
+		{"windows", `\\srv\share\f`, ""}, // UNC — 드라이브형 아님, 보수 allow
+		{"windows", "f.log", ""},         // 상대
+		{"windows", "C:big.log", ""},     // 드라이브 상대(C: 뒤 구분자 없음)
+		{"linux", "/var/log/big.log", "/var/log/big.log"},
+		{"linux", "f.log", ""},
+	}
+	for _, c := range cases {
+		if got := psAbsPath(c.goos, c.arg); got != c.want {
+			t.Fatalf("psAbsPath(%q,%q)=%q want %q", c.goos, c.arg, got, c.want)
+		}
+	}
+}
+
 // runGuardBash — posttooluse-bash.json을 PreToolUse(Bash)로 재정의하고 command만 교체해 Run을
 // 호출한 뒤 stdout(deny JSON 또는 빈 문자열)을 반환한다(runGuard의 Bash 형제). command 조립은
 // 호출자가 filepath.ToSlash로 슬래시화 — Windows t.TempDir() 백슬래시가 bashDumpArg 어휘 판정에서
@@ -1238,7 +1450,7 @@ func runGuardBash(t *testing.T, storeRoot, cwd, command string, env map[string]s
 		"tool_input":      map[string]any{"command": command},
 	})
 	var out bytes.Buffer
-	rc := Run(context.Background(), bytes.NewReader(in), &out, storeRoot, "test", func(k string) string { return env[k] })
+	rc := Run(context.Background(), bytes.NewReader(in), &out, storeRoot, "test", HostClaude, func(k string) string { return env[k] })
 	if rc != 0 {
 		t.Fatalf("guardBash rc=%d want 0", rc)
 	}
@@ -1372,5 +1584,104 @@ func TestGuardBashStoreLockAllows(t *testing.T) {
 	}
 	if got := readDrops(t, sdir); !strings.Contains(got, "guard-store") {
 		t.Fatalf("drops=%q want guard-store", got)
+	}
+}
+
+// runGuardPowerShell — runGuardBash의 PowerShell 형제(tool_name·tool_input만 다름).
+func runGuardPowerShell(t *testing.T, storeRoot, cwd, command string, env map[string]string) string {
+	t.Helper()
+	in := fixtureWith(t, "pretooluse-read.json", map[string]any{
+		"cwd":        cwd,
+		"tool_name":  "PowerShell",
+		"tool_input": map[string]any{"command": command, "description": "test"},
+	})
+	var out bytes.Buffer
+	rc := Run(context.Background(), bytes.NewReader(in), &out, storeRoot, "test", HostClaude, func(k string) string { return env[k] })
+	if rc != 0 {
+		t.Fatalf("guardPowerShell rc=%d want 0", rc)
+	}
+	return out.String()
+}
+
+// D36-① 대형 파일 단순 Get-Content → deny JSON + warning 이벤트(PowerShell·명령 토큰·상대경로·
+// 크기·ctr_search 포함, 절대경로 비포함) + 현장 인덱싱 아티팩트 1건.
+func TestGuardPowerShellLargeFileDenies(t *testing.T) {
+	storeRoot, cwd, contentDir, sdir := guardSetup(t)
+	big := filepath.Join(cwd, "big.txt")
+	writeSized(t, big, 300*1024)
+	out := runGuardPowerShell(t, storeRoot, cwd, "Get-Content "+filepath.ToSlash(big), nil)
+
+	var got map[string]map[string]string
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatalf("deny stdout이 유효 JSON 아님: %v (out=%q)", err, out)
+	}
+	hso := got["hookSpecificOutput"]
+	if hso["hookEventName"] != "PreToolUse" || hso["permissionDecision"] != "deny" {
+		t.Fatalf("deny 스키마 불일치: %+v", hso)
+	}
+	if n := contentArtifacts(t, contentDir); n != 1 {
+		t.Fatalf("artifacts=%d want 1(현장 인덱싱 성공)", n)
+	}
+	reader, err := session.OpenReadOnly(sdir)
+	if err != nil {
+		t.Fatalf("open session.db: %v", err)
+	}
+	defer func() { _ = reader.Close() }()
+	var n int
+	var summary string
+	if err := reader.QueryRow("SELECT count(*), coalesce(max(summary),'') FROM session_events WHERE event_type='warning'").Scan(&n, &summary); err != nil {
+		t.Fatalf("count warning: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("warning events=%d want 1", n)
+	}
+	for _, want := range []string{"PowerShell", "Get-Content", "big.txt", "307200", "ctr_search"} {
+		if !strings.Contains(summary, want) {
+			t.Fatalf("warning summary=%q want 포함 %q", summary, want)
+		}
+	}
+	if strings.Contains(summary, cwd) || strings.Contains(summary, filepath.ToSlash(cwd)) {
+		t.Fatalf("warning summary가 절대경로 누출: %q", summary)
+	}
+}
+
+// D36-② 파이프 포함 → allow. ③ 부분 읽기 플래그 → allow. ④ 상대경로 → allow.
+// ⑤ MSYS형 /c/... → allow(psAbsPath 비승계 — bash 가드와 다른 지점의 회귀 방지).
+func TestGuardPowerShellPipeAllows(t *testing.T) {
+	storeRoot, cwd, _, _ := guardSetup(t)
+	big := filepath.Join(cwd, "big.txt")
+	writeSized(t, big, 300*1024)
+	if out := runGuardPowerShell(t, storeRoot, cwd, "Get-Content "+filepath.ToSlash(big)+" | Select-Object -First 5", nil); out != "" {
+		t.Fatalf("stdout=%q want empty (파이프 = allow)", out)
+	}
+}
+
+func TestGuardPowerShellPartialReadAllows(t *testing.T) {
+	storeRoot, cwd, _, _ := guardSetup(t)
+	big := filepath.Join(cwd, "big.txt")
+	writeSized(t, big, 300*1024)
+	if out := runGuardPowerShell(t, storeRoot, cwd, "Get-Content -TotalCount 5 "+filepath.ToSlash(big), nil); out != "" {
+		t.Fatalf("stdout=%q want empty (부분 읽기 = allow)", out)
+	}
+}
+
+func TestGuardPowerShellRelativePathAllows(t *testing.T) {
+	storeRoot, cwd, _, _ := guardSetup(t)
+	writeSized(t, filepath.Join(cwd, "big.txt"), 300*1024)
+	if out := runGuardPowerShell(t, storeRoot, cwd, "Get-Content big.txt", nil); out != "" {
+		t.Fatalf("stdout=%q want empty (상대경로 = allow)", out)
+	}
+}
+
+func TestGuardPowerShellMsysFormAllows(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("드라이브형 경로 전제")
+	}
+	storeRoot, cwd, _, _ := guardSetup(t)
+	big := filepath.Join(cwd, "big.txt")
+	writeSized(t, big, 300*1024)
+	msys := "/" + strings.ToLower(string(big[0])) + filepath.ToSlash(big[2:]) // C:\x → /c/x
+	if out := runGuardPowerShell(t, storeRoot, cwd, "Get-Content "+msys, nil); out != "" {
+		t.Fatalf("stdout=%q want empty (MSYS형 = PS 드라이브 상대 = allow)", out)
 	}
 }

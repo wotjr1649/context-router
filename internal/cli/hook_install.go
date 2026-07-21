@@ -27,15 +27,15 @@ const (
 )
 
 // hookRegistrations — 설치 대상 4항목(T0-amended 설계 §7). matcher가 빈 문자열이면 전체 매칭
-// (SessionStart=시작 방식 전체, Pre/PostToolUse(Failure)=전 도구 — T0 §4). PreToolUse는 Read|Bash
-// 정규식 매칭(large-read/dump guard 대상) — 관리 그룹 1개 유지가 merge의 동일-이벤트 상호 제거
-// 함정을 회피한다(설계 v0.3 §4).
+// (SessionStart=시작 방식 전체, Pre/PostToolUse(Failure)=전 도구 — T0 §4). PreToolUse는
+// Read|Bash|PowerShell 정규식 매칭(large-read/dump guard 대상 — v0.4 D36) — 관리 그룹 1개 유지가
+// merge의 동일-이벤트 상호 제거 함정을 회피한다(설계 v0.3 §4).
 var hookRegistrations = []struct {
 	event   string
 	matcher string
 }{
 	{"SessionStart", ""},
-	{"PreToolUse", "Read|Bash"},
+	{"PreToolUse", "Read|Bash|PowerShell"},
 	{"PostToolUse", ""},
 	{"PostToolUseFailure", ""},
 }
@@ -188,6 +188,171 @@ func mergeHookSettings(existing []byte, command, marker string, install bool) ([
 	return append(out, '\n'), nil // UTF-8 no BOM, LF + 끝 개행
 }
 
+// codexRegistrations — Codex 설치 대상 2항목(D35 캐프처 전용, §11.1 G1 행 1 채택 — PreToolUse
+// 미등록·거부 표면 없음 §7). matcher 빈 문자열 = 전체 매칭.
+var codexRegistrations = []struct {
+	event   string
+	matcher string
+}{
+	{"SessionStart", ""},
+	{"PostToolUse", ""},
+}
+
+// codexHookCmd — Codex hooks.json 훅 항목. statusMessage가 소유/버전 마커를 겸한다(§11.1 G3
+// — 미지 필드의 스키마 관용성이 미보증이라 공식 필드에 탑재; Codex UI에 노출되는 것은 의도).
+type codexHookCmd struct {
+	Type          string `json:"type"`
+	Command       string `json:"command"`
+	Timeout       int    `json:"timeout"`
+	StatusMessage string `json:"statusMessage"`
+}
+
+type codexOwnedGroup struct {
+	Matcher string         `json:"matcher"`
+	Hooks   []codexHookCmd `json:"hooks"`
+}
+
+// codexGroupProbe — 소유 판정에 필요한 필드만(나머지는 raw 왕복 보존).
+type codexGroupProbe struct {
+	Hooks []struct {
+		Command       string `json:"command"`
+		StatusMessage string `json:"statusMessage"`
+	} `json:"hooks"`
+}
+
+// isCodexHookCommandToken — `context-router codex-hook` 정확 일치(접두사 매칭 금지 —
+// isHookCommandToken의 형제, 러닝 서브커맨드가 달라 별도 함수).
+func isCodexHookCommandToken(cmd string) bool {
+	f := strings.Fields(cmd)
+	return len(f) >= 2 && f[0] == hookBinaryName && f[1] == "codex-hook"
+}
+
+// isOurCodexGroup — 그룹의 **모든** 훅 항목이 자기 것(command 토큰 정확 일치 AND statusMessage
+// 마커 접두)일 때만 자기 그룹으로 판정한다(전건 판정 — §11.2 F4). Claude 쪽 isOurHookGroup은
+// 그룹 레벨 __ctrManaged 마커가 소유를 표시하지만 Codex hooks.json은 미지 필드 금지라 항목
+// 레벨 추론뿐이므로, any-판정이면 사용자가 항목을 추가한 혼합 그룹까지 통째로 지워진다 —
+// 혼합 그룹은 불가침(파손 금지 > 멱등 완전성, 잔존 정리는 사용자 /hooks 몫).
+func isOurCodexGroup(raw json.RawMessage) bool {
+	var p codexGroupProbe
+	if json.Unmarshal(raw, &p) != nil {
+		return false
+	}
+	if len(p.Hooks) == 0 {
+		return false
+	}
+	for _, h := range p.Hooks {
+		if !isCodexHookCommandToken(h.Command) || !strings.HasPrefix(h.StatusMessage, hookMarkerPrefix()) {
+			return false
+		}
+	}
+	return true
+}
+
+// buildCodexHookCommand — buildHookCommand의 Codex 형제: 러닝 서브커맨드가 `codex-hook`이다
+// (D35 호스트 경계 + §11.2 F3 버전 게이트). 인용 규칙은 T11 관례 승계(가정 — Codex 훅 명령
+// 파싱 규칙은 실측 전, 도그푸딩은 --store-root 미명시 경로만 사용).
+func buildCodexHookCommand(storeRootExplicit bool, storeRootRaw string, noShadow bool) string {
+	cmd := hookBinaryName + " codex-hook"
+	if storeRootExplicit && storeRootRaw != "" {
+		cmd += " --store-root '" + strings.ReplaceAll(storeRootRaw, "'", `'\''`) + "'"
+	}
+	if noShadow {
+		cmd += " --no-shadow"
+	}
+	return cmd
+}
+
+// codexHooksPath — 설치 대상 hooks.json 경로(§11.1 G3). 기본 프로젝트 `<root>/.codex/hooks.json`,
+// --user는 `$CODEX_HOME/hooks.json`(CODEX_HOME 미설정 시 `~/.codex/hooks.json`). Codex는 CODEX_HOME
+// 환경변수로 상태 루트(config·auth·logs·sessions·skills, 기본 ~/.codex)를 재지정하고 hooks.json은 그
+// 활성 config 계층 옆에서 탐색되므로(공식 env-vars 문서), CODEX_HOME이 설정된 사용자에게 ~/.codex에
+// 쓰면 Codex가 읽지 않는 파일을 만드는 무성 오설치가 된다(최종 리뷰 Codex P2). 빈 문자열=미설정으로
+// 폴백. config.toml·[hooks.state]는 절대 건드리지 않는다(신뢰 승인 우회 금지).
+func codexHooksPath(user bool, projectRoot string) (string, error) {
+	if user {
+		if codexHome := os.Getenv("CODEX_HOME"); codexHome != "" {
+			return filepath.Join(codexHome, "hooks.json"), nil
+		}
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return "", errors.New("hook: 홈 디렉터리 해석 실패")
+		}
+		return filepath.Join(home, ".codex", "hooks.json"), nil
+	}
+	return filepath.Join(projectRoot, ".codex", "hooks.json"), nil
+}
+
+// mergeCodexHooks — mergeHookSettings의 Codex 형제(D28 원칙 승계: 멱등·타 항목/미지 키 raw
+// 보존·제거 대칭·빈 컨테이너 정리). 등록 집합·그룹 타입·소유 판정만 다르다.
+func mergeCodexHooks(existing []byte, command, marker string, install bool) ([]byte, error) {
+	settings := map[string]json.RawMessage{}
+	if len(bytes.TrimSpace(existing)) > 0 {
+		if err := json.Unmarshal(existing, &settings); err != nil {
+			return nil, err
+		}
+		if settings == nil {
+			settings = map[string]json.RawMessage{}
+		}
+	}
+	hooks := map[string]json.RawMessage{}
+	if raw, ok := settings["hooks"]; ok {
+		if err := json.Unmarshal(raw, &hooks); err != nil {
+			return nil, err
+		}
+		if hooks == nil {
+			hooks = map[string]json.RawMessage{}
+		}
+	}
+	for _, reg := range codexRegistrations {
+		var arr []json.RawMessage
+		if raw, ok := hooks[reg.event]; ok {
+			if err := json.Unmarshal(raw, &arr); err != nil {
+				return nil, err
+			}
+		}
+		kept := make([]json.RawMessage, 0, len(arr)+1)
+		for _, el := range arr {
+			if isOurCodexGroup(el) {
+				continue
+			}
+			kept = append(kept, el)
+		}
+		if install {
+			b, err := json.Marshal(codexOwnedGroup{
+				Matcher: reg.matcher,
+				Hooks:   []codexHookCmd{{Type: "command", Command: command, Timeout: hookTimeoutSec, StatusMessage: marker}},
+			})
+			if err != nil {
+				return nil, err
+			}
+			kept = append(kept, b)
+		}
+		if len(kept) == 0 {
+			delete(hooks, reg.event)
+			continue
+		}
+		b, err := json.Marshal(kept)
+		if err != nil {
+			return nil, err
+		}
+		hooks[reg.event] = b
+	}
+	if len(hooks) == 0 {
+		delete(settings, "hooks")
+	} else {
+		b, err := json.Marshal(hooks)
+		if err != nil {
+			return nil, err
+		}
+		settings["hooks"] = b
+	}
+	out, err := json.MarshalIndent(settings, "", "  ")
+	if err != nil {
+		return nil, err
+	}
+	return append(out, '\n'), nil
+}
+
 // atomicWriteFile — temp 파일 + rename 원자 쓰기(설계 §7). dir을 MkdirAll로 보강하고 같은 dir에
 // 임시 파일을 만들어 rename한다(같은 볼륨 rename만 원자적). 실패 시 임시 파일을 정리한다.
 func atomicWriteFile(path string, data []byte) error {
@@ -267,7 +432,24 @@ func runHook(ctx context.Context, args []string, storeRoot, storeRootRaw string,
 			break
 		}
 	}
-	hook.Run(ctx, os.Stdin, stdout, storeRoot, version, getenv)
+	hook.Run(ctx, os.Stdin, stdout, storeRoot, version, hook.HostClaude, getenv)
+	return nil
+}
+
+// runCodexHook — Codex 러닝 훅 전용 서브커맨드(설계 v0.4 §2 D35, §11.2 F3). install/uninstall
+// 하위 없음 — 모든 인자는 러닝 훅 인자(--no-shadow만 인식, 그 외 fail-open 무시 D23). 전용
+// 서브커맨드인 이유: v0.3 러닝 훅은 미지 인자를 무시하므로 플래그로 호스트를 구분하면 구버전
+// 바이너리가 Codex 이벤트를 cc:로 오귀속시킨다 — 미지 서브커맨드는 v0.3이 exit 1로 거부해
+// 오귀속이 구조적으로 불가능하다(버전 게이트).
+func runCodexHook(ctx context.Context, args []string, storeRoot, version string, stdout io.Writer) error {
+	getenv := os.Getenv
+	for _, a := range args {
+		if a == "--no-shadow" {
+			getenv = shadowOffGetenv
+			break
+		}
+	}
+	hook.Run(ctx, os.Stdin, stdout, storeRoot, version, hook.HostCodex, getenv)
 	return nil
 }
 
@@ -287,11 +469,37 @@ func runHookInstall(args []string, storeRoot, storeRootRaw string, storeRootExpl
 	fs.SetOutput(io.Discard)
 	user := fs.Bool("user", false, "~/.claude/settings.json에 등록(기본: 프로젝트)")
 	noShadow := fs.Bool("no-shadow", false, "Shadow Recall 비활성(훅 명령에 --no-shadow 주입)")
+	codex := fs.Bool("codex", false, "Codex CLI hooks.json에 등록(기본: Claude settings.json)")
 	if err := fs.Parse(args); err != nil {
 		return fmt.Errorf("hook install: 플래그 파싱 실패: %w", err)
 	}
 	if rest := fs.Args(); len(rest) > 0 {
 		return fmt.Errorf("hook install: 예상치 않은 인자 %d개", len(rest))
+	}
+	if *codex {
+		path, err := codexHooksPath(*user, projectRoot)
+		if err != nil {
+			return err
+		}
+		if storeRootExplicit && storeRootRaw != "" {
+			if abs, absErr := filepath.Abs(storeRootRaw); absErr == nil {
+				storeRootRaw = abs
+			}
+		}
+		command := buildCodexHookCommand(storeRootExplicit, storeRootRaw, *noShadow)
+		existing, err := os.ReadFile(path)
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			return errors.New("hook: 설정 파일 읽기 실패")
+		}
+		merged, err := mergeCodexHooks(existing, command, hookMarker(version), true)
+		if err != nil {
+			return fmt.Errorf("hook: 설정 병합 실패: %w", err)
+		}
+		if err := atomicWriteFile(path, merged); err != nil {
+			return errors.New("hook install: 설정 쓰기 실패")
+		}
+		fmt.Fprintf(stdout, "hook install (codex): %d개 이벤트 등록 완료 — Codex에서 /hooks로 훅을 리뷰·신뢰해야 실행됩니다\n", len(codexRegistrations))
+		return nil
 	}
 	path, err := hookSettingsPath(*user, projectRoot)
 	if err != nil {
@@ -322,11 +530,35 @@ func runHookUninstall(args []string, projectRoot string, stdout io.Writer) error
 	fs := flag.NewFlagSet("hook uninstall", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	user := fs.Bool("user", false, "~/.claude/settings.json에서 제거(기본: 프로젝트)")
+	codex := fs.Bool("codex", false, "Codex CLI hooks.json에서 제거(기본: Claude settings.json)")
 	if err := fs.Parse(args); err != nil {
 		return fmt.Errorf("hook uninstall: 플래그 파싱 실패: %w", err)
 	}
 	if rest := fs.Args(); len(rest) > 0 {
 		return fmt.Errorf("hook uninstall: 예상치 않은 인자 %d개", len(rest))
+	}
+	if *codex {
+		path, err := codexHooksPath(*user, projectRoot)
+		if err != nil {
+			return err
+		}
+		existing, err := os.ReadFile(path)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				fmt.Fprintln(stdout, "hook uninstall (codex): 설정 파일 없음 — 제거할 항목 없음")
+				return nil
+			}
+			return errors.New("hook: 설정 파일 읽기 실패")
+		}
+		merged, err := mergeCodexHooks(existing, "", "", false)
+		if err != nil {
+			return fmt.Errorf("hook: 설정 병합 실패: %w", err)
+		}
+		if err := atomicWriteFile(path, merged); err != nil {
+			return errors.New("hook uninstall: 설정 쓰기 실패")
+		}
+		fmt.Fprintln(stdout, "hook uninstall (codex): 훅 항목 제거 완료")
+		return nil
 	}
 	path, err := hookSettingsPath(*user, projectRoot)
 	if err != nil {

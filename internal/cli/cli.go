@@ -16,6 +16,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -27,6 +28,17 @@ import (
 // releaseURL: 컴파일타임 상수 — upgrade가 응답에서 취하는 것은 tag_name 버전 문자열뿐이다.
 // 응답이 제공하는 URL·명령·기타 필드는 절대 출력하지 않는다(위생, 설계 §7).
 const releaseURL = "https://api.github.com/repos/wotjr1649/context-router/releases/latest"
+
+// defaultStoreWarnBytes — D38 store 용량 경고 임계 기본값(설계 v0.4 §5 "기본 100MB").
+const defaultStoreWarnBytes = 100 << 20 // 100MiB
+
+// storeWarnBytes — CTR_SHADOW_WARN_BYTES 양수만 채택, 파싱 실패·비양수는 기본값(D38).
+func storeWarnBytes(getenv func(string) string) int64 {
+	if v, err := strconv.ParseInt(getenv("CTR_SHADOW_WARN_BYTES"), 10, 64); err == nil && v > 0 {
+		return v
+	}
+	return defaultStoreWarnBytes
+}
 
 // Run: cli 서브커맨드 단일 진입점. storeRoot·projectRoot는 main이 이미 결정해 넘긴다(cli는
 // 재도출하지 않는다 — 설계서 §7 Produces). sub은 main이 7개 이름(doctor·upgrade·stats·purge·
@@ -71,6 +83,10 @@ func Run(ctx context.Context, sub string, args []string, storeRoot, projectRoot,
 		// install/uninstall + 러닝 훅(무인자/--no-shadow) 디스패치는 runHook이 소유한다(설계 §7,
 		// hook_install.go). 러닝 훅은 항상 exit 0(fail-open §2.3).
 		return runHook(ctx, args, storeRoot, storeRootRaw, storeRootExplicit, projectRoot, version, stdout)
+	case "codex-hook":
+		// Codex 러닝 훅(설계 v0.4 §2 D35) — 항상 exit 0(fail-open §2.3). 전용 서브커맨드 =
+		// 구버전 바이너리 오귀속 차단 게이트(§11.2 F3).
+		return runCodexHook(ctx, args, storeRoot, version, stdout)
 	default:
 		return fmt.Errorf("cli: 미지 서브커맨드: %s", sub)
 	}
@@ -1290,6 +1306,11 @@ func runDoctor(ctx context.Context, w io.Writer, storeRoot, projectRoot, version
 		fmt.Fprintln(w, "[14] content.db: 없음")
 	} else {
 		fmt.Fprintf(w, "[14] content.db: sources=%d artifacts=%d blob=%dB\n", sz.Sources, sz.Artifacts, sz.BlobBytes)
+		// D38 — CAS 전체 blob 총량 경고(shadow 전용 아님 — [14] 측정 실체 그대로). 관측 채널이지
+		// 정책 집행이 아니다(D27): 자동 삭제 없음. SizeStats 실패 경로는 이 분기 밖이라 미평가.
+		if warn := storeWarnBytes(os.Getenv); sz.BlobBytes > warn {
+			fmt.Fprintf(w, "[14] warning: blob %dB > 임계 %dB(CTR_SHADOW_WARN_BYTES) — 수동 구제는 purge 계열 CLI(현행 purge는 source_kind 무구분 삭제 — shadow만 선택 삭제 불가). 자동 삭제 없음\n", sz.BlobBytes, warn)
+		}
 	}
 
 	fmt.Fprintln(w)

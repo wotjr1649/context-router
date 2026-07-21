@@ -1,0 +1,14 @@
+{
+  "session_id": "3f2504e0-4f89-41d3-9a0c-0305e82c3301",
+  "transcript_path": null,
+  "cwd": "C:/replaced-by-test",
+  "turn_id": "turn-1",
+  "tool_use_id": "call-1",
+  "permission_mode": "default",
+  "model": "gpt-5.6-sol",
+  "hook_event_name": "PostToolUse",
+  "tool_name": "Bash",
+  "tool_input": { "command": "echo hello" },
+  "tool_response": { "stdout": "hello", "stderr": "" },
+  "duration_ms": 12
+}

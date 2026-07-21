@@ -76,7 +76,7 @@ func assertDoctorAscending(t *testing.T, out string) {
 	}
 }
 
-// ① 빈 설정에 install → 4개 이벤트 등록·유효 JSON·PreToolUse matcher "Read|Bash"·timeout 10.
+// ① 빈 설정에 install → 4개 이벤트 등록·유효 JSON·PreToolUse matcher "Read|Bash|PowerShell"·timeout 10.
 func TestHookInstall_EmptyRegistersFourItems(t *testing.T) {
 	projectRoot := t.TempDir()
 	var out bytes.Buffer
@@ -119,13 +119,13 @@ func TestHookInstall_EmptyRegistersFourItems(t *testing.T) {
 			t.Fatalf("event %q bad command/timeout: %+v", ev, s.Hooks[ev][0])
 		}
 	}
-	if s.Hooks["PreToolUse"][0].Matcher != "Read|Bash" {
-		t.Fatalf("PreToolUse matcher=%q want Read|Bash", s.Hooks["PreToolUse"][0].Matcher)
+	if s.Hooks["PreToolUse"][0].Matcher != "Read|Bash|PowerShell" {
+		t.Fatalf("PreToolUse matcher=%q want Read|Bash|PowerShell", s.Hooks["PreToolUse"][0].Matcher)
 	}
 }
 
 // ①-b D32 업그레이드 재설치(설계 §8 설치 게이트): v0.2 형태 settings(marker 0.2.0 + PreToolUse
-// matcher "Read")를 seed → install 재실행 → PreToolUse 관리 그룹 1개·matcher "Read|Bash"·총 4그룹·
+// matcher "Read")를 seed → install 재실행 → PreToolUse 관리 그룹 1개·matcher "Read|Bash|PowerShell"·총 4그룹·
 // marker 현재 버전으로 갱신(구 matcher 그룹이 잔존하지 않고 대칭 교체된다).
 func TestHookInstall_UpgradeReinstallWidensMatcher(t *testing.T) {
 	projectRoot := t.TempDir()
@@ -176,8 +176,8 @@ func TestHookInstall_UpgradeReinstallWidensMatcher(t *testing.T) {
 	if len(pre) != 1 {
 		t.Fatalf("PreToolUse groups=%d want 1(단일 관리 그룹 유지): %s", len(pre), data)
 	}
-	if pre[0].Matcher != "Read|Bash" {
-		t.Fatalf("PreToolUse matcher=%q want Read|Bash (구 Read 그룹 미교체): %s", pre[0].Matcher, data)
+	if pre[0].Matcher != "Read|Bash|PowerShell" {
+		t.Fatalf("PreToolUse matcher=%q want Read|Bash|PowerShell (구 Read 그룹 미교체): %s", pre[0].Matcher, data)
 	}
 	if pre[0].Managed != "context-router/0.3.0" {
 		t.Fatalf("marker=%q want context-router/0.3.0 (버전 미갱신): %s", pre[0].Managed, data)
@@ -706,5 +706,149 @@ func TestRunHook_NoShadowRunningBranch(t *testing.T) {
 	}
 	if n := run(nil); n != 1 {
 		t.Fatalf("control artifacts=%d want 1(저장)", n)
+	}
+}
+
+// D35 설치 — 병합이 타 그룹·미지 최상위 키를 보존하고 자기 2이벤트만 소유한다.
+func TestMergeCodexHooksInstallPreservesForeign(t *testing.T) {
+	existing := []byte(`{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"pwsh -File policy.ps1","timeout":10,"statusMessage":"policy"}]}]},"otherTop":1}`)
+	out, err := mergeCodexHooks(existing, "context-router codex-hook", "context-router/0.4.0", true)
+	if err != nil {
+		t.Fatalf("merge: %v", err)
+	}
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(out, &m); err != nil {
+		t.Fatalf("out 파싱: %v", err)
+	}
+	if _, ok := m["otherTop"]; !ok {
+		t.Fatalf("미지 최상위 키 소실: %s", out)
+	}
+	var hooks map[string][]json.RawMessage
+	if err := json.Unmarshal(m["hooks"], &hooks); err != nil {
+		t.Fatalf("hooks 파싱: %v", err)
+	}
+	if len(hooks["PreToolUse"]) != 1 {
+		t.Fatalf("타 그룹 보존 실패: %v", hooks["PreToolUse"])
+	}
+	for _, ev := range []string{"SessionStart", "PostToolUse"} {
+		if len(hooks[ev]) != 1 || !isOurCodexGroup(hooks[ev][0]) {
+			t.Fatalf("%s 자기 그룹 미등록: %v", ev, hooks[ev])
+		}
+	}
+	if strings.Contains(string(out), "__ctrManaged") {
+		t.Fatalf("Codex hooks.json에 미지 필드 금지(§11.1 G3): %s", out)
+	}
+}
+
+// 멱등: install 2회 = 1회와 동일 바이트. 제거 대칭: install→uninstall이 원본 구조를 복원.
+func TestMergeCodexHooksIdempotentAndSymmetric(t *testing.T) {
+	existing := []byte(`{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"pwsh -File policy.ps1","timeout":10}]}]}}`)
+	once, err := mergeCodexHooks(existing, "context-router codex-hook", "context-router/0.4.0", true)
+	if err != nil {
+		t.Fatalf("install: %v", err)
+	}
+	twice, err := mergeCodexHooks(once, "context-router codex-hook", "context-router/0.4.1", true)
+	if err != nil {
+		t.Fatalf("재install: %v", err)
+	}
+	if strings.Contains(string(twice), "0.4.0") {
+		t.Fatalf("구버전 마커 잔존(교체 실패): %s", twice)
+	}
+	removed, err := mergeCodexHooks(twice, "", "", false)
+	if err != nil {
+		t.Fatalf("uninstall: %v", err)
+	}
+	if strings.Contains(string(removed), "context-router") {
+		t.Fatalf("자기 항목 잔존: %s", removed)
+	}
+	if !strings.Contains(string(removed), "policy.ps1") {
+		t.Fatalf("타 그룹 소실: %s", removed)
+	}
+}
+
+// F4 — 혼합 그룹(자기 항목 + 사용자 항목 동거)은 불가침: install이 그 그룹을 건드리지 않고
+// 순수 자기 그룹을 별도로 추가한다(파손 금지 > 멱등 완전성 — 혼합 그룹의 자기 잔존 항목
+// 정리는 사용자 /hooks 몫).
+func TestMergeCodexHooksMixedGroupUntouched(t *testing.T) {
+	mixed := []byte(`{"hooks":{"PostToolUse":[{"matcher":"","hooks":[` +
+		`{"type":"command","command":"context-router codex-hook","timeout":10,"statusMessage":"context-router/0.3.9"},` +
+		`{"type":"command","command":"pwsh -File user.ps1","timeout":10,"statusMessage":"user"}]}]}}`)
+	out, err := mergeCodexHooks(mixed, "context-router codex-hook", "context-router/0.4.0", true)
+	if err != nil {
+		t.Fatalf("merge: %v", err)
+	}
+	if !strings.Contains(string(out), "user.ps1") || !strings.Contains(string(out), "context-router/0.3.9") {
+		t.Fatalf("혼합 그룹이 변형·삭제됨(불가침 위반): %s", out)
+	}
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(out, &m); err != nil {
+		t.Fatalf("out 파싱: %v", err)
+	}
+	var hooks map[string][]json.RawMessage
+	if err := json.Unmarshal(m["hooks"], &hooks); err != nil {
+		t.Fatalf("hooks 파싱: %v", err)
+	}
+	if len(hooks["PostToolUse"]) != 2 {
+		t.Fatalf("PostToolUse 그룹 수=%d want 2(혼합 보존 + 순수 신규)", len(hooks["PostToolUse"]))
+	}
+}
+
+// F4 — 동일 버전 재적용의 진짜 멱등: f(f(x)) == f(x) 바이트 동일(중복·순서 drift 검출).
+func TestMergeCodexHooksIdempotentBytes(t *testing.T) {
+	existing := []byte(`{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"pwsh -File policy.ps1","timeout":10}]}]}}`)
+	once, err := mergeCodexHooks(existing, "context-router codex-hook", "context-router/0.4.0", true)
+	if err != nil {
+		t.Fatalf("1차: %v", err)
+	}
+	twice, err := mergeCodexHooks(once, "context-router codex-hook", "context-router/0.4.0", true)
+	if err != nil {
+		t.Fatalf("2차: %v", err)
+	}
+	if !bytes.Equal(once, twice) {
+		t.Fatalf("멱등 위반:\n1차=%s\n2차=%s", once, twice)
+	}
+}
+
+// 경로: 기본 project <root>/.codex/hooks.json, --user는 CODEX_HOME 미설정 시 ~/.codex/hooks.json.
+// t.Setenv 사용 → t.Parallel 금지(기존 관례).
+func TestCodexHooksPath(t *testing.T) {
+	t.Setenv("CODEX_HOME", "") // 빈 문자열=미설정 → ~/.codex 폴백을 결정적으로 만든다(최종 리뷰 Codex P2)
+	p, err := codexHooksPath(false, `C:\proj`)
+	if err != nil || p != filepath.Join(`C:\proj`, ".codex", "hooks.json") {
+		t.Fatalf("project 경로=%q err=%v", p, err)
+	}
+	u, err := codexHooksPath(true, `C:\proj`)
+	if err != nil || !strings.HasSuffix(u, filepath.Join(".codex", "hooks.json")) {
+		t.Fatalf("user 경로=%q err=%v", u, err)
+	}
+}
+
+// --user는 CODEX_HOME이 설정되면 $CODEX_HOME/hooks.json을 쓴다(최종 리뷰 Codex P2 — 무성 오설치
+// 방지). t.Setenv 사용 → t.Parallel 금지.
+func TestCodexHooksPathCodexHome(t *testing.T) {
+	codexHome := t.TempDir()
+	t.Setenv("CODEX_HOME", codexHome)
+	u, err := codexHooksPath(true, `C:\proj`)
+	if err != nil || u != filepath.Join(codexHome, "hooks.json") {
+		t.Fatalf("user 경로=%q want=%q err=%v", u, filepath.Join(codexHome, "hooks.json"), err)
+	}
+}
+
+// e2e: hook install --codex가 파일 생성 + 신뢰 승인 안내를 출력한다.
+func TestRunHookInstallCodex(t *testing.T) {
+	root := t.TempDir()
+	var out bytes.Buffer
+	if err := runHookInstall([]string{"--codex"}, "", "", false, root, "0.4.0", &out); err != nil {
+		t.Fatalf("install --codex: %v", err)
+	}
+	written, err := os.ReadFile(filepath.Join(root, ".codex", "hooks.json"))
+	if err != nil {
+		t.Fatalf("hooks.json 미생성: %v", err)
+	}
+	if !strings.Contains(string(written), "context-router codex-hook") {
+		t.Fatalf("러닝 명령이 codex-hook 서브커맨드가 아님(§11.2 F3): %s", written)
+	}
+	if !strings.Contains(out.String(), "/hooks") {
+		t.Fatalf("신뢰 승인 안내 누락: %q", out.String())
 	}
 }
