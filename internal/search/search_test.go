@@ -500,6 +500,51 @@ func TestQuery_HitSourceDeterministicMultiSource(t *testing.T) {
 	}
 }
 
+// TestQuery_HitSourceShadowCoexist: D30 — 같은 artifact에 구 inline: 행과 신규 shadow: 행이
+// 공존하면 uri ASC 규약대로 inline:이 결정적으로 표시된다(설계 v0.3 §2 승계 한계 케이스).
+// shadow 단독 artifact는 RelativizeSource를 무변형 통과한다(§8 게이트 직접 커버). hook kind로
+// 등록해 비-file 소스의 stale 단락(os.Stat 미호출)도 함께 지킨다.
+func TestQuery_HitSourceShadowCoexist(t *testing.T) {
+	st, err := store.Open(t.TempDir(), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	reg := func(uri, srcHash, body string) {
+		t.Helper()
+		if _, err := st.Register(t.Context(), store.Registration{
+			StoredBytes: []byte(body), MediaType: "text/plain", Redaction: "none",
+			Source: store.SourceMeta{URI: uri, Kind: "hook", SrcHash: srcHash},
+			Chunks: []store.Chunk{{
+				Ordinal: 0, ByteStart: 0, ByteEnd: int64(len(body)),
+				LineStart: 1, LineEnd: 1, Text: body,
+			}},
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	body := "coexist needle content"
+	reg("shadow:Bash:"+strings.Repeat("ab", 32), "h", body) // 역순 등록 — 삽입순 우연 배제
+	reg("inline:Bash", "h", body)                           // 같은 본문 → 같은 artifact, 소스 2행 공존
+	res, err := Query(t.Context(), st, "", []string{"needle"}, 3, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res[0].Hits) != 1 || res[0].Hits[0].Source != "inline:Bash" {
+		t.Fatalf("want inline:Bash (uri ASC 결정성), got %+v", res[0].Hits)
+	}
+	// shadow 단독 artifact — Source가 shadow: URI 그대로(무변형 통과).
+	reg2URI := "shadow:Grep:" + strings.Repeat("cd", 32)
+	reg(reg2URI, "h2", "solo shadow needle2 body")
+	res2, err := Query(t.Context(), st, "", []string{"needle2"}, 3, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res2[0].Hits) != 1 || res2[0].Hits[0].Source != reg2URI {
+		t.Fatalf("want %s verbatim (RelativizeSource 무변형), got %+v", reg2URI, res2[0].Hits)
+	}
+}
+
 func TestQuery_SnippetStemPrefixFallback(t *testing.T) {
 	st, err := store.Open(t.TempDir(), false)
 	if err != nil {

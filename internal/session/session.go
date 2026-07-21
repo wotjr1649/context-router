@@ -29,8 +29,10 @@ var (
 )
 
 const (
-	dbFileName        = "session.db"
-	lockFileName      = "session.lock"      // lifetime lease(shared) — §6.2 ①
+	dbFileName = "session.db"
+	// LockFileName: lifetime lease(shared) 파일명 — §6.2 ①. 외부(훅 테스트 등)가 락 경합을
+	// 재현할 때 리터럴 하드코딩 대신 참조하는 단일 진실원(T6 잔여).
+	LockFileName      = "session.lock"
 	initLockFileName  = "session.init.lock" // 신규 생성·WAL 전환 직렬화(exclusive) — §6.2 ②
 	recoverMarkerName = "session.recover-pending"
 )
@@ -323,7 +325,7 @@ func acquireSharedLease(dir, op string) (func(), error) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, sanitizeIOErr("open mkdir", err)
 	}
-	release, err := store.AcquireLock(filepath.Join(dir, lockFileName), true)
+	release, err := store.AcquireLock(filepath.Join(dir, LockFileName), true)
 	if err != nil {
 		return nil, fmt.Errorf("%s: session.lock 공유 잠금 획득 실패: %w: %v", op, ErrLeaseHeld, err)
 	}

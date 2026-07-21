@@ -486,7 +486,7 @@ func TestRecover_ServerRunning_RejectsImmediately(t *testing.T) {
 	}
 
 	// lease가 여전히 정상 보유 중이어야(recover가 실패 경로에서 뭔가를 잘못 해제/훼손하지 않음).
-	if _, lockErr := store.AcquireLock(filepath.Join(dir, lockFileName), false); lockErr == nil {
+	if _, lockErr := store.AcquireLock(filepath.Join(dir, LockFileName), false); lockErr == nil {
 		t.Fatal("session.lock should still be exclusively unavailable — server(d)가 shared를 보유 중이어야 함")
 	}
 }

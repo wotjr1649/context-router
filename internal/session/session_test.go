@@ -158,7 +158,7 @@ func TestOpen_RecoverMarkerBlocks(t *testing.T) {
 	}
 
 	// lease가 해제됐다면 exclusive 잠금을 새로 취득할 수 있어야 한다(leak 없음 검증).
-	release, lockErr := store.AcquireLock(filepath.Join(dir, lockFileName), false)
+	release, lockErr := store.AcquireLock(filepath.Join(dir, LockFileName), false)
 	if lockErr != nil {
 		t.Fatalf("session.lock 잔류(leak) 의심: exclusive 재취득 실패: %v", lockErr)
 	}
@@ -1048,7 +1048,7 @@ func TestOpenAppend_RecoverMarkerBlocks(t *testing.T) {
 	if !errors.Is(err, ErrRecoverPending) {
 		t.Fatalf("err=%v want ErrRecoverPending", err)
 	}
-	release, lockErr := store.AcquireLock(filepath.Join(dir, lockFileName), false)
+	release, lockErr := store.AcquireLock(filepath.Join(dir, LockFileName), false)
 	if lockErr != nil {
 		t.Fatalf("lease 누수 의심: exclusive 재취득 실패: %v", lockErr)
 	}

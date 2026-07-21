@@ -225,7 +225,7 @@ func TestHookLeaseHeld(t *testing.T) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		t.Fatalf("mkdir: %v", err)
 	}
-	release, err := store.AcquireLock(filepath.Join(dir, "session.lock"), false) // exclusive 선점
+	release, err := store.AcquireLock(filepath.Join(dir, session.LockFileName), false) // exclusive 선점
 	if err != nil {
 		t.Fatalf("acquire exclusive: %v", err)
 	}
@@ -607,17 +607,20 @@ func TestShadowOverMinStores(t *testing.T) {
 	}
 	_ = reader.Close()
 
-	refs := eventRefs(t, sdir, "tool_result_summary")
-	if len(refs) != 1 {
-		t.Fatalf("tool_result_summary refs=%v want 1개", refs)
-	}
 	want := "artifact://cc:3f2504e0-4f89-41d3-9a0c-0305e82c3301/sha256-"
-	if !strings.HasPrefix(refs[0], want) {
-		t.Fatalf("ref=%q want prefix %q", refs[0], want)
-	}
-	hash := strings.TrimPrefix(refs[0], want)
-	if len(hash) != 64 {
-		t.Fatalf("ref hash 길이=%d want 64(hex sha256)", len(hash))
+	// D30: artifact_created·tool_result_summary 둘 다 rep.Hash 기반 동일 ref를 실어야 한다
+	// (shadow: URI로 저장돼도 ref는 content_hash 주소 — §5).
+	for _, et := range []string{"artifact_created", "tool_result_summary"} {
+		refs := eventRefs(t, sdir, et)
+		if len(refs) != 1 {
+			t.Fatalf("%s refs=%v want 1개", et, refs)
+		}
+		if !strings.HasPrefix(refs[0], want) {
+			t.Fatalf("%s ref=%q want prefix %q", et, refs[0], want)
+		}
+		if hash := strings.TrimPrefix(refs[0], want); len(hash) != 64 {
+			t.Fatalf("%s ref hash 길이=%d want 64(hex sha256)", et, len(hash))
+		}
 	}
 }
 

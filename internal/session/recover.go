@@ -54,7 +54,7 @@ type RecoverResult struct {
 //     fsync.
 //  7. 마커 삭제 + 결과 반환(cli가 stderr로 보고).
 func Recover(dir string) (RecoverResult, error) {
-	release, lockErr := store.AcquireLock(filepath.Join(dir, lockFileName), false)
+	release, lockErr := store.AcquireLock(filepath.Join(dir, LockFileName), false)
 	if lockErr != nil {
 		return RecoverResult{}, fmt.Errorf("session recover: session.lock exclusive 획득 실패(서버 실행 중일 수 있음): %w: %v", ErrLeaseHeld, lockErr)
 	}
