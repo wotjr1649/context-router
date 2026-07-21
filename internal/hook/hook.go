@@ -1,5 +1,5 @@
 // Package hook — Claude Code 훅 서브프로세스(`context-router hook`) 진입점: stdin 이벤트 1건을
-// cc: 세션에 append하거나 fail-open으로 drop한다. 설계서 §2(훅 아키텍처·세션 식별·fail-open·
+// 호스트 접두(cc:/cx:) 세션에 append하거나 fail-open으로 drop한다. 설계서 §2(훅 아키텍처·세션 식별·fail-open·
 // deadline). MCP 서버 경유 없음 — cli 평면에서 session/ident를 직접 소비한다(계측 매핑은 T5).
 package hook
 
@@ -45,6 +45,15 @@ type hookInput struct {
 // 않는다 — cc:<uuid> 세션 식별자의 형태 안정성을 위해 정확히 canonical 형태만 채택한다.
 var canonicalUUIDRe = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
 
+// Host — 훅 이벤트의 발신 호스트(설계 v0.4 §2 D35). 값이 곧 세션 네임스페이스 접두다.
+// 진입점은 명시적 호스트 인자로 분기한다 — 암묵 재사용으로 인한 cc/cx 오귀속 금지.
+type Host string
+
+const (
+	HostClaude Host = "cc" // Claude Code
+	HostCodex  Host = "cx" // Codex CLI (§11.1 G1 — Claude 동형 훅 페이로드)
+)
+
 const (
 	defaultDeadlineMS   = 2000
 	defaultRetentionSec = 2592000 // 30일 — 훅 세션 기본 retention(설계 §2.2)
@@ -54,13 +63,19 @@ const (
 )
 
 // Run — 훅 이벤트 1건을 처리한다(설계 §2). **항상 0을 반환한다**(fail-open §2.3): 어떤 실패도
-// exit 0 + drops 1줄로 흡수하고 호스트에 오류를 전파하지 않는다. 순서: CTR_HOOKS_OFF → stdin
-// 드레인 → 파싱 → session_id canonical 검증 → cc: 조립 → cwd로 session dir 도출 → deadline ctx →
-// SessionStart=EnsureSession / 그 외=SessionExists 판정. stdout은 guard(T7)의 permissionDecision
-// JSON 전용이라 골격에서는 미사용. getenv는 테스트 주입점.
-func Run(ctx context.Context, stdin io.Reader, stdout io.Writer, storeRoot, version string, getenv func(string) string) int {
+// exit 0 + drops 1줄로 흡수하고 호스트에 오류를 전파하지 않는다. 순서: CTR_HOOKS_OFF → host 검증 →
+// stdin 드레인 → 파싱 → session_id canonical 검증 → 호스트 접두(cc:/cx:) 조립 → cwd로 session dir
+// 도출 → deadline ctx → SessionStart=EnsureSession / 그 외=SessionExists 판정. host는 명시적 발신
+// 호스트(D35) — 세션 네임스페이스 접두라 미지 값은 오귀속 대신 drop한다. stdout은 guard(T7)의
+// permissionDecision JSON 전용이라 골격에서는 미사용. getenv는 테스트 주입점.
+func Run(ctx context.Context, stdin io.Reader, stdout io.Writer, storeRoot, version string, host Host, getenv func(string) string) int {
 	if getenv("CTR_HOOKS_OFF") == "1" {
 		_, _ = io.Copy(io.Discard, stdin) // 소비 후 exit — broken pipe 방지(설계 §2.3)
+		return 0
+	}
+	if host != HostClaude && host != HostCodex {
+		_, _ = io.Copy(io.Discard, stdin) // drain — broken pipe 방지
+		appendDrop(storeRoot, "bad-host") // 오귀속 대신 drop(D35 격리)
 		return 0
 	}
 	data, err := io.ReadAll(io.LimitReader(stdin, maxStdinBytes+1)) // 상한+1로 초과 감지, 정상 크기는 EOF까지 소비
@@ -93,7 +108,7 @@ func Run(ctx context.Context, stdin io.Reader, stdout io.Writer, storeRoot, vers
 
 	ctx, cancel := context.WithTimeout(ctx, deadline(getenv))
 	defer cancel()
-	dispatch(ctx, in, dir, contentDir, canon.WorktreeRoot, "cc:"+in.SessionID, version, getenv, stdout)
+	dispatch(ctx, in, dir, contentDir, canon.WorktreeRoot, string(host)+":"+in.SessionID, version, getenv, stdout)
 	return 0
 }
 

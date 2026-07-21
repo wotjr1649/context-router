@@ -71,6 +71,10 @@ func Run(ctx context.Context, sub string, args []string, storeRoot, projectRoot,
 		// install/uninstall + 러닝 훅(무인자/--no-shadow) 디스패치는 runHook이 소유한다(설계 §7,
 		// hook_install.go). 러닝 훅은 항상 exit 0(fail-open §2.3).
 		return runHook(ctx, args, storeRoot, storeRootRaw, storeRootExplicit, projectRoot, version, stdout)
+	case "codex-hook":
+		// Codex 러닝 훅(설계 v0.4 §2 D35) — 항상 exit 0(fail-open §2.3). 전용 서브커맨드 =
+		// 구버전 바이너리 오귀속 차단 게이트(§11.2 F3).
+		return runCodexHook(ctx, args, storeRoot, version, stdout)
 	default:
 		return fmt.Errorf("cli: 미지 서브커맨드: %s", sub)
 	}

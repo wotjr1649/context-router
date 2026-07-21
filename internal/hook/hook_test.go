@@ -43,10 +43,87 @@ func fixtureWith(t *testing.T, name string, overrides map[string]any) []byte {
 	return out
 }
 
-// runHook — Run을 결정론 입력(env 맵·io.Discard stdout)으로 호출한다.
+// runHook — Run을 결정론 입력(env 맵·io.Discard stdout)으로 호출한다(cc 기본).
 func runHook(t *testing.T, storeRoot string, in []byte, env map[string]string) int {
 	t.Helper()
-	return Run(context.Background(), bytes.NewReader(in), io.Discard, storeRoot, "test", func(k string) string { return env[k] })
+	return runHookHost(t, HostClaude, storeRoot, in, env)
+}
+
+// runHookHost — 호스트 경계 주입 변형(D35).
+func runHookHost(t *testing.T, host Host, storeRoot string, in []byte, env map[string]string) int {
+	t.Helper()
+	return Run(context.Background(), bytes.NewReader(in), io.Discard, storeRoot, "test", host, func(k string) string { return env[k] })
+}
+
+// D35 — 동일 UUID의 cc/cx 오귀속 금지: cc SessionStart 후 같은 UUID의 cx 이벤트는
+// unknown-session drop, cx SessionStart를 거쳐야 cx 이벤트가 기록된다(네임스페이스 격리).
+func TestHookHostIsolation(t *testing.T) {
+	storeRoot := t.TempDir()
+	cwd := evalLong(t, t.TempDir())
+	start := fixtureWith(t, "sessionstart.json", map[string]any{"cwd": cwd})
+	post := fixtureWith(t, "posttooluse-codex-bash.json", map[string]any{"cwd": cwd})
+
+	if rc := runHook(t, storeRoot, start, nil); rc != 0 { // cc 세션 등록
+		t.Fatalf("cc SessionStart rc=%d", rc)
+	}
+	if rc := runHookHost(t, HostCodex, storeRoot, post, nil); rc != 0 { // 같은 UUID의 cx 이벤트
+		t.Fatalf("cx PostToolUse rc=%d", rc)
+	}
+	sdir := sessDir(t, storeRoot, cwd)
+	if got := readDrops(t, sdir); !strings.Contains(got, "unknown-session") {
+		t.Fatalf("drops=%q want unknown-session (cx 미등록 — cc로 오귀속 금지)", got)
+	}
+	if rc := runHookHost(t, HostCodex, storeRoot, start, nil); rc != 0 { // cx 세션 등록
+		t.Fatalf("cx SessionStart rc=%d", rc)
+	}
+	if rc := runHookHost(t, HostCodex, storeRoot, post, nil); rc != 0 {
+		t.Fatalf("cx PostToolUse(등록 후) rc=%d", rc)
+	}
+	reader, err := session.OpenReadOnly(sdir)
+	if err != nil {
+		t.Fatalf("open session.db: %v", err)
+	}
+	defer func() { _ = reader.Close() }()
+	var cc, cx, cxEv int
+	if err := reader.QueryRow(`SELECT
+		(SELECT count(*) FROM sessions WHERE session_id LIKE 'cc:%'),
+		(SELECT count(*) FROM sessions WHERE session_id LIKE 'cx:%'),
+		(SELECT count(*) FROM session_events WHERE session_id LIKE 'cx:%')`).Scan(&cc, &cx, &cxEv); err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	if cc != 1 || cx != 1 || cxEv == 0 {
+		t.Fatalf("cc=%d cx=%d cxEv=%d want 1,1,>0 (네임스페이스 격리)", cc, cx, cxEv)
+	}
+
+	// 결정표 행 1 수용(§11.1 G1) — cx 이벤트도 shadow 캡처되고 artifact ref가 cx: 네임스페이스를
+	// 운반한다(D35+D30, 기존 dispatch·shadowCapture 재사용 경로의 계약 고정).
+	bigPost := fixtureWith(t, "posttooluse-codex-bash.json", map[string]any{
+		"cwd": cwd, "tool_response": bigStdout(20000),
+	})
+	if rc := runHookHost(t, HostCodex, storeRoot, bigPost, nil); rc != 0 {
+		t.Fatalf("cx big PostToolUse rc=%d", rc)
+	}
+	var refs string
+	if err := reader.QueryRow(`SELECT coalesce(max(artifact_refs),'') FROM session_events
+		WHERE session_id LIKE 'cx:%' AND event_type='artifact_created'`).Scan(&refs); err != nil {
+		t.Fatalf("refs: %v", err)
+	}
+	if !strings.Contains(refs, "artifact://cx:") {
+		t.Fatalf("refs=%q want artifact://cx: 접두(D35 네임스페이스 운반)", refs)
+	}
+}
+
+// D35 — 미지 host는 오귀속 대신 drop(bad-host, storeRoot 사이드카) + exit 0.
+func TestHookBadHostDrops(t *testing.T) {
+	storeRoot := t.TempDir()
+	cwd := evalLong(t, t.TempDir())
+	in := fixtureWith(t, "sessionstart.json", map[string]any{"cwd": cwd})
+	if rc := runHookHost(t, Host("zz"), storeRoot, in, nil); rc != 0 {
+		t.Fatalf("rc=%d want 0(fail-open)", rc)
+	}
+	if got := readDrops(t, storeRoot); !strings.Contains(got, "bad-host") {
+		t.Fatalf("drops=%q want bad-host", got)
+	}
 }
 
 // sessDir — Run과 동일한 규칙으로 storeRoot·cwd에서 worktree 세션 디렉터리를 도출한다(main과
@@ -320,7 +397,7 @@ func TestHookHooksOffDrainsStdin(t *testing.T) {
 	storeRoot := filepath.Join(t.TempDir(), "storeroot")
 	payload := []byte(`{"hook_event_name":"SessionStart","session_id":"x","cwd":"y","source":"startup"}`)
 	cr := &countReader{r: bytes.NewReader(payload)}
-	rc := Run(context.Background(), cr, io.Discard, storeRoot, "test", func(k string) string {
+	rc := Run(context.Background(), cr, io.Discard, storeRoot, "test", HostClaude, func(k string) string {
 		if k == "CTR_HOOKS_OFF" {
 			return "1"
 		}
@@ -341,7 +418,7 @@ func TestHookStdinOversize(t *testing.T) {
 	cwd := t.TempDir()
 	payload := []byte(strings.Repeat("a", maxStdinBytes+4096)) // 상한 초과 + drain할 잉여
 	cr := &countReader{r: bytes.NewReader(payload)}
-	rc := Run(context.Background(), cr, io.Discard, storeRoot, "test", func(string) string { return "" })
+	rc := Run(context.Background(), cr, io.Discard, storeRoot, "test", HostClaude, func(string) string { return "" })
 	if rc != 0 {
 		t.Fatalf("rc=%d want 0", rc)
 	}
@@ -1064,7 +1141,7 @@ func runGuard(t *testing.T, storeRoot string, overrides map[string]any, env map[
 	t.Helper()
 	in := fixtureWith(t, "pretooluse-read.json", overrides)
 	var out bytes.Buffer
-	rc := Run(context.Background(), bytes.NewReader(in), &out, storeRoot, "test", func(k string) string { return env[k] })
+	rc := Run(context.Background(), bytes.NewReader(in), &out, storeRoot, "test", HostClaude, func(k string) string { return env[k] })
 	if rc != 0 {
 		t.Fatalf("guard rc=%d want 0", rc)
 	}
@@ -1371,7 +1448,7 @@ func runGuardBash(t *testing.T, storeRoot, cwd, command string, env map[string]s
 		"tool_input":      map[string]any{"command": command},
 	})
 	var out bytes.Buffer
-	rc := Run(context.Background(), bytes.NewReader(in), &out, storeRoot, "test", func(k string) string { return env[k] })
+	rc := Run(context.Background(), bytes.NewReader(in), &out, storeRoot, "test", HostClaude, func(k string) string { return env[k] })
 	if rc != 0 {
 		t.Fatalf("guardBash rc=%d want 0", rc)
 	}
@@ -1517,7 +1594,7 @@ func runGuardPowerShell(t *testing.T, storeRoot, cwd, command string, env map[st
 		"tool_input": map[string]any{"command": command, "description": "test"},
 	})
 	var out bytes.Buffer
-	rc := Run(context.Background(), bytes.NewReader(in), &out, storeRoot, "test", func(k string) string { return env[k] })
+	rc := Run(context.Background(), bytes.NewReader(in), &out, storeRoot, "test", HostClaude, func(k string) string { return env[k] })
 	if rc != 0 {
 		t.Fatalf("guardPowerShell rc=%d want 0", rc)
 	}

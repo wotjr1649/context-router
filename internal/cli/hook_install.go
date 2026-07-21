@@ -267,7 +267,24 @@ func runHook(ctx context.Context, args []string, storeRoot, storeRootRaw string,
 			break
 		}
 	}
-	hook.Run(ctx, os.Stdin, stdout, storeRoot, version, getenv)
+	hook.Run(ctx, os.Stdin, stdout, storeRoot, version, hook.HostClaude, getenv)
+	return nil
+}
+
+// runCodexHook — Codex 러닝 훅 전용 서브커맨드(설계 v0.4 §2 D35, §11.2 F3). install/uninstall
+// 하위 없음 — 모든 인자는 러닝 훅 인자(--no-shadow만 인식, 그 외 fail-open 무시 D23). 전용
+// 서브커맨드인 이유: v0.3 러닝 훅은 미지 인자를 무시하므로 플래그로 호스트를 구분하면 구버전
+// 바이너리가 Codex 이벤트를 cc:로 오귀속시킨다 — 미지 서브커맨드는 v0.3이 exit 1로 거부해
+// 오귀속이 구조적으로 불가능하다(버전 게이트).
+func runCodexHook(ctx context.Context, args []string, storeRoot, version string, stdout io.Writer) error {
+	getenv := os.Getenv
+	for _, a := range args {
+		if a == "--no-shadow" {
+			getenv = shadowOffGetenv
+			break
+		}
+	}
+	hook.Run(ctx, os.Stdin, stdout, storeRoot, version, hook.HostCodex, getenv)
 	return nil
 }
 

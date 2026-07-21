@@ -128,6 +128,7 @@
 | `posttooluse-write.json` | `PostToolUse` | Write, `tool_response = {filePath, success}` (문서 예시와 동형) |
 | `posttooluse-error.json` | **`PostToolUseFailure`** | 실패 도구 호출의 **문서상 오류 신호**(`error` 문자열). 파일명은 브리프 유지, 내용은 문서 충실. |
 | `sessionstart.json` | `SessionStart` | `source: "startup"` |
+| `posttooluse-codex-bash.json` | `PostToolUse` | Codex CLI 훅 형상(설계 v0.4 §11.1 G1, codex-cli 0.144.6 문서 기준; 추가 필드는 무시됨). |
 
 - 파일 인코딩: UTF-8 (BOM 없음), LF 개행.
 - 더미 값: `session_id`는 canonical UUID(`3f2504e0-4f89-41d3-9a0c-0305e82c3301`), 경로는 Windows 스타일.
