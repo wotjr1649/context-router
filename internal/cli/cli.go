@@ -1208,15 +1208,26 @@ func runDoctor(ctx context.Context, w io.Writer, storeRoot, projectRoot string) 
 
 	// [9]-[13] 훅/사이드카 진단(설계 §7·§9 확장). 전부 정보성 — 미설치·미해석·drops 존재는
 	// 정상 상태라 실패로 세지 않는다(진단 본문에는 절대경로 허용, §12 canary는 반환 오류 전용).
-	settingsPath := filepath.Join(projectRoot, ".claude", "settings.json")
-	switch n, hookErr := countRegisteredHooks(settingsPath); {
-	case hookErr != nil:
-		fmt.Fprintln(w, "[9] hooks: 프로젝트 settings 파싱 실패")
-	case n == 0:
-		fmt.Fprintln(w, "[9] hooks: 미등록 (context-router hook install)")
-	default:
-		fmt.Fprintf(w, "[9] hooks: 등록됨 (%d개 이벤트)\n", n)
+	// [9] 훅 등록 상태 — 프로젝트 + 사용자(~/.claude) 범위 양쪽 검사(F5: `hook install --user`
+	// 등록을 프로젝트-only 검사가 놓쳐 "미등록" 오보하던 문제). 두 경로 모두 install/uninstall과
+	// 동일한 hookSettingsPath 이음새로 도출한다(사용자 홈 = os.UserHomeDir).
+	hookScope := func(path string, pathErr error) string {
+		if pathErr != nil {
+			return "확인불가"
+		}
+		switch n, err := countRegisteredHooks(path); {
+		case err != nil:
+			return "파싱실패"
+		case n == 0:
+			return "미등록"
+		default:
+			return fmt.Sprintf("등록됨(%d개)", n)
+		}
 	}
+	projPath, _ := hookSettingsPath(false, projectRoot) // 프로젝트 경로는 오류를 내지 않는다
+	userPath, userPathErr := hookSettingsPath(true, projectRoot)
+	fmt.Fprintf(w, "[9] hooks: project=%s user=%s (context-router hook install)\n",
+		hookScope(projPath, nil), hookScope(userPath, userPathErr))
 
 	if p, lookErr := exec.LookPath(hookBinaryName); lookErr != nil {
 		fmt.Fprintln(w, "[10] context-router: PATH 미해석 (설치 후 훅 실행 가능)")

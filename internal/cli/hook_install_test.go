@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -13,7 +14,25 @@ import (
 	"testing"
 
 	"github.com/wotjr1649/context-router/internal/ident"
+	"github.com/wotjr1649/context-router/internal/store"
 )
+
+// TestMain — 이 패키지 테스트 전역 격리: doctor([9] 사용자 범위 검사)·`hook install --user`가
+// 실사용자 ~/.claude를 절대 건드리지 않도록 홈을 프로세스 임시 디렉터리로 돌린다(os.UserHomeDir
+// 이음새 = Windows USERPROFILE / 그 외 HOME). 사용자 범위에 실제로 기록하는 테스트는 t.Setenv로
+// 자기 전용 임시 홈을 덮어써(격리·자동 복원) 이 기본 홈을 오염시키지 않는다.
+func TestMain(m *testing.M) {
+	home, err := os.MkdirTemp("", "ctr-cli-test-home-")
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "TestMain: 임시 홈 생성 실패:", err)
+		os.Exit(1)
+	}
+	_ = os.Setenv("HOME", home)
+	_ = os.Setenv("USERPROFILE", home)
+	code := m.Run()
+	_ = os.RemoveAll(home)
+	os.Exit(code)
+}
 
 // firstHookCommand: settings.json의 SessionStart 첫 그룹 첫 명령 문자열을 뽑는다(설치가 쓴
 // 훅 명령을 검증하는 헬퍼).
@@ -306,7 +325,7 @@ func TestHookInstall_CommandReflectsFlags(t *testing.T) {
 	t.Run("install_writes_no_shadow_and_explicit_store_root", func(t *testing.T) {
 		projectRoot := t.TempDir()
 		var out bytes.Buffer
-		// storeRoot(canon)와 storeRootRaw(원시)를 다르게 줘서 원시값이 주입되는지 확인.
+		// storeRoot(canon)와 storeRootRaw(원시)를 다르게 줘서 명시 store-root가 주입되는지 확인.
 		if err := runHookInstall([]string{"--no-shadow"}, "/canon/store", "/raw/store", true, projectRoot, "0.1.0", &out); err != nil {
 			t.Fatalf("install: %v", err)
 		}
@@ -314,8 +333,34 @@ func TestHookInstall_CommandReflectsFlags(t *testing.T) {
 		if !strings.Contains(cmd, "--no-shadow") {
 			t.Fatalf("cmd=%q missing --no-shadow", cmd)
 		}
-		if !strings.Contains(cmd, "--store-root /raw/store") {
-			t.Fatalf("cmd=%q must inject the raw store-root value", cmd)
+		absRaw, err := filepath.Abs("/raw/store") // F3: install이 절대화해 주입
+		if err != nil {
+			t.Fatalf("abs: %v", err)
+		}
+		if !strings.Contains(cmd, "--store-root "+absRaw) {
+			t.Fatalf("cmd=%q must inject the absolutized store-root %q", cmd, absRaw)
+		}
+	})
+
+	// F3: 상대 --store-root는 절대화돼 settings에 기입돼야 한다(원시 상대경로가 박히면 프로젝트별
+	// cwd로 store가 파편화). settings JSON을 파싱해 훅 명령을 뽑아 확인한다(TempDir 격리).
+	t.Run("install_absolutizes_relative_store_root", func(t *testing.T) {
+		projectRoot := t.TempDir()
+		var out bytes.Buffer
+		const rel = "./cache"
+		if err := runHookInstall(nil, "/canon/store", rel, true, projectRoot, "0.1.0", &out); err != nil {
+			t.Fatalf("install: %v", err)
+		}
+		cmd := firstHookCommand(t, projectRoot)
+		abs, err := filepath.Abs(rel)
+		if err != nil {
+			t.Fatalf("abs: %v", err)
+		}
+		if !strings.Contains(cmd, "--store-root "+abs) {
+			t.Fatalf("cmd=%q must contain absolutized store-root %q", cmd, abs)
+		}
+		if strings.Contains(cmd, "--store-root "+rel) {
+			t.Fatalf("cmd=%q must NOT contain the raw relative path %q", cmd, rel)
 		}
 	})
 
@@ -343,7 +388,7 @@ func TestDoctor_HookItemsAndAscendingOrder(t *testing.T) {
 		}
 		out := buf.String()
 		for _, want := range []string{
-			"[9] hooks: 미등록",
+			"[9] hooks: project=미등록",
 			"[10] context-router:",
 			"[11] store-root path:",
 			"[12] drops:",
@@ -384,7 +429,7 @@ func TestDoctor_HookItemsAndAscendingOrder(t *testing.T) {
 			t.Fatalf("runDoctor err=%v out=%s", err, buf.String())
 		}
 		out := buf.String()
-		if !strings.Contains(out, "[9] hooks: 등록됨") {
+		if !strings.Contains(out, "[9] hooks: project=등록됨") {
 			t.Fatalf("out missing registered-hooks line:\n%s", out)
 		}
 		if !strings.Contains(out, "[12] drops: store-root=2 worktree=3 total=5") {
@@ -392,4 +437,126 @@ func TestDoctor_HookItemsAndAscendingOrder(t *testing.T) {
 		}
 		assertDoctorAscending(t, out)
 	})
+}
+
+// ⑧ F5: `hook install --user` 후 doctor가 사용자 범위 등록을 인식하고 프로젝트 범위는 미등록으로
+// 보고해야 한다(프로젝트-only 검사 회귀 방지). 사용자 홈은 t.Setenv로 자기 전용 TempDir로 덮어써
+// 실사용자 ~/.claude를 건드리지 않는다(TestMain 기본 홈 격리 위에서 추가 격리·자동 복원).
+func TestDoctor_UserScopeHookRegistration(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home) // Windows os.UserHomeDir 이음새
+	storeRoot := t.TempDir()
+	projectRoot := t.TempDir()
+
+	var iout bytes.Buffer
+	if err := runHookInstall([]string{"--user"}, storeRoot, "", false, projectRoot, "0.1.0", &iout); err != nil {
+		t.Fatalf("install --user: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(home, ".claude", "settings.json")); err != nil {
+		t.Fatalf("user-scope settings not written under temp home: %v", err)
+	}
+
+	var buf bytes.Buffer
+	if err := runDoctor(context.Background(), &buf, storeRoot, projectRoot); err != nil {
+		t.Fatalf("runDoctor err=%v out=%s", err, buf.String())
+	}
+	out := buf.String()
+	if !strings.Contains(out, "user=등록됨") {
+		t.Fatalf("doctor must report user-scope registration:\n%s", out)
+	}
+	if !strings.Contains(out, "project=미등록") {
+		t.Fatalf("doctor must report project scope as unregistered:\n%s", out)
+	}
+	assertDoctorAscending(t, out)
+}
+
+// hookRunPayload — cli 러닝 훅 stdin JSON을 조립한다(경로 이스케이프 위해 json.Marshal 사용).
+// session_id는 hook.canonicalUUIDRe를 통과하는 고정 UUID.
+func hookRunPayload(t *testing.T, fields map[string]any) []byte {
+	t.Helper()
+	fields["session_id"] = "3f2504e0-4f89-41d3-9a0c-0305e82c3301"
+	b, err := json.Marshal(fields)
+	if err != nil {
+		t.Fatalf("marshal payload: %v", err)
+	}
+	return b
+}
+
+// setStdin — os.Stdin을 payload를 담은 임시 파일로 교체한다(cli.runHook은 os.Stdin을 직접 읽는다).
+func setStdin(t *testing.T, payload []byte) {
+	t.Helper()
+	f, err := os.CreateTemp(t.TempDir(), "stdin-*.json")
+	if err != nil {
+		t.Fatalf("temp stdin: %v", err)
+	}
+	if _, err := f.Write(payload); err != nil {
+		t.Fatalf("write stdin: %v", err)
+	}
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		t.Fatalf("seek stdin: %v", err)
+	}
+	os.Stdin = f
+	t.Cleanup(func() { _ = f.Close() })
+}
+
+// contentArtifactCount — contentDir/content.db(read-only)의 artifacts 행 수. 미존재면 -1(Shadow 미저장).
+func contentArtifactCount(t *testing.T, contentDir string) int {
+	t.Helper()
+	if _, err := os.Stat(filepath.Join(contentDir, "content.db")); os.IsNotExist(err) {
+		return -1
+	}
+	st, err := store.Open(contentDir, true)
+	if err != nil {
+		t.Fatalf("open content.db ro: %v", err)
+	}
+	defer func() { _ = st.Close() }()
+	var n int
+	if err := st.Reader().QueryRow("SELECT count(*) FROM artifacts").Scan(&n); err != nil {
+		t.Fatalf("count artifacts: %v", err)
+	}
+	return n
+}
+
+// F7: cli 러닝 훅의 --no-shadow 분기가 CTR_SHADOW_OFF로 반영돼 Shadow 아티팩트를 저장하지 않는지
+// 행동으로 확인한다(플래그 없는 대조군은 저장). SessionStart로 세션을 만든 뒤 >CTR_SHADOW_MIN
+// PostToolUse를 발화한다(러닝 경로는 os.Stdin을 읽으므로 각 호출마다 stdin 교체). TempDir 격리.
+func TestRunHook_NoShadowRunningBranch(t *testing.T) {
+	t.Setenv("CTR_SHADOW_MIN", "100") // 소형 payload로 게이트 통과(대용량 리터럴 회피)
+	t.Setenv("CTR_SHADOW_OFF", "")    // 대조군이 실제 env 잔여 OFF에 오염되지 않도록
+	t.Setenv("CTR_HOOKS_OFF", "")
+	origStdin := os.Stdin
+	t.Cleanup(func() { os.Stdin = origStdin })
+
+	run := func(args []string) int {
+		storeRoot := t.TempDir()
+		cwd := t.TempDir()
+		// ① 세션 생성 — 후속 PostToolUse가 미지 세션으로 drop되지 않도록.
+		setStdin(t, hookRunPayload(t, map[string]any{
+			"hook_event_name": "SessionStart", "cwd": cwd, "source": "startup",
+		}))
+		if err := runHook(context.Background(), nil, storeRoot, "", false, cwd, "test", io.Discard); err != nil {
+			t.Fatalf("sessionstart: %v", err)
+		}
+		// ② >MIN PostToolUse — args(--no-shadow 유무)에 따라 Shadow on/off.
+		setStdin(t, hookRunPayload(t, map[string]any{
+			"hook_event_name": "PostToolUse", "cwd": cwd, "tool_name": "Bash",
+			"tool_response": map[string]any{"stdout": strings.Repeat("a", 500), "stderr": ""},
+		}))
+		if err := runHook(context.Background(), args, storeRoot, "", false, cwd, "test", io.Discard); err != nil {
+			t.Fatalf("posttooluse: %v", err)
+		}
+		canon, err := ident.Canonicalize(cwd)
+		if err != nil {
+			t.Fatalf("canonicalize: %v", err)
+		}
+		return contentArtifactCount(t, filepath.Join(storeRoot, "projects", canon.ProjectID))
+	}
+
+	if n := run([]string{"--no-shadow"}); n != -1 {
+		t.Fatalf("--no-shadow artifacts=%d want -1(미저장) — CTR_SHADOW_OFF 미반영", n)
+	}
+	if n := run(nil); n != 1 {
+		t.Fatalf("control artifacts=%d want 1(저장)", n)
+	}
 }

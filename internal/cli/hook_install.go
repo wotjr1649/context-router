@@ -287,6 +287,13 @@ func runHookInstall(args []string, storeRoot, storeRootRaw string, storeRootExpl
 	if err != nil {
 		return err
 	}
+	// F3: 명시된 상대 --store-root는 절대화한다 — 상대 경로를 그대로 훅 명령에 박으면 프로젝트마다
+	// 훅 실행 시점 cwd 기준으로 서로 다른 store로 갈라진다(store 파편화). 절대화 실패 시 원시값 유지.
+	if storeRootExplicit && storeRootRaw != "" {
+		if abs, absErr := filepath.Abs(storeRootRaw); absErr == nil {
+			storeRootRaw = abs
+		}
+	}
 	command := buildHookCommand(storeRootExplicit, storeRootRaw, *noShadow)
 	merged, err := mergeSettingsFile(path, command, hookMarker(version), true)
 	if err != nil {
