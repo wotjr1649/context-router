@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -397,6 +398,20 @@ func TestMainDispatch_CLI(t *testing.T) {
 	}
 }
 
+// TestMainDispatch_HookPreprocFailOpen(최종 리뷰 C3): 실행 훅의 root 플래그 파싱 실패(값 없는
+// --store-root)는 fail-open으로 흡수돼 err=nil(exit 0)이어야 한다(D23 — settings에 잔존한
+// 잘못된 훅 명령이 호스트를 막으면 안 됨). install은 같은 실패를 그대로 전파한다(사용자 대면).
+func TestMainDispatch_HookPreprocFailOpen(t *testing.T) {
+	handled, err := dispatchCLI(context.Background(), []string{"context-router", "hook", "--store-root"})
+	if !handled || err != nil {
+		t.Fatalf("running hook: handled=%v err=%v want true/nil(fail-open)", handled, err)
+	}
+	handled, err = dispatchCLI(context.Background(), []string{"context-router", "hook", "install", "--store-root"})
+	if !handled || err == nil {
+		t.Fatalf("install: handled=%v err=%v want true/non-nil(전파)", handled, err)
+	}
+}
+
 // TestMainDispatch_Session: "session" 서브커맨드가 cliSubcommands를 통과해 cli.Run까지
 // 위임되는지 확인한다(태스크9a, 설계 §7 — main.go: sub "session" 허용). 이 프로젝트에는
 // worktree가 없어 export 자체는 실패하지만(handled=true·err!=nil), 그 오류가 "미지
@@ -415,6 +430,27 @@ func TestMainDispatch_Session(t *testing.T) {
 	}
 	if strings.Contains(err.Error(), "미지 서브커맨드") {
 		t.Fatalf("session must not be rejected as unknown subcommand: %v", err)
+	}
+}
+
+// TestMainDispatch_Usage: "usage" 서브커맨드가 cliSubcommands를 통과해 cli.Run까지 위임되는지
+// 확인한다(태스크9, 설계 §6·§7). transcript 디렉터리가 없어 usage 자체는 실패하지만
+// (handled=true·err!=nil), 그 오류가 "미지 서브커맨드"가 아니어야 한다 — dispatchCLI가 usage를
+// 정상적으로 cli.Run에 위임했다는 증거(TestMainDispatch_Session과 동형).
+func TestMainDispatch_Usage(t *testing.T) {
+	proj := t.TempDir()
+	storeRoot := filepath.Join(t.TempDir(), "storeroot")
+	missing := filepath.Join(t.TempDir(), "no-transcripts")
+	args := []string{"context-router", "usage", "--transcripts", missing, "--root", proj, "--store-root", storeRoot}
+	handled, err := dispatchCLI(context.Background(), args)
+	if !handled {
+		t.Fatal("want handled=true for usage subcommand")
+	}
+	if err == nil {
+		t.Fatal("want error (missing transcripts dir), got nil")
+	}
+	if strings.Contains(err.Error(), "미지 서브커맨드") {
+		t.Fatalf("usage must not be rejected as unknown subcommand: %v", err)
 	}
 }
 
@@ -506,6 +542,143 @@ func captureStdout(t *testing.T, fn func()) string {
 		t.Fatalf("read pipe: %v", err)
 	}
 	return string(out)
+}
+
+// TestMainDispatch_Hook: "hook" 서브커맨드가 cliSubcommands를 통과해 cli.Run까지 위임되는지
+// 확인한다(v0.2 설계 §2 — main.go: sub "hook" 등재). internal/hook만 테스트하면 맵 등재
+// 누락에도 GREEN이 되는 사각을 막는다(브리프 ⑨). hook.Run은 stdin을 읽으므로(fail-open) os.Stdin을
+// 즉시 EOF인 파이프로 잠시 대체해 ReadAll이 블록하지 않게 한다 — 빈 stdin은 bad-input drop 후
+// exit 0(→ cli.Run nil)이라 dispatchCLI는 handled=true·err=nil을 반환해야 한다.
+func TestMainDispatch_Hook(t *testing.T) {
+	storeRoot := filepath.Join(t.TempDir(), "storeroot")
+
+	origStdin := os.Stdin
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe: %v", err)
+	}
+	_ = w.Close() // 즉시 EOF
+	os.Stdin = r
+	defer func() { os.Stdin = origStdin; _ = r.Close() }()
+
+	handled, err := dispatchCLI(context.Background(), []string{"context-router", "hook", "--store-root", storeRoot})
+	if !handled {
+		t.Fatal("want handled=true for hook subcommand")
+	}
+	if err != nil {
+		t.Fatalf("hook dispatch err=%v (must not be rejected as unknown subcommand)", err)
+	}
+}
+
+// TestMainDispatch_Hook_AbsorbsPreprocError: F2 — 실행 훅(install/uninstall 아님)의 전처리
+// 실패는 exit 1이 아니라 흡수돼야 한다(설계 §2 always-exit-0). store-root 기본값 도출을 OS별
+// env를 비워 실패시키는 seam으로 주입하고, dispatchCLI가 handled=true·err=nil을 반환하는지 본다.
+// install은 종전대로 오류를 전파해야 한다(흡수 대상은 실행 훅 한정).
+func TestMainDispatch_Hook_AbsorbsPreprocError(t *testing.T) {
+	// storeRootFor → defaultStoreRoot 실패 강제(3-OS): windows LOCALAPPDATA, linux XDG/HOME,
+	// darwin HOME 모두 비운다(CTR_STORE_ROOT도 비워 env 우선순위 우회 차단).
+	t.Setenv("CTR_STORE_ROOT", "")
+	t.Setenv("LOCALAPPDATA", "")
+	t.Setenv("XDG_DATA_HOME", "")
+	t.Setenv("HOME", "")
+
+	t.Run("running_hook_absorbs", func(t *testing.T) {
+		origStdin := os.Stdin
+		r, w, err := os.Pipe()
+		if err != nil {
+			t.Fatalf("pipe: %v", err)
+		}
+		_ = w.Close() // 즉시 EOF — 흡수 경로가 stdin을 drain
+		os.Stdin = r
+		defer func() { os.Stdin = origStdin; _ = r.Close() }()
+
+		handled, err := dispatchCLI(context.Background(), []string{"context-router", "hook"})
+		if !handled {
+			t.Fatal("want handled=true for hook subcommand")
+		}
+		if err != nil {
+			t.Fatalf("running hook preproc error must be absorbed (exit 0), got err=%v", err)
+		}
+	})
+
+	t.Run("install_still_errors", func(t *testing.T) {
+		handled, err := dispatchCLI(context.Background(), []string{"context-router", "hook", "install", "--root", t.TempDir()})
+		if !handled {
+			t.Fatal("want handled=true for hook install")
+		}
+		if err == nil {
+			t.Fatal("install preproc error must NOT be absorbed, got nil")
+		}
+	})
+}
+
+// TestMainDispatch_HookInstall_ExplicitStoreRoot: 브리프 ⑧ — main dispatch가 `--store-root`
+// 명시 여부(storeRootExplicit)와 원시값(storeRootRaw)을 cli.Run에 전달해, 명시된 경우에만 훅
+// 명령 args에 `--store-root <원시값>`이 주입되는지 실경로로 확인한다. prescanRootFlags가
+// 토큰을 소비하므로 이 전달이 없으면 cli.Run은 명시/기본을 구분할 수 없다(리뷰 반영).
+func TestMainDispatch_HookInstall_ExplicitStoreRoot(t *testing.T) {
+	readCommand := func(t *testing.T, proj string) string {
+		t.Helper()
+		data, err := os.ReadFile(filepath.Join(proj, ".claude", "settings.json"))
+		if err != nil {
+			t.Fatalf("read settings: %v", err)
+		}
+		var s struct {
+			Hooks map[string][]struct {
+				Hooks []struct {
+					Command string `json:"command"`
+				} `json:"hooks"`
+			} `json:"hooks"`
+		}
+		if err := json.Unmarshal(data, &s); err != nil {
+			t.Fatalf("parse: %v\n%s", err, data)
+		}
+		g := s.Hooks["SessionStart"]
+		if len(g) == 0 || len(g[0].Hooks) == 0 {
+			t.Fatalf("no SessionStart command: %s", data)
+		}
+		return g[0].Hooks[0].Command
+	}
+
+	t.Run("explicit_injects_raw_store_root", func(t *testing.T) {
+		proj := t.TempDir()
+		storeRoot := filepath.Join(t.TempDir(), "storeroot")
+		var handled bool
+		var derr error
+		captureStdout(t, func() {
+			handled, derr = dispatchCLI(context.Background(), []string{
+				"context-router", "hook", "install", "--root", proj, "--store-root", storeRoot,
+			})
+		})
+		if !handled {
+			t.Fatal("want handled=true")
+		}
+		if derr != nil {
+			t.Fatalf("hook install dispatch err=%v", derr)
+		}
+		cmd := readCommand(t, proj)
+		if !strings.Contains(cmd, "--store-root") || !strings.Contains(cmd, storeRoot) {
+			t.Fatalf("cmd=%q must inject explicit --store-root %q", cmd, storeRoot)
+		}
+	})
+
+	t.Run("default_omits_store_root", func(t *testing.T) {
+		proj := t.TempDir()
+		var handled bool
+		var derr error
+		captureStdout(t, func() {
+			handled, derr = dispatchCLI(context.Background(), []string{
+				"context-router", "hook", "install", "--root", proj,
+			})
+		})
+		if !handled || derr != nil {
+			t.Fatalf("handled=%v err=%v", handled, derr)
+		}
+		cmd := readCommand(t, proj)
+		if strings.Contains(cmd, "--store-root") {
+			t.Fatalf("cmd=%q must not inject store-root when not explicitly given", cmd)
+		}
+	})
 }
 
 // TestMainDispatch_Stats_Provider: 실제 dispatchCLI 경로로 `stats --provider <jsonl>`이
@@ -1586,5 +1759,455 @@ func TestE2E_CallToolCancellation(t *testing.T) {
 	}
 	if st := cmd.ProcessState; st == nil || !st.Success() {
 		t.Fatalf("(c) exit state=%v want 코드 0 (stderr=%s)", st, stderrBuf.String())
+	}
+}
+
+// ─── v0.2 forced-channel 통합 게이트 (설계 §10, T10 Step1-2) ───────────────────
+//
+// 실바이너리를 one-shot `context-router hook`으로 실행해(별도 프로세스·stdin 주입) cc: 세션
+// 스트림을 E2E로 검증한다. internal/hook 단위 테스트가 이미 개별 동작을 커버하므로 대부분
+// born-green이며, 여기서의 가치는 실 프로세스 경계·실 잠금 경합·MCP 서버 동시 가동을 pin하는 것.
+
+// hookDeadlineEnv — 훅 deadline을 300ms로 낮춰 잠금 경합 경로가 예산 안에 종료하는지 측정한다.
+var hookDeadlineEnv = map[string]string{"CTR_HOOK_DEADLINE_MS": "300"}
+
+// hookFixture — internal/hook/testdata 골든 픽스처(T0)를 읽어 overrides로 필드를 덮어쓴 stdin
+// JSON을 만든다(internal/hook의 fixtureWith를 package main에서 미러 — internals import 금지).
+// 픽스처의 하드코딩 cwd는 호스트 의존적이라 각 테스트가 실재 t.TempDir()로 대체한다.
+func hookFixture(t *testing.T, name string, overrides map[string]any) []byte {
+	t.Helper()
+	raw, err := os.ReadFile(filepath.Join("..", "..", "internal", "hook", "testdata", name))
+	if err != nil {
+		t.Fatalf("read fixture %s: %v", name, err)
+	}
+	var m map[string]any
+	if err := json.Unmarshal(raw, &m); err != nil {
+		t.Fatalf("unmarshal fixture %s: %v", name, err)
+	}
+	for k, v := range overrides {
+		m[k] = v
+	}
+	out, err := json.Marshal(m)
+	if err != nil {
+		t.Fatalf("marshal fixture %s: %v", name, err)
+	}
+	return out
+}
+
+// bigToolResponse — >CTR_SHADOW_MIN(16KiB)인 tool_response 오브젝트(strings.Repeat 생성 —
+// 대용량 리터럴 금지 규율). Shadow Recall을 발화시킨다(hook_test.bigStdout와 동형).
+func bigToolResponse() map[string]any {
+	return map[string]any{"stdout": strings.Repeat("a", 20000), "stderr": ""}
+}
+
+// runHookOneShot — 실바이너리를 `hook --store-root <storeRoot>`로 1회 실행하고(신규 exec 헬퍼:
+// stdin 주입·env 병합·exit code 캡처, spawnCtr는 장기 MCP stdio 전용이라 재사용 불가) 종료 코드와
+// 경과 시간을 돌려준다. 훅은 fail-open이라 항상 exit 0이어야 한다. spawn/wait 실패만 t.Fatal한다.
+func runHookOneShot(t *testing.T, bin, storeRoot string, stdin []byte, env map[string]string) (int, time.Duration) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, bin, "hook", "--store-root", storeRoot)
+	cmd.Stdin = bytes.NewReader(stdin)
+	cmd.Env = os.Environ()
+	for k, v := range env {
+		cmd.Env = append(cmd.Env, k+"="+v)
+	}
+	var stdoutBuf, stderrBuf bytes.Buffer
+	cmd.Stdout = &stdoutBuf
+	cmd.Stderr = &stderrBuf
+	start := time.Now()
+	err := cmd.Run()
+	elapsed := time.Since(start)
+	if err != nil {
+		// ExitError는 종료 코드로 흡수(훅은 0이어야 하지만 판정은 호출자) — 그 외(spawn/timeout)는 Fatal.
+		if _, ok := err.(*exec.ExitError); !ok {
+			t.Fatalf("hook one-shot 실행 실패: %v (stderr=%s)", err, stderrBuf.String())
+		}
+	}
+	return cmd.ProcessState.ExitCode(), elapsed
+}
+
+// hookSessionDir — --root proj/--store-root storeRoot 조합의 worktree 세션 디렉터리(session.db·
+// drops.log 위치). sessionDBPathFor의 부모.
+func hookSessionDir(t *testing.T, storeRoot, proj string) string {
+	t.Helper()
+	return filepath.Dir(sessionDBPathFor(t, storeRoot, proj))
+}
+
+// hookContentDir — 프로젝트 레벨 content.db 디렉터리(<storeRoot>/projects/<pid>, main·§5 join과 동일).
+func hookContentDir(t *testing.T, storeRoot, proj string) string {
+	t.Helper()
+	canon, err := ident.Canonicalize(proj)
+	if err != nil {
+		t.Fatalf("canonicalize: %v", err)
+	}
+	return filepath.Join(storeRoot, "projects", canon.ProjectID)
+}
+
+// readHookDrops — dir/session.drops.log 내용(fail-open 사이드카 검증용).
+func readHookDrops(t *testing.T, dir string) string {
+	t.Helper()
+	b, err := os.ReadFile(filepath.Join(dir, "session.drops.log"))
+	if err != nil {
+		t.Fatalf("read drops in %s: %v", dir, err)
+	}
+	return string(b)
+}
+
+// assertOneDrop — drops.log이 정확히 1줄이고 그 줄이 want 토큰을 포함하는지 검증(deadline 게이트:
+// 사이드카는 드롭당 1줄 append이므로 스퓨리어스 추가 드롭이 있으면 줄 수로 잡힌다).
+func assertOneDrop(t *testing.T, dir, want string) {
+	t.Helper()
+	got := readHookDrops(t, dir)
+	lines := strings.Split(strings.TrimRight(got, "\n"), "\n")
+	if len(lines) != 1 {
+		t.Fatalf("drops=%d줄 want 1줄 (%q)", len(lines), got)
+	}
+	if !strings.Contains(lines[0], want) {
+		t.Fatalf("drops=%q want %q 포함", got, want)
+	}
+}
+
+// contentArtifactCount — contentDir/content.db(read-only)의 artifacts 행 수. 미존재(Shadow 미저장)면 -1.
+func contentArtifactCount(t *testing.T, contentDir string) int {
+	t.Helper()
+	if _, err := os.Stat(filepath.Join(contentDir, "content.db")); os.IsNotExist(err) {
+		return -1
+	}
+	st, err := store.Open(contentDir, true)
+	if err != nil {
+		t.Fatalf("open content.db ro: %v", err)
+	}
+	defer func() { _ = st.Close() }()
+	var n int
+	if err := st.Reader().QueryRow("SELECT count(*) FROM artifacts").Scan(&n); err != nil {
+		t.Fatalf("count artifacts: %v", err)
+	}
+	return n
+}
+
+// countEventsByType — session.db(read-only)에서 event_type별 행 수를 맵으로 반환한다(worktree 전체).
+func countEventsByType(t *testing.T, dbDir string) map[string]int {
+	t.Helper()
+	reader, err := session.OpenReadOnly(dbDir)
+	if err != nil {
+		t.Fatalf("open session.db: %v", err)
+	}
+	defer func() { _ = reader.Close() }()
+	rows, err := reader.Query("SELECT event_type, count(*) FROM session_events GROUP BY event_type")
+	if err != nil {
+		t.Fatalf("group events: %v", err)
+	}
+	defer rows.Close()
+	counts := map[string]int{}
+	for rows.Next() {
+		var et string
+		var n int
+		if err := rows.Scan(&et, &n); err != nil {
+			t.Fatalf("scan: %v", err)
+		}
+		counts[et] = n
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("rows: %v", err)
+	}
+	return counts
+}
+
+// TestE2E_HookForcedChannel — 게이트족①(E2E) + 세션 규칙 재확인. 실바이너리 one-shot 훅으로
+// SessionStart(×2, 멱등)·PostToolUse 3건(bash 소·write·bash 대=shadow)·미지 세션 1건을 실행하고
+// session.db·content.db·drops.log를 직접 읽어 검증한다(서버 미개입 — 훅 기록 결정의 직접 관찰).
+func TestE2E_HookForcedChannel(t *testing.T) {
+	if testing.Short() {
+		t.Skip("느린 E2E 스모크 — short 모드 skip")
+	}
+	bin := buildCtrBinary(t)
+	proj := t.TempDir()
+	storeRoot := t.TempDir()
+
+	// SessionStart ×2 — EnsureSession 멱등: session_start 이벤트는 1건만 남아야 한다(설계 §2.2).
+	for i := 0; i < 2; i++ {
+		if rc, _ := runHookOneShot(t, bin, storeRoot, hookFixture(t, "sessionstart.json", map[string]any{"cwd": proj}), nil); rc != 0 {
+			t.Fatalf("SessionStart #%d rc=%d want 0", i, rc)
+		}
+	}
+	// PostToolUse 3건.
+	posts := [][]byte{
+		hookFixture(t, "posttooluse-bash.json", map[string]any{"cwd": proj}),                                     // test_run(소)
+		hookFixture(t, "posttooluse-write.json", map[string]any{"cwd": proj}),                                    // file_edit
+		hookFixture(t, "posttooluse-bash.json", map[string]any{"cwd": proj, "tool_response": bigToolResponse()}), // test_run + shadow
+	}
+	for i, p := range posts {
+		if rc, _ := runHookOneShot(t, bin, storeRoot, p, nil); rc != 0 {
+			t.Fatalf("PostToolUse #%d rc=%d want 0", i, rc)
+		}
+	}
+	// 미지 세션(SessionStart 없이) PostToolUse → drop, 이벤트 미추가(같은 worktree 세션 dir).
+	unknownSID := "11111111-2222-4333-8444-555555555555"
+	if rc, _ := runHookOneShot(t, bin, storeRoot, hookFixture(t, "posttooluse-bash.json", map[string]any{"cwd": proj, "session_id": unknownSID}), nil); rc != 0 {
+		t.Fatalf("unknown-session rc=%d want 0", rc)
+	}
+
+	dbDir := hookSessionDir(t, storeRoot, proj)
+	counts := countEventsByType(t, dbDir)
+	// session_start 1건(멱등), test_run 2건(bash 소·대 — 미지 세션 건은 drop되어 미포함),
+	// file_edit 1건, shadow 이벤트 2건(artifact_created·tool_result_summary).
+	want := map[string]int{"session_start": 1, "test_run": 2, "file_edit": 1, "artifact_created": 1, "tool_result_summary": 1}
+	for et, n := range want {
+		if counts[et] != n {
+			t.Fatalf("event_type %q count=%d want %d (all=%+v)", et, counts[et], n, counts)
+		}
+	}
+	// 스퓨리어스/예기치 못한 event_type 검출: 기대 카운트 합 == session_events 총 행 수.
+	wantTotal, gotTotal := 0, 0
+	for _, n := range want {
+		wantTotal += n
+	}
+	for _, n := range counts {
+		gotTotal += n
+	}
+	if gotTotal != wantTotal {
+		t.Fatalf("session_events 총 %d행 want %d (예기치 못한 event_type: all=%+v)", gotTotal, wantTotal, counts)
+	}
+	// content.db에 shadow 아티팩트 1건.
+	if n := contentArtifactCount(t, hookContentDir(t, storeRoot, proj)); n != 1 {
+		t.Fatalf("content artifacts=%d want 1 (shadow 미저장)", n)
+	}
+	// 미지 세션 drop 기록.
+	if got := readHookDrops(t, dbDir); !strings.Contains(got, "unknown-session") {
+		t.Fatalf("drops=%q want unknown-session", got)
+	}
+	// sessions 행이 cc:<uuid>로 등록됐는지 확인.
+	reader, err := session.OpenReadOnly(dbDir)
+	if err != nil {
+		t.Fatalf("open session.db: %v", err)
+	}
+	defer func() { _ = reader.Close() }()
+	var sid string
+	if err := reader.QueryRow("SELECT session_id FROM sessions WHERE session_id LIKE 'cc:%'").Scan(&sid); err != nil {
+		t.Fatalf("sessions row: %v", err)
+	}
+	if want := "cc:3f2504e0-4f89-41d3-9a0c-0305e82c3301"; sid != want {
+		t.Fatalf("session_id=%q want %q", sid, want)
+	}
+}
+
+// TestE2E_HookDeadlineDeterminism — 게이트족②(deadline 결정론). 세 잠금 경합 경로 각각에 대해
+// 실바이너리 훅을 CTR_HOOK_DEADLINE_MS=300으로 실행 → 예산 안에 종료(경과 측정)·exit 0·drops 1줄.
+// (계획 리뷰 교체: exclusive lease 선점은 논블로킹 AcquireLock이 즉시 ErrLeaseHeld로 떨어져
+// deadline 경로에 진입조차 못하므로 세 기법 ①동일 session.db BEGIN IMMEDIATE ②신규 DB init-lock
+// ③content store open-lock으로 대체.) 5초 하드 대기 회귀를 3초 상한으로 잡는다(spawn 오버헤드 여유).
+func TestE2E_HookDeadlineDeterminism(t *testing.T) {
+	if testing.Short() {
+		t.Skip("느린 E2E 스모크 — short 모드 skip")
+	}
+	bin := buildCtrBinary(t)
+
+	// ① 동일 session.db에 BEGIN IMMEDIATE write txn 점유 → 후속 훅의 Append가 SQLite BUSY로
+	//    예산 안에 포기(append-failed). 부모 프로세스가 OS 파일락으로 write 락을 잡는다(WAL 단일 writer).
+	t.Run("append_begin_immediate", func(t *testing.T) {
+		proj := t.TempDir()
+		storeRoot := t.TempDir()
+		if rc, _ := runHookOneShot(t, bin, storeRoot, hookFixture(t, "sessionstart.json", map[string]any{"cwd": proj}), nil); rc != 0 {
+			t.Fatalf("SessionStart rc=%d want 0", rc)
+		}
+		dbPath := sessionDBPathFor(t, storeRoot, proj)
+		// store.go와 동일 DSN(WAL·busy_timeout·_txlock=immediate) — modernc "sqlite" 드라이버는
+		// session/store 패키지 import로 이미 등록돼 있다(별도 blank import 불필요).
+		dsn := "file:" + filepath.ToSlash(dbPath) + "?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_txlock=immediate"
+		db, err := sql.Open("sqlite", dsn)
+		if err != nil {
+			t.Fatalf("open session.db: %v", err)
+		}
+		db.SetMaxOpenConns(1)
+		defer func() { _ = db.Close() }()
+		tx, err := db.BeginTx(context.Background(), nil) // BEGIN IMMEDIATE — RESERVED write 락 취득
+		if err != nil {
+			t.Fatalf("begin immediate: %v", err)
+		}
+		// 임시 테이블 생성으로 write 락을 확실히 잡는다(rollback 시 원복). _txlock=immediate만으로도
+		// 성립하지만 벨트-앤-서스펜더.
+		if _, err := tx.ExecContext(context.Background(), "CREATE TABLE IF NOT EXISTS _e2e_writelock(x)"); err != nil {
+			_ = tx.Rollback()
+			t.Fatalf("write-lock probe: %v", err)
+		}
+		defer func() { _ = tx.Rollback() }()
+
+		rc, elapsed := runHookOneShot(t, bin, storeRoot, hookFixture(t, "posttooluse-bash.json", map[string]any{"cwd": proj}), hookDeadlineEnv)
+		t.Logf("① BEGIN IMMEDIATE: elapsed=%v", elapsed)
+		if rc != 0 {
+			t.Fatalf("rc=%d want 0(fail-open)", rc)
+		}
+		// 단일 SQLite busy 대기는 ctx-blind라 busy_timeout(500ms)이 300ms 예산을 넘긴다(spawn 포함
+		// 계측 ≈1s). 상한은 2s — 옛 5초 하드 대기 회귀는 잡되 busy-wait 지배 경로에 여유를 둔다.
+		if elapsed > 2*time.Second {
+			t.Fatalf("deadline 미관측 의심 — %v 소요(5초 하드 대기 추정)", elapsed)
+		}
+		assertOneDrop(t, hookSessionDir(t, storeRoot, proj), "append-failed")
+	})
+
+	// ② 신규 DB의 session.init.lock을 exclusive 점유 → SessionStart 훅의 최초 WAL 전환 직렬화가
+	//    예산 안에 포기(lease-held). session.db는 만들지 않는다(존재하면 init-lock 경로가 스킵된다).
+	t.Run("init_lock_new_db", func(t *testing.T) {
+		proj := t.TempDir()
+		storeRoot := t.TempDir()
+		dbDir := hookSessionDir(t, storeRoot, proj)
+		if err := os.MkdirAll(dbDir, 0o700); err != nil {
+			t.Fatalf("mkdir sessDir: %v", err)
+		}
+		release, err := store.AcquireLock(filepath.Join(dbDir, "session.init.lock"), false) // exclusive 선점
+		if err != nil {
+			t.Fatalf("acquire init-lock: %v", err)
+		}
+		defer release()
+
+		rc, elapsed := runHookOneShot(t, bin, storeRoot, hookFixture(t, "sessionstart.json", map[string]any{"cwd": proj}), hookDeadlineEnv)
+		t.Logf("② init-lock: elapsed=%v", elapsed)
+		if rc != 0 {
+			t.Fatalf("rc=%d want 0(fail-open)", rc)
+		}
+		// ctx-aware 대기 경로 — 예산 초과 즉시 포기(계측 ≈325ms). 상한 1s.
+		if elapsed > time.Second {
+			t.Fatalf("deadline 미관측 의심 — %v 소요", elapsed)
+		}
+		assertOneDrop(t, dbDir, "lease-held")
+	})
+
+	// ③ content store open-lock(content.db.rebuild.lock)을 exclusive 점유 → Shadow Recall의
+	//    store.OpenContext가 예산 안에 포기(shadow-store). 대용량 응답으로 shadow 게이트에 진입시킨다.
+	t.Run("content_store_lock", func(t *testing.T) {
+		proj := t.TempDir()
+		storeRoot := t.TempDir()
+		if rc, _ := runHookOneShot(t, bin, storeRoot, hookFixture(t, "sessionstart.json", map[string]any{"cwd": proj}), nil); rc != 0 {
+			t.Fatalf("SessionStart rc=%d want 0", rc)
+		}
+		contentDir := hookContentDir(t, storeRoot, proj)
+		if err := os.MkdirAll(contentDir, 0o700); err != nil {
+			t.Fatalf("mkdir contentDir: %v", err)
+		}
+		release, err := store.AcquireLock(filepath.Join(contentDir, "content.db.rebuild.lock"), false) // exclusive 선점
+		if err != nil {
+			t.Fatalf("acquire content lock: %v", err)
+		}
+		defer release()
+
+		in := hookFixture(t, "posttooluse-bash.json", map[string]any{"cwd": proj, "tool_response": bigToolResponse()})
+		rc, elapsed := runHookOneShot(t, bin, storeRoot, in, hookDeadlineEnv)
+		t.Logf("③ content-lock: elapsed=%v", elapsed)
+		if rc != 0 {
+			t.Fatalf("rc=%d want 0(fail-open)", rc)
+		}
+		// ctx-aware 대기 경로 — 예산 초과 즉시 포기(계측 ≈323ms). 상한 1s.
+		if elapsed > time.Second {
+			t.Fatalf("deadline 미관측 의심 — %v 소요", elapsed)
+		}
+		assertOneDrop(t, hookSessionDir(t, storeRoot, proj), "shadow-store")
+	})
+}
+
+// TestE2E_HookConcurrentSummaryExport — 게이트족①(2-프로세스 동시성) + 게이트족③(summary/export
+// 왕복). SessionStart로 cc: 세션을 만든 뒤 MCP 서버(spawnCtr)를 장기 가동한 상태에서 one-shot 훅을
+// 실행해(shared lease 공존·content.db/session.db 동시 쓰기) 무손실을 확인하고, 서버의
+// ctr_session_summary/ctr_export_events가 훅 이벤트를 producer 정확·untrusted 표기로 반환하는지 검증한다.
+func TestE2E_HookConcurrentSummaryExport(t *testing.T) {
+	if testing.Short() {
+		t.Skip("느린 E2E 스모크 — short 모드 skip")
+	}
+	bin := buildCtrBinary(t)
+	proj := t.TempDir()
+	storeRoot := t.TempDir()
+
+	// cc: 세션 선재 — 미지 세션의 후속 이벤트는 drop되므로.
+	if rc, _ := runHookOneShot(t, bin, storeRoot, hookFixture(t, "sessionstart.json", map[string]any{"cwd": proj}), nil); rc != 0 {
+		t.Fatalf("SessionStart rc=%d want 0", rc)
+	}
+
+	// MCP 서버 장기 가동(shared lease + content store 열기). 이 동안 훅이 append한다.
+	cmd, c, stderrBuf, err := spawnCtr(t, bin, "--root", proj, "--store-root", storeRoot)
+	if err != nil {
+		t.Fatalf("spawn: %v", err)
+	}
+	if err := handshake(c, "ctr-e2e-hook-concurrent"); err != nil {
+		t.Fatalf("handshake: %v", err)
+	}
+
+	// 서버 가동 중 PostToolUse 4건(bash 소 3 + bash 대 1=shadow → content.db 동시 쓰기).
+	const smallPosts = 3
+	for i := 0; i < smallPosts; i++ {
+		if rc, _ := runHookOneShot(t, bin, storeRoot, hookFixture(t, "posttooluse-bash.json", map[string]any{"cwd": proj}), nil); rc != 0 {
+			t.Fatalf("PostToolUse 소 #%d rc=%d want 0", i, rc)
+		}
+	}
+	if rc, _ := runHookOneShot(t, bin, storeRoot, hookFixture(t, "posttooluse-bash.json", map[string]any{"cwd": proj, "tool_response": bigToolResponse()}), nil); rc != 0 {
+		t.Fatalf("PostToolUse 대 rc=%d want 0", rc)
+	}
+	wantTestRun := smallPosts + 1 // bash 4건 모두 test_run
+
+	// 서버의 ctr_export_events로 훅 이벤트 무손실 + producer/untrusted 검증(worktree 전체 범위).
+	testRun, artifactCreated := 0, 0
+	var sawProducer bool
+	after := int64(0)
+	for {
+		var out mcp.ExportEventsOutput
+		if err := callTool(c, "ctr_export_events", mcp.ExportEventsInput{After: after, Limit: 200}, &out); err != nil {
+			t.Fatalf("ctr_export_events: %v", err)
+		}
+		if !out.Untrusted {
+			t.Fatal("export untrusted=false want true")
+		}
+		for _, ev := range out.Events {
+			switch ev.EventType {
+			case "test_run":
+				testRun++
+				if ev.SchemaVersion != "1.0" {
+					t.Fatalf("hook 이벤트 schemaVersion=%q want 1.0", ev.SchemaVersion)
+				}
+				if ev.Producer.Name != "context-router" || ev.Producer.Version != version {
+					t.Fatalf("hook 이벤트 producer=%+v want name=context-router version=%s", ev.Producer, version)
+				}
+				if ev.PrivacyLabel != "internal" {
+					t.Fatalf("hook 이벤트 privacyLabel=%q want internal", ev.PrivacyLabel)
+				}
+				sawProducer = true
+			case "artifact_created":
+				artifactCreated++
+			}
+		}
+		if len(out.Events) == 0 || out.NextAfter == after {
+			break
+		}
+		after = out.NextAfter
+	}
+	if testRun != wantTestRun {
+		t.Fatalf("test_run 이벤트=%d want %d (서버 동시 가동 중 훅 append 손실)", testRun, wantTestRun)
+	}
+	if artifactCreated != 1 {
+		t.Fatalf("artifact_created=%d want 1 (content.db 동시 쓰기 손실)", artifactCreated)
+	}
+	if !sawProducer {
+		t.Fatal("훅 이벤트의 producer/untrusted 표기를 확인하지 못함")
+	}
+
+	// ctr_session_summary도 훅 이벤트를 untrusted로 반환한다.
+	var sumOut mcp.SessionSummaryOutput
+	if err := callTool(c, "ctr_session_summary", mcp.SessionSummaryInput{}, &sumOut); err != nil {
+		t.Fatalf("ctr_session_summary: %v", err)
+	}
+	if !sumOut.Untrusted {
+		t.Fatal("summary untrusted=false want true")
+	}
+	sawSummaryTestRun := false
+	for _, g := range sumOut.Groups {
+		if g.EventType == "test_run" && len(g.Events) > 0 {
+			sawSummaryTestRun = true
+		}
+	}
+	if !sawSummaryTestRun {
+		t.Fatalf("ctr_session_summary에 훅 test_run 그룹 부재: %+v", sumOut.Groups)
+	}
+
+	if err := closeAndWait(cmd, c); err != nil {
+		t.Fatalf("process exit: %v (stderr=%s)", err, stderrBuf.String())
 	}
 }

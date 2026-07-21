@@ -26,7 +26,7 @@ import (
 	"github.com/wotjr1649/context-router/internal/transform"
 )
 
-const version = "0.1.0"
+const version = "0.2.0"
 
 type serverFlags struct {
 	Root, StoreRoot, LogLevel   string
@@ -463,7 +463,9 @@ const transformWorkerArg = "__transform-worker"
 // 인자는 dispatchCLI의 관심사가 아니다 — MCP 서버 플래그로 그대로 흘려보낸다. "session"은
 // v0.1 태스크9 추가(§6.3·§7) — export(9a)·recover(9b) 두 하위 서브커맨드를 cli.Run이 내부
 // 디스패치한다(이 맵은 최상위 이름 1개만 안다, T4-plan3 미지 서브커맨드 MCP 오기동 차단 정합).
-var cliSubcommands = map[string]bool{"doctor": true, "stats": true, "purge": true, "upgrade": true, "session": true}
+// "hook"은 v0.2 추가(설계 §2) — Claude Code 훅 서브프로세스(stdin JSON 1건→cc: 세션 append).
+// "usage"는 v0.2 추가(설계 §6) — 로컬 transcript 세션별 토큰 집계 + cc: 스트림 대조(읽기 전용).
+var cliSubcommands = map[string]bool{"doctor": true, "stats": true, "purge": true, "upgrade": true, "session": true, "hook": true, "usage": true}
 
 // prescanRootFlags: cli 서브커맨드 args에서 --root/--store-root(단대시 -root/-store-root,
 // "--f v"·"--f=v" 두 형태 모두)만 수동으로 뽑아내고 그 토큰을 제거한 나머지를 반환한다.
@@ -513,6 +515,20 @@ func prescanRootFlags(args []string) (root, storeRoot string, rest []string, err
 // handled=false면 호출자가 평소대로 MCP 서버 경로(run)로 진행해야 한다 — cli는 storeRoot를
 // 재도출하지 않는다(설계 §7 Produces). --root/--store-root를 제외한 나머지 args는 그대로
 // cli.Run에 넘겨 서브커맨드 전용 flagset(stats의 --provider 등)이 스스로 파싱한다.
+// absorbHookPreprocErr — 실행 훅(install/uninstall이 아닌 `hook`)의 전처리 오류를 fail-open으로
+// 흡수한다(설계 §2 always-exit-0): stdin을 EOF까지 소비(broken pipe 방지)하고 stderr 1줄
+// (절대경로·비밀 미포함)만 남긴 뒤 nil(exit 0)을 돌려준다. install/uninstall·그 외 서브커맨드는
+// 원래 오류를 그대로 전파해 기존 exit 1 동작을 유지한다.
+func absorbHookPreprocErr(sub string, rest []string, err error) error {
+	isRunningHook := sub == "hook" && (len(rest) == 0 || (rest[0] != "install" && rest[0] != "uninstall"))
+	if !isRunningHook {
+		return err
+	}
+	_, _ = io.Copy(io.Discard, os.Stdin)
+	fmt.Fprintln(os.Stderr, "ctr: hook 전처리 실패 — 이벤트 무시(exit 0)")
+	return nil
+}
+
 func dispatchCLI(ctx context.Context, args []string) (handled bool, err error) {
 	if len(args) < 2 {
 		return false, nil
@@ -530,22 +546,29 @@ func dispatchCLI(ctx context.Context, args []string) (handled bool, err error) {
 
 	root, storeRootRaw, rest, err := prescanRootFlags(subArgs)
 	if err != nil {
-		return true, err
+		// 실행 훅의 root 플래그 파싱 실패(예: 값 없는 --store-root가 settings에 잔존)도 fail-open으로
+		// 흡수한다(D23 — 최종 리뷰 C3). rest는 파싱 실패로 비어 있을 수 있으므로 원본 subArgs로
+		// install/uninstall(오류 전파 유지)을 판별한다.
+		return true, absorbHookPreprocErr(sub, subArgs, err)
 	}
 	if root == "" {
 		if root, err = os.Getwd(); err != nil {
-			return true, err
+			return true, absorbHookPreprocErr(sub, rest, err)
 		}
 	}
 	storeRoot, err := storeRootFor(serverFlags{StoreRoot: storeRootRaw})
 	if err != nil {
-		return true, err
+		return true, absorbHookPreprocErr(sub, rest, err)
 	}
 	storeRoot, err = canonicalizeStoreRoot(storeRoot)
 	if err != nil {
-		return true, err
+		return true, absorbHookPreprocErr(sub, rest, err)
 	}
-	return true, cli.Run(ctx, sub, rest, storeRoot, root, version, os.Stdout, os.Stderr)
+	// storeRootExplicit: prescanRootFlags가 --store-root 토큰을 소비하므로 cli는 명시/기본을
+	// 구분할 수 없다 — 여기서 판별해(원시값 비어있지 않음) 넘긴다. hook install이 명시된 경우에만
+	// 훅 명령 args에 --store-root <원시값>을 주입한다(설계 §7).
+	storeRootExplicit := storeRootRaw != ""
+	return true, cli.Run(ctx, sub, rest, storeRoot, root, version, storeRootExplicit, storeRootRaw, os.Stdout, os.Stderr)
 }
 
 func main() {

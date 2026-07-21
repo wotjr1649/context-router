@@ -490,3 +490,42 @@ func TestRecover_ServerRunning_RejectsImmediately(t *testing.T) {
 		t.Fatal("session.lock should still be exclusively unavailable — server(d)가 shared를 보유 중이어야 함")
 	}
 }
+
+// TestRecover_SweepsIncompleteBakOrphans — 부채정리 ②: backupOriginal은 -shm→-wal→main
+// 순으로 옮기므로 main rename 전 crash하면 main 멤버가 없는 .bak-<ts> sidecar 고아가 남는다
+// (resumePublishFromTmp 주석의 "부분 이동 family는 포렌식 잔재로 남는다"). recover 완료 후
+// 그런 불완전 ts family는 스윕돼 사라져야 하고, main을 포함한 완전한 백업은 보존돼야 한다.
+func TestRecover_SweepsIncompleteBakOrphans(t *testing.T) {
+	dir := t.TempDir()
+	seedAndCorruptEvents(t, dir, 400)
+
+	// main 없는 .bak-<oldts> sidecar 고아 주입(부분 이동 잔재). ts는 backupOriginal 신규 ts보다
+	// 앞선 과거값(사전순 정렬).
+	orphanTS := "20200101T000000.000000000Z"
+	orphans := []string{
+		dbFileName + bakInfix + orphanTS + "-wal",
+		dbFileName + bakInfix + orphanTS + "-shm",
+	}
+	for _, name := range orphans {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("stale"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if _, err := Recover(dir); err != nil {
+		t.Fatalf("Recover: %v", err)
+	}
+
+	for _, name := range orphans {
+		if _, statErr := os.Stat(filepath.Join(dir, name)); !errors.Is(statErr, os.ErrNotExist) {
+			t.Fatalf("incomplete ts-orphan %s should be swept after recover, stat err=%v", name, statErr)
+		}
+	}
+
+	// 완전한 백업(main 포함)은 스윕이 지우면 안 된다.
+	if _, found, err := latestBackupMain(dir); err != nil {
+		t.Fatal(err)
+	} else if !found {
+		t.Fatal("legitimate .bak-<ts> main should survive the orphan sweep")
+	}
+}

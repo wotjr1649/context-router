@@ -194,7 +194,7 @@ func TestRunDoctor_InitializedStore(t *testing.T) {
 // 이를 통해 미지 단어를 MCP 플래그로 잘못 흡수하지 않도록 한다(설계 §7).
 func TestRun_UnknownSub(t *testing.T) {
 	var out, errOut bytes.Buffer
-	err := Run(context.Background(), "bogus", nil, t.TempDir(), t.TempDir(), "0.0.1-dev", &out, &errOut)
+	err := Run(context.Background(), "bogus", nil, t.TempDir(), t.TempDir(), "0.0.1-dev", false, "", &out, &errOut)
 	if err == nil {
 		t.Fatal("want error for unknown subcommand, got nil")
 	}
@@ -209,7 +209,7 @@ func TestRunPurge_ExactlyOneSelector(t *testing.T) {
 		{"--project", "x", "--all"}, // 둘 다 있음
 	} {
 		var out, errOut bytes.Buffer
-		err := Run(context.Background(), "purge", args, t.TempDir(), t.TempDir(), "0.0.1-dev", &out, &errOut)
+		err := Run(context.Background(), "purge", args, t.TempDir(), t.TempDir(), "0.0.1-dev", false, "", &out, &errOut)
 		if err == nil {
 			t.Fatalf("args=%v: want selector 오류, got nil", args)
 		}
@@ -511,7 +511,7 @@ func TestRunPurge_E2E_GCOnlyNoConfirm(t *testing.T) {
 	var out, errOut bytes.Buffer
 	// --force도 --older-than도 없다 — gc 단독이 확인을 생략하고도 성공해야 한다.
 	args := []string{"--project", projectRoot, "--gc"}
-	if err := Run(context.Background(), "purge", args, storeRoot, projectRoot, "0.0.1-dev", &out, &errOut); err != nil {
+	if err := Run(context.Background(), "purge", args, storeRoot, projectRoot, "0.0.1-dev", false, "", &out, &errOut); err != nil {
 		t.Fatalf("Run purge --gc err=%v out=%s", err, out.String())
 	}
 
@@ -842,7 +842,7 @@ func TestRunStats_Local(t *testing.T) {
 	}
 
 	var out, errOut bytes.Buffer
-	if err := Run(context.Background(), "stats", nil, storeRoot, projectRoot, "0.0.1-dev", &out, &errOut); err != nil {
+	if err := Run(context.Background(), "stats", nil, storeRoot, projectRoot, "0.0.1-dev", false, "", &out, &errOut); err != nil {
 		t.Fatalf("Run stats err=%v out=%s", err, out.String())
 	}
 	got := out.String()
@@ -863,7 +863,7 @@ func TestRunStats_Local(t *testing.T) {
 // 계약이 cli까지 그대로 이어지는지 확인한다.
 func TestRunStats_Local_NoLedger(t *testing.T) {
 	var out, errOut bytes.Buffer
-	if err := Run(context.Background(), "stats", nil, t.TempDir(), t.TempDir(), "0.0.1-dev", &out, &errOut); err != nil {
+	if err := Run(context.Background(), "stats", nil, t.TempDir(), t.TempDir(), "0.0.1-dev", false, "", &out, &errOut); err != nil {
 		t.Fatalf("Run stats err=%v out=%s", err, out.String())
 	}
 	got := out.String()
@@ -893,7 +893,7 @@ func TestRunStats_Provider(t *testing.T) {
 
 	var out, errOut bytes.Buffer
 	args := []string{"--provider", path}
-	if err := Run(context.Background(), "stats", args, t.TempDir(), t.TempDir(), "0.0.1-dev", &out, &errOut); err != nil {
+	if err := Run(context.Background(), "stats", args, t.TempDir(), t.TempDir(), "0.0.1-dev", false, "", &out, &errOut); err != nil {
 		t.Fatalf("Run stats --provider err=%v out=%s", err, out.String())
 	}
 	got := out.String()
@@ -915,7 +915,7 @@ func TestRunStats_Provider_FileMissing(t *testing.T) {
 	var out, errOut bytes.Buffer
 	missing := filepath.Join(t.TempDir(), "missing.jsonl")
 	args := []string{"--provider", missing}
-	err := Run(context.Background(), "stats", args, t.TempDir(), t.TempDir(), "0.0.1-dev", &out, &errOut)
+	err := Run(context.Background(), "stats", args, t.TempDir(), t.TempDir(), "0.0.1-dev", false, "", &out, &errOut)
 	if err == nil {
 		t.Fatal("want error for missing --provider file, got nil")
 	}
@@ -932,7 +932,7 @@ func TestRunStats_Local_ProjectIdentifyFailure(t *testing.T) {
 	missingProject := filepath.Join(t.TempDir(), "does-not-exist")
 
 	var out, errOut bytes.Buffer
-	err := Run(context.Background(), "stats", nil, storeRoot, missingProject, "0.0.1-dev", &out, &errOut)
+	err := Run(context.Background(), "stats", nil, storeRoot, missingProject, "0.0.1-dev", false, "", &out, &errOut)
 	if err == nil {
 		t.Fatal("want error for nonexistent project root, got nil")
 	}
@@ -960,7 +960,7 @@ func TestRunStats_Provider_OversizedLine(t *testing.T) {
 
 	var out, errOut bytes.Buffer
 	args := []string{"--provider", path}
-	if err := Run(context.Background(), "stats", args, t.TempDir(), t.TempDir(), "0.0.1-dev", &out, &errOut); err != nil {
+	if err := Run(context.Background(), "stats", args, t.TempDir(), t.TempDir(), "0.0.1-dev", false, "", &out, &errOut); err != nil {
 		t.Fatalf("Run stats --provider err=%v out=%s", err, out.String())
 	}
 	got := out.String()
@@ -977,7 +977,7 @@ func TestRunStats_Provider_OversizedLine(t *testing.T) {
 // 그대로 에코되면 안 된다(규약 §6, 리뷰 Fix Round 3 item 5 — 개수만 밝힌다).
 func TestRunDoctor_UnexpectedArgs(t *testing.T) {
 	var out, errOut bytes.Buffer
-	err := Run(context.Background(), "doctor", []string{"--bogus"}, t.TempDir(), t.TempDir(), "0.0.1-dev", &out, &errOut)
+	err := Run(context.Background(), "doctor", []string{"--bogus"}, t.TempDir(), t.TempDir(), "0.0.1-dev", false, "", &out, &errOut)
 	if err == nil {
 		t.Fatal("want error for unexpected doctor args, got nil")
 	}
@@ -988,7 +988,7 @@ func TestRunDoctor_UnexpectedArgs(t *testing.T) {
 
 func TestRunUpgrade_UnexpectedArgs(t *testing.T) {
 	var out, errOut bytes.Buffer
-	err := Run(context.Background(), "upgrade", []string{"--bogus"}, t.TempDir(), t.TempDir(), "0.0.1-dev", &out, &errOut)
+	err := Run(context.Background(), "upgrade", []string{"--bogus"}, t.TempDir(), t.TempDir(), "0.0.1-dev", false, "", &out, &errOut)
 	if err == nil {
 		t.Fatal("want error for unexpected upgrade args, got nil")
 	}
@@ -1001,7 +1001,7 @@ func TestRunUpgrade_UnexpectedArgs(t *testing.T) {
 // 없이 그냥 파일명만 넘긴 경우)를 침묵 수용하면 안 된다(리뷰 Fix Round 3, item 4).
 func TestRunStats_UnexpectedPositionalArg(t *testing.T) {
 	var out, errOut bytes.Buffer
-	err := Run(context.Background(), "stats", []string{"provider.jsonl"}, t.TempDir(), t.TempDir(), "0.0.1-dev", &out, &errOut)
+	err := Run(context.Background(), "stats", []string{"provider.jsonl"}, t.TempDir(), t.TempDir(), "0.0.1-dev", false, "", &out, &errOut)
 	if err == nil {
 		t.Fatal("want error for unexpected positional arg, got nil")
 	}
@@ -1025,7 +1025,7 @@ func TestRunStats_Provider_ContextCanceled(t *testing.T) {
 	cancel()
 
 	var out, errOut bytes.Buffer
-	err := Run(ctx, "stats", []string{"--provider", path}, t.TempDir(), t.TempDir(), "0.0.1-dev", &out, &errOut)
+	err := Run(ctx, "stats", []string{"--provider", path}, t.TempDir(), t.TempDir(), "0.0.1-dev", false, "", &out, &errOut)
 	if err == nil {
 		t.Fatal("want error for canceled context, got nil")
 	}
@@ -1131,7 +1131,7 @@ func TestRunSessionExport_JSONLRoundTrip(t *testing.T) {
 
 	var out, errOut bytes.Buffer
 	args := []string{"export", "--project", projectRoot, "--worktree", canon.WorktreeID}
-	if err := Run(context.Background(), "session", args, storeRoot, projectRoot, "0.0.1-dev", &out, &errOut); err != nil {
+	if err := Run(context.Background(), "session", args, storeRoot, projectRoot, "0.0.1-dev", false, "", &out, &errOut); err != nil {
 		t.Fatalf("Run session export err=%v stderr=%s", err, errOut.String())
 	}
 
@@ -1185,7 +1185,7 @@ func TestRunSessionExport_WorktreeContract(t *testing.T) {
 
 		var out, errOut bytes.Buffer
 		args := []string{"export", "--project", projectRoot}
-		if err := Run(context.Background(), "session", args, storeRoot, projectRoot, "0.0.1-dev", &out, &errOut); err == nil {
+		if err := Run(context.Background(), "session", args, storeRoot, projectRoot, "0.0.1-dev", false, "", &out, &errOut); err == nil {
 			t.Fatalf("want error for ambiguous worktree, got nil (out=%s)", out.String())
 		}
 		for _, wid := range []string{"wt-a", "wt-b"} {
@@ -1213,7 +1213,7 @@ func TestRunSessionExport_WorktreeContract(t *testing.T) {
 
 		var out, errOut bytes.Buffer
 		args := []string{"export", "--project", projectRoot}
-		if err := Run(context.Background(), "session", args, storeRoot, projectRoot, "0.0.1-dev", &out, &errOut); err != nil {
+		if err := Run(context.Background(), "session", args, storeRoot, projectRoot, "0.0.1-dev", false, "", &out, &errOut); err != nil {
 			t.Fatalf("Run session export(single worktree, no --worktree) err=%v stderr=%s", err, errOut.String())
 		}
 	})
@@ -1363,7 +1363,7 @@ func TestRunSessionRecover_HappyPath(t *testing.T) {
 
 	var out, errOut bytes.Buffer
 	args := []string{"recover", "--project", projectRoot, "--worktree", canon.WorktreeID}
-	if err := Run(context.Background(), "session", args, storeRoot, projectRoot, "0.0.1-dev", &out, &errOut); err != nil {
+	if err := Run(context.Background(), "session", args, storeRoot, projectRoot, "0.0.1-dev", false, "", &out, &errOut); err != nil {
 		t.Fatalf("Run session recover err=%v stderr=%s", err, errOut.String())
 	}
 	if out.Len() != 0 {
@@ -1395,7 +1395,7 @@ func TestRunSessionRecover_ServerRunning_RejectsImmediately(t *testing.T) {
 
 	var out, errOut bytes.Buffer
 	args := []string{"recover", "--project", projectRoot, "--worktree", canon.WorktreeID}
-	err = Run(context.Background(), "session", args, storeRoot, projectRoot, "0.0.1-dev", &out, &errOut)
+	err = Run(context.Background(), "session", args, storeRoot, projectRoot, "0.0.1-dev", false, "", &out, &errOut)
 	if !errors.Is(err, session.ErrLeaseHeld) {
 		t.Fatalf("err=%v want session.ErrLeaseHeld (out=%s stderr=%s)", err, out.String(), errOut.String())
 	}
@@ -1451,7 +1451,7 @@ func TestRunSessionRecover_PublishInterrupted_DelegatesDespiteMissingDB(t *testi
 	// 3) CLI recover — session.db 부재에도 위임·완료해야 한다.
 	var out, errOut bytes.Buffer
 	args := []string{"recover", "--project", projectRoot, "--worktree", canon.WorktreeID}
-	if err := Run(context.Background(), "session", args, storeRoot, projectRoot, "0.0.1-dev", &out, &errOut); err != nil {
+	if err := Run(context.Background(), "session", args, storeRoot, projectRoot, "0.0.1-dev", false, "", &out, &errOut); err != nil {
 		t.Fatalf("Run session recover err=%v stderr=%s", err, errOut.String())
 	}
 	if !strings.Contains(errOut.String(), "인양 완료") {
@@ -1469,5 +1469,34 @@ func TestRunSessionRecover_PublishInterrupted_DelegatesDespiteMissingDB(t *testi
 	var qc string
 	if err := reader.QueryRow("PRAGMA quick_check").Scan(&qc); err != nil || qc != "ok" {
 		t.Fatalf("published db quick_check=%q err=%v want ok", qc, err)
+	}
+}
+
+// TestRecover_UnknownWorktreeListsCandidates — 부채정리 ④: 존재하지 않는 --worktree id로
+// recover 시 오류 문구가 실제 worktree 후보 id를 안내해야 한다(listWorktreeDirs 재사용). 수정
+// 전에는 opaque하게 "복구 자산 확인 실패"로 끝났다.
+func TestRecover_UnknownWorktreeListsCandidates(t *testing.T) {
+	storeRoot := t.TempDir()
+	projectRoot := t.TempDir()
+	canon, err := ident.Canonicalize(projectRoot)
+	if err != nil {
+		t.Fatalf("canonicalize: %v", err)
+	}
+	// 실제 worktree 하나를 만들어 후보가 존재하게 한다.
+	dbDir := filepath.Join(storeRoot, "projects", canon.ProjectID, "worktrees", canon.WorktreeID)
+	d, err := session.Open(dbDir, session.Options{Producer: "context-router/test"})
+	if err != nil {
+		t.Fatalf("session.Open: %v", err)
+	}
+	_ = d.Close()
+
+	var out, errOut bytes.Buffer
+	args := []string{"recover", "--project", projectRoot, "--worktree", "nonexistent-wid"}
+	err = Run(context.Background(), "session", args, storeRoot, projectRoot, "0.0.1-dev", false, "", &out, &errOut)
+	if err == nil {
+		t.Fatal("want error for nonexistent worktree id")
+	}
+	if !strings.Contains(err.Error(), canon.WorktreeID) {
+		t.Fatalf("error should list candidate worktree id %q, got %q", canon.WorktreeID, err.Error())
 	}
 }

@@ -311,6 +311,37 @@ func TestRegister_ReindexUpdatesRawBlobHashAndExtraction(t *testing.T) {
 	}
 }
 
+// TestRegister_ReindexUpdatesSourceKind(최종 리뷰 C6): 같은 URI를 다른 kind로 재등록하면
+// source_kind도 최신 값으로 갱신돼야 한다 — 과거엔 ON CONFLICT DO UPDATE가 이 컬럼을 빼먹어
+// inline:<title> 충돌(§5 한계) 시 provenance가 최초 kind에 고정됐다(CAS 경로는 갱신하므로 정합).
+func TestRegister_ReindexUpdatesSourceKind(t *testing.T) {
+	s := openT(t)
+	uri := "inline:Read"
+	reg1 := Registration{
+		StoredBytes: []byte("v1"), MediaType: "text/plain",
+		Source: SourceMeta{URI: uri, Kind: "inline", SrcHash: "k1"},
+		Chunks: []Chunk{{Ordinal: 0, Text: "v1"}},
+	}
+	if _, err := s.Register(t.Context(), reg1); err != nil {
+		t.Fatal(err)
+	}
+	reg2 := Registration{
+		StoredBytes: []byte("v2"), MediaType: "text/plain",
+		Source: SourceMeta{URI: uri, Kind: "hook", SrcHash: "k2"},
+		Chunks: []Chunk{{Ordinal: 0, Text: "v2"}},
+	}
+	if _, err := s.Register(t.Context(), reg2); err != nil {
+		t.Fatal(err)
+	}
+	var kind string
+	if err := s.reader.QueryRow("SELECT source_kind FROM sources WHERE uri=?", uri).Scan(&kind); err != nil {
+		t.Fatal(err)
+	}
+	if kind != "hook" {
+		t.Fatalf("source_kind=%q want %q (재등록 후 stale provenance)", kind, "hook")
+	}
+}
+
 // TestRegister_FileReindexRawBlobHashStaysEmpty: file 경로는 RawBlob/Extraction을 넘기지
 // 않으므로(둘 다 빈값) 위 수정으로 excluded 참조를 추가해도 재색인 후 계속 NULL이어야 한다
 // (회귀 없음).
@@ -1540,4 +1571,29 @@ func FuzzSnapUTF8(f *testing.F) {
 			t.Fatalf("잘못된 UTF-8 반환: %q", data[s:e])
 		}
 	})
+}
+
+// TestOpenContextLockDeadline: writable OpenContext의 open-lock 대기가 ctx deadline을 관측해
+// 5초 하드 한도 이전에 ErrUnavailable로 포기한다(훅 deadline 예산, 설계 §2.3 — D13 예외 변형).
+// Open(=OpenContext(background))의 무기한(5초까지) 대기 기본 동작은 불변이다.
+func TestOpenContextLockDeadline(t *testing.T) {
+	dir := t.TempDir()
+	// content.db.rebuild.lock을 외부에서 배타 선점 — writable OpenContext의 lockStoreCtx가 경합.
+	release, err := AcquireLock(filepath.Join(dir, lockFileName), false)
+	if err != nil {
+		t.Fatalf("선점 잠금: %v", err)
+	}
+	defer release()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	_, err = OpenContext(ctx, dir, false)
+	elapsed := time.Since(start)
+	if !errors.Is(err, ErrUnavailable) {
+		t.Fatalf("err=%v want ErrUnavailable(ctx deadline 관측)", err)
+	}
+	if elapsed > 2*time.Second {
+		t.Fatalf("ctx 미관측 의심 — %v 소요(5초 하드 대기 추정)", elapsed)
+	}
 }

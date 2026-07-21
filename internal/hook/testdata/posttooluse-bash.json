@@ -1,0 +1,19 @@
+{
+  "session_id": "3f2504e0-4f89-41d3-9a0c-0305e82c3301",
+  "transcript_path": "C:\\Users\\js\\.claude\\projects\\C--Users-js-Documents-AI-DEV-context-router\\3f2504e0-4f89-41d3-9a0c-0305e82c3301.jsonl",
+  "cwd": "C:\\Users\\js\\Documents\\AI_DEV\\context-router",
+  "permission_mode": "default",
+  "hook_event_name": "PostToolUse",
+  "tool_name": "Bash",
+  "tool_input": {
+    "command": "go test ./internal/hook/...",
+    "description": "Run hook package tests"
+  },
+  "tool_response": {
+    "stdout": "ok  \tgithub.com/wotjr1649/context-router/internal/hook\t0.312s\n",
+    "stderr": "",
+    "interrupted": false
+  },
+  "tool_use_id": "toolu_01ABC123DEF456GHI789JKL0",
+  "duration_ms": 312
+}

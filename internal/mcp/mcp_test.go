@@ -1517,6 +1517,28 @@ func TestFetchDescriptionMentionsByteExactNotWebFetch(t *testing.T) {
 	}
 }
 
+// TestRecordEventSchemaAttributesFloat64Caveat — 부채정리 ③: ctr_record_event 설명에 JSON
+// 숫자가 float64로 디코딩돼 큰 정수는 정밀도를 잃는다는 attributes 캐비앗이 있어야 한다.
+func TestRecordEventSchemaAttributesFloat64Caveat(t *testing.T) {
+	cs, _, _, _ := newRecordEventTestServer(t)
+	lt, err := cs.ListTools(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("list tools: %v", err)
+	}
+	var desc string
+	for _, tl := range lt.Tools {
+		if tl.Name == "ctr_record_event" {
+			desc = tl.Description
+		}
+	}
+	if desc == "" {
+		t.Fatal("ctr_record_event not found in tools/list")
+	}
+	if !strings.Contains(desc, "float64") {
+		t.Fatalf("ctr_record_event description missing attributes float64 caveat: %q", desc)
+	}
+}
+
 // --- ctr_record_event (태스크 3, 설계 §3.1) ---
 
 // newRecordEventTestServer: newTestServer와 동형이지만 Session DB까지 배선해 ctr_record_event를
@@ -2059,6 +2081,66 @@ func TestSummary_GroupTruncatedUnderBudget(t *testing.T) {
 	}
 	if len(notes.Events) == 0 || len(notes.Events) >= 5 {
 		t.Fatalf("note.Events len=%d want 0<n<5(budget-limited)", len(notes.Events))
+	}
+}
+
+// TestSummary_BudgetMeasuresSummaryLenOnly: 부채 ②(설계 §9). summary 예산은 직렬화 전체가
+// 아니라 이벤트 summary 텍스트 길이(len(Summary))만 잰다는 관례를 계약으로 고정한다. UUIDv7
+// event_id·session_id만으로도 이벤트 직렬화는 80바이트를 넘지만, 3바이트 요약은 5바이트 예산에
+// 들어간다 — 직렬화 전체를 쟀다면 첫 이벤트조차 실리지 못해 0건이어야 한다. v0.1 최종리뷰가
+// 명시한 "len(Summary)-only(full-payload라 최대 ~4배 초과 가능)"가 export(직렬화 전체 계상)와
+// 달리 summary에서는 의도된 설계임을 못박는다. 기존 동작 고정 — born-green.
+func TestSummary_BudgetMeasuresSummaryLenOnly(t *testing.T) {
+	cs, _, sess, _, _ := newSummaryTestServer(t)
+	ctx := context.Background()
+	mustAppend(t, sess, session.Event{Type: "note", Summary: "bbbbbb"}) // 6B, 더 오래됨
+	mustAppend(t, sess, session.Event{Type: "note", Summary: "aaa"})    // 3B, 가장 최근
+
+	res, err := cs.CallTool(ctx, &mcp.CallToolParams{Name: "ctr_session_summary", Arguments: SessionSummaryInput{MaxReturnBytes: 5}})
+	if err != nil {
+		t.Fatalf("call: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("summary error: %+v", res.Content)
+	}
+	var out SessionSummaryOutput
+	remarshal(t, res.StructuredContent, &out)
+
+	// len(Summary)-only: 최신 "aaa"(3B) ≤ 5 → 1건 유지, 남은 예산 2B < "bbbbbb"(6B) → 절단.
+	notes := findSummaryGroup(out, "note")
+	if notes == nil || len(notes.Events) != 1 || notes.Events[0].Summary != "aaa" {
+		t.Fatalf("note group=%+v want exactly [aaa](len(Summary)-only 관례 — 직렬화 전체였다면 0건)", notes)
+	}
+	if !notes.Truncated {
+		t.Fatalf("note.Truncated=false want true(6B 이벤트가 남은 예산 초과)")
+	}
+}
+
+// TestSummary_GroupsTruncatedFanOutCap: 부채 ①(설계 §9) wire 배선 — session.Summarize의
+// fan-out 캡 신호가 ctr_session_summary 출력의 groups_truncated로 그대로 노출된다(소비자 대면
+// 계약). session.maxSummaryGroups(=32)를 넘는 구별 event_type을 시드해 신호를 강제한다.
+func TestSummary_GroupsTruncatedFanOutCap(t *testing.T) {
+	cs, _, sess, _, _ := newSummaryTestServer(t)
+	ctx := context.Background()
+	for i := 0; i < 40; i++ { // > 32(session.maxSummaryGroups) 확실히 초과
+		mustAppend(t, sess, session.Event{Type: fmt.Sprintf("type_%d", i), Summary: "s"})
+	}
+
+	res, err := cs.CallTool(ctx, &mcp.CallToolParams{Name: "ctr_session_summary", Arguments: SessionSummaryInput{MaxReturnBytes: 1 << 20}})
+	if err != nil {
+		t.Fatalf("call: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("summary error: %+v", res.Content)
+	}
+	var out SessionSummaryOutput
+	remarshal(t, res.StructuredContent, &out)
+
+	if !out.GroupsTruncated {
+		t.Fatalf("GroupsTruncated=false want true(40 타입 > 32 상한)")
+	}
+	if len(out.Groups) > 32 {
+		t.Fatalf("len(Groups)=%d want <=32(fan-out 상한)", len(out.Groups))
 	}
 }
 

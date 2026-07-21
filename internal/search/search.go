@@ -51,11 +51,13 @@ func normalizeQuery(q string) (porter, trigram string, shortToks []string) {
 	return strings.Join(pt, " AND "), strings.Join(tt, " AND "), shortToks
 }
 
-// filterShortTokenCandidates: trigram 후보(ids, 순위 순서 유지) 중 shortToks(<3자라
-// trigram 식에서 빠진 토큰)가 하나라도 chunk.text에 리터럴로 없는 후보를 버린다 — trigram
-// 식이 짧은 토큰을 누락해 AND 계약이 깨지는 것을 막는다(Fix E). porter 후보는 이미 모든
-// 토큰을 AND로 포함하므로 이 필터를 거치지 않는다.
-func filterShortTokenCandidates(ctx context.Context, db *sql.DB, ids []int64, shortToks []string) ([]int64, error) {
+// filterShortTokenCandidates: trigram 후보(ids, 순위 순서 유지) 중 shortToks(<3자라 trigram
+// 식에서 빠진 토큰)가 하나라도 <table>.<textCol>에 리터럴로 없는 후보를 버린다 — trigram 식이
+// 짧은 토큰을 누락해 AND 계약이 깨지는 것을 막는다(Fix E). content(chunks/text)·events
+// (session_events/summary) 공용 헬퍼 — table/textCol은 패키지 상수만 전달되므로(사용자 입력
+// 아님) 식별자 연결이 안전하다(bm25Rank의 table 연결과 동형). porter 후보는 이미 모든 토큰을
+// AND로 포함하므로 이 필터를 거치지 않는다.
+func filterShortTokenCandidates(ctx context.Context, db *sql.DB, table, textCol string, ids []int64, shortToks []string) ([]int64, error) {
 	if len(shortToks) == 0 || len(ids) == 0 {
 		return ids, nil
 	}
@@ -66,7 +68,7 @@ func filterShortTokenCandidates(ctx context.Context, db *sql.DB, ids []int64, sh
 		args[i] = id
 	}
 	rows, err := db.QueryContext(ctx,
-		"SELECT id, text FROM chunks WHERE id IN ("+strings.Join(placeholders, ",")+")", args...)
+		"SELECT id, "+textCol+" FROM "+table+" WHERE id IN ("+strings.Join(placeholders, ",")+")", args...)
 	if err != nil {
 		return nil, err
 	}
@@ -394,7 +396,7 @@ func Query(ctx context.Context, st *store.Store, projectRoot string, queries []s
 		if err != nil {
 			return nil, err
 		}
-		tIDs, err = filterShortTokenCandidates(ctx, db, tIDs, shortToks)
+		tIDs, err = filterShortTokenCandidates(ctx, db, "chunks", "text", tIDs, shortToks)
 		if err != nil {
 			return nil, err
 		}
@@ -477,57 +479,6 @@ func bm25RankEvents(ctx context.Context, r *sql.DB, table, match string, n int) 
 	return ids, rows.Err()
 }
 
-// filterShortTokenCandidatesEvents: filterShortTokenCandidates(위, Fix E)의 이벤트판 —
-// session_events.summary에서 trigram 식이 누락한 짧은 토큰(<3자)의 리터럴 존재를 재확인해
-// AND 계약을 지킨다. content 경로는 손대지 않는다(회귀 테스트 무영향).
-func filterShortTokenCandidatesEvents(ctx context.Context, r *sql.DB, ids []int64, shortToks []string) ([]int64, error) {
-	if len(shortToks) == 0 || len(ids) == 0 {
-		return ids, nil
-	}
-	placeholders := make([]string, len(ids))
-	args := make([]any, len(ids))
-	for i, id := range ids {
-		placeholders[i] = "?"
-		args[i] = id
-	}
-	rows, err := r.QueryContext(ctx,
-		"SELECT id, summary FROM session_events WHERE id IN ("+strings.Join(placeholders, ",")+")", args...)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	texts := make(map[int64]string, len(ids))
-	for rows.Next() {
-		var id int64
-		var text string
-		if err := rows.Scan(&id, &text); err != nil {
-			return nil, err
-		}
-		texts[id] = text
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	kept := make([]int64, 0, len(ids))
-	for _, id := range ids {
-		text, ok := texts[id]
-		if !ok {
-			continue
-		}
-		all := true
-		for _, tok := range shortToks {
-			if foldIndex(text, tok) < 0 {
-				all = false
-				break
-			}
-		}
-		if all {
-			kept = append(kept, id)
-		}
-	}
-	return kept, nil
-}
-
 // eventHitQuery: session_events에서 EventHit 표시 컬럼 + superseded 판정(잔존 행 기준
 // EXISTS)을 1개 SELECT로 채운다. 스윕(§5)이 교정 이벤트를 지워도 이 쿼리는 그 시점 잔존
 // 행만 보므로 자동으로 정합적이다.
@@ -562,7 +513,7 @@ func QueryEvents(ctx context.Context, r *sql.DB, q string, limit int) ([]EventHi
 	if err != nil {
 		return nil, err
 	}
-	tIDs, err = filterShortTokenCandidatesEvents(ctx, r, tIDs, shortToks)
+	tIDs, err = filterShortTokenCandidates(ctx, r, "session_events", "summary", tIDs, shortToks)
 	if err != nil {
 		return nil, err
 	}
