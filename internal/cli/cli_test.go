@@ -130,7 +130,7 @@ func TestRunDoctor_Smoke(t *testing.T) {
 	}
 
 	var buf bytes.Buffer
-	if err := runDoctor(context.Background(), &buf, storeRoot, projectRoot); err != nil {
+	if err := runDoctor(context.Background(), &buf, storeRoot, projectRoot, "0.0.1-dev"); err != nil {
 		t.Fatalf("runDoctor err=%v out=%s", err, buf.String())
 	}
 	out := buf.String()
@@ -178,7 +178,7 @@ func TestRunDoctor_InitializedStore(t *testing.T) {
 	}
 
 	var buf bytes.Buffer
-	if err := runDoctor(context.Background(), &buf, storeRoot, projectRoot); err != nil {
+	if err := runDoctor(context.Background(), &buf, storeRoot, projectRoot, "0.0.1-dev"); err != nil {
 		t.Fatalf("runDoctor err=%v out=%s", err, buf.String())
 	}
 	out := buf.String()
@@ -187,6 +187,48 @@ func TestRunDoctor_InitializedStore(t *testing.T) {
 	}
 	if !strings.Contains(out, "[4] fts5: 가능") {
 		t.Fatalf("out missing fts5 available on an initialized (read-only-probed) store: %s", out)
+	}
+}
+
+// TestRunDoctor_ContentDBSize: D33a [14] — content.db 규모 행이 sources·artifacts 행수와
+// artifacts/ CAS 물리 blob 바이트의 정확값을 방출한다. fixture: 인덱스 아티팩트 2개(길이 10·15,
+// 상이) + raw blob 2회 기록(동일 20B 콘텐츠 → dedup으로 물리 1파일). blob 바이트는 물리 파일
+// 합산이라 10+15+20=45 — DB 파일 크기 합산이나 0 방출 오구현, dedup 미반영(65) 오구현을 걸러낸다.
+func TestRunDoctor_ContentDBSize(t *testing.T) {
+	storeRoot := t.TempDir()
+	projectRoot := t.TempDir()
+	canon, err := ident.Canonicalize(projectRoot)
+	if err != nil {
+		t.Fatalf("canonicalize: %v", err)
+	}
+	projDir := filepath.Join(storeRoot, "projects", canon.ProjectID)
+	st, err := store.Open(projDir, false)
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	raw := []byte(strings.Repeat("R", 20)) // 두 소스가 공유하는 원본 blob(20B) — 물리 dedup 검증용
+	reg := func(uri, idx string) {
+		if _, err := st.Register(context.Background(), store.Registration{
+			StoredBytes: []byte(idx), MediaType: "text/plain",
+			Source:  store.SourceMeta{URI: uri, Kind: "file", SrcHash: uri},
+			Chunks:  []store.Chunk{{Ordinal: 0, Text: idx}},
+			RawBlob: raw,
+		}); err != nil {
+			t.Fatalf("register %s: %v", uri, err)
+		}
+	}
+	reg("/src-a", strings.Repeat("a", 10)) // 인덱스 콘텐츠 A(10B)
+	reg("/src-b", strings.Repeat("b", 15)) // 인덱스 콘텐츠 B(15B) — A와 상이 → artifacts=2
+	if err := st.Close(); err != nil {
+		t.Fatalf("store.Close: %v", err)
+	}
+
+	var buf bytes.Buffer
+	if err := runDoctor(context.Background(), &buf, storeRoot, projectRoot, "0.0.1-dev"); err != nil {
+		t.Fatalf("runDoctor err=%v out=%s", err, buf.String())
+	}
+	if !strings.Contains(buf.String(), "[14] content.db: sources=2 artifacts=2 blob=45B") {
+		t.Fatalf("out missing exact content.db size line:\n%s", buf.String())
 	}
 }
 
@@ -1041,7 +1083,7 @@ func TestRunDoctor_StoreRootDeepMissingParents_Writable(t *testing.T) {
 	projectRoot := t.TempDir()
 
 	var buf bytes.Buffer
-	if err := runDoctor(context.Background(), &buf, storeRoot, projectRoot); err != nil {
+	if err := runDoctor(context.Background(), &buf, storeRoot, projectRoot, "0.0.1-dev"); err != nil {
 		t.Fatalf("runDoctor err=%v out=%s", err, buf.String())
 	}
 	if !strings.Contains(buf.String(), "[1] store-root: exists=false writable=true") {
@@ -1069,7 +1111,7 @@ func TestRunDoctor_StoreRootAncestorIsFile_Rejected(t *testing.T) {
 	projectRoot := t.TempDir()
 
 	var buf bytes.Buffer
-	err := runDoctor(context.Background(), &buf, storeRoot, projectRoot)
+	err := runDoctor(context.Background(), &buf, storeRoot, projectRoot, "0.0.1-dev")
 	if err == nil {
 		t.Fatal("want error — store-root의 중간 조상이 비디렉터리 파일")
 	}
@@ -1090,7 +1132,7 @@ func TestRunDoctor_StoreRootIsFile_Rejected(t *testing.T) {
 	projectRoot := t.TempDir()
 
 	var buf bytes.Buffer
-	err := runDoctor(context.Background(), &buf, storeRoot, projectRoot)
+	err := runDoctor(context.Background(), &buf, storeRoot, projectRoot, "0.0.1-dev")
 	if err == nil {
 		t.Fatal("want error — store-root path is an existing non-directory file")
 	}
@@ -1226,7 +1268,7 @@ func TestRunDoctor_SessionItems(t *testing.T) {
 		storeRoot := t.TempDir()
 		projectRoot := t.TempDir()
 		var buf bytes.Buffer
-		if err := runDoctor(context.Background(), &buf, storeRoot, projectRoot); err != nil {
+		if err := runDoctor(context.Background(), &buf, storeRoot, projectRoot, "0.0.1-dev"); err != nil {
 			t.Fatalf("runDoctor err=%v out=%s", err, buf.String())
 		}
 		out := buf.String()
@@ -1258,7 +1300,7 @@ func TestRunDoctor_SessionItems(t *testing.T) {
 		}
 
 		var buf bytes.Buffer
-		if err := runDoctor(context.Background(), &buf, storeRoot, projectRoot); err != nil {
+		if err := runDoctor(context.Background(), &buf, storeRoot, projectRoot, "0.0.1-dev"); err != nil {
 			t.Fatalf("runDoctor err=%v out=%s", err, buf.String())
 		}
 		out := buf.String()
@@ -1293,7 +1335,7 @@ func TestRunDoctor_SessionItems(t *testing.T) {
 		}
 
 		var buf bytes.Buffer
-		err = runDoctor(context.Background(), &buf, storeRoot, projectRoot)
+		err = runDoctor(context.Background(), &buf, storeRoot, projectRoot, "0.0.1-dev")
 		if err == nil {
 			t.Fatalf("want error(진단 실패 항목 존재), got nil: %s", buf.String())
 		}

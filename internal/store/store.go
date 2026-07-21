@@ -908,3 +908,72 @@ func LedgerStats(dir string) ([]ToolStat, error) {
 	}
 	return out, nil
 }
+
+// SizeStat: content.db 규모 스냅샷(doctor [14] shadow 성장 관측 채널, 설계 v0.3 §2·D33).
+// BlobBytes는 artifacts/ CAS의 물리 blob 파일 합산 — DB 파일 크기가 아니다.
+type SizeStat struct {
+	Sources, Artifacts int64
+	BlobBytes          int64
+}
+
+// SizeStats: dir/content.db를 read-only로 열어 sources·artifacts 행수를 세고, artifacts/ CAS
+// 디렉터리의 물리 blob 바이트를 합산한다(설계 v0.3 §2·D33). content.db 미존재는 LedgerStats와
+// 동일하게 (nil, nil) — 호출자(doctor [14])가 "없음"으로 fail-soft 렌더한다. blob 바이트는
+// GCOrphanBlobs와 동일 관례로 파일명이 sha256 hex(64자)인 것만 센다 — writeBlob 임시파일
+// (hash.tmp.pid.seq)은 길이가 달라 자연히 제외된다. dedup은 물리 파일 합산이라 자동(동일
+// content_hash는 한 파일).
+func SizeStats(dir string) (*SizeStat, error) {
+	path := filepath.Join(dir, "content.db")
+	if _, err := os.Stat(path); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, nil
+		}
+		return nil, sanitizeIOErr("size stat", err)
+	}
+	db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(path)+"?mode=ro&_pragma=busy_timeout(5000)")
+	if err != nil {
+		return nil, fmt.Errorf("store SizeStats: %w", err)
+	}
+	defer db.Close()
+
+	var st SizeStat
+	if err := db.QueryRow("SELECT count(*) FROM sources").Scan(&st.Sources); err != nil {
+		return nil, fmt.Errorf("store SizeStats: %w", err)
+	}
+	if err := db.QueryRow("SELECT count(*) FROM artifacts").Scan(&st.Artifacts); err != nil {
+		return nil, fmt.Errorf("store SizeStats: %w", err)
+	}
+
+	// artifacts/<hex 2자 prefix>/<64-hex> 2단 레이아웃을 GCOrphanBlobs와 동형으로 순회한다.
+	blobRoot := filepath.Join(dir, "artifacts")
+	prefixes, err := os.ReadDir(blobRoot)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return &st, nil // artifacts/ 부재 — blob 0(DB만 있고 blob 미배치인 비정상도 fail-soft)
+		}
+		return nil, sanitizeIOErr("size readdir", err)
+	}
+	for _, p := range prefixes {
+		if !p.IsDir() {
+			continue
+		}
+		entries, err := os.ReadDir(filepath.Join(blobRoot, p.Name()))
+		if err != nil {
+			return nil, sanitizeIOErr("size readdir", err)
+		}
+		for _, e := range entries {
+			if len(e.Name()) != 64 { // 64-hex CAS blob만 — 임시파일·기타 제외(GCOrphanBlobs 관례)
+				continue
+			}
+			info, err := e.Info()
+			if err != nil {
+				if errors.Is(err, os.ErrNotExist) { // 순회 중 사라짐(동시 GC 등) — 무시
+					continue
+				}
+				return nil, sanitizeIOErr("size stat", err)
+			}
+			st.BlobBytes += info.Size()
+		}
+	}
+	return &st, nil
+}

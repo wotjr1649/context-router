@@ -464,7 +464,7 @@ func TestDoctor_HookItemsAndAscendingOrder(t *testing.T) {
 		storeRoot := t.TempDir()
 		projectRoot := t.TempDir()
 		var buf bytes.Buffer
-		if err := runDoctor(context.Background(), &buf, storeRoot, projectRoot); err != nil {
+		if err := runDoctor(context.Background(), &buf, storeRoot, projectRoot, "0.1.0"); err != nil {
 			t.Fatalf("runDoctor err=%v out=%s", err, buf.String())
 		}
 		out := buf.String()
@@ -474,6 +474,7 @@ func TestDoctor_HookItemsAndAscendingOrder(t *testing.T) {
 			"[11] store-root path:",
 			"[12] drops:",
 			"[13] sidecar writable:",
+			"[14] content.db:", // store 없는 unregistered 경로 — fail-soft "없음" 라인으로 방출
 		} {
 			if !strings.Contains(out, want) {
 				t.Fatalf("out missing %q:\n%s", want, out)
@@ -506,15 +507,15 @@ func TestDoctor_HookItemsAndAscendingOrder(t *testing.T) {
 		}
 
 		var buf bytes.Buffer
-		if err := runDoctor(context.Background(), &buf, storeRoot, projectRoot); err != nil {
+		if err := runDoctor(context.Background(), &buf, storeRoot, projectRoot, "0.1.0"); err != nil {
 			t.Fatalf("runDoctor err=%v out=%s", err, buf.String())
 		}
 		out := buf.String()
 		if !strings.Contains(out, "[9] hooks: project=등록됨") {
 			t.Fatalf("out missing registered-hooks line:\n%s", out)
 		}
-		if !strings.Contains(out, "[12] drops: store-root=2 worktree=3 total=5") {
-			t.Fatalf("out missing two-location drops sum:\n%s", out)
+		if !strings.Contains(out, "[12] drops: store-root=2(a=1,b=1) worktree=3(x=1,y=1,z=1) total=5") {
+			t.Fatalf("out missing reason-rollup drops line:\n%s", out)
 		}
 		assertDoctorAscending(t, out)
 	})
@@ -539,7 +540,7 @@ func TestDoctor_UserScopeHookRegistration(t *testing.T) {
 	}
 
 	var buf bytes.Buffer
-	if err := runDoctor(context.Background(), &buf, storeRoot, projectRoot); err != nil {
+	if err := runDoctor(context.Background(), &buf, storeRoot, projectRoot, "0.1.0"); err != nil {
 		t.Fatalf("runDoctor err=%v out=%s", err, buf.String())
 	}
 	out := buf.String()
@@ -550,6 +551,47 @@ func TestDoctor_UserScopeHookRegistration(t *testing.T) {
 		t.Fatalf("doctor must report project scope as unregistered:\n%s", out)
 	}
 	assertDoctorAscending(t, out)
+}
+
+// D33a 마커 일치: 현재 버전으로 install한 뒤 같은 버전 바이너리로 doctor를 돌리면 [9]가
+// "marker <v>"만 표기하고 불일치 경고(≠)를 내지 않는다.
+func TestDoctor_HookMarkerVersionMatch(t *testing.T) {
+	storeRoot := t.TempDir()
+	projectRoot := t.TempDir()
+	var iout bytes.Buffer
+	if err := runHookInstall(nil, storeRoot, "", false, projectRoot, "9.9.9", &iout); err != nil {
+		t.Fatalf("install: %v", err)
+	}
+	var buf bytes.Buffer
+	if err := runDoctor(context.Background(), &buf, storeRoot, projectRoot, "9.9.9"); err != nil {
+		t.Fatalf("runDoctor err=%v out=%s", err, buf.String())
+	}
+	out := buf.String()
+	if !strings.Contains(out, "project=등록됨(4개, marker 9.9.9)") {
+		t.Fatalf("out missing matched marker version:\n%s", out)
+	}
+	if strings.Contains(out, "≠") {
+		t.Fatalf("out must not warn mismatch on matching versions:\n%s", out)
+	}
+}
+
+// D33a 마커 불일치: 구버전 마커로 install(= 구버전 마커 seed)한 뒤 신버전 바이너리로 doctor를
+// 돌리면 [9]가 "marker <old>≠<new> — hook install 재실행"으로 재설치를 안내한다.
+func TestDoctor_HookMarkerVersionMismatch(t *testing.T) {
+	storeRoot := t.TempDir()
+	projectRoot := t.TempDir()
+	var iout bytes.Buffer
+	if err := runHookInstall(nil, storeRoot, "", false, projectRoot, "0.1.0", &iout); err != nil {
+		t.Fatalf("install(old): %v", err)
+	}
+	var buf bytes.Buffer
+	if err := runDoctor(context.Background(), &buf, storeRoot, projectRoot, "0.3.0"); err != nil {
+		t.Fatalf("runDoctor err=%v out=%s", err, buf.String())
+	}
+	out := buf.String()
+	if !strings.Contains(out, "project=등록됨(4개, marker 0.1.0≠0.3.0 — hook install 재실행)") {
+		t.Fatalf("out missing marker mismatch warning:\n%s", out)
+	}
 }
 
 // hookRunPayload — cli 러닝 훅 stdin JSON을 조립한다(경로 이스케이프 위해 json.Marshal 사용).

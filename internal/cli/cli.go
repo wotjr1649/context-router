@@ -44,7 +44,7 @@ func Run(ctx context.Context, sub string, args []string, storeRoot, projectRoot,
 			// Fix Round 3, item 5).
 			return fmt.Errorf("cli: doctor: 예상치 않은 인자 %d개", len(args))
 		}
-		return runDoctor(ctx, stdout, storeRoot, projectRoot)
+		return runDoctor(ctx, stdout, storeRoot, projectRoot, version)
 	case "upgrade":
 		if len(args) > 0 {
 			return fmt.Errorf("cli: upgrade: 예상치 않은 인자 %d개", len(args))
@@ -1055,7 +1055,7 @@ enabled_tools = ["ctr_search", "ctr_fetch", "ctr_transform", "ctr_record_event",
 // 스니펫을 w에 출력한다. store를 생성하지 않는다(store.Open(dir, true)만 사용, 설계 §7).
 // 실패 항목이 있으면 error를 반환한다(main이 exit 1) — 반환 오류 메시지에는 절대경로를
 // 담지 않는다(§12 canary), 대신 상세는 w의 진단 본문에 있다.
-func runDoctor(ctx context.Context, w io.Writer, storeRoot, projectRoot string) error {
+func runDoctor(ctx context.Context, w io.Writer, storeRoot, projectRoot, version string) error {
 	var failed []string
 	fmt.Fprintln(w, "context-router doctor")
 	fmt.Fprintln(w)
@@ -1211,17 +1211,23 @@ func runDoctor(ctx context.Context, w io.Writer, storeRoot, projectRoot string) 
 	// [9] 훅 등록 상태 — 프로젝트 + 사용자(~/.claude) 범위 양쪽 검사(F5: `hook install --user`
 	// 등록을 프로젝트-only 검사가 놓쳐 "미등록" 오보하던 문제). 두 경로 모두 install/uninstall과
 	// 동일한 hookSettingsPath 이음새로 도출한다(사용자 홈 = os.UserHomeDir).
+	// 마커 버전(install이 기입한 __ctrManaged 버전)을 바이너리 version과 대조해 불일치 시
+	// 재설치를 안내한다(설계 v0.3 §5·D33a — 훅 계약이 바뀐 구버전 마커가 남아 있으면 러닝 훅이
+	// 신 계약과 어긋난다).
 	hookScope := func(path string, pathErr error) string {
 		if pathErr != nil {
 			return "확인불가"
 		}
-		switch n, err := countRegisteredHooks(path); {
+		n, marker, err := scanRegisteredHooks(path)
+		switch {
 		case err != nil:
 			return "파싱실패"
 		case n == 0:
 			return "미등록"
+		case marker != "" && marker != version:
+			return fmt.Sprintf("등록됨(%d개, marker %s≠%s — hook install 재실행)", n, marker, version)
 		default:
-			return fmt.Sprintf("등록됨(%d개)", n)
+			return fmt.Sprintf("등록됨(%d개, marker %s)", n, marker)
 		}
 	}
 	projPath, _ := hookSettingsPath(false, projectRoot) // 프로젝트 경로는 오류를 내지 않는다
@@ -1238,12 +1244,15 @@ func runDoctor(ctx context.Context, w io.Writer, storeRoot, projectRoot string) 
 	fmt.Fprintf(w, "[11] store-root path: %s\n", storeRoot)
 
 	// [12] drops 건수 — 두 위치 합산(T4 결정): <storeRoot>/드롭(식별 전) + <sessionDir>/드롭(worktree별).
-	rootDrops := countDropsLog(filepath.Join(storeRoot, dropsFileName))
-	wtDrops := 0
+	// 각 위치를 사유별로 롤업해 "N(사유=n,...)"로 렌더한다(설계 v0.3 §5·D33a). total은 줄 수 합계
+	// (빈 줄·미파싱 줄 포함 — 기존 줄 수 계약 보존).
+	rootTotal, rootReasons := dropsByReason(filepath.Join(storeRoot, dropsFileName))
+	wtTotal, wtReasons := 0, map[string]int(nil)
 	if canon.ProjectID != "" && canon.WorktreeID != "" {
-		wtDrops = countDropsLog(filepath.Join(storeRoot, "projects", canon.ProjectID, "worktrees", canon.WorktreeID, dropsFileName))
+		wtTotal, wtReasons = dropsByReason(filepath.Join(storeRoot, "projects", canon.ProjectID, "worktrees", canon.WorktreeID, dropsFileName))
 	}
-	fmt.Fprintf(w, "[12] drops: store-root=%d worktree=%d total=%d\n", rootDrops, wtDrops, rootDrops+wtDrops)
+	fmt.Fprintf(w, "[12] drops: store-root=%s worktree=%s total=%d\n",
+		formatDropCount(rootTotal, rootReasons), formatDropCount(wtTotal, wtReasons), rootTotal+wtTotal)
 
 	// [13] 사이드카(drops.log) 기록 가능 여부 — worktree 세션 dir이 실재하면 그걸, 아니면
 	// store-root를 프로브한다(식별 전 drops는 store-root, 이후는 worktree dir, §2.3).
@@ -1254,6 +1263,17 @@ func runDoctor(ctx context.Context, w io.Writer, storeRoot, projectRoot string) 
 		}
 	}
 	fmt.Fprintf(w, "[13] sidecar writable: %v\n", dirExistsCLI(sidecarDir) && probeWritable(sidecarDir))
+
+	// [14] content.db 규모 — shadow 성장 관측 채널(설계 v0.3 §2 보존·D33). 정보성 — 실패로
+	// 세지 않는다. store.SizeStats가 artifacts/ CAS 물리 blob 바이트를 소유(D13 anti-fragmentation).
+	// project 식별 실패·content.db 부재·조회 실패는 전부 "없음"으로 fail-soft(행은 항상 방출).
+	if canon.ProjectID == "" {
+		fmt.Fprintln(w, "[14] content.db: 없음")
+	} else if sz, err := store.SizeStats(filepath.Join(storeRoot, "projects", canon.ProjectID)); err != nil || sz == nil {
+		fmt.Fprintln(w, "[14] content.db: 없음")
+	} else {
+		fmt.Fprintf(w, "[14] content.db: sources=%d artifacts=%d blob=%dB\n", sz.Sources, sz.Artifacts, sz.BlobBytes)
+	}
 
 	fmt.Fprintln(w)
 	fmt.Fprint(w, hostSnippet)
