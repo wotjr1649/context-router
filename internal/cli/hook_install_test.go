@@ -312,9 +312,12 @@ func TestHookInstall_CommandReflectsFlags(t *testing.T) {
 	}{
 		{false, "", false, "context-router hook"},
 		{false, "", true, "context-router hook --no-shadow"},
-		{true, "/custom/store", false, "context-router hook --store-root /custom/store"},
-		{true, "/custom/store", true, "context-router hook --store-root /custom/store --no-shadow"},
+		{true, "/custom/store", false, "context-router hook --store-root '/custom/store'"},
+		{true, "/custom/store", true, "context-router hook --store-root '/custom/store' --no-shadow"},
 		{false, "/ignored", false, "context-router hook"}, // 미명시 → 무기입
+		// T11 실측: 훅 명령은 sh 파싱 — 백슬래시·공백 경로는 홑따옴표 인용으로만 무변형 전달.
+		{true, `C:\tmp\ctr t11 store`, false, `context-router hook --store-root 'C:\tmp\ctr t11 store'`},
+		{true, "/it's/store", false, `context-router hook --store-root '/it'\''s/store'`},
 	}
 	for _, c := range cases {
 		if got := buildHookCommand(c.explicit, c.raw, c.noShadow); got != c.want {
@@ -337,8 +340,8 @@ func TestHookInstall_CommandReflectsFlags(t *testing.T) {
 		if err != nil {
 			t.Fatalf("abs: %v", err)
 		}
-		if !strings.Contains(cmd, "--store-root "+absRaw) {
-			t.Fatalf("cmd=%q must inject the absolutized store-root %q", cmd, absRaw)
+		if !strings.Contains(cmd, "--store-root '"+absRaw+"'") {
+			t.Fatalf("cmd=%q must inject the absolutized store-root %q (single-quoted)", cmd, absRaw)
 		}
 	})
 
@@ -356,10 +359,10 @@ func TestHookInstall_CommandReflectsFlags(t *testing.T) {
 		if err != nil {
 			t.Fatalf("abs: %v", err)
 		}
-		if !strings.Contains(cmd, "--store-root "+abs) {
-			t.Fatalf("cmd=%q must contain absolutized store-root %q", cmd, abs)
+		if !strings.Contains(cmd, "--store-root '"+abs+"'") {
+			t.Fatalf("cmd=%q must contain absolutized store-root %q (single-quoted)", cmd, abs)
 		}
-		if strings.Contains(cmd, "--store-root "+rel) {
+		if strings.Contains(cmd, "--store-root '"+rel+"'") {
 			t.Fatalf("cmd=%q must NOT contain the raw relative path %q", cmd, rel)
 		}
 	})

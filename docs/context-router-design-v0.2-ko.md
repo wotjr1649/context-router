@@ -116,7 +116,7 @@
 ## 7. 패키징·설치 (D28)
 
 - `context-router hook install [--user]`: 프로젝트 `.claude/settings.json`(기본) 또는 `--user`로 사용자 설정에 훅 등록을 멱등 병합. **병합 계약**: 기존 JSON 파싱 → 해당 훅 이벤트 배열에만 자기 항목 append/치환(식별은 명령 문자열 `context-router hook` + 버전 마커) → temp 파일 + rename **원자 쓰기**. 미지 키·타 도구의 훅 항목은 왕복 보존(보존 자체가 테스트 게이트, §10). `uninstall`이 대칭 제거. 등록 항목: SessionStart, PreToolUse(Read), PostToolUse(전 도구), PostToolUseFailure(전 도구) + timeout 10(단위 **초** — T0 확인, command 기본 600초).
-- 훅 명령은 PATH의 **`context-router`**(실행 파일명 — `ctr`은 MCP 등록 키일 뿐이다). **store-root 정합**: `.mcp.json` args의 `--store-root`는 훅 프로세스에 전파되지 않으므로(우선순위 플래그>`CTR_STORE_ROOT`>OS 기본, main 현행), 커스텀 store-root는 `CTR_STORE_ROOT` env 규약으로 통일하고 `install --store-root <p>`가 주어지면 훅 명령 args에 명시 주입한다. doctor 확장: 훅 등록 상태(설정 파일 파싱)·`context-router` PATH 해석·해석된 store-root·drops 건수를 항목으로 추가하고, 기존 항목 순서 nit([3]→[5]→[4])를 함께 정렬(§9 편승).
+- 훅 명령은 PATH의 **`context-router`**(실행 파일명 — `ctr`은 MCP 등록 키일 뿐이다). **store-root 정합**: `.mcp.json` args의 `--store-root`는 훅 프로세스에 전파되지 않으므로(우선순위 플래그>`CTR_STORE_ROOT`>OS 기본, main 현행), 커스텀 store-root는 `CTR_STORE_ROOT` env 규약으로 통일하고 `install --store-root <p>`가 주어지면 훅 명령 args에 명시 주입한다 — **T11 실측**: 훅 명령은 Windows 실호스트에서도 POSIX sh 규칙으로 파싱되므로(비인용 백슬래시 소실·공백 분할) 주입 값은 **홑따옴표 인용**(내부 홑따옴표 `'\''`)으로 기입한다. doctor 확장: 훅 등록 상태(설정 파일 파싱)·`context-router` PATH 해석·해석된 store-root·drops 건수를 항목으로 추가하고, 기존 항목 순서 nit([3]→[5]→[4])를 함께 정렬(§9 편승).
 - Claude Code plugin manifest(마켓플레이스형)는 이월 — 로컬 우선 단일 바이너리에는 settings 병합이 최소완결. Codex 훅(`cx:`)은 Claude Code 계약 안정 후(§12).
 
 ## 8. 보안 계약 (승계 중심)

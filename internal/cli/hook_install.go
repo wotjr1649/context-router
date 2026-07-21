@@ -65,8 +65,10 @@ func hookMarkerPrefix() string { return hookBinaryName + "/" }
 func buildHookCommand(storeRootExplicit bool, storeRootRaw string, noShadow bool) string {
 	cmd := hookBinaryName + " hook"
 	if storeRootExplicit && storeRootRaw != "" {
-		// ponytail: 공백 포함 store-root는 미인용 — 그런 경로는 T11 실측 후 인용 규칙 추가.
-		cmd += " --store-root " + storeRootRaw
+		// T11 실측: 훅 명령은 Windows에서도 POSIX sh 규칙으로 파싱된다 — 비인용 값은 백슬래시가
+		// 소실되고(C:\tmp\ctr→C:tmpctr) 공백에서 분할된다. 홑따옴표 인용만 무변형 전달(캡처 argv
+		// 실측). 내부 홑따옴표는 표준 '\'' 이스케이프.
+		cmd += " --store-root '" + strings.ReplaceAll(storeRootRaw, "'", `'\''`) + "'"
 	}
 	if noShadow {
 		cmd += " --no-shadow"
