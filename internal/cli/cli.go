@@ -711,7 +711,7 @@ func purgeSessionFiles(projDir string, stderr io.Writer) error {
 		// 고지한다. unix의 unlink-while-open은 열린 서버가 계속 append하는 파일을 지워 이벤트를
 		// 유실시키고, 복구와도 경합하기 때문. release는 비멱등(store.AcquireLock 계약)이라 삭제
 		// 직후 정확히 1회 호출한다.
-		release, lockErr := store.AcquireLock(filepath.Join(wtDir, "session.lock"), false)
+		release, lockErr := store.AcquireLock(filepath.Join(wtDir, session.LockFileName), false)
 		if lockErr != nil {
 			fmt.Fprintf(stderr, "purge: skip worktree %s (session.lock 점유 — 활성 서버/복구 중)\n", e.Name())
 			continue
@@ -1198,7 +1198,7 @@ func runDoctor(ctx context.Context, w io.Writer, storeRoot, projectRoot, version
 
 		// [7] lease shared 프로브(설계 §6.2) — 시도-즉시-해제. exclusive 프로브는 하지 않는다
 		// (시작 중인 서버의 shared 획득과 경합해 오분기시키는 경로 차단, 설계 §6.2 명문 계약).
-		if release, lockErr := store.AcquireLock(filepath.Join(sessDir, "session.lock"), true); lockErr != nil {
+		if release, lockErr := store.AcquireLock(filepath.Join(sessDir, session.LockFileName), true); lockErr != nil {
 			fmt.Fprintf(w, "[7] session.lock: shared 획득 실패: %v\n", lockErr)
 			failed = append(failed, "session.lock")
 		} else {
@@ -1282,6 +1282,8 @@ func runDoctor(ctx context.Context, w io.Writer, storeRoot, projectRoot, version
 	// [14] content.db 규모 — shadow 성장 관측 채널(설계 v0.3 §2 보존·D33). 정보성 — 실패로
 	// 세지 않는다. store.SizeStats가 artifacts/ CAS 물리 blob 바이트를 소유(D13 anti-fragmentation).
 	// project 식별 실패·content.db 부재·조회 실패는 전부 "없음"으로 fail-soft(행은 항상 방출).
+	// 서버가 동시 실행 중이면 SizeStats의 ro-open이 content.db 점유와 경합해 실패할 수 있고 그때도
+	// "없음"으로 나온다 — 손상이 아니라 일시적 경합(서버 정지 후 재실행하면 값이 나옴).
 	if canon.ProjectID == "" {
 		fmt.Fprintln(w, "[14] content.db: 없음")
 	} else if sz, err := store.SizeStats(filepath.Join(storeRoot, "projects", canon.ProjectID)); err != nil || sz == nil {

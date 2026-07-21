@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -449,6 +450,12 @@ func TestSummaryAllowlist(t *testing.T) {
 		if _, _, attrs := classify(bashEvent(t, "PostToolUse", "go test ./...")); attrs["matched_pattern"] != "test_run" {
 			t.Fatalf("matched_pattern=%v want test_run", attrs["matched_pattern"])
 		}
+		if _, _, attrs := classify(bashEvent(t, "PostToolUse", "git diff HEAD")); attrs["matched_pattern"] != "git_diff" {
+			t.Fatalf("matched_pattern=%v want git_diff", attrs["matched_pattern"])
+		}
+		if _, _, attrs := classify(bashEvent(t, "PostToolUse", "go build ./...")); attrs["matched_pattern"] != "build_run" {
+			t.Fatalf("matched_pattern=%v want build_run", attrs["matched_pattern"])
+		}
 		if _, _, attrs := classify(bashEvent(t, "PostToolUse", "ls -la")); attrs["matched_pattern"] != nil {
 			t.Fatalf("tool_call matched_pattern=%v want absent", attrs["matched_pattern"])
 		}
@@ -668,6 +675,7 @@ func TestShadowOverMinStores(t *testing.T) {
 	want := "artifact://cc:3f2504e0-4f89-41d3-9a0c-0305e82c3301/sha256-"
 	// D30: artifact_created·tool_result_summary 둘 다 rep.Hash 기반 동일 ref를 실어야 한다
 	// (shadow: URI로 저장돼도 ref는 content_hash 주소 — §5).
+	hexHash := regexp.MustCompile(`^[0-9a-f]{64}$`) // ingest_test.go:855 관례 — hex-charset까지 단정
 	for _, et := range []string{"artifact_created", "tool_result_summary"} {
 		refs := eventRefs(t, sdir, et)
 		if len(refs) != 1 {
@@ -676,8 +684,8 @@ func TestShadowOverMinStores(t *testing.T) {
 		if !strings.HasPrefix(refs[0], want) {
 			t.Fatalf("%s ref=%q want prefix %q", et, refs[0], want)
 		}
-		if hash := strings.TrimPrefix(refs[0], want); len(hash) != 64 {
-			t.Fatalf("%s ref hash 길이=%d want 64(hex sha256)", et, len(hash))
+		if hash := strings.TrimPrefix(refs[0], want); !hexHash.MatchString(hash) {
+			t.Fatalf("%s ref hash=%q want ^[0-9a-f]{64}$(hex sha256)", et, hash)
 		}
 	}
 }
