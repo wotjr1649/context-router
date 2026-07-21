@@ -1597,3 +1597,39 @@ func TestOpenContextLockDeadline(t *testing.T) {
 		t.Fatalf("ctx 미관측 의심 — %v 소요(5초 하드 대기 추정)", elapsed)
 	}
 }
+
+// D37 — sourceOf(fetch 표시 경로)도 kind-티어 우선(α6: search/fetch 대표 일치).
+func TestReadRangeSourceKindTier(t *testing.T) {
+	s, err := Open(t.TempDir(), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { s.Close() })
+	body := "tier body\n"
+	reg := func(uri, kind string) int64 {
+		t.Helper()
+		id, err := s.Register(t.Context(), Registration{
+			StoredBytes: []byte(body), MediaType: "text/plain", Redaction: "none",
+			Source: SourceMeta{URI: uri, Kind: kind, SrcHash: "h"},
+			Chunks: []Chunk{{
+				Ordinal: 0, ByteStart: 0, ByteEnd: int64(len(body)),
+				LineStart: 1, LineEnd: 1, Text: body,
+			}},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return id
+	}
+	id := reg("inline:AAA", "hook") // uri 사전순 선행 hook 행
+	if id2 := reg("inline:ZZZ", "inline"); id2 != id {
+		t.Fatalf("동일 content인데 artifact 분리: %d != %d", id, id2)
+	}
+	r, err := s.ReadRange(t.Context(), id, Selector{Kind: "line", LineStart: 1, LineEnd: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !r.HasSource || r.Source.URI != "inline:ZZZ" || r.Source.Kind == "hook" {
+		t.Fatalf("want inline:ZZZ(비-hook 티어), got %+v", r.Source)
+	}
+}

@@ -545,6 +545,40 @@ func TestQuery_HitSourceShadowCoexist(t *testing.T) {
 	}
 }
 
+// D37 — 사전순으로 명시 티어보다 앞서는 hook URI가 대표가 되지 않는다(kind-티어 우선).
+// 기존 coexist 테스트(구 inline·신 shadow 둘 다 kind=hook 동티어 — inline 우선)는 무수정
+// 유지가 계약이다. 셋업은 그 테스트의 Register 관례 그대로.
+func TestQuery_HitSourceKindTier(t *testing.T) {
+	st, err := store.Open(t.TempDir(), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	reg := func(uri, kind, body string) {
+		t.Helper()
+		if _, err := st.Register(t.Context(), store.Registration{
+			StoredBytes: []byte(body), MediaType: "text/plain", Redaction: "none",
+			Source: store.SourceMeta{URI: uri, Kind: kind, SrcHash: "h"},
+			Chunks: []store.Chunk{{
+				Ordinal: 0, ByteStart: 0, ByteEnd: int64(len(body)),
+				LineStart: 1, LineEnd: 1, Text: body,
+			}},
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	body := "tierneedle content"
+	reg("inline:AAA", "hook", body)   // hook 티어 — uri 사전순 선행(사전식 우연 재현)
+	reg("inline:ZZZ", "inline", body) // 명시 티어 — 같은 본문 → 같은 artifact, 소스 2행
+	res, err := Query(t.Context(), st, "", []string{"tierneedle"}, 3, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res[0].Hits) != 1 || res[0].Hits[0].Source != "inline:ZZZ" {
+		t.Fatalf("want inline:ZZZ (kind-티어 우선 — hook 최하위), got %+v", res[0].Hits)
+	}
+}
+
 func TestQuery_SnippetStemPrefixFallback(t *testing.T) {
 	st, err := store.Open(t.TempDir(), false)
 	if err != nil {
