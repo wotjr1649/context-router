@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -850,5 +851,79 @@ func TestRunHookInstallCodex(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), "/hooks") {
 		t.Fatalf("신뢰 승인 안내 누락: %q", out.String())
+	}
+}
+
+// isOurCodexGroup 직접 에지 단정(v0.4 최종 리뷰 이월 — 기존 커버는 merge 경유 간접).
+// 전건 판정(§11.2 F4): 모든 항목이 command 토큰 정확 일치 AND statusMessage 마커 접두일
+// 때만 자기 그룹 — 혼합 그룹 불가침의 근거 함수.
+func TestIsOurCodexGroupEdges(t *testing.T) {
+	ours := `{"type":"command","command":"context-router codex-hook","timeout":10,"statusMessage":"context-router/0.4.0"}`
+	cases := []struct {
+		name string
+		raw  string
+		want bool
+	}{
+		{"비JSON", `not-json`, false},
+		{"빈 그룹", `{"matcher":"","hooks":[]}`, false},
+		{"전건 자기 항목", `{"matcher":"","hooks":[` + ours + `]}`, true},
+		{"후행 플래그 허용", `{"matcher":"","hooks":[{"type":"command","command":"context-router codex-hook --no-shadow","timeout":10,"statusMessage":"context-router/0.4.0"}]}`, true},
+		{"혼합(자기+외래)", `{"matcher":"","hooks":[` + ours + `,{"type":"command","command":"pwsh -File u.ps1","timeout":10,"statusMessage":"user"}]}`, false},
+		{"command 불일치(claude 러닝)", `{"matcher":"","hooks":[{"type":"command","command":"context-router hook","timeout":10,"statusMessage":"context-router/0.4.0"}]}`, false},
+		{"접두 닮은 명령(codex-hook-wrapper)", `{"matcher":"","hooks":[{"type":"command","command":"context-router codex-hook-wrapper","timeout":10,"statusMessage":"context-router/0.4.0"}]}`, false},
+		{"marker 접두 불일치", `{"matcher":"","hooks":[{"type":"command","command":"context-router codex-hook","timeout":10,"statusMessage":"other/0.4.0"}]}`, false},
+	}
+	for _, c := range cases {
+		if got := isOurCodexGroup(json.RawMessage(c.raw)); got != c.want {
+			t.Fatalf("%s: isOurCodexGroup=%v want %v", c.name, got, c.want)
+		}
+	}
+}
+
+// e2e: hook uninstall --codex run 분기(v0.4 최종 리뷰 이월 — 기존 커버는 merge 레벨만) —
+// install 산출물에서 자기 그룹만 제거, 선존 외래 그룹 보존, 제거 완료 안내 출력.
+func TestRunHookUninstallCodex(t *testing.T) {
+	root := t.TempDir()
+	foreign := []byte(`{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"pwsh -File policy.ps1","timeout":10}]}]}}`)
+	if err := os.MkdirAll(filepath.Join(root, ".codex"), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(root, ".codex", "hooks.json"), foreign, 0o644); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	if err := runHookInstall([]string{"--codex"}, "", "", false, root, "0.4.0", io.Discard); err != nil {
+		t.Fatalf("install --codex: %v", err)
+	}
+	var out bytes.Buffer
+	if err := runHookUninstall([]string{"--codex"}, root, &out); err != nil {
+		t.Fatalf("uninstall --codex: %v", err)
+	}
+	written, err := os.ReadFile(filepath.Join(root, ".codex", "hooks.json"))
+	if err != nil {
+		t.Fatalf("hooks.json 읽기: %v", err)
+	}
+	if strings.Contains(string(written), "context-router") {
+		t.Fatalf("자기 항목 잔존: %s", written)
+	}
+	if !strings.Contains(string(written), "policy.ps1") {
+		t.Fatalf("외래 그룹 소실: %s", written)
+	}
+	if !strings.Contains(out.String(), "제거 완료") {
+		t.Fatalf("제거 완료 안내 누락: %q", out.String())
+	}
+}
+
+// e2e: hook uninstall --codex 파일 미존재 no-op 분기 — 안내만 출력, 오류·파일 생성 없음.
+func TestRunHookUninstallCodexNoFile(t *testing.T) {
+	root := t.TempDir()
+	var out bytes.Buffer
+	if err := runHookUninstall([]string{"--codex"}, root, &out); err != nil {
+		t.Fatalf("uninstall --codex: %v", err)
+	}
+	if !strings.Contains(out.String(), "설정 파일 없음") {
+		t.Fatalf("no-op 안내 누락: %q", out.String())
+	}
+	if _, statErr := os.Stat(filepath.Join(root, ".codex", "hooks.json")); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("no-op인데 파일 생성됨: %v", statErr)
 	}
 }
