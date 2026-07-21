@@ -731,6 +731,83 @@ func TestShadowDenylistSkips(t *testing.T) {
 	}
 }
 
+// D39-① Bash `cat .env`(정적 증명 덤프, denylist 파일) → 미저장 + drops shadow-denylist.
+// 응답 본문에 런타임 분할 canary를 실어 "비밀이 store에 없다"까지 겸증한다(§8).
+func TestShadowCommandDenylistSkipsBash(t *testing.T) {
+	storeRoot, cwd, contentDir, sdir := shadowSetup(t)
+	canary := "xox" + "b-1234567890-ABCDEFGHIJKLMNOP" // 런타임 조립 — 소스에 연속 토큰 금지
+	in := fixtureWith(t, "posttooluse-bash.json", map[string]any{
+		"cwd":           cwd,
+		"tool_input":    map[string]any{"command": "cat .env"},
+		"tool_response": map[string]any{"stdout": canary + strings.Repeat("x", 20000), "stderr": ""},
+	})
+	if rc := runHook(t, storeRoot, in, nil); rc != 0 {
+		t.Fatalf("rc=%d want 0", rc)
+	}
+	if n := contentArtifacts(t, contentDir); n != -1 {
+		t.Fatalf("artifacts=%d want -1(denylist 미저장 — content.db 미생성)", n)
+	}
+	if got := readDrops(t, sdir); !strings.Contains(got, "shadow-denylist") {
+		t.Fatalf("drops=%q want shadow-denylist", got)
+	}
+}
+
+// D39-② PowerShell `Get-Content .env` — Bash와 대칭.
+func TestShadowCommandDenylistSkipsPowerShell(t *testing.T) {
+	storeRoot, cwd, contentDir, sdir := shadowSetup(t)
+	in := fixtureWith(t, "posttooluse-bash.json", map[string]any{
+		"cwd":           cwd,
+		"tool_name":     "PowerShell",
+		"tool_input":    map[string]any{"command": "Get-Content .env"},
+		"tool_response": bigStdout(20000),
+	})
+	if rc := runHook(t, storeRoot, in, nil); rc != 0 {
+		t.Fatalf("rc=%d want 0", rc)
+	}
+	if n := contentArtifacts(t, contentDir); n != -1 {
+		t.Fatalf("artifacts=%d want -1(denylist 미저장)", n)
+	}
+	if got := readDrops(t, sdir); !strings.Contains(got, "shadow-denylist") {
+		t.Fatalf("drops=%q want shadow-denylist", got)
+	}
+}
+
+// D39-④ 점 세그먼트 변형도 정규화 후 대조된다 — `.docker/config.json` 접미 규칙 우회 봉쇄
+// (계획 리뷰 F2).
+func TestShadowCommandDenylistNormalizes(t *testing.T) {
+	storeRoot, cwd, contentDir, sdir := shadowSetup(t)
+	in := fixtureWith(t, "posttooluse-bash.json", map[string]any{
+		"cwd":           cwd,
+		"tool_input":    map[string]any{"command": "cat ./.docker/./config.json"},
+		"tool_response": bigStdout(20000),
+	})
+	if rc := runHook(t, storeRoot, in, nil); rc != 0 {
+		t.Fatalf("rc=%d want 0", rc)
+	}
+	if n := contentArtifacts(t, contentDir); n != -1 {
+		t.Fatalf("artifacts=%d want -1(정규화 후 denylist 대조)", n)
+	}
+	if got := readDrops(t, sdir); !strings.Contains(got, "shadow-denylist") {
+		t.Fatalf("drops=%q want shadow-denylist", got)
+	}
+}
+
+// D39-③ 증명 불가 출력(파이프)은 현행대로 색인 — 커버리지 급감 방지(설계 §7 잔여 한계).
+func TestShadowCommandUnprovenStillIndexes(t *testing.T) {
+	storeRoot, cwd, contentDir, _ := shadowSetup(t)
+	in := fixtureWith(t, "posttooluse-bash.json", map[string]any{
+		"cwd":           cwd,
+		"tool_input":    map[string]any{"command": "cat .env | head"},
+		"tool_response": bigStdout(20000),
+	})
+	if rc := runHook(t, storeRoot, in, nil); rc != 0 {
+		t.Fatalf("rc=%d want 0", rc)
+	}
+	if n := contentArtifacts(t, contentDir); n != 1 {
+		t.Fatalf("artifacts=%d want 1(증명 불가 = 현행 색인 유지)", n)
+	}
+}
+
 // ⑤ NUL 바이트를 담은 tool_response(바이너리) → 미저장. 유효 JSON은 raw NUL을 못 담으므로
 // (json은 로 escape) shadowCapture를 직접 호출해 raw NUL을 주입한다.
 func TestShadowBinarySkips(t *testing.T) {

@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"path"
+	"path/filepath"
 	"strconv"
 
 	"github.com/wotjr1649/context-router/internal/ingest"
@@ -20,6 +22,7 @@ const (
 
 // fileOriginTools: tool_response가 파일 내용에서 유래하는 도구 — tool_input 경로를 secret
 // 파일명 denylist에 대조한다(비밀 파일 출력의 파일명 우회 색인 차단, 설계 §5).
+// command 출력(Bash·PowerShell)은 commandDumpPath의 정적 증명 시에만 경로 대조한다(D39).
 var fileOriginTools = map[string]bool{"Read": true, "NotebookRead": true}
 
 // shadowCapture — PostToolUse(성공) 이벤트의 tool_response를 §5 자체 방어(OFF→MIN→MAX→denylist
@@ -42,6 +45,10 @@ func shadowCapture(ctx context.Context, ad *session.AppendDB, in hookInput, dir,
 	}
 	if fileOriginTools[in.ToolName] && shadowInputDenied(in.ToolInput) {
 		appendDrop(dir, "shadow-denylist") // 비밀 파일 유래 응답 — 미저장
+		return
+	}
+	if p := commandDumpPath(in); p != "" && ingest.DeniedFilename(p) {
+		appendDrop(dir, "shadow-denylist") // D39 — 정적 증명 덤프 경로가 denylist 파일, 미저장
 		return
 	}
 	// D31 decode-sniff: body는 hook.Run 외부 파싱을 통과한 유효 JSON — 문자열 leaf를
@@ -101,6 +108,32 @@ func shadowInputDenied(toolInput json.RawMessage) bool {
 		path = f.NotebookPath
 	}
 	return path != "" && ingest.DeniedFilename(path)
+}
+
+// commandDumpPath — command 계열 도구(Bash·PowerShell)의 tool_input이 정적으로 "단일 파일
+// 덤프"로 증명되면 그 경로를 반환한다(D39). 증명 불가(파이프·복합식·다중 파일 등)는 "" —
+// 현행대로 색인한다(잔여 표면은 설계 v0.4 §7 한계 명문화, Redact·sniff 의존). 절대화는 하지
+// 않는다 — 대조는 이름 기반(ingest.DeniedFilename)이라 상대경로 덤프도 커버한다(§11.1 파생 ①).
+func commandDumpPath(in hookInput) string {
+	var f struct {
+		Command string `json:"command"`
+	}
+	var p string
+	switch in.ToolName {
+	case "Bash":
+		_ = json.Unmarshal(in.ToolInput, &f)
+		p = bashDumpArg(f.Command)
+	case "PowerShell":
+		_ = json.Unmarshal(in.ToolInput, &f)
+		p = psDumpArg(f.Command)
+	}
+	if p == "" {
+		return ""
+	}
+	// 대조 전 정규화(ToSlash+Clean) — 점 세그먼트·중복 구분자로 `.docker/config.json` 접미
+	// 규칙을 우회하는 변형을 봉쇄하고, PS 백슬래시 경로의 basename 판정을 OS 무관하게 만든다
+	// (계획 리뷰 F2). 대소문자·symlink 변형은 Read 경로 denylist와 동일한 잔여 표면(§7).
+	return path.Clean(filepath.ToSlash(p))
 }
 
 // shadowAppend: Shadow 이벤트 1건 append — 실패는 drops 1줄만 남기고 계속한다(부분 성공 허용,
