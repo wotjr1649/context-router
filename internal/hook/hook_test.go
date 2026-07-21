@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -1427,5 +1428,104 @@ func TestGuardBashStoreLockAllows(t *testing.T) {
 	}
 	if got := readDrops(t, sdir); !strings.Contains(got, "guard-store") {
 		t.Fatalf("drops=%q want guard-store", got)
+	}
+}
+
+// runGuardPowerShell — runGuardBash의 PowerShell 형제(tool_name·tool_input만 다름).
+func runGuardPowerShell(t *testing.T, storeRoot, cwd, command string, env map[string]string) string {
+	t.Helper()
+	in := fixtureWith(t, "pretooluse-read.json", map[string]any{
+		"cwd":        cwd,
+		"tool_name":  "PowerShell",
+		"tool_input": map[string]any{"command": command, "description": "test"},
+	})
+	var out bytes.Buffer
+	rc := Run(context.Background(), bytes.NewReader(in), &out, storeRoot, "test", func(k string) string { return env[k] })
+	if rc != 0 {
+		t.Fatalf("guardPowerShell rc=%d want 0", rc)
+	}
+	return out.String()
+}
+
+// D36-① 대형 파일 단순 Get-Content → deny JSON + warning 이벤트(PowerShell·명령 토큰·상대경로·
+// 크기·ctr_search 포함, 절대경로 비포함) + 현장 인덱싱 아티팩트 1건.
+func TestGuardPowerShellLargeFileDenies(t *testing.T) {
+	storeRoot, cwd, contentDir, sdir := guardSetup(t)
+	big := filepath.Join(cwd, "big.txt")
+	writeSized(t, big, 300*1024)
+	out := runGuardPowerShell(t, storeRoot, cwd, "Get-Content "+filepath.ToSlash(big), nil)
+
+	var got map[string]map[string]string
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatalf("deny stdout이 유효 JSON 아님: %v (out=%q)", err, out)
+	}
+	hso := got["hookSpecificOutput"]
+	if hso["hookEventName"] != "PreToolUse" || hso["permissionDecision"] != "deny" {
+		t.Fatalf("deny 스키마 불일치: %+v", hso)
+	}
+	if n := contentArtifacts(t, contentDir); n != 1 {
+		t.Fatalf("artifacts=%d want 1(현장 인덱싱 성공)", n)
+	}
+	reader, err := session.OpenReadOnly(sdir)
+	if err != nil {
+		t.Fatalf("open session.db: %v", err)
+	}
+	defer func() { _ = reader.Close() }()
+	var n int
+	var summary string
+	if err := reader.QueryRow("SELECT count(*), coalesce(max(summary),'') FROM session_events WHERE event_type='warning'").Scan(&n, &summary); err != nil {
+		t.Fatalf("count warning: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("warning events=%d want 1", n)
+	}
+	for _, want := range []string{"PowerShell", "Get-Content", "big.txt", "307200", "ctr_search"} {
+		if !strings.Contains(summary, want) {
+			t.Fatalf("warning summary=%q want 포함 %q", summary, want)
+		}
+	}
+	if strings.Contains(summary, cwd) || strings.Contains(summary, filepath.ToSlash(cwd)) {
+		t.Fatalf("warning summary가 절대경로 누출: %q", summary)
+	}
+}
+
+// D36-② 파이프 포함 → allow. ③ 부분 읽기 플래그 → allow. ④ 상대경로 → allow.
+// ⑤ MSYS형 /c/... → allow(psAbsPath 비승계 — bash 가드와 다른 지점의 회귀 방지).
+func TestGuardPowerShellPipeAllows(t *testing.T) {
+	storeRoot, cwd, _, _ := guardSetup(t)
+	big := filepath.Join(cwd, "big.txt")
+	writeSized(t, big, 300*1024)
+	if out := runGuardPowerShell(t, storeRoot, cwd, "Get-Content "+filepath.ToSlash(big)+" | Select-Object -First 5", nil); out != "" {
+		t.Fatalf("stdout=%q want empty (파이프 = allow)", out)
+	}
+}
+
+func TestGuardPowerShellPartialReadAllows(t *testing.T) {
+	storeRoot, cwd, _, _ := guardSetup(t)
+	big := filepath.Join(cwd, "big.txt")
+	writeSized(t, big, 300*1024)
+	if out := runGuardPowerShell(t, storeRoot, cwd, "Get-Content -TotalCount 5 "+filepath.ToSlash(big), nil); out != "" {
+		t.Fatalf("stdout=%q want empty (부분 읽기 = allow)", out)
+	}
+}
+
+func TestGuardPowerShellRelativePathAllows(t *testing.T) {
+	storeRoot, cwd, _, _ := guardSetup(t)
+	writeSized(t, filepath.Join(cwd, "big.txt"), 300*1024)
+	if out := runGuardPowerShell(t, storeRoot, cwd, "Get-Content big.txt", nil); out != "" {
+		t.Fatalf("stdout=%q want empty (상대경로 = allow)", out)
+	}
+}
+
+func TestGuardPowerShellMsysFormAllows(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("드라이브형 경로 전제")
+	}
+	storeRoot, cwd, _, _ := guardSetup(t)
+	big := filepath.Join(cwd, "big.txt")
+	writeSized(t, big, 300*1024)
+	msys := "/" + strings.ToLower(string(big[0])) + filepath.ToSlash(big[2:]) // C:\x → /c/x
+	if out := runGuardPowerShell(t, storeRoot, cwd, "Get-Content "+msys, nil); out != "" {
+		t.Fatalf("stdout=%q want empty (MSYS형 = PS 드라이브 상대 = allow)", out)
 	}
 }

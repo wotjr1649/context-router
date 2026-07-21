@@ -133,14 +133,16 @@ func dispatch(ctx context.Context, in hookInput, dir, contentDir, worktreeRoot, 
 		return
 	}
 	// PreToolUse는 T7 large-read/dump guard 몫 — tool_call로 중복 계상하지 않고 tool_name으로
-	// 분기한다(설계 §4 D25·D32). matcher가 Read|Bash라 여기 오는 건 사실상 이 둘뿐이고, 각 가드가
-	// 자체 정적 판정으로 그 외를 통과시킨다.
+	// 분기한다(설계 §4 D25·D32·v0.4 D36). matcher가 Read|Bash|PowerShell라 여기 오는 건 사실상
+	// 이 셋뿐이고, 각 가드가 자체 정적 판정으로 그 외를 통과시킨다.
 	if in.HookEventName == "PreToolUse" {
 		switch in.ToolName {
 		case "Read":
 			guardRead(ctx, ad, in, dir, contentDir, worktreeRoot, getenv, stdout)
 		case "Bash":
 			guardBash(ctx, ad, in, dir, contentDir, worktreeRoot, getenv, stdout)
+		case "PowerShell":
+			guardPowerShell(ctx, ad, in, dir, contentDir, worktreeRoot, getenv, stdout)
 		}
 		return
 	}
@@ -241,6 +243,39 @@ func guardBash(ctx context.Context, ad *session.AppendDB, in hookInput, dir, con
 	// warning detail: 명령·상대 파일·크기·안내 요지(설계 §4). workspaceRel이 상대화하므로
 	// 절대경로는 이벤트에 실리지 않는다.
 	denyTool(ctx, ad, in, dir, "Bash", "cat "+workspaceRel(in.CWD, path)+" "+strconv.FormatInt(info.Size(), 10)+"B — ctr_search/ctr_fetch", stdout)
+}
+
+// guardPowerShell — D36 PowerShell 단일파일 덤프 가드(guardBash의 형제, 설계 v0.4 §3). 정적
+// 판정(psDumpArg 어휘 + psAbsPath 절대경로) 성립 시에만 D25 4조건(임계 초과·경계 내·denylist
+// 아님·현장 인덱싱 성공)을 guardBash와 동일 경로로 판정하고 deny한다. 그 외 전부 통과.
+func guardPowerShell(ctx context.Context, ad *session.AppendDB, in hookInput, dir, contentDir, worktreeRoot string, getenv func(string) string, stdout io.Writer) {
+	var f struct {
+		Command string `json:"command"`
+	}
+	if json.Unmarshal(in.ToolInput, &f) != nil {
+		return
+	}
+	path := psAbsPath(runtime.GOOS, psDumpArg(f.Command))
+	if path == "" {
+		return // 정적 판정 불가·비덤프·비절대 — 통과
+	}
+	info, err := os.Stat(path)
+	if err != nil || info.IsDir() || info.Size() <= guardReadMax(getenv) {
+		return // 임계 이하·stat 불가·디렉터리 — 통과
+	}
+	st, err := store.OpenContext(ctx, contentDir, false)
+	if err != nil {
+		appendDrop(dir, "guard-store")
+		return
+	}
+	defer func() { _ = st.Close() }()
+	rep, err := ingest.Run(ctx, st, worktreeRoot, nil, ingest.Request{Path: path})
+	if err != nil || rep.Indexed != 1 {
+		return // 경계 밖·denylist·oversize·색인 실패 — 통과
+	}
+	// detail의 명령 토큰은 psDumpArg 성립 시 화이트리스트 4토큰 중 하나라 원문 운반이 안전하다.
+	cmdToken := strings.Fields(f.Command)[0]
+	denyTool(ctx, ad, in, dir, "PowerShell", cmdToken+" "+workspaceRel(in.CWD, path)+" "+strconv.FormatInt(info.Size(), 10)+"B — ctr_search/ctr_fetch", stdout)
 }
 
 // denyTool — 4조건 성립 시 deny 출력 헬퍼(설계 §4). stdout에 permissionDecision JSON(T0 검증
