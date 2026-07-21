@@ -76,7 +76,7 @@ func assertDoctorAscending(t *testing.T, out string) {
 	}
 }
 
-// ① 빈 설정에 install → 4개 이벤트 등록·유효 JSON·PreToolUse matcher "Read"·timeout 10.
+// ① 빈 설정에 install → 4개 이벤트 등록·유효 JSON·PreToolUse matcher "Read|Bash"·timeout 10.
 func TestHookInstall_EmptyRegistersFourItems(t *testing.T) {
 	projectRoot := t.TempDir()
 	var out bytes.Buffer
@@ -119,8 +119,68 @@ func TestHookInstall_EmptyRegistersFourItems(t *testing.T) {
 			t.Fatalf("event %q bad command/timeout: %+v", ev, s.Hooks[ev][0])
 		}
 	}
-	if s.Hooks["PreToolUse"][0].Matcher != "Read" {
-		t.Fatalf("PreToolUse matcher=%q want Read", s.Hooks["PreToolUse"][0].Matcher)
+	if s.Hooks["PreToolUse"][0].Matcher != "Read|Bash" {
+		t.Fatalf("PreToolUse matcher=%q want Read|Bash", s.Hooks["PreToolUse"][0].Matcher)
+	}
+}
+
+// ①-b D32 업그레이드 재설치(설계 §8 설치 게이트): v0.2 형태 settings(marker 0.2.0 + PreToolUse
+// matcher "Read")를 seed → install 재실행 → PreToolUse 관리 그룹 1개·matcher "Read|Bash"·총 4그룹·
+// marker 현재 버전으로 갱신(구 matcher 그룹이 잔존하지 않고 대칭 교체된다).
+func TestHookInstall_UpgradeReinstallWidensMatcher(t *testing.T) {
+	projectRoot := t.TempDir()
+	path := filepath.Join(projectRoot, ".claude", "settings.json")
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// v0.2가 기입했던 형태 — PreToolUse matcher는 "Read"(단일 그룹), 마커는 구버전.
+	seed := `{
+  "hooks": {
+    "SessionStart": [
+      {"matcher": "", "hooks": [{"type": "command", "command": "context-router hook", "timeout": 10}], "__ctrManaged": "context-router/0.2.0"}
+    ],
+    "PreToolUse": [
+      {"matcher": "Read", "hooks": [{"type": "command", "command": "context-router hook", "timeout": 10}], "__ctrManaged": "context-router/0.2.0"}
+    ],
+    "PostToolUse": [
+      {"matcher": "", "hooks": [{"type": "command", "command": "context-router hook", "timeout": 10}], "__ctrManaged": "context-router/0.2.0"}
+    ],
+    "PostToolUseFailure": [
+      {"matcher": "", "hooks": [{"type": "command", "command": "context-router hook", "timeout": 10}], "__ctrManaged": "context-router/0.2.0"}
+    ]
+  }
+}`
+	if err := os.WriteFile(path, []byte(seed), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	if err := runHookInstall(nil, "/store", "", false, projectRoot, "0.3.0", &out); err != nil {
+		t.Fatalf("install: %v", err)
+	}
+
+	if n, _ := countRegisteredHooks(path); n != 4 {
+		t.Fatalf("after upgrade registered=%d want 4 (관리 그룹 중복/누락)", n)
+	}
+	data, _ := os.ReadFile(path)
+	var s struct {
+		Hooks map[string][]struct {
+			Matcher string `json:"matcher"`
+			Managed string `json:"__ctrManaged"`
+		} `json:"hooks"`
+	}
+	if err := json.Unmarshal(data, &s); err != nil {
+		t.Fatalf("parse: %v\n%s", err, data)
+	}
+	pre := s.Hooks["PreToolUse"]
+	if len(pre) != 1 {
+		t.Fatalf("PreToolUse groups=%d want 1(단일 관리 그룹 유지): %s", len(pre), data)
+	}
+	if pre[0].Matcher != "Read|Bash" {
+		t.Fatalf("PreToolUse matcher=%q want Read|Bash (구 Read 그룹 미교체): %s", pre[0].Matcher, data)
+	}
+	if pre[0].Managed != "context-router/0.3.0" {
+		t.Fatalf("marker=%q want context-router/0.3.0 (버전 미갱신): %s", pre[0].Managed, data)
 	}
 }
 

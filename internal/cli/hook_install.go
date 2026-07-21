@@ -26,14 +26,15 @@ const (
 )
 
 // hookRegistrations — 설치 대상 4항목(T0-amended 설계 §7). matcher가 빈 문자열이면 전체 매칭
-// (SessionStart=시작 방식 전체, Pre/PostToolUse(Failure)=전 도구 — T0 §4). PreToolUse만 Read로
-// 필터(large-read guard 대상).
+// (SessionStart=시작 방식 전체, Pre/PostToolUse(Failure)=전 도구 — T0 §4). PreToolUse는 Read|Bash
+// 정규식 매칭(large-read/dump guard 대상) — 관리 그룹 1개 유지가 merge의 동일-이벤트 상호 제거
+// 함정을 회피한다(설계 v0.3 §4).
 var hookRegistrations = []struct {
 	event   string
 	matcher string
 }{
 	{"SessionStart", ""},
-	{"PreToolUse", "Read"},
+	{"PreToolUse", "Read|Bash"},
 	{"PostToolUse", ""},
 	{"PostToolUseFailure", ""},
 }
