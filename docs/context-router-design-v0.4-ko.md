@@ -273,3 +273,87 @@ column), title dedup, CAS 갱신 시 구버전 blob 즉시 orphan-GC(실해 미�
   "usage에 Codex 집계 추가"는 세 번째 저장 형식 계약이라 비범위 처리.
 - (계획 체크포인트의 adversarial-review 1패스는 별도 — 계획 확정 시 수행해
   여기 추기.)
+
+### §11.1 관측 프리체크 결과·채택 (계획 Task 0, 2026-07-21 — 컨트롤러 세션 수행·판정)
+
+- **G1 — §2 결정표 행 1 채택(전체: 등록 + 도구 단위 계측 + shadow).** 근거:
+  codex-cli 0.144.6 로컬 실측 + 공식 훅 문서(developers.openai.com/codex/hooks).
+  Codex는 Claude Code 동형 훅 시스템을 갖는다 — 공통 stdin 필드 `session_id`
+  (canonical UUID — rollout session_meta의 payload.session_id 실측 일치)·
+  `transcript_path`·`cwd`·`hook_event_name`·`model`·`permission_mode`; 이벤트
+  SessionStart(`source`=startup/resume/clear/compact, matcher는 source 대상)·
+  PreToolUse·PostToolUse(`tool_name`·`tool_use_id`·`tool_input` — Bash·
+  apply_patch는 `.command`·`tool_response` JSON 출력 페이로드 有, Bash 비-0
+  종료도 PostToolUse로 발화하며 PostToolUseFailure 이벤트는 부재)·
+  UserPromptSubmit·SubagentStart/Stop·Stop·Pre/PostCompact. 세션 생성 신호 有
+  + 도구 단위 이벤트 有 + 출력 페이로드 有 → 행 1. 계측 매핑: 기존 classify/
+  buildEvent 재사용(Bash 분류 유효 — Codex tool_name `Bash` 실재; apply_patch·
+  mcp__*는 기본 tool_call), 없는 이벤트 미기입(D27). Codex의 Bash 비-0 종료가
+  tool_call로 계상되는 것은 정직한 한계로 수용(error 이벤트 부재 — 허위 계측
+  금지 우선).
+- **G2 — matcher `Read|Bash|PowerShell` 확정.** 스크래치 프로젝트 캡처 훅
+  실측(Claude Code, win32): tool_name 정확히 `"PowerShell"`, PreToolUse 발화
+  확인, tool_input `{command, description}`(어휘 게이트 입력 =
+  `tool_input.command`), PostToolUse tool_response `{stdout, stderr,
+  interrupted, isImage}`(Bash 동형 — shadow 게이트 무수정 적용 가능),
+  session_id canonical UUID.
+- **G3 — §2 "TOML 병합기 신규 구현" 항목 비발동, hooks.json JSON 병합기로
+  대체.** 등록 표면 실측·문서: `~/.codex/hooks.json`(user)·
+  `<repo>/.codex/hooks.json`(project) — Claude settings.json `hooks` 필드와
+  동형 스키마(`{"hooks":{"<Event>":[{matcher, hooks:[{type:"command",
+  command, timeout, statusMessage}]}]}}`). `config.toml`의 `[hooks.state]`는
+  Codex 소유 trust-hash 저장소라 설치기 기입 금지(신뢰 승인 우회 방지),
+  inline `[hooks]`는 비채택(공식 권고 "Prefer one representation per
+  layer"). 설치 계약: JSON 병합에 D28 원칙 승계(멱등·원자 쓰기·타 항목/미지
+  키 raw 보존·제거 대칭·실패 시 원본 무변경). 소유 마커는 미지 필드
+  (`__ctrManaged`)의 스키마 관용성이 문서상 미보증이라 공식 필드
+  `statusMessage`에 `context-router/<version>`을 탑재하고 command 토큰 정확
+  일치(`context-router codex-hook` — §11.2 F3의 전용 러닝 서브커맨드, 소유
+  판정은 §11.2 F4의 전건 규칙)와의 결합으로 판정한다. 훅 실행은 사용자의
+  Codex `/hooks` 신뢰 승인에 의존(정의 변경 시 재신뢰) — 설치기가 안내 1줄을
+  출력한다. Codex 등록 이벤트 = SessionStart + PostToolUse만(D35 캐프처 전용
+  — PreToolUse 미등록, §7 "신규 거부 표면 없음" 정합).
+- **파생 확정 2건.** ① D39 대조 경로는 어휘 게이트 반환값을 절대화 없이
+  ToSlash+Clean 정규화만 거쳐 `ingest.DeniedFilename`에 대조한다(§11.2 F2
+  정정 — 점 세그먼트 변형의 `.docker/config.json` 접미 규칙 우회 봉쇄) —
+  대조는 이름 기반이라 상대경로 덤프(`cat secrets/.env`)도 커버하며, deny
+  게이트(D25·D32)의 절대경로 요건과는 무관하다. ② psDumpArg의 절대경로 판정은 bashDumpArg용 MSYS
+  `/x/…` 변환을 승계하지 않는 형제 함수(psAbsPath)로 한다 — PowerShell에서
+  `/c/x`는 "현재 드라이브 루트 상대" 경로라 MSYS 변환을 적용하면 오파일
+  판정 위험; Windows는 드라이브형(`X:\`·`X:/`, ToSlash 정규화)만, Unix
+  pwsh는 `/`-접두만 절대로 인정한다.
+
+### §11.2 계획 체크포인트 적대 검수 처리 기록 (2026-07-21)
+
+- 이중 적대 검수 1패스(계획 `docs/superpowers/plans/2026-07-21-v04-channel-expansion.md`
+  대상): 서브에이전트(opus) Critical 1·Minor 4 + Codex adversarial-review(high 4·
+  medium 2, 판정 needs-attention). 수렴 2건 반영 — 격리 테스트 픽스처 UUID
+  불일치(C1=F5: 동일 UUID cc/cx 격리를 검증하려면 Codex 픽스처가 형제 픽스처와
+  같은 UUID여야 함), Run 호출부·임포트 전수 누락(M1·M2=F6: runGuard 호출부,
+  cli.go `strconv`·hook_test.go `runtime`·shadow.go `path`/`path/filepath`).
+- **Codex 고유 채택 3건**:
+  - **F3 → Codex 러닝 진입점은 `--host` 플래그가 아니라 전용 서브커맨드
+    `codex-hook`**: v0.3 러닝 훅은 미지 인자를 fail-open으로 무시하므로 플래그
+    방식은 "구버전 바이너리 + 신버전 hooks.json" 조합에서 Codex 이벤트를
+    조용히 `cc:`로 오귀속시킨다. 미지 서브커맨드는 구버전 dispatchCLI가 exit
+    1로 거부하므로 서브커맨드가 구조적 버전 게이트다(D35 오귀속 금지의 배포
+    호환성 확장). hook.Run의 host 인자 검증(bad-host drop)은 심층 방어로 유지.
+  - **F4 → Codex 그룹 소유 판정은 전건 규칙**: 그룹의 모든 훅 항목이 command
+    토큰 정확 일치 AND statusMessage 마커 접두일 때만 자기 그룹(any-판정이면
+    사용자가 항목을 추가한 혼합 그룹까지 통째 삭제됨 — Claude 쪽은 그룹 레벨
+    `__ctrManaged` 마커가 있어 노출이 다름). 혼합 그룹은 불가침 — 파손 금지가
+    멱등 완전성에 우선하고, 잔존 정리는 사용자 `/hooks` 몫. Codex 원권고의
+    훅-항목 단위 외과 제거는 그룹 재작성이 미지 그룹 필드를 파괴할 수 있어
+    전건 판정으로 대체. 동일 버전 f(f(x))==f(x) 바이트 멱등 테스트 추가.
+  - **F2 부분 → D39 대조 전 ToSlash+Clean 정규화**(§11.1 파생 ① 정정): 점
+    세그먼트(`cat ./.docker/./config.json`)의 접미 규칙 우회 봉쇄 + PS 백슬래시
+    경로의 basename 판정 OS 무관화.
+- **기각/하향**: F1(psDumpArg 덤프 토큰의 별칭 재정의·프로필 shadow로 인한 오탐
+  deny)은 D32 bash `cat` 셰도잉과 동일 클래스의 기수용 리스크 — deny 시에도
+  대상 파일이 현장 색인돼 ctr_search/ctr_fetch로 복구 가능(비가역 아님)하고,
+  module-qualified 한정은 가드 무력화라 기각. F2 잔여(대소문자·symlink 변형,
+  PS provider 경로의 shadow 오드롭 — 예: `Get-Content Env:\.env`)는 기존 Read
+  경로 denylist와 동일한 잔여 표면이며 오동작 방향이 안전(미저장)이라 §7
+  한계로 기록(v0.5+ 재상정 후보). 서브에이전트 M3(병합기 형제 중복)은 G3 확정
+  사항 재확인, M4(다중 소스 테스트 전수)는 Task 6의 패키지 전체 GREEN 게이트가
+  커버.
