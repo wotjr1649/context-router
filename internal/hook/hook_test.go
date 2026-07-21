@@ -1422,7 +1422,7 @@ func TestPsDumpArg(t *testing.T) {
 // (설계 §11.1 파생 ②: PS에서 /c/x는 현재 드라이브 루트 상대라 변환 시 오파일 판정 위험).
 func TestPsAbsPath(t *testing.T) {
 	cases := []struct{ goos, arg, want string }{
-		{"windows", `C:\big\f.log`, "C:/big/f.log"}, // ToSlash 정규화
+		{"windows", `C:\big\f.log`, "C:/big/f.log"}, // goos-키 백슬래시→슬래시 정규화(호스트 무관)
 		{"windows", "C:/big/f.log", "C:/big/f.log"},
 		{"windows", "/c/big/f.log", ""},  // MSYS형 — PS에선 드라이브 상대, 비절대(allow)
 		{"windows", `\\srv\share\f`, ""}, // UNC — 드라이브형 아님, 보수 allow
