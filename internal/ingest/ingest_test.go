@@ -12,7 +12,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
+	"slices"
 	"strings"
 	"testing"
 
@@ -373,8 +375,8 @@ func TestCanonicalUnchanged(t *testing.T) {
 // 한다(β1-3 — byte-exact 계약 보호).
 func TestIsBinary_NonUTF8(t *testing.T) {
 	b := bytes.Repeat([]byte{0xB0, 0xA1, 0xFF, 0xFE}, 50)
-	if !isBinary(b) {
-		t.Fatal("무효 UTF-8인데 isBinary=false")
+	if !IsBinary(b) {
+		t.Fatal("무효 UTF-8인데 IsBinary=false")
 	}
 }
 
@@ -770,11 +772,13 @@ func TestRunWeb_TitleCapped(t *testing.T) {
 // sources.source_kind로 저장된다. 빈 SourceKind는 기본 "inline"으로 유지(무해 회귀).
 func TestSourceKindHookFlows(t *testing.T) {
 	st, _ := openStoreT(t)
-	if _, err := Run(context.Background(), st, "", nil, Request{Content: "hook body\n", Title: "Read", SourceKind: "hook"}); err != nil {
+	rep, err := Run(context.Background(), st, "", nil, Request{Content: "hook body\n", Title: "Read", SourceKind: "hook"})
+	if err != nil {
 		t.Fatal(err)
 	}
 	var kind string
-	if err := st.Reader().QueryRow("SELECT source_kind FROM sources WHERE uri=?", "inline:Read").Scan(&kind); err != nil {
+	// D30: hook 패시브 색인은 inline:Read가 아니라 shadow:Read:<content_hash>로 저장된다.
+	if err := st.Reader().QueryRow("SELECT source_kind FROM sources WHERE uri=?", "shadow:Read:"+rep.Hash).Scan(&kind); err != nil {
 		t.Fatalf("query source_kind: %v", err)
 	}
 	if kind != "hook" {
@@ -813,5 +817,72 @@ func TestReportHashMatchesContentHash(t *testing.T) {
 	}
 	if rep.Hash != sha256hex(t, []byte(body)) {
 		t.Fatalf("Report.Hash가 저장본(redact 없음) sha256과 불일치")
+	}
+}
+
+// TestRunInline_HookShadowURI: D30 — SourceKind "hook"은 shadow:<Title>:<content_hash>
+// 키로 저장돼 상이 콘텐츠가 서로를 덮지 않고(2행), 동일 콘텐츠 재등장은 같은 URI
+// 갱신(여전히 2행)이어야 한다. 비-hook 인라인은 기존 inline:<Title> 불변.
+func TestRunInline_HookShadowURI(t *testing.T) {
+	st, _ := openStoreT(t)
+	ctx := context.Background()
+	big := strings.Repeat("alpha ", 100)
+	rep, err := Run(ctx, st, "", nil, Request{Content: big, Title: "Bash", SourceKind: "hook"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Run(ctx, st, "", nil, Request{Content: big + "beta", Title: "Bash", SourceKind: "hook"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Run(ctx, st, "", nil, Request{Content: big, Title: "Bash", SourceKind: "hook"}); err != nil {
+		t.Fatal(err) // 동일 콘텐츠 재등장 — 행 수 불변이어야 함
+	}
+	rows, err := st.Reader().Query("SELECT uri FROM sources WHERE uri LIKE 'shadow:Bash:%' ORDER BY uri")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var uris []string
+	for rows.Next() {
+		var u string
+		if rows.Scan(&u) == nil {
+			uris = append(uris, u)
+		}
+	}
+	if len(uris) != 2 {
+		t.Fatalf("want 2 shadow rows(clobber 없음·dedup 유지), got %d: %v", len(uris), uris)
+	}
+	re := regexp.MustCompile(`^shadow:Bash:[0-9a-f]{64}$`)
+	for _, u := range uris {
+		if !re.MatchString(u) {
+			t.Fatalf("URI 형식 위반: %q", u)
+		}
+	}
+	// ① URI suffix == 저장본 content_hash(rep.Hash) — 첫 등록(big)분의 URI가 실제로 저장됐는지.
+	if !slices.Contains(uris, "shadow:Bash:"+rep.Hash) {
+		t.Fatalf("rep.Hash 기반 URI(shadow:Bash:%s)가 저장 행에 없음: %v", rep.Hash, uris)
+	}
+}
+
+// TestRunInline_HookShadowURI_RedactedSuffix: D30 ② — raw≠stored(redact 발생) 입력에서도
+// shadow URI suffix는 raw srcHash가 아니라 "저장본" content_hash(rep.Hash)와 일치한다.
+// ponytail: 런타임 분할 리터럴 — 소스에 연속 토큰 미존재(규약 §8).
+func TestRunInline_HookShadowURI_RedactedSuffix(t *testing.T) {
+	st, _ := openStoreT(t)
+	body := strings.Repeat("filler line of text\n", 20) + "token gh" + "p_abcdefghijklmnopqrstuvwxyz012345 end\n"
+	rep, err := Run(context.Background(), st, "", nil, Request{Content: body, Title: "Bash", SourceKind: "hook"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var uri string
+	if err := st.Reader().QueryRow("SELECT uri FROM sources WHERE uri LIKE 'shadow:Bash:%'").Scan(&uri); err != nil {
+		t.Fatalf("shadow 행 조회 실패: %v", err)
+	}
+	if !strings.HasSuffix(uri, rep.Hash) {
+		t.Fatalf("URI suffix != rep.Hash(저장본 content_hash): uri=%q hash=%q", uri, rep.Hash)
+	}
+	// raw srcHash를 잘못 썼다면 여기서 잡힌다 — redact로 stored≠raw라 두 해시가 다르다.
+	if strings.HasSuffix(uri, sha256hex(t, []byte(body))) {
+		t.Fatal("URI suffix가 raw srcHash와 일치 — 저장본 해시를 써야 한다")
 	}
 }

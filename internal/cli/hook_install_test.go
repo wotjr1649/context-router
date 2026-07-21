@@ -76,7 +76,7 @@ func assertDoctorAscending(t *testing.T, out string) {
 	}
 }
 
-// ① 빈 설정에 install → 4개 이벤트 등록·유효 JSON·PreToolUse matcher "Read"·timeout 10.
+// ① 빈 설정에 install → 4개 이벤트 등록·유효 JSON·PreToolUse matcher "Read|Bash"·timeout 10.
 func TestHookInstall_EmptyRegistersFourItems(t *testing.T) {
 	projectRoot := t.TempDir()
 	var out bytes.Buffer
@@ -119,8 +119,68 @@ func TestHookInstall_EmptyRegistersFourItems(t *testing.T) {
 			t.Fatalf("event %q bad command/timeout: %+v", ev, s.Hooks[ev][0])
 		}
 	}
-	if s.Hooks["PreToolUse"][0].Matcher != "Read" {
-		t.Fatalf("PreToolUse matcher=%q want Read", s.Hooks["PreToolUse"][0].Matcher)
+	if s.Hooks["PreToolUse"][0].Matcher != "Read|Bash" {
+		t.Fatalf("PreToolUse matcher=%q want Read|Bash", s.Hooks["PreToolUse"][0].Matcher)
+	}
+}
+
+// ①-b D32 업그레이드 재설치(설계 §8 설치 게이트): v0.2 형태 settings(marker 0.2.0 + PreToolUse
+// matcher "Read")를 seed → install 재실행 → PreToolUse 관리 그룹 1개·matcher "Read|Bash"·총 4그룹·
+// marker 현재 버전으로 갱신(구 matcher 그룹이 잔존하지 않고 대칭 교체된다).
+func TestHookInstall_UpgradeReinstallWidensMatcher(t *testing.T) {
+	projectRoot := t.TempDir()
+	path := filepath.Join(projectRoot, ".claude", "settings.json")
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// v0.2가 기입했던 형태 — PreToolUse matcher는 "Read"(단일 그룹), 마커는 구버전.
+	seed := `{
+  "hooks": {
+    "SessionStart": [
+      {"matcher": "", "hooks": [{"type": "command", "command": "context-router hook", "timeout": 10}], "__ctrManaged": "context-router/0.2.0"}
+    ],
+    "PreToolUse": [
+      {"matcher": "Read", "hooks": [{"type": "command", "command": "context-router hook", "timeout": 10}], "__ctrManaged": "context-router/0.2.0"}
+    ],
+    "PostToolUse": [
+      {"matcher": "", "hooks": [{"type": "command", "command": "context-router hook", "timeout": 10}], "__ctrManaged": "context-router/0.2.0"}
+    ],
+    "PostToolUseFailure": [
+      {"matcher": "", "hooks": [{"type": "command", "command": "context-router hook", "timeout": 10}], "__ctrManaged": "context-router/0.2.0"}
+    ]
+  }
+}`
+	if err := os.WriteFile(path, []byte(seed), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	if err := runHookInstall(nil, "/store", "", false, projectRoot, "0.3.0", &out); err != nil {
+		t.Fatalf("install: %v", err)
+	}
+
+	if n, _ := countRegisteredHooks(path); n != 4 {
+		t.Fatalf("after upgrade registered=%d want 4 (관리 그룹 중복/누락)", n)
+	}
+	data, _ := os.ReadFile(path)
+	var s struct {
+		Hooks map[string][]struct {
+			Matcher string `json:"matcher"`
+			Managed string `json:"__ctrManaged"`
+		} `json:"hooks"`
+	}
+	if err := json.Unmarshal(data, &s); err != nil {
+		t.Fatalf("parse: %v\n%s", err, data)
+	}
+	pre := s.Hooks["PreToolUse"]
+	if len(pre) != 1 {
+		t.Fatalf("PreToolUse groups=%d want 1(단일 관리 그룹 유지): %s", len(pre), data)
+	}
+	if pre[0].Matcher != "Read|Bash" {
+		t.Fatalf("PreToolUse matcher=%q want Read|Bash (구 Read 그룹 미교체): %s", pre[0].Matcher, data)
+	}
+	if pre[0].Managed != "context-router/0.3.0" {
+		t.Fatalf("marker=%q want context-router/0.3.0 (버전 미갱신): %s", pre[0].Managed, data)
 	}
 }
 
@@ -404,7 +464,7 @@ func TestDoctor_HookItemsAndAscendingOrder(t *testing.T) {
 		storeRoot := t.TempDir()
 		projectRoot := t.TempDir()
 		var buf bytes.Buffer
-		if err := runDoctor(context.Background(), &buf, storeRoot, projectRoot); err != nil {
+		if err := runDoctor(context.Background(), &buf, storeRoot, projectRoot, "0.1.0"); err != nil {
 			t.Fatalf("runDoctor err=%v out=%s", err, buf.String())
 		}
 		out := buf.String()
@@ -414,6 +474,7 @@ func TestDoctor_HookItemsAndAscendingOrder(t *testing.T) {
 			"[11] store-root path:",
 			"[12] drops:",
 			"[13] sidecar writable:",
+			"[14] content.db:", // store 없는 unregistered 경로 — fail-soft "없음" 라인으로 방출
 		} {
 			if !strings.Contains(out, want) {
 				t.Fatalf("out missing %q:\n%s", want, out)
@@ -446,18 +507,43 @@ func TestDoctor_HookItemsAndAscendingOrder(t *testing.T) {
 		}
 
 		var buf bytes.Buffer
-		if err := runDoctor(context.Background(), &buf, storeRoot, projectRoot); err != nil {
+		if err := runDoctor(context.Background(), &buf, storeRoot, projectRoot, "0.1.0"); err != nil {
 			t.Fatalf("runDoctor err=%v out=%s", err, buf.String())
 		}
 		out := buf.String()
 		if !strings.Contains(out, "[9] hooks: project=등록됨") {
 			t.Fatalf("out missing registered-hooks line:\n%s", out)
 		}
-		if !strings.Contains(out, "[12] drops: store-root=2 worktree=3 total=5") {
-			t.Fatalf("out missing two-location drops sum:\n%s", out)
+		if !strings.Contains(out, "[12] drops: store-root=2(a=1,b=1) worktree=3(x=1,y=1,z=1) total=5") {
+			t.Fatalf("out missing reason-rollup drops line:\n%s", out)
 		}
 		assertDoctorAscending(t, out)
 	})
+}
+
+// ⑦ dropsByReason 엄격 파싱: appendDrop 계약("<unix초>\t<사유>") 비준수 줄은 전부 unparsed로 세되
+// total은 빈 줄 포함 모든 줄을 센다(줄 수 계약). 빈 줄·탭 없는 줄·비숫자 ts·3필드(탭 초과) 커버 —
+// 비준수 줄이 자기 사유(bad-input·foo\tbar)로 새지 않음을 len==2로 확인(사유 TAB 혼입 회귀 방지).
+func TestDropsByReason_StrictParsing(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "session.drops.log")
+	// 유효 1줄 + 빈 줄 + 탭 없는 줄 + 비숫자 ts + 3필드(탭 혼입) = 5줄.
+	body := "1\ta\n\nnofield\ngarbage\tbad-input\n123\tfoo\tbar\n"
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	total, reasons := dropsByReason(path)
+	if total != 5 {
+		t.Fatalf("total=%d want 5(빈 줄 포함 모든 줄)", total)
+	}
+	if reasons["a"] != 1 {
+		t.Fatalf("reasons[a]=%d want 1(유효 줄)", reasons["a"])
+	}
+	if reasons["unparsed"] != 4 {
+		t.Fatalf("reasons[unparsed]=%d want 4(빈 줄·탭 없음·비숫자 ts·3필드)", reasons["unparsed"])
+	}
+	if len(reasons) != 2 {
+		t.Fatalf("reasons=%v want 정확히 {a,unparsed}(bad-input/foo 등 미유입)", reasons)
+	}
 }
 
 // ⑧ F5: `hook install --user` 후 doctor가 사용자 범위 등록을 인식하고 프로젝트 범위는 미등록으로
@@ -479,7 +565,7 @@ func TestDoctor_UserScopeHookRegistration(t *testing.T) {
 	}
 
 	var buf bytes.Buffer
-	if err := runDoctor(context.Background(), &buf, storeRoot, projectRoot); err != nil {
+	if err := runDoctor(context.Background(), &buf, storeRoot, projectRoot, "0.1.0"); err != nil {
 		t.Fatalf("runDoctor err=%v out=%s", err, buf.String())
 	}
 	out := buf.String()
@@ -490,6 +576,47 @@ func TestDoctor_UserScopeHookRegistration(t *testing.T) {
 		t.Fatalf("doctor must report project scope as unregistered:\n%s", out)
 	}
 	assertDoctorAscending(t, out)
+}
+
+// D33a 마커 일치: 현재 버전으로 install한 뒤 같은 버전 바이너리로 doctor를 돌리면 [9]가
+// "marker <v>"만 표기하고 불일치 경고(≠)를 내지 않는다.
+func TestDoctor_HookMarkerVersionMatch(t *testing.T) {
+	storeRoot := t.TempDir()
+	projectRoot := t.TempDir()
+	var iout bytes.Buffer
+	if err := runHookInstall(nil, storeRoot, "", false, projectRoot, "9.9.9", &iout); err != nil {
+		t.Fatalf("install: %v", err)
+	}
+	var buf bytes.Buffer
+	if err := runDoctor(context.Background(), &buf, storeRoot, projectRoot, "9.9.9"); err != nil {
+		t.Fatalf("runDoctor err=%v out=%s", err, buf.String())
+	}
+	out := buf.String()
+	if !strings.Contains(out, "project=등록됨(4개, marker 9.9.9)") {
+		t.Fatalf("out missing matched marker version:\n%s", out)
+	}
+	if strings.Contains(out, "≠") {
+		t.Fatalf("out must not warn mismatch on matching versions:\n%s", out)
+	}
+}
+
+// D33a 마커 불일치: 구버전 마커로 install(= 구버전 마커 seed)한 뒤 신버전 바이너리로 doctor를
+// 돌리면 [9]가 "marker <old>≠<new> — hook install 재실행"으로 재설치를 안내한다.
+func TestDoctor_HookMarkerVersionMismatch(t *testing.T) {
+	storeRoot := t.TempDir()
+	projectRoot := t.TempDir()
+	var iout bytes.Buffer
+	if err := runHookInstall(nil, storeRoot, "", false, projectRoot, "0.1.0", &iout); err != nil {
+		t.Fatalf("install(old): %v", err)
+	}
+	var buf bytes.Buffer
+	if err := runDoctor(context.Background(), &buf, storeRoot, projectRoot, "0.3.0"); err != nil {
+		t.Fatalf("runDoctor err=%v out=%s", err, buf.String())
+	}
+	out := buf.String()
+	if !strings.Contains(out, "project=등록됨(4개, marker 0.1.0≠0.3.0 — hook install 재실행)") {
+		t.Fatalf("out missing marker mismatch warning:\n%s", out)
+	}
 }
 
 // hookRunPayload — cli 러닝 훅 stdin JSON을 조립한다(경로 이스케이프 위해 json.Marshal 사용).

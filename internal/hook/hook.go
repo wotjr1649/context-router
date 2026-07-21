@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -115,10 +116,7 @@ func dispatch(ctx context.Context, in hookInput, dir, contentDir, worktreeRoot, 
 		// source는 신뢰 불가 stdin 문자열(최종 리뷰 C4) — EnsureSession은 서버 발행 고정 이벤트라
 		// ValidateEvent를 우회하므로 여기서 길이만 봉인한다(거대 source의 payload 상한 우회 차단).
 		// enum 강제는 안 한다: 호스트가 신형 source 값을 추가하면 세션 기록 전체가 사장된다(전방 호환).
-		src := in.Source
-		if len(src) > maxSourceBytes {
-			src = src[:maxSourceBytes]
-		}
+		src := truncateUTF8(in.Source, maxSourceBytes) // C4: rune 경계 절단(byte-slice는 멀티바이트 source를 깨뜨림)
 		if _, err := ad.EnsureSession(ctx, src, worktreeRoot); err != nil {
 			appendDrop(dir, "ensure-failed")
 		}
@@ -134,10 +132,16 @@ func dispatch(ctx context.Context, in hookInput, dir, contentDir, worktreeRoot, 
 		appendDrop(dir, "unknown-session") // 미지 세션의 후속 이벤트는 drop(설계 §2.2)
 		return
 	}
-	// PreToolUse(Read)는 T7 large-read guard 몫 — tool_call로 중복 계상하지 않고 별도 분기로
-	// 처리한다(설계 §4). matcher가 Read라 여기 오는 건 사실상 Read뿐이지만 guardRead가 재확인한다.
+	// PreToolUse는 T7 large-read/dump guard 몫 — tool_call로 중복 계상하지 않고 tool_name으로
+	// 분기한다(설계 §4 D25·D32). matcher가 Read|Bash라 여기 오는 건 사실상 이 둘뿐이고, 각 가드가
+	// 자체 정적 판정으로 그 외를 통과시킨다.
 	if in.HookEventName == "PreToolUse" {
-		guardRead(ctx, ad, in, dir, contentDir, worktreeRoot, getenv, stdout)
+		switch in.ToolName {
+		case "Read":
+			guardRead(ctx, ad, in, dir, contentDir, worktreeRoot, getenv, stdout)
+		case "Bash":
+			guardBash(ctx, ad, in, dir, contentDir, worktreeRoot, getenv, stdout)
+		}
 		return
 	}
 	// PostToolUse/PostToolUseFailure만 기본 이벤트 1건으로 기록한다(1 호출 = 1 이벤트).
@@ -202,14 +206,49 @@ func guardRead(ctx context.Context, ad *session.AppendDB, in hookInput, dir, con
 	if err != nil || rep.Indexed != 1 {
 		return // ①④ 경계 밖·denylist·oversize·색인 실패 → 통과
 	}
-	denyRead(ctx, ad, in, dir, f.FilePath, info.Size(), stdout)
+	denyTool(ctx, ad, in, dir, "Read", workspaceRel(in.CWD, f.FilePath)+" "+strconv.FormatInt(info.Size(), 10)+"B", stdout)
 }
 
-// denyRead — 4조건 성립 시 deny 출력 헬퍼(설계 §4). stdout에 permissionDecision JSON(T0 검증
-// 스키마)을 **먼저** 쓰고 그다음 warning 이벤트(차단 파일 상대 경로·크기)를 best-effort로 append
-// 한다 — 이벤트 기록 실패는 deny 판정에 영향 없다(fail-open은 기록 경로에만; 가드 판정은 DB 없이
-// 성립, §4). stdout은 deny JSON 전용이라(Claude Code가 exit 0 stdout을 파싱) 그 외 바이트는 쓰지 않는다.
-func denyRead(ctx context.Context, ad *session.AppendDB, in hookInput, dir, filePath string, size int64, stdout io.Writer) {
+// guardBash — D32 Bash 단일파일 덤프 가드(guardRead의 형제, 설계 v0.3 §4). 정적
+// 판정(bashDumpArg 어휘 + dumpAbsPath 절대경로) 성립 시에만 D25 4조건(임계 초과·
+// 경계 내·denylist 아님·현장 인덱싱 성공)을 guardRead와 동일 경로로 판정하고
+// deny한다. 그 외 전부 통과.
+func guardBash(ctx context.Context, ad *session.AppendDB, in hookInput, dir, contentDir, worktreeRoot string, getenv func(string) string, stdout io.Writer) {
+	var f struct {
+		Command string `json:"command"`
+	}
+	if json.Unmarshal(in.ToolInput, &f) != nil {
+		return
+	}
+	path := dumpAbsPath(runtime.GOOS, bashDumpArg(f.Command))
+	if path == "" {
+		return // 정적 판정 불가·비덤프·비절대 — 통과
+	}
+	info, err := os.Stat(path)
+	if err != nil || info.IsDir() || info.Size() <= guardReadMax(getenv) {
+		return // 임계 이하·stat 불가·디렉터리 — 통과
+	}
+	st, err := store.OpenContext(ctx, contentDir, false)
+	if err != nil {
+		appendDrop(dir, "guard-store")
+		return
+	}
+	defer func() { _ = st.Close() }()
+	rep, err := ingest.Run(ctx, st, worktreeRoot, nil, ingest.Request{Path: path})
+	if err != nil || rep.Indexed != 1 {
+		return // 경계 밖·denylist·oversize·색인 실패 — 통과
+	}
+	// warning detail: 명령·상대 파일·크기·안내 요지(설계 §4). workspaceRel이 상대화하므로
+	// 절대경로는 이벤트에 실리지 않는다.
+	denyTool(ctx, ad, in, dir, "Bash", "cat "+workspaceRel(in.CWD, path)+" "+strconv.FormatInt(info.Size(), 10)+"B — ctr_search/ctr_fetch", stdout)
+}
+
+// denyTool — 4조건 성립 시 deny 출력 헬퍼(설계 §4). stdout에 permissionDecision JSON(T0 검증
+// 스키마)을 **먼저** 쓰고 그다음 warning 이벤트(호출자 조립 detail — 상대 경로·크기 등)를
+// best-effort로 append한다 — 이벤트 기록 실패는 deny 판정에 영향 없다(fail-open은 기록 경로에만;
+// 가드 판정은 DB 없이 성립, §4). stdout은 deny JSON 전용이라(Claude Code가 exit 0 stdout을 파싱)
+// 그 외 바이트는 쓰지 않는다.
+func denyTool(ctx context.Context, ad *session.AppendDB, in hookInput, dir, toolName, detail string, stdout io.Writer) {
 	out := map[string]any{"hookSpecificOutput": map[string]any{
 		"hookEventName":            "PreToolUse",
 		"permissionDecision":       "deny",
@@ -218,9 +257,9 @@ func denyRead(ctx context.Context, ad *session.AppendDB, in hookInput, dir, file
 	if b, err := json.Marshal(out); err == nil {
 		_, _ = stdout.Write(b)
 	}
-	// summary는 allowlist 조립(도구명 + 워크스페이스 상대 경로 + 바이트 크기) — 원문 미운반, §3 상대
-	// 경로 기준은 in.CWD(worktreeRoot와 동일 워크스페이스). 조립 후 Redact 2차 방어 + 상한 절단.
-	summary := summaryLine("Read", workspaceRel(in.CWD, filePath)+" "+strconv.FormatInt(size, 10)+"B")
+	// summary는 allowlist 조립(도구명 + 호출자 조립 detail) — 원문 미운반. detail은 이미 워크스페이스
+	// 상대화된 요소만 담는다(절대경로 미운반, §3·§5.5). 조립 후 Redact 2차 방어 + 상한 절단.
+	summary := summaryLine(toolName, detail)
 	if red, spans := ingest.Redact([]byte(summary)); spans > 0 {
 		summary = string(red)
 	}
@@ -236,6 +275,50 @@ func guardReadMax(getenv func(string) string) int64 {
 		return v
 	}
 	return defaultGuardReadMax
+}
+
+// bashDumpArg — D32 어휘 판정: 명령이 "단일 단순 `cat <경로>`"일 때만 경로 인자를
+// 반환한다(그 외 전부 "" = allow). 비ASCII·제어문자는 bash IFS와 strings.Fields의
+// 분할 규칙이 달라(NBSP 등) 오판 여지가 있으므로 전면 판정 포기. 파서는 확신이
+// 있을 때만 deny하고, 오동작의 최대 피해는 "가드 미발화"다(설계 v0.3 §4·§7).
+// ponytail: ~·# 전면 배제는 경로 내 정당한 문자까지 놓치는 의도적 미탐(allow 편향)
+// — 실측에서 미탐이 문제되면 위치 인지 파서로 승급.
+func bashDumpArg(command string) string {
+	for i := 0; i < len(command); i++ {
+		if command[i] < 0x20 || command[i] > 0x7e {
+			return ""
+		}
+	}
+	if strings.ContainsAny(command, "|&;<>`$(){}*?[]'\"\\~#") {
+		return ""
+	}
+	fields := strings.Fields(command)
+	if len(fields) != 2 || fields[0] != "cat" || strings.HasPrefix(fields[1], "-") {
+		return ""
+	}
+	return fields[1]
+}
+
+// dumpAbsPath — OS 절대경로 정규화(goos는 테스트 주입점, 실호출은 runtime.GOOS).
+// Windows: MSYS 형태 /x/...를 x:/... 드라이브형으로 변환 후 드라이브형만 절대로
+// 인정(Go의 경로 의미론에서 /c/x는 현재 드라이브 상대 — 잘못 stat하면 오파일
+// 판정이라 제외). Unix: /-접두만 절대. 상대·불명은 전부 ""(allow).
+func dumpAbsPath(goos, arg string) string {
+	if goos == "windows" {
+		if len(arg) >= 3 && arg[0] == '/' && arg[2] == '/' &&
+			((arg[1] >= 'a' && arg[1] <= 'z') || (arg[1] >= 'A' && arg[1] <= 'Z')) {
+			arg = string(arg[1]) + ":" + arg[2:]
+		}
+		if len(arg) >= 3 && arg[1] == ':' && arg[2] == '/' &&
+			((arg[0] >= 'a' && arg[0] <= 'z') || (arg[0] >= 'A' && arg[0] <= 'Z')) {
+			return arg
+		}
+		return ""
+	}
+	if strings.HasPrefix(arg, "/") {
+		return arg
+	}
+	return ""
 }
 
 // toolInputFields — classify가 소비하는 tool_input 하위 필드만(allowlist). command는 Bash,
@@ -273,7 +356,7 @@ var errCodeRe = regexp.MustCompile(`(?i)(?:status code|exit code|code)\s+(\d+)`)
 // 요소>`로만 조립하고 원시 인자·오류 전문·응답 본문은 넣지 않는다(summary는 FTS 색인 대상 —
 // 비밀 운반 차단 1차 방어). 순수 함수(테이블 테스트가 계약)이며 파일 상대 경로 기준은 in.CWD다
 // (worktreeRoot와 동일 워크스페이스 디렉터리 — canon Fold/RealPath는 store-id 안정화 전용이라
-// 표시 경로에는 불필요). attrs는 allowlist 필드만(exit_code·is_interrupt) 채운다.
+// 표시 경로에는 불필요). attrs는 allowlist 필드만(exit_code·is_interrupt·matched_pattern) 채운다.
 func classify(in hookInput) (eventType, summary string, attrs map[string]any) {
 	if in.HookEventName == "PostToolUseFailure" {
 		element, a := classifyError(in.Error, in.IsInterrupt)
@@ -290,7 +373,10 @@ func classify(in hookInput) (eventType, summary string, attrs map[string]any) {
 				break
 			}
 		}
-		return et, summaryLine("Bash", bashFirstToken(f.Command)), nil
+		if et != "tool_call" { // T5: 매치한 패턴명(안정 enum)을 attr로 방출(설계 §3 "매치 패턴명" allowlist)
+			attrs = map[string]any{"matched_pattern": et}
+		}
+		return et, summaryLine("Bash", bashFirstToken(f.Command)), attrs
 	case "Write", "Edit", "NotebookEdit":
 		var f toolInputFields
 		_ = json.Unmarshal(in.ToolInput, &f)

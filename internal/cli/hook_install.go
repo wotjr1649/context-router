@@ -14,6 +14,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"github.com/wotjr1649/context-router/internal/hook"
@@ -26,14 +27,15 @@ const (
 )
 
 // hookRegistrations — 설치 대상 4항목(T0-amended 설계 §7). matcher가 빈 문자열이면 전체 매칭
-// (SessionStart=시작 방식 전체, Pre/PostToolUse(Failure)=전 도구 — T0 §4). PreToolUse만 Read로
-// 필터(large-read guard 대상).
+// (SessionStart=시작 방식 전체, Pre/PostToolUse(Failure)=전 도구 — T0 §4). PreToolUse는 Read|Bash
+// 정규식 매칭(large-read/dump guard 대상) — 관리 그룹 1개 유지가 merge의 동일-이벤트 상호 제거
+// 함정을 회피한다(설계 v0.3 §4).
 var hookRegistrations = []struct {
 	event   string
 	matcher string
 }{
 	{"SessionStart", ""},
-	{"PreToolUse", "Read"},
+	{"PreToolUse", "Read|Bash"},
 	{"PostToolUse", ""},
 	{"PostToolUseFailure", ""},
 }
@@ -345,59 +347,114 @@ func runHookUninstall(args []string, projectRoot string, stdout io.Writer) error
 	return nil
 }
 
-// countRegisteredHooks — path의 settings에서 자기 소유 훅 그룹 수를 센다(doctor [9] 등록 상태).
-// 파일 미존재·hooks 부재는 0, 파싱 실패만 오류.
-func countRegisteredHooks(path string) (int, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return 0, nil
+// scanRegisteredHooks — path의 settings에서 자기 소유 훅 그룹 수와 마커 버전을 함께 수집한다
+// (doctor [9] 등록 상태 + 버전 불일치 감지). 마커 버전은 첫 자기 그룹의 __ctrManaged에서
+// hookMarkerPrefix 뒤 부분이다 — 한 번의 install이 4개 그룹을 동일 버전 마커로 쓰므로(§7) 어느
+// 그룹에서 취하든 값이 같아 map 순회 순서와 무관하게 결정적이다. 파일 미존재·hooks 부재는 (0,""),
+// 파싱 실패만 오류.
+func scanRegisteredHooks(path string) (count int, marker string, err error) {
+	data, rerr := os.ReadFile(path)
+	if rerr != nil {
+		if errors.Is(rerr, os.ErrNotExist) {
+			return 0, "", nil
 		}
-		return 0, errors.New("hook: 설정 파일 읽기 실패")
+		return 0, "", errors.New("hook: 설정 파일 읽기 실패")
 	}
 	if len(bytes.TrimSpace(data)) == 0 {
-		return 0, nil
+		return 0, "", nil
 	}
 	var settings map[string]json.RawMessage
 	if err := json.Unmarshal(data, &settings); err != nil {
-		return 0, err
+		return 0, "", err
 	}
 	raw, ok := settings["hooks"]
 	if !ok {
-		return 0, nil
+		return 0, "", nil
 	}
 	var hooks map[string]json.RawMessage
 	if err := json.Unmarshal(raw, &hooks); err != nil {
-		return 0, err
+		return 0, "", err
 	}
-	count := 0
 	for _, arr := range hooks {
 		var groups []json.RawMessage
 		if json.Unmarshal(arr, &groups) != nil {
 			continue // 배열이 아닌 이벤트는 우리 소유가 아님 — 건너뜀
 		}
 		for _, g := range groups {
-			if isOurHookGroup(g) {
-				count++
+			if !isOurHookGroup(g) {
+				continue
+			}
+			count++
+			if marker == "" { // 첫 자기 그룹의 마커 버전만(모두 동일 — install 계약)
+				var p hookGroupProbe
+				if json.Unmarshal(g, &p) == nil {
+					marker = strings.TrimPrefix(p.Managed, hookMarkerPrefix())
+				}
 			}
 		}
 	}
-	return count, nil
+	return count, marker, nil
 }
 
-// countDropsLog — drops 사이드카(1줄=1 drop, 설계 §2.3) 줄 수를 센다(doctor [12]). 미존재·읽기
-// 실패는 0.
-func countDropsLog(path string) int {
+// countRegisteredHooks — scanRegisteredHooks의 개수 부분만(기존 호출부·테스트 호환 얇은 래퍼).
+func countRegisteredHooks(path string) (int, error) {
+	n, _, err := scanRegisteredHooks(path)
+	return n, err
+}
+
+// dropsByReason — drops.log을 사유별로 집계한다(doctor [12]). appendDrop 계약은 정확히
+// "<unix초>\t<사유>"(fmt "%d\t%s") — ts가 1+ 숫자이고 사유가 비지 않으며 탭을 포함하지 않는(정확히
+// 2필드) 줄만 그 사유로 센다. 어긋나면(비숫자 ts·탭 초과 필드로 사유에 TAB 혼입 등) "unparsed" —
+// 진단은 절대 중단하지 않고(설계 v0.3 §5), total은 빈 줄 포함 모든 줄을 센다(줄 수 계약). 파일 부재·
+// 읽기 실패는 (0, nil) — 기존 countDropsLog와 동일한 fail-soft.
+func dropsByReason(path string) (int, map[string]int) {
 	f, err := os.Open(path)
 	if err != nil {
-		return 0
+		return 0, nil
 	}
 	defer func() { _ = f.Close() }()
-	n := 0
+	total, reasons := 0, map[string]int{}
 	sc := bufio.NewScanner(f)
-	sc.Buffer(make([]byte, 0, 64*1024), 1<<20)
+	sc.Buffer(make([]byte, 0, 64*1024), 1<<20) // 긴 줄에도 스캔 중단 방지(countDropsLog 관례 보존)
 	for sc.Scan() {
-		n++
+		total++ // 빈 줄도 센다 — 기존 countDropsLog의 total 의미 보존(줄 수 계약)
+		ts, reason, ok := strings.Cut(sc.Text(), "\t")
+		if ok && reason != "" && !strings.Contains(reason, "\t") && isUnixTS(ts) {
+			reasons[reason]++
+		} else {
+			reasons["unparsed"]++ // 빈 줄·비숫자 ts·탭 초과 필드·사유 없음 전부 unparsed
+		}
 	}
-	return n
+	return total, reasons
+}
+
+// isUnixTS — appendDrop이 쓰는 ts(time.Now().Unix()의 "%d")는 1+ ASCII 숫자다. 그 형식만 인정한다
+// (부호·공백·빈 문자열 거부) — 실제 writer 포맷에 맞춰 검증한다.
+func isUnixTS(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// formatDropCount — "N(사유=n,...)" 렌더(사유 알파벳순, 결정적). N==0이면 "0".
+func formatDropCount(total int, reasons map[string]int) string {
+	if total == 0 {
+		return "0"
+	}
+	keys := make([]string, 0, len(reasons))
+	for k := range reasons {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	parts := make([]string, 0, len(keys))
+	for _, k := range keys {
+		parts = append(parts, fmt.Sprintf("%s=%d", k, reasons[k]))
+	}
+	return fmt.Sprintf("%d(%s)", total, strings.Join(parts, ","))
 }

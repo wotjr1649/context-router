@@ -158,7 +158,7 @@ func TestOpen_RecoverMarkerBlocks(t *testing.T) {
 	}
 
 	// lease가 해제됐다면 exclusive 잠금을 새로 취득할 수 있어야 한다(leak 없음 검증).
-	release, lockErr := store.AcquireLock(filepath.Join(dir, lockFileName), false)
+	release, lockErr := store.AcquireLock(filepath.Join(dir, LockFileName), false)
 	if lockErr != nil {
 		t.Fatalf("session.lock 잔류(leak) 의심: exclusive 재취득 실패: %v", lockErr)
 	}
@@ -726,6 +726,34 @@ func TestSummarize_TypeFanOutUnderCap(t *testing.T) {
 	}
 }
 
+// TestSummarize_TypeFanOutAlphabetical — 부채 T10b(설계 §9): fan-out 상한 초과 절단은 event_type
+// 오름차순 "앞에서" 상한까지만 취한다(결정적 선택). 기존 TestSummarize_TypeFanOutCap은 개수·플래그만
+// 확인하고 어느 타입이 살아남는지는 미행사 — 여기서 알파벳 절단 선택을 고정한다.
+func TestSummarize_TypeFanOutAlphabetical(t *testing.T) {
+	dir := t.TempDir()
+	d := openT(t, dir, Options{Producer: "test/fanout-alpha"})
+	var custom []string
+	for i := 0; i < maxSummaryGroups+8; i++ {
+		et := fmt.Sprintf("g%02d", i) // 'g' 시작·동일 길이 → session_start 등 자동 타입보다 앞, 사전순=수치순
+		mustAppend(t, d, Event{Type: et, Summary: "s"})
+		custom = append(custom, et)
+	}
+	want := custom[:maxSummaryGroups] // 상한 초과분(g32~)과 뒤쪽 자동 타입은 절단
+
+	sum, err := Summarize(context.Background(), d.Reader(), "", 5)
+	if err != nil {
+		t.Fatalf("Summarize: %v", err)
+	}
+	if !sum.GroupsTruncated || len(sum.Groups) != maxSummaryGroups {
+		t.Fatalf("truncated=%v len=%d want true,%d", sum.GroupsTruncated, len(sum.Groups), maxSummaryGroups)
+	}
+	for i, g := range sum.Groups {
+		if g.EventType != want[i] {
+			t.Fatalf("Groups[%d]=%q want %q (알파벳 앞 %d개만 생존)", i, g.EventType, want[i], maxSummaryGroups)
+		}
+	}
+}
+
 // matchesFTS: fts에서 token이 하나라도 MATCH되면 true(설계 §2.3 이벤트 FTS 동기화 검증
 // 공용 헬퍼 — ①②③ 공유).
 func matchesFTS(t *testing.T, d *DB, fts, token string) bool {
@@ -1048,7 +1076,7 @@ func TestOpenAppend_RecoverMarkerBlocks(t *testing.T) {
 	if !errors.Is(err, ErrRecoverPending) {
 		t.Fatalf("err=%v want ErrRecoverPending", err)
 	}
-	release, lockErr := store.AcquireLock(filepath.Join(dir, lockFileName), false)
+	release, lockErr := store.AcquireLock(filepath.Join(dir, LockFileName), false)
 	if lockErr != nil {
 		t.Fatalf("lease 누수 의심: exclusive 재취득 실패: %v", lockErr)
 	}

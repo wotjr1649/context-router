@@ -368,10 +368,11 @@ func isMarkdownExt(name string) bool {
 	return ext == ".md" || ext == ".markdown"
 }
 
-// isBinary sniffs the first 8KB of b for a NUL byte, or reports b(전체) as
+// IsBinary sniffs the first 8KB of b for a NUL byte, or reports b(전체) as
 // invalid UTF-8(§4.4 스킵 규칙; β1-3 — NUL 없는 비 UTF-8도 byte-exact 계약 보호를
 // 위해 skip. 전체 b로 검사 — 8KB 경계에서 멀티바이트 rune이 잘려 오탐하는 것을 방지).
-func isBinary(b []byte) bool {
+// D31 hook decode-sniff가 재사용하므로 export한다(동작 불변).
+func IsBinary(b []byte) bool {
 	n := len(b)
 	if n > 8192 {
 		n = 8192
@@ -556,7 +557,7 @@ func ingestOne(ctx context.Context, st *store.Store, w workItem) (skipReason str
 	if !canonicalUnchanged(w.abs) {
 		return "changed-during-read", 0, nil
 	}
-	if isBinary(raw) {
+	if IsBinary(raw) {
 		return "binary", 0, nil
 	}
 	sum := sha256.Sum256(raw)
@@ -653,8 +654,8 @@ feed:
 	return rep, firstErr
 }
 
-// runInline ingests req.Content directly (uri=inline:<Title>) — §3.0 순서에서 파일
-// 읽기 단계만 생략한다. ponytail: 경로 정책(denylist·바이너리 sniff·크기 상한)은
+// runInline ingests req.Content directly (uri=inline:<Title>; SourceKind=="hook"이면
+// D30 shadow:<Title>:<content_hash>) — §3.0 순서에서 파일 읽기 단계만 생략한다. ponytail: 경로 정책(denylist·바이너리 sniff·크기 상한)은
 // 디스크 파일 고유 위험을 다루는 것이라 호출자가 이미 신뢰하고 전달한 인라인
 // 텍스트에는 적용하지 않는다 — 필요해지면 여기서 동일 검사를 추가한다.
 func runInline(ctx context.Context, st *store.Store, req Request) (Report, error) {
@@ -675,12 +676,23 @@ func runInline(ctx context.Context, st *store.Store, req Request) (Report, error
 	if kind == "" {
 		kind = "inline"
 	}
+	// content_hash = redact 후 저장본의 sha256 (store.Register가 계산·저장하는 값과 동일 —
+	// 콘텐츠 주소라 결정적). Register가 반환하지 않으므로 여기서 동일 규칙으로 계산해 URI 조립·
+	// Report.Hash 양쪽에 쓴다(이중 해시 제거, artifact ref 조립용 §5).
+	csum := sha256.Sum256(stored)
+	contentHash := hex.EncodeToString(csum[:])
+	uri := "inline:" + req.Title
+	if kind == "hook" {
+		// D30: hook 패시브 색인 전용 네임스페이스 — 콘텐츠 주소 키라 상이 출력이 서로를
+		// 덮지 않는다(설계 v0.3 §2). MCP inline: 규약은 불변.
+		uri = "shadow:" + req.Title + ":" + contentHash
+	}
 	_, err := st.Register(ctx, store.Registration{
 		StoredBytes: stored,
 		MediaType:   mediaType,
 		Redaction:   redaction,
 		Source: store.SourceMeta{
-			URI: "inline:" + req.Title, Kind: kind,
+			URI: uri, Kind: kind,
 			Size: int64(len(raw)), SrcHash: srcHash,
 		},
 		Chunks: ChunkText(string(stored), md),
@@ -688,11 +700,7 @@ func runInline(ctx context.Context, st *store.Store, req Request) (Report, error
 	if err != nil {
 		return Report{}, fmt.Errorf("ingest: run: %w", err)
 	}
-	// content_hash = redact 후 저장본의 sha256 (store.Register가 계산·저장하는 값과 동일 —
-	// 콘텐츠 주소라 결정적). Register가 반환하지 않으므로 여기서 동일 규칙으로 재계산해
-	// Report.Hash로 노출한다(artifact ref 조립용, 설계 §5).
-	csum := sha256.Sum256(stored)
-	return Report{Indexed: 1, BytesStored: int64(len(stored)), Hash: hex.EncodeToString(csum[:])}, nil
+	return Report{Indexed: 1, BytesStored: int64(len(stored)), Hash: contentHash}, nil
 }
 
 // Run ingests req.Path(파일|디렉터리) 또는 req.Content(inline)를 §3.0 파이프라인으로

@@ -161,6 +161,40 @@ func TestHookSessionStartSourceTruncated(t *testing.T) {
 	}
 }
 
+// ②-c source 멀티바이트 경계 절단(C4 rune-safe): maxSourceBytes(64)가 3바이트 룬(U+AC00) 중간에
+// 떨어지는 입력에서 byte-slice(src[:64])는 룬을 반쪽 내 깨진 UTF-8을 남기지만, truncateUTF8은
+// 룬 경계(63B=21룬)까지 물러나 온전한 UTF-8만 기록한다. 결과가 21룬 프리픽스와 정확히 같아야 한다.
+func TestHookSessionStartSourceRuneBoundary(t *testing.T) {
+	storeRoot := filepath.Join(t.TempDir(), "storeroot")
+	cwd := t.TempDir()
+	han := string(rune(0xAC00)) // "가" — 3바이트 UTF-8(소스에 멀티바이트 리터럴 미포함)
+	in := fixtureWith(t, "sessionstart.json", map[string]any{
+		"cwd":    cwd,
+		"source": strings.Repeat(han, 100), // 300B, 64B는 22번째 룬(바이트 63~65) 중간
+	})
+	if rc := runHook(t, storeRoot, in, nil); rc != 0 {
+		t.Fatalf("rc=%d want 0", rc)
+	}
+	reader, err := session.OpenReadOnly(sessDir(t, storeRoot, cwd))
+	if err != nil {
+		t.Fatalf("open session.db: %v", err)
+	}
+	defer func() { _ = reader.Close() }()
+	var payload string
+	if err := reader.QueryRow("SELECT payload FROM session_events WHERE event_type='session_start'").Scan(&payload); err != nil {
+		t.Fatalf("payload: %v", err)
+	}
+	var p struct {
+		Source string `json:"source"`
+	}
+	if err := json.Unmarshal([]byte(payload), &p); err != nil {
+		t.Fatalf("unmarshal payload: %v", err)
+	}
+	if want := strings.Repeat(han, 21); p.Source != want { // byte-slice면 64B(반쪽 룬)로 불일치
+		t.Fatalf("source=%q(len=%d) want 21룬 프리픽스(len=%d)", p.Source, len(p.Source), len(want))
+	}
+}
+
 // ③ 비-SessionStart 이벤트를 미지 세션으로 → 이벤트 0건 + drops 1줄(unknown-session).
 func TestHookUnknownSession(t *testing.T) {
 	storeRoot := filepath.Join(t.TempDir(), "storeroot")
@@ -206,6 +240,20 @@ func TestHookBadSessionID(t *testing.T) {
 	}
 }
 
+// ④-b cwd가 실재하지 않으면(worktree 미식별) → drop(bad-cwd), 세션 DB 미생성. bad-session-id와
+// 마찬가지로 세션 dir 도출 전 단계라 storeRoot 레벨 drops.log에 기록된다(hook.go 순서).
+func TestHookBadCWD(t *testing.T) {
+	storeRoot := filepath.Join(t.TempDir(), "storeroot")
+	cwd := t.TempDir()
+	in := fixtureWith(t, "sessionstart.json", map[string]any{"cwd": filepath.Join(cwd, "no-such-dir")})
+	if rc := runHook(t, storeRoot, in, nil); rc != 0 {
+		t.Fatalf("rc=%d want 0", rc)
+	}
+	if got := readDrops(t, storeRoot); !strings.Contains(got, "bad-cwd") {
+		t.Fatalf("drops=%q want bad-cwd", got)
+	}
+}
+
 // ⑤ stdin 파싱 불능(잘린 JSON) → 0 반환 + drops(bad-input).
 func TestHookBadInput(t *testing.T) {
 	storeRoot := filepath.Join(t.TempDir(), "storeroot")
@@ -225,7 +273,7 @@ func TestHookLeaseHeld(t *testing.T) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		t.Fatalf("mkdir: %v", err)
 	}
-	release, err := store.AcquireLock(filepath.Join(dir, "session.lock"), false) // exclusive 선점
+	release, err := store.AcquireLock(filepath.Join(dir, session.LockFileName), false) // exclusive 선점
 	if err != nil {
 		t.Fatalf("acquire exclusive: %v", err)
 	}
@@ -393,6 +441,16 @@ func TestSummaryAllowlist(t *testing.T) {
 		_, summary, _ := classify(bashEvent(t, "PostToolUse", "git diff HEAD"))
 		if summary != "Bash: git" {
 			t.Fatalf("summary=%q want %q", summary, "Bash: git")
+		}
+	})
+	// T5: 분류된 Bash는 매치 패턴명(안정 enum = event_type)을 matched_pattern attr로 방출하고,
+	// 미매치(tool_call)는 방출하지 않는다(설계 §3 "매치 패턴명" allowlist).
+	t.Run("matched_pattern_attr", func(t *testing.T) {
+		if _, _, attrs := classify(bashEvent(t, "PostToolUse", "go test ./...")); attrs["matched_pattern"] != "test_run" {
+			t.Fatalf("matched_pattern=%v want test_run", attrs["matched_pattern"])
+		}
+		if _, _, attrs := classify(bashEvent(t, "PostToolUse", "ls -la")); attrs["matched_pattern"] != nil {
+			t.Fatalf("tool_call matched_pattern=%v want absent", attrs["matched_pattern"])
 		}
 	})
 	// ④ secret canary(분할 리터럴)를 비-첫토큰 인자에 심으면 summary·attrs에 원문 부재(allowlist 1차 방어).
@@ -607,17 +665,20 @@ func TestShadowOverMinStores(t *testing.T) {
 	}
 	_ = reader.Close()
 
-	refs := eventRefs(t, sdir, "tool_result_summary")
-	if len(refs) != 1 {
-		t.Fatalf("tool_result_summary refs=%v want 1개", refs)
-	}
 	want := "artifact://cc:3f2504e0-4f89-41d3-9a0c-0305e82c3301/sha256-"
-	if !strings.HasPrefix(refs[0], want) {
-		t.Fatalf("ref=%q want prefix %q", refs[0], want)
-	}
-	hash := strings.TrimPrefix(refs[0], want)
-	if len(hash) != 64 {
-		t.Fatalf("ref hash 길이=%d want 64(hex sha256)", len(hash))
+	// D30: artifact_created·tool_result_summary 둘 다 rep.Hash 기반 동일 ref를 실어야 한다
+	// (shadow: URI로 저장돼도 ref는 content_hash 주소 — §5).
+	for _, et := range []string{"artifact_created", "tool_result_summary"} {
+		refs := eventRefs(t, sdir, et)
+		if len(refs) != 1 {
+			t.Fatalf("%s refs=%v want 1개", et, refs)
+		}
+		if !strings.HasPrefix(refs[0], want) {
+			t.Fatalf("%s ref=%q want prefix %q", et, refs[0], want)
+		}
+		if hash := strings.TrimPrefix(refs[0], want); len(hash) != 64 {
+			t.Fatalf("%s ref hash 길이=%d want 64(hex sha256)", et, len(hash))
+		}
 	}
 }
 
@@ -821,14 +882,84 @@ func TestShadowStoreLockDeadline(t *testing.T) {
 	}
 }
 
+// ⑪ store open은 성공하지만 ingest.Run이 실패하면 → 미저장 + drops(shadow-ingest). 취소된 ctx를
+// 쓴다: lockStoreCtx는 락이 한가하면 첫 tryLockFile에서 ctx 검사 없이 즉시 성공하므로 OpenContext는
+// 취소 ctx에서도 통과하고, ingest.Run 첫 줄 ctx.Err()가 실패를 낸다(shadow-ingest 경로의 결정적 트리거).
+func TestShadowIngestDrops(t *testing.T) {
+	_, _, contentDir, sdir := shadowSetup(t)
+	ad, err := session.OpenAppend(context.Background(), sdir, session.AppendOptions{
+		ExternalSessionID: "cc:3f2504e0-4f89-41d3-9a0c-0305e82c3301",
+		Producer:          "context-router/test",
+	})
+	if err != nil {
+		t.Fatalf("OpenAppend: %v", err)
+	}
+	defer func() { _ = ad.Close() }()
+	// MIN 통과·유효 JSON·비바이너리 leaf여야 store open까지 도달한다(그다음이 ingest 실패 지점).
+	body := append(append([]byte{'"'}, bytes.Repeat([]byte("a"), 20000)...), '"') // JSON 문자열 리터럴
+	in := hookInput{HookEventName: "PostToolUse", ToolName: "Bash", ToolResponse: json.RawMessage(body)}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // ingest.Run 진입 즉시 ctx.Err()로 실패
+	shadowCapture(ctx, ad, in, sdir, contentDir, "cc:3f2504e0-4f89-41d3-9a0c-0305e82c3301", func(string) string { return "" })
+
+	if n := contentArtifacts(t, contentDir); n > 0 {
+		t.Fatalf("artifacts=%d want 0/-1(ingest 실패로 미저장)", n)
+	}
+	if got := readDrops(t, sdir); !strings.Contains(got, "shadow-ingest") {
+		t.Fatalf("drops=%q want shadow-ingest", got)
+	}
+}
+
+// ⑫ ingest는 성공하지만 세션 append가 실패하면 → drops(shadow-append). ad를 shadowCapture 전에
+// Close해 두면 store.OpenContext+ingest.Run은 fresh content store에서 성공(Indexed==1)하고, 이후
+// shadowAppend→ad.Append가 닫힌 writer에 "database is closed"로 실패한다(shadow-append 경로).
+func TestShadowAppendDrops(t *testing.T) {
+	_, _, contentDir, sdir := shadowSetup(t)
+	ad, err := session.OpenAppend(context.Background(), sdir, session.AppendOptions{
+		ExternalSessionID: "cc:3f2504e0-4f89-41d3-9a0c-0305e82c3301",
+		Producer:          "context-router/test",
+	})
+	if err != nil {
+		t.Fatalf("OpenAppend: %v", err)
+	}
+	if err := ad.Close(); err != nil { // append 이전에 닫아 writer 실패를 주입
+		t.Fatalf("Close: %v", err)
+	}
+	// MIN 통과·유효 JSON·비바이너리 leaf → ingest까지 성공한 뒤 append 단계에서만 실패시킨다.
+	body := append(append([]byte{'"'}, bytes.Repeat([]byte("a"), 20000)...), '"') // JSON 문자열 리터럴
+	in := hookInput{HookEventName: "PostToolUse", ToolName: "Bash", ToolResponse: json.RawMessage(body)}
+	shadowCapture(context.Background(), ad, in, sdir, contentDir, "cc:3f2504e0-4f89-41d3-9a0c-0305e82c3301", func(string) string { return "" })
+
+	if n := contentArtifacts(t, contentDir); n != 1 {
+		t.Fatalf("artifacts=%d want 1(ingest 성공 후 append 실패 시나리오)", n)
+	}
+	if got := readDrops(t, sdir); !strings.Contains(got, "shadow-append") {
+		t.Fatalf("drops=%q want shadow-append", got)
+	}
+}
+
 // ─── T7: large-read guard 4조건 판정 (설계 §4) ────────────────────────────────
 
 // guardSetup — session_start를 발화해 세션을 선재시키고 (storeRoot, cwd, contentDir, sdir)를
 // 반환한다. 가드는 SessionExists 통과 후 동작하므로 세션이 있어야 한다(shadowSetup과 동형).
+// evalLong — 픽스처 디렉터리를 장문명으로 정규화한다. Windows CI의 t.TempDir()는 8.3 단축명
+// (C:\Users\RUNNER~1\...)을 낼 수 있고, 그 ~는 bashDumpArg의 어휘 거부(설계상 allow-bias)에 걸려
+// guardBash가 stat/store 전에 반환한다 — 로컬은 ~가 없어 통과하는 픽스처 이식성 버그. EvalSymlinks가
+// Windows 8.3 성분을 장문명으로 해석한다(경로는 존재해야 함 — t.TempDir()은 존재). 프로덕션의 ~ allow는
+// 그대로다. 정규화하지 않으면 allow-계열 테스트도 의도한 조건 전에 어휘 게이트에 걸려 무의미 통과한다.
+func evalLong(t *testing.T, dir string) string {
+	t.Helper()
+	if p, err := filepath.EvalSymlinks(dir); err == nil {
+		return p
+	}
+	return dir
+}
+
 func guardSetup(t *testing.T) (storeRoot, cwd, contentDir, sdir string) {
 	t.Helper()
 	storeRoot = filepath.Join(t.TempDir(), "storeroot")
-	cwd = t.TempDir()
+	cwd = evalLong(t, t.TempDir())
 	if rc := runHook(t, storeRoot, fixtureWith(t, "sessionstart.json", map[string]any{"cwd": cwd}), nil); rc != 0 {
 		t.Fatalf("sessionstart rc=%d want 0", rc)
 	}
@@ -887,6 +1018,31 @@ func TestGuardPartialReadAllows(t *testing.T) {
 	}, nil)
 	if out != "" {
 		t.Fatalf("stdout=%q want empty (부분 읽기 = allow)", out)
+	}
+}
+
+// ②-b offset 단독·limit 단독도 부분 읽기 → allow(T7: 둘 중 하나만 있어도 통과, 존재-판정이 &&가 아님).
+func TestGuardPartialReadOffsetOrLimitAlone(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		in   map[string]any
+	}{
+		{"offset_alone", map[string]any{"offset": 1}},
+		{"limit_alone", map[string]any{"limit": 100}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			storeRoot, cwd, _, _ := guardSetup(t)
+			big := filepath.Join(cwd, "big.txt")
+			writeSized(t, big, 300*1024) // 임계 초과·경계 내 — 부분 읽기 판정만이 통과 근거
+			ti := map[string]any{"file_path": big}
+			for k, v := range tc.in {
+				ti[k] = v
+			}
+			out := runGuard(t, storeRoot, map[string]any{"cwd": cwd, "tool_input": ti}, nil)
+			if out != "" {
+				t.Fatalf("stdout=%q want empty (%s = allow)", out, tc.name)
+			}
+		})
 	}
 }
 
@@ -1002,6 +1158,203 @@ func TestGuardIndexFailureAllows(t *testing.T) {
 		"cwd":        cwd,
 		"tool_input": map[string]any{"file_path": big},
 	}, map[string]string{"CTR_HOOK_DEADLINE_MS": "300"})
+	elapsed := time.Since(start)
+	if out != "" {
+		t.Fatalf("stdout=%q want empty (인덱싱 실패 = allow)", out)
+	}
+	if elapsed > 2*time.Second {
+		t.Fatalf("deadline 미관측 의심 — %v 소요", elapsed)
+	}
+	if got := readDrops(t, sdir); !strings.Contains(got, "guard-store") {
+		t.Fatalf("drops=%q want guard-store", got)
+	}
+}
+
+// ─── D32: Bash 단일파일 덤프 가드 정적 판정 (설계 v0.3 §4) ─────────────────────
+
+// TestBashDumpArg: D32 어휘 판정 — 단일 단순 `cat <경로>`만 경로 인자를 반환하고
+// 나머지는 전부 ""(allow). 오탐 deny 차단이 목적이므로 거부 케이스가 본론이다.
+func TestBashDumpArg(t *testing.T) {
+	cases := []struct{ cmd, want string }{
+		{"cat /c/big/file.log", "/c/big/file.log"},
+		{"cat C:/big/file.log", "C:/big/file.log"}, // 절대 여부는 dumpAbsPath 몫
+		{"cat file.log", "file.log"},               // 어휘상 후보 — 절대 판정에서 탈락
+		{"cat -n /c/f", ""},                        // 옵션 — 제외
+		{"cat /c/a /c/b", ""},                      // 인자 2개 — 제외
+		{"cat /c/f | head", ""},                    // 파이프 — 제외
+		{"cat /c/f > /c/g", ""},                    // 리다이렉트 — 제외
+		{"cat /c/f; ls", ""},                       // 체이닝 — 제외
+		{"cat \"/c/f\"", ""},                       // 인용 — 제외(보수)
+		{"cat /c/with\\ space", ""},                // 백슬래시 — 제외(bash가 소비)
+		{"cat /c/f ", ""},                          // NBSP — bash IFS와 달리 Fields가 쪼갬 → 비ASCII 전면 거부
+		{"cat /c/a!b", "/c/a!b"},                   // ! — 비대화형 bash에서 리터럴, 허용
+		{"cat /c/~backup", ""},                     // ~ 전면 배제 — 의도적 미탐(allow 편향)
+		{"type /c/big/file.log", ""},               // bash type=명령 조회, 덤프 아님
+		{"tac /c/f", ""},                           // cat 외 명령 — 제외
+		{"", ""},
+	}
+	for _, c := range cases {
+		if got := bashDumpArg(c.cmd); got != c.want {
+			t.Fatalf("bashDumpArg(%q)=%q want %q", c.cmd, got, c.want)
+		}
+	}
+}
+
+// TestDumpAbsPath: OS별 절대경로 정규화 — goos 주입으로 양쪽 분기를 한 OS에서 검증.
+func TestDumpAbsPath(t *testing.T) {
+	cases := []struct{ goos, arg, want string }{
+		{"windows", "/c/big/f.log", "c:/big/f.log"}, // MSYS → 드라이브형 변환
+		{"windows", "C:/big/f.log", "C:/big/f.log"},
+		{"windows", "file.log", ""}, // 상대 — 제외
+		{"windows", "/tmp/f", ""},   // 드라이브 불명 — 제외(보수)
+		{"linux", "/tmp/f", "/tmp/f"},
+		{"linux", "C:/big/f.log", ""}, // Unix에선 상대경로 — 제외
+		{"linux", "file.log", ""},
+	}
+	for _, c := range cases {
+		if got := dumpAbsPath(c.goos, c.arg); got != c.want {
+			t.Fatalf("dumpAbsPath(%q,%q)=%q want %q", c.goos, c.arg, got, c.want)
+		}
+	}
+}
+
+// runGuardBash — posttooluse-bash.json을 PreToolUse(Bash)로 재정의하고 command만 교체해 Run을
+// 호출한 뒤 stdout(deny JSON 또는 빈 문자열)을 반환한다(runGuard의 Bash 형제). command 조립은
+// 호출자가 filepath.ToSlash로 슬래시화 — Windows t.TempDir() 백슬래시가 bashDumpArg 어휘 판정에서
+// 거부되지 않도록(설계 §4).
+func runGuardBash(t *testing.T, storeRoot, cwd, command string, env map[string]string) string {
+	t.Helper()
+	in := fixtureWith(t, "posttooluse-bash.json", map[string]any{
+		"hook_event_name": "PreToolUse",
+		"cwd":             cwd,
+		"tool_input":      map[string]any{"command": command},
+	})
+	var out bytes.Buffer
+	rc := Run(context.Background(), bytes.NewReader(in), &out, storeRoot, "test", func(k string) string { return env[k] })
+	if rc != 0 {
+		t.Fatalf("guardBash rc=%d want 0", rc)
+	}
+	return out.String()
+}
+
+// D32-① 대형 파일 단순 cat → deny JSON + warning 이벤트(Bash·cat·상대경로·크기·ctr_search 포함,
+// 절대경로 비포함) + 현장 인덱싱 아티팩트 1건.
+func TestGuardBashLargeFileDenies(t *testing.T) {
+	storeRoot, cwd, contentDir, sdir := guardSetup(t)
+	big := filepath.Join(cwd, "big.txt")
+	writeSized(t, big, 300*1024)
+	out := runGuardBash(t, storeRoot, cwd, "cat "+filepath.ToSlash(big), nil)
+
+	var got map[string]map[string]string
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatalf("deny stdout이 유효 JSON 아님: %v (out=%q)", err, out)
+	}
+	hso := got["hookSpecificOutput"]
+	if hso["hookEventName"] != "PreToolUse" || hso["permissionDecision"] != "deny" {
+		t.Fatalf("deny 스키마 불일치: %+v (out=%q)", hso, out)
+	}
+
+	if n := contentArtifacts(t, contentDir); n != 1 {
+		t.Fatalf("artifacts=%d want 1(현장 인덱싱 성공)", n)
+	}
+
+	reader, err := session.OpenReadOnly(sdir)
+	if err != nil {
+		t.Fatalf("open session.db: %v", err)
+	}
+	defer func() { _ = reader.Close() }()
+	var n int
+	var summary string
+	if err := reader.QueryRow("SELECT count(*), coalesce(max(summary),'') FROM session_events WHERE event_type='warning'").Scan(&n, &summary); err != nil {
+		t.Fatalf("count warning: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("warning events=%d want 1", n)
+	}
+	for _, want := range []string{"Bash", "cat", "big.txt", "307200", "ctr_search"} {
+		if !strings.Contains(summary, want) {
+			t.Fatalf("warning summary=%q want 포함 %q", summary, want)
+		}
+	}
+	if strings.Contains(summary, cwd) || strings.Contains(summary, filepath.ToSlash(cwd)) {
+		t.Fatalf("warning summary가 절대경로 누출: %q", summary)
+	}
+}
+
+// D32-② 파이프 포함 → allow(bashDumpArg가 | 로 어휘 거부).
+func TestGuardBashPipeAllows(t *testing.T) {
+	storeRoot, cwd, _, _ := guardSetup(t)
+	big := filepath.Join(cwd, "big.txt")
+	writeSized(t, big, 300*1024)
+	out := runGuardBash(t, storeRoot, cwd, "cat "+filepath.ToSlash(big)+" | head", nil)
+	if out != "" {
+		t.Fatalf("stdout=%q want empty (파이프 = allow)", out)
+	}
+}
+
+// D32-③ 상대경로 → allow(dumpAbsPath가 비절대로 거부). 상대경로라 슬래시화 불필요.
+func TestGuardBashRelativePathAllows(t *testing.T) {
+	storeRoot, cwd, _, _ := guardSetup(t)
+	writeSized(t, filepath.Join(cwd, "big.txt"), 300*1024)
+	out := runGuardBash(t, storeRoot, cwd, "cat big.txt", nil)
+	if out != "" {
+		t.Fatalf("stdout=%q want empty (상대경로 = allow)", out)
+	}
+}
+
+// D32-④ 임계 미만 → allow.
+func TestGuardBashUnderThresholdAllows(t *testing.T) {
+	storeRoot, cwd, _, _ := guardSetup(t)
+	small := filepath.Join(cwd, "small.txt")
+	writeSized(t, small, 1024) // 1KiB < 256KiB
+	out := runGuardBash(t, storeRoot, cwd, "cat "+filepath.ToSlash(small), nil)
+	if out != "" {
+		t.Fatalf("stdout=%q want empty (임계 이하 = allow)", out)
+	}
+}
+
+// D32-⑤ 경계 밖 대형 파일 → allow(ingest ErrWorkspace → Indexed==0).
+func TestGuardBashOutsideBoundaryAllows(t *testing.T) {
+	storeRoot, cwd, _, _ := guardSetup(t)
+	outside := filepath.Join(evalLong(t, t.TempDir()), "big.txt") // cwd와 형제 — 경계 밖
+	writeSized(t, outside, 300*1024)
+	out := runGuardBash(t, storeRoot, cwd, "cat "+filepath.ToSlash(outside), nil)
+	if out != "" {
+		t.Fatalf("stdout=%q want empty (경계 밖 = allow)", out)
+	}
+}
+
+// D32-⑥ denylist 파일(.env, Indexed==0 Skipped) cat → allow + artifact 0건.
+func TestGuardBashDenylistAllows(t *testing.T) {
+	storeRoot, cwd, contentDir, _ := guardSetup(t)
+	env := filepath.Join(cwd, ".env")
+	writeSized(t, env, 300*1024) // 임계 초과라 크기 게이트 통과 → denylist라 Skipped
+	out := runGuardBash(t, storeRoot, cwd, "cat "+filepath.ToSlash(env), nil)
+	if out != "" {
+		t.Fatalf("stdout=%q want empty (denylist = allow)", out)
+	}
+	if n := contentArtifacts(t, contentDir); n > 0 {
+		t.Fatalf("artifacts=%d want 0/-1(.env 미색인)", n)
+	}
+}
+
+// D32-⑦ content store open-lock 점유 → allow(무출력) + drops(guard-store). Bash 분기 fail-open
+// 직접 커버(Read ⑥ 패턴 복제). deadline 예산 안에서 포기(5초 하드 대기 금지).
+func TestGuardBashStoreLockAllows(t *testing.T) {
+	storeRoot, cwd, contentDir, sdir := guardSetup(t)
+	if err := os.MkdirAll(contentDir, 0o700); err != nil {
+		t.Fatalf("mkdir contentDir: %v", err)
+	}
+	release, err := store.AcquireLock(filepath.Join(contentDir, "content.db.rebuild.lock"), false) // 배타 선점
+	if err != nil {
+		t.Fatalf("선점 잠금: %v", err)
+	}
+	defer release()
+
+	big := filepath.Join(cwd, "big.txt")
+	writeSized(t, big, 300*1024)
+	start := time.Now()
+	out := runGuardBash(t, storeRoot, cwd, "cat "+filepath.ToSlash(big), map[string]string{"CTR_HOOK_DEADLINE_MS": "300"})
 	elapsed := time.Since(start)
 	if out != "" {
 		t.Fatalf("stdout=%q want empty (인덱싱 실패 = allow)", out)
