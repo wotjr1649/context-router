@@ -279,11 +279,11 @@ func TestUsage_TotalsFlag(t *testing.T) {
 	if !strings.HasPrefix(outTotals, wantPlain) {
 		t.Fatalf("--totals 본표 prefix가 기본 출력과 다름:\n%s", outTotals)
 	}
-	// 본표 뒤(suffix)에 두 TOTAL 행이 각각의 그룹 실측 합계로 등장해야 한다(열 1~5 정확성 포함).
-	suffix := outTotals[len(wantPlain):]
-	for _, label := range []string{"hooks:on", "hooks:off"} {
-		if want := totalRowFrom(wantPlain, label); !strings.Contains(suffix, want) {
-			t.Fatalf("--totals 출력에 기대 TOTAL 행 %q 부재:\n%s", want, suffix)
-		}
+	// 본표 뒤(suffix)는 정확히 두 TOTAL 행(on 먼저 off 다음)이어야 한다 — "정확히 2행" 계약.
+	// Contains만 쓰면 stray 3번째 행·on/off 순서 뒤바뀜을 놓친다. 합계는 세션 행 실측 파싱으로
+	// 조립(열 1~5 정확성 포함).
+	wantSuffix := totalRowFrom(wantPlain, "hooks:on") + totalRowFrom(wantPlain, "hooks:off")
+	if suffix := outTotals[len(wantPlain):]; suffix != wantSuffix {
+		t.Fatalf("--totals suffix 불일치:\n got %q\nwant %q", suffix, wantSuffix)
 	}
 }

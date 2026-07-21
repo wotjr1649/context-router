@@ -867,6 +867,34 @@ func TestShadowIngestDrops(t *testing.T) {
 	}
 }
 
+// ⑫ ingest는 성공하지만 세션 append가 실패하면 → drops(shadow-append). ad를 shadowCapture 전에
+// Close해 두면 store.OpenContext+ingest.Run은 fresh content store에서 성공(Indexed==1)하고, 이후
+// shadowAppend→ad.Append가 닫힌 writer에 "database is closed"로 실패한다(shadow-append 경로).
+func TestShadowAppendDrops(t *testing.T) {
+	_, _, contentDir, sdir := shadowSetup(t)
+	ad, err := session.OpenAppend(context.Background(), sdir, session.AppendOptions{
+		ExternalSessionID: "cc:3f2504e0-4f89-41d3-9a0c-0305e82c3301",
+		Producer:          "context-router/test",
+	})
+	if err != nil {
+		t.Fatalf("OpenAppend: %v", err)
+	}
+	if err := ad.Close(); err != nil { // append 이전에 닫아 writer 실패를 주입
+		t.Fatalf("Close: %v", err)
+	}
+	// MIN 통과·유효 JSON·비바이너리 leaf → ingest까지 성공한 뒤 append 단계에서만 실패시킨다.
+	body := append(append([]byte{'"'}, bytes.Repeat([]byte("a"), 20000)...), '"') // JSON 문자열 리터럴
+	in := hookInput{HookEventName: "PostToolUse", ToolName: "Bash", ToolResponse: json.RawMessage(body)}
+	shadowCapture(context.Background(), ad, in, sdir, contentDir, "cc:3f2504e0-4f89-41d3-9a0c-0305e82c3301", func(string) string { return "" })
+
+	if n := contentArtifacts(t, contentDir); n != 1 {
+		t.Fatalf("artifacts=%d want 1(ingest 성공 후 append 실패 시나리오)", n)
+	}
+	if got := readDrops(t, sdir); !strings.Contains(got, "shadow-append") {
+		t.Fatalf("drops=%q want shadow-append", got)
+	}
+}
+
 // ─── T7: large-read guard 4조건 판정 (설계 §4) ────────────────────────────────
 
 // guardSetup — session_start를 발화해 세션을 선재시키고 (storeRoot, cwd, contentDir, sdir)를
