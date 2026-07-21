@@ -375,8 +375,8 @@ func TestCanonicalUnchanged(t *testing.T) {
 // 한다(β1-3 — byte-exact 계약 보호).
 func TestIsBinary_NonUTF8(t *testing.T) {
 	b := bytes.Repeat([]byte{0xB0, 0xA1, 0xFF, 0xFE}, 50)
-	if !isBinary(b) {
-		t.Fatal("무효 UTF-8인데 isBinary=false")
+	if !IsBinary(b) {
+		t.Fatal("무효 UTF-8인데 IsBinary=false")
 	}
 }
 

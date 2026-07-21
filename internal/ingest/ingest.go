@@ -368,10 +368,11 @@ func isMarkdownExt(name string) bool {
 	return ext == ".md" || ext == ".markdown"
 }
 
-// isBinary sniffs the first 8KB of b for a NUL byte, or reports b(전체) as
+// IsBinary sniffs the first 8KB of b for a NUL byte, or reports b(전체) as
 // invalid UTF-8(§4.4 스킵 규칙; β1-3 — NUL 없는 비 UTF-8도 byte-exact 계약 보호를
 // 위해 skip. 전체 b로 검사 — 8KB 경계에서 멀티바이트 rune이 잘려 오탐하는 것을 방지).
-func isBinary(b []byte) bool {
+// D31 hook decode-sniff가 재사용하므로 export한다(동작 불변).
+func IsBinary(b []byte) bool {
 	n := len(b)
 	if n > 8192 {
 		n = 8192
@@ -556,7 +557,7 @@ func ingestOne(ctx context.Context, st *store.Store, w workItem) (skipReason str
 	if !canonicalUnchanged(w.abs) {
 		return "changed-during-read", 0, nil
 	}
-	if isBinary(raw) {
+	if IsBinary(raw) {
 		return "binary", 0, nil
 	}
 	sum := sha256.Sum256(raw)

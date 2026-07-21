@@ -44,13 +44,21 @@ func shadowCapture(ctx context.Context, ad *session.AppendDB, in hookInput, dir,
 		appendDrop(dir, "shadow-denylist") // 비밀 파일 유래 응답 — 미저장
 		return
 	}
-	// NUL 판정(D26): body는 json.RawMessage라 외부 파싱이 성공한 시점에 리터럴 NUL은 올 수 없고
-	// (유효 JSON 문자열은 제어문자를 이스케이프), 실경로의 NUL은 \u0000 이스케이프 텍스트로 나타난다
-	// (최종 리뷰 C2). 둘 다 검사한다 — 리터럴 검사는 직조립 입력(테스트 등) 방어로 유지.
-	// ponytail: 부분열 검사라 \u0000 텍스트를 논하는 콘텐츠도 스킵된다(FP 허용, fail-open) —
-	// 정밀 판정은 v0.3 decode-sniff 후보.
-	if bytes.IndexByte(body, 0) != -1 || bytes.Contains(body, []byte(`\u0000`)) {
-		return // NUL(리터럴·이스케이프) = 비텍스트(바이너리) — 조용히 미저장
+	// D31 decode-sniff: body는 hook.Run 외부 파싱을 통과한 유효 JSON — 문자열 leaf를
+	// 재귀 수집해 디코드된 실바이트로 판정한다(C2 부분문자열 검사의 FP 상한 제거).
+	// 유효 JSON 전제에서 Unmarshal은 실패하지 않는다(실패는 직조립 입력 방어 — 조용히 스킵).
+	var decoded any
+	if json.Unmarshal(body, &decoded) != nil {
+		return
+	}
+	for _, leaf := range stringLeaves(decoded, nil) {
+		b := []byte(leaf)
+		// 전장 IndexByte가 필수다: NUL은 유효 UTF-8 코드포인트라 IsBinary의 utf8.Valid를
+		// 통과하고, IsBinary의 NUL 탐색은 첫 8KiB뿐 — late-NUL(기존 회귀 테스트
+		// TestShadowEscapedNULSkips의 20KB 뒤 니들)은 여기서만 잡힌다.
+		if bytes.IndexByte(b, 0) != -1 || ingest.IsBinary(b) {
+			return // leaf에 NUL·비텍스트 — 조용히 미저장(현행 관례 승계)
+		}
 	}
 
 	st, err := store.OpenContext(ctx, contentDir, false)
@@ -105,4 +113,22 @@ func shadowLimit(getenv func(string) string, key string, def int) int {
 		return v
 	}
 	return def
+}
+
+// stringLeaves — 디코드된 JSON 값에서 문자열 leaf를 전부 모은다(문자열·배열·객체 재귀,
+// 그 외 스칼라 무시). D31 판정 전용 — 저장 바이트는 원문 직렬화 그대로다.
+func stringLeaves(v any, acc []string) []string {
+	switch t := v.(type) {
+	case string:
+		acc = append(acc, t)
+	case []any:
+		for _, e := range t {
+			acc = stringLeaves(e, acc)
+		}
+	case map[string]any:
+		for _, e := range t {
+			acc = stringLeaves(e, acc)
+		}
+	}
+	return acc
 }
