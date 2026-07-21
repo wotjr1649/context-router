@@ -1841,6 +1841,20 @@ func readHookDrops(t *testing.T, dir string) string {
 	return string(b)
 }
 
+// assertOneDrop — drops.log이 정확히 1줄이고 그 줄이 want 토큰을 포함하는지 검증(deadline 게이트:
+// 사이드카는 드롭당 1줄 append이므로 스퓨리어스 추가 드롭이 있으면 줄 수로 잡힌다).
+func assertOneDrop(t *testing.T, dir, want string) {
+	t.Helper()
+	got := readHookDrops(t, dir)
+	lines := strings.Split(strings.TrimRight(got, "\n"), "\n")
+	if len(lines) != 1 {
+		t.Fatalf("drops=%d줄 want 1줄 (%q)", len(lines), got)
+	}
+	if !strings.Contains(lines[0], want) {
+		t.Fatalf("drops=%q want %q 포함", got, want)
+	}
+}
+
 // contentArtifactCount — contentDir/content.db(read-only)의 artifacts 행 수. 미존재(Shadow 미저장)면 -1.
 func contentArtifactCount(t *testing.T, contentDir string) int {
 	t.Helper()
@@ -1931,6 +1945,17 @@ func TestE2E_HookForcedChannel(t *testing.T) {
 			t.Fatalf("event_type %q count=%d want %d (all=%+v)", et, counts[et], n, counts)
 		}
 	}
+	// 스퓨리어스/예기치 못한 event_type 검출: 기대 카운트 합 == session_events 총 행 수.
+	wantTotal, gotTotal := 0, 0
+	for _, n := range want {
+		wantTotal += n
+	}
+	for _, n := range counts {
+		gotTotal += n
+	}
+	if gotTotal != wantTotal {
+		t.Fatalf("session_events 총 %d행 want %d (예기치 못한 event_type: all=%+v)", gotTotal, wantTotal, counts)
+	}
 	// content.db에 shadow 아티팩트 1건.
 	if n := contentArtifactCount(t, hookContentDir(t, storeRoot, proj)); n != 1 {
 		t.Fatalf("content artifacts=%d want 1 (shadow 미저장)", n)
@@ -1964,7 +1989,6 @@ func TestE2E_HookDeadlineDeterminism(t *testing.T) {
 		t.Skip("느린 E2E 스모크 — short 모드 skip")
 	}
 	bin := buildCtrBinary(t)
-	const maxElapsed = 3 * time.Second
 
 	// ① 동일 session.db에 BEGIN IMMEDIATE write txn 점유 → 후속 훅의 Append가 SQLite BUSY로
 	//    예산 안에 포기(append-failed). 부모 프로세스가 OS 파일락으로 write 락을 잡는다(WAL 단일 writer).
@@ -2001,12 +2025,12 @@ func TestE2E_HookDeadlineDeterminism(t *testing.T) {
 		if rc != 0 {
 			t.Fatalf("rc=%d want 0(fail-open)", rc)
 		}
-		if elapsed > maxElapsed {
+		// 단일 SQLite busy 대기는 ctx-blind라 busy_timeout(500ms)이 300ms 예산을 넘긴다(spawn 포함
+		// 계측 ≈1s). 상한은 2s — 옛 5초 하드 대기 회귀는 잡되 busy-wait 지배 경로에 여유를 둔다.
+		if elapsed > 2*time.Second {
 			t.Fatalf("deadline 미관측 의심 — %v 소요(5초 하드 대기 추정)", elapsed)
 		}
-		if got := readHookDrops(t, hookSessionDir(t, storeRoot, proj)); !strings.Contains(got, "append-failed") {
-			t.Fatalf("drops=%q want append-failed", got)
-		}
+		assertOneDrop(t, hookSessionDir(t, storeRoot, proj), "append-failed")
 	})
 
 	// ② 신규 DB의 session.init.lock을 exclusive 점유 → SessionStart 훅의 최초 WAL 전환 직렬화가
@@ -2029,12 +2053,11 @@ func TestE2E_HookDeadlineDeterminism(t *testing.T) {
 		if rc != 0 {
 			t.Fatalf("rc=%d want 0(fail-open)", rc)
 		}
-		if elapsed > maxElapsed {
+		// ctx-aware 대기 경로 — 예산 초과 즉시 포기(계측 ≈325ms). 상한 1s.
+		if elapsed > time.Second {
 			t.Fatalf("deadline 미관측 의심 — %v 소요", elapsed)
 		}
-		if got := readHookDrops(t, dbDir); !strings.Contains(got, "lease-held") {
-			t.Fatalf("drops=%q want lease-held(init-lock 대기 예산 초과)", got)
-		}
+		assertOneDrop(t, dbDir, "lease-held")
 	})
 
 	// ③ content store open-lock(content.db.rebuild.lock)을 exclusive 점유 → Shadow Recall의
@@ -2061,12 +2084,11 @@ func TestE2E_HookDeadlineDeterminism(t *testing.T) {
 		if rc != 0 {
 			t.Fatalf("rc=%d want 0(fail-open)", rc)
 		}
-		if elapsed > maxElapsed {
+		// ctx-aware 대기 경로 — 예산 초과 즉시 포기(계측 ≈323ms). 상한 1s.
+		if elapsed > time.Second {
 			t.Fatalf("deadline 미관측 의심 — %v 소요", elapsed)
 		}
-		if got := readHookDrops(t, hookSessionDir(t, storeRoot, proj)); !strings.Contains(got, "shadow-store") {
-			t.Fatalf("drops=%q want shadow-store", got)
-		}
+		assertOneDrop(t, hookSessionDir(t, storeRoot, proj), "shadow-store")
 	})
 }
 

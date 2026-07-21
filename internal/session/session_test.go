@@ -1134,6 +1134,34 @@ func TestOpenAppend_CoexistWithOpen(t *testing.T) {
 	}
 }
 
+// TestOpenAppend_CloseSkipsCheckpoint — F4: AppendDB.Close는 wal_checkpoint(TRUNCATE)를 하지
+// 않는다(단명 훅 latency 절감, WAL 정비는 서버·recover 몫 §2.3). guard 핸들이 붙어 있어(서버 상당,
+// 마지막-커넥션-close 자동 checkpoint/삭제 방지) 훅이 Append→Close해도 -wal 프레임이 남아야 한다.
+// 옛 Close라면 idle guard 뒤에서 TRUNCATE가 -wal을 0으로 잘라 이 검사가 실패한다.
+func TestOpenAppend_CloseSkipsCheckpoint(t *testing.T) {
+	dir := t.TempDir()
+	_ = openAppendT(t, dir, AppendOptions{ExternalSessionID: testCCSessionID, Producer: "guard"}) // 장수 커넥션 유지(cleanup까지)
+
+	hook, err := OpenAppend(context.Background(), dir, AppendOptions{ExternalSessionID: testCCSessionID, Producer: "hook"})
+	if err != nil {
+		t.Fatalf("OpenAppend: %v", err)
+	}
+	if _, _, _, err := hook.Append(context.Background(), Event{Type: "note", Summary: "x"}); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+	if err := hook.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	fi, statErr := os.Stat(filepath.Join(dir, dbFileName) + "-wal")
+	if statErr != nil {
+		t.Fatalf("-wal stat: %v (Close가 checkpoint(TRUNCATE)로 삭제한 것으로 의심)", statErr)
+	}
+	if fi.Size() == 0 {
+		t.Fatal("-wal size=0 — AppendDB.Close가 checkpoint(TRUNCATE)를 돌린 흔적(생략해야 함)")
+	}
+}
+
 // corruptEventsRootHeader — session_events b-tree 루트 페이지의 **헤더(오프셋 0: 페이지 타입
 // 바이트)**를 훼손한다. seedAndCorruptEvents(오프셋 +50, 셀 영역)은 quick_check(전수 스캔)는
 // 잡지만 append의 오른쪽-끝 삽입 경로는 우회할 수 있어 INSERT가 성공해 버린다 — 페이지 타입

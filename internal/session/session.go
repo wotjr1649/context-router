@@ -904,14 +904,16 @@ func (ad *AppendDB) Append(ctx context.Context, ev Event) (id int64, eventID str
 	return appendEvent(ctx, ad.writer, ad.sessionID, ev)
 }
 
-// Close — writer/reader를 닫고 lifetime lease를 해제한다(DB.Close와 동형). leaseRelease는
-// idempotent가 아니므로 한 핸들당 정확히 1회만 호출해야 한다.
+// Close — writer/reader를 닫고 lifetime lease를 해제한다. DB.Close와 달리 wal_checkpoint를
+// 하지 않는다 — 매 툴 호출마다 도는 단명 훅이 TRUNCATE checkpoint하면 서버 read txn과 겹칠 때
+// busy_timeout(500ms)까지 대기해(게다가 deadline ctx 밖) 훅 latency만 부풀린다. WAL 정비는
+// 장수 서버(DB.Close)·recover 경로의 몫이다(설계 §2.3). leaseRelease는 idempotent가 아니므로
+// 한 핸들당 정확히 1회만 호출해야 한다.
 func (ad *AppendDB) Close() error {
-	_, checkpointErr := ad.writer.Exec("PRAGMA wal_checkpoint(TRUNCATE)")
 	readerErr := ad.reader.Close()
 	writerErr := ad.writer.Close()
 	ad.leaseRelease()
-	return errors.Join(checkpointErr, readerErr, writerErr)
+	return errors.Join(readerErr, writerErr)
 }
 
 // sanitizeIOErr — store.go의 동명 헬퍼와 동일 관례(리터럴 복제, unexported라 import 불가):
