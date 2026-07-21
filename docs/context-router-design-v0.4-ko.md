@@ -46,7 +46,8 @@
   우연을 의도된 계층으로 승격하는 결정이다(§4).
 - **D38** store 용량 임계 경고: doctor [14]에 **content.db CAS 전체 blob
   총량**(shadow 전용 아님 — [14]의 측정 실체 그대로) 임계 초과 시 경고 1줄
-  추가(기본 100MB, `CTR_SHADOW_WARN_BYTES` 오버라이드). 자동 삭제 없음.
+  추가(기본 100MiB, `CTR_STORE_WARN_BYTES` 오버라이드 — v0.5 개명: 구
+  `CTR_SHADOW_WARN_BYTES`, 측정 실체 정합·별칭 없음). 자동 삭제 없음.
   경고 문구는 수동 구제 경로(purge 계열 CLI)를 안내하되 **현행 purge의
   비선택(source_kind 무구분) 삭제 성격을 병기**한다. SizeStats 실패([14]
   "없음") 시 경고 미평가. shadow 귀속 바이트 집계·hook 전용 purge는 v0.5+
@@ -185,7 +186,7 @@
 
 - doctor [14] 행 뒤에 조건부 경고 1줄: **content.db CAS 전체 blob 총량**
   (shadow 전용 아님 — 명시 ingest 포함, [14] 측정 실체 그대로) > 임계
-  (기본 100MB, `CTR_SHADOW_WARN_BYTES` 파싱 실패·비양수 → 기본값) 시에만
+  (기본 100MiB, `CTR_STORE_WARN_BYTES` 파싱 실패·비양수 → 기본값) 시에만
   출력. 문구는 총량 현황 + 수동 구제 경로(purge 계열 CLI) 안내 + **현행
   purge의 비선택 삭제 성격**(source_kind 무구분 — shadow만 골라 지울 수
   없음)을 함께 명시. SizeStats 실패([14] "없음", ro-open 경합 등) 시 경고
