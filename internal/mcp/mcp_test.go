@@ -1638,7 +1638,7 @@ func TestRecordEventRoundTrip(t *testing.T) {
 // attributes 4097B·refs 17개) → INVALID_ARGUMENT. 개별 필드는 상한 이내인데 총합만 8KB를
 // 넘는 경우도 별도로 검증한다.
 func TestRecordEventCapViolations(t *testing.T) {
-	cs, _, _, _ := newRecordEventTestServer(t)
+	cs, st, _, _ := newRecordEventTestServer(t)
 
 	tests := []struct {
 		name string
@@ -1669,20 +1669,41 @@ func TestRecordEventCapViolations(t *testing.T) {
 		recordEventErrPrefix(t, cs, in, codeInvalidArgument)
 	})
 
-	// C5: 개별 필드·related는 상한 이내이고 refs 없이는 총합 7000B(≤8192)로 통과하지만,
-	// 해석될 artifact URI(119B×16=1904)를 더하면 8904B로 초과해야 한다. refs가 계상되지 않으면
-	// 7000B로 통과해 이 테스트가 실패하므로, 가산 회귀를 정확히 잡는다(refs는 해석 전 거부되어
-	// 실재하지 않아도 됨).
+	// C5(T3): refs 바이트 가산(session.ValidateEvent)이 실제로 계상되는지 게이트한다. 소계 7000B는
+	// refs 없이 통과(≤8192)하지만, 실재 artifact로 해석된 URI 16개(각 ≥83B)를 더하면 8192B를 넘어
+	// 거부돼야 한다 — refs 가산만이 판정을 뒤집는다. (refs는 바이트 합산 전에 resolve되므로 미등록
+	// store의 id 0 refs로는 합산 전 거부돼 가산을 행사하지 못한다 → 반드시 실재 id를 등록해 쓴다.)
 	t.Run("total_8KB_with_artifact_uris", func(t *testing.T) {
-		item := "https://example.com/" + strings.Repeat("a", 474-len("https://example.com/")) // 474B×2 = 948
-		in := RecordEventInput{
-			EventType:        "note",                          // 4
-			Summary:          strings.Repeat("s", 2048),       // 2048
-			Attributes:       mapAttrsOfSize(4000),            // 4000
-			RelatedResources: []string{item, item},            // 948 → 소계 7000
-			ArtifactRefs:     make([]int64, maxRefsOrRelated), // +119×16 = 1904 → 8904
+		id, err := st.Register(context.Background(), store.Registration{
+			StoredBytes: []byte("ref body"), MediaType: "text/plain",
+			Source: store.SourceMeta{URI: "/ref.txt", Kind: "file", SrcHash: "refh"},
+		})
+		if err != nil {
+			t.Fatalf("register: %v", err)
 		}
-		recordEventErrPrefix(t, cs, in, codeInvalidArgument)
+		refs := make([]int64, maxRefsOrRelated) // 동일 실재 id 16개 — URI 길이 동일, 16×≥83B 가산
+		for i := range refs {
+			refs[i] = id
+		}
+		item := "https://example.com/" + strings.Repeat("a", 474-len("https://example.com/")) // 474B×2 = 948
+		base := RecordEventInput{
+			EventType:        "note",                    // 4
+			Summary:          strings.Repeat("s", 2048), // 2048
+			Attributes:       mapAttrsOfSize(4000),      // 4000
+			RelatedResources: []string{item, item},      // 948 → 소계 7000(≤8192)
+		}
+		// refs 없이는 통과 — 소계가 상한 이내임을 고정(without-refs sibling).
+		res, err := cs.CallTool(context.Background(), &mcp.CallToolParams{Name: "ctr_record_event", Arguments: base})
+		if err != nil {
+			t.Fatalf("call(no refs): %v", err)
+		}
+		if res.IsError {
+			t.Fatalf("refs 없이 거부됨(소계 7000B는 통과해야 함): %+v", res.Content)
+		}
+		// refs 16개를 더하면 초과 거부 — 가산 회귀(session.go refs 합산 루프 삭제)를 정확히 잡는다.
+		withRefs := base
+		withRefs.ArtifactRefs = refs
+		recordEventErrPrefix(t, cs, withRefs, codeInvalidArgument)
 	})
 }
 
