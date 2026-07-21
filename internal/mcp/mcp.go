@@ -25,7 +25,7 @@ import (
 	"github.com/wotjr1649/context-router/internal/transform"
 )
 
-const serverVersion = "0.2.0"
+const serverVersion = "0.3.0"
 
 // Config — Serve/NewServer 입력 (설계 §4, §8).
 type Config struct {
