@@ -206,6 +206,20 @@ func TestHookBadSessionID(t *testing.T) {
 	}
 }
 
+// ④-b cwd가 실재하지 않으면(worktree 미식별) → drop(bad-cwd), 세션 DB 미생성. bad-session-id와
+// 마찬가지로 세션 dir 도출 전 단계라 storeRoot 레벨 drops.log에 기록된다(hook.go 순서).
+func TestHookBadCWD(t *testing.T) {
+	storeRoot := filepath.Join(t.TempDir(), "storeroot")
+	cwd := t.TempDir()
+	in := fixtureWith(t, "sessionstart.json", map[string]any{"cwd": filepath.Join(cwd, "no-such-dir")})
+	if rc := runHook(t, storeRoot, in, nil); rc != 0 {
+		t.Fatalf("rc=%d want 0", rc)
+	}
+	if got := readDrops(t, storeRoot); !strings.Contains(got, "bad-cwd") {
+		t.Fatalf("drops=%q want bad-cwd", got)
+	}
+}
+
 // ⑤ stdin 파싱 불능(잘린 JSON) → 0 반환 + drops(bad-input).
 func TestHookBadInput(t *testing.T) {
 	storeRoot := filepath.Join(t.TempDir(), "storeroot")
@@ -821,6 +835,35 @@ func TestShadowStoreLockDeadline(t *testing.T) {
 	}
 	if got := readDrops(t, sdir); !strings.Contains(got, "shadow-store") {
 		t.Fatalf("drops=%q want shadow-store", got)
+	}
+}
+
+// ⑪ store open은 성공하지만 ingest.Run이 실패하면 → 미저장 + drops(shadow-ingest). 취소된 ctx를
+// 쓴다: lockStoreCtx는 락이 한가하면 첫 tryLockFile에서 ctx 검사 없이 즉시 성공하므로 OpenContext는
+// 취소 ctx에서도 통과하고, ingest.Run 첫 줄 ctx.Err()가 실패를 낸다(shadow-ingest 경로의 결정적 트리거).
+func TestShadowIngestDrops(t *testing.T) {
+	_, _, contentDir, sdir := shadowSetup(t)
+	ad, err := session.OpenAppend(context.Background(), sdir, session.AppendOptions{
+		ExternalSessionID: "cc:3f2504e0-4f89-41d3-9a0c-0305e82c3301",
+		Producer:          "context-router/test",
+	})
+	if err != nil {
+		t.Fatalf("OpenAppend: %v", err)
+	}
+	defer func() { _ = ad.Close() }()
+	// MIN 통과·유효 JSON·비바이너리 leaf여야 store open까지 도달한다(그다음이 ingest 실패 지점).
+	body := append(append([]byte{'"'}, bytes.Repeat([]byte("a"), 20000)...), '"') // JSON 문자열 리터럴
+	in := hookInput{HookEventName: "PostToolUse", ToolName: "Bash", ToolResponse: json.RawMessage(body)}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // ingest.Run 진입 즉시 ctx.Err()로 실패
+	shadowCapture(ctx, ad, in, sdir, contentDir, "cc:3f2504e0-4f89-41d3-9a0c-0305e82c3301", func(string) string { return "" })
+
+	if n := contentArtifacts(t, contentDir); n > 0 {
+		t.Fatalf("artifacts=%d want 0/-1(ingest 실패로 미저장)", n)
+	}
+	if got := readDrops(t, sdir); !strings.Contains(got, "shadow-ingest") {
+		t.Fatalf("drops=%q want shadow-ingest", got)
 	}
 }
 

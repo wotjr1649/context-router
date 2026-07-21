@@ -380,6 +380,7 @@ func runUsage(ctx context.Context, w io.Writer, args []string, storeRoot, projec
 	fs := flag.NewFlagSet("usage", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	transcripts := fs.String("transcripts", "", "Claude Code transcript 디렉터리(생략 시 cwd에서 유도)")
+	totals := fs.Bool("totals", false, "본표 뒤 hooks:on/off 그룹 집계 2행 추가(설계 v0.3 §5)")
 	if err := fs.Parse(args); err != nil {
 		return fmt.Errorf("usage: 플래그 파싱 실패: %w", err)
 	}
@@ -404,6 +405,7 @@ func runUsage(ctx context.Context, w io.Writer, args []string, storeRoot, projec
 	ccSet := loadCCSessions(ctx, storeRoot, projectRoot)
 
 	fmt.Fprintln(w, "session\tinput\toutput\tcache_read\tcache_creation\trecords\thooks")
+	var onSum, offSum usageSums // --totals 그룹 누적(hooks:on/off) — 열 구조 불변, 세션 수는 미표시
 	for _, e := range entries { // os.ReadDir는 파일명 오름차순 정렬을 보장(결정론)
 		if e.IsDir() || !strings.HasSuffix(e.Name(), ".jsonl") {
 			continue
@@ -414,10 +416,23 @@ func runUsage(ctx context.Context, w io.Writer, args []string, storeRoot, projec
 		}
 		uuid := strings.TrimSuffix(e.Name(), ".jsonl")
 		hooks := "hooks:off"
+		grp := &offSum
 		if ccSet["cc:"+uuid] {
 			hooks = "hooks:on"
+			grp = &onSum
 		}
+		grp.input += s.input
+		grp.output += s.output
+		grp.cacheRead += s.cacheRead
+		grp.cacheCreate += s.cacheCreate
+		grp.records += s.records
 		fmt.Fprintf(w, "%s\t%d\t%d\t%d\t%d\t%d\t%s\n", uuid, s.input, s.output, s.cacheRead, s.cacheCreate, s.records, hooks)
+	}
+	// --totals: 본표 뒤에 그룹 합계 2행만 덧붙인다(무플래그 출력은 byte-for-byte 불변 — 설계 §8 게이트).
+	// session 열=그룹 라벨, hooks 열=그룹 라벨, 나머지 5열=토큰·records 합계(열 구조 불변).
+	if *totals {
+		fmt.Fprintf(w, "TOTAL:hooks:on\t%d\t%d\t%d\t%d\t%d\thooks:on\n", onSum.input, onSum.output, onSum.cacheRead, onSum.cacheCreate, onSum.records)
+		fmt.Fprintf(w, "TOTAL:hooks:off\t%d\t%d\t%d\t%d\t%d\thooks:off\n", offSum.input, offSum.output, offSum.cacheRead, offSum.cacheCreate, offSum.records)
 	}
 	return nil
 }

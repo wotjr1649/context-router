@@ -3,8 +3,10 @@ package cli
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -182,4 +184,106 @@ func usageRowFor(out, uuid string) string {
 		}
 	}
 	return ""
+}
+
+// seedCCSession — cc:<uuid> 세션을 session.db에 시드한다(hook 런타임과 동일한 OpenAppend+
+// EnsureSession 경로 — usage의 hooks:on 표기 조건). 여러 번 호출하면 여러 cc: 세션이 쌓인다.
+func seedCCSession(t *testing.T, storeRoot, projectRoot, uuid string) {
+	t.Helper()
+	canon, err := ident.Canonicalize(projectRoot)
+	if err != nil {
+		t.Fatalf("canon: %v", err)
+	}
+	sessDir := filepath.Join(storeRoot, "projects", canon.ProjectID, "worktrees", canon.WorktreeID)
+	ad, err := session.OpenAppend(context.Background(), sessDir, session.AppendOptions{ExternalSessionID: "cc:" + uuid, Producer: "test", RetentionSec: 0})
+	if err != nil {
+		t.Fatalf("OpenAppend %s: %v", uuid, err)
+	}
+	if _, err := ad.EnsureSession(context.Background(), "startup", ""); err != nil {
+		t.Fatalf("EnsureSession %s: %v", uuid, err)
+	}
+	if err := ad.Close(); err != nil {
+		t.Fatalf("Close %s: %v", uuid, err)
+	}
+}
+
+// runUsageString — usage 서브명령을 tdir·extra 플래그로 실행하고 stdout 전문을 돌려준다.
+func runUsageString(t *testing.T, storeRoot, projectRoot, tdir string, extra ...string) string {
+	t.Helper()
+	args := append([]string{"--transcripts", tdir}, extra...)
+	var out, errOut bytes.Buffer
+	if err := Run(context.Background(), "usage", args, storeRoot, projectRoot, "0.0.1-dev", false, "", &out, &errOut); err != nil {
+		t.Fatalf("Run usage err=%v out=%s", err, out.String())
+	}
+	return out.String()
+}
+
+// totalRowFrom — plain 본표의 세션 행(7열)을 파싱해 label(hooks:on|off) 그룹의 토큰·records
+// 합계를 계산하고 runUsage가 찍을 TOTAL 행 문자열을 조립한다(단정을 하드코딩 아닌 실측 합산으로).
+func totalRowFrom(plain, label string) string {
+	var c [5]int64
+	for _, ln := range strings.Split(plain, "\n") {
+		f := strings.Split(ln, "\t")
+		if len(f) != 7 || f[0] == "session" || f[6] != label {
+			continue
+		}
+		for i := 0; i < 5; i++ {
+			v, _ := strconv.ParseInt(f[1+i], 10, 64)
+			c[i] += v
+		}
+	}
+	return fmt.Sprintf("TOTAL:%s\t%d\t%d\t%d\t%d\t%d\t%s\n", label, c[0], c[1], c[2], c[3], c[4], label)
+}
+
+// TestUsage_TotalsFlag: D33 — --totals가 hooks:on/off 그룹 합계 2행을 덧붙이고, 플래그가 없으면
+// 출력이 byte-for-byte 불변이어야 한다(행=세션 1:1 계약 유지, 이중 집계 방지, 설계 §8 게이트).
+func TestUsage_TotalsFlag(t *testing.T) {
+	storeRoot := t.TempDir()
+	projectRoot := t.TempDir()
+
+	// hooks:on 2세션(cc: 시드) + hooks:off 1세션 — on 그룹에 2세션을 둬서 합산이 다중 세션을
+	// 가로질러 맞는지 검증한다(단일 세션이면 열 합산 버그를 못 잡는다).
+	onUUID1 := "aaaaaaaa-0000-0000-0000-0000000000a1"
+	onUUID2 := "bbbbbbbb-0000-0000-0000-0000000000b2"
+	offUUID := "cccccccc-0000-0000-0000-0000000000c3"
+	seedCCSession(t, storeRoot, projectRoot, onUUID1)
+	seedCCSession(t, storeRoot, projectRoot, onUUID2)
+
+	tdir := t.TempDir()
+	writeUsageTranscript(t, tdir, onUUID1, []string{
+		`{"type":"assistant","message":{"usage":{"input_tokens":100,"output_tokens":20,"cache_read_input_tokens":5,"cache_creation_input_tokens":1}}}`,
+	})
+	writeUsageTranscript(t, tdir, onUUID2, []string{
+		`{"type":"assistant","message":{"usage":{"input_tokens":50,"output_tokens":4,"cache_read_input_tokens":3,"cache_creation_input_tokens":0}}}`,
+	})
+	writeUsageTranscript(t, tdir, offUUID, []string{
+		`{"type":"assistant","message":{"usage":{"input_tokens":7,"output_tokens":3,"cache_read_input_tokens":2,"cache_creation_input_tokens":9}}}`,
+	})
+
+	// os.ReadDir는 파일명 오름차순 정렬을 보장 → aaaa < bbbb < cccc 순.
+	wantPlain := strings.Join([]string{
+		"session\tinput\toutput\tcache_read\tcache_creation\trecords\thooks",
+		onUUID1 + "\t100\t20\t5\t1\t1\thooks:on",
+		onUUID2 + "\t50\t4\t3\t0\t1\thooks:on",
+		offUUID + "\t7\t3\t2\t9\t1\thooks:off",
+		"",
+	}, "\n")
+
+	// 기본 출력 불변은 byte-for-byte로 고정한다 — "TOTAL 부재"만 검사하면 헤더·열 순서·행 형식
+	// 회귀를 놓친다(설계 §8 게이트).
+	if outPlain := runUsageString(t, storeRoot, projectRoot, tdir); outPlain != wantPlain {
+		t.Fatalf("무플래그 출력 회귀:\n got %q\nwant %q", outPlain, wantPlain)
+	}
+
+	outTotals := runUsageString(t, storeRoot, projectRoot, tdir, "--totals")
+	if !strings.HasPrefix(outTotals, wantPlain) {
+		t.Fatalf("--totals 본표 prefix가 기본 출력과 다름:\n%s", outTotals)
+	}
+	// 본표 뒤(suffix)에 두 TOTAL 행이 각각의 그룹 실측 합계로 등장해야 한다(열 1~5 정확성 포함).
+	suffix := outTotals[len(wantPlain):]
+	for _, label := range []string{"hooks:on", "hooks:off"} {
+		if want := totalRowFrom(wantPlain, label); !strings.Contains(suffix, want) {
+			t.Fatalf("--totals 출력에 기대 TOTAL 행 %q 부재:\n%s", want, suffix)
+		}
+	}
 }
