@@ -23,6 +23,9 @@ shadow URI 콘텐츠 해시 키, 재귀 leaf decode-sniff, Bash 단일파일 덤
 - 브랜치: `feat/v0.3-reliability` (Task 1 시작 전 main에서 생성). 리뷰 BASE는
   SDD ledger의 태스크별 기록 기준(`HEAD~1` 금지).
 - 소스 주석은 한국어, 기존 밀도·어조 유지. `ponytail:` 주석 관례 유지.
+- **`git add -A` 금지** — 이 저장소 작업 트리에는 untracked 로컬 도그푸딩 설정
+  (`.claude/settings.json`)이 있다. 커밋은 명시 경로 stage만, 커밋 전
+  `git status --short`로 staged 목록 확인.
 - 설계서 문면과 어긋나는 발견 시: 구현을 설계에 맞추지 말고 **중단 후 보고**
   (T0-style verify-then-halt).
 
@@ -130,10 +133,22 @@ func TestRunInline_HookShadowURI(t *testing.T) {
 }
 ```
 
-- [ ] **Step 2: 실패 확인**
+추가 단정 2건을 같은 테스트(또는 인접 신규 테스트)에 넣는다:
+① `rep, _ := Run(...)`의 반환으로 `strings.HasSuffix(uri, rep.Hash)` — URI suffix가
+**저장본** content_hash와 일치(raw srcHash를 잘못 쓰면 여기서 잡힌다). ② 기존
+redact 테스트 니들(anchor: `grep -n "Redact" internal/ingest/ingest_test.go` —
+분할 리터럴 관례 준수)을 hook kind로 투입해 raw≠stored인 입력에서도 suffix ==
+`rep.Hash`.
+
+- [ ] **Step 2: 실패 확인 + 기존 테스트 갱신 목록 확정**
 
 Run: `go test -p 1 ./internal/ingest -run TestRunInline_HookShadowURI -v`
 Expected: FAIL — `want 2 shadow rows, got 0` (현행은 `inline:Bash` 단일 행 clobber).
+
+**기존 테스트 갱신(필수)**: `TestSourceKindHookFlows`(ingest_test.go:777 부근)는
+hook 결과를 `uri="inline:Read"`로 조회한다 — D30 적용 즉시 깨진다. `Run` 반환
+`rep.Hash`를 받아 `"shadow:Read:"+rep.Hash`로 조회하도록 갱신하고, 같은 테스트의
+비-hook `inline:Other` 단정(787행 부근)은 **그대로 유지**한다.
 
 - [ ] **Step 3: 최소 구현** — `runInline`의 URI 조립·해시 중복 제거:
 
@@ -199,7 +214,7 @@ func TestQuery_HitSourceShadowCoexist(t *testing.T) {
 	}
 	reg("shadow:Bash:"+strings.Repeat("ab", 32), "hook") // 역순 등록 — 삽입순 우연 배제
 	reg("inline:Bash", "hook")
-	res, err := Query(t.Context(), st, "", []string{"needle"}, 3)
+	res, err := Query(t.Context(), st, "", []string{"needle"}, 3, 0) // 실 시그니처 6인자(limit, budgetBytes=0 무제한)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -217,7 +232,7 @@ func TestQuery_HitSourceShadowCoexist(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	res2, err := Query(t.Context(), st, "", []string{"needle2"}, 3)
+	res2, err := Query(t.Context(), st, "", []string{"needle2"}, 3, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -270,35 +285,41 @@ git commit -m "feat(v0.3): D30 shadow URI 콘텐츠 해시 키 — hook 전용 s
 Run: `go test -p 1 ./internal/ingest` → PASS (rename만).
 
 - [ ] **Step 2: 실패하는 테스트 작성** — shadow 게이트 테스트(기존 shadow 테스트
-파일의 헬퍼·픽스처 관례를 재사용해 다음 3케이스 추가):
+파일의 헬퍼·픽스처 관례를 재사용해 4케이스 추가). **유일한 RED 반전은 (a)다** —
+현행 게이트는 리터럴 NUL과 escape-text를 **둘 다** 거부하므로(shadow.go:52),
+"현행 저장·신코드 거부"인 입력은 존재하지 않는다. (b)(d)는 both-reject 컨트롤.
 
 ```go
 // TestShadow_DecodeSniff: D31 — (a) NUL 이스케이프 시퀀스를 텍스트로 "논하는"
-// 정상 콘텐츠(C2 FP 사례)는 이제 저장되고, (b) 디코드된 leaf에 실제 NUL이 있는
-// 객체 응답은 미저장이며, (c) {stdout,stderr} 객체 fixture의 정상 대용량 출력은
-// 저장된다. NUL leaf 니들은 소스에 리터럴 제어 바이트를 두지 않기 위해 런타임
-// 조립한다(string(rune(0)) — Edit 도구 이스케이프 함정 회피).
+// 정상 콘텐츠(C2 FP 사례)는 이제 저장된다(유일한 동작 변화). (b) escape가 디코드
+// 되어 leaf에 실 NUL이 생기는 객체 응답과 (d) 배열 leaf 속 NUL은 전후 모두 미저장
+// (컨트롤 — 회귀 방지). (c) {stdout,stderr} 정상 객체는 저장. 니들의 escape
+// 시퀀스는 소스에 그대로 두지 말고 반드시 런타임 조립(`+"\\"+"u0000"+`)한다 —
+// 파일 편집 도구의 \uXXXX 디코드 함정으로 실 제어 바이트가 박히는 사고 방지.
 func TestShadow_DecodeSniff(t *testing.T) {
-	// (a) FP 사례: 본문이 백슬래시-u-0-0-0-0 텍스트를 담는 JSON 문자열 — 저장 기대.
-	fpBody := `"discussing the ` + `\\` + `u0000 escape in prose ` + strings.Repeat("pad ", 5000) + `"`
-	// (b) 실 NUL leaf: 디코드하면 leaf 안에 실제 NUL 바이트 — 미저장 기대.
-	nulBody := `{"stdout":"abc` + ` ` + `def` + strings.Repeat("pad ", 5000) + `","stderr":""}`
-	// (c) 정상 객체 fixture — 저장 기대.
+	esc := "\\" + "u0000" // 런타임 조립 — 소스 바이트에는 escape 텍스트만 존재
+	// (a) FP 사례: escape를 "논하는" 산문 — 저장 기대(RED: 현행은 부분문자열 검사로 거부).
+	fpBody := `"discussing the ` + esc + ` escape in prose ` + strings.Repeat("pad ", 5000) + `"`
+	// (b) stdout leaf가 escape를 담아 디코드 후 실 NUL — 전후 모두 미저장(컨트롤).
+	nulBody := `{"stdout":"abc` + esc + `def` + strings.Repeat("pad ", 5000) + `","stderr":""}`
+	// (c) 정상 객체 fixture — 저장 기대(전후 동일).
 	okBody := `{"stdout":"` + strings.Repeat("line ", 5000) + `","stderr":""}`
+	// (d) 배열 leaf 속 NUL — []any 재귀 누락을 잡는 게이트(설계 §8 D31).
+	arrBody := `["ok` + strings.Repeat("pad ", 5000) + `","x` + esc + `y"]`
 	// 각 body를 기존 shadowCapture 테스트 하네스로 투입하고 저장/미저장을
 	// content.db 행 수·drops 부재로 단정한다(기존 케이스의 단정 방식 복사).
-	_ = fpBody; _ = nulBody; _ = okBody // 실제 단정은 기존 하네스 관례로 작성
+	_ = fpBody; _ = nulBody; _ = okBody; _ = arrBody // 단정은 기존 하네스 관례로
 }
 ```
 
-주의: (b)의 ` `은 **Go 소스의 이스케이프 문자열 리터럴**(백틱 아닌 큰따옴표
-문자열 안 ` `)로 두면 컴파일 시 실 NUL이 되어 의도대로 leaf에 들어간다 —
-단 파일 편집 도구로 쓸 때는 `"abc" + string(rune(0)) + "def"` 런타임 조립로
-우회할 것(위 스케치의 문자열 연결 표기는 그 지시다).
+주의(함정 재발 방지): 위 `esc` 런타임 조립을 풀어 쓰지 말 것. 계획·소스 어디에도
+실 제어 바이트가 들어가면 안 된다(파일이 binary 판정되고 Go 컴파일이 깨진다).
+(b)의 raw JSON은 **출력 가능한 escape 텍스트**를 담고, Unmarshal이 그것을 leaf 내
+실 NUL로 바꾼다 — 그 leaf를 전장 검사로 거부하는 것이 D31 경로다.
 
 Run: `go test -p 1 ./internal/hook -run TestShadow_DecodeSniff -v`
-Expected: FAIL — (a)가 현행 부분문자열 검사에 걸려 미저장(C2 FP), (b)는 통과되어
-저장됨(현행은 escape-text만 검사, leaf 디코드 안 함) — 둘 다 역전이어야 함.
+Expected: FAIL — (a)만 역전(현행 escape-text 부분문자열 검사가 거부 → 신코드는
+저장). (b)(c)(d)는 전후 동일 거동이어야 하며 RED 단계에서도 통과가 정상.
 
 - [ ] **Step 3: 구현** — `shadow.go` 47~54행 블록을 교체:
 
@@ -311,11 +332,19 @@ Expected: FAIL — (a)가 현행 부분문자열 검사에 걸려 미저장(C2 F
 		return
 	}
 	for _, leaf := range stringLeaves(decoded, nil) {
-		if ingest.IsBinary([]byte(leaf)) {
+		b := []byte(leaf)
+		// 전장 IndexByte가 필수다: NUL은 유효 UTF-8 코드포인트라 IsBinary의 utf8.Valid를
+		// 통과하고, IsBinary의 NUL 탐색은 첫 8KiB뿐 — late-NUL(기존 회귀 테스트
+		// TestShadowEscapedNULSkips의 20KB 뒤 니들)은 여기서만 잡힌다.
+		if bytes.IndexByte(b, 0) != -1 || ingest.IsBinary(b) {
 			return // leaf에 NUL·비텍스트 — 조용히 미저장(현행 관례 승계)
 		}
 	}
 ```
+
+(`bytes` import는 그대로 유지된다 — 전장 NUL 검사가 계속 사용. 기존
+`TestShadowEscapedNULSkips`는 수정 없이 GREEN 유지가 게이트다: escape 텍스트가
+디코드되어 leaf 20KB 뒤 실 NUL이 되고, 전장 검사가 거부한다.)
 
 파일 하단에 헬퍼 추가:
 
@@ -363,83 +392,135 @@ git commit -m "feat(v0.3): D31 재귀 leaf decode-sniff — C2 FP 상한 제거,
 
 **Interfaces:**
 - Consumes: `guardReadMax`(동일 임계 재사용), `ingest.Run` 4조건 판정(guardRead 관례), `denyTool`.
-- Produces: `bashDumpPath(command string) string`(판정 성립 시 절대경로, 불성립 `""`),
+- Produces: `bashDumpArg(command string) string`(어휘 판정 — 후보 경로 인자 또는 `""`),
+  `dumpAbsPath(goos, arg string) string`(OS 절대경로 정규화 — goos 테스트 주입점),
   `guardBash(ctx, ad, in, dir, contentDir, worktreeRoot, getenv, stdout)`(guardRead 동형 시그니처),
-  `denyTool(ctx, ad, in, dir, toolName, filePath, size, stdout)`(구 denyRead 일반화).
+  `denyTool(ctx, ad, in, dir, toolName, detail string, stdout)`(구 denyRead 일반화).
 
-- [ ] **Step 1: 실패하는 테스트 작성** — `bashDumpPath` 단위 테스트:
+- [ ] **Step 1: 실패하는 테스트 작성** — `bashDumpArg`/`dumpAbsPath` 단위 테스트:
 
 ```go
-// TestBashDumpPath: D32 정적 판정 — 단일 단순 `cat <절대경로>`만 경로를 반환하고
+// TestBashDumpArg: D32 어휘 판정 — 단일 단순 `cat <경로>`만 경로 인자를 반환하고
 // 나머지는 전부 ""(allow). 오탐 deny 차단이 목적이므로 거부 케이스가 본론이다.
-func TestBashDumpPath(t *testing.T) {
+func TestBashDumpArg(t *testing.T) {
 	cases := []struct{ cmd, want string }{
 		{"cat /c/big/file.log", "/c/big/file.log"},
-		{"cat C:/big/file.log", "C:/big/file.log"},
-		{"cat file.log", ""},              // 상대경로 — cwd 불확정, 판정 제외(설계 §4)
-		{"cat -n /c/f", ""},               // 옵션 — 제외
-		{"cat /c/a /c/b", ""},             // 인자 2개 — 제외
-		{"cat /c/f | head", ""},           // 파이프 — 제외
-		{"cat /c/f > /c/g", ""},           // 리다이렉트 — 제외
-		{"cat /c/f; ls", ""},              // 체이닝 — 제외
-		{"cat \"/c/f\"", ""},              // 인용 — 제외(보수)
-		{"cat /c/with\\ space", ""},       // 백슬래시 — 제외(bash가 소비, 정적 판정 불가)
-		{"type /c/big/file.log", ""},      // bash type=명령 조회, 덤프 아님
-		{"tac /c/f", ""},                  // cat 외 명령 — 제외
+		{"cat C:/big/file.log", "C:/big/file.log"}, // 절대 여부는 dumpAbsPath 몫
+		{"cat file.log", "file.log"},               // 어휘상 후보 — 절대 판정에서 탈락
+		{"cat -n /c/f", ""},                        // 옵션 — 제외
+		{"cat /c/a /c/b", ""},                      // 인자 2개 — 제외
+		{"cat /c/f | head", ""},                    // 파이프 — 제외
+		{"cat /c/f > /c/g", ""},                    // 리다이렉트 — 제외
+		{"cat /c/f; ls", ""},                       // 체이닝 — 제외
+		{"cat \"/c/f\"", ""},                       // 인용 — 제외(보수)
+		{"cat /c/with\\ space", ""},                // 백슬래시 — 제외(bash가 소비)
+		{"cat /c/f", ""},                      // NBSP — bash IFS와 달리 Fields가 쪼갬 → 비ASCII 전면 거부
+		{"cat /c/a!b", "/c/a!b"},                   // ! — 비대화형 bash에서 리터럴, 허용
+		{"cat /c/~backup", ""},                     // ~ 전면 배제 — 의도적 미탐(allow 편향)
+		{"type /c/big/file.log", ""},               // bash type=명령 조회, 덤프 아님
+		{"tac /c/f", ""},                           // cat 외 명령 — 제외
 		{"", ""},
 	}
 	for _, c := range cases {
-		if got := bashDumpPath(c.cmd); got != c.want {
-			t.Fatalf("bashDumpPath(%q)=%q want %q", c.cmd, got, c.want)
+		if got := bashDumpArg(c.cmd); got != c.want {
+			t.Fatalf("bashDumpArg(%q)=%q want %q", c.cmd, got, c.want)
+		}
+	}
+}
+
+// TestDumpAbsPath: OS별 절대경로 정규화 — goos 주입으로 양쪽 분기를 한 OS에서 검증.
+func TestDumpAbsPath(t *testing.T) {
+	cases := []struct{ goos, arg, want string }{
+		{"windows", "/c/big/f.log", "c:/big/f.log"}, // MSYS → 드라이브형 변환
+		{"windows", "C:/big/f.log", "C:/big/f.log"},
+		{"windows", "file.log", ""},                 // 상대 — 제외
+		{"windows", "/tmp/f", ""},                   // 드라이브 불명 — 제외(보수)
+		{"linux", "/tmp/f", "/tmp/f"},
+		{"linux", "C:/big/f.log", ""},               // Unix에선 상대경로 — 제외
+		{"linux", "file.log", ""},
+	}
+	for _, c := range cases {
+		if got := dumpAbsPath(c.goos, c.arg); got != c.want {
+			t.Fatalf("dumpAbsPath(%q,%q)=%q want %q", c.goos, c.arg, got, c.want)
 		}
 	}
 }
 ```
 
-Run: `go test -p 1 ./internal/hook -run TestBashDumpPath -v`
-Expected: FAIL — `bashDumpPath` 미정의.
+Run: `go test -p 1 ./internal/hook -run 'TestBashDumpArg|TestDumpAbsPath' -v`
+Expected: FAIL — 두 함수 미정의.
 
-- [ ] **Step 2: `bashDumpPath` 구현** — hook.go의 guardRead 근처에 추가:
+- [ ] **Step 2: `bashDumpArg`/`dumpAbsPath` 구현** — hook.go의 guardRead 근처에 추가:
 
 ```go
-// bashDumpPath — D32 정적 판정: 명령이 "단일 단순 `cat <절대경로>`"일 때만 그 경로를
-// 반환한다(그 외 전부 "" = allow). 셸 메타문자·인용·백슬래시가 하나라도 있으면 정적
-// 판정 불가로 본다 — 파서는 확신이 있을 때만 deny하고, 오동작의 최대 피해는 "가드
-// 미발화"다(설계 v0.3 §4·§7). 상대경로는 훅 cwd와 도구 cwd 불일치 시 오파일 판정
-// 위험이 있어 제외(절대경로 한정). Windows 드라이브 경로는 bash 관례상 슬래시형
-// (C:/...)만 온다 — 백슬래시형은 bash가 소비하므로 정적 판정 대상이 아니다.
-func bashDumpPath(command string) string {
-	if strings.ContainsAny(command, "|&;<>`$(){}*?[]'\"\\\n\r\t~#") {
+// bashDumpArg — D32 어휘 판정: 명령이 "단일 단순 `cat <경로>`"일 때만 경로 인자를
+// 반환한다(그 외 전부 "" = allow). 비ASCII·제어문자는 bash IFS와 strings.Fields의
+// 분할 규칙이 달라(NBSP 등) 오판 여지가 있으므로 전면 판정 포기. 파서는 확신이
+// 있을 때만 deny하고, 오동작의 최대 피해는 "가드 미발화"다(설계 v0.3 §4·§7).
+// ponytail: ~·# 전면 배제는 경로 내 정당한 문자까지 놓치는 의도적 미탐(allow 편향)
+// — 실측에서 미탐이 문제되면 위치 인지 파서로 승급.
+func bashDumpArg(command string) string {
+	for i := 0; i < len(command); i++ {
+		if command[i] < 0x20 || command[i] > 0x7e {
+			return ""
+		}
+	}
+	if strings.ContainsAny(command, "|&;<>`$(){}*?[]'\"\\~#") {
 		return ""
 	}
 	fields := strings.Fields(command)
 	if len(fields) != 2 || fields[0] != "cat" || strings.HasPrefix(fields[1], "-") {
 		return ""
 	}
-	p := fields[1]
-	driveAbs := len(p) > 2 && ((p[0] >= 'A' && p[0] <= 'Z') || (p[0] >= 'a' && p[0] <= 'z')) && p[1] == ':' && p[2] == '/'
-	if !strings.HasPrefix(p, "/") && !driveAbs {
+	return fields[1]
+}
+
+// dumpAbsPath — OS 절대경로 정규화(goos는 테스트 주입점, 실호출은 runtime.GOOS).
+// Windows: MSYS 형태 /x/...를 x:/... 드라이브형으로 변환 후 드라이브형만 절대로
+// 인정(Go의 경로 의미론에서 /c/x는 현재 드라이브 상대 — 잘못 stat하면 오파일
+// 판정이라 제외). Unix: /-접두만 절대. 상대·불명은 전부 ""(allow).
+func dumpAbsPath(goos, arg string) string {
+	if goos == "windows" {
+		if len(arg) >= 3 && arg[0] == '/' && arg[2] == '/' &&
+			((arg[1] >= 'a' && arg[1] <= 'z') || (arg[1] >= 'A' && arg[1] <= 'Z')) {
+			arg = string(arg[1]) + ":" + arg[2:]
+		}
+		if len(arg) >= 3 && arg[1] == ':' && arg[2] == '/' &&
+			((arg[0] >= 'a' && arg[0] <= 'z') || (arg[0] >= 'A' && arg[0] <= 'Z')) {
+			return arg
+		}
 		return ""
 	}
-	return p
+	if strings.HasPrefix(arg, "/") {
+		return arg
+	}
+	return ""
 }
 ```
 
-Run: `go test -p 1 ./internal/hook -run TestBashDumpPath -v` → PASS.
+guardBash에서의 사용: `path := dumpAbsPath(runtime.GOOS, bashDumpArg(f.Command))`
+(`runtime` import 추가 — Step 3 스케치에 이미 반영됨).
+
+Run: `go test -p 1 ./internal/hook -run 'TestBashDumpArg|TestDumpAbsPath' -v` → PASS.
 
 - [ ] **Step 3: denyRead → denyTool 일반화 + guardBash + dispatch**
 
-`denyRead`의 시그니처를 `denyTool(ctx, ad, in, dir, toolName, filePath string, size int64, stdout)`로
-바꾸고 본문의 `summaryLine("Read", ...)` → `summaryLine(toolName, ...)`,
-permissionDecisionReason 문구는 불변. guardRead의 호출부를
-`denyTool(ctx, ad, in, dir, "Read", f.FilePath, info.Size(), stdout)`로 갱신.
+`denyRead`의 시그니처를 `denyTool(ctx, ad, in, dir, toolName, detail string, stdout)`로
+바꾸고 본문의 summary 조립을 `summaryLine(toolName, detail)`로, permissionDecisionReason
+문구는 불변. 호출부: guardRead는 기존 문면 그대로
+`denyTool(..., "Read", workspaceRel(in.CWD, f.FilePath)+" "+strconv.FormatInt(info.Size(), 10)+"B", stdout)`,
+guardBash는 설계 §4 warning 계약(명령·파일·크기·안내 요지)대로
+`denyTool(..., "Bash", "cat "+workspaceRel(in.CWD, path)+" "+strconv.FormatInt(info.Size(), 10)+"B — ctr_search/ctr_fetch", stdout)`.
+(workspaceRel이 이미 상대화하므로 절대경로는 이벤트에 실리지 않는다 — 테스트로
+Bash 라벨·명령어·안내 문구 포함과 절대경로 비포함을 단정.)
 
 guardBash — guardRead 동형(4조건 공유):
 
 ```go
 // guardBash — D32 Bash 단일파일 덤프 가드(guardRead의 형제, 설계 v0.3 §4). 정적
-// 판정(bashDumpPath) 성립 시에만 D25 4조건(임계 초과·경계 내·denylist 아님·현장
-// 인덱싱 성공)을 guardRead와 동일 경로로 판정하고 deny한다. 그 외 전부 통과.
+// 판정(bashDumpArg 어휘 + dumpAbsPath 절대경로) 성립 시에만 D25 4조건(임계 초과·
+// 경계 내·denylist 아님·현장 인덱싱 성공)을 guardRead와 동일 경로로 판정하고
+// deny한다. 그 외 전부 통과.
 func guardBash(ctx context.Context, ad *session.AppendDB, in hookInput, dir, contentDir, worktreeRoot string, getenv func(string) string, stdout io.Writer) {
 	var f struct {
 		Command string `json:"command"`
@@ -447,9 +528,9 @@ func guardBash(ctx context.Context, ad *session.AppendDB, in hookInput, dir, con
 	if json.Unmarshal(in.ToolInput, &f) != nil {
 		return
 	}
-	path := bashDumpPath(f.Command)
+	path := dumpAbsPath(runtime.GOOS, bashDumpArg(f.Command))
 	if path == "" {
-		return // 정적 판정 불가·비덤프 — 통과
+		return // 정적 판정 불가·비덤프·비절대 — 통과
 	}
 	info, err := os.Stat(path)
 	if err != nil || info.IsDir() || info.Size() <= guardReadMax(getenv) {
@@ -485,8 +566,13 @@ dispatch(hook.go 139~142행)를 tool_name 라우팅으로:
 
 - [ ] **Step 4: guardBash 통합 테스트** — 기존 guardRead 테스트 관례(대형 파일
 fixture·deny JSON 단정·warning 이벤트 단정)를 복사해 케이스 추가:
-대형 파일 단순 cat=deny(+warning 이벤트) / 파이프 포함=allow / 상대경로=allow /
-임계 미만=allow / 경계 밖=allow. drops `guard-store` 경로는 기존 관례 승계.
+대형 파일 단순 cat=deny(+warning 이벤트: `Bash`·`cat`·`ctr_search` 문구 포함,
+절대경로 비포함) / 파이프 포함=allow / 상대경로=allow / 임계 미만=allow /
+경계 밖=allow / **denylist 파일 cat=allow(artifact 0건)** / **content store lock
+경합=allow + drops `guard-store`**(기존 Read 전용 lock 테스트 패턴 복제 —
+Bash 분기의 fail-open 직접 커버). 테스트의 명령 조립은
+`"cat " + filepath.ToSlash(bigFile)` — Windows `t.TempDir()`의 백슬래시가
+어휘 판정에서 거부되지 않도록 슬래시형으로.
 
 Run: `go test -p 1 ./internal/hook` → PASS.
 
@@ -495,8 +581,15 @@ Run: `go test -p 1 ./internal/hook` → PASS.
 `hook_install.go:36` `{"PreToolUse", "Read"}` → `{"PreToolUse", "Read|Bash"}`
 (+ 28~30행 주석 갱신: "PreToolUse는 Read|Bash 정규식 매칭 — 관리 그룹 1개 유지가
 merge의 동일-이벤트 상호 제거 함정을 회피한다, 설계 v0.3 §4").
-`hook_install_test.go`의 matcher 단정(anchor: `grep -n '"Read"' internal/cli/hook_install_test.go`)을
-`"Read|Bash"`로 교체. 등록 수 `want 4`는 불변(레지스트리 여전히 4항목).
+matcher-값 단정은 `hook_install_test.go:122~123` **한 곳뿐** — 그 줄만
+`"Read|Bash"`로 교체하고, **광범위 grep 일괄 치환 금지**(legacy uninstall
+fixture의 `"Read"` 문자열은 구버전 설정 재현이므로 유지). 등록 수
+`want 4`(99·142·212행)는 불변(레지스트리 여전히 4항목).
+
+**업그레이드 재설치 테스트(신규, 설계 §8 D32 설치 게이트)**: v0.2 형태 settings
+(marker `context-router/0.2.0` + PreToolUse matcher `"Read"` 그룹)를 seed →
+`hook install` 재실행 → 단정: PreToolUse 관리 그룹 **1개**, matcher
+`"Read|Bash"`, 총 4그룹, marker가 현재 버전으로 갱신.
 
 Run: `go test -p 1 ./internal/cli` → PASS.
 
@@ -504,7 +597,7 @@ Run: `go test -p 1 ./internal/cli` → PASS.
 
 ```bash
 git add internal/hook internal/cli
-git commit -m "feat(v0.3): D32 Bash 단일파일 덤프 가드 — bashDumpPath 정적 판정 + guardBash(4조건 공유) + matcher Read|Bash 단일 그룹"
+git commit -m "feat(v0.3): D32 Bash 단일파일 덤프 가드 — bashDumpArg/dumpAbsPath 정적 판정 + guardBash(4조건 공유) + matcher Read|Bash 단일 그룹"
 ```
 
 ---
@@ -513,9 +606,11 @@ git commit -m "feat(v0.3): D32 Bash 단일파일 덤프 가드 — bashDumpPath 
 
 **Files:**
 - Modify: `internal/cli/hook_install.go` (countDropsLog 390행 부근 → 사유 맵 버전 추가)
-- Modify: `internal/cli/cli.go` (doctor [9] 1229행 부근, [12] 1240~1246행, [13] 뒤 [14] 신설)
+- Modify: `internal/cli/cli.go` (doctor [9] 1229행 부근, [12] 1240~1246행, [13] 뒤 [14] 신설, runDoctor 시그니처)
 - Modify: `internal/store/store.go` (규모 조회 헬퍼 — 기존 Reader() 쿼리로 충분하면 cli 측 쿼리로 대체 가능, 구현자가 기존 관례에 맞춰 선택)
-- Test: `internal/cli/hook_install_test.go`
+- Test: `internal/cli/hook_install_test.go`, **`internal/cli/cli_test.go`**
+  (runDoctor 직접 호출 11곳 — cli_test.go:133·181·1044·1072·1093·1229·1261·1296 +
+  hook_install_test.go:407·449·482 — 시그니처 변경 시 전부 갱신)
 
 **Interfaces:**
 - Produces: `dropsByReason(path string) (total int, reasons map[string]int)`
@@ -526,16 +621,15 @@ git commit -m "feat(v0.3): D32 Bash 단일파일 덤프 가드 — bashDumpPath 
 412~416행·456행 부근)의 정확-문자열 단정을 신형식으로 교체 + [14] 추가:
 
 ```go
-// (기존 "[12] drops: store-root=2 worktree=3 total=5" 단정을 교체)
-if !strings.Contains(out, "[12] drops: store-root=2(x=1,y=1) worktree=3(unknown-session=3) total=5") {
+// (기존 "[12] drops: store-root=2 worktree=3 total=5" 단정을 교체 — fixture가 심는
+// 실제 사유는 hook_install_test.go:433·444의 root a,b / worktree x,y,z)
+if !strings.Contains(out, "[12] drops: store-root=2(a=1,b=1) worktree=3(x=1,y=1,z=1) total=5") {
 	t.Fatalf("out missing reason-rollup drops line:\n%s", out)
 }
-// (헤더 리스트 단정에 추가)
+// (412~416행 헤더 리스트 단정에 추가 — 이 서브테스트는 store 없는 unregistered
+// 경로이므로 [14]는 fail-soft "없음" 라인으로 방출되어야 한다)
 "[14] content.db:",
 ```
-
-(테스트가 심는 drops 사유는 기존 fixture의 실제 사유 문자열로 맞출 것 — 위 x/y는
-자리표시가 아니라 "기존 fixture가 쓰는 사유명을 그대로 옮기라"는 지시다.)
 
 Run: `go test -p 1 ./internal/cli -run TestDoctor -v` → FAIL (구형식 출력).
 
@@ -557,15 +651,11 @@ func dropsByReason(path string) (int, map[string]int) {
 	total, reasons := 0, map[string]int{}
 	sc := bufio.NewScanner(f)
 	for sc.Scan() {
-		line := sc.Text()
-		if line == "" {
-			continue
-		}
-		total++
-		if _, reason, ok := strings.Cut(line, "\t"); ok && reason != "" {
+		total++ // 빈 줄도 센다 — 기존 countDropsLog의 total 의미 보존(줄 수 계약)
+		if _, reason, ok := strings.Cut(sc.Text(), "\t"); ok && reason != "" {
 			reasons[reason]++
 		} else {
-			reasons["unparsed"]++
+			reasons["unparsed"]++ // 빈 줄·탭 없음·사유 없음 전부 unparsed
 		}
 	}
 	return total, reasons
@@ -608,18 +698,29 @@ cli.go [12]:
 헬퍼를 추가해(설정 JSON에서 `__ctrManaged` 값의 `hookBinaryName+"/"` 접두 뒤
 버전을 수집 — isOurHookGroup 관례 재사용) `등록됨(4개, marker 0.2.0)` 형태로,
 바이너리 버전과 다르면 `등록됨(4개, marker 0.2.0≠0.3.0 — hook install 재실행)`.
-(doctor에 현재 version 문자열이 전달되는지 확인 — 없으면 Run 경유로 배선,
-anchor: `grep -n "version" internal/cli/cli.go | head`.)
+**배선(필수)**: `cli.Run`(cli.go:39)은 version을 받지만 runDoctor(cli.go:1058)에
+전달하지 않는다 — `runDoctor(..., version string)`로 확장하고 Run의 doctor 분기
+(cli.go:47 부근)와 **직접 호출 11곳**(Files 참조)을 전부 갱신한다. 테스트:
+marker 일치(현재 버전으로 install한 settings)와 불일치(구버전 마커를 seed)
+각 1케이스.
 
 [14] — [13] 출력 뒤:
 
 ```go
-	// [14] content.db 규모 — shadow 성장 관측 채널(설계 v0.3 §2 보존·D33). 정보성.
-	// sources·artifacts는 COUNT 쿼리, blob 바이트는 CAS 디렉터리 파일 크기 합산
-	// (orphan-GC가 걷는 것과 동일한 blob 경로 헬퍼 재사용 — anchor: store_test.go
-	// writeAgedOrphanBlob의 경로 조립).
+	// [14] content.db 규모 — shadow 성장 관측 채널(설계 v0.3 §2 보존·D33). 정보성 —
+	// store 부재·열기 실패는 "없음"으로 fail-soft(unregistered 경로에서도 행은 방출).
+	// content.db 경로는 [3] 검사와 동일 이음새로 도출한다(runDoctor 상단의 기존
+	// content.db 경로 조립 재사용). blob 바이트는 물리 파일 합산 — 프로덕션 경로
+	// 헬퍼는 없으므로 artifacts CAS 디렉터리(artifacts/<hex 2자 prefix>/<64-hex>)를
+	// filepath.WalkDir로 걷고 임시 파일(tmp 접두/접미)은 제외한다. store_test.go
+	// writeAgedOrphanBlob(:1349)의 경로 조립은 레이아웃 참고용(테스트 헬퍼 — 재사용
+	// 불가).
 	fmt.Fprintf(w, "[14] content.db: sources=%d artifacts=%d blob=%dB\n", nSources, nArtifacts, blobBytes)
+	// (부재 시) fmt.Fprintln(w, "[14] content.db: 없음")
 ```
+
+테스트: raw blob 2개(그중 1쌍은 동일 콘텐츠 dedup) fixture로 sources·artifacts·
+blob 바이트 **정확값** 단정 — 전부 0이거나 DB 크기만 합산하는 오구현을 걸러낸다.
 
 - [ ] **Step 3: 통과 확인 + 커밋**
 
@@ -652,12 +753,18 @@ git commit -m "feat(v0.3): D33a doctor — drops 사유 롤업·[9] 마커 버�
 func TestUsage_TotalsFlag(t *testing.T) {
 	// (기존 하네스: hooks:on 1세션 + hooks:off 1세션 시드)
 	outPlain := runUsageForTest(t /*, ... 하네스 인자*/)               // 플래그 없음
-	if strings.Contains(outPlain, "TOTAL:") {
-		t.Fatalf("무플래그 출력에 TOTAL 행이 있으면 안 됨:\n%s", outPlain)
+	// 기본 출력 불변은 byte-for-byte로 고정한다 — "TOTAL: 부재"만 검사하면 헤더·열
+	// 순서·행 형식 회귀를 놓친다(설계 §8 게이트). wantPlain은 fixture에서 계산한
+	// 기대 전문(기존 usage 테스트의 기대 문자열 조립 관례).
+	if outPlain != wantPlain {
+		t.Fatalf("무플래그 출력 회귀:\n got %q\nwant %q", outPlain, wantPlain)
 	}
 	outTotals := runUsageForTest(t /*, ... , "--totals"*/)
+	if !strings.HasPrefix(outTotals, wantPlain) {
+		t.Fatalf("--totals 출력의 본표 prefix가 기본 출력과 다름:\n%s", outTotals)
+	}
 	for _, want := range []string{"TOTAL:hooks:on\t", "TOTAL:hooks:off\t"} {
-		if !strings.Contains(outTotals, want) {
+		if !strings.Contains(outTotals[len(wantPlain):], want) {
 			t.Fatalf("--totals 출력에 %q 부재:\n%s", want, outTotals)
 		}
 	}
@@ -696,12 +803,12 @@ Run: `go test -p 1 ./internal/cli -run TestUsage_TotalsFlag -v` → FAIL.
 열 구조 불변 원칙. 세션 수가 필요해지면 별도 결정.)
 
 - [ ] **Step 3: T4 drop-reason 테스트** — `internal/hook/hook_test.go`의 기존
-`readDrops` 관례로, 아직 단정되지 않은 사유 경로를 커버(anchor:
-`grep -n "appendDrop(" internal/hook/*.go`로 전 사유 나열 →
-`grep -n "사유문자열" internal/hook/*_test.go`로 미커버 확인):
-최소 `bad-input`·`guard-store`·`shadow-store`·`shadow-ingest` 중 미커버 전부.
-각각 해당 실패를 유발하는 기존 테스트 패턴(손상 stdin·잠긴 store 등)을 복사해
-drops 한 줄 단정.
+`readDrops` 관례로, 아직 단정되지 않은 사유 경로를 커버. **grep이 정본이다**
+(anchor: `grep -n "appendDrop(" internal/hook/*.go`로 전 사유 나열 →
+각 사유 문자열을 `internal/hook/*_test.go`에서 검색해 미커버 확정):
+사전 조사 기준 `bad-input`·`guard-store`·`shadow-store`는 이미 커버됨
+(hook_test.go:215·1012·819) — 실미커버는 `shadow-ingest`(+grep이 더 찾으면 그것도).
+해당 실패를 유발하는 기존 테스트 패턴을 복사해 drops 한 줄 단정.
 
 - [ ] **Step 4: GREEN + 커밋**
 
@@ -723,20 +830,27 @@ git commit -m "feat(v0.3): D33b usage --totals 옵트인 + T4 drop-reason 미커
 - [ ] **Step 2: T3** — mcp cap-test의 refs 계열 119B 가산 미행사 케이스 추가(anchor:
 `grep -n "119" internal/mcp/*_test.go` 또는 cap 상수 테스트 — session-10 ⑪ 동결
 문면대로 가산 행사 케이스 1개).
-- [ ] **Step 3: T5** — `matched_pattern` attr 방출 추가(anchor:
-`grep -rn "matched_pattern" internal docs` — 설계상 방출해야 하나 미방출인 지점).
+- [ ] **Step 3: T5** — `matched_pattern` attr 방출 추가. **anchor: `internal/hook/hook.go`의
+`bashClassifiers`/`classify` 반환부**(internal 코드에는 `matched_pattern` 문자열이
+아직 없다 — 설계 문서에만 있음). classifier가 매칭한 패턴을 안정 enum 문자열로
+이벤트 attr에 방출 + 단정 1개.
 - [ ] **Step 4: T7** — guardRead offset-단독·limit-단독 통과 케이스 2개(anchor:
 hook_test.go의 기존 부분 읽기 케이스 옆).
-- [ ] **Step 5: T10b** — UPDATE_GOLDEN 가드·fan-out 알파벳 절단(anchor:
-`grep -rn "UPDATE_GOLDEN" cmd` — golden 재생성 가드 + 절단 케이스).
-- [ ] **Step 6: C4** — SessionStart source 절단을 byte-slice → `truncateUTF8`로
-(anchor: `grep -n "64" internal/hook/hook.go`의 source 절단 지점 — session-11 C4 nit).
+- [ ] **Step 5: T10b** — UPDATE_GOLDEN 가드·fan-out 알파벳 절단. **anchor:
+`internal/session/export_test.go`(UPDATE_GOLDEN — `cmd/`가 아니다) +
+`internal/session/summary.go`(fan-out 절단 지점)**. golden 재생성 가드 + 절단
+케이스 각 1개.
+- [ ] **Step 6: C4** — SessionStart source 절단을 byte-slice → `truncateUTF8`로.
+**anchor: `internal/hook/hook.go:120`의 `src[:maxSourceBytes]`**(상수는
+hook.go:52 `maxSourceBytes=64`; `truncateUTF8`은 227행 기존 함수 재사용) +
+멀티바이트 경계 니들 테스트 1개.
 - [ ] **Step 7: GREEN + 커밋**
 
 Run: `go test -p 1 ./...` → 전체 PASS (여기서만 전체 스위트 1회)
 
 ```bash
-git add -A
+git status --short   # internal/ 밖 의도치 않은 변경·untracked(.claude/ 등) 확인
+git add internal
 git commit -m "chore(v0.3): 부채 편승 minors — T1·T3·T5·T7·T10b·C4 (T6는 Task 1 편승)"
 ```
 
@@ -756,7 +870,9 @@ git commit -m "chore(v0.3): 부채 편승 minors — T1·T3·T5·T7·T10b·C4 (T
 Run: `go test -p 1 ./...` → PASS / `gofumpt -l .` → 출력 없음
 
 ```bash
-git add -A && git commit -m "chore: 버전 0.3.0 범프"
+git status --short   # .claude/ 등 로컬 도그푸딩 설정이 staged되지 않게 확인
+git add cmd internal
+git commit -m "chore: 버전 0.3.0 범프"
 ```
 
 - [ ] **Step 2: 재빌드·재설치** — `go install ./cmd/context-router` →
@@ -769,6 +885,8 @@ Task 0 하네스 재사용)에서: ① 대형 파일 `cat` deny 발화 + warning
 ([12] 롤업·[9] marker 0.3.0·[14] 규모) ④ `usage --totals` 동작. 결과를 ledger와
 session-12 기록에 남긴다.
 
-- [ ] **Step 4: 머지 준비** — superpowers:finishing-a-development-branch로 PR
-(최종 whole-branch 이중 리뷰는 표준 프로토콜: 서브에이전트 + Codex
-`review --base <branch-point>` 병렬 1패스).
+- [ ] **Step 4: CI 3-OS 게이트 + 머지 준비** — PR 생성 후 **Ubuntu·Windows·macOS
+matrix가 전부 GREEN일 때만** 머지 준비 완료로 판정한다(설계 §8 — 특히 D32는
+OS별 경로 의미론이 달라 로컬 GREEN만으로 회귀를 배제할 수 없다). 이후
+superpowers:finishing-a-development-branch로 머지(최종 whole-branch 이중 리뷰는
+표준 프로토콜: 서브에이전트 + Codex `review --base <branch-point>` 병렬 1패스).
