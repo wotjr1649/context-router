@@ -249,8 +249,8 @@ func isOurCodexGroup(raw json.RawMessage) bool {
 }
 
 // buildCodexHookCommand — buildHookCommand의 Codex 형제: 러닝 서브커맨드가 `codex-hook`이다
-// (D35 호스트 경계 + §11.2 F3 버전 게이트). 인용 규칙은 T11 관례 승계(가정 — Codex 훅 명령
-// 파싱 규칙은 실측 전, 도그푸딩은 --store-root 미명시 경로만 사용).
+// (D35 호스트 경계 + §11.2 F3 버전 게이트). 인용 규칙은 T11 관례 승계 — 2026-07-22 실측:
+// 공백 포함 --store-root가 홑따옴표 인용으로 무변형 전달됨(실 codex exec, Windows).
 func buildCodexHookCommand(storeRootExplicit bool, storeRootRaw string, noShadow bool) string {
 	cmd := hookBinaryName + " codex-hook"
 	if storeRootExplicit && storeRootRaw != "" {
