@@ -60,23 +60,25 @@ func runHookHost(t *testing.T, host Host, storeRoot string, in []byte, env map[s
 func TestHookHostIsolation(t *testing.T) {
 	storeRoot := t.TempDir()
 	cwd := evalLong(t, t.TempDir())
+	// 느린 CI 러너에서 기본 2s 데드라인이 fail-open drop을 유발 — 테스트는 러너 속도 무의존이어야 함.
+	env := map[string]string{"CTR_HOOK_DEADLINE_MS": "60000"}
 	start := fixtureWith(t, "sessionstart.json", map[string]any{"cwd": cwd})
 	post := fixtureWith(t, "posttooluse-codex-bash.json", map[string]any{"cwd": cwd})
 
-	if rc := runHook(t, storeRoot, start, nil); rc != 0 { // cc 세션 등록
+	if rc := runHook(t, storeRoot, start, env); rc != 0 { // cc 세션 등록
 		t.Fatalf("cc SessionStart rc=%d", rc)
 	}
-	if rc := runHookHost(t, HostCodex, storeRoot, post, nil); rc != 0 { // 같은 UUID의 cx 이벤트
+	if rc := runHookHost(t, HostCodex, storeRoot, post, env); rc != 0 { // 같은 UUID의 cx 이벤트
 		t.Fatalf("cx PostToolUse rc=%d", rc)
 	}
 	sdir := sessDir(t, storeRoot, cwd)
 	if got := readDrops(t, sdir); !strings.Contains(got, "unknown-session") {
 		t.Fatalf("drops=%q want unknown-session (cx 미등록 — cc로 오귀속 금지)", got)
 	}
-	if rc := runHookHost(t, HostCodex, storeRoot, start, nil); rc != 0 { // cx 세션 등록
+	if rc := runHookHost(t, HostCodex, storeRoot, start, env); rc != 0 { // cx 세션 등록
 		t.Fatalf("cx SessionStart rc=%d", rc)
 	}
-	if rc := runHookHost(t, HostCodex, storeRoot, post, nil); rc != 0 {
+	if rc := runHookHost(t, HostCodex, storeRoot, post, env); rc != 0 {
 		t.Fatalf("cx PostToolUse(등록 후) rc=%d", rc)
 	}
 	reader, err := session.OpenReadOnly(sdir)
@@ -100,7 +102,7 @@ func TestHookHostIsolation(t *testing.T) {
 	bigPost := fixtureWith(t, "posttooluse-codex-bash.json", map[string]any{
 		"cwd": cwd, "tool_response": bigStdout(20000),
 	})
-	if rc := runHookHost(t, HostCodex, storeRoot, bigPost, nil); rc != 0 {
+	if rc := runHookHost(t, HostCodex, storeRoot, bigPost, env); rc != 0 {
 		t.Fatalf("cx big PostToolUse rc=%d", rc)
 	}
 	var refs string

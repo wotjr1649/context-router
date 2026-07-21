@@ -403,11 +403,12 @@ func psDumpArg(command string) string {
 
 // psAbsPath — psDumpArg 인자의 절대경로 판정(dumpAbsPath 자매). PS에서 `/c/x`는 MSYS가 아니라
 // "현재 드라이브 루트 상대"라 bash용 MSYS 변환을 승계하면 오파일 stat 위험(설계 §11.1 파생 ②)
-// — Windows는 드라이브형(`X:\`·`X:/`)만 절대로 인정하고 ToSlash로 정규화한다. Unix(pwsh)는
-// `/`-접두만 절대. 그 외 전부 ""(allow).
+// — Windows는 드라이브형(`X:\`·`X:/`)만 절대로 인정하고 goos 인자 기준 백슬래시→슬래시 치환으로
+// 정규화한다(호스트 무관 — filepath.ToSlash는 호스트 OS 구분자만 바꿔 비-Windows 호스트에서 실패;
+// 테스트 이식성 — 3-OS 게이트). Unix(pwsh)는 `/`-접두만 절대. 그 외 전부 ""(allow).
 func psAbsPath(goos, arg string) string {
 	if goos == "windows" {
-		arg = filepath.ToSlash(arg)
+		arg = strings.ReplaceAll(arg, "\\", "/")
 		if len(arg) >= 3 && arg[1] == ':' && arg[2] == '/' &&
 			((arg[0] >= 'a' && arg[0] <= 'z') || (arg[0] >= 'A' && arg[0] <= 'Z')) {
 			return arg
