@@ -123,6 +123,12 @@ func recordEventFromInput(ctx context.Context, st *store.Store, sessionID string
 		}
 		attrBytes = b
 	}
+	// 개수 선검사(최종 리뷰 C1): 초과 리스트가 resolve의 아이템당 SQLite 조회로 증폭되는 것을
+	// 차단한다. 값의 정본은 session.MaxRefsOrRelated(규칙 중복 없음)이고 최종 검증은 여전히
+	// 아래 ValidateEvent가 수행한다.
+	if len(in.ArtifactRefs) > session.MaxRefsOrRelated {
+		return session.Event{}, toolErr(codeInvalidArgument, "artifact_refs는 16개 이하여야 합니다")
+	}
 	// wire 변환: int64 refs → 정본 URI, related URI 스킴 검증(형식 — 상한 규칙 아님).
 	refs, err := resolveArtifactRefs(ctx, st, sessionID, in.ArtifactRefs)
 	if err != nil {

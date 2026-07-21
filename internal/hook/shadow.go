@@ -44,8 +44,13 @@ func shadowCapture(ctx context.Context, ad *session.AppendDB, in hookInput, dir,
 		appendDrop(dir, "shadow-denylist") // 비밀 파일 유래 응답 — 미저장
 		return
 	}
-	if bytes.IndexByte(body, 0) != -1 {
-		return // NUL 바이트 = 비텍스트(바이너리) — 조용히 미저장
+	// NUL 판정(D26): body는 json.RawMessage라 외부 파싱이 성공한 시점에 리터럴 NUL은 올 수 없고
+	// (유효 JSON 문자열은 제어문자를 이스케이프), 실경로의 NUL은 \u0000 이스케이프 텍스트로 나타난다
+	// (최종 리뷰 C2). 둘 다 검사한다 — 리터럴 검사는 직조립 입력(테스트 등) 방어로 유지.
+	// ponytail: 부분열 검사라 \u0000 텍스트를 논하는 콘텐츠도 스킵된다(FP 허용, fail-open) —
+	// 정밀 판정은 v0.3 decode-sniff 후보.
+	if bytes.IndexByte(body, 0) != -1 || bytes.Contains(body, []byte(`\u0000`)) {
+		return // NUL(리터럴·이스케이프) = 비텍스트(바이너리) — 조용히 미저장
 	}
 
 	st, err := store.OpenContext(ctx, contentDir, false)

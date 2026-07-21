@@ -122,11 +122,17 @@ func mergeHookSettings(existing []byte, command, marker string, install bool) ([
 		if err := json.Unmarshal(existing, &settings); err != nil {
 			return nil, err
 		}
+		if settings == nil { // JSON `null` → Unmarshal이 맵을 nil로 설정(할당 시 패닉, 최종 리뷰 C5)
+			settings = map[string]json.RawMessage{}
+		}
 	}
 	hooks := map[string]json.RawMessage{}
 	if raw, ok := settings["hooks"]; ok {
 		if err := json.Unmarshal(raw, &hooks); err != nil {
 			return nil, err
+		}
+		if hooks == nil { // `{"hooks":null}` 동일 경로(최종 리뷰 C5)
+			hooks = map[string]json.RawMessage{}
 		}
 	}
 	for _, reg := range hookRegistrations {

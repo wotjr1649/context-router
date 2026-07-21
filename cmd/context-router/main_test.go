@@ -398,6 +398,20 @@ func TestMainDispatch_CLI(t *testing.T) {
 	}
 }
 
+// TestMainDispatch_HookPreprocFailOpen(최종 리뷰 C3): 실행 훅의 root 플래그 파싱 실패(값 없는
+// --store-root)는 fail-open으로 흡수돼 err=nil(exit 0)이어야 한다(D23 — settings에 잔존한
+// 잘못된 훅 명령이 호스트를 막으면 안 됨). install은 같은 실패를 그대로 전파한다(사용자 대면).
+func TestMainDispatch_HookPreprocFailOpen(t *testing.T) {
+	handled, err := dispatchCLI(context.Background(), []string{"context-router", "hook", "--store-root"})
+	if !handled || err != nil {
+		t.Fatalf("running hook: handled=%v err=%v want true/nil(fail-open)", handled, err)
+	}
+	handled, err = dispatchCLI(context.Background(), []string{"context-router", "hook", "install", "--store-root"})
+	if !handled || err == nil {
+		t.Fatalf("install: handled=%v err=%v want true/non-nil(전파)", handled, err)
+	}
+}
+
 // TestMainDispatch_Session: "session" 서브커맨드가 cliSubcommands를 통과해 cli.Run까지
 // 위임되는지 확인한다(태스크9a, 설계 §7 — main.go: sub "session" 허용). 이 프로젝트에는
 // worktree가 없어 export 자체는 실패하지만(handled=true·err!=nil), 그 오류가 "미지

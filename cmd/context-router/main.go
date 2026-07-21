@@ -546,7 +546,10 @@ func dispatchCLI(ctx context.Context, args []string) (handled bool, err error) {
 
 	root, storeRootRaw, rest, err := prescanRootFlags(subArgs)
 	if err != nil {
-		return true, err
+		// 실행 훅의 root 플래그 파싱 실패(예: 값 없는 --store-root가 settings에 잔존)도 fail-open으로
+		// 흡수한다(D23 — 최종 리뷰 C3). rest는 파싱 실패로 비어 있을 수 있으므로 원본 subArgs로
+		// install/uninstall(오류 전파 유지)을 판별한다.
+		return true, absorbHookPreprocErr(sub, subArgs, err)
 	}
 	if root == "" {
 		if root, err = os.Getwd(); err != nil {

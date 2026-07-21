@@ -129,6 +129,38 @@ func TestHookSessionStart(t *testing.T) {
 	}
 }
 
+// ②-b source 길이 봉인(최종 리뷰 C4): 거대 source(신뢰 불가 stdin)는 maxSourceBytes(64)로
+// 절단되어 session_start payload에 기록된다 — EnsureSession의 ValidateEvent 우회 상한 방어.
+func TestHookSessionStartSourceTruncated(t *testing.T) {
+	storeRoot := filepath.Join(t.TempDir(), "storeroot")
+	cwd := t.TempDir()
+	in := fixtureWith(t, "sessionstart.json", map[string]any{
+		"cwd":    cwd,
+		"source": strings.Repeat("s", 5000),
+	})
+	if rc := runHook(t, storeRoot, in, nil); rc != 0 {
+		t.Fatalf("rc=%d want 0", rc)
+	}
+	reader, err := session.OpenReadOnly(sessDir(t, storeRoot, cwd))
+	if err != nil {
+		t.Fatalf("open session.db: %v", err)
+	}
+	defer func() { _ = reader.Close() }()
+	var payload string
+	if err := reader.QueryRow("SELECT payload FROM session_events WHERE event_type='session_start'").Scan(&payload); err != nil {
+		t.Fatalf("payload: %v", err)
+	}
+	var p struct {
+		Source string `json:"source"`
+	}
+	if err := json.Unmarshal([]byte(payload), &p); err != nil {
+		t.Fatalf("unmarshal payload: %v", err)
+	}
+	if len(p.Source) != maxSourceBytes {
+		t.Fatalf("source len=%d want %d(절단)", len(p.Source), maxSourceBytes)
+	}
+}
+
 // ③ 비-SessionStart 이벤트를 미지 세션으로 → 이벤트 0건 + drops 1줄(unknown-session).
 func TestHookUnknownSession(t *testing.T) {
 	storeRoot := filepath.Join(t.TempDir(), "storeroot")
@@ -646,6 +678,23 @@ func TestShadowBinarySkips(t *testing.T) {
 	shadowCapture(context.Background(), ad, in, sdir, contentDir, "cc:3f2504e0-4f89-41d3-9a0c-0305e82c3301", func(string) string { return "" })
 	if n := contentArtifacts(t, contentDir); n != -1 {
 		t.Fatalf("artifacts=%d want -1(바이너리 미저장)", n)
+	}
+}
+
+// ⑤-b 실경로 형태(최종 리뷰 C2): 유효 JSON에서 NUL은 유니코드 이스케이프 텍스트로 도착한다 —
+// 전체 파이프라인(runHook)으로 이스케이프 판정을 검증한다(응답 문자열에 raw NUL을 넣으면
+// fixtureWith의 json.Marshal이 실경로와 동일하게 이스케이프한다).
+func TestShadowEscapedNULSkips(t *testing.T) {
+	storeRoot, cwd, contentDir, _ := shadowSetup(t)
+	in := fixtureWith(t, "posttooluse-bash.json", map[string]any{
+		"cwd":           cwd,
+		"tool_response": map[string]any{"stdout": strings.Repeat("a", 20000) + "\x00binary", "stderr": ""},
+	})
+	if rc := runHook(t, storeRoot, in, nil); rc != 0 {
+		t.Fatalf("rc=%d want 0", rc)
+	}
+	if n := contentArtifacts(t, contentDir); n != -1 {
+		t.Fatalf("artifacts=%d want -1(이스케이프 NUL 미저장)", n)
 	}
 }
 

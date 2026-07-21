@@ -49,6 +49,7 @@ const (
 	defaultRetentionSec = 2592000 // 30일 — 훅 세션 기본 retention(설계 §2.2)
 	dropsLogName        = "session.drops.log"
 	maxStdinBytes       = 8 << 20 // stdin 읽기 상한(fail-open 봉인) — CTR_SHADOW_MAX 1MiB + JSON 이스케이프·대형 Write tool_input 여유
+	maxSourceBytes      = 64      // SessionStart source 길이 봉인(최종 리뷰 C4) — 문서 enum 최대 7B, 여유 포함
 )
 
 // Run — 훅 이벤트 1건을 처리한다(설계 §2). **항상 0을 반환한다**(fail-open §2.3): 어떤 실패도
@@ -111,7 +112,14 @@ func dispatch(ctx context.Context, in hookInput, dir, contentDir, worktreeRoot, 
 	defer func() { _ = ad.Close() }()
 
 	if in.HookEventName == "SessionStart" {
-		if _, err := ad.EnsureSession(ctx, in.Source, worktreeRoot); err != nil {
+		// source는 신뢰 불가 stdin 문자열(최종 리뷰 C4) — EnsureSession은 서버 발행 고정 이벤트라
+		// ValidateEvent를 우회하므로 여기서 길이만 봉인한다(거대 source의 payload 상한 우회 차단).
+		// enum 강제는 안 한다: 호스트가 신형 source 값을 추가하면 세션 기록 전체가 사장된다(전방 호환).
+		src := in.Source
+		if len(src) > maxSourceBytes {
+			src = src[:maxSourceBytes]
+		}
+		if _, err := ad.EnsureSession(ctx, src, worktreeRoot); err != nil {
 			appendDrop(dir, "ensure-failed")
 		}
 		return
@@ -194,14 +202,14 @@ func guardRead(ctx context.Context, ad *session.AppendDB, in hookInput, dir, con
 	if err != nil || rep.Indexed != 1 {
 		return // ①④ 경계 밖·denylist·oversize·색인 실패 → 통과
 	}
-	denyRead(ctx, ad, in, dir, worktreeRoot, f.FilePath, info.Size(), stdout)
+	denyRead(ctx, ad, in, dir, f.FilePath, info.Size(), stdout)
 }
 
 // denyRead — 4조건 성립 시 deny 출력 헬퍼(설계 §4). stdout에 permissionDecision JSON(T0 검증
 // 스키마)을 **먼저** 쓰고 그다음 warning 이벤트(차단 파일 상대 경로·크기)를 best-effort로 append
 // 한다 — 이벤트 기록 실패는 deny 판정에 영향 없다(fail-open은 기록 경로에만; 가드 판정은 DB 없이
 // 성립, §4). stdout은 deny JSON 전용이라(Claude Code가 exit 0 stdout을 파싱) 그 외 바이트는 쓰지 않는다.
-func denyRead(ctx context.Context, ad *session.AppendDB, in hookInput, dir, worktreeRoot, filePath string, size int64, stdout io.Writer) {
+func denyRead(ctx context.Context, ad *session.AppendDB, in hookInput, dir, filePath string, size int64, stdout io.Writer) {
 	out := map[string]any{"hookSpecificOutput": map[string]any{
 		"hookEventName":            "PreToolUse",
 		"permissionDecision":       "deny",

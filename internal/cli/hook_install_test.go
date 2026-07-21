@@ -302,6 +302,24 @@ func TestHookInstall_AtomicWriteNoTempLeftover(t *testing.T) {
 	}
 }
 
+// ⑥-b JSON `null`·`{"hooks":null}` 설정(구문상 유효)에서 install이 패닉 없이 병합한다
+// (최종 리뷰 C5 — Unmarshal이 null을 nil 맵으로 설정해 할당 시 패닉하던 경로).
+func TestMergeHookSettings_NullTolerant(t *testing.T) {
+	for _, existing := range []string{"null", `{"hooks":null}`} {
+		out, err := mergeHookSettings([]byte(existing), "context-router hook", "context-router/0.2.0", true)
+		if err != nil {
+			t.Fatalf("existing=%q merge err: %v", existing, err)
+		}
+		var settings map[string]json.RawMessage
+		if err := json.Unmarshal(out, &settings); err != nil {
+			t.Fatalf("existing=%q 출력이 유효 JSON 아님: %v", existing, err)
+		}
+		if _, ok := settings["hooks"]; !ok {
+			t.Fatalf("existing=%q 병합 결과에 hooks 없음: %s", existing, out)
+		}
+	}
+}
+
 // ⑦ 훅 명령이 --no-shadow / --store-root(명시 시에만) 플래그를 반영한다.
 func TestHookInstall_CommandReflectsFlags(t *testing.T) {
 	cases := []struct {

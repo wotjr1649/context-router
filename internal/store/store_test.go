@@ -311,6 +311,37 @@ func TestRegister_ReindexUpdatesRawBlobHashAndExtraction(t *testing.T) {
 	}
 }
 
+// TestRegister_ReindexUpdatesSourceKind(최종 리뷰 C6): 같은 URI를 다른 kind로 재등록하면
+// source_kind도 최신 값으로 갱신돼야 한다 — 과거엔 ON CONFLICT DO UPDATE가 이 컬럼을 빼먹어
+// inline:<title> 충돌(§5 한계) 시 provenance가 최초 kind에 고정됐다(CAS 경로는 갱신하므로 정합).
+func TestRegister_ReindexUpdatesSourceKind(t *testing.T) {
+	s := openT(t)
+	uri := "inline:Read"
+	reg1 := Registration{
+		StoredBytes: []byte("v1"), MediaType: "text/plain",
+		Source: SourceMeta{URI: uri, Kind: "inline", SrcHash: "k1"},
+		Chunks: []Chunk{{Ordinal: 0, Text: "v1"}},
+	}
+	if _, err := s.Register(t.Context(), reg1); err != nil {
+		t.Fatal(err)
+	}
+	reg2 := Registration{
+		StoredBytes: []byte("v2"), MediaType: "text/plain",
+		Source: SourceMeta{URI: uri, Kind: "hook", SrcHash: "k2"},
+		Chunks: []Chunk{{Ordinal: 0, Text: "v2"}},
+	}
+	if _, err := s.Register(t.Context(), reg2); err != nil {
+		t.Fatal(err)
+	}
+	var kind string
+	if err := s.reader.QueryRow("SELECT source_kind FROM sources WHERE uri=?", uri).Scan(&kind); err != nil {
+		t.Fatal(err)
+	}
+	if kind != "hook" {
+		t.Fatalf("source_kind=%q want %q (재등록 후 stale provenance)", kind, "hook")
+	}
+}
+
 // TestRegister_FileReindexRawBlobHashStaysEmpty: file 경로는 RawBlob/Extraction을 넘기지
 // 않으므로(둘 다 빈값) 위 수정으로 excluded 참조를 추가해도 재색인 후 계속 NULL이어야 한다
 // (회귀 없음).

@@ -449,9 +449,9 @@ func (s *Store) Register(ctx context.Context, reg Registration) (int64, error) {
 		}
 		_, err := tx.Exec(`INSERT INTO sources(uri,artifact_id,source_kind,src_size,src_mtime_ns,src_hash,raw_blob_hash,extraction,indexed_at)
 			VALUES(?,?,?,?,?,?,?,?,?)
-			ON CONFLICT(uri) DO UPDATE SET artifact_id=excluded.artifact_id,src_size=excluded.src_size,
-			  src_mtime_ns=excluded.src_mtime_ns,src_hash=excluded.src_hash,indexed_at=excluded.indexed_at,
-			  raw_blob_hash=excluded.raw_blob_hash,extraction=excluded.extraction`,
+			ON CONFLICT(uri) DO UPDATE SET artifact_id=excluded.artifact_id,source_kind=excluded.source_kind,
+			  src_size=excluded.src_size,src_mtime_ns=excluded.src_mtime_ns,src_hash=excluded.src_hash,
+			  indexed_at=excluded.indexed_at,raw_blob_hash=excluded.raw_blob_hash,extraction=excluded.extraction`,
 			reg.Source.URI, artID, reg.Source.Kind, reg.Source.Size, reg.Source.MtimeNS, reg.Source.SrcHash,
 			nullIfEmpty(rawBlobHash), nullIfEmpty(reg.Source.Extraction), time.Now().Unix())
 		return err
