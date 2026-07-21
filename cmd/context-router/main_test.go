@@ -28,6 +28,14 @@ import (
 	"github.com/wotjr1649/context-router/internal/store"
 )
 
+// TestVersionPinnedToServerVersion: main의 `version`과 mcp.ServerVersion은 2원화 상태라
+// 범프 시 한쪽 누락 위험이 있다(v0.3 T7이 실제로 2지점 동시 범프였음). 등가를 핀해 회귀를 막는다.
+func TestVersionPinnedToServerVersion(t *testing.T) {
+	if version != mcp.ServerVersion {
+		t.Fatalf("version=%q != mcp.ServerVersion=%q — 두 상수는 항상 같이 범프해야 한다", version, mcp.ServerVersion)
+	}
+}
+
 func TestParseFlags(t *testing.T) {
 	tests := []struct {
 		name    string

@@ -918,7 +918,10 @@ type SizeStat struct {
 
 // SizeStats: dir/content.db를 read-only로 열어 sources·artifacts 행수를 세고, artifacts/ CAS
 // 디렉터리의 물리 blob 바이트를 합산한다(설계 v0.3 §2·D33). content.db 미존재는 LedgerStats와
-// 동일하게 (nil, nil) — 호출자(doctor [14])가 "없음"으로 fail-soft 렌더한다. blob 바이트는
+// 동일하게 (nil, nil) — 호출자(doctor [14])가 "없음"으로 fail-soft 렌더한다. 서버가 content.db를
+// 동시 점유(WAL 라이터) 중이면 이 ro 열기/조회가 (nil, err)로 실패할 수 있는데, 이 역시 doctor가
+// "없음"으로 렌더한다 — 손상이 아니라 일시적 경합이므로 재실행하면 값이 나온다(비관례 직접 open은
+// 정보성 진단 경로 한정, fail-soft). blob 바이트는
 // GCOrphanBlobs와 동일 관례로 파일명이 sha256 hex(64자)인 것만 센다 — writeBlob 임시파일
 // (hash.tmp.pid.seq)은 길이가 달라 자연히 제외된다. dedup은 물리 파일 합산이라 자동(동일
 // content_hash는 한 파일).

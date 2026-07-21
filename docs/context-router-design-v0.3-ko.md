@@ -140,7 +140,9 @@ drop은 0건. spill journal이 구제할 대상이 관측되지 않았으므로 
   테스트(hook_install_test.go의 `[12]` 행)는 신형식으로 교체.
 - doctor 추가: ① `[9]` hooks 행에 설치 마커 버전 표기 + 바이너리 버전 불일치
   시 재설치 안내(업그레이드 감지) ② content.db 규모 행(sources·artifacts·blob
-  바이트) — shadow 성장 관측 채널(§2 보존).
+  바이트) — shadow 성장 관측 채널(§2 보존). 캐비앗: 서버 동시 실행 중이면
+  SizeStats의 ro-open이 content.db 점유와 경합해 실패, `[14]`가 "없음"으로 날 수
+  있다 — 손상이 아니라 일시적 경합의 fail-soft(서버 정지 후 재실행하면 값 표시).
 - `usage --totals`(옵트인 플래그): 본표 뒤 집계 2행 — session 열
   `TOTAL:hooks:on`/`TOTAL:hooks:off`, 토큰·records 열은 그룹 합계, hooks 열은
   그룹 라벨 반복. **기본 출력은 불변**(행 = transcript 세션 1:1 계약 유지 —
