@@ -809,8 +809,10 @@ func TestMergeCodexHooksIdempotentBytes(t *testing.T) {
 	}
 }
 
-// 경로: 기본 project <root>/.codex/hooks.json, --user는 ~/.codex/hooks.json.
+// 경로: 기본 project <root>/.codex/hooks.json, --user는 CODEX_HOME 미설정 시 ~/.codex/hooks.json.
+// t.Setenv 사용 → t.Parallel 금지(기존 관례).
 func TestCodexHooksPath(t *testing.T) {
+	t.Setenv("CODEX_HOME", "") // 빈 문자열=미설정 → ~/.codex 폴백을 결정적으로 만든다(최종 리뷰 Codex P2)
 	p, err := codexHooksPath(false, `C:\proj`)
 	if err != nil || p != filepath.Join(`C:\proj`, ".codex", "hooks.json") {
 		t.Fatalf("project 경로=%q err=%v", p, err)
@@ -818,6 +820,17 @@ func TestCodexHooksPath(t *testing.T) {
 	u, err := codexHooksPath(true, `C:\proj`)
 	if err != nil || !strings.HasSuffix(u, filepath.Join(".codex", "hooks.json")) {
 		t.Fatalf("user 경로=%q err=%v", u, err)
+	}
+}
+
+// --user는 CODEX_HOME이 설정되면 $CODEX_HOME/hooks.json을 쓴다(최종 리뷰 Codex P2 — 무성 오설치
+// 방지). t.Setenv 사용 → t.Parallel 금지.
+func TestCodexHooksPathCodexHome(t *testing.T) {
+	codexHome := t.TempDir()
+	t.Setenv("CODEX_HOME", codexHome)
+	u, err := codexHooksPath(true, `C:\proj`)
+	if err != nil || u != filepath.Join(codexHome, "hooks.json") {
+		t.Fatalf("user 경로=%q want=%q err=%v", u, filepath.Join(codexHome, "hooks.json"), err)
 	}
 }
 

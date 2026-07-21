@@ -263,10 +263,16 @@ func buildCodexHookCommand(storeRootExplicit bool, storeRootRaw string, noShadow
 }
 
 // codexHooksPath — 설치 대상 hooks.json 경로(§11.1 G3). 기본 프로젝트 `<root>/.codex/hooks.json`,
-// --user는 `~/.codex/hooks.json`. config.toml·[hooks.state]는 절대 건드리지 않는다(신뢰 승인
-// 우회 금지).
+// --user는 `$CODEX_HOME/hooks.json`(CODEX_HOME 미설정 시 `~/.codex/hooks.json`). Codex는 CODEX_HOME
+// 환경변수로 상태 루트(config·auth·logs·sessions·skills, 기본 ~/.codex)를 재지정하고 hooks.json은 그
+// 활성 config 계층 옆에서 탐색되므로(공식 env-vars 문서), CODEX_HOME이 설정된 사용자에게 ~/.codex에
+// 쓰면 Codex가 읽지 않는 파일을 만드는 무성 오설치가 된다(최종 리뷰 Codex P2). 빈 문자열=미설정으로
+// 폴백. config.toml·[hooks.state]는 절대 건드리지 않는다(신뢰 승인 우회 금지).
 func codexHooksPath(user bool, projectRoot string) (string, error) {
 	if user {
+		if codexHome := os.Getenv("CODEX_HOME"); codexHome != "" {
+			return filepath.Join(codexHome, "hooks.json"), nil
+		}
 		home, err := os.UserHomeDir()
 		if err != nil {
 			return "", errors.New("hook: 홈 디렉터리 해석 실패")
