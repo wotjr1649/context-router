@@ -259,9 +259,35 @@ func doctorSizeWarnSetup(t *testing.T) (storeRoot, projectRoot string) {
 	return storeRoot, projectRoot
 }
 
+// D38 — storeWarnBytes 오버라이드 채택 규칙 직접 단정(v0.4 최종 리뷰 이월): 양수만 채택,
+// 비양수·파싱 실패·미설정은 기본값(100MiB) 폴백.
+func TestStoreWarnBytes(t *testing.T) {
+	cases := []struct {
+		env  string
+		want int64
+	}{
+		{"5", 5},
+		{"0", defaultStoreWarnBytes},
+		{"-1", defaultStoreWarnBytes},
+		{"abc", defaultStoreWarnBytes},
+		{"", defaultStoreWarnBytes},
+	}
+	for _, c := range cases {
+		getenv := func(k string) string { // 키 대조 — 신규 env명을 정확히 읽는지가 단정의 일부
+			if k == "CTR_STORE_WARN_BYTES" {
+				return c.env
+			}
+			return ""
+		}
+		if got := storeWarnBytes(getenv); got != c.want {
+			t.Fatalf("storeWarnBytes(env=%q)=%d want %d", c.env, got, c.want)
+		}
+	}
+}
+
 func TestRunDoctor_StoreSizeWarn(t *testing.T) {
 	storeRoot, projectRoot := doctorSizeWarnSetup(t)
-	t.Setenv("CTR_SHADOW_WARN_BYTES", "5") // blob 10B > 5B → 발화
+	t.Setenv("CTR_STORE_WARN_BYTES", "5") // blob 10B > 5B → 발화
 	var buf bytes.Buffer
 	if err := runDoctor(context.Background(), &buf, storeRoot, projectRoot, "0.0.1-dev"); err != nil {
 		t.Fatalf("runDoctor err=%v out=%s", err, buf.String())

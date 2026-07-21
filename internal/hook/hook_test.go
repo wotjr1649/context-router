@@ -1422,7 +1422,7 @@ func TestPsDumpArg(t *testing.T) {
 // (설계 §11.1 파생 ②: PS에서 /c/x는 현재 드라이브 루트 상대라 변환 시 오파일 판정 위험).
 func TestPsAbsPath(t *testing.T) {
 	cases := []struct{ goos, arg, want string }{
-		{"windows", `C:\big\f.log`, "C:/big/f.log"}, // ToSlash 정규화
+		{"windows", `C:\big\f.log`, "C:/big/f.log"}, // goos-키 백슬래시→슬래시 정규화(호스트 무관)
 		{"windows", "C:/big/f.log", "C:/big/f.log"},
 		{"windows", "/c/big/f.log", ""},  // MSYS형 — PS에선 드라이브 상대, 비절대(allow)
 		{"windows", `\\srv\share\f`, ""}, // UNC — 드라이브형 아님, 보수 allow
@@ -1463,7 +1463,9 @@ func TestGuardBashLargeFileDenies(t *testing.T) {
 	storeRoot, cwd, contentDir, sdir := guardSetup(t)
 	big := filepath.Join(cwd, "big.txt")
 	writeSized(t, big, 300*1024)
-	out := runGuardBash(t, storeRoot, cwd, "cat "+filepath.ToSlash(big), nil)
+	// 느린 CI 러너에서 기본 2s 데드라인이 fail-open drop(빈 stdout)을 유발 — deny 단정 + 300KB
+	// 현장 색인 테스트는 러너 속도 무의존이어야 함(v0.4 CI F2와 동일 클래스·동일 처방).
+	out := runGuardBash(t, storeRoot, cwd, "cat "+filepath.ToSlash(big), map[string]string{"CTR_HOOK_DEADLINE_MS": "60000"})
 
 	var got map[string]map[string]string
 	if err := json.Unmarshal([]byte(out), &got); err != nil {
@@ -1609,7 +1611,8 @@ func TestGuardPowerShellLargeFileDenies(t *testing.T) {
 	storeRoot, cwd, contentDir, sdir := guardSetup(t)
 	big := filepath.Join(cwd, "big.txt")
 	writeSized(t, big, 300*1024)
-	out := runGuardPowerShell(t, storeRoot, cwd, "Get-Content "+filepath.ToSlash(big), nil)
+	// 느린 CI 러너 데드라인 fail-open drop 방지 — TestGuardBashLargeFileDenies와 동일 처방.
+	out := runGuardPowerShell(t, storeRoot, cwd, "Get-Content "+filepath.ToSlash(big), map[string]string{"CTR_HOOK_DEADLINE_MS": "60000"})
 
 	var got map[string]map[string]string
 	if err := json.Unmarshal([]byte(out), &got); err != nil {

@@ -29,12 +29,13 @@ import (
 // 응답이 제공하는 URL·명령·기타 필드는 절대 출력하지 않는다(위생, 설계 §7).
 const releaseURL = "https://api.github.com/repos/wotjr1649/context-router/releases/latest"
 
-// defaultStoreWarnBytes — D38 store 용량 경고 임계 기본값(설계 v0.4 §5 "기본 100MB").
+// defaultStoreWarnBytes — D38 store 용량 경고 임계 기본값(설계 v0.4 §5 "기본 100MiB").
 const defaultStoreWarnBytes = 100 << 20 // 100MiB
 
-// storeWarnBytes — CTR_SHADOW_WARN_BYTES 양수만 채택, 파싱 실패·비양수는 기본값(D38).
+// storeWarnBytes — CTR_STORE_WARN_BYTES 양수만 채택, 파싱 실패·비양수는 기본값(D38 — 측정
+// 실체가 CAS 전체 blob이라 STORE 명명; 구명 CTR_SHADOW_WARN_BYTES는 v0.5 개명, 별칭 없음).
 func storeWarnBytes(getenv func(string) string) int64 {
-	if v, err := strconv.ParseInt(getenv("CTR_SHADOW_WARN_BYTES"), 10, 64); err == nil && v > 0 {
+	if v, err := strconv.ParseInt(getenv("CTR_STORE_WARN_BYTES"), 10, 64); err == nil && v > 0 {
 		return v
 	}
 	return defaultStoreWarnBytes
@@ -1309,7 +1310,7 @@ func runDoctor(ctx context.Context, w io.Writer, storeRoot, projectRoot, version
 		// D38 — CAS 전체 blob 총량 경고(shadow 전용 아님 — [14] 측정 실체 그대로). 관측 채널이지
 		// 정책 집행이 아니다(D27): 자동 삭제 없음. SizeStats 실패 경로는 이 분기 밖이라 미평가.
 		if warn := storeWarnBytes(os.Getenv); sz.BlobBytes > warn {
-			fmt.Fprintf(w, "[14] warning: blob %dB > 임계 %dB(CTR_SHADOW_WARN_BYTES) — 수동 구제는 purge 계열 CLI(현행 purge는 source_kind 무구분 삭제 — shadow만 선택 삭제 불가). 자동 삭제 없음\n", sz.BlobBytes, warn)
+			fmt.Fprintf(w, "[14] warning: blob %dB > 임계 %dB(CTR_STORE_WARN_BYTES) — 수동 구제는 purge 계열 CLI(현행 purge는 source_kind 무구분 삭제 — shadow만 선택 삭제 불가). 자동 삭제 없음\n", sz.BlobBytes, warn)
 		}
 	}
 

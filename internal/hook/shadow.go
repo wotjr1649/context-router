@@ -113,7 +113,8 @@ func shadowInputDenied(toolInput json.RawMessage) bool {
 // commandDumpPath — command 계열 도구(Bash·PowerShell)의 tool_input이 정적으로 "단일 파일
 // 덤프"로 증명되면 그 경로를 반환한다(D39). 증명 불가(파이프·복합식·다중 파일 등)는 "" —
 // 현행대로 색인한다(잔여 표면은 설계 v0.4 §7 한계 명문화, Redact·sniff 의존). 절대화는 하지
-// 않는다 — 대조는 이름 기반(ingest.DeniedFilename)이라 상대경로 덤프도 커버한다(§11.1 파생 ①).
+// 않는다 — 대조는 basename 글롭 + `.docker/config.json` 경로 접미(ingest.DeniedFilename)라
+// 상대경로 덤프도 커버한다(§11.1 파생 ①).
 func commandDumpPath(in hookInput) string {
 	var f struct {
 		Command string `json:"command"`

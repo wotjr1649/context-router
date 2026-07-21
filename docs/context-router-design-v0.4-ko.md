@@ -46,7 +46,8 @@
   우연을 의도된 계층으로 승격하는 결정이다(§4).
 - **D38** store 용량 임계 경고: doctor [14]에 **content.db CAS 전체 blob
   총량**(shadow 전용 아님 — [14]의 측정 실체 그대로) 임계 초과 시 경고 1줄
-  추가(기본 100MB, `CTR_SHADOW_WARN_BYTES` 오버라이드). 자동 삭제 없음.
+  추가(기본 100MiB, `CTR_STORE_WARN_BYTES` 오버라이드 — v0.5 개명: 구
+  `CTR_SHADOW_WARN_BYTES`, 측정 실체 정합·별칭 없음). 자동 삭제 없음.
   경고 문구는 수동 구제 경로(purge 계열 CLI)를 안내하되 **현행 purge의
   비선택(source_kind 무구분) 삭제 성격을 병기**한다. SizeStats 실패([14]
   "없음") 시 경고 미평가. shadow 귀속 바이트 집계·hook 전용 purge는 v0.5+
@@ -130,6 +131,11 @@
   무변경)뿐이고, JSON(settings.json) 병합기 구현은 재사용 불가. 소유 항목
   식별(마커)·중복 처리·주석/미지 키 보존 수준은 G3 관측 후 설치 계약으로
   확정해 §11에 추기.
+- 업그레이드 순서: 바이너리 교체(`go install`)가 `hook install --codex` 재등록보다
+  먼저다 — hooks.json의 `codex-hook`은 v0.3 이하 구 바이너리에서 미지 서브커맨드
+  exit 1(버전 게이트, §11.2 F3)이므로 신 hooks.json + 구 바이너리 창에서는 cx:
+  캐프처만 침묵 불발한다(오귀속 없음). Claude 쪽 `hook` 서브커맨드는 구버전도
+  인식하므로 같은 창에서 cc: 캐프처는 지속된다.
 
 ## 3. PowerShell 가드 (D36) + shadow denylist 보강 (D39)
 
@@ -185,7 +191,7 @@
 
 - doctor [14] 행 뒤에 조건부 경고 1줄: **content.db CAS 전체 blob 총량**
   (shadow 전용 아님 — 명시 ingest 포함, [14] 측정 실체 그대로) > 임계
-  (기본 100MB, `CTR_SHADOW_WARN_BYTES` 파싱 실패·비양수 → 기본값) 시에만
+  (기본 100MiB, `CTR_STORE_WARN_BYTES` 파싱 실패·비양수 → 기본값) 시에만
   출력. 문구는 총량 현황 + 수동 구제 경로(purge 계열 CLI) 안내 + **현행
   purge의 비선택 삭제 성격**(source_kind 무구분 — shadow만 골라 지울 수
   없음)을 함께 명시. SizeStats 실패([14] "없음", ro-open 경합 등) 시 경고
