@@ -1226,6 +1226,61 @@ func TestDumpAbsPath(t *testing.T) {
 	}
 }
 
+// TestPsDumpArg: D36 어휘 판정(bashDumpArg 자매) — "대소문자 무시 덤프 토큰(Get-Content·gc·
+// cat·type) + 위치 인자 정확히 1개"만 경로를 반환, 나머지는 전부 ""(allow). 오탐 deny 차단이
+// 목적이라 거부 케이스가 본론이다. G2 실측(설계 §11.1): 입력은 tool_input.command.
+func TestPsDumpArg(t *testing.T) {
+	cases := []struct{ cmd, want string }{
+		{`Get-Content C:\big\file.log`, `C:\big\file.log`}, // 백슬래시는 PS 경로 구분자 — 허용(bash와 차이)
+		{"get-content C:/big/file.log", "C:/big/file.log"}, // 대소문자 무시
+		{"gc C:/big/file.log", "C:/big/file.log"},          // alias
+		{"cat C:/big/file.log", "C:/big/file.log"},         // pwsh alias
+		{"type C:/big/file.log", "C:/big/file.log"},        // cmd 유래 alias(PS에선 Get-Content)
+		{"Get-Content file.log", "file.log"},               // 어휘상 후보 — 절대 판정은 psAbsPath 몫
+		{"Get-Content -TotalCount 5 C:/f", ""},             // 부분 읽기 — 인자 3개
+		{"gc C:/f -Tail 10", ""},                           // 부분 읽기(후위)
+		{"gc -Raw C:/f", ""},                               // 대시 토큰
+		{"gc -Path C:/f", ""},                              // 명명 파라미터
+		{"gc C:/a,C:/b", ""},                               // 콤마 배열 — 제외
+		{"gc C:/*.log", ""},                                // 와일드카드 — 제외
+		{"gc $env:TEMP/f", ""},                             // 변수 전개 — 제외
+		{"gc C:/f | Select-Object -First 5", ""},           // 파이프 — 제외
+		{"gc C:/f; ls", ""},                                // 복합식 — 제외
+		{"Get-Content 'C:/f'", ""},                         // 인용 — 제외(보수)
+		{"gc `C:/f`", ""},                                  // 백틱(PS 이스케이프) — 제외
+		{"gc C:/한글.log", ""},                               // 비ASCII — 전면 판정 포기
+		{"gc ~/f", ""},                                     // ~ 홈 확장 — 제외
+		{"gc @(C:/f)", ""},                                 // @ 서브식/배열 — 제외
+		{"Set-Content C:/f", ""},                           // 덤프 아닌 명령
+		{"", ""},
+	}
+	for _, c := range cases {
+		if got := psDumpArg(c.cmd); got != c.want {
+			t.Fatalf("psDumpArg(%q)=%q want %q", c.cmd, got, c.want)
+		}
+	}
+}
+
+// TestPsAbsPath: psDumpArg 인자의 절대 판정 — bash용 MSYS /x/ 변환을 승계하지 않는다
+// (설계 §11.1 파생 ②: PS에서 /c/x는 현재 드라이브 루트 상대라 변환 시 오파일 판정 위험).
+func TestPsAbsPath(t *testing.T) {
+	cases := []struct{ goos, arg, want string }{
+		{"windows", `C:\big\f.log`, "C:/big/f.log"}, // ToSlash 정규화
+		{"windows", "C:/big/f.log", "C:/big/f.log"},
+		{"windows", "/c/big/f.log", ""},  // MSYS형 — PS에선 드라이브 상대, 비절대(allow)
+		{"windows", `\\srv\share\f`, ""}, // UNC — 드라이브형 아님, 보수 allow
+		{"windows", "f.log", ""},         // 상대
+		{"windows", "C:big.log", ""},     // 드라이브 상대(C: 뒤 구분자 없음)
+		{"linux", "/var/log/big.log", "/var/log/big.log"},
+		{"linux", "f.log", ""},
+	}
+	for _, c := range cases {
+		if got := psAbsPath(c.goos, c.arg); got != c.want {
+			t.Fatalf("psAbsPath(%q,%q)=%q want %q", c.goos, c.arg, got, c.want)
+		}
+	}
+}
+
 // runGuardBash — posttooluse-bash.json을 PreToolUse(Bash)로 재정의하고 command만 교체해 Run을
 // 호출한 뒤 stdout(deny JSON 또는 빈 문자열)을 반환한다(runGuard의 Bash 형제). command 조립은
 // 호출자가 filepath.ToSlash로 슬래시화 — Windows t.TempDir() 백슬래시가 bashDumpArg 어휘 판정에서

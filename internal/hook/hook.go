@@ -321,6 +321,55 @@ func dumpAbsPath(goos, arg string) string {
 	return ""
 }
 
+// psDumpArg — D36 어휘 판정(bashDumpArg 자매): 명령이 "단일 단순 <덤프 토큰> <경로>"일 때만
+// 경로 인자를 반환한다(그 외 전부 "" = allow). 덤프 토큰은 대소문자 무시 Get-Content·gc·cat·
+// type. PS 메타문자(파이프·리다이렉트·서브식 $()·변수 $·배열 콤마·스플래팅 @·백틱 이스케이프·
+// 주석 #·인용·와일드카드·괄호·세미콜론·~)와 비ASCII는 전면 판정 포기 — 파서는 확신이 있을
+// 때만 deny하고 오동작의 최대 피해는 "가드 미발화"다(설계 v0.4 §3, bashDumpArg 원칙 승계).
+// bash와 달리 백슬래시는 Windows 경로 구분자라 허용한다. 부분 읽기 플래그(-TotalCount·-Head·
+// -Tail)와 명명 파라미터(-Raw·-Path 등)는 "인자 정확히 1개 + 대시 토큰 배제"에 이미 걸러진다.
+// 덤프 토큰의 별칭 재정의·프로필 함수 shadow로 인한 오탐 deny는 D32 bash `cat` 셰도잉과 동일
+// 클래스로 수용(§11.2 F1) — deny 시에도 대상 파일이 현장 색인돼 ctr_search/ctr_fetch로 복구
+// 가능하다(비가역 아님).
+func psDumpArg(command string) string {
+	for i := 0; i < len(command); i++ {
+		if command[i] < 0x20 || command[i] > 0x7e {
+			return ""
+		}
+	}
+	if strings.ContainsAny(command, "|&;<>`$(){}*?[]'\"~#@,") {
+		return ""
+	}
+	fields := strings.Fields(command)
+	if len(fields) != 2 || strings.HasPrefix(fields[1], "-") {
+		return ""
+	}
+	switch strings.ToLower(fields[0]) {
+	case "get-content", "gc", "cat", "type":
+		return fields[1]
+	}
+	return ""
+}
+
+// psAbsPath — psDumpArg 인자의 절대경로 판정(dumpAbsPath 자매). PS에서 `/c/x`는 MSYS가 아니라
+// "현재 드라이브 루트 상대"라 bash용 MSYS 변환을 승계하면 오파일 stat 위험(설계 §11.1 파생 ②)
+// — Windows는 드라이브형(`X:\`·`X:/`)만 절대로 인정하고 ToSlash로 정규화한다. Unix(pwsh)는
+// `/`-접두만 절대. 그 외 전부 ""(allow).
+func psAbsPath(goos, arg string) string {
+	if goos == "windows" {
+		arg = filepath.ToSlash(arg)
+		if len(arg) >= 3 && arg[1] == ':' && arg[2] == '/' &&
+			((arg[0] >= 'a' && arg[0] <= 'z') || (arg[0] >= 'A' && arg[0] <= 'Z')) {
+			return arg
+		}
+		return ""
+	}
+	if strings.HasPrefix(arg, "/") {
+		return arg
+	}
+	return ""
+}
+
 // toolInputFields — classify가 소비하는 tool_input 하위 필드만(allowlist). command는 Bash,
 // file_path/notebook_path는 파일 편집 도구 경로. 나머지(content 등 원문)는 파싱하지 않는다(§3 원문 미수용).
 type toolInputFields struct {
