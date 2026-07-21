@@ -623,8 +623,8 @@ func finishPublish(dir string) error {
 
 // sweepOrphanBackups — 부분 이동으로 남은 .bak-<ts> sidecar 고아(-wal/-shm만 있고 main 멤버가
 // 없는 것)를 제거한다. backupOriginal은 -shm→-wal→main 순으로 옮기므로 main rename 전 crash
-// 시 sidecar만 옮겨진 불완전 ts family가 잔재로 남는다(resumePublishFromTmp 주석의 "포렌식
-// 잔재"). WAL/SHM은 짝이 되는 main 없이는 무의미하므로 게시(main 확정) 직후 스윕한다 — main을
+// 시 sidecar만 옮겨진 불완전 ts family가 잔재로 남는다(resumePublishFromTmp 주석의 부분 이동
+// sidecar 고아). WAL/SHM은 짝이 되는 main 없이는 무의미하므로 게시(main 확정) 직후 스윕한다 — main을
 // 가진 완전한 백업 family는 건드리지 않는다.
 func sweepOrphanBackups(dir string) error {
 	entries, err := os.ReadDir(dir)
@@ -665,7 +665,7 @@ func sweepOrphanBackups(dir string) error {
 // resumePublishFromTmp — 마커 하 tmp-우선 재개(A2, 설계 §6.3 ⑦): 검증 완료된 인양본(tmp)이
 // 건강하면 재인양 없이 게시만 마저 끝낸다. 원본 session.db가 아직 남아 있으면(backupOriginal이
 // 원본 -wal/-shm만 옮기고 main rename 전 crash) 남은 원본 family를 backupOriginal로 마저
-// 백업한 뒤(존재하는 멤버만 옮기므로 부분 이동 family는 포렌식 잔재로 남는다) finishPublish로
+// 백업한 뒤(존재하는 멤버만 옮겨 생기는 부분 이동 sidecar 고아는 finishPublish의 sweepOrphanBackups가 스윕) finishPublish로
 // tmp를 게시한다 — 원본에서 재인양하면 이미 분리돼 나간 -wal 꼬리를 잃으므로 tmp를 그대로
 // 게시하는 것이 핵심이다. 원본이 이미 없으면(직전 실행이 backupOriginal까지 끝냄) 기존 백업을
 // 그대로 보고한다. 반환 건수는 tmp를 직접 세어 §6.3 ⑦의 "인양 건수 보고"를 재인양 없이 지킨다.

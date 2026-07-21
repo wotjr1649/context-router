@@ -353,6 +353,30 @@ func TestExport_OmitemptyEmptyFieldsGolden(t *testing.T) {
 	}
 }
 
+// goldenRegenBlocked — UPDATE_GOLDEN 골든 재생성 가드(T10b, session-10 채택): CI에서 골든을
+// 재생성하면 방금 쓴 바이트와 비교해 byte-exact 테스트가 무조건 통과 → 회귀 가드가 무력화된다.
+// CI(env CI 설정)에서 UPDATE_GOLDEN이 켜지면 재생성을 막는다 — 로컬 재생성만 허용.
+func goldenRegenBlocked(updateGolden, ci string) bool {
+	return updateGolden != "" && ci != ""
+}
+
+// TestGoldenRegenBlocked — 가드 진리표: CI∧UPDATE_GOLDEN만 차단, 나머지 통과.
+func TestGoldenRegenBlocked(t *testing.T) {
+	for _, c := range []struct {
+		upd, ci string
+		want    bool
+	}{
+		{"", "", false},
+		{"1", "", false},    // 로컬 재생성 허용
+		{"", "true", false}, // CI 평시(재생성 아님) 통과
+		{"1", "true", true}, // CI 재생성 차단
+	} {
+		if got := goldenRegenBlocked(c.upd, c.ci); got != c.want {
+			t.Fatalf("goldenRegenBlocked(%q,%q)=%v want %v", c.upd, c.ci, got, c.want)
+		}
+	}
+}
+
 // TestExport_ByteExactGolden — 부채 ④(설계 §9, v0.1 최종리뷰 요구): 고정 cc: 세션·고정
 // event_id/ts로 시드한 훅 이벤트(빈 필드 1건 + 전 필드 1건)를 export한 바이트를 testdata 골든과
 // 바이트 단위로 비교한다 — 필드 순서·키 이름·타임스탬프 형식·omitempty 드롭의 어떤 표류도 잡는다.
@@ -387,7 +411,11 @@ func TestExport_ByteExactGolden(t *testing.T) {
 	got = append(got, '\n')
 
 	goldenPath := filepath.Join("testdata", "export_golden.json")
-	if os.Getenv("UPDATE_GOLDEN") != "" {
+	update := os.Getenv("UPDATE_GOLDEN")
+	if goldenRegenBlocked(update, os.Getenv("CI")) {
+		t.Fatal("UPDATE_GOLDEN은 CI에서 금지 — 재생성은 로컬 전용(byte-exact 골든 회귀 가드 무력화 방지)")
+	}
+	if update != "" {
 		if err := os.WriteFile(goldenPath, got, 0o644); err != nil {
 			t.Fatalf("write golden: %v", err)
 		}

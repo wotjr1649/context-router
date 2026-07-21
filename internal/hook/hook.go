@@ -116,10 +116,7 @@ func dispatch(ctx context.Context, in hookInput, dir, contentDir, worktreeRoot, 
 		// source는 신뢰 불가 stdin 문자열(최종 리뷰 C4) — EnsureSession은 서버 발행 고정 이벤트라
 		// ValidateEvent를 우회하므로 여기서 길이만 봉인한다(거대 source의 payload 상한 우회 차단).
 		// enum 강제는 안 한다: 호스트가 신형 source 값을 추가하면 세션 기록 전체가 사장된다(전방 호환).
-		src := in.Source
-		if len(src) > maxSourceBytes {
-			src = src[:maxSourceBytes]
-		}
+		src := truncateUTF8(in.Source, maxSourceBytes) // C4: rune 경계 절단(byte-slice는 멀티바이트 source를 깨뜨림)
 		if _, err := ad.EnsureSession(ctx, src, worktreeRoot); err != nil {
 			appendDrop(dir, "ensure-failed")
 		}
@@ -359,7 +356,7 @@ var errCodeRe = regexp.MustCompile(`(?i)(?:status code|exit code|code)\s+(\d+)`)
 // 요소>`로만 조립하고 원시 인자·오류 전문·응답 본문은 넣지 않는다(summary는 FTS 색인 대상 —
 // 비밀 운반 차단 1차 방어). 순수 함수(테이블 테스트가 계약)이며 파일 상대 경로 기준은 in.CWD다
 // (worktreeRoot와 동일 워크스페이스 디렉터리 — canon Fold/RealPath는 store-id 안정화 전용이라
-// 표시 경로에는 불필요). attrs는 allowlist 필드만(exit_code·is_interrupt) 채운다.
+// 표시 경로에는 불필요). attrs는 allowlist 필드만(exit_code·is_interrupt·matched_pattern) 채운다.
 func classify(in hookInput) (eventType, summary string, attrs map[string]any) {
 	if in.HookEventName == "PostToolUseFailure" {
 		element, a := classifyError(in.Error, in.IsInterrupt)
@@ -376,7 +373,10 @@ func classify(in hookInput) (eventType, summary string, attrs map[string]any) {
 				break
 			}
 		}
-		return et, summaryLine("Bash", bashFirstToken(f.Command)), nil
+		if et != "tool_call" { // T5: 매치한 패턴명(안정 enum)을 attr로 방출(설계 §3 "매치 패턴명" allowlist)
+			attrs = map[string]any{"matched_pattern": et}
+		}
+		return et, summaryLine("Bash", bashFirstToken(f.Command)), attrs
 	case "Write", "Edit", "NotebookEdit":
 		var f toolInputFields
 		_ = json.Unmarshal(in.ToolInput, &f)

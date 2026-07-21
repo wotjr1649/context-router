@@ -161,6 +161,40 @@ func TestHookSessionStartSourceTruncated(t *testing.T) {
 	}
 }
 
+// ②-c source 멀티바이트 경계 절단(C4 rune-safe): maxSourceBytes(64)가 3바이트 룬(U+AC00) 중간에
+// 떨어지는 입력에서 byte-slice(src[:64])는 룬을 반쪽 내 깨진 UTF-8을 남기지만, truncateUTF8은
+// 룬 경계(63B=21룬)까지 물러나 온전한 UTF-8만 기록한다. 결과가 21룬 프리픽스와 정확히 같아야 한다.
+func TestHookSessionStartSourceRuneBoundary(t *testing.T) {
+	storeRoot := filepath.Join(t.TempDir(), "storeroot")
+	cwd := t.TempDir()
+	han := string(rune(0xAC00)) // "가" — 3바이트 UTF-8(소스에 멀티바이트 리터럴 미포함)
+	in := fixtureWith(t, "sessionstart.json", map[string]any{
+		"cwd":    cwd,
+		"source": strings.Repeat(han, 100), // 300B, 64B는 22번째 룬(바이트 63~65) 중간
+	})
+	if rc := runHook(t, storeRoot, in, nil); rc != 0 {
+		t.Fatalf("rc=%d want 0", rc)
+	}
+	reader, err := session.OpenReadOnly(sessDir(t, storeRoot, cwd))
+	if err != nil {
+		t.Fatalf("open session.db: %v", err)
+	}
+	defer func() { _ = reader.Close() }()
+	var payload string
+	if err := reader.QueryRow("SELECT payload FROM session_events WHERE event_type='session_start'").Scan(&payload); err != nil {
+		t.Fatalf("payload: %v", err)
+	}
+	var p struct {
+		Source string `json:"source"`
+	}
+	if err := json.Unmarshal([]byte(payload), &p); err != nil {
+		t.Fatalf("unmarshal payload: %v", err)
+	}
+	if want := strings.Repeat(han, 21); p.Source != want { // byte-slice면 64B(반쪽 룬)로 불일치
+		t.Fatalf("source=%q(len=%d) want 21룬 프리픽스(len=%d)", p.Source, len(p.Source), len(want))
+	}
+}
+
 // ③ 비-SessionStart 이벤트를 미지 세션으로 → 이벤트 0건 + drops 1줄(unknown-session).
 func TestHookUnknownSession(t *testing.T) {
 	storeRoot := filepath.Join(t.TempDir(), "storeroot")
@@ -407,6 +441,16 @@ func TestSummaryAllowlist(t *testing.T) {
 		_, summary, _ := classify(bashEvent(t, "PostToolUse", "git diff HEAD"))
 		if summary != "Bash: git" {
 			t.Fatalf("summary=%q want %q", summary, "Bash: git")
+		}
+	})
+	// T5: 분류된 Bash는 매치 패턴명(안정 enum = event_type)을 matched_pattern attr로 방출하고,
+	// 미매치(tool_call)는 방출하지 않는다(설계 §3 "매치 패턴명" allowlist).
+	t.Run("matched_pattern_attr", func(t *testing.T) {
+		if _, _, attrs := classify(bashEvent(t, "PostToolUse", "go test ./...")); attrs["matched_pattern"] != "test_run" {
+			t.Fatalf("matched_pattern=%v want test_run", attrs["matched_pattern"])
+		}
+		if _, _, attrs := classify(bashEvent(t, "PostToolUse", "ls -la")); attrs["matched_pattern"] != nil {
+			t.Fatalf("tool_call matched_pattern=%v want absent", attrs["matched_pattern"])
 		}
 	})
 	// ④ secret canary(분할 리터럴)를 비-첫토큰 인자에 심으면 summary·attrs에 원문 부재(allowlist 1차 방어).
@@ -961,6 +1005,31 @@ func TestGuardPartialReadAllows(t *testing.T) {
 	}, nil)
 	if out != "" {
 		t.Fatalf("stdout=%q want empty (부분 읽기 = allow)", out)
+	}
+}
+
+// ②-b offset 단독·limit 단독도 부분 읽기 → allow(T7: 둘 중 하나만 있어도 통과, 존재-판정이 &&가 아님).
+func TestGuardPartialReadOffsetOrLimitAlone(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		in   map[string]any
+	}{
+		{"offset_alone", map[string]any{"offset": 1}},
+		{"limit_alone", map[string]any{"limit": 100}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			storeRoot, cwd, _, _ := guardSetup(t)
+			big := filepath.Join(cwd, "big.txt")
+			writeSized(t, big, 300*1024) // 임계 초과·경계 내 — 부분 읽기 판정만이 통과 근거
+			ti := map[string]any{"file_path": big}
+			for k, v := range tc.in {
+				ti[k] = v
+			}
+			out := runGuard(t, storeRoot, map[string]any{"cwd": cwd, "tool_input": ti}, nil)
+			if out != "" {
+				t.Fatalf("stdout=%q want empty (%s = allow)", out, tc.name)
+			}
+		})
 	}
 }
 

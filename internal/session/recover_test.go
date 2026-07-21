@@ -493,7 +493,7 @@ func TestRecover_ServerRunning_RejectsImmediately(t *testing.T) {
 
 // TestRecover_SweepsIncompleteBakOrphans — 부채정리 ②: backupOriginal은 -shm→-wal→main
 // 순으로 옮기므로 main rename 전 crash하면 main 멤버가 없는 .bak-<ts> sidecar 고아가 남는다
-// (resumePublishFromTmp 주석의 "부분 이동 family는 포렌식 잔재로 남는다"). recover 완료 후
+// (resumePublishFromTmp 주석의 "부분 이동 sidecar 고아"). recover 완료 후
 // 그런 불완전 ts family는 스윕돼 사라져야 하고, main을 포함한 완전한 백업은 보존돼야 한다.
 func TestRecover_SweepsIncompleteBakOrphans(t *testing.T) {
 	dir := t.TempDir()
