@@ -521,6 +521,31 @@ func TestDoctor_HookItemsAndAscendingOrder(t *testing.T) {
 	})
 }
 
+// ⑦ dropsByReason 엄격 파싱: appendDrop 계약("<unix초>\t<사유>") 비준수 줄은 전부 unparsed로 세되
+// total은 빈 줄 포함 모든 줄을 센다(줄 수 계약). 빈 줄·탭 없는 줄·비숫자 ts·3필드(탭 초과) 커버 —
+// 비준수 줄이 자기 사유(bad-input·foo\tbar)로 새지 않음을 len==2로 확인(사유 TAB 혼입 회귀 방지).
+func TestDropsByReason_StrictParsing(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "session.drops.log")
+	// 유효 1줄 + 빈 줄 + 탭 없는 줄 + 비숫자 ts + 3필드(탭 혼입) = 5줄.
+	body := "1\ta\n\nnofield\ngarbage\tbad-input\n123\tfoo\tbar\n"
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	total, reasons := dropsByReason(path)
+	if total != 5 {
+		t.Fatalf("total=%d want 5(빈 줄 포함 모든 줄)", total)
+	}
+	if reasons["a"] != 1 {
+		t.Fatalf("reasons[a]=%d want 1(유효 줄)", reasons["a"])
+	}
+	if reasons["unparsed"] != 4 {
+		t.Fatalf("reasons[unparsed]=%d want 4(빈 줄·탭 없음·비숫자 ts·3필드)", reasons["unparsed"])
+	}
+	if len(reasons) != 2 {
+		t.Fatalf("reasons=%v want 정확히 {a,unparsed}(bad-input/foo 등 미유입)", reasons)
+	}
+}
+
 // ⑧ F5: `hook install --user` 후 doctor가 사용자 범위 등록을 인식하고 프로젝트 범위는 미등록으로
 // 보고해야 한다(프로젝트-only 검사 회귀 방지). 사용자 홈은 t.Setenv로 자기 전용 TempDir로 덮어써
 // 실사용자 ~/.claude를 건드리지 않는다(TestMain 기본 홈 격리 위에서 추가 격리·자동 복원).

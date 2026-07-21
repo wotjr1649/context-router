@@ -46,9 +46,13 @@ func shadowCapture(ctx context.Context, ad *session.AppendDB, in hookInput, dir,
 	}
 	// D31 decode-sniff: body는 hook.Run 외부 파싱을 통과한 유효 JSON — 문자열 leaf를
 	// 재귀 수집해 디코드된 실바이트로 판정한다(C2 부분문자열 검사의 FP 상한 제거).
-	// 유효 JSON 전제에서 Unmarshal은 실패하지 않는다(실패는 직조립 입력 방어 — 조용히 스킵).
+	// UseNumber로 수를 json.Number(string 계열)로 받아 float64 범위 밖 수(1e1000 등)의
+	// UnmarshalTypeError 오거부를 없앤다 — 수 leaf는 NUL을 담을 수 없어 stringLeaves가 무시.
+	// 진짜 디코드 불가(직조립 입력)만 조용히 스킵한다.
 	var decoded any
-	if json.Unmarshal(body, &decoded) != nil {
+	dec := json.NewDecoder(bytes.NewReader(body))
+	dec.UseNumber()
+	if dec.Decode(&decoded) != nil {
 		return
 	}
 	for _, leaf := range stringLeaves(decoded, nil) {

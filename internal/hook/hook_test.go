@@ -943,10 +943,23 @@ func TestShadowAppendDrops(t *testing.T) {
 
 // guardSetup — session_start를 발화해 세션을 선재시키고 (storeRoot, cwd, contentDir, sdir)를
 // 반환한다. 가드는 SessionExists 통과 후 동작하므로 세션이 있어야 한다(shadowSetup과 동형).
+// evalLong — 픽스처 디렉터리를 장문명으로 정규화한다. Windows CI의 t.TempDir()는 8.3 단축명
+// (C:\Users\RUNNER~1\...)을 낼 수 있고, 그 ~는 bashDumpArg의 어휘 거부(설계상 allow-bias)에 걸려
+// guardBash가 stat/store 전에 반환한다 — 로컬은 ~가 없어 통과하는 픽스처 이식성 버그. EvalSymlinks가
+// Windows 8.3 성분을 장문명으로 해석한다(경로는 존재해야 함 — t.TempDir()은 존재). 프로덕션의 ~ allow는
+// 그대로다. 정규화하지 않으면 allow-계열 테스트도 의도한 조건 전에 어휘 게이트에 걸려 무의미 통과한다.
+func evalLong(t *testing.T, dir string) string {
+	t.Helper()
+	if p, err := filepath.EvalSymlinks(dir); err == nil {
+		return p
+	}
+	return dir
+}
+
 func guardSetup(t *testing.T) (storeRoot, cwd, contentDir, sdir string) {
 	t.Helper()
 	storeRoot = filepath.Join(t.TempDir(), "storeroot")
-	cwd = t.TempDir()
+	cwd = evalLong(t, t.TempDir())
 	if rc := runHook(t, storeRoot, fixtureWith(t, "sessionstart.json", map[string]any{"cwd": cwd}), nil); rc != 0 {
 		t.Fatalf("sessionstart rc=%d want 0", rc)
 	}
@@ -1303,7 +1316,7 @@ func TestGuardBashUnderThresholdAllows(t *testing.T) {
 // D32-⑤ 경계 밖 대형 파일 → allow(ingest ErrWorkspace → Indexed==0).
 func TestGuardBashOutsideBoundaryAllows(t *testing.T) {
 	storeRoot, cwd, _, _ := guardSetup(t)
-	outside := filepath.Join(t.TempDir(), "big.txt") // cwd와 형제 — 경계 밖
+	outside := filepath.Join(evalLong(t, t.TempDir()), "big.txt") // cwd와 형제 — 경계 밖
 	writeSized(t, outside, 300*1024)
 	out := runGuardBash(t, storeRoot, cwd, "cat "+filepath.ToSlash(outside), nil)
 	if out != "" {
