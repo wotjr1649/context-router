@@ -232,6 +232,61 @@ func TestRunDoctor_ContentDBSize(t *testing.T) {
 	}
 }
 
+// D38 — blob 총량 > 임계면 [14] 뒤 경고 1줄(purge 비선택 성격 병기), 임계 미만이면 무출력.
+// SizeStats 실패("없음") 경로는 else 분기 밖이라 경고 미평가가 구조로 보장된다(기존 테스트 커버).
+// 셋업·호출은 TestRunDoctor_ContentDBSize 관례.
+func doctorSizeWarnSetup(t *testing.T) (storeRoot, projectRoot string) {
+	t.Helper()
+	storeRoot, projectRoot = t.TempDir(), t.TempDir()
+	canon, err := ident.Canonicalize(projectRoot)
+	if err != nil {
+		t.Fatalf("canonicalize: %v", err)
+	}
+	st, err := store.Open(filepath.Join(storeRoot, "projects", canon.ProjectID), false)
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	if _, err := st.Register(context.Background(), store.Registration{
+		StoredBytes: []byte(strings.Repeat("a", 10)), MediaType: "text/plain",
+		Source: store.SourceMeta{URI: "/src-a", Kind: "file", SrcHash: "/src-a"},
+		Chunks: []store.Chunk{{Ordinal: 0, Text: strings.Repeat("a", 10)}},
+	}); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatalf("store.Close: %v", err)
+	}
+	return storeRoot, projectRoot
+}
+
+func TestRunDoctor_StoreSizeWarn(t *testing.T) {
+	storeRoot, projectRoot := doctorSizeWarnSetup(t)
+	t.Setenv("CTR_SHADOW_WARN_BYTES", "5") // blob 10B > 5B → 발화
+	var buf bytes.Buffer
+	if err := runDoctor(context.Background(), &buf, storeRoot, projectRoot, "0.0.1-dev"); err != nil {
+		t.Fatalf("runDoctor err=%v out=%s", err, buf.String())
+	}
+	for _, want := range []string{"[14] warning:", "purge", "무구분"} {
+		if !strings.Contains(buf.String(), want) {
+			t.Fatalf("out missing %q:\n%s", want, buf.String())
+		}
+	}
+}
+
+func TestRunDoctor_StoreSizeWarnSilentUnderThreshold(t *testing.T) {
+	storeRoot, projectRoot := doctorSizeWarnSetup(t) // 임계 미설정 — 기본 100MiB
+	var buf bytes.Buffer
+	if err := runDoctor(context.Background(), &buf, storeRoot, projectRoot, "0.0.1-dev"); err != nil {
+		t.Fatalf("runDoctor err=%v out=%s", err, buf.String())
+	}
+	if !strings.Contains(buf.String(), "[14] content.db: sources=1 artifacts=1 blob=10B") {
+		t.Fatalf("out missing exact [14] line(무회귀):\n%s", buf.String())
+	}
+	if strings.Contains(buf.String(), "[14] warning") {
+		t.Fatalf("경고가 임계 미만에서 발화:\n%s", buf.String())
+	}
+}
+
 // TestRun_UnknownSub: cli의 관심사가 아닌 미지 서브커맨드는 오류를 반환해야 한다 — main이
 // 이를 통해 미지 단어를 MCP 플래그로 잘못 흡수하지 않도록 한다(설계 §7).
 func TestRun_UnknownSub(t *testing.T) {
