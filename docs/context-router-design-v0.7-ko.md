@@ -34,7 +34,8 @@
   신설이 아니다 — `dispatch`는 호스트 무관 공유 경로라 PreToolUse
   분기가 이미 존재하나(hook.go:153, §2 실코드 확인) **host가 현재
   세션 접두 문자열로만 진입하므로 Run→dispatch→가드 명시 전달을
-  신설**한다(가드 헬퍼의 HostClaude 하드코딩 제거 포함). 게이트
+  신설**한다(현행 가드는 host 무분기 — 사실상 cc: 고정 동작을 명시
+  host 스레딩으로 대체, 재검수 용어 정밀화 §10). 게이트
   선택의 실측 근거는 §7(Windows Codex exec = raw PS 구문 지배).
   deny 사유의 ctr_search/ctr_fetch 안내는 D48(MCP 재등록)로
   실효화된다 — 안내된 도구가 없는 "차단+복구 불능" 조합 금지(D32
@@ -114,8 +115,8 @@
   때문이다(v0.4 G3 "캐프처 전용" 결정). 따라서 이식의 최소 갭:
   1. 설치기가 PreToolUse 그룹을 등록(§3).
   2. **호스트×GOOS 단독 게이트 선택**: host를 Run→dispatch→guardBash
-     명시 파라미터로 전달(현재는 세션 접두 문자열에만 반영 — 가드
-     헬퍼의 HostClaude 하드코딩 제거 포함)하고, `cx:`+Windows이면
+     명시 파라미터로 전달(현재는 세션 접두 문자열에만 반영 — 가드는
+     host 무분기로 사실상 cc: 고정 동작)하고, `cx:`+Windows이면
      tool_input.command에 **PS 게이트(psDumpArg+psAbsPath) 단독**,
      `cx:`+비Windows이면 **bash 게이트(bashDumpArg+dumpAbsPath)
      단독**, `cc:`이면 현행 유지. 게이트는 술어+경로 해석의 완결
