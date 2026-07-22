@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/wotjr1649/context-router/internal/ident"
+	"github.com/wotjr1649/context-router/internal/session"
 )
 
 // metaLine — rollout session_meta 1줄(실측 스키마 §7: payload.session_id·id 병존, cwd 원형 경로).
@@ -216,5 +217,185 @@ func TestParseRolloutFile_CorruptAndMissing(t *testing.T) {
 	r5, err := parseRolloutFile(context.Background(), p5, folded)
 	if err != nil || r5.skipped != 1 || r5.turns != 1 || r5.use.total != 11 {
 		t.Fatalf("리프 부재 스킵 강등 실패: err=%v %+v", err, r5)
+	}
+}
+
+// seedCXSessionAt — 지정 worktree 디렉터리에 cx: 세션을 등록한다(seedCCSession 패턴 —
+// 다중 worktree 순회 검증용으로 sessDir를 직접 받는다).
+func seedCXSessionAt(t *testing.T, sessDir, uuid string) {
+	t.Helper()
+	ad, err := session.OpenAppend(context.Background(), sessDir, session.AppendOptions{ExternalSessionID: "cx:" + uuid, Producer: "test", RetentionSec: 0})
+	if err != nil {
+		t.Fatalf("OpenAppend %s: %v", uuid, err)
+	}
+	if _, err := ad.EnsureSession(context.Background(), "startup", ""); err != nil {
+		t.Fatalf("EnsureSession %s: %v", uuid, err)
+	}
+	if err := ad.Close(); err != nil {
+		t.Fatalf("Close %s: %v", uuid, err)
+	}
+}
+
+func wtDir(t *testing.T, storeRoot, projectRoot, name string) string {
+	t.Helper()
+	canon, err := ident.Canonicalize(projectRoot)
+	if err != nil {
+		t.Fatalf("canon: %v", err)
+	}
+	return filepath.Join(storeRoot, "projects", canon.ProjectID, "worktrees", name)
+}
+
+func TestLoadCXSessions_MergesWorktrees(t *testing.T) {
+	storeRoot, projectRoot := t.TempDir(), t.TempDir()
+	canon, _ := ident.Canonicalize(projectRoot)
+	// 현재 worktree + 별도 worktree 양쪽에 등록(D40 ③ — 단일 worktree 조인은 체계적 과소귀속).
+	u1 := "019f0000-0000-7000-8000-0000000000a1"
+	u2 := "019f0000-0000-7000-8000-0000000000b2"
+	seedCXSessionAt(t, filepath.Join(storeRoot, "projects", canon.ProjectID, "worktrees", canon.WorktreeID), u1)
+	seedCXSessionAt(t, wtDir(t, storeRoot, projectRoot, "otherwt"), u2)
+	set, incomplete := loadCXSessions(context.Background(), storeRoot, projectRoot)
+	if incomplete {
+		t.Fatal("정상 순회가 incomplete")
+	}
+	if !set["cx:"+u1] || !set["cx:"+u2] || len(set) != 2 {
+		t.Fatalf("병합 실패: %v", set)
+	}
+}
+
+func TestLoadCXSessions_UnusableDBIsIncomplete(t *testing.T) {
+	storeRoot, projectRoot := t.TempDir(), t.TempDir()
+	u1 := "019f0000-0000-7000-8000-0000000000a1"
+	canon, _ := ident.Canonicalize(projectRoot)
+	seedCXSessionAt(t, filepath.Join(storeRoot, "projects", canon.ProjectID, "worktrees", canon.WorktreeID), u1)
+	// 손상 DB worktree — 그 worktree만 skip + incomplete(스펙 §2: off 확정 금지의 근거 신호).
+	bad := wtDir(t, storeRoot, projectRoot, "badwt")
+	if err := os.MkdirAll(bad, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(bad, "session.db"), []byte("not a sqlite db"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	set, incomplete := loadCXSessions(context.Background(), storeRoot, projectRoot)
+	if !incomplete {
+		t.Fatal("손상 DB가 incomplete=false")
+	}
+	if !set["cx:"+u1] {
+		t.Fatal("정상 worktree 결과가 유실")
+	}
+	// 진짜 부재(빈 스토어)는 complete — 등록이 없었던 것이지 관측 불능이 아니다(계획 검수 교정:
+	// complete=부재일 때만, ReadDir/Stat의 그 외 오류·Canonicalize 실패는 incomplete).
+	set2, inc2 := loadCXSessions(context.Background(), t.TempDir(), projectRoot)
+	if inc2 || len(set2) != 0 {
+		t.Fatalf("빈 스토어: incomplete=%v set=%v", inc2, set2)
+	}
+}
+
+// tsFor — now 기준 d 전 시각을 rollout 파일명 ts 형식(로컬)으로.
+func tsFor(now time.Time, d time.Duration) string {
+	return now.Add(-d).Format("2006-01-02T15-04-05")
+}
+
+func TestScanRollouts_ArmClassification(t *testing.T) {
+	projectRoot := t.TempDir()
+	rolloutRoot := t.TempDir()
+	day := filepath.Join(rolloutRoot, "2026", "07", "22") // YYYY/MM/DD 재귀 순회(§2)
+	if err := os.MkdirAll(day, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 7, 22, 12, 0, 0, 0, time.Local) // 기준 시각 주입(§6 — 결정론)
+	uOn := "019f0000-0000-7000-8000-00000000000a"
+	uOff := "019f0000-0000-7000-8000-00000000000b"
+	uOld := "019f0000-0000-7000-8000-00000000000c"
+	uDiv := "019f0000-0000-7000-8000-00000000000d"
+	uOut := "019f0000-0000-7000-8000-00000000000e"
+	writeRollout(t, day, tsFor(now, 24*time.Hour), uOn, []string{metaLine(uOn, projectRoot), tcLine(100, 50, 10, 110)})
+	writeRollout(t, day, tsFor(now, 48*time.Hour), uOff, []string{metaLine(uOff, projectRoot), tcLine(40, 20, 5, 45)})
+	// 창 밖(8일 전) 미등록 → unknown(§2 — 행 삭제 불변식은 7일까지만 증명).
+	writeRollout(t, day, tsFor(now, 8*24*time.Hour), uOld, []string{metaLine(uOld, projectRoot), tcLine(7, 3, 1, 8)})
+	// cwd 발산 → 제외+집계.
+	writeRollout(t, day, tsFor(now, 24*time.Hour), uDiv, []string{metaLine(uDiv, projectRoot), tcLine(1, 0, 0, 1), metaLine(uDiv, t.TempDir())})
+	// 타 프로젝트 cwd → 자연 배제(집계 없음).
+	writeRollout(t, day, tsFor(now, 24*time.Hour), uOut, []string{metaLine(uOut, t.TempDir()), tcLine(1, 0, 0, 1)})
+	// 손상 파일(meta 없음) → 파일 단위 스킵 집계.
+	writeRollout(t, day, tsFor(now, 24*time.Hour), "019f0000-0000-7000-8000-00000000000f", []string{tcLine(1, 0, 0, 1)})
+
+	cxSet := map[string]bool{"cx:" + uOn: true, "cx:019f0000-0000-7000-8000-0000000000ff": true} // 후자=rollout 부재(n/a K)
+	sc, err := scanRollouts(context.Background(), rolloutRoot, projectRoot, cxSet, false, now)
+	if err != nil {
+		t.Fatalf("err=%v", err)
+	}
+	if len(sc.on) != 1 || sc.on[0].id != uOn || len(sc.off) != 1 || sc.off[0].id != uOff || len(sc.unknown) != 1 || sc.unknown[0].id != uOld {
+		t.Fatalf("arm 분류: on=%d off=%d unknown=%d", len(sc.on), len(sc.off), len(sc.unknown))
+	}
+	if sc.diverged != 1 || sc.skipFiles != 1 {
+		t.Fatalf("diverged=%d skipFiles=%d", sc.diverged, sc.skipFiles)
+	}
+	if sc.registered != 2 || sc.matched != 1 { // K = 2-1 = 1
+		t.Fatalf("registered=%d matched=%d", sc.registered, sc.matched)
+	}
+	if !sc.on[0].start.Equal(now.Add(-24 * time.Hour)) {
+		t.Fatalf("start 파싱: %v", sc.on[0].start)
+	}
+}
+
+func TestScanRollouts_IncompleteDemotesOffToUnknown(t *testing.T) {
+	// DB 불용 시 부재 관측 신뢰 불가 → off 확정 금지, 전부 unknown(§2 — 2패스 수렴).
+	projectRoot := t.TempDir()
+	rolloutRoot := t.TempDir()
+	day := filepath.Join(rolloutRoot, "2026", "07", "22")
+	if err := os.MkdirAll(day, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 7, 22, 12, 0, 0, 0, time.Local)
+	u := "019f0000-0000-7000-8000-00000000000b"
+	writeRollout(t, day, tsFor(now, 24*time.Hour), u, []string{metaLine(u, projectRoot), tcLine(1, 0, 0, 1)})
+	sc, err := scanRollouts(context.Background(), rolloutRoot, projectRoot, nil, true, now)
+	if err != nil {
+		t.Fatalf("err=%v", err)
+	}
+	if len(sc.off) != 0 || len(sc.unknown) != 1 || !sc.incomplete {
+		t.Fatalf("incomplete 강등 실패: off=%d unknown=%d incomplete=%v", len(sc.off), len(sc.unknown), sc.incomplete)
+	}
+}
+
+func TestScanRollouts_WindowBoundaryInclusive(t *testing.T) {
+	// 정확히 7일 전 시작: GC 술어는 started_at < now-7d(엄격 미만)라 행 존재가 보장된다 —
+	// off 확정은 inclusive(!start.Before(cutoff), 계획 검수 교정 — 스펙 §2 "7일 이내").
+	projectRoot := t.TempDir()
+	rolloutRoot := t.TempDir()
+	day := filepath.Join(rolloutRoot, "2026", "07", "15")
+	if err := os.MkdirAll(day, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 7, 22, 12, 0, 0, 0, time.Local)
+	u := "019f0000-0000-7000-8000-00000000000b"
+	writeRollout(t, day, tsFor(now, cxOffWindow), u, []string{metaLine(u, projectRoot), tcLine(1, 0, 0, 1)})
+	sc, err := scanRollouts(context.Background(), rolloutRoot, projectRoot, nil, false, now)
+	if err != nil {
+		t.Fatalf("err=%v", err)
+	}
+	if len(sc.off) != 1 || len(sc.unknown) != 0 {
+		t.Fatalf("경계 세션이 off가 아님: off=%d unknown=%d", len(sc.off), len(sc.unknown))
+	}
+}
+
+func TestScanRollouts_MetaIDAuthority(t *testing.T) {
+	// 파일명-meta id 불일치 — meta의 session_id가 권위(§2: 파일명은 발견 수단), arm 조인도 meta 기준.
+	projectRoot := t.TempDir()
+	rolloutRoot := t.TempDir()
+	day := filepath.Join(rolloutRoot, "2026", "07", "22")
+	if err := os.MkdirAll(day, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 7, 22, 12, 0, 0, 0, time.Local)
+	fileUUID := "019f0000-0000-7000-8000-0000000000f1"
+	metaUUID := "019f0000-0000-7000-8000-0000000000f2"
+	writeRollout(t, day, tsFor(now, 24*time.Hour), fileUUID, []string{metaLine(metaUUID, projectRoot), tcLine(1, 0, 0, 1)})
+	sc, err := scanRollouts(context.Background(), rolloutRoot, projectRoot, map[string]bool{"cx:" + metaUUID: true}, false, now)
+	if err != nil {
+		t.Fatalf("err=%v", err)
+	}
+	if len(sc.on) != 1 || sc.on[0].id != metaUUID || sc.matched != 1 {
+		t.Fatalf("meta 권위 위반: on=%d matched=%d", len(sc.on), sc.matched)
 	}
 }

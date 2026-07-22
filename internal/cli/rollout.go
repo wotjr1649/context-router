@@ -11,12 +11,15 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"io/fs"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"time"
 
 	"github.com/wotjr1649/context-router/internal/ident"
+	"github.com/wotjr1649/context-router/internal/session"
 )
 
 type cxUsage struct{ input, cachedInput, output, total int64 }
@@ -149,4 +152,144 @@ func parseRolloutFile(ctx context.Context, path, foldedRoot string) (cxRollout, 
 			return r, errors.New("usage: rollout 스캔 실패")
 		}
 	}
+}
+
+// cxScan — 프로젝트 귀속 rollout의 arm 분류·커버리지 집계(D45 §3 소비).
+type cxScan struct {
+	on, off, unknown               []cxRollout
+	diverged, skipFiles, skipLines int64
+	incomplete                     bool
+	registered, matched            int
+}
+
+// mustAbs — projectRoot의 절대화(실패는 사실상 없음 — 원본 반환, transcriptDirFor 관례).
+func mustAbs(p string) string {
+	if abs, err := filepath.Abs(p); err == nil {
+		return abs
+	}
+	return p
+}
+
+// cxOffWindow — 관측 창(§2): retention 스윕=이벤트만 삭제 + 빈 세션 GC=started_at<now-7d 필수
+// (retention_sec 무관)라는 실코드 불변식상, 시작 후 7일 이내 등록 행은 자동 삭제 경로가 없다 —
+// 7일 이내 부재만 off 확정 가능(그 밖·DB 불용은 unknown).
+const cxOffWindow = 7 * 24 * time.Hour
+
+// loadCXSessions — 프로젝트 worktrees/* 전체 session.db를 read-only 순회 병합해 cx: 세션 집합을
+// 만든다(D40 ③ 정합 — [15]와 같은 순회 패턴, loadCCSessions의 단일 worktree 조회 재사용 금지 §2).
+// worktree 단위 실패는 그 worktree만 skip + incomplete=true([15] 폴백 정합 — off 확정 금지 신호).
+func loadCXSessions(ctx context.Context, storeRoot, projectRoot string) (map[string]bool, bool) {
+	// complete 판정은 "진짜 부재"일 때만 — 식별 실패·ReadDir/Stat의 부재 외 오류는 관측 불능이라
+	// incomplete=true(off 확정 금지, §2 — 계획 검수 교정: 관측 실패를 complete로 취급하면
+	// 최근 미등록 rollout이 거짓 off가 된다).
+	canon, err := ident.Canonicalize(projectRoot)
+	if err != nil || canon.ProjectID == "" {
+		return nil, true
+	}
+	wtRoot := filepath.Join(storeRoot, "projects", canon.ProjectID, "worktrees")
+	entries, rdErr := os.ReadDir(wtRoot)
+	if rdErr != nil && !os.IsNotExist(rdErr) {
+		return nil, true
+	}
+	set := map[string]bool{}
+	incomplete := false
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		wdir := filepath.Join(wtRoot, e.Name())
+		fi, statErr := os.Stat(filepath.Join(wdir, "session.db"))
+		if statErr != nil {
+			if !os.IsNotExist(statErr) {
+				incomplete = true // 권한 등 — 부재만 "세션 미사용"([6]·[15] 원칙)
+			}
+			continue
+		}
+		if fi.IsDir() {
+			incomplete = true
+			continue
+		}
+		if err := func() error {
+			db, openErr := session.OpenReadOnly(wdir)
+			if openErr != nil {
+				return openErr
+			}
+			defer func() { _ = db.Close() }()
+			rows, qErr := db.QueryContext(ctx, "SELECT session_id FROM sessions WHERE session_id LIKE 'cx:%'")
+			if qErr != nil {
+				return qErr
+			}
+			defer func() { _ = rows.Close() }()
+			for rows.Next() {
+				var id string
+				if rows.Scan(&id) == nil {
+					set[id] = true
+				}
+			}
+			return rows.Err()
+		}(); err != nil {
+			incomplete = true
+		}
+	}
+	return set, incomplete
+}
+
+// scanRollouts — rolloutRoot 재귀 순회(§2): rollout-*.jsonl만 파싱, 모든 meta cwd가 루트 하위인
+// 파일만 채택(발산=제외+집계, 타 프로젝트=자연 배제). arm: cx: 등록=on; 미등록은 !incomplete이고
+// 시작이 7일 창 이내면 off, 그 밖은 unknown. 같은 session_id 재등장은 첫 파일만(UUID 중복 0 실측
+// — 방어적 dedup). 반환 오류는 루트 자체를 못 읽는 경우뿐(호출자가 "rollout 루트 없음" 렌더).
+func scanRollouts(ctx context.Context, rolloutRoot, projectRoot string, cxSet map[string]bool, incomplete bool, now time.Time) (cxScan, error) {
+	sc := cxScan{incomplete: incomplete, registered: len(cxSet)}
+	foldedRoot := ident.Fold(mustAbs(projectRoot))
+	if _, err := os.Stat(rolloutRoot); err != nil {
+		return sc, errors.New("usage: rollout 루트 없음")
+	}
+	seen := map[string]bool{}
+	cutoff := now.Add(-cxOffWindow)
+	walkErr := filepath.WalkDir(rolloutRoot, func(path string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return nil // 하위 오류는 해당 항목만 무시(읽기 전용 관측 채널)
+		}
+		start, _, ok := rolloutStartFromName(d.Name())
+		if !ok {
+			return nil
+		}
+		r, perr := parseRolloutFile(ctx, path, foldedRoot)
+		if perr != nil {
+			if cerr := ctx.Err(); cerr != nil {
+				return cerr
+			}
+			sc.skipFiles++ // 파일 단위 실패 — 프로젝트 판별 불가라 "미귀속"으로 렌더(§3, 침묵 탈락 금지)
+			return nil
+		}
+		if !r.cwdAny {
+			return nil // 타 프로젝트 — 자연 배제(라인 스킵도 미집계 — 경고 오염 방지, 계획 검수 교정)
+		}
+		sc.skipLines += r.skipped // 프로젝트 귀속(채택·발산) 파일의 라인 스킵만 집계
+		if r.cwdOut {
+			sc.diverged++ // cwd 발산 — 제외+집계(§2)
+			return nil
+		}
+		if seen[r.id] {
+			return nil
+		}
+		seen[r.id] = true
+		r.start = start
+		switch {
+		case cxSet["cx:"+r.id]:
+			sc.matched++
+			sc.on = append(sc.on, r)
+		case !incomplete && !start.Before(cutoff):
+			// inclusive(정확히 7일 전 포함) — GC 술어가 started_at < now-7d 엄격 미만이라
+			// 경계 세션의 행 존재도 보장된다(계획 검수 교정).
+			sc.off = append(sc.off, r)
+		default:
+			sc.unknown = append(sc.unknown, r)
+		}
+		return nil
+	})
+	if walkErr != nil {
+		return sc, walkErr // ctx 취소만 도달
+	}
+	return sc, nil
 }
