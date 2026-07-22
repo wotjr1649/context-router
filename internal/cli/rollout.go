@@ -147,8 +147,10 @@ func parseRolloutFile(ctx context.Context, path, foldedRoot string) (cxRollout, 
 				}
 				r.turns++
 				if *tc.Info.Total.Total > r.use.total { // max-wins(§2) — 동률은 첫 스냅샷 유지(결정론)
-					r.use = cxUsage{input: *tc.Info.Total.Input, cachedInput: *tc.Info.Total.CachedInput,
-						output: *tc.Info.Total.Output, total: *tc.Info.Total.Total}
+					r.use = cxUsage{
+						input: *tc.Info.Total.Input, cachedInput: *tc.Info.Total.CachedInput,
+						output: *tc.Info.Total.Output, total: *tc.Info.Total.Total,
+					}
 				}
 			}
 		}
