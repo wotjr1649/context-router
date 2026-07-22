@@ -732,7 +732,7 @@ func TestRunHook_NoShadowRunningBranch(t *testing.T) {
 // D35 설치 — 병합이 타 그룹·미지 최상위 키를 보존하고 자기 2이벤트만 소유한다.
 func TestMergeCodexHooksInstallPreservesForeign(t *testing.T) {
 	existing := []byte(`{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"pwsh -File policy.ps1","timeout":10,"statusMessage":"policy"}]}]},"otherTop":1}`)
-	out, err := mergeCodexHooks(existing, "context-router codex-hook", "context-router/0.4.0", true)
+	out, err := mergeCodexHooks(existing, "context-router codex-hook", "context-router/0.4.0", true, false)
 	if err != nil {
 		t.Fatalf("merge: %v", err)
 	}
@@ -763,18 +763,18 @@ func TestMergeCodexHooksInstallPreservesForeign(t *testing.T) {
 // 멱등: install 2회 = 1회와 동일 바이트. 제거 대칭: install→uninstall이 원본 구조를 복원.
 func TestMergeCodexHooksIdempotentAndSymmetric(t *testing.T) {
 	existing := []byte(`{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"pwsh -File policy.ps1","timeout":10}]}]}}`)
-	once, err := mergeCodexHooks(existing, "context-router codex-hook", "context-router/0.4.0", true)
+	once, err := mergeCodexHooks(existing, "context-router codex-hook", "context-router/0.4.0", true, false)
 	if err != nil {
 		t.Fatalf("install: %v", err)
 	}
-	twice, err := mergeCodexHooks(once, "context-router codex-hook", "context-router/0.4.1", true)
+	twice, err := mergeCodexHooks(once, "context-router codex-hook", "context-router/0.4.1", true, false)
 	if err != nil {
 		t.Fatalf("재install: %v", err)
 	}
 	if strings.Contains(string(twice), "0.4.0") {
 		t.Fatalf("구버전 마커 잔존(교체 실패): %s", twice)
 	}
-	removed, err := mergeCodexHooks(twice, "", "", false)
+	removed, err := mergeCodexHooks(twice, "", "", false, false)
 	if err != nil {
 		t.Fatalf("uninstall: %v", err)
 	}
@@ -793,7 +793,7 @@ func TestMergeCodexHooksMixedGroupUntouched(t *testing.T) {
 	mixed := []byte(`{"hooks":{"PostToolUse":[{"matcher":"","hooks":[` +
 		`{"type":"command","command":"context-router codex-hook","timeout":10,"statusMessage":"context-router/0.3.9"},` +
 		`{"type":"command","command":"pwsh -File user.ps1","timeout":10,"statusMessage":"user"}]}]}}`)
-	out, err := mergeCodexHooks(mixed, "context-router codex-hook", "context-router/0.4.0", true)
+	out, err := mergeCodexHooks(mixed, "context-router codex-hook", "context-router/0.4.0", true, false)
 	if err != nil {
 		t.Fatalf("merge: %v", err)
 	}
@@ -816,11 +816,11 @@ func TestMergeCodexHooksMixedGroupUntouched(t *testing.T) {
 // F4 — 동일 버전 재적용의 진짜 멱등: f(f(x)) == f(x) 바이트 동일(중복·순서 drift 검출).
 func TestMergeCodexHooksIdempotentBytes(t *testing.T) {
 	existing := []byte(`{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"pwsh -File policy.ps1","timeout":10}]}]}}`)
-	once, err := mergeCodexHooks(existing, "context-router codex-hook", "context-router/0.4.0", true)
+	once, err := mergeCodexHooks(existing, "context-router codex-hook", "context-router/0.4.0", true, false)
 	if err != nil {
 		t.Fatalf("1차: %v", err)
 	}
-	twice, err := mergeCodexHooks(once, "context-router codex-hook", "context-router/0.4.0", true)
+	twice, err := mergeCodexHooks(once, "context-router codex-hook", "context-router/0.4.0", true, false)
 	if err != nil {
 		t.Fatalf("2차: %v", err)
 	}
@@ -944,5 +944,86 @@ func TestRunHookUninstallCodexNoFile(t *testing.T) {
 	}
 	if _, statErr := os.Stat(filepath.Join(root, ".codex", "hooks.json")); !errors.Is(statErr, os.ErrNotExist) {
 		t.Fatalf("no-op인데 파일 생성됨: %v", statErr)
+	}
+}
+
+// D47 설치 결합 — withGuard=true면 PreToolUse(matcher Bash) 그룹이 추가되고,
+// uninstall은 withGuard 무관하게 전 이벤트 소거(제거 대칭). 가드 포함 재병합은 멱등.
+// (matcher 단정은 json.MarshalIndent 실출력 형식 "matcher": "Bash"에 맞춘다 — 브리프의
+// 무공백 substring은 실제 콜론-공백 출력과 불일치라 형식만 조정.)
+func TestMergeCodexHooksGuardGroup(t *testing.T) {
+	out, err := mergeCodexHooks(nil, "context-router codex-hook", "context-router/0.7.0", true, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(out)
+	if !strings.Contains(s, `"PreToolUse"`) || !strings.Contains(s, `"matcher": "Bash"`) {
+		t.Fatalf("PreToolUse(Bash) 그룹 누락:\n%s", s)
+	}
+	// withGuard=false — 캡처 2이벤트만
+	out2, err := mergeCodexHooks(nil, "context-router codex-hook", "context-router/0.7.0", true, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(out2), `"PreToolUse"`) {
+		t.Fatalf("withGuard=false에 PreToolUse가 등록됨:\n%s", out2)
+	}
+	// 가드 포함 멱등: f(f(x)) == f(x) 바이트 동일
+	again, err := mergeCodexHooks(out, "context-router codex-hook", "context-router/0.7.0", true, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(out, again) {
+		t.Fatalf("가드 포함 멱등 위반:\n1차=%s\n2차=%s", out, again)
+	}
+	// 제거 대칭: guard 포함 설치본에서 uninstall이 PreToolUse까지 소거
+	removed, err := mergeCodexHooks(out, "", "", false, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(removed), "codex-hook") {
+		t.Fatalf("uninstall 잔존:\n%s", removed)
+	}
+}
+
+// D47+D48 설치 결합: (a) 깨끗한 config.toml → 블록 기입 + PreToolUse 등록,
+// (b) 키-경계 충돌 config.toml → 기입 생략 + PreToolUse 미등록(캡처만) + 안내.
+func TestRunHookInstallCodexCoupling(t *testing.T) {
+	// (a)
+	home := t.TempDir()
+	t.Setenv("CODEX_HOME", home)
+	var buf bytes.Buffer
+	if err := runHookInstall([]string{"--codex", "--user"}, "", "", false, t.TempDir(), "0.7.0", &buf); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := os.ReadFile(filepath.Join(home, "config.toml"))
+	if err != nil || !strings.Contains(string(cfg), "[mcp_servers.ctr]") {
+		t.Fatalf("블록 미기입: %v %s", err, cfg)
+	}
+	hooks, _ := os.ReadFile(filepath.Join(home, "hooks.json"))
+	if !strings.Contains(string(hooks), `"PreToolUse"`) {
+		t.Fatalf("가드 미등록:\n%s", hooks)
+	}
+	// (b)
+	home2 := t.TempDir()
+	t.Setenv("CODEX_HOME", home2)
+	conflict := "[mcp_servers.\"ctr\"]\ncommand = \"custom\"\n"
+	if err := os.WriteFile(filepath.Join(home2, "config.toml"), []byte(conflict), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var buf2 bytes.Buffer
+	if err := runHookInstall([]string{"--codex", "--user"}, "", "", false, t.TempDir(), "0.7.0", &buf2); err != nil {
+		t.Fatal(err)
+	}
+	cfg2, _ := os.ReadFile(filepath.Join(home2, "config.toml"))
+	if string(cfg2) != conflict {
+		t.Fatalf("충돌 config가 변경됨:\n%s", cfg2)
+	}
+	hooks2, _ := os.ReadFile(filepath.Join(home2, "hooks.json"))
+	if strings.Contains(string(hooks2), `"PreToolUse"`) {
+		t.Fatalf("MCP 미확정인데 가드 등록됨:\n%s", hooks2)
+	}
+	if !strings.Contains(buf2.String(), "보류") {
+		t.Fatalf("보류 안내 누락: %s", buf2.String())
 	}
 }

@@ -282,9 +282,17 @@ func codexHooksPath(user bool, projectRoot string) (string, error) {
 	return filepath.Join(projectRoot, ".codex", "hooks.json"), nil
 }
 
+// codexGuardRegistration — D47 가드 그룹(스펙 §3). 설치는 MCP 확정 시에만 포함하고(설치 결합 —
+// 거부 표면과 안내 도구가 함께 실려 D32 위반 봉쇄), 제거는 install=false라 무조건 소거 대상(제거 대칭).
+var codexGuardRegistration = struct {
+	event   string
+	matcher string
+}{"PreToolUse", "Bash"}
+
 // mergeCodexHooks — mergeHookSettings의 Codex 형제(D28 원칙 승계: 멱등·타 항목/미지 키 raw
-// 보존·제거 대칭·빈 컨테이너 정리). 등록 집합·그룹 타입·소유 판정만 다르다.
-func mergeCodexHooks(existing []byte, command, marker string, install bool) ([]byte, error) {
+// 보존·제거 대칭·빈 컨테이너 정리). 등록 집합·그룹 타입·소유 판정만 다르다. withGuard=true거나
+// install=false면 codexGuardRegistration(PreToolUse matcher Bash)을 등록/제거 대상에 포함한다.
+func mergeCodexHooks(existing []byte, command, marker string, install, withGuard bool) ([]byte, error) {
 	settings := map[string]json.RawMessage{}
 	if len(bytes.TrimSpace(existing)) > 0 {
 		if err := json.Unmarshal(existing, &settings); err != nil {
@@ -303,7 +311,11 @@ func mergeCodexHooks(existing []byte, command, marker string, install bool) ([]b
 			hooks = map[string]json.RawMessage{}
 		}
 	}
-	for _, reg := range codexRegistrations {
+	regs := codexRegistrations
+	if withGuard || !install { // 설치는 MCP 확정 시에만, 제거는 무조건(codexRegistrations 원본 보존 위해 fresh copy)
+		regs = append(append([]struct{ event, matcher string }{}, codexRegistrations...), codexGuardRegistration)
+	}
+	for _, reg := range regs {
 		var arr []json.RawMessage
 		if raw, ok := hooks[reg.event]; ok {
 			if err := json.Unmarshal(raw, &arr); err != nil {
@@ -477,29 +489,7 @@ func runHookInstall(args []string, storeRoot, storeRootRaw string, storeRootExpl
 		return fmt.Errorf("hook install: 예상치 않은 인자 %d개", len(rest))
 	}
 	if *codex {
-		path, err := codexHooksPath(*user, projectRoot)
-		if err != nil {
-			return err
-		}
-		if storeRootExplicit && storeRootRaw != "" {
-			if abs, absErr := filepath.Abs(storeRootRaw); absErr == nil {
-				storeRootRaw = abs
-			}
-		}
-		command := buildCodexHookCommand(storeRootExplicit, storeRootRaw, *noShadow)
-		existing, err := os.ReadFile(path)
-		if err != nil && !errors.Is(err, os.ErrNotExist) {
-			return errors.New("hook: 설정 파일 읽기 실패")
-		}
-		merged, err := mergeCodexHooks(existing, command, hookMarker(version), true)
-		if err != nil {
-			return fmt.Errorf("hook: 설정 병합 실패: %w", err)
-		}
-		if err := atomicWriteFile(path, merged); err != nil {
-			return errors.New("hook install: 설정 쓰기 실패")
-		}
-		fmt.Fprintf(stdout, "hook install (codex): %d개 이벤트 등록 완료 — Codex에서 /hooks로 훅을 리뷰·신뢰해야 실행됩니다\n", len(codexRegistrations))
-		return nil
+		return runHookInstallCodex(*user, *noShadow, storeRootExplicit, storeRootRaw, projectRoot, version, stdout)
 	}
 	path, err := hookSettingsPath(*user, projectRoot)
 	if err != nil {
@@ -524,6 +514,70 @@ func runHookInstall(args []string, storeRoot, storeRootRaw string, storeRootExpl
 	return nil
 }
 
+// runHookInstallCodex — --codex 설치 결합(스펙 v0.7 §3, D47+D48). config.toml 관리 블록 병합을
+// 먼저 시도해 MCP 확정 여부를 판정하고(가드 등록의 전제), hooks.json에는 MCP 확정 시에만
+// PreToolUse(Bash) 가드 그룹을 포함한다 — "거부 표면 존재 + 안내 도구 부재"(D32)를 구조적으로 봉쇄.
+func runHookInstallCodex(user, noShadow, storeRootExplicit bool, storeRootRaw, projectRoot, version string, stdout io.Writer) error {
+	cfgPath, err := codexConfigPath()
+	if err != nil {
+		return err
+	}
+	cfgExisting, err := os.ReadFile(cfgPath)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return errors.New("hook: config.toml 읽기 실패")
+	}
+	cfgOut, mcpState := installCodexConfigBlock(cfgExisting)
+	if mcpState == mcpWritten {
+		if err := atomicWriteFile(cfgPath, cfgOut); err != nil {
+			return errors.New("hook install: config.toml 쓰기 실패")
+		}
+	}
+	mcpConfirmed := mcpState == mcpWritten || mcpState == mcpExistingHeader
+	path, err := codexHooksPath(user, projectRoot)
+	if err != nil {
+		return err
+	}
+	if storeRootExplicit && storeRootRaw != "" {
+		if abs, absErr := filepath.Abs(storeRootRaw); absErr == nil {
+			storeRootRaw = abs
+		}
+	}
+	command := buildCodexHookCommand(storeRootExplicit, storeRootRaw, noShadow)
+	existing, err := os.ReadFile(path)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return errors.New("hook: 설정 파일 읽기 실패")
+	}
+	merged, err := mergeCodexHooks(existing, command, hookMarker(version), true, mcpConfirmed)
+	if err != nil {
+		return fmt.Errorf("hook: 설정 병합 실패: %w", err)
+	}
+	if err := atomicWriteFile(path, merged); err != nil {
+		return errors.New("hook install: 설정 쓰기 실패")
+	}
+	reportCodexMCPState(stdout, mcpState)
+	n := len(codexRegistrations)
+	if mcpConfirmed {
+		n++
+	}
+	fmt.Fprintf(stdout, "hook install (codex): %d개 이벤트 등록 완료 — Codex에서 /hooks로 훅을 리뷰·신뢰해야 실행됩니다(정의 변경 시 재신뢰)\n", n)
+	return nil
+}
+
+// reportCodexMCPState — config.toml 병합 결과 상태별 안내(스펙 §3). 확정(written/existingHeader)은
+// 정보성, 미확정(conflict/markerAnomaly)은 수동 조치 안내 — 가드 등록 보류 사유를 명시한다.
+func reportCodexMCPState(stdout io.Writer, state codexMCPState) {
+	switch state {
+	case mcpWritten:
+		fmt.Fprintln(stdout, "hook install (codex): MCP 등록 블록 기입 완료 — Codex 재시작 시 반영")
+	case mcpExistingHeader:
+		fmt.Fprintln(stdout, "hook install (codex): 기존 [mcp_servers.ctr] 등록 감지 — 기입 생략(command 경로를 doctor [10]과 대조해 스테일 여부 확인 권장)")
+	case mcpConflict:
+		fmt.Fprintln(stdout, "hook install (codex): config.toml에 ctr 관련 흔적 감지 — MCP 기입·가드 등록 보류. doctor 스니펫으로 수동 등록 후 재실행하세요")
+	case mcpMarkerAnomaly:
+		fmt.Fprintln(stdout, "hook install (codex): 관리 블록 마커 이상 — config.toml 무변경·가드 등록 보류. 블록 수동 정리 후 재실행하세요")
+	}
+}
+
 // runHookUninstall — uninstall 서브커맨드(설계 §7). 자기 항목(마커+명령 정확 일치)만 대칭
 // 제거한다. 설정 파일이 없으면 no-op.
 func runHookUninstall(args []string, projectRoot string, stdout io.Writer) error {
@@ -538,27 +592,7 @@ func runHookUninstall(args []string, projectRoot string, stdout io.Writer) error
 		return fmt.Errorf("hook uninstall: 예상치 않은 인자 %d개", len(rest))
 	}
 	if *codex {
-		path, err := codexHooksPath(*user, projectRoot)
-		if err != nil {
-			return err
-		}
-		existing, err := os.ReadFile(path)
-		if err != nil {
-			if errors.Is(err, os.ErrNotExist) {
-				fmt.Fprintln(stdout, "hook uninstall (codex): 설정 파일 없음 — 제거할 항목 없음")
-				return nil
-			}
-			return errors.New("hook: 설정 파일 읽기 실패")
-		}
-		merged, err := mergeCodexHooks(existing, "", "", false)
-		if err != nil {
-			return fmt.Errorf("hook: 설정 병합 실패: %w", err)
-		}
-		if err := atomicWriteFile(path, merged); err != nil {
-			return errors.New("hook uninstall: 설정 쓰기 실패")
-		}
-		fmt.Fprintln(stdout, "hook uninstall (codex): 훅 항목 제거 완료")
-		return nil
+		return runHookUninstallCodex(*user, projectRoot, stdout)
 	}
 	path, err := hookSettingsPath(*user, projectRoot)
 	if err != nil {
@@ -576,6 +610,43 @@ func runHookUninstall(args []string, projectRoot string, stdout io.Writer) error
 		return errors.New("hook uninstall: 설정 쓰기 실패")
 	}
 	fmt.Fprintln(stdout, "hook uninstall: 훅 항목 제거 완료")
+	return nil
+}
+
+// runHookUninstallCodex — --codex 제거 대칭(스펙 v0.7 §3, D47+D48). hooks.json 자기 그룹(가드
+// PreToolUse 포함)을 먼저 소거한 뒤 config.toml 관리 블록을 제거한다. hooks.json 미존재는 기존
+// no-op 유지(config는 그때 건드리지 않음). config 제거는 소유 블록이 있을 때만 관용적으로 수행.
+func runHookUninstallCodex(user bool, projectRoot string, stdout io.Writer) error {
+	path, err := codexHooksPath(user, projectRoot)
+	if err != nil {
+		return err
+	}
+	existing, err := os.ReadFile(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			fmt.Fprintln(stdout, "hook uninstall (codex): 설정 파일 없음 — 제거할 항목 없음")
+			return nil
+		}
+		return errors.New("hook: 설정 파일 읽기 실패")
+	}
+	merged, err := mergeCodexHooks(existing, "", "", false, false)
+	if err != nil {
+		return fmt.Errorf("hook: 설정 병합 실패: %w", err)
+	}
+	if err := atomicWriteFile(path, merged); err != nil {
+		return errors.New("hook uninstall: 설정 쓰기 실패")
+	}
+	fmt.Fprintln(stdout, "hook uninstall (codex): 훅 항목 제거 완료")
+	if cfgPath, cErr := codexConfigPath(); cErr == nil {
+		if cfgExisting, rErr := os.ReadFile(cfgPath); rErr == nil {
+			if cfgOut, changed := uninstallCodexConfigBlock(cfgExisting); changed {
+				if wErr := atomicWriteFile(cfgPath, cfgOut); wErr != nil {
+					return errors.New("hook uninstall: config.toml 쓰기 실패")
+				}
+				fmt.Fprintln(stdout, "hook uninstall (codex): MCP 등록 블록 제거 완료")
+			}
+		}
+	}
 	return nil
 }
 
