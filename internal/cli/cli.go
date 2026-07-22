@@ -459,16 +459,17 @@ func runUsage(ctx context.Context, w io.Writer, args []string, storeRoot, projec
 // expected와 다르면 무엇을 입력해도 오류). 비TTY면 force가 없으면 즉시 오류(in을 전혀 읽지
 // 않는다), force가 있으면 즉시 nil(역시 in을 읽지 않는다) — 자동화 경로에서 stdin을 소비하지
 // 않기 위함. 순수 함수(설계 §8 규약) — TTY 판정·os.Stdin 소유는 호출자(Run의 purge 분기) 몫.
-func confirmPurge(in io.Reader, out io.Writer, isTTY bool, force bool, expected string) error {
+func confirmPurge(in io.Reader, out io.Writer, isTTY bool, force bool, scopeNote, expected string) error {
 	if !isTTY {
 		if !force {
 			return errors.New("purge: 비TTY 환경에서는 --force 없이 진행할 수 없습니다")
 		}
 		return nil
 	}
-	// B2: 전체 프로젝트 삭제(--all/--project 무플래그)는 content.db·artifacts와 함께 세션
-	// 이벤트 데이터(session.db 계열)도 삭제한다 — 기존 전체삭제 의미론(행동 무변)을 명시만 한다.
-	fmt.Fprintf(out, "purge: 삭제 대상을 확인합니다(전체 삭제는 세션 이벤트 데이터를 포함합니다). 계속하려면 다음을 그대로 입력하세요: %s\n> ", expected)
+	// scopeNote는 삭제 범위 고지 — 호출자가 제공한다. 전체 purge(B2)는 content.db·artifacts와 함께
+	// 세션 이벤트 데이터(session.db 계열)도 지운다고 명시하고, --hook-only는 shadow-owned 한정임을
+	// 명시한다(세션 이벤트·explicit 소스 보존). 순수 함수라 범위 판정은 호출자 몫(행동 무변).
+	fmt.Fprintf(out, "purge: 삭제 대상을 확인합니다(%s). 계속하려면 다음을 그대로 입력하세요: %s\n> ", scopeNote, expected)
 	sc := bufio.NewScanner(in)
 	if !sc.Scan() {
 		return errors.New("purge: 확인 입력을 읽지 못했습니다 — 삭제하지 않았습니다")
@@ -608,7 +609,7 @@ func runPurge(ctx context.Context, in io.Reader, w, stderr io.Writer, storeRoot 
 	}
 
 	if !gcOnly { // GC 단독은 데이터 삭제가 아니므로 확인 생략(설계 §7)
-		if err := confirmPurge(in, w, isTTY, *force, expected); err != nil {
+		if err := confirmPurge(in, w, isTTY, *force, "전체 삭제는 세션 이벤트 데이터를 포함합니다", expected); err != nil {
 			return err
 		}
 	}
@@ -723,7 +724,8 @@ func runPurgeHookOnly(ctx context.Context, in io.Reader, w, stderr io.Writer, st
 		}
 		estHashes = len(sz.ShadowOwned)
 	}
-	if err := confirmPurge(in, w, isTTY, force, fmt.Sprintf("shadow %dB(%d hashes) 선택 삭제", estBytes, estHashes)); err != nil {
+	if err := confirmPurge(in, w, isTTY, force, "shadow-owned 아티팩트만 삭제 — 세션 이벤트·explicit 소스는 보존",
+		fmt.Sprintf("shadow %dB(%d hashes) 선택 삭제", estBytes, estHashes)); err != nil {
 		return err
 	}
 	st, err := store.Open(projDir, false)
