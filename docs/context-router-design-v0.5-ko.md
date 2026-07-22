@@ -165,10 +165,16 @@
   §11). 재확인·gate와 unlink 사이의 잔여 미세 창은 **rename 격리**로
   봉쇄한다 — 파일을 원자 rename으로 격리한 뒤 격리본을 재검증(fresh
   mtime·참조 발견 시 롤백)하고 삭제한다(계획 체크포인트 검수 §11.2) → ④ 보고는 **실회수 바이트**(실제 unlink 합)와 **age-gate 유예
-  건수**(유예·부분 실패 orphan은 안전 방향 — `--gc`로 후속 회수 가능) →
+  건수**[^est](유예·부분 실패 orphan은 안전 방향 — `--gc`로 후속 회수 가능) →
   ⑤ VACUUM(content.db 축 부차 회수, 트랜잭션 외부, 실패
   log-and-continue — 라이브 서버 시 실패 흔함 §7). explicit 공유
   hash·그 sources는 불변.
+
+[^est]: **견적↔유예 발산** — 확인 문구의 회수 견적(store.SizeStats의 shadow-owned 물리
+    바이트 합)은 귀속 hash 전량 회수를 가정하지만, ③ rename 격리 회수는 age gate(mtime 1h
+    이내)·재참조 발견 시 unlink를 유예(DeferredFiles)하거나 rename/Remove 실패(FailedFiles)로
+    건너뛴다. 따라서 ④의 실회수 바이트는 견적 이하로 발산할 수 있다 — 오차가 아니라 안전 방향
+    설계이며, 유예분은 `--gc` 후속 회수로 수렴한다.
 - runPurge 합류: `sessions`/`gcOnly`와 동형의 **조기 전용 분기**로
   인터셉트 — selective/전체 삭제 기본 분기(`os.RemoveAll`)에 도달하지
   않음을 계약으로 명시(플래그만 추가하고 분기를 앞세우지 않으면
