@@ -914,7 +914,27 @@ func LedgerStats(dir string) ([]ToolStat, error) {
 type SizeStat struct {
 	Sources, Artifacts int64
 	BlobBytes          int64
+	FileBytes          int64            // content.db 파일 실크기(os.Stat) — D40, [14] 병기
+	ShadowOwnedBytes   int64            // 귀속 hash들의 물리 CAS 파일 바이트 합 (= ShadowOwned 값 합, 불변)
+	ShadowOwnedHashes  int              // 귀속 hash 수 (= len(ShadowOwned), 불변)
+	ShadowOwned        map[string]int64 // 귀속 content_hash → 물리 CAS 파일 바이트 — Task 3b/5a/5b 공용 원천
 }
+
+// D40 §2: shadow 귀속 content_hash — 그 hash를 직접 참조하는 소스가 전부 kind='hook'이고 hook
+// 소스가 1개 이상이며, 어떤 비-hook 소스도 그 hash를 raw_blob_hash로 참조하지 않는 hash. hook JOIN이
+// "hook 소스 ≥1"과 "source 0개 → 비귀속"을 함께 보장하고, 두 NOT EXISTS가 직접·raw_blob 비-hook
+// 참조를 배제한다. DISTINCT로 다중 미디어/다중 소스 행을 hash 단위로 접는다. 바이트는 호출부가 CAS
+// 물리 파일에서 합산(논리 byte_length 아님).
+const shadowOwnedHashQuery = `
+SELECT DISTINCT a.content_hash
+FROM artifacts a
+JOIN sources sh ON sh.artifact_id = a.id AND sh.source_kind = 'hook'
+WHERE NOT EXISTS (
+    SELECT 1 FROM artifacts a2 JOIN sources s2 ON s2.artifact_id = a2.id
+    WHERE a2.content_hash = a.content_hash AND s2.source_kind != 'hook')
+  AND NOT EXISTS (
+    SELECT 1 FROM sources s3
+    WHERE s3.raw_blob_hash = a.content_hash AND s3.source_kind != 'hook')`
 
 // SizeStats: dir/content.db를 read-only로 열어 sources·artifacts 행수를 세고, artifacts/ CAS
 // 디렉터리의 물리 blob 바이트를 합산한다(설계 v0.3 §2·D33). content.db 미존재는 LedgerStats와
@@ -927,7 +947,8 @@ type SizeStat struct {
 // content_hash는 한 파일).
 func SizeStats(dir string) (*SizeStat, error) {
 	path := filepath.Join(dir, "content.db")
-	if _, err := os.Stat(path); err != nil {
+	fi, err := os.Stat(path)
+	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return nil, nil
 		}
@@ -939,13 +960,34 @@ func SizeStats(dir string) (*SizeStat, error) {
 	}
 	defer db.Close()
 
-	var st SizeStat
+	st := SizeStat{FileBytes: fi.Size(), ShadowOwned: map[string]int64{}}
 	if err := db.QueryRow("SELECT count(*) FROM sources").Scan(&st.Sources); err != nil {
 		return nil, fmt.Errorf("store SizeStats: %w", err)
 	}
 	if err := db.QueryRow("SELECT count(*) FROM artifacts").Scan(&st.Artifacts); err != nil {
 		return nil, fmt.Errorf("store SizeStats: %w", err)
 	}
+
+	// D40 §2: 귀속 content_hash 집합을 1쿼리로 산출한다. 물리 바이트는 아래 blob walk에서 이 집합
+	// 멤버십 파일만 합산 — 논리 byte_length가 아닌 CAS 실파일 크기(귀속 hash는 파일 1개).
+	owned := map[string]struct{}{}
+	rows, err := db.Query(shadowOwnedHashQuery)
+	if err != nil {
+		return nil, fmt.Errorf("store SizeStats: %w", err)
+	}
+	for rows.Next() {
+		var h string
+		if err := rows.Scan(&h); err != nil {
+			rows.Close()
+			return nil, fmt.Errorf("store SizeStats: %w", err)
+		}
+		owned[h] = struct{}{}
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, fmt.Errorf("store SizeStats: %w", err)
+	}
+	rows.Close()
 
 	// artifacts/<hex 2자 prefix>/<64-hex> 2단 레이아웃을 GCOrphanBlobs와 동형으로 순회한다.
 	blobRoot := filepath.Join(dir, "artifacts")
@@ -976,7 +1018,12 @@ func SizeStats(dir string) (*SizeStat, error) {
 				return nil, sanitizeIOErr("size stat", err)
 			}
 			st.BlobBytes += info.Size()
+			if _, ok := owned[e.Name()]; ok { // D40 §2: 귀속 hash면 물리 파일 크기를 맵·합계에 기록
+				st.ShadowOwned[e.Name()] = info.Size()
+				st.ShadowOwnedBytes += info.Size()
+			}
 		}
 	}
+	st.ShadowOwnedHashes = len(st.ShadowOwned) // 스칼라 = 맵 len (불변)
 	return &st, nil
 }

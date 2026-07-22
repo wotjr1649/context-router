@@ -1633,3 +1633,158 @@ func TestReadRangeSourceKindTier(t *testing.T) {
 		t.Fatalf("want inline:ZZZ(비-hook 티어), got %+v", r.Source)
 	}
 }
+
+// --- D40: SizeStat shadow-owned 귀속·물리 파일 합산 ---
+
+// openAt: 지정 dir에 store를 연다. SizeStats가 같은 dir을 ro로 재오픈하므로 호출부가 dir을 알아야
+// 한다(기존 openT는 t.TempDir()을 내부 생성해 dir을 노출하지 않는다). 시드 후 명시적 Close를 하며,
+// t.Cleanup의 두 번째 Close는 무해(반환값 무시).
+func openAt(t *testing.T, dir string) *Store {
+	t.Helper()
+	s, err := Open(dir, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+	return s
+}
+
+const soContent = "shadow-owned-content" // 귀속 테스트 공용 콘텐츠(케이스별 TempDir 독립이라 재사용 무해)
+
+// regSource: content를 주어진 media_type·uri·kind 소스로 Register(신규 CAS upsert).
+func regSource(t *testing.T, st *Store, content, mediaType, uri, kind string) {
+	t.Helper()
+	if _, err := st.Register(t.Context(), Registration{
+		StoredBytes: []byte(content), MediaType: mediaType,
+		Source: SourceMeta{URI: uri, Kind: kind, SrcHash: "sh-" + uri},
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func seedHookOnly(t *testing.T, st *Store) {
+	regSource(t, st, soContent, "text/plain", "shadow:Bash:1", "hook")
+}
+
+func seedHookPlusFile(t *testing.T, st *Store) {
+	// 동일 콘텐츠·동일 media_type을 hook과 file이 공유 → 아티팩트 1행·소스 2행(비-hook 직접 참조 존재).
+	regSource(t, st, soContent, "text/plain", "shadow:Bash:1", "hook")
+	regSource(t, st, soContent, "text/plain", "/tmp/f.txt", "file")
+}
+
+func seedCrossMedia(t *testing.T, st *Store) {
+	// 동일 콘텐츠·상이 media_type: hook(text/plain)+file(application/json) → content_hash 동일한 2 아티팩트.
+	regSource(t, st, soContent, "text/plain", "shadow:Bash:1", "hook")
+	regSource(t, st, soContent, "application/json", "/tmp/f.json", "file")
+}
+
+func seedRawRefByFile(t *testing.T, st *Store) {
+	// hook 아티팩트(soContent) — 단독이면 귀속. 그러나 file 소스가 soContent를 raw_blob로 참조 → 비귀속.
+	regSource(t, st, soContent, "text/plain", "shadow:Bash:1", "hook")
+	if _, err := st.Register(t.Context(), Registration{
+		StoredBytes: []byte("other-primary-content"), MediaType: "text/plain",
+		Source:  SourceMeta{URI: "/tmp/raw.txt", Kind: "file", SrcHash: "sh-raw"},
+		RawBlob: []byte(soContent), // sources.raw_blob_hash = sha256(soContent)
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func seedNoSource(t *testing.T, st *Store) {
+	// 아티팩트는 있으나 소스 0개 → 비귀속(hook 소스 부재로 걸러진다).
+	regSource(t, st, soContent, "text/plain", "shadow:Bash:1", "hook")
+	if _, err := st.writer.Exec("DELETE FROM sources"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func seedTwoHooks(t *testing.T, st *Store) {
+	// 동일 콘텐츠·동일 media_type을 hook 소스 2개가 참조 → content_hash 단위 dedup 1.
+	regSource(t, st, soContent, "text/plain", "shadow:Bash:1", "hook")
+	regSource(t, st, soContent, "text/plain", "shadow:Bash:2", "hook")
+}
+
+// seedTwoHookArtifactsSameHashDiffMedia: 동일 콘텐츠·상이 media_type을 hook 소스 2개로 Register
+// → content_hash 동일한 2 아티팩트(전부 hook, 귀속)이나 물리 CAS 파일은 1개. content_hash 반환.
+func seedTwoHookArtifactsSameHashDiffMedia(t *testing.T, st *Store) string {
+	regSource(t, st, soContent, "text/plain", "shadow:Bash:1", "hook")
+	regSource(t, st, soContent, "application/json", "shadow:Bash:2", "hook")
+	sum := sha256.Sum256([]byte(soContent))
+	return hex.EncodeToString(sum[:])
+}
+
+func statBlobFile(t *testing.T, dir, h string) os.FileInfo {
+	t.Helper()
+	fi, err := os.Stat(filepath.Join(dir, "artifacts", h[:2], h))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return fi
+}
+
+// TestShadowOwnedAttribution — D40 §2: content_hash 단위 귀속 술어.
+func TestShadowOwnedAttribution(t *testing.T) {
+	cases := []struct {
+		name       string
+		seed       func(t *testing.T, st *Store)
+		wantHashes int
+	}{
+		{"hook만 참조 → 귀속", seedHookOnly, 1},
+		{"hook+explicit 공유 → 비귀속", seedHookPlusFile, 0},
+		{"cross-media 공유(동일 hash·상이 media_type) → 비귀속", seedCrossMedia, 0},
+		{"raw_blob_hash 비-hook 참조 → 비귀속", seedRawRefByFile, 0},
+		{"source 0개 → 비귀속", seedNoSource, 0},
+		{"hook 2개(동일 hash) → 귀속 1(hash 단위 dedup)", seedTwoHooks, 1},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			dir := t.TempDir()
+			st := openAt(t, dir)
+			c.seed(t, st)
+			st.Close() // SizeStats는 dir 기준 별도 ro open — 시드 후 닫고 조회
+			sz, err := SizeStats(dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if sz.ShadowOwnedHashes != c.wantHashes {
+				t.Fatalf("ShadowOwnedHashes=%d want %d", sz.ShadowOwnedHashes, c.wantHashes)
+			}
+			if len(sz.ShadowOwned) != c.wantHashes {
+				t.Fatalf("ShadowOwned len=%d want %d", len(sz.ShadowOwned), c.wantHashes)
+			}
+		})
+	}
+}
+
+// TestShadowOwnedBytesPhysical — D40 §2: 물리 CAS 파일 기저 정확 단정 — 동일 hash의 hook-only
+// cross-media artifact 2행이어도 ShadowOwnedBytes는 물리 파일 1개의 os.Stat 크기와 정확히 같다
+// (논리 byte_length 2배 합산이면 오구현).
+func TestShadowOwnedBytesPhysical(t *testing.T) {
+	dir := t.TempDir()
+	st := openAt(t, dir)
+	h := seedTwoHookArtifactsSameHashDiffMedia(t, st)
+	st.Close()
+	want := statBlobFile(t, dir, h).Size()
+	sz, err := SizeStats(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sz.ShadowOwnedBytes != want {
+		t.Fatalf("ShadowOwnedBytes=%d want %d(물리 파일 크기 — 논리 합산 금지)", sz.ShadowOwnedBytes, want)
+	}
+}
+
+// TestSizeStatFileBytes — D40 §2: FileBytes = content.db 파일 실크기.
+func TestSizeStatFileBytes(t *testing.T) {
+	dir := t.TempDir()
+	st := openAt(t, dir)
+	seedHookOnly(t, st)
+	st.Close()
+	sz, err := SizeStats(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sz.FileBytes <= 0 {
+		t.Fatalf("FileBytes=%d want >0", sz.FileBytes)
+	}
+}
