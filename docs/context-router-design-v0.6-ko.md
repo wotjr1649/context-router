@@ -398,3 +398,16 @@ manifest(무작위 하네스 도입 시 동반 재상정).
   구간 delta·30일 창 잔재 문면 0건, 신규 모순 0건. Minor 1건 — 7일
   창의 off 확정이 최근 세션에 제약되는 arm 간 시기 비대칭의 §5
   미명문화 → §5에 반영(본판).
+
+### 계획 체크포인트 (구현 계획 5373e06 — 이중 검수 1패스)
+
+- 구현 계획 `docs/superpowers/plans/2026-07-22-v0.6-measurement-
+  maturity.md`에 서브에이전트(opus) + Codex adversarial-review 병렬
+  1패스(NO-SHIP → 반영 해소). 계약 정밀화 3건이 본 설계의 해석을
+  구속한다: ① 관측 창 off 판정은 **inclusive**(정확히 7일 전 시작
+  포함 — GC 술어가 엄격 미만이라 행 보장) ② cx: 세션 집합의 관측
+  실패(식별 실패·ReadDir/Stat 오류)는 **부재가 아니라 incomplete**
+  (complete는 진짜 부재만 — off 확정 금지의 적용 범위 명확화) ③ 스킵
+  집계의 귀속 규율 — 라인 스킵은 프로젝트 귀속 파일만, 파일 단위
+  실패는 "미귀속" 라벨로 분리 표기(타 프로젝트 rollout의 경고 오염
+  차단). 산술·API 대조·byte-for-byte 게이트는 양측 무발견.
