@@ -399,3 +399,45 @@ func TestScanRollouts_MetaIDAuthority(t *testing.T) {
 		t.Fatalf("meta 권위 위반: on=%d matched=%d", len(sc.on), sc.matched)
 	}
 }
+
+func TestScanRollouts_SessionFileGroupMerge(t *testing.T) {
+	// 재개·포크는 같은 meta session_id로 새 rollout 파일을 만든다(D44 c65da3d — 파일=세션 폐기).
+	// 두 파일이 한 세션으로 병합: turns 합·use 필드별 합·start=최초 ts·matched 세션당 1회.
+	projectRoot := t.TempDir()
+	rolloutRoot := t.TempDir()
+	day := filepath.Join(rolloutRoot, "2026", "07", "22")
+	if err := os.MkdirAll(day, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 7, 22, 12, 0, 0, 0, time.Local)
+	sess := "019f0000-0000-7000-8000-00000000aa01"  // 공유 meta session_id
+	fileA := "019f0000-0000-7000-8000-0000000000a1" // 파일명 UUID는 상이
+	fileB := "019f0000-0000-7000-8000-0000000000a2"
+	// 파일 B가 더 이르다(start=min 검증): A=24h 전, B=48h 전 — 둘 다 창 이내.
+	writeRollout(t, day, tsFor(now, 24*time.Hour), fileA, []string{metaLine(sess, projectRoot), tcLine(100, 40, 10, 110)})
+	writeRollout(t, day, tsFor(now, 48*time.Hour), fileB, []string{metaLine(sess, projectRoot), tcLine(50, 20, 5, 55)})
+
+	// 등록 시: on 세션 1개·turns=2·use 필드별 합·start=이른 쪽·matched=1.
+	sc, err := scanRollouts(context.Background(), rolloutRoot, projectRoot, map[string]bool{"cx:" + sess: true}, false, now)
+	if err != nil {
+		t.Fatalf("err=%v", err)
+	}
+	if len(sc.on) != 1 || sc.on[0].id != sess || sc.matched != 1 {
+		t.Fatalf("그룹 병합 실패: on=%d matched=%d", len(sc.on), sc.matched)
+	}
+	if sc.on[0].turns != 2 || sc.on[0].use != (cxUsage{input: 150, cachedInput: 60, output: 15, total: 165}) {
+		t.Fatalf("합산 실패: turns=%d use=%+v", sc.on[0].turns, sc.on[0].use)
+	}
+	if !sc.on[0].start.Equal(now.Add(-48 * time.Hour)) {
+		t.Fatalf("start=min 실패: %v", sc.on[0].start)
+	}
+
+	// 등록 없이 창 내 2파일 → off=1(세션 단위 계상 — 파일 2개로 세지 않는다).
+	sc2, err := scanRollouts(context.Background(), rolloutRoot, projectRoot, nil, false, now)
+	if err != nil {
+		t.Fatalf("err=%v", err)
+	}
+	if len(sc2.off) != 1 || len(sc2.on) != 0 || len(sc2.unknown) != 0 {
+		t.Fatalf("off 세션 계상 실패: off=%d on=%d unknown=%d", len(sc2.off), len(sc2.on), len(sc2.unknown))
+	}
+}

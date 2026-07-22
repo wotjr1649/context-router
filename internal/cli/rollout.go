@@ -15,6 +15,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
 
@@ -235,17 +236,19 @@ func loadCXSessions(ctx context.Context, storeRoot, projectRoot string) (map[str
 }
 
 // scanRollouts — rolloutRoot 재귀 순회(§2): rollout-*.jsonl만 파싱, 모든 meta cwd가 루트 하위인
-// 파일만 채택(발산=제외+집계, 타 프로젝트=자연 배제). arm: cx: 등록=on; 미등록은 !incomplete이고
-// 시작이 7일 창 이내면 off, 그 밖은 unknown. 같은 session_id 재등장은 첫 파일만(UUID 중복 0 실측
-// — 방어적 dedup). 반환 오류는 루트 자체를 못 읽는 경우뿐(호출자가 "rollout 루트 없음" 렌더).
+// 파일만 채택(발산=제외+집계, 타 프로젝트=자연 배제). 채택 파일은 meta session_id로 병합(D44
+// c65da3d — 재개·포크가 같은 session_id로 여러 rollout 파일을 만들고 파일 간 누적은 독립 재시작이라
+// 파일 단위 dedup은 후속 파일을 버려 과소계상): turns 합·use는 파일별 max-wins 벡터의 필드별 합·
+// start는 그룹 최초 파일 ts. arm 분류는 그룹 완성 후 세션 단위 1회(session_id 사전순 결정론 §3):
+// cx: 등록=on; 미등록은 !incomplete이고 시작이 7일 창 이내면 off, 그 밖은 unknown. 반환 오류는
+// 루트 자체를 못 읽는 경우뿐(호출자가 "rollout 루트 없음" 렌더).
 func scanRollouts(ctx context.Context, rolloutRoot, projectRoot string, cxSet map[string]bool, incomplete bool, now time.Time) (cxScan, error) {
 	sc := cxScan{incomplete: incomplete, registered: len(cxSet)}
 	foldedRoot := ident.Fold(mustAbs(projectRoot))
 	if _, err := os.Stat(rolloutRoot); err != nil {
 		return sc, errors.New("usage: rollout 루트 없음")
 	}
-	seen := map[string]bool{}
-	cutoff := now.Add(-cxOffWindow)
+	groups := map[string]*cxRollout{} // meta session_id → 병합 누적(파일=세션 폐기, D44 c65da3d)
 	walkErr := filepath.WalkDir(rolloutRoot, func(path string, d fs.DirEntry, err error) error {
 		if err != nil || d.IsDir() {
 			return nil // 하위 오류는 해당 항목만 무시(읽기 전용 관측 채널)
@@ -265,31 +268,50 @@ func scanRollouts(ctx context.Context, rolloutRoot, projectRoot string, cxSet ma
 		if !r.cwdAny {
 			return nil // 타 프로젝트 — 자연 배제(라인 스킵도 미집계 — 경고 오염 방지, 계획 검수 교정)
 		}
-		sc.skipLines += r.skipped // 프로젝트 귀속(채택·발산) 파일의 라인 스킵만 집계
+		sc.skipLines += r.skipped // 프로젝트 귀속(채택·발산) 파일의 라인 스킵만 집계(파일 단위)
 		if r.cwdOut {
-			sc.diverged++ // cwd 발산 — 제외+집계(§2)
+			sc.diverged++ // cwd 발산 — 제외+집계(§2, 파일 단위)
 			return nil
 		}
-		if seen[r.id] {
-			return nil
+		// session_id 그룹 병합: turns 합·use 필드별 합(파일별 max-wins 벡터의 합)·start 최초 ts.
+		g := groups[r.id]
+		if g == nil {
+			g = &cxRollout{id: r.id, start: start}
+			groups[r.id] = g
 		}
-		seen[r.id] = true
-		r.start = start
-		switch {
-		case cxSet["cx:"+r.id]:
-			sc.matched++
-			sc.on = append(sc.on, r)
-		case !incomplete && !start.Before(cutoff):
-			// inclusive(정확히 7일 전 포함) — GC 술어가 started_at < now-7d 엄격 미만이라
-			// 경계 세션의 행 존재도 보장된다(계획 검수 교정).
-			sc.off = append(sc.off, r)
-		default:
-			sc.unknown = append(sc.unknown, r)
+		g.turns += r.turns
+		g.use.input += r.use.input
+		g.use.cachedInput += r.use.cachedInput
+		g.use.output += r.use.output
+		g.use.total += r.use.total
+		if start.Before(g.start) {
+			g.start = start // 그룹 최초 파일 ts
 		}
 		return nil
 	})
 	if walkErr != nil {
 		return sc, walkErr // ctx 취소만 도달
+	}
+	// 분류는 그룹 완성 후 세션 단위 1회 — session_id 사전순 순회(결정론 §3), matched 세션당 1회.
+	ids := make([]string, 0, len(groups))
+	for id := range groups {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	cutoff := now.Add(-cxOffWindow)
+	for _, id := range ids {
+		g := *groups[id]
+		switch {
+		case cxSet["cx:"+id]:
+			sc.matched++
+			sc.on = append(sc.on, g)
+		case !incomplete && !g.start.Before(cutoff):
+			// inclusive(정확히 7일 전 포함) — GC 술어가 started_at < now-7d 엄격 미만이라
+			// 경계 세션의 행 존재도 보장된다(계획 검수 교정).
+			sc.off = append(sc.off, g)
+		default:
+			sc.unknown = append(sc.unknown, g)
+		}
 	}
 	return sc, nil
 }
