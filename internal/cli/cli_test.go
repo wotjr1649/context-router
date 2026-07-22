@@ -230,6 +230,10 @@ func TestRunDoctor_ContentDBSize(t *testing.T) {
 	if !strings.Contains(buf.String(), "[14] content.db: sources=2 artifacts=2 blob=45B") {
 		t.Fatalf("out missing exact content.db size line:\n%s", buf.String())
 	}
+	// D40 — content.db 파일 실크기 병기(FileBytes). 값은 페이지/WAL에 따라 가변이라 접미 존재만 단정.
+	if !strings.Contains(buf.String(), " file=") {
+		t.Fatalf("out missing content.db file= suffix:\n%s", buf.String())
+	}
 }
 
 // D38 — blob 총량 > 임계면 [14] 뒤 경고 1줄(purge 비선택 성격 병기), 임계 미만이면 무출력.

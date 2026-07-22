@@ -1306,7 +1306,7 @@ func runDoctor(ctx context.Context, w io.Writer, storeRoot, projectRoot, version
 	} else if sz, err := store.SizeStats(filepath.Join(storeRoot, "projects", canon.ProjectID)); err != nil || sz == nil {
 		fmt.Fprintln(w, "[14] content.db: 없음")
 	} else {
-		fmt.Fprintf(w, "[14] content.db: sources=%d artifacts=%d blob=%dB\n", sz.Sources, sz.Artifacts, sz.BlobBytes)
+		fmt.Fprintf(w, "[14] content.db: sources=%d artifacts=%d blob=%dB file=%dB\n", sz.Sources, sz.Artifacts, sz.BlobBytes, sz.FileBytes)
 		// D38 — CAS 전체 blob 총량 경고(shadow 전용 아님 — [14] 측정 실체 그대로). 관측 채널이지
 		// 정책 집행이 아니다(D27): 자동 삭제 없음. SizeStats 실패 경로는 이 분기 밖이라 미평가.
 		if warn := storeWarnBytes(os.Getenv); sz.BlobBytes > warn {
