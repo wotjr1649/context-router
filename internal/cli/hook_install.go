@@ -614,36 +614,39 @@ func runHookUninstall(args []string, projectRoot string, stdout io.Writer) error
 }
 
 // runHookUninstallCodex — --codex 제거 대칭(스펙 v0.7 §3, D47+D48). hooks.json 자기 그룹(가드
-// PreToolUse 포함)을 먼저 소거한 뒤 config.toml 관리 블록을 제거한다. hooks.json 미존재는 기존
-// no-op 유지(config는 그때 건드리지 않음). config 제거는 소유 블록이 있을 때만 관용적으로 수행.
+// PreToolUse 포함)을 소거한 뒤 config.toml 관리 블록을 제거한다. hooks.json 미존재는 "제거할 항목
+// 없음"만 알리고 오류 없이 넘어가되(no-op), config.toml 정리는 그와 무관하게 항상 시도한다 —
+// 부분 설치(config만 쓰이고 hooks.json은 실패·수동 삭제)에서 관리 블록이 영구 잔존하는 것을
+// 막는다(Codex P2). config 제거는 소유 블록이 있을 때만 관용적으로 수행.
 func runHookUninstallCodex(user bool, projectRoot string, stdout io.Writer) error {
 	path, err := codexHooksPath(user, projectRoot)
 	if err != nil {
 		return err
 	}
 	existing, err := os.ReadFile(path)
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			fmt.Fprintln(stdout, "hook uninstall (codex): 설정 파일 없음 — 제거할 항목 없음")
-			return nil
-		}
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return errors.New("hook: 설정 파일 읽기 실패")
 	}
-	merged, err := mergeCodexHooks(existing, "", "", false, false)
-	if err != nil {
-		return fmt.Errorf("hook: 설정 병합 실패: %w", err)
+	if errors.Is(err, os.ErrNotExist) {
+		fmt.Fprintln(stdout, "hook uninstall (codex): 설정 파일 없음 — 제거할 항목 없음")
+	} else {
+		merged, mErr := mergeCodexHooks(existing, "", "", false, false)
+		if mErr != nil {
+			return fmt.Errorf("hook: 설정 병합 실패: %w", mErr)
+		}
+		if wErr := atomicWriteFile(path, merged); wErr != nil {
+			return errors.New("hook uninstall: 설정 쓰기 실패")
+		}
+		fmt.Fprintln(stdout, "hook uninstall (codex): 훅 항목 제거 완료")
 	}
-	if err := atomicWriteFile(path, merged); err != nil {
-		return errors.New("hook uninstall: 설정 쓰기 실패")
-	}
-	fmt.Fprintln(stdout, "hook uninstall (codex): 훅 항목 제거 완료")
+	// config.toml 관리 블록 제거는 hooks.json 유무와 무관하게 항상 시도한다(부분 설치 잔존 방지, P2).
 	if cfgPath, cErr := codexConfigPath(); cErr == nil {
 		if cfgExisting, rErr := os.ReadFile(cfgPath); rErr == nil {
 			if cfgOut, changed := uninstallCodexConfigBlock(cfgExisting); changed {
 				if wErr := atomicWriteFile(cfgPath, cfgOut); wErr != nil {
 					return errors.New("hook uninstall: config.toml 쓰기 실패")
 				}
-				fmt.Fprintln(stdout, "hook uninstall (codex): MCP 등록 블록 제거 완료")
+				fmt.Fprintln(stdout, "hook uninstall (codex): MCP 등록 블록 제거 완료 — 다른 프로젝트가 Codex 가드를 계속 사용하면 그 프로젝트에서 hook install --codex 재실행으로 재기입하세요")
 			}
 		}
 	}

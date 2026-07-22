@@ -1159,7 +1159,7 @@ func probeFTS5(ctx context.Context, reader *sql.DB) error {
 }
 
 // hostSnippet: doctor 마지막에 출력하는 호스트 등록 안내(설계 §9) — Claude Code(.mcp.json +
-// permissions ask 규칙)와 Codex(config.toml 기본 3-도구 프로필 + approval prompt 권장).
+// permissions ask 규칙)와 Codex(config.toml 기본 6-도구 프로필 + approval prompt 권장).
 const hostSnippet = `--- host adapter snippets (설계 §9) ---
 
 ## Claude Code (.mcp.json)

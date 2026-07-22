@@ -124,9 +124,19 @@ func ctrKeySignal(s string) bool {
 		strings.Contains(s, ".ctr.")
 }
 
+// mcpServersAssign — 정규화 라인이 루트 mcp_servers 대입 정의인지(계약 3b 보강, Codex P1). 인라인
+// 테이블 대입은 자기완결이라 뒤에 [mcp_servers.ctr] 서브테이블 헤더를 붙이면 중복 정의 파스
+// 에러 → 사용자 Codex 전체 파손. 대입 자체가 정의이므로 ctr 신호 없이 단독 충돌이다. 헤더
+// ([mcp_servers])는 정규화가 "["로 시작해 여기 걸리지 않으며 [mcp_servers.ctr] 확장이 유효하다.
+func mcpServersAssign(s string) bool {
+	return strings.HasPrefix(s, "mcp_servers=") ||
+		strings.HasPrefix(s, "\"mcp_servers\"=") ||
+		strings.HasPrefix(s, "'mcp_servers'=")
+}
+
 // scanOutside — 블록 밖 검사(계약 3). replace 후보는 소유 블록 라인[begin..end]을 제외.
 func scanOutside(lines [][]byte, class markerClass, begin, end int) (hasHeader, conflict bool) {
-	var hasMcp, hasSignal bool
+	var hasMcp, hasSignal, assign bool
 	for i, ln := range lines {
 		if class == classReplace && i >= begin && i <= end {
 			continue
@@ -141,8 +151,11 @@ func scanOutside(lines [][]byte, class markerClass, begin, end int) (hasHeader, 
 		if ctrKeySignal(s) {
 			hasSignal = true
 		}
+		if mcpServersAssign(s) {
+			assign = true // 루트 mcp_servers 대입 — 단독 충돌(Codex P1)
+		}
 	}
-	return hasHeader, hasMcp && hasSignal
+	return hasHeader, (hasMcp && hasSignal) || assign
 }
 
 // installCodexConfigBlock — 관리 블록 병합(스펙 §0 D48·§3). 순수 변환: 파일 IO 없음.

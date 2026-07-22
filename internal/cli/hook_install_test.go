@@ -947,6 +947,33 @@ func TestRunHookUninstallCodexNoFile(t *testing.T) {
 	}
 }
 
+// Codex P2: hooks.json 부재(부분 설치 — config만 쓰이고 hooks.json은 실패·수동 삭제)에서도
+// config.toml 관리 블록 제거를 계속한다. 조기 반환이 정리를 건너뛰던 회귀 방지.
+// t.Setenv 사용 → t.Parallel 금지.
+func TestRunHookUninstallCodexConfigOnlyNoHooks(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("CODEX_HOME", home)
+	block := "# BEGIN context-router\n[mcp_servers.ctr]\ncommand = \"context-router\"\nargs = []\nenabled_tools = [\"ctr_search\", \"ctr_fetch\", \"ctr_transform\", \"ctr_record_event\", \"ctr_session_summary\", \"ctr_export_events\"]\n# ingest/net 활성화 시 권장: default_tools_approval_mode = \"prompt\"\n# END context-router\n"
+	cfg := "model = \"gpt\"\n\n" + block
+	if err := os.WriteFile(filepath.Join(home, "config.toml"), []byte(cfg), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	if err := runHookUninstall([]string{"--codex", "--user"}, t.TempDir(), &out); err != nil {
+		t.Fatalf("uninstall --codex --user: %v", err)
+	}
+	got, err := os.ReadFile(filepath.Join(home, "config.toml"))
+	if err != nil {
+		t.Fatalf("config.toml 읽기: %v", err)
+	}
+	if strings.Contains(string(got), "[mcp_servers.ctr]") {
+		t.Fatalf("hooks.json 부재로 관리 블록 정리가 생략됨:\n%s", got)
+	}
+	if !strings.Contains(out.String(), "MCP 등록 블록 제거 완료") {
+		t.Fatalf("블록 제거 안내 누락: %q", out.String())
+	}
+}
+
 // D47 설치 결합 — withGuard=true면 PreToolUse(matcher Bash) 그룹이 추가되고,
 // uninstall은 withGuard 무관하게 전 이벤트 소거(제거 대칭). 가드 포함 재병합은 멱등.
 // (matcher 단정은 json.MarshalIndent 실출력 형식 "matcher": "Bash"에 맞춘다 — 브리프의
