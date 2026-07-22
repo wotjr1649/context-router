@@ -42,9 +42,14 @@
   원칙)가 범위 결합의 근거. deny 시 warning 이벤트는 cc: 동형으로
   cx: session.db에 기록(실발화 관측 표면). matcher는 `Bash`
   단독(Codex 표면에 Read·PowerShell tool_name 부재 — §7 실측 148건
-  정합). **본 축 전체가 G4에 게이트된다** — 행 3(차단 표면 부재) 판정
-  시 가드 축은 중단·보고하고 D48은 독립 진행한다(§8, 적대 검수
-  Important-3 교정: 확정 어조 금지).
+  정합). **설치 결합**(2패스 교정 §10): PreToolUse 그룹 등록은 D48의
+  MCP 대체 경로 확정 — 관리 블록 기입/갱신 성공 **또는** 블록 밖 정확
+  `[mcp_servers.ctr]` 헤더 실존(사용자 소유 등록=대체 경로 실존) —
+  시에만 수행한다. 미확정(충돌 스킵·마커 이상)이면 가드 등록을
+  보류하고 캐프처만 유지+안내 — "deny + 안내 도구 부재"(D32 위반)
+  조합을 설치 시점에 구조 봉쇄. **본 축 전체가 G4에 게이트된다** —
+  행 3 판정 시 가드 축은 중단·보고하고 D48은 독립 진행한다(§8, 적대
+  검수 Important-3 교정: 확정 어조 금지).
 - **D48** Codex ctr MCP 자동 등록 + PreToolUse 훅 등록: `hook install
   --codex`가 (a) hooks.json에 PreToolUse 그룹 추가(기존 JSON 병합기 —
   F4 전건 소유 판정·정의 변경 재신뢰 안내 승계), (b)
@@ -56,21 +61,32 @@
   중 보존이 **구조적으로** 충족된다. TOML AST round-trip은 기각 —
   go-toml v2는 주석을 보존하지 않아(D28 위반) v0.4 G3가 병합기 신규
   구현을 피했던 사유가 그대로 유효하며, 관리 블록은 파서 없이 원칙을
-  만족하는 최소 구현이다. 충돌 규칙(적대 검수 1패스 교정 §10 —
-  초안의 헤더 라인 스캔은 quoted key `[mcp_servers."ctr"]`·인라인
-  테이블 `mcp_servers.ctr = {…}`·부모 테이블+점표기 등 합법 변형을
-  놓쳐 중복 정의 파스 에러로 사용자 Codex 전체를 깨뜨릴 수 있어
-  폐기): **보수 광역 스캔** — 블록 밖 내용의 공백 제거 정규화
-  문자열에 `mcp_servers`와 `ctr` 토큰이 **동시 등장하면 표기 형태
-  불문 기입 생략+안내 1줄**. 합법 변형 전부가 그물에 걸리고, 오탐
-  (주석 언급 등)의 실패 방향은 "설치 거부+수동 안내"라 안전하다(설치
-  거부≠파손 — F4 불가침 우선). TOML 파서 의존은 계속 비도입 —
-  go.mod에 TOML 의존 0(실측), 검증 전용 파싱은 D28 반론(round-trip
-  보존)이 적용되지 않는 별개 선택지이나(§10) 보수 스캔이 의존 0으로
-  같은 봉쇄를 달성한다. **마커 무결성**: BEGIN/END가 정확히 1쌍·
-  정순이 아니면(END 단독·중복 쌍·역순·END 부재) 전부 **무변경+안내**
-  (multiline string 내 정확 1쌍 마커 오인은 이론상 잔존 — 희귀 한계
-  명문, §3). **개행 계약**: 병합은 바이트 스팬 연산으로 원본 개행
+  만족하는 최소 구현이다. 충돌 규칙(1·2패스 교정 §10 — 초안의 헤더
+  라인 스캔은 quoted key·인라인 테이블·부모 테이블+점표기 합법
+  변형을 놓쳐 중복 정의 파스 에러를 허용, 1패스의 무경계 동시-등장
+  규칙은 `electron`·`spectra`가 `ctr`를 부분열로 포함해 오탐 영구
+  생략 — 양쪽 폐기): **키-경계 보수 스캔** — 블록 밖 내용에
+  `mcp_servers` 존재 **AND** ctr **키-경계 신호**(공백 제거 라인
+  정규화 기준 `ctr]`·`ctr"`·`ctr'`·`ctr=`·행두 `ctr.`) 존재 시 표기
+  형태 불문 기입 생략+안내 1줄. 합법 변형 전부가 경계 신호를
+  동반해 그물에 걸리고(2패스 실행 확인) 단순 부분열은 경계 신호
+  부재로 오탐하지 않는다. 잔여 오탐(값 문자열 `"ctr"` 등)의 실패
+  방향은 설치 거부+수동 안내라 안전하며(설치 거부≠파손 — F4 불가침
+  우선) 이때 D47 가드 등록도 함께 보류된다(설치 결합 — §0 D47).
+  TOML 파서 의존은 계속 비도입 — go.mod에 TOML 의존 0(실측), 검증
+  전용 파싱은 D28 반론(round-trip 보존)이 적용되지 않는 별개
+  선택지이나(§10) 경계 스캔이 의존 0으로 같은 봉쇄를 달성한다.
+  **마커 소유권+무결성**(2패스 Critical 교정 — 접두 자유 텍스트
+  매치는 사용자 주석 블록 `# BEGIN context-router migration` 등을
+  오소유해 교체·삭제함): 마커는 **고정 문자열 정확 라인 매치**
+  (`# BEGIN context-router` / `# END context-router` — 자유 접미
+  폐기, 버전 문자열 없음)이고, BEGIN/END 정확 1쌍·정순 **AND 블록
+  본문에 `[mcp_servers.ctr]` 헤더 라인 실존(본문 검증)**이 전부
+  성립할 때만 소유 블록으로 교체·삭제한다. 하나라도 불성립(단독·
+  중복·역순·본문 불일치)이면 **무변경+안내**, 양쪽 마커 부재는 정상
+  append 경로(§3 — both-absent는 이상이 아니다). multiline string 내
+  정확 마커+본문 오인은 이론상 잔존(희귀 한계 명문, §3). **개행
+  계약**: 병합은 바이트 스팬 연산으로 원본 개행
   형식(CRLF 포함)을 보존하고, 원본이 개행 없이 끝나면 append 경로가
   EOF 개행 1개를 추가한다(유일하게 허용되는 블록 밖 바이트 변경 —
   명문 한계). 왕복 `f_uninstall(f_install(x))`은 그 EOF 개행을
@@ -78,9 +94,10 @@
   삭제), 동일 버전 `f(f(x))==f(x)` 바이트 멱등, 블록 부재 시
   uninstall 무변경. `[hooks.state]`(Codex 소유 trust-hash) 불가침
   유지.
-- **D49** content.db 파일 축 회수 — **설계 선행·구현 이월**: 경로는
-  `purge` 계열 `--vacuum` 플래그(행 삭제 후 VACUUM 실행) 후보로
-  확정하되 구현 착수 조건은 **D46 경고 실발화**(현재 89.9%). 제약
+- **D49** content.db 파일 축 회수 — **설계 선행·구현 이월**: 경로
+  후보로 `purge` 계열 `--vacuum` 플래그(행 삭제 후 VACUUM 실행)를
+  채택하되 구현 착수 조건은 **D46 경고 실발화**(현재 임계 100MiB의
+  89.9%). 제약
   명문화: VACUUM은 라이브 MCP 서버 가동 중 불가(파일 잠금 — 세션 락
   표면으로 사전 감지 가능), 자동 실행 없음(수동 트리거 일관 원칙),
   purge 행 삭제 후에도 free page라 VACUUM 전까지 파일 크기 불변(D46
@@ -91,9 +108,11 @@
 
 ### 1.1 범위
 
-- cx: PreToolUse 덤프 가드 — 호스트별 게이트 선택 + 직렬 적용(§2).
-- `hook install --codex` 확장 — PreToolUse 훅 등록 + config.toml 관리
-  블록 MCP 병합(§3).
+- cx: PreToolUse 덤프 가드 — 호스트×GOOS 단독 게이트(§2). **G4 게이트
+  조건부**(2패스 Minor-8 정합): 행 3 판정 시 본 항목은 제외되고 아래
+  D48 항목만 진행.
+- `hook install --codex` 확장 — config.toml 관리 블록 MCP 병합 +
+  (MCP 확정 시) PreToolUse 훅 등록(§3 설치 결합 순서).
 - D49 설계 §(§4 — 구현 없음), A/B 해석 주석(§5), §7 실측 교정 추기.
 - 버전 0.7.0 범프(2지점), 도그푸딩 갱신.
 
@@ -128,7 +147,15 @@
      Codex는 sh 구문. cc: Bash에 PS 게이트를 합류시키지 않는 이유:
      Claude의 Bash는 Git Bash(POSIX)라 PS 구문이 실행 불가 명령이고,
      게이트 합류는 시맨틱 오염만 남긴다(접근 B의 프로파일 테이블은
-     호스트 2개에 과잉 — 접근 A 채택).
+     호스트 2개에 과잉 — 접근 A 채택). **셸 방언 한계(명문, 2패스
+     §10)**: hook 입력에는 실행 셸을 식별할 신호가 없다(G1 실측 —
+     command 원문뿐). host×GOOS 선택은 §7 실측(Windows Codex=raw PS
+     구문)에 근거한 추정이며, 반대 방언 덤프 — Windows-cx의 POSIX
+     구문(`cat /c/…`), 비Windows-cx의 pwsh 구문(Get-Content) — 는
+     **miss=allow**로 통과한다. 어휘 게이트의 allow-편향
+     by-design(v0.4 §3 비ASCII·8.3 경로 선례 동급)이고, 셸 신호 기반
+     게이트 선택 권고는 신호 부재로 구현 불가라 기각. cx: 실측에서
+     반대 방언 덤프가 관측되면 재상정.
   3. **deny 응답 계약 정합(G4)**: 현행 deny는 Claude PreToolUse
      hookSpecificOutput(permissionDecision=deny + reason) JSON을
      출력한다. Codex가 동형 JSON을 수용하는지(G1은 훅 시스템 동형까지
@@ -163,7 +190,7 @@
 - **config.toml 관리 블록**: 형식 —
 
   ```toml
-  # BEGIN context-router (managed — 이 블록은 hook install --codex가 소유)
+  # BEGIN context-router
   [mcp_servers.ctr]
   command = "context-router"
   args = []
@@ -179,20 +206,33 @@
     보존) → BEGIN/END 마커 쌍을 찾아 블록 교체(부재 시 말미 추가 —
     앞에 구분 빈 줄 1개, 원본이 개행 없이 끝나면 EOF 개행 1개 선행
     추가[유일 허용 블록 밖 변경, D48]) → 임시 파일 기록 후
-    rename(원자). 마커 판정은 **라인 접두 정확 매치**(`# BEGIN
-    context-router` / `# END context-router` — 접두 이후는 설명 자유
-    텍스트, 버전 문자열 없음: 버전 간 마커 호환). **마커 무결성
-    이상은 전부 무변경+안내**(D48 — END 단독·중복 쌍·역순·END 부재.
-    파손 확대 금지, 실패 시 원본 무변경 원칙). 한계 명문: multiline
-    string 안에 정확 1쌍 마커가 존재하는 이론상 케이스는 오인
-    가능(희귀 — 마커 무결성 규칙이 그 외 오인을 걸러냄).
-  - 충돌 검사(D48 보수 광역 스캔): 블록 밖 내용을 공백 제거 정규화한
-    문자열에 `mcp_servers`와 `ctr`가 동시 등장하면 표기 형태 불문
-    기입 생략+안내. 오탐의 실패 방향은 설치 거부+수동 안내(doctor
-    스니펫)로 안전 — 미탐지로 인한 중복 정의 파스 에러(사용자 Codex
-    전체 파손) 방향을 구조적으로 봉쇄.
-  - 제거 대칭: uninstall 시 블록(마커 라인 포함)+설치가 추가한 선행
-    구분 빈 줄 1개를 삭제, 블록 부재 시 무변경. 왕복
+    rename(원자). 마커 판정은 **고정 문자열 정확 라인 매치**(`# BEGIN
+    context-router` / `# END context-router` — 자유 접미 없음, 버전
+    문자열 없음: 버전 간 마커 호환. 2패스 Critical 교정 §10) + 소유
+    인정에는 **본문 검증**(블록 내부 `[mcp_servers.ctr]` 헤더 라인
+    실존) 추가. **양쪽 마커 부재=정상 append**, 그 외 무결성·소유권
+    이상(END 단독·중복 쌍·역순·END 부재·본문 불일치)은 전부
+    **무변경+안내**(파손 확대 금지, 실패 시 원본 무변경 원칙). 한계
+    명문: multiline string 안에 정확 마커 1쌍+관리 본문이 공존하는
+    이론상 케이스는 오인 가능(희귀 — 소유권 검증이 그 외 오인을
+    걸러냄).
+  - 충돌 검사(D48 키-경계 보수 스캔): 블록 밖 내용에 `mcp_servers`
+    존재 AND ctr 키-경계 신호(`ctr]`·`ctr"`·`ctr'`·`ctr=`·행두
+    `ctr.` — 공백 제거 라인 정규화) 존재 시 기입 생략+안내. 오탐의
+    실패 방향은 설치 거부+수동 안내(doctor 스니펫 + 기존 등록의
+    command 경로를 doctor [10]과 대조하라는 스테일 감사 권고 1줄)로
+    안전 — 미탐지로 인한 중복 정의 파스 에러(사용자 Codex 전체 파손)
+    방향을 구조적으로 봉쇄.
+  - **설치 결합 순서**(§0 D47): config.toml 병합을 먼저 수행하고, MCP
+    대체 경로 확정(기입/갱신 성공 또는 블록 밖 정확
+    `[mcp_servers.ctr]` 헤더 실존) 시에만 hooks.json에 PreToolUse
+    그룹을 포함해 병합한다. 미확정이면 캐프처 그룹(SessionStart+
+    PostToolUse)만 갱신 + 보류 안내 — 수동 등록 후 재실행이 복구
+    경로.
+  - 제거 대칭: uninstall 시 블록(마커 라인 포함)을 삭제하고, 선행
+    구분 빈 줄은 **직전 라인이 빈 줄일 때만 그 1줄만** 함께
+    삭제(2패스 Minor — 블록이 파일 중간으로 이동된 경우 사용자
+    내용 오삭제 방지). 블록 부재 시 무변경. 왕복
     `f_uninstall(f_install(x))`은 EOF 개행 정규화를 제외하고 바이트
     동일, 동일 버전 `f(f(x))==f(x)` 바이트 멱등 테스트(D48).
   - `[hooks.state]` 등 블록 밖 내용은 바이트 그대로 보존(구조적 보증).
@@ -207,33 +247,43 @@
 ## 5. A/B 측정 해석 주석 (D45 연계)
 
 - PreToolUse 가드 등록은 cx: hooks:on arm의 **treatment 정의를
-  변경**한다(캐프처 전용 → 캐프처+가드+MCP 재등록). v0.7 배포 시점
-  이후의 `usage --compare` cx: 블록 해석에는 이 경계를 병기한다 —
-  기존 코호트 라벨(대화형(경량) 한정) 유지, 경계 전후 혼합 비교 금지
-  주석. cc: 축은 영향 없음.
+  변경**한다(캐프처 전용 → 캐프처+가드+MCP 재등록). `usage --compare`
+  cx: 블록 해석에는 이 경계를 병기한다 — 기존 코호트 라벨(대화형
+  (경량) 한정) 유지, 경계 전후 혼합 비교 금지 주석. 경계의 실체는
+  "v0.7 배포 시점" 전역선이 아니라 **세션 단위 설치 시점**이며, 모든
+  세션 이벤트에 이미 각인된 `Producer="context-router/<version>"`이
+  기계적 경계 근거를 제공한다(2패스 Minor-9 — v0.7 범위에서는 수동
+  주석으로 족하고, Producer 기반 자동 경계 표기는 후속 측정 도구
+  후보로 §9에 기재). cc: 축은 영향 없음.
 - MCP 재등록으로 Codex 세션이 ctr_search/ctr_fetch를 사용하게 되면
   cx: 이벤트 구성(tool_call 분포)도 변한다 — §7 분해가 재등록 전
   기준선이 된다.
 
 ## 6. 검증·테스트 계약
 
-- 게이트 선택(호스트×GOOS 블랙박스 4계약 + 회귀 핀): ① Windows-cx
-  `Get-Content C:\…\big.txt`(임계 초과) → deny, ② Windows-cx
-  `cat /c/big.log` → **allow**(psAbsPath 드라이브 상대 — MSYS 오파일
-  deny 재도입 금지 핀, §0 D47), ③ 비Windows-cx `cat /abs/big` →
-  deny, ④ 양쪽 미매치 → allow. cc: 현행 무변경 회귀 핀(`cat
-  /c/big.log` MSYS deny 유지 포함). 부분 읽기 플래그·파이프·상대경로
-  allow 케이스는 기존 표(bashDumpArg 16행·psDumpArg 표) 재사용.
+- 게이트 선택(호스트×GOOS 블랙박스 4계약 + 회귀 핀 — **픽스처
+  tool_name은 전부 `"Bash"` 고정**: Codex exec 표면이며, PowerShell로
+  두면 기존 guardPowerShell 경로로 자명 통과해 신설 라우팅이 미검증
+  — 2패스 Minor-7): ① Windows-cx `Get-Content C:\…\big.txt`(임계
+  초과) → deny, ② Windows-cx `cat /c/big.log` → **allow**(psAbsPath
+  드라이브 상대 — MSYS 오파일 deny 재도입 금지 핀, §0 D47), ③
+  비Windows-cx `cat /abs/big` → deny, ④ 양쪽 미매치 → allow. cc:
+  현행 무변경 회귀 핀(`cat /c/big.log` MSYS deny 유지 포함). 부분
+  읽기 플래그·파이프·상대경로 allow 케이스는 기존 표(bashDumpArg
+  16행·psDumpArg 표) 재사용.
 - deny 경로: cx: deny JSON 출력 + warning 이벤트 + 현장 색인 artifact
   + denylist 걸림 시 allow+미색인(D39). G4 판정 결과에 따른 출력 계약
   픽스처.
 - 격리: 동일 UUID cc/cx — PreToolUse 가드 경로 확장(§2).
 - TOML 병합 계약: 멱등(바이트)·블록 밖 보존(주석·미지 키·
   [hooks.state] 포함 픽스처)·**충돌 생략 3형**(quoted key·인라인
-  테이블·부모 테이블+점표기 — 광역 스캔 픽스처)·제거 대칭+왕복
-  (EOF 개행 제외 바이트 동일)·원자성(실패 시 원본 무변경)·**마커
+  테이블·부모 테이블+점표기)·**부분열 오탐 회피**(`electron` 언급
+  픽스처 → 정상 설치)·**마커 소유권**(사용자 유사 마커 블록·본문
+  불일치 → 무변경)·제거 대칭+왕복(EOF 개행 제외 바이트 동일, 중간
+  블록의 선행 비-빈줄 보존)·원자성(실패 시 원본 무변경)·**마커
   무결성 4형**(END 단독·중복 쌍·역순·END 부재 무변경+안내)·CRLF
-  보존·무개행 EOF 파일 append.
+  보존·무개행 EOF 파일 append·**설치 결합**(MCP 미확정 시 PreToolUse
+  그룹 미등록+캐프처 유지).
 - hooks.json: PreToolUse 추가 멱등·F4 전건 판정 회귀.
 - CI 3-OS, `go test -p 1`, §12 canary(비밀 리터럴 분해) 유지.
 
@@ -255,25 +305,38 @@
   구문(Windows=PS 구문·Get-Content/Test-Path 실재)이 hook에 도달한다.
 - 도그푸딩 스냅샷(v0.6.1 직후): [6] sessions=99(empty=72 — 67→69→72
   증가, 7일 GC 회수 창 미도래), [12] drops=325 불변, [14] blob=25.6MB·
-  file=94.3MB(임계 89.9% — D46 미발화), [15] cc:=18.6MB·cx:=768KB.
+  file=94.3MB(임계 100MiB의 89.9% — D46 미발화), [15] cc:=18.6MB·
+  cx:=768KB.
 - cc: 관찰 A/B 2점째: output/rec 0.866·cache_read/rec 0.643 —
   session-21 첫 신호(0.60·0.63)와 일관.
 
 ## 8. 관측 프리체크 게이트 (계획 Task 0 — 컨트롤러 수행·판정, §11 관례)
 
-- **G4 — Codex PreToolUse 차단 응답 계약 + 등록·matcher 표면**: 공식
-  훅 문서(developers.openai.com/codex/hooks) + 실호스트 스크래치
-  관측으로 판정한다. 관측 항목은 3가지(적대 검수 Minor-4 확장): (a)
-  deny 응답 계약, (b) **PreToolUse 등록 자체의 수용 여부**(hooks.json
-  이벤트 키 인식 — 미수용이면 가드가 조용히 죽는다: 행 3 처리), (c)
-  **matcher `Bash` 필터 존중 여부**(미존중=전 도구 발화는 무해 —
-  dispatch가 Read/Bash/PowerShell 외 no-op — 관측 기록만). 결정표:
+- **G4 — Codex PreToolUse 표면 판정(순서 고정 절차 — 2패스 교정:
+  독립 관측의 비배타 행 분류·"수용≠강제" 혼동·payload 미관측을
+  해소)**: 공식 훅 문서(developers.openai.com/codex/hooks) +
+  실호스트 스크래치 관측. **관측 항목 4**: (a) PreToolUse 등록
+  수용(hooks.json 이벤트 키 인식·발화), (b) **payload 운반** —
+  PreToolUse stdin에 `tool_name`+`tool_input.command`가 실리는지(§7
+  148건은 전부 PostToolUse 유래라 PreToolUse payload는 데이터 0 —
+  미운반이면 게이트 입력이 공문자열이라 가드가 조용히 무력), (c)
+  **차단 강제** — deny 출력 시 도구 실행이 실제로 차단되는지(수용≠
+  강제: 자문-deny[경고 후 그대로 실행]는 불합격 — 덤프가 컨텍스트에
+  진입해 가드 목적 자체 실패), (d) matcher `Bash` 필터 존중(독립
+  관측 — 미존중=전 도구 발화는 무해[dispatch가 Read/Bash/PowerShell
+  외 no-op], 기록만·행 판정 비관여). **판정 절차(순서 고정 — 유일
+  결정)**: ① (a) 불수용 → 행 3. ② (b) 미운반 → 행 3(가드 무력·
+  보고). ③ (c) 강제 실증 실패(자문-deny 포함) → 행 3. ④ 강제 실증
+  성공 — Claude 동형 JSON이면 행 1, 비동형 차단 표면(필드명 상이·
+  exit code 기반 등)이면 행 2. 문서화 부재는 그 자체로 중단 사유가
+  아니다 — 실증 우선 + experimental 기록(D44 선례), 단 실증 불가·
+  버전 간 불안정 관측이면 행 3. 결정표:
 
-  | 행 | 관측 | 구현 |
+  | 행 | 판정(위 절차) | 구현 |
   |----|----|----|
-  | 1 | Claude 동형 JSON(permissionDecision) 수용 | 현행 deny 출력 무수정 — 전체 이식 |
-  | 2 | 비동형 차단 표면(JSON 필드명 상이·exit code 기반 등) | codex-hook에서 host별 deny **출력 직렬화만** 매핑(공유 가드 판정 로직 무변경) |
-  | 3 | 차단 표면 부재·문서화 안 됨·PreToolUse 등록 미수용 | 가드 축 중단·보고(설계 개정 없이 재상정 — v0.4 행 5 관례). D48 MCP 등록은 독립 진행 |
+  | 1 | 강제 실증 + Claude 동형 JSON | 현행 deny 출력 무수정 — 전체 이식 |
+  | 2 | 강제 실증 + 비동형 차단 표면 | codex-hook에서 host별 deny **출력 직렬화만** 매핑(공유 가드 판정 로직 무변경) |
+  | 3 | 등록 미수용·payload 미운반·강제 실증 실패·표면 불안정 | 가드 축 중단·보고(설계 개정 없이 재상정 — v0.4 행 5 관례). D48 MCP 등록은 독립 진행 |
 
 - **G5 — 종결(설계 시점 실코드 확인)**: dispatch는 호스트 무관
   PreToolUse 분기를 이미 가지며(hook.go:153), 구 바이너리 창의 deny
@@ -287,9 +350,12 @@ D49 구현(D46 실발화 후), 무작위 A/B 하네스·OTel(D27), exec 3종(D21
 트랙), 서브에이전트 캡처(호스트 표면 필요), register-on-first-event
 (D43), Grep 도구 가드, plugin manifest, semantic 보강, spill journal,
 `repository{}` 기입, `invalidates`, doctor의 Codex MCP 등록 상태 검사
-(D48 사후 필요 실증 시).
+(D48 사후 필요 실증 시), Producer 버전 기반 A/B treatment 자동 경계
+표기(§5 — 세션 단위 기계 경계, 수동 주석 대체 후보).
 
-## 10. 적대 검수 처리 기록 (2026-07-23, 설계 체크포인트 — 1패스)
+## 10. 적대 검수 처리 기록 (2026-07-23, 설계 체크포인트)
+
+### §10.1 1패스 처리 기록 (초안 2b9c05c 대상)
 
 - 이중 적대 검수(초안 2b9c05c 대상): 서브에이전트(opus)
   FIX-REQUIRED(Important 3·Minor 5) + Codex adversarial-review
@@ -322,3 +388,40 @@ D49 구현(D46 실발화 후), 무작위 A/B 하네스·OTel(D27), exec 3종(D21
 - 실코드 대조 결과(서브에이전트): dispatch 공유 경로·codex-hook→
   HostCodex 전달·deny JSON 형태(hookSpecificOutput/permissionDecision)
   주장 전부 부합, go.mod TOML 의존 0 확인.
+
+### §10.2 2패스 처리 기록 (2026-07-23, 사용자 지시 — 585dcaa·0772e2a 대상)
+
+- 이중 적대 검수 2패스(신선 컨텍스트 서브에이전트 + Codex): 서브
+  FIX-REQUIRED(Important 3·Minor 8) + Codex needs-attention(critical
+  1·high 3). **1패스 교정 자체의 결함 3건이 적발되어 재교정**:
+  - **마커 소유권**(Codex Critical): 접두 자유 텍스트+개수 검사는
+    소유권을 증명하지 못해 사용자 주석 블록(`# BEGIN context-router
+    migration` 등)을 오소유·교체·삭제 — 고정 문자열 정확 라인 매치 +
+    본문 검증(`[mcp_servers.ctr]` 실존)으로 교체, 불일치=무변경+안내.
+  - **부분열 오탐**(서브 Imp-1, 실행 검증): 1패스의 무경계 동시-등장
+    스캔은 공백 제거로 토큰 경계가 소멸해 `electron`·`spectra`의
+    `ctr` 부분열에 오탐(영구 생략) — 키-경계 신호 스캔(`ctr]`·
+    `ctr"`·`ctr'`·`ctr=`·행두 `ctr.`)으로 교체. 합법 변형 전부 경계
+    신호 동반 확인(실행 검증). 도그푸딩 config.toml 실물은 `ctr`
+    부분열 0회로 무발동 확인(무력화 가설 반증).
+  - **설치 결합 공백**(수렴 — 서브 Imp-2·Codex high): TOML 병합
+    생략(오탐 포함)과 hooks.json PreToolUse 등록이 독립 수행되면
+    "deny + 안내 도구 부재"(D32 위반 — 설계가 봉쇄를 표방한 조합)
+    발생 — MCP 확정 시에만 PreToolUse 등록하는 결합 순서 신설.
+- **G4 재작성**(수렴 — 서브 Imp-3/Min-4·Codex high): 독립 관측의
+  비배타 행 분류(행 1·3 동시 성립 조합 존재) + "deny 수용≠강제"
+  혼동(자문-deny=거짓 행 1) + PreToolUse payload 운반(tool_input.
+  command) 완전 미관측(§7 148건은 전부 PostToolUse 유래)을 해소 —
+  관측 4항목·순서 고정 판정 절차로 교체.
+- **한계 명문·기각**: 셸 방언 신호 기반 게이트 선택(Codex 권고)은
+  hook 입력에 신호 부재로 구현 불가 기각 — 반대 방언 덤프
+  miss=allow를 by-design 한계로 §2 명문(v0.4 비ASCII 선례 동급),
+  관측 시 재상정.
+- **Minor 반영**: §1.1 잔존 "직렬" 어구·G4 조건부 병기, §6 픽스처
+  tool_name="Bash" 고정, both-absent=append 명문, uninstall 선행
+  빈 줄 가드(직전 라인이 빈 줄일 때만), §5 Producer 세션 단위 기계
+  경계 명시(+§9 자동 표기 후보), "임계 100MiB의 89.9%" 표기 정밀화.
+- 독립 재검증(서브): 게이트 4계약 실코드 성립(`go test
+  ./internal/hook/... -p 1` GREEN), 합법 변형 3형 스캔 포착 실행
+  확인, doctor 스니펫=블록 내용 일치, hook.go:153·GOOS 무분기·접두
+  전달 주장 정확.
