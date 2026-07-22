@@ -40,15 +40,15 @@ func shadowCapture(ctx context.Context, ad *session.AppendDB, in hookInput, dir,
 	case size <= shadowLimit(getenv, "CTR_SHADOW_MIN", defaultShadowMinBytes):
 		return // 임계 이하 — 재소환 가치 낮음, 조용히 스킵
 	case size > shadowLimit(getenv, "CTR_SHADOW_MAX", defaultShadowMaxBytes):
-		appendDrop(dir, "shadow-oversize") // 하드 캡 초과 — 미저장
+		appendDrop(dir, "shadow-oversize", external, in.HookEventName, in.ToolName) // 하드 캡 초과 — 미저장
 		return
 	}
 	if fileOriginTools[in.ToolName] && shadowInputDenied(in.ToolInput) {
-		appendDrop(dir, "shadow-denylist") // 비밀 파일 유래 응답 — 미저장
+		appendDrop(dir, "shadow-denylist", external, in.HookEventName, in.ToolName) // 비밀 파일 유래 응답 — 미저장
 		return
 	}
 	if p := commandDumpPath(in); p != "" && ingest.DeniedFilename(p) {
-		appendDrop(dir, "shadow-denylist") // D39 — 정적 증명 덤프 경로가 denylist 파일, 미저장
+		appendDrop(dir, "shadow-denylist", external, in.HookEventName, in.ToolName) // D39 — 정적 증명 덤프 경로가 denylist 파일, 미저장
 		return
 	}
 	// D31 decode-sniff: body는 hook.Run 외부 파싱을 통과한 유효 JSON — 문자열 leaf를
@@ -74,7 +74,7 @@ func shadowCapture(ctx context.Context, ad *session.AppendDB, in hookInput, dir,
 
 	st, err := store.OpenContext(ctx, contentDir, false)
 	if err != nil {
-		appendDrop(dir, "shadow-store") // 잠금 경합·손상 등 — deadline 예산 안에서 포기
+		appendDrop(dir, "shadow-store", external, in.HookEventName, in.ToolName) // 잠금 경합·손상 등 — deadline 예산 안에서 포기
 		return
 	}
 	defer func() { _ = st.Close() }()
@@ -83,7 +83,7 @@ func shadowCapture(ctx context.Context, ad *session.AppendDB, in hookInput, dir,
 		Content: string(body), Title: in.ToolName, SourceKind: "hook",
 	})
 	if err != nil || rep.Indexed == 0 || rep.Hash == "" {
-		appendDrop(dir, "shadow-ingest")
+		appendDrop(dir, "shadow-ingest", external, in.HookEventName, in.ToolName)
 		return
 	}
 
@@ -141,7 +141,7 @@ func commandDumpPath(in hookInput) string {
 // fail-open). 요약은 도구명+허용 요소만이라 응답 원문·비밀을 운반하지 않는다(§3 allowlist).
 func shadowAppend(ctx context.Context, ad *session.AppendDB, dir string, ev session.Event) {
 	if _, _, _, err := ad.Append(ctx, ev); err != nil {
-		appendDrop(dir, "shadow-append")
+		appendDrop(dir, "shadow-append", "", "", "")
 	}
 }
 

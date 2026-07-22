@@ -75,31 +75,31 @@ func Run(ctx context.Context, stdin io.Reader, stdout io.Writer, storeRoot, vers
 	}
 	if host != HostClaude && host != HostCodex {
 		_, _ = io.Copy(io.Discard, stdin) // drain — broken pipe 방지
-		appendDrop(storeRoot, "bad-host") // 오귀속 대신 drop(D35 격리)
+		appendDrop(storeRoot, "bad-host", "", "", "") // 오귀속 대신 drop(D35 격리)
 		return 0
 	}
 	data, err := io.ReadAll(io.LimitReader(stdin, maxStdinBytes+1)) // 상한+1로 초과 감지, 정상 크기는 EOF까지 소비
 	if err != nil {
-		appendDrop(storeRoot, "bad-input")
+		appendDrop(storeRoot, "bad-input", "", "", "")
 		return 0
 	}
 	if len(data) > maxStdinBytes { // deadline·파싱 이전에 봉인 — 거대 payload OOM 방지(fail-open)
 		_, _ = io.Copy(io.Discard, stdin) // 남은 stdin drain → broken pipe 방지(HOOKS_OFF와 동형)
-		appendDrop(storeRoot, "stdin-oversize")
+		appendDrop(storeRoot, "stdin-oversize", "", "", "")
 		return 0
 	}
 	var in hookInput
 	if json.Unmarshal(data, &in) != nil {
-		appendDrop(storeRoot, "bad-input")
+		appendDrop(storeRoot, "bad-input", "", "", "")
 		return 0
 	}
 	if !canonicalUUIDRe.MatchString(in.SessionID) {
-		appendDrop(storeRoot, "bad-session-id") // 식별 전 단계 — storeRoot 레벨 사이드카
+		appendDrop(storeRoot, "bad-session-id", "", in.HookEventName, in.ToolName) // 식별 전 단계 — storeRoot 레벨 사이드카
 		return 0
 	}
 	canon, err := ident.Canonicalize(in.CWD)
 	if err != nil {
-		appendDrop(storeRoot, "bad-cwd") // worktree 미식별 — storeRoot 레벨 사이드카
+		appendDrop(storeRoot, "bad-cwd", "", in.HookEventName, in.ToolName) // worktree 미식별 — storeRoot 레벨 사이드카
 		return 0
 	}
 	dir := filepath.Join(storeRoot, "projects", canon.ProjectID, "worktrees", canon.WorktreeID)
@@ -122,7 +122,7 @@ func dispatch(ctx context.Context, in hookInput, dir, contentDir, worktreeRoot, 
 		RetentionSec:      retentionSec(getenv),
 	})
 	if err != nil {
-		appendDrop(dir, openErrReason(err))
+		appendDrop(dir, openErrReason(err), external, in.HookEventName, in.ToolName)
 		return
 	}
 	defer func() { _ = ad.Close() }()
@@ -133,18 +133,18 @@ func dispatch(ctx context.Context, in hookInput, dir, contentDir, worktreeRoot, 
 		// enum 강제는 안 한다: 호스트가 신형 source 값을 추가하면 세션 기록 전체가 사장된다(전방 호환).
 		src := truncateUTF8(in.Source, maxSourceBytes) // C4: rune 경계 절단(byte-slice는 멀티바이트 source를 깨뜨림)
 		if _, err := ad.EnsureSession(ctx, src, worktreeRoot); err != nil {
-			appendDrop(dir, "ensure-failed")
+			appendDrop(dir, "ensure-failed", external, in.HookEventName, in.ToolName)
 		}
 		return
 	}
 
 	exists, err := ad.SessionExists(ctx)
 	if err != nil {
-		appendDrop(dir, "session-check-failed")
+		appendDrop(dir, "session-check-failed", external, in.HookEventName, in.ToolName)
 		return
 	}
 	if !exists {
-		appendDrop(dir, "unknown-session") // 미지 세션의 후속 이벤트는 drop(설계 §2.2)
+		appendDrop(dir, "unknown-session", external, in.HookEventName, in.ToolName) // 미지 세션의 후속 이벤트는 drop(설계 §2.2)
 		return
 	}
 	// PreToolUse는 T7 large-read/dump guard 몫 — tool_call로 중복 계상하지 않고 tool_name으로
@@ -166,7 +166,7 @@ func dispatch(ctx context.Context, in hookInput, dir, contentDir, worktreeRoot, 
 	if in.HookEventName == "PostToolUse" || in.HookEventName == "PostToolUseFailure" {
 		if ev, ok := buildEvent(in); ok {
 			if _, _, _, err := ad.Append(ctx, ev); err != nil {
-				appendDrop(dir, "append-failed")
+				appendDrop(dir, "append-failed", external, in.HookEventName, in.ToolName)
 			}
 		}
 		// T6 Shadow Recall — 성공 이벤트만(PostToolUseFailure는 tool_response가 없다). 기본 이벤트에
@@ -212,7 +212,7 @@ func guardRead(ctx context.Context, ad *session.AppendDB, in hookInput, dir, con
 	}
 	st, err := store.OpenContext(ctx, contentDir, false)
 	if err != nil {
-		appendDrop(dir, "guard-store") // 인덱싱 불가(락 경합·손상) — deadline 예산 안에서 포기
+		appendDrop(dir, "guard-store", "", in.HookEventName, in.ToolName) // 인덱싱 불가(락 경합·손상) — deadline 예산 안에서 포기
 		return
 	}
 	defer func() { _ = st.Close() }()
@@ -247,7 +247,7 @@ func guardBash(ctx context.Context, ad *session.AppendDB, in hookInput, dir, con
 	}
 	st, err := store.OpenContext(ctx, contentDir, false)
 	if err != nil {
-		appendDrop(dir, "guard-store")
+		appendDrop(dir, "guard-store", "", in.HookEventName, in.ToolName)
 		return
 	}
 	defer func() { _ = st.Close() }()
@@ -280,7 +280,7 @@ func guardPowerShell(ctx context.Context, ad *session.AppendDB, in hookInput, di
 	}
 	st, err := store.OpenContext(ctx, contentDir, false)
 	if err != nil {
-		appendDrop(dir, "guard-store")
+		appendDrop(dir, "guard-store", "", in.HookEventName, in.ToolName)
 		return
 	}
 	defer func() { _ = st.Close() }()
@@ -315,7 +315,7 @@ func denyTool(ctx context.Context, ad *session.AppendDB, in hookInput, dir, tool
 	}
 	summary = truncateUTF8(summary, session.MaxSummaryBytes)
 	if _, _, _, err := ad.Append(ctx, session.Event{Type: "warning", Summary: summary}); err != nil {
-		appendDrop(dir, "guard-append") // 기록 실패 — deny는 이미 확정, drops 1줄만
+		appendDrop(dir, "guard-append", "", in.HookEventName, in.ToolName) // 기록 실패 — deny는 이미 확정, drops 1줄만
 	}
 }
 
@@ -600,10 +600,29 @@ func openErrReason(err error) string {
 	}
 }
 
-// appendDrop — dir/session.drops.log에 "<unix-ts>\t<reason>\n" 1줄을 O_APPEND한다(설계 §2.3
-// fail-open 사이드카). dir이 아직 없을 수 있어 MkdirAll로 보강한다(best-effort). 자체 실패는
-// stderr slog에만 남긴다(이중 실패 무시, 설계 §2.3 한계) — 절대경로·비밀은 남기지 않는다(§5.5).
-func appendDrop(dir, reason string) {
+// appendDrop — dir/session.drops.log에 진단 5필드 "<unix-ts>\t<reason>\t<sid8>\t<hook_event>\t
+// <tool>\n" 1줄을 O_APPEND한다(D43, 설계 §2.3 fail-open 사이드카). sid8은 세션ID(호스트 접두 포함)
+// 앞 8자, 미상 필드는 "-". sanitize: 탭·개행 제거 + 각 필드 64자 상한(파서 오염 방지, 설계 §5).
+// dir이 아직 없을 수 있어 MkdirAll로 보강한다(best-effort). 자체 실패는 stderr slog에만 남긴다
+// (이중 실패 무시, 설계 §2.3 한계) — 절대경로·비밀은 남기지 않는다(§5.5).
+func appendDrop(dir, reason, sessionID, hookEvent, tool string) {
+	san := func(s string) string {
+		if s == "" {
+			return "-"
+		}
+		s = strings.NewReplacer("\t", " ", "\n", " ", "\r", " ").Replace(s)
+		if len(s) > 64 {
+			s = s[:64]
+		}
+		return s
+	}
+	sid8 := "-"
+	if sessionID != "" {
+		sid8 = sessionID
+		if len(sid8) > 8 {
+			sid8 = sid8[:8]
+		}
+	}
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		slog.Warn("hook drop 기록 실패", "stage", "mkdir", "reason", reason)
 		return
@@ -614,7 +633,8 @@ func appendDrop(dir, reason string) {
 		return
 	}
 	defer func() { _ = f.Close() }()
-	if _, err := fmt.Fprintf(f, "%d\t%s\n", time.Now().Unix(), reason); err != nil {
+	if _, err := fmt.Fprintf(f, "%d\t%s\t%s\t%s\t%s\n",
+		time.Now().Unix(), san(reason), san(sid8), san(hookEvent), san(tool)); err != nil {
 		slog.Warn("hook drop 기록 실패", "stage", "write", "reason", reason)
 	}
 }
