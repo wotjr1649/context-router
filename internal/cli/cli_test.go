@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -14,6 +15,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -230,6 +232,10 @@ func TestRunDoctor_ContentDBSize(t *testing.T) {
 	if !strings.Contains(buf.String(), "[14] content.db: sources=2 artifacts=2 blob=45B") {
 		t.Fatalf("out missing exact content.db size line:\n%s", buf.String())
 	}
+	// D40 — content.db 파일 실크기 병기(FileBytes). 값은 페이지/WAL에 따라 가변이라 접미 존재만 단정.
+	if !strings.Contains(buf.String(), " file=") {
+		t.Fatalf("out missing content.db file= suffix:\n%s", buf.String())
+	}
 }
 
 // D38 — blob 총량 > 임계면 [14] 뒤 경고 1줄(purge 비선택 성격 병기), 임계 미만이면 무출력.
@@ -292,7 +298,7 @@ func TestRunDoctor_StoreSizeWarn(t *testing.T) {
 	if err := runDoctor(context.Background(), &buf, storeRoot, projectRoot, "0.0.1-dev"); err != nil {
 		t.Fatalf("runDoctor err=%v out=%s", err, buf.String())
 	}
-	for _, want := range []string{"[14] warning:", "purge", "무구분"} {
+	for _, want := range []string{"[14] warning:", "purge", "--hook-only"} {
 		if !strings.Contains(buf.String(), want) {
 			t.Fatalf("out missing %q:\n%s", want, buf.String())
 		}
@@ -310,6 +316,141 @@ func TestRunDoctor_StoreSizeWarnSilentUnderThreshold(t *testing.T) {
 	}
 	if strings.Contains(buf.String(), "[14] warning") {
 		t.Fatalf("경고가 임계 미만에서 발화:\n%s", buf.String())
+	}
+}
+
+// seedShadowContentDB — projDir/content.db에 hook 단독(귀속) 아티팩트 1개 + file(비귀속) 1개를
+// Register하고 귀속 hash(=hex(sha256(hookContent))=CAS 파일명=ShadowOwned 키)를 반환한다.
+func seedShadowContentDB(t *testing.T, projDir string) (ownedHash string) {
+	t.Helper()
+	st, err := store.Open(projDir, false)
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	const hookContent = "hook-only-shadow-content"
+	if _, err := st.Register(context.Background(), store.Registration{
+		StoredBytes: []byte(hookContent), MediaType: "text/plain",
+		Source: store.SourceMeta{URI: "shadow:Bash:1", Kind: "hook", SrcHash: "sh-hook"},
+	}); err != nil {
+		t.Fatalf("register hook: %v", err)
+	}
+	if _, err := st.Register(context.Background(), store.Registration{ // 비귀속(file 직접 참조) — 버킷에 안 들어가야 함
+		StoredBytes: []byte("explicit-file-content"), MediaType: "text/plain",
+		Source: store.SourceMeta{URI: "/tmp/f.txt", Kind: "file", SrcHash: "sh-file"},
+	}); err != nil {
+		t.Fatalf("register file: %v", err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatalf("store.Close: %v", err)
+	}
+	sum := sha256.Sum256([]byte(hookContent))
+	return hex.EncodeToString(sum[:])
+}
+
+// seedShadowWorktree — wdir에 정상 session.db를 부트스트랩(session.Open)한 뒤 지정 session_id로
+// artifact_created 이벤트 1건을 raw INSERT한다. session_id 접두(cc:/cx:)를 통제해야 하는데
+// session.Open은 서버 UUID를 발급하므로 공개 API로는 만들 수 없다 — 실제 훅 경로도 external
+// 접두 session_id로 append한다(hook_test.go:110). artifact_refs는 정본 URI JSON 배열.
+func seedShadowWorktree(t *testing.T, wdir, sid string, refs []string) {
+	t.Helper()
+	d, err := session.Open(wdir, session.Options{Producer: "context-router/test"})
+	if err != nil {
+		t.Fatalf("session.Open(%s): %v", wdir, err)
+	}
+	if err := d.Close(); err != nil {
+		t.Fatalf("session.Close: %v", err)
+	}
+	dbPath := filepath.ToSlash(filepath.Join(wdir, "session.db"))
+	db, err := sql.Open("sqlite", "file:"+dbPath+"?_pragma=busy_timeout(5000)")
+	if err != nil {
+		t.Fatalf("open session.db rw: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+	refsJSON, err := json.Marshal(refs)
+	if err != nil {
+		t.Fatalf("marshal refs: %v", err)
+	}
+	if _, err := db.Exec(`INSERT INTO session_events(event_id, session_id, event_type, ts, summary, artifact_refs, redaction)
+		VALUES(?,?,?,?,?,?,?)`, "evt-"+sid, sid, "artifact_created", int64(1700000000), "seeded shadow", string(refsJSON), "none"); err != nil {
+		t.Fatalf("insert artifact_created: %v", err)
+	}
+	if _, err := db.Exec("PRAGMA wal_checkpoint(TRUNCATE)"); err != nil { // ro doctor가 결정적으로 보게 flush
+		t.Fatalf("checkpoint: %v", err)
+	}
+}
+
+// TestDoctorShadowOwnedLine — D40 §2: [15] 접두 분해. hook 단독(귀속) hash를 cc: 세션이
+// artifact_created로 참조 → cc: 버킷. 비귀속(file) ref는 귀속 hash가 아니라 무시된다.
+func TestDoctorShadowOwnedLine(t *testing.T) {
+	storeRoot := t.TempDir()
+	projectRoot := t.TempDir()
+	canon, err := ident.Canonicalize(projectRoot)
+	if err != nil {
+		t.Fatalf("canonicalize: %v", err)
+	}
+	projDir := filepath.Join(storeRoot, "projects", canon.ProjectID)
+	ownedHash := seedShadowContentDB(t, projDir)
+
+	sid := "cc:00000000-0000-7000-8000-0000000000aa"
+	seedShadowWorktree(t, filepath.Join(projDir, "worktrees", "wt1"), sid, []string{
+		"artifact://" + sid + "/sha256-" + ownedHash,               // 귀속 → cc: 버킷
+		"artifact://" + sid + "/sha256-" + strings.Repeat("e", 64), // 비귀속 → 무시
+	})
+
+	var buf bytes.Buffer
+	if err := runDoctor(context.Background(), &buf, storeRoot, projectRoot, "0.0.1-dev"); err != nil {
+		t.Fatalf("runDoctor err=%v out=%s", err, buf.String())
+	}
+	out := buf.String()
+	for _, want := range []string{"[15] shadow-owned: ", "cc:=", "hashes=1", "cx:=0B shared=0B unattributed=0B"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("doctor 출력에 %q 없음:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "세션 분해 없음") || strings.Contains(out, "incomplete") {
+		t.Fatalf("정상 경로인데 '세션 분해 없음'/'incomplete' 병기:\n%s", out)
+	}
+}
+
+// TestDoctorShadowOwnedIncomplete — 손상 session.db 1개가 섞여도 그 worktree만 건너뛰고 괄호
+// 끝에 incomplete를 병기하며, [15] 실패는 doctor 전역 failed에 안 들어가 성공 종료한다.
+func TestDoctorShadowOwnedIncomplete(t *testing.T) {
+	storeRoot := t.TempDir()
+	projectRoot := t.TempDir()
+	canon, err := ident.Canonicalize(projectRoot)
+	if err != nil {
+		t.Fatalf("canonicalize: %v", err)
+	}
+	projDir := filepath.Join(storeRoot, "projects", canon.ProjectID)
+
+	// 정상 worktree 1개(비어 있어도 열림 → usable≥1이어야 incomplete 형식이 나온다).
+	d, err := session.Open(filepath.Join(projDir, "worktrees", "ok"), session.Options{Producer: "context-router/test"})
+	if err != nil {
+		t.Fatalf("session.Open ok: %v", err)
+	}
+	if err := d.Close(); err != nil {
+		t.Fatalf("session.Close ok: %v", err)
+	}
+
+	// 손상 worktree: 0xEE 4096B session.db(SQLITE_NOTADB) — 첫 쿼리에서 오류(mcp_test.go:1937).
+	corrupt := filepath.Join(projDir, "worktrees", "corrupt")
+	if err := os.MkdirAll(corrupt, 0o755); err != nil {
+		t.Fatalf("mkdir corrupt: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(corrupt, "session.db"), bytes.Repeat([]byte{0xEE}, 4096), 0o600); err != nil {
+		t.Fatalf("write corrupt session.db: %v", err)
+	}
+
+	var buf bytes.Buffer
+	if err := runDoctor(context.Background(), &buf, storeRoot, projectRoot, "0.0.1-dev"); err != nil {
+		t.Fatalf("runDoctor err=%v ([15] 실패가 전역 failed로 새면 안 됨) out=%s", err, buf.String())
+	}
+	out := buf.String()
+	if !strings.Contains(out, "[15] shadow-owned: ") || !strings.Contains(out, "incomplete") {
+		t.Fatalf("incomplete 병기 없음:\n%s", out)
+	}
+	if strings.Contains(out, "세션 분해 없음") {
+		t.Fatalf("usable worktree가 있는데 '세션 분해 없음':\n%s", out)
 	}
 }
 
@@ -1386,7 +1527,8 @@ func TestRunDoctor_SessionItems(t *testing.T) {
 		}
 		out := buf.String()
 		for _, want := range []string{
-			"[6] session.db: quick_check=ok",
+			// D42: 갓 연 세션 = 자동 세션 1건(session_start만 → empty). sessions/empty 병기.
+			"[6] session.db: quick_check=ok sessions=1 (empty=1)",
 			"[7] session.lock: shared 획득 가능",
 			"[8] session.recover-pending: 없음",
 		} {
@@ -1621,5 +1763,227 @@ func TestRecover_UnknownWorktreeListsCandidates(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), canon.WorktreeID) {
 		t.Fatalf("error should list candidate worktree id %q, got %q", canon.WorktreeID, err.Error())
+	}
+}
+
+// seedHookOnlyProject — storeRoot 하위에 projectRoot의 canonical ID로 hook 단독(귀속) + file
+// (비귀속) 아티팩트를 시드하고 (pid, projDir, ownedHash)를 반환한다. purge --hook-only CLI
+// 테스트 공용 시드 — seedShadowContentDB(귀속 hash 반환)를 그대로 재사용한다.
+func seedHookOnlyProject(t *testing.T) (pid, projDir, ownedHash string) {
+	t.Helper()
+	storeRoot := t.TempDir()
+	projectRoot := t.TempDir()
+	canon, err := ident.Canonicalize(projectRoot)
+	if err != nil {
+		t.Fatalf("canonicalize: %v", err)
+	}
+	pid = canon.ProjectID
+	projDir = filepath.Join(storeRoot, "projects", pid)
+	ownedHash = seedShadowContentDB(t, projDir)
+	// storeRoot를 반환하지 않는 대신, 호출부는 projDir에서 storeRoot를 역산한다(projects/<pid>).
+	return pid, projDir, ownedHash
+}
+
+// storeRootOf — projDir(=<storeRoot>/projects/<pid>)에서 storeRoot를 역산한다.
+func storeRootOf(projDir string) string { return filepath.Dir(filepath.Dir(projDir)) }
+
+// TestPurgeHookOnlyCLI — e2e: --hook-only가 전역 confirm/전체삭제(os.RemoveAll)에 도달하지 않고
+// shadow 귀속 hash만 회수하며(보고 문면), content.db와 explicit(file) 소스는 보존한다. CAS
+// 파일을 2h 전으로 노후화해 age-gate를 통과시켜 실제 물리 회수까지 확인한다.
+func TestPurgeHookOnlyCLI(t *testing.T) {
+	pid, projDir, ownedHash := seedHookOnlyProject(t)
+	storeRoot := storeRootOf(projDir)
+	casPath := filepath.Join(projDir, "artifacts", ownedHash[:2], ownedHash)
+	old := time.Now().Add(-2 * time.Hour) // > gcOrphanMinAge(1h) → 회수(유예 아님)
+	if err := os.Chtimes(casPath, old, old); err != nil {
+		t.Fatalf("age CAS file: %v", err)
+	}
+
+	var out bytes.Buffer
+	args := []string{"--project", pid, "--hook-only", "--force"}
+	if err := runPurge(context.Background(), failReader{}, &out, io.Discard, storeRoot, args, false); err != nil {
+		t.Fatalf("runPurge err=%v out=%s", err, out.String())
+	}
+	o := out.String()
+	if !strings.Contains(o, "실회수") || !strings.Contains(o, "(1 hashes)") {
+		t.Fatalf("보고 문면 없음:\n%s", o)
+	}
+	// 전체 삭제 비도달: content.db 잔존.
+	if _, err := os.Stat(filepath.Join(projDir, "content.db")); err != nil {
+		t.Fatalf("content.db가 사라짐(전체삭제 분기에 도달) : %v", err)
+	}
+	// shadow 귀속 blob은 실제 회수(파일 부재).
+	if _, err := os.Stat(casPath); !os.IsNotExist(err) {
+		t.Fatalf("shadow CAS blob이 회수되지 않음: stat err=%v", err)
+	}
+	// explicit(file) 소스는 보존, hook 귀속은 0.
+	sz, err := store.SizeStats(projDir)
+	if err != nil || sz == nil {
+		t.Fatalf("SizeStats: %v (nil=%v)", err, sz == nil)
+	}
+	if sz.Sources != 1 || sz.ShadowOwnedHashes != 0 {
+		t.Fatalf("보존/회수 불일치: Sources=%d(want 1) ShadowOwnedHashes=%d(want 0)", sz.Sources, sz.ShadowOwnedHashes)
+	}
+}
+
+// TestPurgeHookOnlyComboRejected — --hook-only는 --all/--older-than/--sessions/--gc와 조합 시
+// 사용 오류(rc != 0)이고 아무것도 삭제하지 않는다(조기 분기가 store를 열기 전에 거부).
+func TestPurgeHookOnlyComboRejected(t *testing.T) {
+	pid, projDir, ownedHash := seedHookOnlyProject(t)
+	storeRoot := storeRootOf(projDir)
+	casPath := filepath.Join(projDir, "artifacts", ownedHash[:2], ownedHash)
+
+	for _, args := range [][]string{
+		{"--project", pid, "--hook-only", "--all"},
+		{"--project", pid, "--hook-only", "--older-than", "1h"},
+		{"--project", pid, "--hook-only", "--sessions"},
+		{"--project", pid, "--hook-only", "--gc"},
+	} {
+		var out bytes.Buffer
+		// failReader: 조합 거부는 confirm(입력 읽기) 이전에 일어나야 한다.
+		if err := runPurge(context.Background(), failReader{}, &out, io.Discard, storeRoot, args, false); err == nil {
+			t.Fatalf("args=%v: want usage error, got nil", args)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(projDir, "content.db")); err != nil {
+		t.Fatalf("거부된 조합이 content.db를 삭제함: %v", err)
+	}
+	if _, err := os.Stat(casPath); err != nil {
+		t.Fatalf("거부된 조합이 shadow blob을 삭제함: %v", err)
+	}
+}
+
+// TestDoctorWarnMentionsHookOnly — [14] 경고 신문구가 --hook-only 선택 삭제를 안내하고 옛 문구
+// ('무구분')는 사라졌다(설계 §8 / D38 승격).
+func TestDoctorWarnMentionsHookOnly(t *testing.T) {
+	storeRoot, projectRoot := doctorSizeWarnSetup(t)
+	t.Setenv("CTR_STORE_WARN_BYTES", "5") // blob 10B > 5B → 발화
+	var buf bytes.Buffer
+	if err := runDoctor(context.Background(), &buf, storeRoot, projectRoot, "0.0.1-dev"); err != nil {
+		t.Fatalf("runDoctor err=%v out=%s", err, buf.String())
+	}
+	out := buf.String()
+	for _, want := range []string{"[14] warning:", "--hook-only", "shadow만 선택 삭제 가능"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("경고 신문구에 %q 없음:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "무구분") {
+		t.Fatalf("옛 문구('무구분')가 남아 있음:\n%s", out)
+	}
+}
+
+// TestPurgeHookOnlySinglePrompt — TTY 경로에서 확인 프롬프트가 정확히 1회만 출력된다(전역
+// confirmPurge와의 중복 방지 회귀 — 조기 분기가 전역 confirm 앞에 있어야 함). 견적 슬러그를
+// 정확히 재구성해 입력하면 통과하고 실회수 보고까지 진행된다.
+func TestPurgeHookOnlySinglePrompt(t *testing.T) {
+	pid, projDir, _ := seedHookOnlyProject(t)
+	storeRoot := storeRootOf(projDir)
+
+	sz, err := store.SizeStats(projDir)
+	if err != nil || sz == nil {
+		t.Fatalf("SizeStats: %v", err)
+	}
+	var estB int64
+	for _, b := range sz.ShadowOwned {
+		estB += b
+	}
+	slug := fmt.Sprintf("shadow %dB(%d hashes) 선택 삭제", estB, len(sz.ShadowOwned))
+
+	var out bytes.Buffer
+	args := []string{"--project", pid, "--hook-only"} // --force 없음 → TTY 확인 경로
+	if err := runPurge(context.Background(), strings.NewReader(slug+"\n"), &out, io.Discard, storeRoot, args, true); err != nil {
+		t.Fatalf("runPurge(TTY) err=%v out=%s", err, out.String())
+	}
+	o := out.String()
+	if n := strings.Count(o, "삭제 대상을 확인합니다"); n != 1 {
+		t.Fatalf("확인 프롬프트가 %d회(정확히 1회여야 — 전역 confirm 중복 방지):\n%s", n, o)
+	}
+	if !strings.Contains(o, "실회수") {
+		t.Fatalf("단일 확인 통과 후 실회수 보고 없음:\n%s", o)
+	}
+}
+
+// blockingWriter — 첫 Write에서 buf에 기록한 뒤 hit을 알리고 release가 닫힐 때까지 막는다.
+// 테스트가 정확히 그 Write 지점(hook-only 보고 직후·VACUUM 직전)에 개입해 다른 연결로 쓰기
+// 잠금을 선점할 수 있게 하는 결정적 배리어다(타이밍 슬립 없음 — 순수 채널 동기화).
+type blockingWriter struct {
+	buf     bytes.Buffer
+	once    sync.Once
+	hit     chan struct{}
+	release chan struct{}
+}
+
+func newBlockingWriter() *blockingWriter {
+	return &blockingWriter{hit: make(chan struct{}), release: make(chan struct{})}
+}
+
+func (b *blockingWriter) Write(p []byte) (int, error) {
+	n, _ := b.buf.Write(p)
+	b.once.Do(func() {
+		close(b.hit)
+		<-b.release
+	})
+	return n, nil
+}
+
+// TestPurgeHookOnlyVacuumFailureContinues — VACUUM 실패는 log-and-continue(rc=0)이며, 실회수
+// 보고는 VACUUM보다 먼저(스펙 §3 순서) 출력된다. 보고 직후·VACUUM 직전에 별도 연결로 쓰기
+// 잠금(BEGIN IMMEDIATE)을 선점해 VACUUM을 SQLITE_BUSY로 결정적으로 실패시킨다.
+func TestPurgeHookOnlyVacuumFailureContinues(t *testing.T) {
+	pid, projDir, _ := seedHookOnlyProject(t)
+	storeRoot := storeRootOf(projDir)
+
+	// content.db에 별도 쓰기 연결(아직 잠금 미선점). WAL 모드는 db 헤더에 지속되므로 재지정 불필요.
+	dbPath := filepath.ToSlash(filepath.Join(projDir, "content.db"))
+	locker, err := sql.Open("sqlite", "file:"+dbPath+"?_pragma=busy_timeout(5000)")
+	if err != nil {
+		t.Fatalf("open locker: %v", err)
+	}
+	defer func() { _ = locker.Close() }()
+	lockConn, err := locker.Conn(context.Background())
+	if err != nil {
+		t.Fatalf("locker conn: %v", err)
+	}
+	defer func() { _ = lockConn.Close() }()
+
+	gw := newBlockingWriter()
+	var errOut bytes.Buffer
+	done := make(chan error, 1)
+	go func() {
+		done <- runPurge(context.Background(), failReader{}, gw, &errOut, storeRoot,
+			[]string{"--project", pid, "--hook-only", "--force"}, false)
+	}()
+
+	// 실회수 보고가 gw.buf에 기록되길 기다린다(= PurgeHookOnly 커밋 완료·쓰기 잠금 해제됨).
+	// runPurge가 보고 전에 조기 종료(오류)하면 hit이 안 오므로 done/타임아웃으로 빠르게 실패한다.
+	select {
+	case <-gw.hit:
+	case rc := <-done:
+		t.Fatalf("runPurge가 실회수 보고 전에 종료(rc=%v) — 조기 분기/보고 순서 회귀:\n%s", rc, gw.buf.String())
+	case <-time.After(30 * time.Second):
+		t.Fatal("실회수 보고가 30s 내 안 나옴")
+	}
+	if _, err := lockConn.ExecContext(context.Background(), "BEGIN IMMEDIATE"); err != nil {
+		t.Fatalf("선점 BEGIN IMMEDIATE: %v", err)
+	}
+	close(gw.release) // runPurge 진행 → VACUUM은 선점된 잠금에 막혀 BUSY 실패
+
+	var rc error
+	select {
+	case rc = <-done:
+	case <-time.After(30 * time.Second):
+		t.Fatal("runPurge가 30s 내 종료 안 됨(교착?)")
+	}
+	_, _ = lockConn.ExecContext(context.Background(), "ROLLBACK")
+
+	if rc != nil {
+		t.Fatalf("VACUUM 실패는 log-and-continue여야 하는데 rc=%v", rc)
+	}
+	if !strings.Contains(gw.buf.String(), "실회수") {
+		t.Fatalf("실회수 보고가 VACUUM 이전에 안 나옴:\n%s", gw.buf.String())
+	}
+	if !strings.Contains(errOut.String(), "VACUUM 실패") {
+		t.Fatalf("VACUUM 실패 로그 없음(정말 실패했는지 확인):\n%s", errOut.String())
 	}
 }

@@ -686,11 +686,18 @@ func appendEvent(ctx context.Context, w *sql.DB, sessionID string, ev Event) (id
 				return qErr
 			}
 		}
+		// D42 §4 세션 존재 게이트: INSERT…SELECT…WHERE EXISTS. 빈 세션 GC가 확인과 INSERT
+		// 사이에 세션 행을 지워도(FK 부재) 삭제된 session_id로 이벤트가 커밋돼 retention 조인에서
+		// 빠지는 영구 orphan을 만들지 않는다. 세션 부재면 0행 삽입 → store.ErrNotFound(기존 매핑
+		// 경로 재사용, 호출자는 drop 처리). 미지 세션 이벤트는 실제 쓰기가 없다(WHERE EXISTS 0행).
 		res, execErr := tx.Exec(`INSERT INTO session_events(event_id, session_id, event_type, ts, summary, payload, artifact_refs, related, redaction, supersedes)
-			VALUES(?,?,?,?,?,?,?,?,?,?)`,
-			eventID, sessionID, ev.Type, ts, ev.Summary, payload, artifactRefsJSON, relatedJSON, redaction, nullIfEmpty(ev.Supersedes))
+			SELECT ?,?,?,?,?,?,?,?,?,? WHERE EXISTS(SELECT 1 FROM sessions WHERE session_id=?)`,
+			eventID, sessionID, ev.Type, ts, ev.Summary, payload, artifactRefsJSON, relatedJSON, redaction, nullIfEmpty(ev.Supersedes), sessionID)
 		if execErr != nil {
 			return execErr
+		}
+		if n, _ := res.RowsAffected(); n == 0 {
+			return fmt.Errorf("session Append: 세션 부재(session_id=%s): %w", sessionID, store.ErrNotFound)
 		}
 		id, _ = res.LastInsertId()
 		return nil

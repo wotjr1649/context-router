@@ -26,7 +26,7 @@ import (
 	"github.com/wotjr1649/context-router/internal/transform"
 )
 
-const version = "0.4.0"
+const version = "0.5.0"
 
 type serverFlags struct {
 	Root, StoreRoot, LogLevel   string
@@ -127,12 +127,13 @@ func retentionSecFromDuration(d time.Duration) int64 {
 // 주입(G7 결정론). run()이 openSessionDB로 session.Open을 배선한 직후(sessDB!=nil일 때만)
 // 호출한다(T10, task-8-report.md의 구조 결정 그대로 이 자리에 합류).
 func sweepSessionRetentionAtStart(ctx context.Context, d *session.DB, now time.Time, stderr io.Writer) {
-	deleted, err := session.Sweep(ctx, d, now)
+	rep, err := session.Sweep(ctx, d, now)
 	if err != nil {
 		fmt.Fprintf(stderr, "ctr: session retention sweep 실패(계속 진행): %v\n", err)
 		return
 	}
-	fmt.Fprintf(stderr, "ctr: session retention sweep: %d개 이벤트 삭제\n", deleted)
+	fmt.Fprintf(stderr, "ctr: session retention sweep: %d개 이벤트 삭제, empty-session GC %d건\n",
+		rep.EventsDeleted, rep.EmptySessionsDeleted)
 }
 
 // openSessionDB — session.Open을 배선한다(설계 §6.2 fail-closed, T10). sentinel 3종

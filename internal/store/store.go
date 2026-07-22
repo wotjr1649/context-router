@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"time"
 	"unicode/utf8"
@@ -828,8 +829,13 @@ func (s *Store) GCOrphanBlobs(ctx context.Context) (removed int64, err error) {
 			return removed, sanitizeIOErr("gc readdir", err)
 		}
 		for _, e := range entries {
-			hash := e.Name()
-			if len(hash) != 64 || referenced[hash] {
+			name := e.Name()
+			// 크래시로 남은 격리본(<64hex>.purging): reclaimHookBlobs가 rename↔remove 사이에 죽으면
+			// DB 행은 이미 삭제돼 hash가 다시 선택되지 않으므로 이 파일은 영구 고아가 된다(최종리뷰 P2).
+			// hash 참조 대상이 아니므로 참조 대조 없이 age gate만 적용해 수거한다(진행 중 격리는 이미
+			// lockStore로 배제됨 — age gate는 이중방어). 정상 blob은 len==64 + 미참조일 때만 후보.
+			isPurging := len(name) == 64+len(".purging") && strings.HasSuffix(name, ".purging")
+			if !isPurging && (len(name) != 64 || referenced[name]) {
 				continue
 			}
 			info, err := e.Info()
@@ -840,9 +846,9 @@ func (s *Store) GCOrphanBlobs(ctx context.Context) (removed int64, err error) {
 				return removed, sanitizeIOErr("gc stat", err)
 			}
 			if time.Since(info.ModTime()) < gcOrphanMinAge {
-				continue // age gate: 등록 진행 중일 수 있음(§3.5) — 다음 GC로 미룬다
+				continue // age gate: 등록/회수 진행 중일 수 있음(§3.5) — 다음 GC로 미룬다
 			}
-			if err := os.Remove(filepath.Join(dir, hash)); err != nil {
+			if err := os.Remove(filepath.Join(dir, name)); err != nil {
 				return removed, sanitizeIOErr("gc remove", err)
 			}
 			removed++
@@ -914,7 +920,27 @@ func LedgerStats(dir string) ([]ToolStat, error) {
 type SizeStat struct {
 	Sources, Artifacts int64
 	BlobBytes          int64
+	FileBytes          int64            // content.db 파일 실크기(os.Stat) — D40, [14] 병기
+	ShadowOwnedBytes   int64            // 귀속 hash들의 물리 CAS 파일 바이트 합 (= ShadowOwned 값 합, 불변)
+	ShadowOwnedHashes  int              // 귀속 hash 수 (= len(ShadowOwned), 불변)
+	ShadowOwned        map[string]int64 // 귀속 content_hash → 물리 CAS 파일 바이트 — Task 3b/5a/5b 공용 원천
 }
+
+// D40 §2: shadow 귀속 content_hash — 그 hash를 직접 참조하는 소스가 전부 kind='hook'이고 hook
+// 소스가 1개 이상이며, 어떤 비-hook 소스도 그 hash를 raw_blob_hash로 참조하지 않는 hash. hook JOIN이
+// "hook 소스 ≥1"과 "source 0개 → 비귀속"을 함께 보장하고, 두 NOT EXISTS가 직접·raw_blob 비-hook
+// 참조를 배제한다. DISTINCT로 다중 미디어/다중 소스 행을 hash 단위로 접는다. 바이트는 호출부가 CAS
+// 물리 파일에서 합산(논리 byte_length 아님).
+const shadowOwnedHashQuery = `
+SELECT DISTINCT a.content_hash
+FROM artifacts a
+JOIN sources sh ON sh.artifact_id = a.id AND sh.source_kind = 'hook'
+WHERE NOT EXISTS (
+    SELECT 1 FROM artifacts a2 JOIN sources s2 ON s2.artifact_id = a2.id
+    WHERE a2.content_hash = a.content_hash AND s2.source_kind != 'hook')
+  AND NOT EXISTS (
+    SELECT 1 FROM sources s3
+    WHERE s3.raw_blob_hash = a.content_hash AND s3.source_kind != 'hook')`
 
 // SizeStats: dir/content.db를 read-only로 열어 sources·artifacts 행수를 세고, artifacts/ CAS
 // 디렉터리의 물리 blob 바이트를 합산한다(설계 v0.3 §2·D33). content.db 미존재는 LedgerStats와
@@ -927,7 +953,8 @@ type SizeStat struct {
 // content_hash는 한 파일).
 func SizeStats(dir string) (*SizeStat, error) {
 	path := filepath.Join(dir, "content.db")
-	if _, err := os.Stat(path); err != nil {
+	fi, err := os.Stat(path)
+	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return nil, nil
 		}
@@ -939,13 +966,34 @@ func SizeStats(dir string) (*SizeStat, error) {
 	}
 	defer db.Close()
 
-	var st SizeStat
+	st := SizeStat{FileBytes: fi.Size(), ShadowOwned: map[string]int64{}}
 	if err := db.QueryRow("SELECT count(*) FROM sources").Scan(&st.Sources); err != nil {
 		return nil, fmt.Errorf("store SizeStats: %w", err)
 	}
 	if err := db.QueryRow("SELECT count(*) FROM artifacts").Scan(&st.Artifacts); err != nil {
 		return nil, fmt.Errorf("store SizeStats: %w", err)
 	}
+
+	// D40 §2: 귀속 content_hash 집합을 1쿼리로 산출한다. 물리 바이트는 아래 blob walk에서 이 집합
+	// 멤버십 파일만 합산 — 논리 byte_length가 아닌 CAS 실파일 크기(귀속 hash는 파일 1개).
+	owned := map[string]struct{}{}
+	rows, err := db.Query(shadowOwnedHashQuery)
+	if err != nil {
+		return nil, fmt.Errorf("store SizeStats: %w", err)
+	}
+	for rows.Next() {
+		var h string
+		if err := rows.Scan(&h); err != nil {
+			rows.Close()
+			return nil, fmt.Errorf("store SizeStats: %w", err)
+		}
+		owned[h] = struct{}{}
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, fmt.Errorf("store SizeStats: %w", err)
+	}
+	rows.Close()
 
 	// artifacts/<hex 2자 prefix>/<64-hex> 2단 레이아웃을 GCOrphanBlobs와 동형으로 순회한다.
 	blobRoot := filepath.Join(dir, "artifacts")
@@ -976,7 +1024,160 @@ func SizeStats(dir string) (*SizeStat, error) {
 				return nil, sanitizeIOErr("size stat", err)
 			}
 			st.BlobBytes += info.Size()
+			if _, ok := owned[e.Name()]; ok { // D40 §2: 귀속 hash면 물리 파일 크기를 맵·합계에 기록
+				st.ShadowOwned[e.Name()] = info.Size()
+				st.ShadowOwnedBytes += info.Size()
+			}
 		}
 	}
+	st.ShadowOwnedHashes = len(st.ShadowOwned) // 스칼라 = 맵 len (불변)
 	return &st, nil
+}
+
+// HookPurgeReport — D41 §3: PurgeHookOnly 결과. 행 삭제된 귀속 hash 수와 물리 파일 회수 내역을 병기.
+type HookPurgeReport struct {
+	Hashes        int   // 행 삭제된 귀속 hash 수
+	ReclaimedB    int64 // 실제 unlink된 물리 바이트 합
+	DeferredFiles int   // age-gate/교체 감지 유예 건수
+	FailedFiles   int   // unlink 실패(orphan 잔존) 건수
+}
+
+// PurgeHookOnly — D41 §3: shadow 귀속(그 hash를 참조하는 소스가 전부 hook) hash의 행을 단일 tx로
+// 삭제한 뒤(술어를 tx 안에서 재실행해 외부 견적을 신뢰하지 않는다), 커밋 후 lockStore 하에 물리 CAS
+// 파일을 rename 격리 프로토콜로 회수한다. 행 삭제와 파일 회수를 내부 두 단계(purgeHookRows·
+// reclaimHookBlobs)로 나눠, 커밋↔회수 사이의 재등록 경합(Register.writeBlob 교체)을 rename 격리로
+// 폐쇄하고 테스트가 그 창에 개입할 수 있게 한다(신규 공개 표면 아님).
+func (s *Store) PurgeHookOnly(ctx context.Context) (HookPurgeReport, error) {
+	hashes, rep, err := s.purgeHookRows(ctx)
+	if err != nil {
+		return rep, err
+	}
+	if err := s.reclaimHookBlobs(ctx, hashes, &rep); err != nil {
+		return rep, err // 행 삭제는 이미 커밋되어 유효 — 남은 파일은 --gc 후속 회수
+	}
+	return rep, nil
+}
+
+// purgeHookRows: 단일 tx(txRetry — PurgeOlderThan과 동일 BUSY 내성)에서 shadow 귀속 hash 집합을
+// 술어 재실행으로 산출(회수 목록)하고, chunks→sources→artifacts 순으로 행을 삭제한다. chunks·sources는
+// sources가 아직 있는 동안 shadow 술어 서브쿼리로 이 purge의 선택분만 지우고(chunks 선삭제로 FTS
+// AFTER DELETE 트리거 동기), artifacts는 sources 삭제 후 술어가 비므로 미리 포착한 hashes 집합에
+// 바인딩해 삭제한다 — PurgeOlderThan의 전역 "NOT IN sources" 고아 sweep과 달리 hook purge는 자기
+// 선택분에만 국한한다(최종리뷰 P1). BUSY 재시도로 fn이 재실행될 수 있어 반환 상태를 매 시도 초기화한다.
+// 회수 목록(SELECT)과 삭제 술어는 같은 tx 스냅샷에서 재평가하므로 항상 일치한다.
+func (s *Store) purgeHookRows(ctx context.Context) ([]string, HookPurgeReport, error) {
+	var hashes []string
+	var rep HookPurgeReport
+	err := s.txRetry(ctx, func(tx *sql.Tx) error {
+		hashes = hashes[:0]
+		rep.Hashes = 0
+		rows, err := tx.QueryContext(ctx, shadowOwnedHashQuery)
+		if err != nil {
+			return err
+		}
+		for rows.Next() {
+			var h string
+			if err := rows.Scan(&h); err != nil {
+				rows.Close()
+				return err
+			}
+			hashes = append(hashes, h)
+		}
+		err = rows.Err()
+		rows.Close() // writer는 SetMaxOpenConns(1) — 후속 Exec 전에 커서를 반드시 닫는다
+		if err != nil {
+			return err
+		}
+		// chunks: shadow 아티팩트의 청크를 sources 삭제 이전에 명시 삭제한다 — 술어가 아직 유효하고
+		// (sources 존재) FTS AFTER DELETE 트리거가 발화한다(cascade는 recursive_triggers OFF라
+		// 트리거 미발화). 이 purge의 선택분에만 국한한다(최종리뷰 P1 — 전역 고아 청크 sweep 금지).
+		if _, err := tx.ExecContext(ctx, `DELETE FROM chunks WHERE artifact_id IN
+			(SELECT id FROM artifacts WHERE content_hash IN (`+shadowOwnedHashQuery+`))`); err != nil {
+			return err
+		}
+		// sources: 귀속 아티팩트의 (전부 hook인) 소스 삭제 — 술어 재실행으로 tx 내 재검증.
+		if _, err := tx.ExecContext(ctx, `DELETE FROM sources WHERE artifact_id IN
+			(SELECT id FROM artifacts WHERE content_hash IN (`+shadowOwnedHashQuery+`))`); err != nil {
+			return err
+		}
+		// artifacts: sources가 사라져 고아가 된 이 purge의 선택분만 삭제한다. sources 삭제 후엔 shadow
+		// 술어가 비므로(hook 소스가 사라져 JOIN 실패) 커서에서 미리 포착한 hashes 집합에 바인딩한다 —
+		// store 전역 고아(예: 재색인으로 source가 새 아티팩트로 재지정돼 남은 source-less 잔재)를 지우지
+		// 않는다(최종리뷰 P1). ponytail: IN 리스트는 SQLITE_MAX_VARIABLE_NUMBER(기본 32766) 상한 —
+		// hook purge 1회가 그 이상 hash를 모을 일은 없다(넘으면 temp table로 승격).
+		if len(hashes) > 0 {
+			ph := strings.TrimSuffix(strings.Repeat("?,", len(hashes)), ",")
+			args := make([]any, len(hashes))
+			for i, h := range hashes {
+				args[i] = h
+			}
+			if _, err := tx.ExecContext(ctx, `DELETE FROM artifacts WHERE content_hash IN (`+ph+`)`, args...); err != nil {
+				return err
+			}
+		}
+		rep.Hashes = len(hashes)
+		return nil
+	})
+	if err != nil {
+		return nil, HookPurgeReport{}, err
+	}
+	return hashes, rep, nil
+}
+
+// reclaimHookBlobs: purgeHookRows 커밋 후 호출 — lockStore(s.dir) 하에 hash별 물리 CAS 파일을 rename
+// 격리 프로토콜로 회수한다. ① os.Rename(p, p+".purging") — 원자, 실패(부재)는 skip ② 격리본 re-Stat:
+// mtime이 gcOrphanMinAge(1h) 이내(교체 감지 겸 age gate) 또는 DB 재확인에서 참조 존재 → 원 경로로
+// 롤백 + Deferred++ ③ 아니면 os.Remove + ReclaimedB += size(Remove 실패는 롤백 + Failed++). rename
+// 이후 도착한 Register.writeBlob은 원 경로에 새 파일을 만들 뿐 무충돌, rename 이전 교체분은 격리본의
+// fresh mtime이 ②에서 걸려 롤백 — Stat↔unlink 오삭제 창을 폐쇄한다. lockStore 실패는 오류로 반환하되
+// 행 삭제는 이미 유효하다(남은 파일은 --gc 후속).
+func (s *Store) reclaimHookBlobs(ctx context.Context, hashes []string, rep *HookPurgeReport) error {
+	if len(hashes) == 0 {
+		return nil
+	}
+	release, err := lockStore(s.dir)
+	if err != nil {
+		return fmt.Errorf("store PurgeHookOnly: %w", err)
+	}
+	defer release()
+	for _, h := range hashes {
+		p := filepath.Join(s.dir, "artifacts", h[:2], h) // blobPath 헬퍼 부재 — 인라인 관례
+		q := p + ".purging"
+		if err := os.Rename(p, q); err != nil {
+			continue // 부재 등 — 회수할 파일 없음(이미 없거나 동시 GC가 수거)
+		}
+		fi, statErr := os.Stat(q)
+		if statErr != nil || time.Since(fi.ModTime()) < gcOrphanMinAge || s.stillReferenced(ctx, h) {
+			_ = os.Rename(q, p) // 롤백: 원 경로 복원
+			rep.DeferredFiles++
+			continue
+		}
+		if err := os.Remove(q); err != nil {
+			_ = os.Rename(q, p)
+			rep.FailedFiles++
+			continue
+		}
+		rep.ReclaimedB += fi.Size()
+	}
+	return nil
+}
+
+// stillReferenced: h를 참조하는 소스가 다시 생겼는지 DB 재확인 — 커밋↔회수 창에 동시 Register가 h를
+// 재등록(artifacts.content_hash 또는 sources.raw_blob_hash)했으면 회수를 유예한다. 조회 실패도
+// 보수적으로 "참조 있음"으로 취급해 유예한다(오삭제보다 orphan 잔존이 안전 — --gc 후속).
+func (s *Store) stillReferenced(ctx context.Context, h string) bool {
+	var exists int
+	err := s.reader.QueryRowContext(ctx,
+		`SELECT EXISTS(SELECT 1 FROM artifacts WHERE content_hash=?)
+		    OR EXISTS(SELECT 1 FROM sources WHERE raw_blob_hash=?)`, h, h).Scan(&exists)
+	return err != nil || exists == 1
+}
+
+// Vacuum — D41: content.db VACUUM(purge로 비운 페이지의 파일 크기 회수). writer 연결로 실행한다 —
+// VACUUM은 배타 쓰기 잠금이 필요하다. Task 5b CLI가 purge 후 후행 호출한다.
+func (s *Store) Vacuum(ctx context.Context) error {
+	if _, err := s.writer.ExecContext(ctx, "VACUUM"); err != nil {
+		return fmt.Errorf("store Vacuum: %w", err)
+	}
+	return nil
 }

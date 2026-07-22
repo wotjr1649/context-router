@@ -547,6 +547,25 @@ func TestDropsByReason_StrictParsing(t *testing.T) {
 	}
 }
 
+// TestDropsByReasonFiveFields — D43: 정확 5필드 신형식 라인의 reason을 집계한다.
+// 3필드(그 외 필드 수)는 여전히 unparsed(느슨 수용 금지, 설계 §5).
+func TestDropsByReasonFiveFields(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "session.drops.log")
+	data := "1700000000\tunknown-session\tcc:99999\tPostToolUse\tRead\n" +
+		"1700000001\tshadow-oversize\t-\t-\t-\n" +
+		"1700000002\tbroken\textra\n" // 3필드 → unparsed
+	if err := os.WriteFile(p, []byte(data), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, got := dropsByReason(p) // 실제 시그니처: (total, reasons)
+	if got["unknown-session"] != 1 || got["shadow-oversize"] != 1 {
+		t.Fatalf("5필드 reason 집계 실패: %v", got)
+	}
+	if got["unparsed"] != 1 {
+		t.Fatalf("3필드는 unparsed 유지: %v", got)
+	}
+}
+
 // ⑧ F5: `hook install --user` 후 doctor가 사용자 범위 등록을 인식하고 프로젝트 범위는 미등록으로
 // 보고해야 한다(프로젝트-only 검사 회귀 방지). 사용자 홈은 t.Setenv로 자기 전용 TempDir로 덮어써
 // 실사용자 ~/.claude를 건드리지 않는다(TestMain 기본 홈 격리 위에서 추가 격리·자동 복원).

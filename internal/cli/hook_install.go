@@ -634,11 +634,11 @@ func countRegisteredHooks(path string) (int, error) {
 	return n, err
 }
 
-// dropsByReason — drops.log을 사유별로 집계한다(doctor [12]). appendDrop 계약은 정확히
-// "<unix초>\t<사유>"(fmt "%d\t%s") — ts가 1+ 숫자이고 사유가 비지 않으며 탭을 포함하지 않는(정확히
-// 2필드) 줄만 그 사유로 센다. 어긋나면(비숫자 ts·탭 초과 필드로 사유에 TAB 혼입 등) "unparsed" —
-// 진단은 절대 중단하지 않고(설계 v0.3 §5), total은 빈 줄 포함 모든 줄을 센다(줄 수 계약). 파일 부재·
-// 읽기 실패는 (0, nil) — 기존 countDropsLog와 동일한 fail-soft.
+// dropsByReason — drops.log을 사유별로 집계한다(doctor [12]). appendDrop 계약은 정확히 2필드
+// "<unix초>\t<사유>"(구) 또는 5필드 "<unix초>\t<사유>\t<sid8>\t<hook_event>\t<tool>"(신, D43) —
+// ts가 1+ 숫자이고 사유(필드[1])가 비지 않는 그 두 필드 수의 줄만 사유로 센다. 그 외 필드 수·비숫자
+// ts·사유 없음은 "unparsed"(느슨 수용 금지, 설계 §5) — 진단은 절대 중단하지 않고, total은 빈 줄
+// 포함 모든 줄을 센다(줄 수 계약). 파일 부재·읽기 실패는 (0, nil) — countDropsLog와 동일 fail-soft.
 func dropsByReason(path string) (int, map[string]int) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -650,11 +650,12 @@ func dropsByReason(path string) (int, map[string]int) {
 	sc.Buffer(make([]byte, 0, 64*1024), 1<<20) // 긴 줄에도 스캔 중단 방지(countDropsLog 관례 보존)
 	for sc.Scan() {
 		total++ // 빈 줄도 센다 — 기존 countDropsLog의 total 의미 보존(줄 수 계약)
-		ts, reason, ok := strings.Cut(sc.Text(), "\t")
-		if ok && reason != "" && !strings.Contains(reason, "\t") && isUnixTS(ts) {
-			reasons[reason]++
+		fields := strings.Split(sc.Text(), "\t")
+		// D43: 정확 2필드(구) 또는 정확 5필드(신)만 수용 — 그 외 필드 수는 unparsed(느슨 수용 금지).
+		if (len(fields) == 2 || len(fields) == 5) && fields[1] != "" && isUnixTS(fields[0]) {
+			reasons[fields[1]]++
 		} else {
-			reasons["unparsed"]++ // 빈 줄·비숫자 ts·탭 초과 필드·사유 없음 전부 unparsed
+			reasons["unparsed"]++ // 빈 줄·비숫자 ts·필드 수 불일치·사유 없음 전부 unparsed
 		}
 	}
 	return total, reasons

@@ -304,6 +304,41 @@ func TestHookUnknownSession(t *testing.T) {
 	}
 }
 
+// TestDropLineDiagnosticFields — D43: unknown-session drop 라인이 5필드
+// (ts, reason, sid8, hook_event, tool)를 기록한다. 미상 필드는 "-".
+func TestDropLineDiagnosticFields(t *testing.T) {
+	storeRoot := filepath.Join(t.TempDir(), "storeroot")
+	cwd := t.TempDir()
+	// 미지 세션(SessionStart 없음)의 PostToolUse/Read → unknown-session drop.
+	// session_id는 맨 canonical UUID — 호스트 접두(cc:)는 dispatch가 부여하므로
+	// sid8은 "cc:99999"가 된다(접두 UUID 앞 8자). 맨 UUID를 넘기면 "99999999"로 실패.
+	in := fixtureWith(t, "pretooluse-read.json", map[string]any{
+		"cwd":             cwd,
+		"session_id":      "99999999-0000-7000-8000-000000000000",
+		"hook_event_name": "PostToolUse",
+		"tool_name":       "Read",
+	})
+	env := map[string]string{"CTR_HOOK_DEADLINE_MS": "60000"} // 느린 러너 fail-open drop 방지
+	if rc := runHook(t, storeRoot, in, env); rc != 0 {
+		t.Fatalf("rc=%d want 0", rc)
+	}
+	dir := sessDir(t, storeRoot, cwd)
+	line := strings.TrimSpace(readDrops(t, dir))
+	fields := strings.Split(line, "\t")
+	if len(fields) != 5 {
+		t.Fatalf("fields=%d want 5 (line=%q)", len(fields), line)
+	}
+	if fields[1] != "unknown-session" {
+		t.Fatalf("reason=%q want unknown-session", fields[1])
+	}
+	if fields[2] != "cc:99999" { // 세션ID 앞 8자(호스트 접두 포함)
+		t.Fatalf("sid8=%q want cc:99999", fields[2])
+	}
+	if fields[3] != "PostToolUse" || fields[4] != "Read" {
+		t.Fatalf("event/tool=%q/%q want PostToolUse/Read", fields[3], fields[4])
+	}
+}
+
 // ④ session_id 형식 불량(비UUID) → drop(bad-session-id), 세션 DB 미생성.
 func TestHookBadSessionID(t *testing.T) {
 	storeRoot := filepath.Join(t.TempDir(), "storeroot")

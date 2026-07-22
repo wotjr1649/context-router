@@ -33,7 +33,7 @@ const releaseURL = "https://api.github.com/repos/wotjr1649/context-router/releas
 const defaultStoreWarnBytes = 100 << 20 // 100MiB
 
 // storeWarnBytes — CTR_STORE_WARN_BYTES 양수만 채택, 파싱 실패·비양수는 기본값(D38 — 측정
-// 실체가 CAS 전체 blob이라 STORE 명명; 구명 CTR_SHADOW_WARN_BYTES는 v0.5 개명, 별칭 없음).
+// 실체가 CAS 전체 blob이라 STORE 명명).
 func storeWarnBytes(getenv func(string) string) int64 {
 	if v, err := strconv.ParseInt(getenv("CTR_STORE_WARN_BYTES"), 10, 64); err == nil && v > 0 {
 		return v
@@ -547,11 +547,24 @@ func runPurge(ctx context.Context, in io.Reader, w, stderr io.Writer, storeRoot 
 	gc := fs.Bool("gc", false, "orphan blob GC 수행")
 	force := fs.Bool("force", false, "비TTY 환경에서 확인을 생략(자동화 전용)")
 	sessions := fs.Bool("sessions", false, "session.db 파일(계열, -wal/-shm 포함) 삭제 대상 포함 — .bak-*·recover-pending 마커는 제외(설계 §5)")
+	hookOnly := fs.Bool("hook-only", false, "shadow 귀속(참조가 전부 hook) 아티팩트만 선택 삭제(--project 전용) — content.db·explicit 소스는 보존(설계 §3, D41)")
 	if err := fs.Parse(args); err != nil {
 		return fmt.Errorf("purge: 플래그 파싱 실패: %w", err)
 	}
 	if rest := fs.Args(); len(rest) > 0 {
 		return fmt.Errorf("purge: 예상치 않은 인자 %d개", len(rest))
+	}
+	// D41 조기 분기: --hook-only는 전역 confirmPurge(아래)·전체 삭제(os.RemoveAll)에 도달하기
+	// 전에 전용 경로로 인터셉트한다 — 그러지 않으면(예: --sessions처럼 전역 confirm 뒤에 두면)
+	// 확인 프롬프트가 2회 뜬다(설계 §3). --project 단독과만 조합 가능하다.
+	if *hookOnly {
+		if *all || *olderThanFlag != "" || *sessions || *gc {
+			return errors.New("purge: --hook-only는 --project와만 조합할 수 있습니다")
+		}
+		if *project == "" {
+			return errors.New("purge: --hook-only는 --project가 필요합니다")
+		}
+		return runPurgeHookOnly(ctx, in, w, stderr, storeRoot, *project, *force, isTTY)
 	}
 	if (*project != "") == *all {
 		return errors.New("purge: --project와 --all 중 정확히 하나를 지정해야 합니다")
@@ -681,6 +694,58 @@ func runPurge(ctx context.Context, in io.Reader, w, stderr io.Writer, storeRoot 
 		}
 	}
 	return nil
+}
+
+// runPurgeHookOnly: purge --hook-only 전용 경로(설계 §3, D41). shadow 귀속(그 hash를 참조하는
+// 소스가 전부 hook) 아티팩트만 삭제하고 content.db·explicit 소스는 보존한다. 흐름 순서 고정:
+// ⓪ store open 선행(견적) — 이 분기 한정으로 현행 confirm→open을 open→confirm으로 재배치한다
+// (견적 문구를 confirm에 담기 위해). 견적은 store.SizeStats(projDir)의 ShadowOwned 물리 바이트
+// 합·hash 수다(별도 견적 함수 없음). ① confirmPurge(견적 문구) → ② PurgeHookOnly → ④ 실회수
+// 보고 먼저 → ⑤ VACUUM 후행(실패는 stderr log-and-continue·rc=0 — 부분 성공 노출을 VACUUM 뒤로
+// 미루지 않는다). SizeStats는 content.db가 없으면 (nil,nil)이라, phantom 프로젝트(store.Open이
+// 없는 대상을 새로 생성)를 막기 위해 열기 전 content.db 실재를 먼저 판정한다(runPurge와 동형).
+func runPurgeHookOnly(ctx context.Context, in io.Reader, w, stderr io.Writer, storeRoot, project string, force, isTTY bool) error {
+	id, err := purgeProjectID(storeRoot, project)
+	if err != nil {
+		return errors.New("purge: 프로젝트 식별 실패")
+	}
+	projDir := filepath.Join(storeRoot, "projects", id)
+	if _, err := os.Stat(filepath.Join(projDir, "content.db")); err != nil {
+		return errors.New("purge: 대상 프로젝트 없음")
+	}
+	var estBytes int64
+	var estHashes int
+	if sz, err := store.SizeStats(projDir); err != nil {
+		return err
+	} else if sz != nil {
+		for _, b := range sz.ShadowOwned {
+			estBytes += b
+		}
+		estHashes = len(sz.ShadowOwned)
+	}
+	if err := confirmPurge(in, w, isTTY, force, fmt.Sprintf("shadow %dB(%d hashes) 선택 삭제", estBytes, estHashes)); err != nil {
+		return err
+	}
+	st, err := store.Open(projDir, false)
+	if err != nil {
+		return err
+	}
+	rep, purgeErr := st.PurgeHookOnly(ctx)
+	if purgeErr == nil {
+		// ④ 실회수 보고 먼저(스펙 §3 순서) — VACUUM 성패와 무관하게 부분 성공을 즉시 노출한다.
+		fmt.Fprintf(w, "hook-only purge: 실회수 %dB(%d hashes), 유예 %d건, 실패 %d건\n",
+			rep.ReclaimedB, rep.Hashes, rep.DeferredFiles, rep.FailedFiles)
+		// ⑤ VACUUM 후행 — 실패는 log-and-continue(rc=0). 서버 점유 등으로 배타 잠금을 못 잡으면
+		// 실패하는데, 행 삭제는 이미 커밋되어 유효하므로 서버 정지 후 재실행 시 파일 크기가 회수된다.
+		if verr := st.Vacuum(ctx); verr != nil {
+			fmt.Fprintf(stderr, "ctr: VACUUM 실패(계속 진행 — 서버 정지 후 재실행 시 회수): %v\n", verr)
+		}
+	}
+	closeErr := st.Close()
+	if purgeErr != nil {
+		return purgeErr
+	}
+	return closeErr
 }
 
 // runGCOrphan: read-only store로 orphan blob GC만 수행한다(gcOnly·세션 단독+--gc 두 경로
@@ -1201,15 +1266,33 @@ func runDoctor(ctx context.Context, w io.Writer, storeRoot, projectRoot, version
 		} else {
 			var quickCheck string
 			qcErr := reader.QueryRowContext(ctx, "PRAGMA quick_check").Scan(&quickCheck)
+			// D42 [6] 병기: 전체 세션 수 + 빈 세션 수(비-session_start 이벤트 0건). empty 술어는
+			// GC와 동일하되 나이 게이트는 무관(경과 무관 진단). close 전에 조회한다.
+			var sessCount, emptyCount int64
+			var countErr error
+			if qcErr == nil && quickCheck == "ok" {
+				countErr = reader.QueryRowContext(ctx, `SELECT
+					(SELECT COUNT(*) FROM sessions),
+					(SELECT COUNT(*) FROM sessions s WHERE NOT EXISTS(
+						SELECT 1 FROM session_events e
+						WHERE e.session_id = s.session_id AND e.event_type != 'session_start'))`).Scan(&sessCount, &emptyCount)
+			}
 			closeErr := reader.Close()
 			switch {
 			case qcErr != nil || quickCheck != "ok":
 				fmt.Fprintf(w, "[6] session.db: quick_check 실패 (quick_check=%q)\n", quickCheck)
 				failed = append(failed, "session.db")
-			case closeErr != nil:
-				fmt.Fprintf(w, "[6] session.db: quick_check=ok (close 경고: %v)\n", closeErr)
 			default:
-				fmt.Fprintln(w, "[6] session.db: quick_check=ok")
+				// empty 계상 조회 실패는 [6]을 실패로 뒤집지 않는다(정보성 유지 — 설계 §8).
+				counts := ""
+				if countErr == nil {
+					counts = fmt.Sprintf(" sessions=%d (empty=%d)", sessCount, emptyCount)
+				}
+				if closeErr != nil {
+					fmt.Fprintf(w, "[6] session.db: quick_check=ok%s (close 경고: %v)\n", counts, closeErr)
+				} else {
+					fmt.Fprintf(w, "[6] session.db: quick_check=ok%s\n", counts)
+				}
 			}
 		}
 
@@ -1301,17 +1384,124 @@ func runDoctor(ctx context.Context, w io.Writer, storeRoot, projectRoot, version
 	// project 식별 실패·content.db 부재·조회 실패는 전부 "없음"으로 fail-soft(행은 항상 방출).
 	// 서버가 동시 실행 중이면 SizeStats의 ro-open이 content.db 점유와 경합해 실패할 수 있고 그때도
 	// "없음"으로 나온다 — 손상이 아니라 일시적 경합(서버 정지 후 재실행하면 값이 나옴).
+	var sz *store.SizeStat // [15]가 소비 — [14] else에서만 채워지고 그 외엔 nil(귀속 0으로 처리)
 	if canon.ProjectID == "" {
 		fmt.Fprintln(w, "[14] content.db: 없음")
-	} else if sz, err := store.SizeStats(filepath.Join(storeRoot, "projects", canon.ProjectID)); err != nil || sz == nil {
+	} else if s, err := store.SizeStats(filepath.Join(storeRoot, "projects", canon.ProjectID)); err != nil || s == nil {
 		fmt.Fprintln(w, "[14] content.db: 없음")
 	} else {
-		fmt.Fprintf(w, "[14] content.db: sources=%d artifacts=%d blob=%dB\n", sz.Sources, sz.Artifacts, sz.BlobBytes)
+		sz = s
+		fmt.Fprintf(w, "[14] content.db: sources=%d artifacts=%d blob=%dB file=%dB\n", sz.Sources, sz.Artifacts, sz.BlobBytes, sz.FileBytes)
 		// D38 — CAS 전체 blob 총량 경고(shadow 전용 아님 — [14] 측정 실체 그대로). 관측 채널이지
 		// 정책 집행이 아니다(D27): 자동 삭제 없음. SizeStats 실패 경로는 이 분기 밖이라 미평가.
 		if warn := storeWarnBytes(os.Getenv); sz.BlobBytes > warn {
-			fmt.Fprintf(w, "[14] warning: blob %dB > 임계 %dB(CTR_STORE_WARN_BYTES) — 수동 구제는 purge 계열 CLI(현행 purge는 source_kind 무구분 삭제 — shadow만 선택 삭제 불가). 자동 삭제 없음\n", sz.BlobBytes, warn)
+			fmt.Fprintf(w, "[14] warning: blob %dB > 임계 %dB(CTR_STORE_WARN_BYTES) — 수동 구제는 purge 계열 CLI(purge --project <id> --hook-only로 shadow만 선택 삭제 가능). 자동 삭제 없음\n", sz.BlobBytes, warn)
 		}
+	}
+
+	// [15] D40 §2 — shadow-owned 접두 분해: projects/<pid>/worktrees/* 하위 각 session.db를
+	// read-only로 순회해 artifact_created 이벤트의 session_id 접두(cc:/cx:)로 귀속 hash를
+	// 버킷팅한다. 귀속 hash→물리 바이트는 [14]의 sz.ShadowOwned가 소유한다(CAS 경로 재구성
+	// 금지 — D13). worktree 단위 격리: 열기·조회·스캔·JSON 파싱 어느 단계든 실패하면 그
+	// worktree만 건너뛰고 괄호 끝에 ' incomplete'를 병기한다(전역 failed 목록에 넣지 않는
+	// 관측 채널). session.db 부재는 실패가 아니라 세션 미사용이라 [6]과 동일하게 조용히 건너뛴다
+	// (usable에도 세지 않는다). 쓸 수 있는 worktree가 하나도 없으면(부재·전부 불용) '세션 분해
+	// 없음'으로 렌더한다. hash 추출은 LastIndex("sha256-")(세션ID의 ':' 성분과 무충돌, §3.1).
+	owned := map[string]int64(nil)
+	var ownedBytes int64
+	var ownedHashes int
+	if sz != nil {
+		owned, ownedBytes, ownedHashes = sz.ShadowOwned, sz.ShadowOwnedBytes, sz.ShadowOwnedHashes
+	}
+	hashPrefixes := map[string]map[string]bool{} // 귀속 hash → 관측된 호스트 접두 집합({cc:,cx:}만)
+	usable, incomplete := 0, false
+	if canon.ProjectID != "" {
+		wtRoot := filepath.Join(storeRoot, "projects", canon.ProjectID, "worktrees")
+		entries, _ := os.ReadDir(wtRoot) // 부재/오류 → 빈 목록 → '세션 분해 없음'으로 귀결
+		for _, e := range entries {
+			if !e.IsDir() {
+				continue
+			}
+			wdir := filepath.Join(wtRoot, e.Name())
+			if fi, statErr := os.Stat(filepath.Join(wdir, "session.db")); statErr != nil || fi.IsDir() {
+				continue // session.db 부재 — 세션 미사용 worktree, 실패 아님([6] 원칙)
+			}
+			if err := func() error {
+				db, openErr := session.OpenReadOnly(wdir)
+				if openErr != nil {
+					return openErr
+				}
+				defer func() { _ = db.Close() }()
+				rows, qErr := db.QueryContext(ctx,
+					`SELECT session_id, artifact_refs FROM session_events
+					 WHERE event_type='artifact_created' AND artifact_refs IS NOT NULL`)
+				if qErr != nil {
+					return qErr
+				}
+				defer func() { _ = rows.Close() }()
+				for rows.Next() {
+					var sid, refsJSON string
+					if scanErr := rows.Scan(&sid, &refsJSON); scanErr != nil {
+						return scanErr
+					}
+					var refs []string
+					if jErr := json.Unmarshal([]byte(refsJSON), &refs); jErr != nil {
+						return jErr
+					}
+					var prefix string
+					switch {
+					case strings.HasPrefix(sid, "cc:"):
+						prefix = "cc:"
+					case strings.HasPrefix(sid, "cx:"):
+						prefix = "cx:"
+					default:
+						continue // 미지 호스트 접두 — 귀속에 기여하지 않음(unattributed로 귀결)
+					}
+					for _, ref := range refs {
+						i := strings.LastIndex(ref, "sha256-")
+						if i < 0 {
+							continue
+						}
+						h := ref[i+len("sha256-"):]
+						if _, ok := owned[h]; !ok {
+							continue // 귀속 hash만 버킷팅 대상
+						}
+						if hashPrefixes[h] == nil {
+							hashPrefixes[h] = map[string]bool{}
+						}
+						hashPrefixes[h][prefix] = true
+					}
+				}
+				return rows.Err()
+			}(); err != nil {
+				incomplete = true // 이 worktree만 skip — 전역 failed 금지
+				continue
+			}
+			usable++
+		}
+	}
+	if usable == 0 {
+		fmt.Fprintf(w, "[15] shadow-owned: %dB hashes=%d (세션 분해 없음)\n", ownedBytes, ownedHashes)
+	} else {
+		var ccB, cxB, sharedB, unattrB int64
+		for h, b := range owned { // 귀속 hash 전수 — 각 hash는 정확히 한 버킷으로(합=ownedBytes 불변)
+			switch set := hashPrefixes[h]; {
+			case len(set) >= 2:
+				sharedB += b
+			case set["cc:"]:
+				ccB += b
+			case set["cx:"]:
+				cxB += b
+			default:
+				unattrB += b
+			}
+		}
+		suffix := ""
+		if incomplete {
+			suffix = " incomplete"
+		}
+		fmt.Fprintf(w, "[15] shadow-owned: %dB hashes=%d (cc:=%dB cx:=%dB shared=%dB unattributed=%dB%s)\n",
+			ownedBytes, ownedHashes, ccB, cxB, sharedB, unattrB, suffix)
 	}
 
 	fmt.Fprintln(w)

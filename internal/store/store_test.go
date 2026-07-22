@@ -1466,6 +1466,51 @@ func TestGCOrphanBlobs_AgeGate(t *testing.T) {
 	}
 }
 
+// writePurgingBlob: 테스트용 — dir/artifacts/hash[:2]/hash.purging 격리본을 만들고 mtime을
+// now+age로 강제한다(크래시로 rename 이후·remove 이전에 프로세스가 죽은 상황 모사, 최종리뷰 P2).
+func writePurgingBlob(t *testing.T, storeDir, hash string, age time.Duration) string {
+	t.Helper()
+	dir := filepath.Join(storeDir, "artifacts", hash[:2])
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, hash+".purging")
+	if err := os.WriteFile(path, []byte("purging"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	tm := time.Now().Add(age)
+	if err := os.Chtimes(path, tm, tm); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+// TestGCOrphanBlobsSweepsStalePurging — 최종리뷰 P2: reclaimHookBlobs가 rename 격리 중
+// 크래시하면 DB 행은 이미 삭제돼 hash가 다시 선택되지 않으므로 <64hex>.purging 파일이 영구
+// 고아가 된다. GC가 age gate(1h)를 넘긴 격리본은 수거하고 신선한 것(진행 중일 수 있음)은
+// 보존해야 한다.
+func TestGCOrphanBlobsSweepsStalePurging(t *testing.T) {
+	s := openT(t)
+	staleHash := strings.Repeat("a", 64)
+	stalePath := writePurgingBlob(t, s.dir, staleHash, -2*gcOrphanMinAge)
+	freshHash := strings.Repeat("b", 64)
+	freshPath := writePurgingBlob(t, s.dir, freshHash, 0)
+
+	removed, err := s.GCOrphanBlobs(t.Context())
+	if err != nil {
+		t.Fatalf("GCOrphanBlobs: %v", err)
+	}
+	if removed != 1 {
+		t.Fatalf("removed=%d want 1(오래된 격리본만)", removed)
+	}
+	if _, err := os.Stat(stalePath); !os.IsNotExist(err) {
+		t.Fatalf("오래된 .purging 잔존: err=%v", err)
+	}
+	if _, err := os.Stat(freshPath); err != nil {
+		t.Fatalf("신선한 .purging이 삭제됨(진행 중 회수 오삭제 위험): %v", err)
+	}
+}
+
 // TestAcquireLock_SharedSharedCoexist: 두 shared 잠금이 동시에 성립해야 한다(release 전
 // 둘 다 성공) — 같은 프로세스라도 별도 os.OpenFile 호출이라 open file description/핸들이
 // 갈라져 flock/LockFileEx의 shared+shared 공존이 실제로 검증된다(vacuous하지 않음).
@@ -1631,5 +1676,379 @@ func TestReadRangeSourceKindTier(t *testing.T) {
 	}
 	if !r.HasSource || r.Source.URI != "inline:ZZZ" || r.Source.Kind == "hook" {
 		t.Fatalf("want inline:ZZZ(비-hook 티어), got %+v", r.Source)
+	}
+}
+
+// --- D40: SizeStat shadow-owned 귀속·물리 파일 합산 ---
+
+// openAt: 지정 dir에 store를 연다. SizeStats가 같은 dir을 ro로 재오픈하므로 호출부가 dir을 알아야
+// 한다(기존 openT는 t.TempDir()을 내부 생성해 dir을 노출하지 않는다). 시드 후 명시적 Close를 하며,
+// t.Cleanup의 두 번째 Close는 무해(반환값 무시).
+func openAt(t *testing.T, dir string) *Store {
+	t.Helper()
+	s, err := Open(dir, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+	return s
+}
+
+const soContent = "shadow-owned-content" // 귀속 테스트 공용 콘텐츠(케이스별 TempDir 독립이라 재사용 무해)
+
+// regSource: content를 주어진 media_type·uri·kind 소스로 Register(신규 CAS upsert).
+func regSource(t *testing.T, st *Store, content, mediaType, uri, kind string) {
+	t.Helper()
+	if _, err := st.Register(t.Context(), Registration{
+		StoredBytes: []byte(content), MediaType: mediaType,
+		Source: SourceMeta{URI: uri, Kind: kind, SrcHash: "sh-" + uri},
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func seedHookOnly(t *testing.T, st *Store) {
+	regSource(t, st, soContent, "text/plain", "shadow:Bash:1", "hook")
+}
+
+func seedHookPlusFile(t *testing.T, st *Store) {
+	// 동일 콘텐츠·동일 media_type을 hook과 file이 공유 → 아티팩트 1행·소스 2행(비-hook 직접 참조 존재).
+	regSource(t, st, soContent, "text/plain", "shadow:Bash:1", "hook")
+	regSource(t, st, soContent, "text/plain", "/tmp/f.txt", "file")
+}
+
+func seedCrossMedia(t *testing.T, st *Store) {
+	// 동일 콘텐츠·상이 media_type: hook(text/plain)+file(application/json) → content_hash 동일한 2 아티팩트.
+	regSource(t, st, soContent, "text/plain", "shadow:Bash:1", "hook")
+	regSource(t, st, soContent, "application/json", "/tmp/f.json", "file")
+}
+
+func seedRawRefByFile(t *testing.T, st *Store) {
+	// hook 아티팩트(soContent) — 단독이면 귀속. 그러나 file 소스가 soContent를 raw_blob로 참조 → 비귀속.
+	regSource(t, st, soContent, "text/plain", "shadow:Bash:1", "hook")
+	if _, err := st.Register(t.Context(), Registration{
+		StoredBytes: []byte("other-primary-content"), MediaType: "text/plain",
+		Source:  SourceMeta{URI: "/tmp/raw.txt", Kind: "file", SrcHash: "sh-raw"},
+		RawBlob: []byte(soContent), // sources.raw_blob_hash = sha256(soContent)
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func seedNoSource(t *testing.T, st *Store) {
+	// 아티팩트는 있으나 소스 0개 → 비귀속(hook 소스 부재로 걸러진다).
+	regSource(t, st, soContent, "text/plain", "shadow:Bash:1", "hook")
+	if _, err := st.writer.Exec("DELETE FROM sources"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func seedTwoHooks(t *testing.T, st *Store) {
+	// 동일 콘텐츠·동일 media_type을 hook 소스 2개가 참조 → content_hash 단위 dedup 1.
+	regSource(t, st, soContent, "text/plain", "shadow:Bash:1", "hook")
+	regSource(t, st, soContent, "text/plain", "shadow:Bash:2", "hook")
+}
+
+// seedTwoHookArtifactsSameHashDiffMedia: 동일 콘텐츠·상이 media_type을 hook 소스 2개로 Register
+// → content_hash 동일한 2 아티팩트(전부 hook, 귀속)이나 물리 CAS 파일은 1개. content_hash 반환.
+func seedTwoHookArtifactsSameHashDiffMedia(t *testing.T, st *Store) string {
+	regSource(t, st, soContent, "text/plain", "shadow:Bash:1", "hook")
+	regSource(t, st, soContent, "application/json", "shadow:Bash:2", "hook")
+	sum := sha256.Sum256([]byte(soContent))
+	return hex.EncodeToString(sum[:])
+}
+
+func statBlobFile(t *testing.T, dir, h string) os.FileInfo {
+	t.Helper()
+	fi, err := os.Stat(filepath.Join(dir, "artifacts", h[:2], h))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return fi
+}
+
+// TestShadowOwnedAttribution — D40 §2: content_hash 단위 귀속 술어.
+func TestShadowOwnedAttribution(t *testing.T) {
+	cases := []struct {
+		name       string
+		seed       func(t *testing.T, st *Store)
+		wantHashes int
+	}{
+		{"hook만 참조 → 귀속", seedHookOnly, 1},
+		{"hook+explicit 공유 → 비귀속", seedHookPlusFile, 0},
+		{"cross-media 공유(동일 hash·상이 media_type) → 비귀속", seedCrossMedia, 0},
+		{"raw_blob_hash 비-hook 참조 → 비귀속", seedRawRefByFile, 0},
+		{"source 0개 → 비귀속", seedNoSource, 0},
+		{"hook 2개(동일 hash) → 귀속 1(hash 단위 dedup)", seedTwoHooks, 1},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			dir := t.TempDir()
+			st := openAt(t, dir)
+			c.seed(t, st)
+			st.Close() // SizeStats는 dir 기준 별도 ro open — 시드 후 닫고 조회
+			sz, err := SizeStats(dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if sz.ShadowOwnedHashes != c.wantHashes {
+				t.Fatalf("ShadowOwnedHashes=%d want %d", sz.ShadowOwnedHashes, c.wantHashes)
+			}
+			if len(sz.ShadowOwned) != c.wantHashes {
+				t.Fatalf("ShadowOwned len=%d want %d", len(sz.ShadowOwned), c.wantHashes)
+			}
+		})
+	}
+}
+
+// TestShadowOwnedBytesPhysical — D40 §2: 물리 CAS 파일 기저 정확 단정 — 동일 hash의 hook-only
+// cross-media artifact 2행이어도 ShadowOwnedBytes는 물리 파일 1개의 os.Stat 크기와 정확히 같다
+// (논리 byte_length 2배 합산이면 오구현).
+func TestShadowOwnedBytesPhysical(t *testing.T) {
+	dir := t.TempDir()
+	st := openAt(t, dir)
+	h := seedTwoHookArtifactsSameHashDiffMedia(t, st)
+	st.Close()
+	want := statBlobFile(t, dir, h).Size()
+	sz, err := SizeStats(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sz.ShadowOwnedBytes != want {
+		t.Fatalf("ShadowOwnedBytes=%d want %d(물리 파일 크기 — 논리 합산 금지)", sz.ShadowOwnedBytes, want)
+	}
+}
+
+// TestSizeStatFileBytes — D40 §2: FileBytes = content.db 파일 실크기.
+func TestSizeStatFileBytes(t *testing.T) {
+	dir := t.TempDir()
+	st := openAt(t, dir)
+	seedHookOnly(t, st)
+	st.Close()
+	sz, err := SizeStats(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sz.FileBytes <= 0 {
+		t.Fatalf("FileBytes=%d want >0", sz.FileBytes)
+	}
+}
+
+// --- D41 PurgeHookOnly 헬퍼 (Task 5a) ---------------------------------------
+
+func hashOf(content string) string {
+	sum := sha256.Sum256([]byte(content))
+	return hex.EncodeToString(sum[:])
+}
+
+// ageBlobFile: h의 CAS 파일 mtime을 now+delta로 강제(결정론 — 설계 §8, os.Chtimes).
+func ageBlobFile(t *testing.T, st *Store, h string, delta time.Duration) {
+	t.Helper()
+	tm := time.Now().Add(delta)
+	if err := os.Chtimes(filepath.Join(st.dir, "artifacts", h[:2], h), tm, tm); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func assertBlobFileExists(t *testing.T, st *Store, h string) {
+	t.Helper()
+	if _, err := os.Stat(filepath.Join(st.dir, "artifacts", h[:2], h)); err != nil {
+		t.Fatalf("blob %s 부재(기대: 잔존): %v", h[:8], err)
+	}
+}
+
+func assertHashIntact(t *testing.T, st *Store, h string) {
+	t.Helper()
+	var n int
+	if err := st.reader.QueryRow("SELECT count(*) FROM artifacts WHERE content_hash=?", h).Scan(&n); err != nil || n == 0 {
+		t.Fatalf("artifact %s 소멸(기대: 보존): n=%d err=%v", h[:8], n, err)
+	}
+	assertBlobFileExists(t, st, h)
+}
+
+func assertHashGone(t *testing.T, st *Store, h string) {
+	t.Helper()
+	var n int
+	if err := st.reader.QueryRow("SELECT count(*) FROM artifacts WHERE content_hash=?", h).Scan(&n); err != nil || n != 0 {
+		t.Fatalf("artifact %s 잔존(기대: 삭제): n=%d err=%v", h[:8], n, err)
+	}
+	if _, err := os.Stat(filepath.Join(st.dir, "artifacts", h[:2], h)); !os.IsNotExist(err) {
+		t.Fatalf("blob %s 잔존(기대: 회수): err=%v", h[:8], err)
+	}
+}
+
+// TestPurgeHookOnly — D41 §3: explicit 공유 보존 + hook-만 행·파일·FTS 삭제.
+func TestPurgeHookOnly(t *testing.T) {
+	st := openAt(t, t.TempDir())
+	// hook-만(청크 포함 → FTS 동기 관측). seedHookOnly는 청크가 없어 직접 Register.
+	hookContent := "purge-hook-only zzneedle"
+	if _, err := st.Register(context.Background(), Registration{
+		StoredBytes: []byte(hookContent), MediaType: "text/plain",
+		Source: SourceMeta{URI: "shadow:Bash:po1", Kind: "hook", SrcHash: "h-po1"},
+		Chunks: []Chunk{{Ordinal: 0, Text: hookContent}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	hookHash := hashOf(hookContent)
+	// explicit 공유(hook+file, 동일 콘텐츠) — 비귀속, 완전 보존.
+	regSource(t, st, "purge-shared", "text/plain", "shadow:Bash:po2", "hook")
+	regSource(t, st, "purge-shared", "text/plain", "/tmp/po-shared.txt", "file")
+	sharedHash := hashOf("purge-shared")
+
+	ageBlobFile(t, st, hookHash, -2*time.Hour) // age gate 통과(1h 초과)
+	rep, err := st.PurgeHookOnly(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rep.Hashes != 1 || rep.ReclaimedB <= 0 || rep.DeferredFiles != 0 || rep.FailedFiles != 0 {
+		t.Fatalf("report=%+v want Hashes=1 ReclaimedB>0 Deferred=0 Failed=0", rep)
+	}
+	assertHashGone(t, st, hookHash)
+	assertHashIntact(t, st, sharedHash)
+	var n int
+	if err := st.reader.QueryRow("SELECT count(*) FROM fts_porter WHERE fts_porter MATCH 'zzneedle'").Scan(&n); err != nil || n != 0 {
+		t.Fatalf("fts_porter zzneedle 잔존(FTS 미동기): n=%d err=%v", n, err)
+	}
+}
+
+// TestPurgeHookOnlyAgeGateDefers — mtime 30분 전(1h 이내) 파일은 행만 삭제되고 unlink 유예
+// (DeferredFiles=1, 파일 잔존 → --gc 후속 회수 경로).
+func TestPurgeHookOnlyAgeGateDefers(t *testing.T) {
+	st := openAt(t, t.TempDir())
+	seedHookOnly(t, st)
+	h := hashOf(soContent)
+	ageBlobFile(t, st, h, -30*time.Minute)
+	rep, err := st.PurgeHookOnly(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rep.Hashes != 1 || rep.DeferredFiles != 1 || rep.ReclaimedB != 0 {
+		t.Fatalf("report=%+v want Hashes=1·유예 1·회수 0", rep)
+	}
+	assertBlobFileExists(t, st, h) // 파일 보존(재등록 경합 안전)
+}
+
+// TestPurgeHookOnlyRevalidates — 견적 후 비-hook source가 생긴 hash는 tx 내 재검증으로 대상 제외
+// (행·파일 모두 보존).
+func TestPurgeHookOnlyRevalidates(t *testing.T) {
+	st := openAt(t, t.TempDir())
+	seedHookOnly(t, st) // 견적 시점엔 귀속(hook만)
+	h := hashOf(soContent)
+	// 견적 이후 비-hook 소스가 동일 콘텐츠를 참조 → 더 이상 귀속 아님.
+	regSource(t, st, soContent, "text/plain", "/tmp/reval.txt", "file")
+	ageBlobFile(t, st, h, -2*time.Hour) // age gate와 무관하게 애초에 대상 제외되어야 함
+	rep, err := st.PurgeHookOnly(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rep.Hashes != 0 || rep.ReclaimedB != 0 || rep.DeferredFiles != 0 {
+		t.Fatalf("report=%+v want Hashes=0(재검증 제외)", rep)
+	}
+	assertHashIntact(t, st, h)
+}
+
+// TestPurgeHookOnlyReplacedFileRollsBack — 경합 시뮬: 행 삭제 커밋 후·파일 회수 전에 동일 경로를
+// fresh mtime 파일로 교체(Register.writeBlob 재등록 시뮬) → rename 격리 ②의 fresh-mtime 검출로
+// 롤백(원 경로 복원·Deferred=1·회수 0). 내부 단계(purgeHookRows/reclaimHookBlobs)로 창에 개입.
+func TestPurgeHookOnlyReplacedFileRollsBack(t *testing.T) {
+	st := openAt(t, t.TempDir())
+	seedHookOnly(t, st)
+	h := hashOf(soContent)
+	ageBlobFile(t, st, h, -2*time.Hour) // 원본은 age gate를 통과할 만큼 오래됨
+
+	hashes, rep, err := st.purgeHookRows(context.Background()) // ① 행 삭제 tx만 커밋
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rep.Hashes != 1 {
+		t.Fatalf("Hashes=%d want 1", rep.Hashes)
+	}
+	// ② 커밋↔회수 창에 fresh mtime으로 교체(writeBlob은 파일만 쓰고 DB 행은 만들지 않는다).
+	if err := st.writeBlob(h, []byte("replaced-fresh")); err != nil {
+		t.Fatal(err)
+	}
+	// ③ 회수 단계 — fresh-mtime 검출로 롤백해야 한다(오삭제 방지).
+	if err := st.reclaimHookBlobs(context.Background(), hashes, &rep); err != nil {
+		t.Fatal(err)
+	}
+	if rep.DeferredFiles != 1 || rep.ReclaimedB != 0 {
+		t.Fatalf("report=%+v want 롤백(Deferred=1·회수 0)", rep)
+	}
+	assertBlobFileExists(t, st, h) // 원 경로 복원
+}
+
+// TestVacuum — D41: purge 후 후행 VACUUM(Task 5b 소비)이 열린 store에서 오류 없이 실행되고 데이터가
+// 보존되는지 확인(VACUUM은 tx 밖에서만 실행 가능 — 회귀 방지 스모크).
+func TestVacuum(t *testing.T) {
+	st := openAt(t, t.TempDir())
+	seedHookOnly(t, st)
+	if _, err := st.PurgeHookOnly(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	regSource(t, st, "vacuum-keep", "text/plain", "/tmp/keep.txt", "file")
+	if err := st.Vacuum(context.Background()); err != nil {
+		t.Fatalf("Vacuum: %v", err)
+	}
+	var n int
+	if err := st.reader.QueryRow("SELECT count(*) FROM artifacts WHERE content_hash=?", hashOf("vacuum-keep")).Scan(&n); err != nil || n != 1 {
+		t.Fatalf("VACUUM 후 데이터 손실: n=%d err=%v", n, err)
+	}
+}
+
+// TestPurgeHookOnlyPreservesReindexResidue — 최종리뷰 P1: purge --hook-only의 고아 정리는
+// 이 purge의 선택분(shadow 귀속 hash)에만 국한돼야 한다. 재색인 잔재(같은 URI를 A→B로
+// 재등록하며 source_kind와 무관하게 생기는 source-less 아티팩트)는 hook과 무관한 store 전역
+// 잔여라 hook-only purge가 건드리면 안 된다 — 잔재 아티팩트 행·청크(FTS 포함)는 보존하고
+// hook-only 행만 삭제해야 한다.
+func TestPurgeHookOnlyPreservesReindexResidue(t *testing.T) {
+	st := openAt(t, t.TempDir())
+	ctx := context.Background()
+	// 재색인 잔재: 같은 URI를 content A→B로 재등록 → content A 아티팩트가 source-less 잔재.
+	const residueURI = "/reindex.txt"
+	const contentA = "reindex-residue-A zzresidue"
+	if _, err := st.Register(ctx, Registration{
+		StoredBytes: []byte(contentA), MediaType: "text/plain",
+		Source: SourceMeta{URI: residueURI, Kind: "file", SrcHash: "sh-A"},
+		Chunks: []Chunk{{Ordinal: 0, Text: contentA}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	residueHash := hashOf(contentA)
+	const contentB = "reindex-current-B"
+	if _, err := st.Register(ctx, Registration{
+		StoredBytes: []byte(contentB), MediaType: "text/plain",
+		Source: SourceMeta{URI: residueURI, Kind: "file", SrcHash: "sh-B"},
+		Chunks: []Chunk{{Ordinal: 0, Text: contentB}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// hook-only 대상.
+	const hookContent = "purge-hook-residue zzneedle"
+	if _, err := st.Register(ctx, Registration{
+		StoredBytes: []byte(hookContent), MediaType: "text/plain",
+		Source: SourceMeta{URI: "shadow:Bash:rr1", Kind: "hook", SrcHash: "h-rr1"},
+		Chunks: []Chunk{{Ordinal: 0, Text: hookContent}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	hookHash := hashOf(hookContent)
+	ageBlobFile(t, st, hookHash, -2*time.Hour) // age gate 통과
+
+	rep, err := st.PurgeHookOnly(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rep.Hashes != 1 {
+		t.Fatalf("rep.Hashes=%d want 1(hook만 — 잔재는 shadow 귀속 아님)", rep.Hashes)
+	}
+	assertHashGone(t, st, hookHash)      // hook-only 행·blob 삭제
+	assertHashIntact(t, st, residueHash) // 잔재 아티팩트 행·blob 보존(전역 고아 sweep 금지)
+	var rn int
+	if err := st.reader.QueryRow("SELECT count(*) FROM fts_porter WHERE fts_porter MATCH 'zzresidue'").Scan(&rn); err != nil || rn != 1 {
+		t.Fatalf("잔재 청크 FTS 소멸(전역 청크 sweep): n=%d err=%v", rn, err)
+	}
+	var hn int
+	if err := st.reader.QueryRow("SELECT count(*) FROM fts_porter WHERE fts_porter MATCH 'zzneedle'").Scan(&hn); err != nil || hn != 0 {
+		t.Fatalf("hook 청크 FTS 잔존(미동기): n=%d err=%v", hn, err)
 	}
 }
