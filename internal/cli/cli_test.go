@@ -1526,7 +1526,8 @@ func TestRunDoctor_SessionItems(t *testing.T) {
 		}
 		out := buf.String()
 		for _, want := range []string{
-			"[6] session.db: quick_check=ok",
+			// D42: 갓 연 세션 = 자동 세션 1건(session_start만 → empty). sessions/empty 병기.
+			"[6] session.db: quick_check=ok sessions=1 (empty=1)",
 			"[7] session.lock: shared 획득 가능",
 			"[8] session.recover-pending: 없음",
 		} {

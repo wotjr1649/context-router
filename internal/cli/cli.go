@@ -1201,15 +1201,33 @@ func runDoctor(ctx context.Context, w io.Writer, storeRoot, projectRoot, version
 		} else {
 			var quickCheck string
 			qcErr := reader.QueryRowContext(ctx, "PRAGMA quick_check").Scan(&quickCheck)
+			// D42 [6] 병기: 전체 세션 수 + 빈 세션 수(비-session_start 이벤트 0건). empty 술어는
+			// GC와 동일하되 나이 게이트는 무관(경과 무관 진단). close 전에 조회한다.
+			var sessCount, emptyCount int64
+			var countErr error
+			if qcErr == nil && quickCheck == "ok" {
+				countErr = reader.QueryRowContext(ctx, `SELECT
+					(SELECT COUNT(*) FROM sessions),
+					(SELECT COUNT(*) FROM sessions s WHERE NOT EXISTS(
+						SELECT 1 FROM session_events e
+						WHERE e.session_id = s.session_id AND e.event_type != 'session_start'))`).Scan(&sessCount, &emptyCount)
+			}
 			closeErr := reader.Close()
 			switch {
 			case qcErr != nil || quickCheck != "ok":
 				fmt.Fprintf(w, "[6] session.db: quick_check 실패 (quick_check=%q)\n", quickCheck)
 				failed = append(failed, "session.db")
-			case closeErr != nil:
-				fmt.Fprintf(w, "[6] session.db: quick_check=ok (close 경고: %v)\n", closeErr)
 			default:
-				fmt.Fprintln(w, "[6] session.db: quick_check=ok")
+				// empty 계상 조회 실패는 [6]을 실패로 뒤집지 않는다(정보성 유지 — 설계 §8).
+				counts := ""
+				if countErr == nil {
+					counts = fmt.Sprintf(" sessions=%d (empty=%d)", sessCount, emptyCount)
+				}
+				if closeErr != nil {
+					fmt.Fprintf(w, "[6] session.db: quick_check=ok%s (close 경고: %v)\n", counts, closeErr)
+				} else {
+					fmt.Fprintf(w, "[6] session.db: quick_check=ok%s\n", counts)
+				}
 			}
 		}
 

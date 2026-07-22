@@ -865,12 +865,12 @@ func TestSweep_PerSessionClockInjected(t *testing.T) {
 	idA := mustAppendID(t, dA, Event{Type: "note", Summary: "a-event"})
 	idB := mustAppendID(t, dB, Event{Type: "note", Summary: "b-event"})
 
-	deleted, err := Sweep(context.Background(), dA, time.Now().Add(2*time.Hour))
+	rep, err := Sweep(context.Background(), dA, time.Now().Add(2*time.Hour))
 	if err != nil {
 		t.Fatalf("Sweep: %v", err)
 	}
-	if deleted != 2 { // session_start(Open 자동) + a-event, 둘 다 A 소속
-		t.Fatalf("deleted=%d want 2(A의 session_start+a-event)", deleted)
+	if rep.EventsDeleted != 2 { // session_start(Open 자동) + a-event, 둘 다 A 소속
+		t.Fatalf("EventsDeleted=%d want 2(A의 session_start+a-event)", rep.EventsDeleted)
 	}
 
 	var existsA, existsB int
@@ -895,12 +895,12 @@ func TestSweep_AllUndeclaredReturnsZero(t *testing.T) {
 	d := openT(t, dir, Options{Producer: "p"}) // retention 미표명
 	mustAppend(t, d, Event{Type: "note", Summary: "x"})
 
-	deleted, err := Sweep(context.Background(), d, time.Now().Add(999*time.Hour))
+	rep, err := Sweep(context.Background(), d, time.Now().Add(999*time.Hour))
 	if err != nil {
 		t.Fatalf("Sweep: %v", err)
 	}
-	if deleted != 0 {
-		t.Fatalf("deleted=%d want 0(모든 세션 미표명 — off와 동치)", deleted)
+	if rep.EventsDeleted != 0 {
+		t.Fatalf("EventsDeleted=%d want 0(모든 세션 미표명 — off와 동치)", rep.EventsDeleted)
 	}
 }
 
@@ -932,12 +932,12 @@ func TestSweep_DanglingSupersedesAllowed(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	deleted, err := Sweep(context.Background(), d, time.Now())
+	rep, err := Sweep(context.Background(), d, time.Now())
 	if err != nil {
 		t.Fatalf("Sweep: %v", err)
 	}
-	if deleted != 1 {
-		t.Fatalf("deleted=%d want 1(B만)", deleted)
+	if rep.EventsDeleted != 1 {
+		t.Fatalf("EventsDeleted=%d want 1(B만)", rep.EventsDeleted)
 	}
 
 	sumAfter, err := Summarize(context.Background(), d.Reader(), "", 5)
