@@ -243,6 +243,10 @@ func TestRunDoctor_ContentDBSize(t *testing.T) {
 // 셋업·호출은 TestRunDoctor_ContentDBSize 관례.
 func doctorSizeWarnSetup(t *testing.T) (storeRoot, projectRoot string) {
 	t.Helper()
+	// 부모 env의 임계 키 누수 시 무경고 단정이 거짓 실패(Codex P2) — 양 축을 기본값으로
+	// 고정(""=기본 폴백, 개별 테스트의 후행 t.Setenv가 덮어씀).
+	t.Setenv("CTR_STORE_WARN_BYTES", "")
+	t.Setenv("CTR_CONTENT_FILE_WARN_BYTES", "")
 	storeRoot, projectRoot = t.TempDir(), t.TempDir()
 	canon, err := ident.Canonicalize(projectRoot)
 	if err != nil {
