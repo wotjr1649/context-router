@@ -398,11 +398,31 @@ func runUsage(ctx context.Context, w io.Writer, args []string, storeRoot, projec
 	fs.SetOutput(io.Discard)
 	transcripts := fs.String("transcripts", "", "Claude Code transcript 디렉터리(생략 시 cwd에서 유도)")
 	totals := fs.Bool("totals", false, "본표 뒤 hooks:on/off 그룹 집계 2행 추가(설계 v0.3 §5)")
+	compare := fs.Bool("compare", false, "채널(cc/cx)×hooks:on/off 비교 리포트(설계 v0.6 D45 — 본표 대체)")
+	minRecords := fs.Int64("min-records", 0, "집계 제외 임계(cc=records, cx=turns; --compare 전용)")
+	rollouts := fs.String("rollouts", "", "Codex rollout 루트(--compare 전용, 생략 시 ~/.codex/sessions)")
 	if err := fs.Parse(args); err != nil {
 		return fmt.Errorf("usage: 플래그 파싱 실패: %w", err)
 	}
 	if rest := fs.Args(); len(rest) > 0 {
 		return fmt.Errorf("usage: 예상치 않은 인자 %d개", len(rest))
+	}
+	if *compare && *totals {
+		return errors.New("usage: --compare와 --totals는 함께 쓸 수 없습니다")
+	}
+	if !*compare && (*minRecords != 0 || *rollouts != "") {
+		return errors.New("usage: --min-records/--rollouts는 --compare 전용입니다")
+	}
+	if *compare {
+		dir := *transcripts
+		if dir == "" {
+			dir = transcriptDirFor(projectRoot)
+		}
+		rroot := *rollouts
+		if rroot == "" {
+			rroot = defaultRolloutRoot()
+		}
+		return runUsageCompare(ctx, w, storeRoot, projectRoot, dir, rroot, *minRecords, time.Now())
 	}
 
 	dir := *transcripts
