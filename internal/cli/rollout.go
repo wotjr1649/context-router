@@ -234,9 +234,10 @@ func loadCXSessions(ctx context.Context, storeRoot, projectRoot string) (map[str
 			defer func() { _ = rows.Close() }()
 			for rows.Next() {
 				var id string
-				if rows.Scan(&id) == nil {
-					set[id] = true
+				if scanErr := rows.Scan(&id); scanErr != nil {
+					return scanErr // 행 관측 실패도 침묵 금지 — worktree 단위 incomplete 강등([15] 폴백 정합)
 				}
+				set[id] = true
 			}
 			return rows.Err()
 		}(); err != nil {

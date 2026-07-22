@@ -243,6 +243,10 @@ func TestRunDoctor_ContentDBSize(t *testing.T) {
 // 셋업·호출은 TestRunDoctor_ContentDBSize 관례.
 func doctorSizeWarnSetup(t *testing.T) (storeRoot, projectRoot string) {
 	t.Helper()
+	// 부모 env의 임계 키 누수 시 무경고 단정이 거짓 실패(Codex P2) — 양 축을 기본값으로
+	// 고정(""=기본 폴백, 개별 테스트의 후행 t.Setenv가 덮어씀).
+	t.Setenv("CTR_STORE_WARN_BYTES", "")
+	t.Setenv("CTR_CONTENT_FILE_WARN_BYTES", "")
 	storeRoot, projectRoot = t.TempDir(), t.TempDir()
 	canon, err := ident.Canonicalize(projectRoot)
 	if err != nil {
@@ -320,7 +324,8 @@ func TestRunDoctor_StoreSizeWarnSilentUnderThreshold(t *testing.T) {
 }
 
 // TestRunDoctor_ContentFileWarn — D46 발화: 전용 키만 소액 설정 — content.db 파일은 항상 >1B.
-// 픽스처·doctor 실행부는 TestRunDoctor_StoreSizeWarn과 동일.
+// 픽스처·doctor 실행부는 TestRunDoctor_StoreSizeWarn과 동일. 역방향 축 독립(file 키 조정 시
+// blob 침묵)도 여기서 단정 — AxisIndependent 테스트의 blob→file 방향과 쌍.
 func TestRunDoctor_ContentFileWarn(t *testing.T) {
 	storeRoot, projectRoot := doctorSizeWarnSetup(t)
 	t.Setenv("CTR_CONTENT_FILE_WARN_BYTES", "1")
@@ -331,6 +336,9 @@ func TestRunDoctor_ContentFileWarn(t *testing.T) {
 	out := buf.String()
 	if !strings.Contains(out, "[14] warning: file ") || !strings.Contains(out, "CTR_CONTENT_FILE_WARN_BYTES") {
 		t.Fatalf("파일 축 경고 미발화:\n%s", out)
+	}
+	if strings.Contains(out, "[14] warning: blob ") {
+		t.Fatalf("file 키 조정이 blob 축 경고를 발화(키 분리 위반):\n%s", out)
 	}
 }
 
