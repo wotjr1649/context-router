@@ -435,3 +435,59 @@ D49 구현(D46 실발화 후), 무작위 A/B 하네스·OTel(D27), exec 3종(D21
   신호 5종을 회피해 중복 정의 파스 에러 방향 miss — `.ctr.` 신호
   추가(실행 검증: 표기 관례 변형 포착 유지·부분열 오탐 없음),
   "합법 변형 전부" 과장을 "표기 관례 변형"으로 완화.
+
+### §10.3 관측 프리체크 결과·판정 (Task 0)
+
+2026-07-23, 컨트롤러 수행. codex-cli **0.144.6**, 스크래치
+`CODEX_HOME=C:\tmp\ctr-g4\codex-home`(auth만 복사 — 사용자 실환경
+무접촉), 워크스페이스 `C:\tmp\ctr-g4\ws`(git init·trusted 기입).
+실증 아티팩트: `C:\tmp\ctr-g4\{payload,deny-payload}.jsonl`.
+
+**G4 관측** (§8 관측 a~d):
+
+- **(a) 공식 문서**(developers.openai.com/codex/hooks): 등록은
+  `hooks.json` 또는 config.toml 인라인 `[hooks]` — 이벤트→matcher
+  그룹→command 핸들러의 Claude 동형 3계층, 셸 명령은 matcher
+  `Bash`로 매치(unified exec 포함). PreToolUse 입력에
+  `tool_name`·`tool_input`(Bash는 `tool_input.command`) 명문. 차단
+  응답은 **Claude 동형**(`hookSpecificOutput.permissionDecision:
+  "deny"`+`permissionDecisionReason`)을 공식 수용, 구형
+  `{"decision":"block"}`·exit 2+stderr도 병행 수용. 비관리 훅은
+  `/hooks` 리뷰·신뢰(정의 해시 기록, 변경 시 재신뢰) 필수 —
+  `--dangerously-bypass-hook-trust`로 1회성 우회 가능(스크래치
+  실증의 거짓 행 3 방지에 사용).
+- **(b) payload 운반 ✓**: user-layer hooks.json PreToolUse(matcher
+  `Bash`) 캡처 훅으로 codex exec 1회 — stdin payload에
+  `tool_name:"Bash"`, `tool_input.command:"Set-Content -Path
+  ran1.txt -Value executed"`(**raw PS 구문 그대로** — §7 실측 재확증)
+  운반. Claude 동형 필드(session_id·cwd·hook_event_name·
+  tool_use_id) + Codex 확장(turn_id·transcript_path·model·
+  permission_mode).
+- **(c) 차단 강제 ✓**: baseline(sandbox 해제) 동일 명령 실행
+  성공(`ran1.txt` 생성) ↔ 훅을 Claude 동형 deny JSON 출력으로 교체
+  후 동일 조건에서 `hook: PreToolUse Blocked` +
+  `Command blocked by PreToolUse hook: test`(reason 모델 노출) +
+  부작용 파일(`proof.txt`) **미생성** — 자문-deny 아닌 실행 차단.
+  부수 관측: read-only sandbox에서는 router 정책이 훅 판정과
+  별개로 쓰기 명령을 자체 거부(declined) — 훅 발화 자체는 sandbox
+  거부와 무관하게 유지.
+- **(d) matcher 존중 ✓**(기록만): 비셸 런(텍스트 응답만)에서 훅
+  미발화, 캡처된 전 payload가 `tool_name:"Bash"`.
+
+**G4 판정 — 행 1** (§8 순서 고정: ① 등록 수용 ✓ → ② 운반 ✓ → ③
+강제 ✓ → ④ Claude 동형 JSON 수용): 가드 이식은 denyTool 출력
+무변경으로 진행. **Task 1 Step 8(행 2 분기) 비활성**, T1~T4 계획
+원안 그대로.
+
+**G6 관측** (사용자 실물 `C:\Users\js\.codex\config.toml` —
+`CODEX_HOME` env 미설정 확인): 17,060B·508라인·**LF 지배(CRLF
+0)**·EOF 개행 유·BOM 무·주석 라인 0. `[mcp_servers.*]` 6종
+(L319–362: openaiDeveloperDocs·node_repl(+env)·context7·github·
+chrome-devtools(+env)), `[hooks.state]` L33~(트러스트 해시 — 본
+저장소 `.codex/hooks.json`의 post_tool_use·session_start 포함).
+관리 블록 마커 0개, **ctr 키-경계 신호 0**(2패스 §10.2 관측
+재확인). 플러그인 스코프
+`plugins."ctxscribe@wotjr1649".mcp_servers.mcp`가 `mcp_servers`
+부분열을 보유하나 키-경계 신호 비해당 — §3 (b) AND 조건 미충족으로
+무발동(오탐 회피 설계의 실물 확증). 예상 설치 경로: append →
+`mcpWritten`, LF 블록 기입.
