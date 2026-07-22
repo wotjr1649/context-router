@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"testing"
@@ -110,6 +111,21 @@ func TestParseRolloutFile_VectorUnitSnapshot(t *testing.T) {
 	}
 }
 
+func TestParseRolloutFile_TieKeepsFirst(t *testing.T) {
+	// max-wins 동률 규칙(§2 "동률은 첫 스냅샷 유지" — strict `>`): total 동률·벡터 상이면
+	// 나중 스냅샷을 채택하지 않는다(`>=`로 바뀌면 input=190이 나와 실패하는 판별 테스트).
+	root := t.TempDir()
+	p := writeRollout(t, t.TempDir(), "2026-07-21T20-51-22", testUUID, []string{
+		metaLine(testUUID, root),
+		tcLine(200, 80, 20, 220),
+		tcLine(190, 90, 25, 220), // 동률 total — 채택 금지
+	})
+	r, err := parseRolloutFile(context.Background(), p, ident.Fold(root))
+	if err != nil || r.use != (cxUsage{input: 200, cachedInput: 80, output: 20, total: 220}) {
+		t.Fatalf("동률 첫 스냅샷 미유지: err=%v use=%+v", err, r.use)
+	}
+}
+
 func TestParseRolloutFile_CwdDivergence(t *testing.T) {
 	// meta 간 cwd 발산(스펙 §2 — 파일 제외+집계 대상 신호): cwdAny·cwdOut 동시 true.
 	root := t.TempDir()
@@ -135,15 +151,20 @@ func TestParseRolloutFile_CwdDivergence(t *testing.T) {
 	if err != nil || !r2.cwdAny || r2.cwdOut {
 		t.Fatalf("하위 cwd 미채택: err=%v %+v", err, r2)
 	}
-	// §6 cwd 정규화 경계: 대소문자·구분자 상이는 Fold로 동일 판정, trailing separator도 채택.
-	upper := strings.ToUpper(root)
-	p3 := writeRollout(t, t.TempDir(), "2026-07-21T20-51-24", testUUID, []string{
-		metaLine(testUUID, upper), tcLine(1, 0, 0, 1),
-	})
-	r3, err := parseRolloutFile(context.Background(), p3, ident.Fold(root))
-	if err != nil || !r3.cwdAny || r3.cwdOut {
-		t.Fatalf("대소문자 정규화 실패: err=%v %+v", err, r3)
+	// §6 cwd 정규화 경계 — 대소문자: Fold는 windows/darwin만 케이스폴드(unix는 `\`·대소문자가
+	// 합법 파일명이라 미적용, internal/ident/ident.go:35-37). unix에선 대문자 root가 발산하므로
+	// 이 채택 단정은 케이스폴드 플랫폼에서만 유효하다.
+	if runtime.GOOS == "windows" || runtime.GOOS == "darwin" {
+		upper := strings.ToUpper(root)
+		p3 := writeRollout(t, t.TempDir(), "2026-07-21T20-51-24", testUUID, []string{
+			metaLine(testUUID, upper), tcLine(1, 0, 0, 1),
+		})
+		r3, err := parseRolloutFile(context.Background(), p3, ident.Fold(root))
+		if err != nil || !r3.cwdAny || r3.cwdOut {
+			t.Fatalf("대소문자 정규화 실패: err=%v %+v", err, r3)
+		}
 	}
+	// trailing separator는 플랫폼 무관 — 그대로 채택.
 	p4 := writeRollout(t, t.TempDir(), "2026-07-21T20-51-25", testUUID, []string{
 		metaLine(testUUID, root+string(os.PathSeparator)), tcLine(1, 0, 0, 1),
 	})
@@ -184,5 +205,16 @@ func TestParseRolloutFile_CorruptAndMissing(t *testing.T) {
 	r4, err := parseRolloutFile(context.Background(), p4, folded)
 	if err != nil || r4.skipped != 1 || r4.turns != 1 || r4.use.total != 11 {
 		t.Fatalf("필드 부재 스킵 강등 실패: err=%v %+v", err, r4)
+	}
+	// total_token_usage는 있으나 개별 리프(cached_input_tokens)만 부재(부분 커버 — §2 스킵 강등):
+	// 벡터 불완전 = 형식 변경 → skipped++·turn 미계상.
+	p5 := writeRollout(t, t.TempDir(), "2026-07-21T20-51-27", testUUID, []string{
+		metaLine(testUUID, root),
+		`{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":5,"output_tokens":1,"total_tokens":6}}}}`,
+		tcLine(10, 5, 1, 11),
+	})
+	r5, err := parseRolloutFile(context.Background(), p5, folded)
+	if err != nil || r5.skipped != 1 || r5.turns != 1 || r5.use.total != 11 {
+		t.Fatalf("리프 부재 스킵 강등 실패: err=%v %+v", err, r5)
 	}
 }
