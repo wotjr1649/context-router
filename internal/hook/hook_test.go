@@ -148,6 +148,43 @@ func readDrops(t *testing.T, dir string) string {
 	return string(b)
 }
 
+// TestAppendDropSanitizesFields — appendDrop이 기록하는 각 필드(reason·sid·event·tool)의 탭·개행·
+// CR을 공백으로 무해화하고 64자 상한을 적용해, 사이드카 5필드 TSV 파서가 주입 개행/구분자로
+// 오염되지 않음을 고정(설계 §5). 구현 무변경 회귀 핀.
+func TestAppendDropSanitizesFields(t *testing.T) {
+	dir := t.TempDir()
+	appendDrop(dir,
+		"r\ta\nb\rc",            // reason: 탭·개행·CR → 공백
+		"s\ti\nd",               // sessionID(≤8자라 절단 없음): 탭·개행 → 공백
+		"Pre\nToolUse",          // hookEvent: 개행 → 공백
+		strings.Repeat("T", 80)) // tool: 64자 상한
+
+	raw := readDrops(t, dir)
+	rec := strings.TrimRight(raw, "\n")
+	// 주입 개행이 레코드를 여러 줄로 쪼개면 안 된다(단일 레코드 = 개행 0).
+	if strings.Contains(rec, "\n") {
+		t.Fatalf("주입 개행이 레코드를 분할: %q", raw)
+	}
+	fields := strings.Split(rec, "\t")
+	if len(fields) != 5 { // ts + 4필드 — 탭 주입이 컬럼을 늘리면 안 된다
+		t.Fatalf("필드 수=%d want 5(탭 주입 오염): %q", len(fields), raw)
+	}
+	for _, f := range fields[1:] {
+		if strings.ContainsAny(f, "\n\r") {
+			t.Fatalf("무해화 안 된 개행/CR 잔존: %q", f)
+		}
+		if len(f) > 64 {
+			t.Fatalf("64자 상한 위반: len=%d %q", len(f), f)
+		}
+	}
+	if fields[1] != "r a b c" || fields[3] != "Pre ToolUse" {
+		t.Fatalf("무해화 결과 불일치: reason=%q event=%q", fields[1], fields[3])
+	}
+	if fields[4] != strings.Repeat("T", 64) { // 64자 정확 절단
+		t.Fatalf("tool 절단 오류: %q", fields[4])
+	}
+}
+
 // countReader — Read로 소비된 총 바이트를 센다(⑧ drain 검증용).
 type countReader struct {
 	r io.Reader
@@ -1134,8 +1171,15 @@ func TestShadowAppendDrops(t *testing.T) {
 	if n := contentArtifacts(t, contentDir); n != 1 {
 		t.Fatalf("artifacts=%d want 1(ingest 성공 후 append 실패 시나리오)", n)
 	}
-	if got := readDrops(t, sdir); !strings.Contains(got, "shadow-append") {
+	got := readDrops(t, sdir)
+	if !strings.Contains(got, "shadow-append") {
 		t.Fatalf("drops=%q want shadow-append", got)
+	}
+	// 사이드카 필드 정합: shadow-append 실패 drop도 event/tool을 담아야 한다(hook.go appendDrop와 동형).
+	for _, want := range []string{"PostToolUse", "Bash"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("shadow-append drop에 %q 없음(event/tool 미전달): %q", want, got)
+		}
 	}
 }
 
