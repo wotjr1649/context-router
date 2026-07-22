@@ -41,6 +41,20 @@ func storeWarnBytes(getenv func(string) string) int64 {
 	return defaultStoreWarnBytes
 }
 
+// defaultContentFileWarnBytes — D46 content.db 파일 축 경고 임계 기본값(설계 v0.6 §4 — 가시화
+// 트리거: 조용한 기본값이 아니다).
+const defaultContentFileWarnBytes = 100 << 20 // 100MiB
+
+// contentFileWarnBytes — CTR_CONTENT_FILE_WARN_BYTES 양수만 채택(storeWarnBytes와 동형 규율).
+// blob 키와 분리한 전용 키(D46) — 두 축은 크기·성장·구제 경로가 달라 한쪽 조정이 다른 축을
+// 무력화하면 안 된다.
+func contentFileWarnBytes(getenv func(string) string) int64 {
+	if v, err := strconv.ParseInt(getenv("CTR_CONTENT_FILE_WARN_BYTES"), 10, 64); err == nil && v > 0 {
+		return v
+	}
+	return defaultContentFileWarnBytes
+}
+
 // Run: cli 서브커맨드 단일 진입점. storeRoot·projectRoot는 main이 이미 결정해 넘긴다(cli는
 // 재도출하지 않는다 — 설계서 §7 Produces). sub은 main이 7개 이름(doctor·upgrade·stats·purge·
 // session·hook·usage) 중 하나임을 이미 확인했다. args는 doctor·upgrade에서 미사용, stats가 --provider
@@ -1418,6 +1432,11 @@ func runDoctor(ctx context.Context, w io.Writer, storeRoot, projectRoot, version
 		// 정책 집행이 아니다(D27): 자동 삭제 없음. SizeStats 실패 경로는 이 분기 밖이라 미평가.
 		if warn := storeWarnBytes(os.Getenv); sz.BlobBytes > warn {
 			fmt.Fprintf(w, "[14] warning: blob %dB > 임계 %dB(CTR_STORE_WARN_BYTES) — 수동 구제는 purge 계열 CLI(purge --project <id> --hook-only로 shadow만 선택 삭제 가능). 자동 삭제 없음\n", sz.BlobBytes, warn)
+		}
+		// D46 — content.db 파일 축(청크 텍스트+FTS) 자문 경고. D38 기준 축(blob)은 대체하지
+		// 않는다 — 파일 축은 purge 후에도 free page로 즉시 안 줄어 별도 안내가 계약(설계 v0.6 §4).
+		if warn := contentFileWarnBytes(os.Getenv); sz.FileBytes > warn {
+			fmt.Fprintf(w, "[14] warning: file %dB > 임계 %dB(CTR_CONTENT_FILE_WARN_BYTES) — 청크 텍스트+FTS 축(자문). purge 행 삭제 후에도 free page로 즉시 줄지 않음, 회수는 VACUUM(라이브 서버 제약 — 서버 비가동 시), --hook-only는 shadow 귀속 한정(explicit 소스 감축은 전체 purge). 자동 삭제 없음\n", sz.FileBytes, warn)
 		}
 	}
 
