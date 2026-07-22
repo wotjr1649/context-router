@@ -162,7 +162,9 @@
   lockStore를 잡지 않으므로 DB 재확인만으로는 배치→커밋 창의 재등록
   blob을 오삭제할 수 있다(재확인↔unlink TOCTOU). mtime age gate가 그
   창을 커버하는 기존 GCOrphanBlobs의 검증 기전이다(1·2차 적대 검수
-  §11) → ④ 보고는 **실회수 바이트**(실제 unlink 합)와 **age-gate 유예
+  §11). 재확인·gate와 unlink 사이의 잔여 미세 창은 **rename 격리**로
+  봉쇄한다 — 파일을 원자 rename으로 격리한 뒤 격리본을 재검증(fresh
+  mtime·참조 발견 시 롤백)하고 삭제한다(계획 체크포인트 검수 §11.2) → ④ 보고는 **실회수 바이트**(실제 unlink 합)와 **age-gate 유예
   건수**(유예·부분 실패 orphan은 안전 방향 — `--gc`로 후속 회수 가능) →
   ⑤ VACUUM(content.db 축 부차 회수, 트랜잭션 외부, 실패
   log-and-continue — 라이브 서버 시 실패 흔함 §7). explicit 공유
@@ -376,5 +378,17 @@ CAS 갱신 시 구버전 blob 즉시 orphan-GC(실해 미관측), [15] 접두 �
   재배치(§3 ⓪), `--sessions`/`--gc` 조합 거부 추가(§3), 미지 세션
   이벤트의 write lock 회피(`INSERT…WHERE EXISTS` 권장, §4), [6] empty
   계상 조회 실패 시 정보성 유지(§8).
-- (계획 체크포인트의 adversarial-review 1패스는 별도 — 계획 확정 시
-  수행해 여기 추기.)
+### §11.2 계획 체크포인트 적대 검수 처리 기록 (2026-07-22)
+
+- 이중 검수(계획 초판 8a53164 대상): 서브에이전트(opus) C1·I3·M5·분할
+  권고 + Codex adversarial-review(high 4·medium 2, NO-SHIP) — 전 건 계획
+  반영, NO-SHIP 사유 해소. 상세는 계획 문서 "계획 체크포인트 적대 검수
+  반영" 절.
+- 설계 정본 파급 2건: ① §3 ③에 rename 격리 구절 추기(재확인·gate와
+  unlink 사이 잔여 미세 창 — Register writeBlob 교체 경합의 완전 봉쇄)
+  ② 버전 상수는 실제 2개(`version`+`mcp.ServerVersion`, 핀 고정 테스트
+  실재)임을 계획에 명문화(§1.1 문면은 유지 — "버전 상수 0.5.0"의 실체
+  주석).
+- Codex 예산: 설계 체크포인트 2패스(사용자 지시)·계획 체크포인트 1패스
+  소진. 이후 재검수는 표준 가드(체크포인트당 1패스, fix 후 재검수는
+  서브에이전트 전용)로 복귀.

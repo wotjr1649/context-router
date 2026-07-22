@@ -87,8 +87,14 @@ func TestDropLineDiagnosticFields(t *testing.T) {
 }
 ```
 
-주의: `postToolUseInput`/`runDispatchForDrop`이 없으면 기존 unknown-session
-테스트(hook_test.go:279 부근)의 구성 코드를 따라 작성. 새 파일 만들지 말 것.
+주의(검수 정정 2건): ① `postToolUseInput`/`runDispatchForDrop`은 부재 —
+기존 unknown-session 테스트(hook_test.go:279 부근)의 구성 코드를 따라
+작성(새 파일 금지). ② **session_id 함정**: 입력 JSON의 `session_id`는
+canonical UUID여야 하며(비정형은 dispatch 이전 `bad-session-id` drop —
+hook.go:96), 호스트 접두(`cc:`)는 dispatch가 `string(host)+":"+SessionID`
+로 부여한다(hook.go:111). 따라서 appendDrop에는 **접두된 external**을
+전달해야 sid8이 `cc:99999`가 된다 — `in.SessionID`(맨 UUID)를 넘기면
+`99999999`가 되어 단정 실패.
 
 - [ ] **Step 2: 실행 — RED 확인**
 
@@ -137,17 +143,22 @@ Expected: 전부 PASS (readDrops substring 단정은 신형식에서도 통과 �
 
 - [ ] **Step 5: 실패 테스트 — dropsByReason {2,5} 수용**
 
-`internal/cli/hook_install_test.go`에 추가(기존 3필드 unparsed 단정 테스트는
-**무변경 유지** — 설계 §5):
+`internal/cli/hook_install_test.go`에 추가. **주의(검수 정정)**:
+`dropsByReason`의 실제 입력은 문자열이 아니라 **파일 경로**다 — 기존
+`TestDropsByReason_StrictParsing`(hook_install_test.go:528 부근)처럼 임시
+파일에 기록 후 경로로 호출한다. 기존 3필드 unparsed 단정 테스트는
+**무변경 유지**(설계 §5).
 
 ```go
 // TestDropsByReasonFiveFields — D43: 정확 5필드 신형식 라인의 reason을
 // 집계한다. 3·4필드는 여전히 unparsed(기존 단정 불변).
 func TestDropsByReasonFiveFields(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "session.drops.log")
 	data := "1700000000\tunknown-session\tcc:99999\tPostToolUse\tRead\n" +
 		"1700000001\tshadow-oversize\t-\t-\t-\n" +
 		"1700000002\tbroken\textra\n" // 3필드 → unparsed
-	got := dropsByReasonFromString(t, data) // 기존 테스트가 쓰는 진입 헬퍼 재사용
+	if err := os.WriteFile(p, []byte(data), 0o600); err != nil { t.Fatal(err) }
+	got := dropsByReason(p) // 기존 시그니처(경로 입력) 그대로
 	if got["unknown-session"] != 1 || got["shadow-oversize"] != 1 {
 		t.Fatalf("5필드 reason 집계 실패: %v", got)
 	}
@@ -194,11 +205,16 @@ git commit -m "feat(v0.5): D43 drops 진단 5필드 + [12] 파서 {2,5}필드 �
   (SizeStat·blob walk)·`store.go:400-460`(Register·raw_blob_hash 기입)
 
 **Interfaces:**
-- Produces: SizeStats 구조체(기존 이름 유지)에 필드 추가 —
-  `FileBytes int64`(content.db os.Stat), `ShadowOwnedBytes int64`,
-  `ShadowOwnedHashes int`, 그리고 귀속 hash 집합 조회
-  `ShadowOwnedHashSet() (map[string]struct{}, error)` 상당(Task 5a·3이
-  소비 — 실제 배치는 기존 SizeStat 반환 경로에 맞춰 조정하되 이름 고정).
+- Produces(검수 정정 — 실코드 API에 고정): 실제 표면은 **구조체
+  `type SizeStat`(단수) + 패키지 함수 `func SizeStats(dir string)
+  (*SizeStat, error)`**(store.go:914·928 — content.db를 dir 기준 `mode=ro`
+  로 새로 연다, live 핸들 아님). 여기에 필드 추가 —
+  `FileBytes int64`(content.db os.Stat 크기),
+  `ShadowOwnedBytes int64`(귀속 물리 바이트 합),
+  `ShadowOwnedHashes int`(귀속 hash 수),
+  `ShadowOwned map[string]int64`(**귀속 hash → 물리 CAS 파일 바이트** —
+  Task 3b 접두 분해·Task 5a/5b 견적이 공용 소비하는 원천. 스칼라 2필드는
+  이 맵의 합산·len과 항상 일치).
 - 귀속 술어(설계 §2, 불변): hash h가 shadow 귀속 ⟺ h를 참조하는 모든
   artifact의 모든 source가 kind='hook' AND h를 raw_blob_hash로 참조하는
   비-hook source 없음 AND hook source ≥ 1. 바이트는 CAS 물리 파일 크기.
@@ -225,25 +241,46 @@ func TestShadowOwnedAttribution(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			st := openTestStore(t)
+			dir := t.TempDir()
+			st := openT(t, dir) // 기존 store 테스트 열기 관례(선행 읽기로 확정)
 			c.seed(t, st)
-			sz, err := st.SizeStat()
+			st.Close() // SizeStats는 dir 기준 별도 ro open — 시드 후 닫고 조회
+			sz, err := SizeStats(dir)
 			if err != nil { t.Fatal(err) }
 			if sz.ShadowOwnedHashes != c.wantHashes {
 				t.Fatalf("ShadowOwnedHashes=%d want %d", sz.ShadowOwnedHashes, c.wantHashes)
 			}
-			if c.wantHashes > 0 && sz.ShadowOwnedBytes <= 0 {
-				t.Fatalf("ShadowOwnedBytes=%d want >0(물리 파일 합산)", sz.ShadowOwnedBytes)
+			if len(sz.ShadowOwned) != c.wantHashes {
+				t.Fatalf("ShadowOwned len=%d want %d", len(sz.ShadowOwned), c.wantHashes)
 			}
 		})
 	}
 }
 
+// TestShadowOwnedBytesPhysical — D40 §2: 물리 CAS 파일 기저 정확 단정 —
+// 동일 hash의 hook-only cross-media artifact 2행이어도 ShadowOwnedBytes는
+// 물리 파일 1개의 os.Stat 크기와 정확히 같다(논리 byte_length 2배 합산이면
+// 오구현 — 검수 요구 정밀 단정).
+func TestShadowOwnedBytesPhysical(t *testing.T) {
+	dir := t.TempDir()
+	st := openT(t, dir)
+	h := seedTwoHookArtifactsSameHashDiffMedia(t, st) // 동일 콘텐츠·상이 media_type
+	st.Close()
+	want := statBlobFile(t, dir, h).Size() // artifacts/<h[:2]>/<h> os.Stat
+	sz, err := SizeStats(dir)
+	if err != nil { t.Fatal(err) }
+	if sz.ShadowOwnedBytes != want {
+		t.Fatalf("ShadowOwnedBytes=%d want %d(물리 파일 크기 — 논리 합산 금지)", sz.ShadowOwnedBytes, want)
+	}
+}
+
 // TestSizeStatFileBytes — D40 §2: FileBytes = content.db 파일 실크기.
 func TestSizeStatFileBytes(t *testing.T) {
-	st := openTestStore(t)
+	dir := t.TempDir()
+	st := openT(t, dir)
 	seedHookOnly(t, st)
-	sz, err := st.SizeStat()
+	st.Close()
+	sz, err := SizeStats(dir)
 	if err != nil { t.Fatal(err) }
 	if sz.FileBytes <= 0 {
 		t.Fatalf("FileBytes=%d want >0", sz.FileBytes)
@@ -309,24 +346,56 @@ git commit -m "feat(v0.5): D40 SizeStat 확장 — content_hash 귀속 술어·�
 
 ---
 
-### Task 3: D40 — doctor [14] 확장·[15] 신설 (접두 분해·worktree 순회)
+### Task 3a: D40 — doctor [14] `file=` 병기
 
 **Files:**
-- Modify: `internal/cli/cli.go` (doctor [14]/[15] 출력, worktrees/* 순회)
+- Modify: `internal/cli/cli.go` (doctor [14] 라인)
 - Test: `internal/cli/cli_test.go`
-- 선행 읽기: `internal/cli/cli.go:1180-1330`(doctor [6]~[14]·경고),
-  `cli.go:700-715`(purgeSessionFiles의 worktrees/* 순회 관례),
-  `internal/session/export.go` 또는 session.go의 이벤트 조회·
-  `artifact://` URI 규약(ref 파싱 전례: `internal/hook/hook_test.go:981-1011`)
+- 선행 읽기: `internal/cli/cli.go:1300-1315`([14]·경고)
 
 **Interfaces:**
-- Consumes: Task 2의 SizeStats 확장 필드·귀속 hash 집합.
+- Consumes: Task 2 `SizeStat.FileBytes`.
+- Produces: `[14] content.db: sources=%d artifacts=%d blob=%dB file=%dB`
+  (순서 고정 — 기존 `blob=45B` Contains 단정은 접미 확장에 안전).
+  D38 경고 평가 기준은 [14] blob 그대로(문구 갱신은 Task 5b).
+
+- [ ] **Step 1: 실패 테스트** — 기존 doctor 테스트(cli_test.go:230 부근)
+  옆에 `strings.Contains(out, " file=")` 단정 1개 추가.
+- [ ] **Step 2: RED 확인** — `go test -p 1 ./internal/cli -run TestDoctor -v` → FAIL.
+- [ ] **Step 3: 구현** — [14] Fprintf에 ` file=%dB`(FileBytes) 추가.
+- [ ] **Step 4: GREEN** — `go test -p 1 ./internal/cli -v` 전부 PASS.
+- [ ] **Step 5: 커밋**
+
+```bash
+git add internal/cli/cli.go internal/cli/cli_test.go
+git commit -m "feat(v0.5): D40 doctor [14] file= 병기"
+```
+
+---
+
+### Task 3b: D40 — doctor [15] shadow-owned 접두 분해 (worktree 순회)
+
+**Files:**
+- Modify: `internal/cli/cli.go` ([15] 신설·worktrees/* 순회)
+- Test: `internal/cli/cli_test.go`
+- 선행 읽기: `internal/cli/cli.go:1180-1330`(doctor [6]~[14]),
+  `cli.go:700-715`(purgeSessionFiles의 worktrees/* 순회 관례 —
+  `os.ReadDir(projDir/worktrees)` 인라인, 전용 헬퍼 없음),
+  `internal/session/session.go:300-320`(OpenReadOnly — **raw `*sql.DB`
+  반환**, SQL 직접 조회), `internal/hook/hook_test.go:981-1011`
+  (`artifact://` ref에서 `LastIndex("sha256-")`로 hash 추출하는 선례 —
+  세션ID의 `:` 성분과 무충돌)
+
+**Interfaces:**
+- Consumes: Task 2 `SizeStat.ShadowOwned map[string]int64`(귀속 hash→물리
+  바이트 — 접두별 %dB는 이 맵으로 합산. **CAS 경로를 cli에서 재구성하지
+  말 것** — D13 소유 계약 위반).
 - Produces: doctor 출력 계약(설계 §2, 문면 고정):
-  - `[14] content.db: sources=%d artifacts=%d blob=%dB file=%dB`
   - `[15] shadow-owned: %dB hashes=%d (cc:=%dB cx:=%dB shared=%dB unattributed=%dB)`
-  - 일부 session.db 불용 시 괄호 끝 ` incomplete`, 전부 불용 시
+  - 일부 session.db 불용(열기·조회·스캔·JSON 파싱 어느 단계든) 시 괄호
+    끝 ` incomplete`, 전부 불용 시
     `[15] shadow-owned: %dB hashes=%d (세션 분해 없음)`.
-  - D38 경고 평가 기준은 [14] blob 그대로(문구 갱신은 Task 5b).
+  - 실패는 worktree 단위 격리 — doctor 전역 failed 목록에 넣지 않는다.
 
 - [ ] **Step 1: 실패 테스트 작성**
 
@@ -334,13 +403,14 @@ git commit -m "feat(v0.5): D40 SizeStat 확장 — content_hash 귀속 술어·�
 cli_test.go:230 부근의 시드 방식):
 
 ```go
-// TestDoctorShadowOwnedLine — D40 §2: [14] file= 병기 + [15] 접두 분해.
+// TestDoctorShadowOwnedLine — D40 §2: [15] 접두 분해.
 func TestDoctorShadowOwnedLine(t *testing.T) {
 	// 시드: hook-만 hash 1개(cc: 세션 artifact_created ref 부여),
-	// explicit hash 1개. worktree session.db에 artifact_created 이벤트 기입.
-	...(기존 시드 헬퍼 조합)...
+	// explicit hash 1개. worktree session.db에 artifact_created 이벤트 기입
+	// (sessions 직접 INSERT 선례: session export_test.go:390 방식).
+	...(기존 시드 헬퍼 조합 — doctor 실행 헬퍼는 기존 doctor 테스트 관례)...
 	out := runDoctor(t, storeRoot, projRoot)
-	for _, want := range []string{" file=", "[15] shadow-owned: ", "cc:="} {
+	for _, want := range []string{"[15] shadow-owned: ", "cc:="} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("doctor 출력에 %q 없음:\n%s", want, out)
 		}
@@ -373,33 +443,36 @@ doctor [14] 라인에 ` file=%dB` 추가(Task 2 FileBytes). [15] 신설:
 // [15] D40 §2 — 접두 분해: worktrees/* 전체 순회, 실패는 worktree 단위
 // 격리(열기·조회·스캔·JSON 파싱 어느 단계든 skip+incomplete, 전역 실패
 // 전파 금지).
-type prefixBytes struct{ cc, cx, shared, unattributed int64 }
-owned := ... // Task 2의 귀속 hash 집합 + hash→물리크기 맵
-hashPrefix := map[string]map[string]bool{} // hash → {"cc:","cx:"}
+owned := sz.ShadowOwned // Task 2 산출: 귀속 hash → 물리 바이트
+hashPrefix := map[string]map[string]bool{} // hash → {"cc:","cx:"} 관측 집합
 incomplete := false
-for _, wdir := range listWorktreeDirs(projDir) { // purgeSessionFiles 관례 동형
+entries, _ := os.ReadDir(filepath.Join(projDir, "worktrees")) // 순회 관례 인라인(purgeSessionFiles 동형)
+for _, e := range entries {
+	wdir := filepath.Join(projDir, "worktrees", e.Name())
 	if err := func() error {
-		db, err := session.OpenReadOnly(wdir)
+		db, err := session.OpenReadOnly(wdir) // raw *sql.DB — SQL 직접 조회
 		if err != nil { return err }
 		defer db.Close()
-		rows, err := db.QueryArtifactCreated(ctx) // (session_id, artifact_refs JSON)
+		rows, err := db.QueryContext(ctx,
+			`SELECT session_id, artifact_refs FROM session_events
+			 WHERE event_type='artifact_created' AND artifact_refs IS NOT NULL`)
 		if err != nil { return err }
+		defer rows.Close()
 		for rows.Next() {
-			// ref = "artifact://<session-id>/sha256-<hash>" — 마지막
-			// "/sha256-" 이후가 hash(세션ID의 ':' 성분과 무관, 설계 §2)
+			// artifact_refs = JSON 배열, 각 ref = "artifact://<sid>/sha256-<hash>"
+			// hash 추출은 LastIndex("sha256-") 선례(hook_test.go:995) —
+			// 세션ID의 ':' 성분과 무충돌.
 			...JSON 디코드 + hash 추출 + 접두(cc:/cx:/기타) 기록...
 		}
 		return rows.Err()
 	}(); err != nil {
-		incomplete = true // 해당 worktree만 skip
+		incomplete = true // 해당 worktree만 skip — 전역 failed 금지
 	}
 }
-// hash별: 접두 1종 → 해당 버킷, 2종 이상 → shared, 기록 없음/기타 접두
-// → unattributed. 출력 문면은 Interfaces 계약 그대로.
+// hash별(owned의 키만 대상): 접두 1종 → 해당 버킷에 owned[h] 합산,
+// 2종 이상 → shared, 기록 없음/기타 접두 → unattributed.
+// 출력 문면은 Interfaces 계약 그대로.
 ```
-
-session 계층에 조회 헬퍼가 없으면 **기존 export 경로의 조회를 재사용**
-(신규 인터페이스 정의 금지 — 함수 1개 추가는 가).
 
 - [ ] **Step 4: GREEN + cli 전체 회귀**
 
@@ -410,7 +483,7 @@ Expected: 전부 PASS ([14] 기존 Contains 단정은 접미 확장에 안전 �
 
 ```bash
 git add internal/cli/cli.go internal/cli/cli_test.go
-git commit -m "feat(v0.5): D40 doctor [14] file 병기 + [15] shadow-owned 접두 분해(worktree 순회·incomplete 격리)"
+git commit -m "feat(v0.5): D40 doctor [15] shadow-owned 접두 분해(worktree 순회·incomplete 격리)"
 ```
 
 ---
@@ -419,20 +492,36 @@ git commit -m "feat(v0.5): D40 doctor [14] file 병기 + [15] shadow-owned 접�
 
 **Files:**
 - Modify: `internal/session/retention.go` (Sweep 확장)
+- Modify: `cmd/context-router/main.go` (Sweep 호출자 —
+  sweepSessionRetentionAtStart의 반환 소비·고지 문구, 검수 정정: 기존
+  `(int64, error)` 반환을 "삭제된 이벤트 수"로 출력하므로 시그니처 변경이
+  여기 파급)
 - Modify: `internal/cli/cli.go` ([6] sessions/empty 병기)
 - Test: `internal/session/retention_test.go`(없으면 기존 세션 테스트 파일),
+  `cmd/context-router/main_test.go`(고지 문구 소비처가 있으면),
   `internal/cli/cli_test.go`
 - 선행 읽기: `internal/session/retention.go` 전체,
   `internal/session/session.go:60-100`(스키마·FTS 트리거),
+  `cmd/context-router/main.go:125-140`(sweepSessionRetentionAtStart),
   `internal/cli/cli.go:1198-1215`([6])
 
 **Interfaces:**
-- Produces: `session.Sweep(ctx, d, now)` 반환에 빈 세션 GC 건수 합산
-  (기존 시그니처 유지 — 고지 1줄에 `empty-session GC n건` 병합).
+- Produces(검수 정정 — 두 종류 건수는 기존 `(int64, error)`로 보고 불가):
+  ```go
+  type SweepReport struct {
+  	EventsDeleted        int64 // 기존 retention 삭제 이벤트 수
+  	EmptySessionsDeleted int64 // 빈 세션 GC 세션 수
+  }
+  func Sweep(ctx context.Context, d *DB, now time.Time) (SweepReport, error)
+  ```
+  호출자(main.go) 고지: 기존 stderr 1줄에 `empty-session GC n건` 병합.
   GC 술어(설계 §4, 불변): 비-session_start 이벤트 0건 AND
-  `started_at < now-7d`(상수 `emptySessionMaxAge = 7 * 24 * time.Hour`),
-  retention_sec 무관. **배치 상수 `sweepBatchSessions = 64`** — 세션
-  64개 단위 분할 커밋(잠금 양보, 설계 §4 잠금 예산).
+  `started_at < now-7d`(상수 `emptySessionMaxAgeSec = 7*24*3600`),
+  retention_sec 무관. **배치 상수 `sweepBatchSessions = 64`** — 배치당
+  단일 트랜잭션, 배치 간 잠금 양보(설계 §4 잠금 예산). **후보 선정·빈
+  술어 재검증·DELETE 2종은 반드시 같은 `BEGIN IMMEDIATE` 트랜잭션
+  안에서**(검수 정정 — 후보를 tx 밖에서 선정하면 선정↔삭제 사이에
+  커밋된 실이벤트까지 삭제하는 TOCTOU).
 - Consumes: 없음.
 
 - [ ] **Step 1: 실패 테스트 작성**
@@ -469,6 +558,10 @@ func TestSweepEmptySessionGC(t *testing.T) {
 
 // TestSweepEmptySessionGCBatch — 배치 상수 초과(65개) 시 복수 트랜잭션
 // 커밋(전량 GC됨을 단정 — 분할이 결과를 바꾸지 않음).
+
+// TestSweepEmptySessionGCPreservesLateEvent — barrier(검수 요구): 후보로
+// 보일 세션에 Sweep 직전 실이벤트를 커밋 → 그 세션·이벤트 보존 단정
+// (빈-술어가 DELETE와 같은 tx 안에서 재평가됨을 고정).
 ```
 
 seed 헬퍼는 `export_test.go:390` 방식(직접 INSERT) 재사용.
@@ -481,29 +574,39 @@ Expected: FAIL
 - [ ] **Step 3: Sweep 확장 구현**
 
 ```go
-// D42 §4: 빈 세션 GC — 배치 분할(sweepBatchSessions 단위 커밋, 잠금 양보).
+// D42 §4: 빈 세션 GC — 배치 분할(배치당 단일 BEGIN IMMEDIATE tx).
+// 후보 SELECT·술어 재검증·DELETE 2종이 전부 같은 tx 안(TOCTOU 봉쇄 —
+// tx 밖 후보 선정은 선정↔삭제 사이 커밋된 실이벤트를 오삭제).
 const (
 	emptySessionMaxAgeSec = 7 * 24 * 3600
 	sweepBatchSessions    = 64
 )
 for {
-	// 배치 선정: 빈 세션(비-session_start 이벤트 0) + 7일 경과
-	rows := SELECT session_id FROM sessions s
-	        WHERE s.started_at < ?now - emptySessionMaxAgeSec
-	          AND NOT EXISTS(SELECT 1 FROM session_events e
-	                WHERE e.session_id = s.session_id
-	                  AND e.event_type != 'session_start')
-	        LIMIT sweepBatchSessions
-	if len(rows) == 0 { break }
-	tx: DELETE FROM session_events WHERE session_id IN (...);
-	    DELETE FROM sessions WHERE session_id IN (...);
-	commit // 배치 간 잠금 양보
-	gcCount += len(rows)
+	var n int64
+	err := d.runTx(ctx, func(tx *sql.Tx) error { // BEGIN IMMEDIATE — 기존 tx 관례
+		// 같은 tx 안에서 선정+검증: DELETE의 WHERE에 빈-술어를 직접 내장
+		res, err := tx.Exec(`
+			DELETE FROM sessions WHERE session_id IN (
+				SELECT s.session_id FROM sessions s
+				WHERE s.started_at < ?
+				  AND NOT EXISTS(SELECT 1 FROM session_events e
+				        WHERE e.session_id = s.session_id
+				          AND e.event_type != 'session_start')
+				LIMIT ?)`, nowUnix-emptySessionMaxAgeSec, sweepBatchSessions)
+		// 삭제된 세션의 session_start 이벤트도 같은 tx에서 삭제
+		// (sessions 삭제 대상 목록을 RETURNING 또는 선행 SELECT로 같은 tx 내 확보)
+		...
+		n, _ = res.RowsAffected()
+		return err
+	})
+	if err != nil || n == 0 { break }
+	rep.EmptySessionsDeleted += n // 실삭제 행만 집계
+	// 배치 간 잠금 양보(tx 종료로 자동)
 }
 ```
 
 기존 retention 삭제도 동일 배치 상수로 분할(설계 §4 — 단일 대형 tx 금지).
-고지: 기존 stderr 1줄에 `empty-session GC n건` 병합.
+main.go 호출자 갱신: SweepReport 소비 + 고지 `… empty-session GC n건` 병합.
 
 - [ ] **Step 4: GREEN + session 회귀**
 
@@ -520,8 +623,8 @@ Run: `go test -p 1 ./internal/cli -v` → PASS.
 - [ ] **Step 6: 커밋**
 
 ```bash
-git add internal/session/retention.go internal/session/*_test.go internal/cli/cli.go internal/cli/cli_test.go
-git commit -m "feat(v0.5): D42 빈 세션 GC(7일·retention 무관·배치 분할) + doctor [6] 세션 집계"
+git add internal/session/retention.go internal/session/*_test.go cmd/context-router/main.go cmd/context-router/main_test.go internal/cli/cli.go internal/cli/cli_test.go
+git commit -m "feat(v0.5): D42 빈 세션 GC(SweepReport·tx 내 재검증·배치 분할) + doctor [6] 세션 집계"
 ```
 
 ---
@@ -574,12 +677,16 @@ Append의 이벤트 INSERT를 게이트 형태로 교체(같은 tx 내 모든 �
 원칙). `RowsAffected()==0`이면 세션 부재 오류 반환(기존 오류 매핑 경로).
 미지 세션 이벤트는 write lock을 잡지 않는다(WHERE EXISTS 0행 — 설계 §4).
 
-- [ ] **Step 4: GREEN + 훅 shadow 경로 회귀**
+- [ ] **Step 4: GREEN + shadow 이벤트 타입 게이트 검증(세션 계층)**
 
 Run: `go test -p 1 ./internal/session ./internal/hook -v`
-Expected: 전부 PASS. `internal/hook/hook_test.go`에 1케이스 추가 —
-session_start 직후 세션 행 DELETE 후 shadowCapture 유발 입력 →
-artifact_created·tool_result_summary 0건 단정(shadow 경로도 게이트 확인).
+Expected: 전부 PASS. **검수 정정 — 훅 블랙박스로 shadow 게이트를 검증하지
+말 것**: dispatch는 SessionExists=false면 unknown-session drop 후 조기
+반환이라 shadowCapture에 도달하지 않아, 게이트 없이도 0건이 참이 되는
+공허 테스트가 된다. 대신 **세션 계층에서 직접** 검증한다 — 삭제된 세션에
+`ev.Type="artifact_created"`·`"tool_result_summary"`를 `ad.Append`로 넣어
+거부(0행) 단정. 모든 append가 appendEvent(session.go:652) 단일 경로를
+지나므로 이 단정이 곧 shadowCapture 경로 커버다(설계 §8 계약 충족).
 
 - [ ] **Step 5: resume 자가 회복 회귀**
 
@@ -613,16 +720,25 @@ git commit -m "feat(v0.5): D42 append 존재 게이트(WHERE EXISTS·전체 appe
   type HookPurgeReport struct {
   	Hashes        int   // 행 삭제된 귀속 hash 수
   	ReclaimedB    int64 // 실제 unlink된 물리 바이트 합
-  	DeferredFiles int   // age-gate 유예(1h 이내 mtime) 건수
+  	DeferredFiles int   // age-gate/교체 감지 유예 건수
   	FailedFiles   int   // unlink 실패(orphan 잔존) 건수
   }
   func (s *Store) PurgeHookOnly(ctx context.Context) (HookPurgeReport, error)
+  func (s *Store) Vacuum(ctx context.Context) error // s.writer.ExecContext("VACUUM") — Task 5b 소비(검수 정정: Writer() 접근자 부재)
   ```
 - 실행 계약(설계 §3, 불변): 단일 tx에서 술어 재검증(Task 2 술어 재실행)
   → sources·chunks(FTS 동기)·artifacts 행 삭제 → 커밋 → `lockStore`
-  획득 하에 hash 명시 집합의 파일을 hash별 미참조 재확인 + **mtime
-  age gate(gcOrphanMinAge=1h) 통과 시에만 unlink**. VACUUM은 여기가
-  아니라 CLI(Task 5b)에서 후행.
+  (패키지 함수 — 검수 정정: 메서드 아님) 획득 하에 hash 명시 집합을
+  **rename 격리 프로토콜**로 회수(아래 — 검수 발견: Stat↔unlink 사이에
+  Register의 writeBlob 교체가 끼면 fresh 파일을 오삭제, 이미 읽은
+  ModTime으로는 age gate가 못 막음). VACUUM 실행은 CLI(Task 5b)가
+  `Vacuum(ctx)` 호출로 후행.
+- rename 격리 프로토콜(파일별): ① `os.Rename(p, p+".purging")` — 원자,
+  실패(부재)는 skip ② 격리본 re-Stat: mtime이 gcOrphanMinAge(1h) 이내
+  **또는** DB 재확인에서 참조 존재 → `os.Rename` 롤백 + Deferred++
+  ③ 아니면 `os.Remove(격리본)` + ReclaimedB += size. rename 이후 도착한
+  Register.writeBlob은 원 경로에 새 파일을 만들 뿐이라 무충돌, rename
+  이전 교체분은 격리본의 fresh mtime이 ②에서 걸려 롤백 — 창 폐쇄.
 
 - [ ] **Step 1: 실패 테스트 작성**
 
@@ -657,9 +773,16 @@ func TestPurgeHookOnlyAgeGateDefers(t *testing.T) {
 
 // TestPurgeHookOnlyRevalidates — 견적 후 비-hook source가 생긴 hash는
 // tx 내 재검증으로 대상 제외(행·파일 모두 보존).
+
+// TestPurgeHookOnlyReplacedFileRollsBack — 경합 시뮬(검수 요구): 행 삭제
+// 커밋 후·파일 회수 전 시점에 동일 경로를 fresh mtime 파일로 교체
+// (Register.writeBlob 재등록 시뮬) → rename 격리 ②의 fresh-mtime 검출로
+// 롤백(원 경로 복원·Deferred=1·ReclaimedB=0) 단정.
 ```
 
-`ageBlobFile`은 `os.Chtimes`로 mtime 조작(결정론 — 설계 §8).
+`ageBlobFile`은 `os.Chtimes`로 mtime 조작(결정론 — 설계 §8). 교체 시뮬은
+회수 단계를 함수로 분리해 테스트가 행 삭제와 회수 사이에 개입할 수 있게
+구성한다(내부 함수 분리는 가 — 신규 공개 표면 아님).
 
 - [ ] **Step 2: RED 확인**
 
@@ -671,36 +794,48 @@ Run: `go test -p 1 ./internal/store -run TestPurgeHookOnly -v` → FAIL
 func (s *Store) PurgeHookOnly(ctx context.Context) (HookPurgeReport, error) {
 	var rep HookPurgeReport
 	var hashes []string
-	// ① tx: 술어 재검증(shadowOwnedHashQuery 재실행) + 행 삭제
-	err := s.withTx(ctx, func(tx *sql.Tx) error {
+	// ① tx: 술어 재검증(shadowOwnedHashQuery 재실행) + 행 삭제.
+	// tx 래퍼는 기존 관례(runTx/txRetry — store.go:360/378, 검수 정정:
+	// withTx 아님)를 재사용, 삭제 순서는 PurgeOlderThan(chunks 우선) 동형.
+	err := s.runTx(ctx, func(tx *sql.Tx) error {
 		hashes = queryShadowOwnedHashes(tx) // Task 2 술어 재사용
-		// hash 집합의 artifact id들 → chunks(FTS 동기)·sources·artifacts 삭제
-		// (기존 PurgeOlderThan의 삭제 순서·FTS 처리 관례 재사용)
-		...
+		...chunks(FTS 동기)·sources·artifacts 행 삭제...
 		rep.Hashes = len(hashes)
 		return nil
 	})
 	if err != nil { return rep, err }
-	// ② lockStore 하에 파일 회수 — age gate + 미참조 재확인
-	unlock, err := s.lockStore()
-	if err != nil { return rep, err } // 행 삭제는 유효 — orphan은 --gc 후속
+	// ② lockStore(s.dir) — 패키지 함수(store.go:56, 검수 정정: 메서드
+	// 아님) 획득 하에 rename 격리 회수. 실패해도 행 삭제는 유효(orphan은
+	// --gc 후속).
+	unlock, err := lockStore(s.dir)
+	if err != nil { return rep, err }
 	defer unlock()
 	for _, h := range hashes {
-		p := s.blobPath(h)
-		fi, err := os.Stat(p)
-		if err != nil { continue }
-		if time.Since(fi.ModTime()) < gcOrphanMinAge { // 검증된 1h gate
+		p := filepath.Join(s.dir, "artifacts", h[:2], h) // blobPath 헬퍼 부재 — 인라인 관례
+		q := p + ".purging"
+		if err := os.Rename(p, q); err != nil { continue } // 부재 등 skip
+		fi, err := os.Stat(q)
+		rollback := err != nil ||
+			time.Since(fi.ModTime()) < gcOrphanMinAge || // 교체 감지 겸 age gate
+			stillReferenced(ctx, s, h)                   // DB 재확인
+		if rollback {
+			_ = os.Rename(q, p)
 			rep.DeferredFiles++
 			continue
 		}
-		if stillReferenced(s, h) { continue } // 보조 재확인
-		if err := os.Remove(p); err != nil {
+		if err := os.Remove(q); err != nil {
+			_ = os.Rename(q, p)
 			rep.FailedFiles++
 			continue
 		}
 		rep.ReclaimedB += fi.Size()
 	}
 	return rep, nil
+}
+
+func (s *Store) Vacuum(ctx context.Context) error {
+	_, err := s.writer.ExecContext(ctx, "VACUUM")
+	return err
 }
 ```
 
@@ -712,7 +847,7 @@ Run: `go test -p 1 ./internal/store -v` → 전부 PASS
 
 ```bash
 git add internal/store/store.go internal/store/store_test.go
-git commit -m "feat(v0.5): D41 PurgeHookOnly — 술어 재검증·행 삭제·age-gate CAS 회수"
+git commit -m "feat(v0.5): D41 PurgeHookOnly — 술어 재검증·행 삭제·rename 격리 CAS 회수 + Vacuum API"
 ```
 
 ---
@@ -729,14 +864,21 @@ git commit -m "feat(v0.5): D41 PurgeHookOnly — 술어 재검증·행 삭제·a
   `cli_test.go:295`(무구분 단정)
 
 **Interfaces:**
-- Consumes: Task 5a `PurgeHookOnly`·`HookPurgeReport`, Task 2 견적.
+- Consumes: Task 5a `PurgeHookOnly`·`HookPurgeReport`·`Vacuum(ctx)`,
+  Task 2 `SizeStats(dir)`의 `ShadowOwned` 맵(견적 = 합산·len — 별도
+  estimateShadowOwned 함수 부재, 검수 정정).
 - Produces: CLI 계약(설계 §3) —
-  - `--hook-only`는 `gcOnly`/`sessions`와 동형의 **조기 전용 분기**
-    (전체 삭제 `os.RemoveAll` 기본 분기 비도달).
-  - `--all`·`--older-than`·`--sessions`·`--gc`와 조합 시 사용 오류.
-  - 흐름: store open → 견적([15] 술어) → confirmPurge(견적 문구) →
-    PurgeHookOnly → VACUUM(실패 log-and-continue) → 보고(실회수 바이트 +
-    유예 건수).
+  - `--hook-only`는 **전역 confirmPurge(cli.go:597)보다 앞**에 조기 전용
+    분기로 인터셉트(검수 정정 — sessions:641은 전역 confirm 뒤라 그
+    위치면 확인이 2회 뜬다). 확인은 자체 confirmPurge 1회만, 전체 삭제
+    `os.RemoveAll` 기본 분기 비도달.
+  - `--all`·`--older-than`·`--sessions`·`--gc`와 조합 시 사용 오류
+    (오류 반환은 기존 runPurge의 사용 오류 관례 재사용 — usageError
+    헬퍼 부재, 검수 정정).
+  - 흐름(스펙 §3 순서 고정): store open → 견적(ShadowOwned 합산) →
+    confirmPurge(견적 문구) → PurgeHookOnly → **④ 실회수 보고 먼저** →
+    ⑤ `st.Vacuum(ctx)`(실패는 stderr log-and-continue — 보고를 VACUUM
+    뒤로 미루면 부분 성공 노출이 늦어진다, 검수 정정).
   - [14] 경고 문구: "현행 purge는 source_kind 무구분 삭제 …" →
     `"purge --project <id> --hook-only로 shadow만 선택 삭제 가능"`.
 
@@ -758,6 +900,12 @@ func TestPurgeHookOnlyCLI(t *testing.T) {
 
 // TestDoctorWarnMentionsHookOnly — [14] 경고 문구가 --hook-only를 안내
 // (기존 cli_test.go:295의 "무구분" 단정을 신문구로 갱신 — 설계 §8).
+
+// TestPurgeHookOnlySinglePrompt — TTY 경로에서 확인 프롬프트가 정확히
+// 1회만 출력(--force 없이 — 전역 confirm과의 중복 방지 회귀, 검수 요구).
+
+// TestPurgeHookOnlyVacuumFailureContinues — Vacuum 실패 시에도 실회수
+// 보고는 이미 출력됐고 rc=0(log-and-continue) 단정.
 ```
 
 - [ ] **Step 2: RED 확인**
@@ -767,27 +915,35 @@ Expected: FAIL
 
 - [ ] **Step 3: 구현**
 
-runPurge에 플래그 추가 + 조합 검증 + 조기 분기(sessions:641 앞·동형):
+runPurge에 플래그 추가 + 조합 검증 + 조기 분기(**전역 confirm(597)보다
+앞** — 확인 중복 방지):
 
 ```go
 if *hookOnlyFlag {
 	if *allFlag || *olderThanFlag != "" || *sessionsFlag || *gcFlag {
-		return usageError("--hook-only는 --project와만 조합")
+		return fmt.Errorf("--hook-only는 --project와만 조합") // 기존 사용 오류 관례로 조정
 	}
-	st, err := store.Open(projDir, false) // ⓪ open 선행(견적)
-	...
-	est := estimateShadowOwned(st) // Task 2 술어 — [15]와 동일 수치
+	// ⓪ open 선행(견적) — 검수 정정: 현행 confirm→open 순서를 이 분기에
+	// 한해 open→confirm으로. 견적은 SizeStats(projDir)의 ShadowOwned 합산.
+	sz, err := store.SizeStats(projDir)
+	if err != nil { return err }
+	var estB int64
+	for _, b := range sz.ShadowOwned { estB += b }
 	if err := confirmPurge(in, w, isTTY, *force,
-		fmt.Sprintf("shadow %dB(%d hashes) 선택 삭제", est.Bytes, est.Hashes)); err != nil {
+		fmt.Sprintf("shadow %dB(%d hashes) 선택 삭제", estB, len(sz.ShadowOwned))); err != nil {
 		return err
 	}
+	st, err := store.Open(projDir, false)
+	if err != nil { return err }
+	defer st.Close()
 	rep, err := st.PurgeHookOnly(ctx)
 	if err != nil { return err }
-	if _, verr := st.Writer().Exec("VACUUM"); verr != nil {
+	// ④ 실회수 보고 먼저(스펙 §3 순서) → ⑤ VACUUM 후행
+	fmt.Fprintf(w, "hook-only purge: 실회수 %dB(%d hashes), 유예 %d건, 실패 %d건\n",
+		rep.ReclaimedB, rep.Hashes, rep.DeferredFiles, rep.FailedFiles)
+	if verr := st.Vacuum(ctx); verr != nil {
 		fmt.Fprintf(stderr, "ctr: VACUUM 실패(계속 진행 — 서버 정지 후 재실행 시 회수): %v\n", verr)
 	}
-	fmt.Fprintf(w, "hook-only purge: 실회수 %dB(%d hashes), age-gate 유예 %d건, 실패 %d건\n",
-		rep.ReclaimedB, rep.Hashes, rep.DeferredFiles, rep.FailedFiles)
 	return nil
 }
 ```
@@ -813,6 +969,10 @@ git commit -m "feat(v0.5): D41 purge --hook-only CLI 배선 — 조기 분기·�
 - Modify: `internal/cli/cli.go:36` 부근(구명 `CTR_SHADOW_WARN_BYTES` 주석 제거)
 - Modify: `docs/context-router-design-v0.4-ko.md` D38 항목(구명 병기 구절 제거)
 - Modify: `cmd/context-router/main.go:29` (`const version = "0.5.0"`)
+- Modify: `internal/mcp/mcp.go:30` (`const ServerVersion = "0.5.0"` —
+  **검수 발견 C1**: `cmd/context-router/main_test.go:33`의
+  `TestVersionPinnedToServerVersion`이 두 상수 동일을 강제한다. main.go만
+  바꾸면 전체 스위트 RED — 반드시 동반 범프)
 - Test: 기존 스위트 회귀만(신규 테스트 없음 — 주석·문서·상수)
 
 **Interfaces:** 없음.
@@ -822,18 +982,19 @@ git commit -m "feat(v0.5): D41 purge --hook-only CLI 배선 — 조기 분기·�
 - [ ] **Step 2: v0.4 설계서 D38 문면의 "구 `CTR_SHADOW_WARN_BYTES`" 병기
   구절만 제거**(D38 항목 나머지 불변 — append-only는 docs/prompts 규약,
   설계 정본은 amend-in-place).
-- [ ] **Step 3: version 상수 0.5.0** + 마커 검증 테스트가 버전 문자열을
-  참조하면 함께 갱신(선행 Grep: `0\.4\.0` in *.go).
+- [ ] **Step 3: 버전 상수 2개 동반 범프** — main.go:29 `version`과
+  mcp.go:30 `ServerVersion`을 함께 `"0.5.0"`으로(§1.1의 "버전 상수"는
+  실제 2개다). 그 외 잔여 확인: Grep `0\.4\.0` in `*.go`.
 - [ ] **Step 4: 전체 회귀**
 
 Run: `go test -p 1 ./...`
-Expected: 전부 PASS
+Expected: 전부 PASS (`TestVersionPinnedToServerVersion` 포함)
 
 - [ ] **Step 5: 커밋**
 
 ```bash
-git add internal/cli/cli.go docs/context-router-design-v0.4-ko.md cmd/context-router/main.go
-git commit -m "chore(v0.5): 구명 breadcrumb 2건 제거 + version 0.5.0"
+git add internal/cli/cli.go docs/context-router-design-v0.4-ko.md cmd/context-router/main.go internal/mcp/mcp.go
+git commit -m "chore(v0.5): 구명 breadcrumb 2건 제거 + version·ServerVersion 0.5.0"
 ```
 
 ---
@@ -841,28 +1002,57 @@ git commit -m "chore(v0.5): 구명 breadcrumb 2건 제거 + version 0.5.0"
 ### Task 7: 통합 — 전체 회귀·도그푸딩 스모크·PR
 
 - [ ] **Step 1: 전체 스위트** — `go test -p 1 ./...` 전부 PASS.
-- [ ] **Step 2: 도그푸딩 스모크(컨트롤러 수행)** — `go install
-  ./cmd/context-router` 후 실store에 `context-router doctor` 1회:
-  [14] `file=` 병기·[15] 라인·[6] `sessions=78 (empty=55)` 상당 출력 확인
-  (실측치는 시점에 따라 다름 — 문면 존재만 단정). 파괴적 명령
-  (purge) 은 실store에 실행하지 않는다.
+- [ ] **Step 2: 도그푸딩 스모크(컨트롤러 수행)** — **검수 정정: `go
+  install` 금지**(전역 GOBIN을 덮어 리뷰 전 코드가 활성 훅 바이너리로
+  즉시 투입되거나, PATH 불일치 시 구버전을 검사하는 거짓 양성). 대신:
+
+  ```
+  go build -o "$env:TEMP\ctr-smoke\context-router.exe" ./cmd/context-router
+  & "$env:TEMP\ctr-smoke\context-router.exe" doctor   # 절대경로 직접 실행
+  ```
+
+  [14] `file=` 병기·[15] 라인·[6] `sessions=… (empty=…)` 문면 존재만
+  단정(실측치는 시점 의존). 파괴적 명령(purge)은 실store에 실행하지
+  않는다. **활성 훅 바이너리 교체(`go install`)는 머지 후 별도
+  단계**(아래 Step 4 이후)로 분리.
 - [ ] **Step 3: PR 생성** — base main, 제목 `feat: v0.5 store 수명주기
   (D40~D43)`, 본문에 설계 정본·§11 검수 요약 링크. 3-OS CI GREEN 확인.
 - [ ] **Step 4: 머지·태그는 최종 리뷰(이중: 서브에이전트+Codex `review
-  --base`) 통과 후** — 표준 프로토콜. 태그 `v0.5.0`.
+  --base`) 통과 후** — 표준 프로토콜. 태그 `v0.5.0`. 머지 후에만
+  `go install ./cmd/context-router`로 도그푸딩 바이너리 갱신.
 
 ---
 
 ## Self-Review 기록
 
-- 스펙 커버리지: §1.1 6항목 ↔ Task 1(D43)·2/3(D40)·4a/4b(D42)·5a/5b(D41)·
-  6(편승·버전)·7(릴리스) — 갭 없음. §3 실행 계약 ⓪~⑤ ↔ Task 5a(②③④)·
-  5b(⓪①⑤). §4 3계약 ↔ 4a(GC·배치)·4b(게이트·resume). §8 검증 계약의
-  각 항목이 태스크 내 테스트로 배치됨(cross-media·raw_blob_hash·URI 추출·
-  incomplete·age gate 유예·조합 거부·기본 분기 비도달·배치 분할·[6] 정보성·
-  {2,5}필드·5필드 수용·경고 문구 갱신).
-- 타입 일관성: `HookPurgeReport`·`PurgeHookOnly`·`ShadowOwnedBytes`·
-  `ShadowOwnedHashes`·`sweepBatchSessions`·`emptySessionMaxAgeSec` 명칭을
-  태스크 간 교차 참조로 고정.
+- 스펙 커버리지: §1.1 6항목 ↔ Task 1(D43)·2/3a/3b(D40)·4a/4b(D42)·
+  5a/5b(D41)·6(편승·버전)·7(릴리스) — 갭 없음. §3 실행 계약 ⓪~⑤ ↔
+  Task 5a(②③④의 store 작업+Vacuum API)·5b(⓪①·④보고·⑤호출). §4 3계약 ↔
+  4a(GC·배치·tx 내 재검증)·4b(게이트·resume). §8 검증 계약의 각 항목이
+  태스크 내 테스트로 배치됨(cross-media·raw_blob_hash·URI 추출·incomplete·
+  rename 격리 유예·경합 롤백·조합 거부·기본 분기 비도달·배치 분할·barrier·
+  [6] 정보성·{2,5}필드·5필드 수용·경고 문구 갱신·TTY 단일 프롬프트·
+  VACUUM 실패 continue).
+- 타입 일관성: `HookPurgeReport`·`PurgeHookOnly`·`Vacuum`·`SizeStat`(단수
+  구조체)/`SizeStats(dir)`(패키지 함수)·`ShadowOwned`(맵)·
+  `ShadowOwnedBytes`·`ShadowOwnedHashes`·`SweepReport`·
+  `sweepBatchSessions`·`emptySessionMaxAgeSec` 명칭을 태스크 간 교차
+  참조로 고정.
 - 계획 코드 블록은 설계 계약 기준 — 구현자는 선행 읽기 후 기존 시그니처에
   맞춰 조정하되 Interfaces 블록의 이름·계약은 불변.
+
+## 계획 체크포인트 적대 검수 반영 (2026-07-22, 초판 8a53164 대상)
+
+- 이중 검수: 서브에이전트(opus) C1·I3·M5·분할 권고 + Codex(high 4·
+  medium 2, NO-SHIP) — 전 건 반영.
+- 수렴: Vacuum 접근자 부재·Task 5b 스코프 공백(→ Task 5a에 `Vacuum(ctx)`
+  신설), SizeStat 심볼 반전(→ 실코드 API 고정 + 물리 기저 정확 단정).
+- Codex 고유: CAS 회수 Stat↔unlink 창(→ rename 격리 프로토콜), 빈 세션
+  GC 후보 tx 밖 선정(→ tx 내 재검증 + barrier 테스트), `go install`
+  스모크의 활성 훅 오염(→ `go build -o` 임시경로), Sweep `(int64,error)`
+  로 2종 건수 보고 불가(→ `SweepReport` + main.go 스코프 편입), confirm
+  중복·보고/VACUUM 순서(→ 전역 confirm 앞 분기·보고 선행).
+- 서브에이전트 고유: `mcp.ServerVersion` 동반 범프 누락(C — Task 6),
+  hash→크기 맵 인터페이스 공백(→ `ShadowOwned` 맵), shadow 게이트 훅
+  블랙박스 테스트 공허(→ 세션 계층 직접 Append 검증), dropsByReason
+  경로 입력·sid8 접두 함정 문면 정정, Task 3 분할(3a/3b).
