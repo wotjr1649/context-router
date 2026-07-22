@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -314,6 +315,141 @@ func TestRunDoctor_StoreSizeWarnSilentUnderThreshold(t *testing.T) {
 	}
 	if strings.Contains(buf.String(), "[14] warning") {
 		t.Fatalf("경고가 임계 미만에서 발화:\n%s", buf.String())
+	}
+}
+
+// seedShadowContentDB — projDir/content.db에 hook 단독(귀속) 아티팩트 1개 + file(비귀속) 1개를
+// Register하고 귀속 hash(=hex(sha256(hookContent))=CAS 파일명=ShadowOwned 키)를 반환한다.
+func seedShadowContentDB(t *testing.T, projDir string) (ownedHash string) {
+	t.Helper()
+	st, err := store.Open(projDir, false)
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	const hookContent = "hook-only-shadow-content"
+	if _, err := st.Register(context.Background(), store.Registration{
+		StoredBytes: []byte(hookContent), MediaType: "text/plain",
+		Source: store.SourceMeta{URI: "shadow:Bash:1", Kind: "hook", SrcHash: "sh-hook"},
+	}); err != nil {
+		t.Fatalf("register hook: %v", err)
+	}
+	if _, err := st.Register(context.Background(), store.Registration{ // 비귀속(file 직접 참조) — 버킷에 안 들어가야 함
+		StoredBytes: []byte("explicit-file-content"), MediaType: "text/plain",
+		Source: store.SourceMeta{URI: "/tmp/f.txt", Kind: "file", SrcHash: "sh-file"},
+	}); err != nil {
+		t.Fatalf("register file: %v", err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatalf("store.Close: %v", err)
+	}
+	sum := sha256.Sum256([]byte(hookContent))
+	return hex.EncodeToString(sum[:])
+}
+
+// seedShadowWorktree — wdir에 정상 session.db를 부트스트랩(session.Open)한 뒤 지정 session_id로
+// artifact_created 이벤트 1건을 raw INSERT한다. session_id 접두(cc:/cx:)를 통제해야 하는데
+// session.Open은 서버 UUID를 발급하므로 공개 API로는 만들 수 없다 — 실제 훅 경로도 external
+// 접두 session_id로 append한다(hook_test.go:110). artifact_refs는 정본 URI JSON 배열.
+func seedShadowWorktree(t *testing.T, wdir, sid string, refs []string) {
+	t.Helper()
+	d, err := session.Open(wdir, session.Options{Producer: "context-router/test"})
+	if err != nil {
+		t.Fatalf("session.Open(%s): %v", wdir, err)
+	}
+	if err := d.Close(); err != nil {
+		t.Fatalf("session.Close: %v", err)
+	}
+	dbPath := filepath.ToSlash(filepath.Join(wdir, "session.db"))
+	db, err := sql.Open("sqlite", "file:"+dbPath+"?_pragma=busy_timeout(5000)")
+	if err != nil {
+		t.Fatalf("open session.db rw: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+	refsJSON, err := json.Marshal(refs)
+	if err != nil {
+		t.Fatalf("marshal refs: %v", err)
+	}
+	if _, err := db.Exec(`INSERT INTO session_events(event_id, session_id, event_type, ts, summary, artifact_refs, redaction)
+		VALUES(?,?,?,?,?,?,?)`, "evt-"+sid, sid, "artifact_created", int64(1700000000), "seeded shadow", string(refsJSON), "none"); err != nil {
+		t.Fatalf("insert artifact_created: %v", err)
+	}
+	if _, err := db.Exec("PRAGMA wal_checkpoint(TRUNCATE)"); err != nil { // ro doctor가 결정적으로 보게 flush
+		t.Fatalf("checkpoint: %v", err)
+	}
+}
+
+// TestDoctorShadowOwnedLine — D40 §2: [15] 접두 분해. hook 단독(귀속) hash를 cc: 세션이
+// artifact_created로 참조 → cc: 버킷. 비귀속(file) ref는 귀속 hash가 아니라 무시된다.
+func TestDoctorShadowOwnedLine(t *testing.T) {
+	storeRoot := t.TempDir()
+	projectRoot := t.TempDir()
+	canon, err := ident.Canonicalize(projectRoot)
+	if err != nil {
+		t.Fatalf("canonicalize: %v", err)
+	}
+	projDir := filepath.Join(storeRoot, "projects", canon.ProjectID)
+	ownedHash := seedShadowContentDB(t, projDir)
+
+	sid := "cc:00000000-0000-7000-8000-0000000000aa"
+	seedShadowWorktree(t, filepath.Join(projDir, "worktrees", "wt1"), sid, []string{
+		"artifact://" + sid + "/sha256-" + ownedHash,               // 귀속 → cc: 버킷
+		"artifact://" + sid + "/sha256-" + strings.Repeat("e", 64), // 비귀속 → 무시
+	})
+
+	var buf bytes.Buffer
+	if err := runDoctor(context.Background(), &buf, storeRoot, projectRoot, "0.0.1-dev"); err != nil {
+		t.Fatalf("runDoctor err=%v out=%s", err, buf.String())
+	}
+	out := buf.String()
+	for _, want := range []string{"[15] shadow-owned: ", "cc:=", "hashes=1", "cx:=0B shared=0B unattributed=0B"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("doctor 출력에 %q 없음:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "세션 분해 없음") || strings.Contains(out, "incomplete") {
+		t.Fatalf("정상 경로인데 '세션 분해 없음'/'incomplete' 병기:\n%s", out)
+	}
+}
+
+// TestDoctorShadowOwnedIncomplete — 손상 session.db 1개가 섞여도 그 worktree만 건너뛰고 괄호
+// 끝에 incomplete를 병기하며, [15] 실패는 doctor 전역 failed에 안 들어가 성공 종료한다.
+func TestDoctorShadowOwnedIncomplete(t *testing.T) {
+	storeRoot := t.TempDir()
+	projectRoot := t.TempDir()
+	canon, err := ident.Canonicalize(projectRoot)
+	if err != nil {
+		t.Fatalf("canonicalize: %v", err)
+	}
+	projDir := filepath.Join(storeRoot, "projects", canon.ProjectID)
+
+	// 정상 worktree 1개(비어 있어도 열림 → usable≥1이어야 incomplete 형식이 나온다).
+	d, err := session.Open(filepath.Join(projDir, "worktrees", "ok"), session.Options{Producer: "context-router/test"})
+	if err != nil {
+		t.Fatalf("session.Open ok: %v", err)
+	}
+	if err := d.Close(); err != nil {
+		t.Fatalf("session.Close ok: %v", err)
+	}
+
+	// 손상 worktree: 0xEE 4096B session.db(SQLITE_NOTADB) — 첫 쿼리에서 오류(mcp_test.go:1937).
+	corrupt := filepath.Join(projDir, "worktrees", "corrupt")
+	if err := os.MkdirAll(corrupt, 0o755); err != nil {
+		t.Fatalf("mkdir corrupt: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(corrupt, "session.db"), bytes.Repeat([]byte{0xEE}, 4096), 0o600); err != nil {
+		t.Fatalf("write corrupt session.db: %v", err)
+	}
+
+	var buf bytes.Buffer
+	if err := runDoctor(context.Background(), &buf, storeRoot, projectRoot, "0.0.1-dev"); err != nil {
+		t.Fatalf("runDoctor err=%v ([15] 실패가 전역 failed로 새면 안 됨) out=%s", err, buf.String())
+	}
+	out := buf.String()
+	if !strings.Contains(out, "[15] shadow-owned: ") || !strings.Contains(out, "incomplete") {
+		t.Fatalf("incomplete 병기 없음:\n%s", out)
+	}
+	if strings.Contains(out, "세션 분해 없음") {
+		t.Fatalf("usable worktree가 있는데 '세션 분해 없음':\n%s", out)
 	}
 }
 
