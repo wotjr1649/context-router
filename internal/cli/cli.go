@@ -547,11 +547,24 @@ func runPurge(ctx context.Context, in io.Reader, w, stderr io.Writer, storeRoot 
 	gc := fs.Bool("gc", false, "orphan blob GC 수행")
 	force := fs.Bool("force", false, "비TTY 환경에서 확인을 생략(자동화 전용)")
 	sessions := fs.Bool("sessions", false, "session.db 파일(계열, -wal/-shm 포함) 삭제 대상 포함 — .bak-*·recover-pending 마커는 제외(설계 §5)")
+	hookOnly := fs.Bool("hook-only", false, "shadow 귀속(참조가 전부 hook) 아티팩트만 선택 삭제(--project 전용) — content.db·explicit 소스는 보존(설계 §3, D41)")
 	if err := fs.Parse(args); err != nil {
 		return fmt.Errorf("purge: 플래그 파싱 실패: %w", err)
 	}
 	if rest := fs.Args(); len(rest) > 0 {
 		return fmt.Errorf("purge: 예상치 않은 인자 %d개", len(rest))
+	}
+	// D41 조기 분기: --hook-only는 전역 confirmPurge(아래)·전체 삭제(os.RemoveAll)에 도달하기
+	// 전에 전용 경로로 인터셉트한다 — 그러지 않으면(예: --sessions처럼 전역 confirm 뒤에 두면)
+	// 확인 프롬프트가 2회 뜬다(설계 §3). --project 단독과만 조합 가능하다.
+	if *hookOnly {
+		if *all || *olderThanFlag != "" || *sessions || *gc {
+			return errors.New("purge: --hook-only는 --project와만 조합할 수 있습니다")
+		}
+		if *project == "" {
+			return errors.New("purge: --hook-only는 --project가 필요합니다")
+		}
+		return runPurgeHookOnly(ctx, in, w, stderr, storeRoot, *project, *force, isTTY)
 	}
 	if (*project != "") == *all {
 		return errors.New("purge: --project와 --all 중 정확히 하나를 지정해야 합니다")
@@ -681,6 +694,58 @@ func runPurge(ctx context.Context, in io.Reader, w, stderr io.Writer, storeRoot 
 		}
 	}
 	return nil
+}
+
+// runPurgeHookOnly: purge --hook-only 전용 경로(설계 §3, D41). shadow 귀속(그 hash를 참조하는
+// 소스가 전부 hook) 아티팩트만 삭제하고 content.db·explicit 소스는 보존한다. 흐름 순서 고정:
+// ⓪ store open 선행(견적) — 이 분기 한정으로 현행 confirm→open을 open→confirm으로 재배치한다
+// (견적 문구를 confirm에 담기 위해). 견적은 store.SizeStats(projDir)의 ShadowOwned 물리 바이트
+// 합·hash 수다(별도 견적 함수 없음). ① confirmPurge(견적 문구) → ② PurgeHookOnly → ④ 실회수
+// 보고 먼저 → ⑤ VACUUM 후행(실패는 stderr log-and-continue·rc=0 — 부분 성공 노출을 VACUUM 뒤로
+// 미루지 않는다). SizeStats는 content.db가 없으면 (nil,nil)이라, phantom 프로젝트(store.Open이
+// 없는 대상을 새로 생성)를 막기 위해 열기 전 content.db 실재를 먼저 판정한다(runPurge와 동형).
+func runPurgeHookOnly(ctx context.Context, in io.Reader, w, stderr io.Writer, storeRoot, project string, force, isTTY bool) error {
+	id, err := purgeProjectID(storeRoot, project)
+	if err != nil {
+		return errors.New("purge: 프로젝트 식별 실패")
+	}
+	projDir := filepath.Join(storeRoot, "projects", id)
+	if _, err := os.Stat(filepath.Join(projDir, "content.db")); err != nil {
+		return errors.New("purge: 대상 프로젝트 없음")
+	}
+	var estBytes int64
+	var estHashes int
+	if sz, err := store.SizeStats(projDir); err != nil {
+		return err
+	} else if sz != nil {
+		for _, b := range sz.ShadowOwned {
+			estBytes += b
+		}
+		estHashes = len(sz.ShadowOwned)
+	}
+	if err := confirmPurge(in, w, isTTY, force, fmt.Sprintf("shadow %dB(%d hashes) 선택 삭제", estBytes, estHashes)); err != nil {
+		return err
+	}
+	st, err := store.Open(projDir, false)
+	if err != nil {
+		return err
+	}
+	rep, purgeErr := st.PurgeHookOnly(ctx)
+	if purgeErr == nil {
+		// ④ 실회수 보고 먼저(스펙 §3 순서) — VACUUM 성패와 무관하게 부분 성공을 즉시 노출한다.
+		fmt.Fprintf(w, "hook-only purge: 실회수 %dB(%d hashes), 유예 %d건, 실패 %d건\n",
+			rep.ReclaimedB, rep.Hashes, rep.DeferredFiles, rep.FailedFiles)
+		// ⑤ VACUUM 후행 — 실패는 log-and-continue(rc=0). 서버 점유 등으로 배타 잠금을 못 잡으면
+		// 실패하는데, 행 삭제는 이미 커밋되어 유효하므로 서버 정지 후 재실행 시 파일 크기가 회수된다.
+		if verr := st.Vacuum(ctx); verr != nil {
+			fmt.Fprintf(stderr, "ctr: VACUUM 실패(계속 진행 — 서버 정지 후 재실행 시 회수): %v\n", verr)
+		}
+	}
+	closeErr := st.Close()
+	if purgeErr != nil {
+		return purgeErr
+	}
+	return closeErr
 }
 
 // runGCOrphan: read-only store로 orphan blob GC만 수행한다(gcOnly·세션 단독+--gc 두 경로
@@ -1330,7 +1395,7 @@ func runDoctor(ctx context.Context, w io.Writer, storeRoot, projectRoot, version
 		// D38 — CAS 전체 blob 총량 경고(shadow 전용 아님 — [14] 측정 실체 그대로). 관측 채널이지
 		// 정책 집행이 아니다(D27): 자동 삭제 없음. SizeStats 실패 경로는 이 분기 밖이라 미평가.
 		if warn := storeWarnBytes(os.Getenv); sz.BlobBytes > warn {
-			fmt.Fprintf(w, "[14] warning: blob %dB > 임계 %dB(CTR_STORE_WARN_BYTES) — 수동 구제는 purge 계열 CLI(현행 purge는 source_kind 무구분 삭제 — shadow만 선택 삭제 불가). 자동 삭제 없음\n", sz.BlobBytes, warn)
+			fmt.Fprintf(w, "[14] warning: blob %dB > 임계 %dB(CTR_STORE_WARN_BYTES) — 수동 구제는 purge 계열 CLI(purge --project <id> --hook-only로 shadow만 선택 삭제 가능). 자동 삭제 없음\n", sz.BlobBytes, warn)
 		}
 	}
 
