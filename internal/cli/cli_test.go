@@ -319,6 +319,52 @@ func TestRunDoctor_StoreSizeWarnSilentUnderThreshold(t *testing.T) {
 	}
 }
 
+// TestRunDoctor_ContentFileWarn — D46 발화: 전용 키만 소액 설정 — content.db 파일은 항상 >1B.
+// 픽스처·doctor 실행부는 TestRunDoctor_StoreSizeWarn과 동일.
+func TestRunDoctor_ContentFileWarn(t *testing.T) {
+	storeRoot, projectRoot := doctorSizeWarnSetup(t)
+	t.Setenv("CTR_CONTENT_FILE_WARN_BYTES", "1")
+	var buf bytes.Buffer
+	if err := runDoctor(context.Background(), &buf, storeRoot, projectRoot, "0.0.1-dev"); err != nil {
+		t.Fatalf("runDoctor err=%v out=%s", err, buf.String())
+	}
+	out := buf.String()
+	if !strings.Contains(out, "[14] warning: file ") || !strings.Contains(out, "CTR_CONTENT_FILE_WARN_BYTES") {
+		t.Fatalf("파일 축 경고 미발화:\n%s", out)
+	}
+}
+
+// TestRunDoctor_ContentFileWarnAxisIndependent — D46 축 독립: blob 키만 낮추면 blob 경고만
+// 발화하고 파일 경고는 기본 100MiB 임계라 침묵한다(소형 픽스처 ≪ 100MiB — 전용 키 분리 판별).
+func TestRunDoctor_ContentFileWarnAxisIndependent(t *testing.T) {
+	storeRoot, projectRoot := doctorSizeWarnSetup(t)
+	t.Setenv("CTR_STORE_WARN_BYTES", "1")
+	var buf bytes.Buffer
+	if err := runDoctor(context.Background(), &buf, storeRoot, projectRoot, "0.0.1-dev"); err != nil {
+		t.Fatalf("runDoctor err=%v out=%s", err, buf.String())
+	}
+	out := buf.String()
+	if !strings.Contains(out, "[14] warning: blob ") {
+		t.Fatalf("blob 경고 미발화:\n%s", out)
+	}
+	if strings.Contains(out, "[14] warning: file ") {
+		t.Fatalf("blob 키 조정이 파일 축 경고를 발화(키 분리 위반):\n%s", out)
+	}
+}
+
+// TestContentFileWarnBytes — CTR_CONTENT_FILE_WARN_BYTES 양수만 채택(storeWarnBytes와 동형).
+func TestContentFileWarnBytes(t *testing.T) {
+	if got := contentFileWarnBytes(func(string) string { return "" }); got != 100<<20 {
+		t.Fatalf("기본값: %d", got)
+	}
+	if got := contentFileWarnBytes(func(string) string { return "12345" }); got != 12345 {
+		t.Fatalf("env 채택: %d", got)
+	}
+	if got := contentFileWarnBytes(func(string) string { return "-1" }); got != 100<<20 {
+		t.Fatalf("비양수 거부: %d", got)
+	}
+}
+
 // seedShadowContentDB — projDir/content.db에 hook 단독(귀속) 아티팩트 1개 + file(비귀속) 1개를
 // Register하고 귀속 hash(=hex(sha256(hookContent))=CAS 파일명=ShadowOwned 키)를 반환한다.
 func seedShadowContentDB(t *testing.T, projDir string) (ownedHash string) {
