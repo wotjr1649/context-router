@@ -79,14 +79,14 @@ func TestSweepEmptySessionGC(t *testing.T) {
 	old := now.Add(-8 * 24 * time.Hour).Unix()   // 7일 경과 → GC
 	fresh := now.Add(-6 * 24 * time.Hour).Unix() // 미경과 → 보존
 
-	seedSession(t, d, "cc:aaa-old-empty-r0", old, 0)        // retention 0 무관 GC
+	seedSession(t, d, "cc:aaa-old-empty-r0", old, 0)         // retention 0 무관 GC
 	seedSession(t, d, "cc:bbb-old-empty-r30d", old, 2592000) // retention 30d 무관 GC
 	seedSessionStart(t, d, "cc:aaa-old-empty-r0", old)       // session_start만
 	seedSessionStart(t, d, "cc:bbb-old-empty-r30d", old)
-	seedSessionStart(t, d, "cc:bbb-old-empty-r30d", old+1)   // session_start 복수도 빈 세션
-	seedSession(t, d, "cc:ccc-fresh-empty", fresh, 0)        // 미경과 보존
+	seedSessionStart(t, d, "cc:bbb-old-empty-r30d", old+1) // session_start 복수도 빈 세션
+	seedSession(t, d, "cc:ccc-fresh-empty", fresh, 0)      // 미경과 보존
 	seedSessionStart(t, d, "cc:ccc-fresh-empty", fresh)
-	seedSession(t, d, "cc:ddd-old-realevt", old, 0)          // 실이벤트 보유 → 보존
+	seedSession(t, d, "cc:ddd-old-realevt", old, 0) // 실이벤트 보유 → 보존
 	seedSessionStart(t, d, "cc:ddd-old-realevt", old)
 	insertRawEvent(t, d, "e1", "cc:ddd-old-realevt", "tool_call", old+1, "x", nil, nil, nil, "none", "")
 

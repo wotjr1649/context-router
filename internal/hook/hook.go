@@ -74,7 +74,7 @@ func Run(ctx context.Context, stdin io.Reader, stdout io.Writer, storeRoot, vers
 		return 0
 	}
 	if host != HostClaude && host != HostCodex {
-		_, _ = io.Copy(io.Discard, stdin) // drain — broken pipe 방지
+		_, _ = io.Copy(io.Discard, stdin)             // drain — broken pipe 방지
 		appendDrop(storeRoot, "bad-host", "", "", "") // 오귀속 대신 drop(D35 격리)
 		return 0
 	}
