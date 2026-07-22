@@ -108,14 +108,15 @@ func Run(ctx context.Context, stdin io.Reader, stdout io.Writer, storeRoot, vers
 
 	ctx, cancel := context.WithTimeout(ctx, deadline(getenv))
 	defer cancel()
-	dispatch(ctx, in, dir, contentDir, canon.WorktreeRoot, string(host)+":"+in.SessionID, version, getenv, stdout)
+	dispatch(ctx, in, dir, contentDir, canon.WorktreeRoot, host, version, getenv, stdout)
 	return 0
 }
 
 // dispatch — 세션 식별 완료 후의 open·branch 경로(설계 §2.2). Run에서 분리해 핸들러 길이 규율
 // (≤50줄, D13)을 지키고 T5~T7이 합류할 단일 이음새를 만든다. 모든 실패는 drop 후 조용히 반환한다
 // (Run이 항상 0을 반환하는 fail-open 계약의 연장).
-func dispatch(ctx context.Context, in hookInput, dir, contentDir, worktreeRoot, external, version string, getenv func(string) string, stdout io.Writer) {
+func dispatch(ctx context.Context, in hookInput, dir, contentDir, worktreeRoot string, host Host, version string, getenv func(string) string, stdout io.Writer) {
+	external := string(host) + ":" + in.SessionID // 세션 네임스페이스 접두(D35) — host는 이제 명시 파라미터
 	ad, err := session.OpenAppend(ctx, dir, session.AppendOptions{
 		ExternalSessionID: external,
 		Producer:          fmt.Sprintf("context-router/%s", version),
@@ -155,7 +156,7 @@ func dispatch(ctx context.Context, in hookInput, dir, contentDir, worktreeRoot, 
 		case "Read":
 			guardRead(ctx, ad, in, dir, contentDir, worktreeRoot, getenv, stdout)
 		case "Bash":
-			guardBash(ctx, ad, in, dir, contentDir, worktreeRoot, getenv, stdout)
+			guardBash(ctx, ad, in, dir, contentDir, worktreeRoot, host, getenv, stdout)
 		case "PowerShell":
 			guardPowerShell(ctx, ad, in, dir, contentDir, worktreeRoot, getenv, stdout)
 		}
@@ -226,18 +227,18 @@ func guardRead(ctx context.Context, ad *session.AppendDB, in hookInput, dir, con
 	denyTool(ctx, ad, in, dir, "Read", workspaceRel(in.CWD, f.FilePath)+" "+strconv.FormatInt(info.Size(), 10)+"B", stdout)
 }
 
-// guardBash — D32 Bash 단일파일 덤프 가드(guardRead의 형제, 설계 v0.3 §4). 정적
-// 판정(bashDumpArg 어휘 + dumpAbsPath 절대경로) 성립 시에만 D25 4조건(임계 초과·
-// 경계 내·denylist 아님·현장 인덱싱 성공)을 guardRead와 동일 경로로 판정하고
-// deny한다. 그 외 전부 통과.
-func guardBash(ctx context.Context, ad *session.AppendDB, in hookInput, dir, contentDir, worktreeRoot string, getenv func(string) string, stdout io.Writer) {
+// guardBash — D32 Bash 단일파일 덤프 가드(guardRead의 형제, 설계 v0.3 §4·v0.7 D47). 정적
+// 판정(guardDumpPath — host×GOOS 단독 게이트: cx:+Windows는 PS 게이트, 그 외는 bash 게이트)
+// 성립 시에만 D25 4조건(임계 초과·경계 내·denylist 아님·현장 인덱싱 성공)을 guardRead와 동일
+// 경로로 판정하고 deny한다. 그 외 전부 통과.
+func guardBash(ctx context.Context, ad *session.AppendDB, in hookInput, dir, contentDir, worktreeRoot string, host Host, getenv func(string) string, stdout io.Writer) {
 	var f struct {
 		Command string `json:"command"`
 	}
 	if json.Unmarshal(in.ToolInput, &f) != nil {
 		return
 	}
-	path := dumpAbsPath(runtime.GOOS, bashDumpArg(f.Command))
+	path := guardDumpPath(host, runtime.GOOS, f.Command)
 	if path == "" {
 		return // 정적 판정 불가·비덤프·비절대 — 통과
 	}
@@ -256,8 +257,13 @@ func guardBash(ctx context.Context, ad *session.AppendDB, in hookInput, dir, con
 		return // 경계 밖·denylist·oversize·색인 실패 — 통과
 	}
 	// warning detail: 명령·상대 파일·크기·안내 요지(설계 §4). workspaceRel이 상대화하므로
-	// 절대경로는 이벤트에 실리지 않는다.
-	denyTool(ctx, ad, in, dir, "Bash", "cat "+workspaceRel(in.CWD, path)+" "+strconv.FormatInt(info.Size(), 10)+"B — ctr_search/ctr_fetch", stdout)
+	// 절대경로는 이벤트에 실리지 않는다. deny detail의 명령 토큰: PS 게이트(cx:+Windows) 성립 시
+	// 화이트리스트 4토큰 중 하나라 원문 운반이 안전(psDumpArg 계약), bash 게이트는 cat 고정(bashDumpArg 계약).
+	token := "cat"
+	if host == HostCodex && runtime.GOOS == "windows" {
+		token = strings.Fields(f.Command)[0]
+	}
+	denyTool(ctx, ad, in, dir, "Bash", token+" "+workspaceRel(in.CWD, path)+" "+strconv.FormatInt(info.Size(), 10)+"B — ctr_search/ctr_fetch", stdout)
 }
 
 // guardPowerShell — D36 PowerShell 단일파일 덤프 가드(guardBash의 형제, 설계 v0.4 §3). 정적
@@ -419,6 +425,17 @@ func psAbsPath(goos, arg string) string {
 		return arg
 	}
 	return ""
+}
+
+// guardDumpPath — D47 호스트×GOOS 단독 게이트 선택(스펙 v0.7 §2). 게이트는 어휘 술어+
+// 절대경로 해석이 묶인 완결 정책이라 직렬·혼합 금지: cx:+Windows는 PS 게이트(실측 §7 —
+// Codex Windows exec는 raw PS 구문), 그 외(cx:+비Windows·cc: 전체)는 bash 게이트.
+// 반대 방언 덤프는 miss=allow(fail-open by-design, 스펙 §2 셸 방언 한계).
+func guardDumpPath(host Host, goos, command string) string {
+	if host == HostCodex && goos == "windows" {
+		return psAbsPath(goos, psDumpArg(command))
+	}
+	return dumpAbsPath(goos, bashDumpArg(command))
 }
 
 // toolInputFields — classify가 소비하는 tool_input 하위 필드만(allowlist). command는 Bash,
