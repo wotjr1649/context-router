@@ -25,10 +25,13 @@ func seedSessionStart(t *testing.T, d *DB, sessionID string, ts int64) {
 	insertRawEvent(t, d, fmt.Sprintf("ss-%s-%d", sessionID, ts), sessionID, eventTypeSessionStart, ts, "session start", nil, nil, nil, "none", "")
 }
 
-// querySessionIDs — 잔존 세션 id 전체를 정렬해 반환한다(slices.Equal 비교용).
+// querySessionIDs — 시드한 cc: 네임스페이스의 잔존 세션 id만 정렬해 반환한다(slices.Equal 비교용).
+// openT가 자동 생성하는 세션은 UUIDv7 id·실시간 started_at·session_start 뿐인 빈 세션이라, 실제
+// 시각이 GC 컷오프를 지나면 old→fresh로 뒤집혀 보존/삭제가 바뀐다. 'cc:%' 필터로 그 자동 세션을
+// 배제해 시드 세션의 GC 경계만 시계 독립적으로 비교한다.
 func querySessionIDs(t *testing.T, d *DB) []string {
 	t.Helper()
-	rows, err := d.Reader().Query("SELECT session_id FROM sessions ORDER BY session_id")
+	rows, err := d.Reader().Query("SELECT session_id FROM sessions WHERE session_id LIKE 'cc:%' ORDER BY session_id")
 	if err != nil {
 		t.Fatalf("querySessionIDs: %v", err)
 	}
