@@ -357,6 +357,33 @@ D49 구현(D46 실발화 후), 무작위 A/B 하네스·OTel(D27), exec 3종(D21
 (D48 사후 필요 실증 시), Producer 버전 기반 A/B treatment 자동 경계
 표기(§5 — 세션 단위 기계 경계, 수동 주석 대체 후보).
 
+**v0.7 최종 이중 리뷰 파생 잔존 리스크 3건** (2026-07-23, §10.4 —
+전부 수동 개입·부분 손상을 전제하는 협소 경로, 복구 실존, 코드
+무변경 결정. v0.7.x에서 사용자 판단으로 재상정 가능):
+
+1. **다운그레이드-재설치 스테일 가드**(서브 I + Codex P1 수렴):
+   설치 1이 MCP 확정·가드 등록 → 사용자가 config.toml을 수동
+   훼손(conflict/marker 이상) → 설치 2가 `withGuard=false`로
+   PreToolUse를 순회하지 않아 기존 가드 잔존. 스펙 Produces 공식
+   (`withGuard || !install`)의 귀결. **해법 양론**: 서브=현상 유지
+   +문서화(conflict 대부분이 의미상 유효한 수동 MCP 등록이라 가드
+   잔존이 정상 — 자가치유는 정당한 가드를 박탈하는 회귀) /
+   Codex=자가치유(미확정 설치 시 가드 제거 — 블록 삭제 후 재설치
+   시나리오는 MCP 실부재). 문서화 채택, 자가치유는 사용자 결정
+   대기. 복구: `hook uninstall --codex`(가드 무조건 소거) 또는
+   config 정상화 후 재설치.
+2. **전역 블록 vs 프로젝트 훅 수명 불일치**(Codex P1 부분 채택):
+   MCP 블록은 `$CODEX_HOME/config.toml` 전역 단일, 훅은 프로젝트
+   스코프 가능 — 프로젝트 A/B 설치 후 한쪽 uninstall이 공유 블록을
+   제거하면 타 프로젝트 가드만 잔존. 크로스 프로젝트 탐지는 구조상
+   불가(타 프로젝트 `.codex/` 열거 불능)라 uninstall 안내 메시지에
+   재설치 힌트 보강으로 완화(재설치가 블록을 멱등 재기입). 
+3. **라인 기반 스캔의 문자열 컨텍스트 무추적**(Codex P2 문서화):
+   멀티라인 문자열 안에 정확한 `[mcp_servers.ctr]` 라인이 들어
+   있으면 mcpExistingHeader 오확정(가드 등록·MCP 실부재) 이론
+   가능. TOML 파서 비도입(D48) 설계의 명문 한계 — 발생 개연성
+   극저(설정 파일 내 문서용 멀티라인 문자열 필요), 관측 시 재상정.
+
 ## 10. 적대 검수 처리 기록 (2026-07-23, 설계 체크포인트)
 
 ### §10.1 1패스 처리 기록 (초안 2b9c05c 대상)
@@ -435,3 +462,90 @@ D49 구현(D46 실발화 후), 무작위 A/B 하네스·OTel(D27), exec 3종(D21
   신호 5종을 회피해 중복 정의 파스 에러 방향 miss — `.ctr.` 신호
   추가(실행 검증: 표기 관례 변형 포착 유지·부분열 오탐 없음),
   "합법 변형 전부" 과장을 "표기 관례 변형"으로 완화.
+
+### §10.3 관측 프리체크 결과·판정 (Task 0)
+
+2026-07-23, 컨트롤러 수행. codex-cli **0.144.6**, 스크래치
+`CODEX_HOME=C:\tmp\ctr-g4\codex-home`(auth만 복사 — 사용자 실환경
+무접촉), 워크스페이스 `C:\tmp\ctr-g4\ws`(git init·trusted 기입).
+실증 아티팩트: `C:\tmp\ctr-g4\{payload,deny-payload}.jsonl`.
+
+**G4 관측** (§8 관측 a~d):
+
+- **(a) 공식 문서**(developers.openai.com/codex/hooks): 등록은
+  `hooks.json` 또는 config.toml 인라인 `[hooks]` — 이벤트→matcher
+  그룹→command 핸들러의 Claude 동형 3계층, 셸 명령은 matcher
+  `Bash`로 매치(unified exec 포함). PreToolUse 입력에
+  `tool_name`·`tool_input`(Bash는 `tool_input.command`) 명문. 차단
+  응답은 **Claude 동형**(`hookSpecificOutput.permissionDecision:
+  "deny"`+`permissionDecisionReason`)을 공식 수용, 구형
+  `{"decision":"block"}`·exit 2+stderr도 병행 수용. 비관리 훅은
+  `/hooks` 리뷰·신뢰(정의 해시 기록, 변경 시 재신뢰) 필수 —
+  `--dangerously-bypass-hook-trust`로 1회성 우회 가능(스크래치
+  실증의 거짓 행 3 방지에 사용).
+- **(b) payload 운반 ✓**: user-layer hooks.json PreToolUse(matcher
+  `Bash`) 캡처 훅으로 codex exec 1회 — stdin payload에
+  `tool_name:"Bash"`, `tool_input.command:"Set-Content -Path
+  ran1.txt -Value executed"`(**raw PS 구문 그대로** — §7 실측 재확증)
+  운반. Claude 동형 필드(session_id·cwd·hook_event_name·
+  tool_use_id) + Codex 확장(turn_id·transcript_path·model·
+  permission_mode).
+- **(c) 차단 강제 ✓**: baseline(sandbox 해제) 동일 명령 실행
+  성공(`ran1.txt` 생성) ↔ 훅을 Claude 동형 deny JSON 출력으로 교체
+  후 동일 조건에서 `hook: PreToolUse Blocked` +
+  `Command blocked by PreToolUse hook: test`(reason 모델 노출) +
+  부작용 파일(`proof.txt`) **미생성** — 자문-deny 아닌 실행 차단.
+  부수 관측: read-only sandbox에서는 router 정책이 훅 판정과
+  별개로 쓰기 명령을 자체 거부(declined) — 훅 발화 자체는 sandbox
+  거부와 무관하게 유지.
+- **(d) matcher 존중 ✓**(기록만): 비셸 런(텍스트 응답만)에서 훅
+  미발화, 캡처된 전 payload가 `tool_name:"Bash"`.
+
+**G4 판정 — 행 1** (§8 순서 고정: ① 등록 수용 ✓ → ② 운반 ✓ → ③
+강제 ✓ → ④ Claude 동형 JSON 수용): 가드 이식은 denyTool 출력
+무변경으로 진행. **Task 1 Step 8(행 2 분기) 비활성**, T1~T4 계획
+원안 그대로.
+
+**G6 관측** (사용자 실물 `C:\Users\js\.codex\config.toml` —
+`CODEX_HOME` env 미설정 확인): 17,060B·508라인·**LF 지배(CRLF
+0)**·EOF 개행 유·BOM 무·주석 라인 0. `[mcp_servers.*]` 6종
+(L319–362: openaiDeveloperDocs·node_repl(+env)·context7·github·
+chrome-devtools(+env)), `[hooks.state]` L33~(트러스트 해시 — 본
+저장소 `.codex/hooks.json`의 post_tool_use·session_start 포함).
+관리 블록 마커 0개, **ctr 키-경계 신호 0**(2패스 §10.2 관측
+재확인). 플러그인 스코프
+`plugins."ctxscribe@wotjr1649".mcp_servers.mcp`가 `mcp_servers`
+부분열을 보유하나 키-경계 신호 비해당 — §3 (b) AND 조건 미충족으로
+무발동(오탐 회피 설계의 실물 확증). 예상 설치 경로: append →
+`mcpWritten`, LF 블록 기입.
+
+### §10.4 최종 이중 리뷰 처리 기록 (2026-07-23, 구현 체크포인트 —
+브랜치 0632630..4a002bc 대상)
+
+- 서브(opus whole-branch): **With fixes** — C0/I1/M3. 크로스파일
+  정합 완전 확인(관리 블록 `enabled_tools` = doctor 스니펫 = 무조건
+  등록 MCP 6도구 일치, matcher `Bash` ↔ dispatch ↔ deny JSON 이음새
+  일관, cc: 하위 호환 유지).
+- Codex(review --base): P1×3·P2×2.
+- **병합 판정**:
+  - **Codex P1-1 채택(코드)**: 루트 인라인 `mcp_servers = {…}`(ctr
+    신호 무)가 §3 (b) AND 조건을 회피해 append → 인라인 테이블
+    자기완결 규칙으로 `[mcp_servers.ctr]` 확장이 **파스 에러**(tomllib
+    실검증) — D48이 봉쇄를 표방한 방향의 계약 자체 갭. 루트 할당
+    정규화 프리픽스(`mcp_servers=`·quoted 변형) 단독 충돌 신호로
+    §3 (b) 개정. 헤더 정의(`[mcp_servers]`) + 타 서버는 확장 합법
+    이므로 비충돌 유지(회귀 핀 추가).
+  - **Codex P1-2 = 서브 I 수렴**(교차 확증): 스테일 가드 — 해법
+    상충(문서화 vs 자가치유)으로 §9-1 양론 기록, 코드 무변경,
+    사용자 결정 이월.
+  - **Codex P1-3 부분 채택**: 전역 블록 수명 — uninstall 안내 보강
+    +§9-2 문서화(구조 수정은 크로스 프로젝트 탐지 불능으로 기각).
+  - **Codex P2-1 채택(코드)**: uninstall이 hooks.json 부재 시 config
+    블록 정리 스킵(부분 설치 잔재 영구화) — 부재=빈 집합 취급, 정리
+    지속.
+  - **Codex P2-2 문서화**: 문자열 내 헤더 오확정 — §9-3 명문 한계.
+  - **서브 M 채택**: doctor 스니펫 주석 "3-도구" 스테일 정정(6도구).
+    서브 M 잔여 2건(cx+win 토큰 재파싱 — psDumpArg 계약 연동 주의
+    주석 수준, mergeCodexHooks 72줄 — 형제 관례 수용)은 무조치 기록.
+- fix 웨이브 1회(코드 4건) 후 재리뷰는 서브 단독(Codex 체크포인트
+  1패스 소진 규약).

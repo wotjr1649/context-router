@@ -113,6 +113,31 @@ func TestHookHostIsolation(t *testing.T) {
 	if !strings.Contains(refs, "artifact://cx:") {
 		t.Fatalf("refs=%q want artifact://cx: 접두(D35 네임스페이스 운반)", refs)
 	}
+
+	// D47 — cx: Bash 덤프 deny가 cc:<uuid> 세션에 오귀속되지 않는다(격리). 같은 UUID의 cx deny
+	// 발화 후 cc: 이벤트에 warning이 없어야 한다. 기존 reader(session.db)를 재사용해 조회한다.
+	big := filepath.Join(cwd, "big.txt")
+	writeSized(t, big, 300*1024)
+	pre := fixtureWith(t, "posttooluse-codex-bash.json", map[string]any{
+		"hook_event_name": "PreToolUse",
+		"tool_name":       "Bash",
+		"cwd":             cwd,
+		"tool_input":      map[string]any{"command": cxDumpCmd(big)},
+	})
+	var denyOut bytes.Buffer
+	if rc := Run(context.Background(), bytes.NewReader(pre), &denyOut, storeRoot, "test", HostCodex, func(k string) string { return env[k] }); rc != 0 {
+		t.Fatalf("cx Bash deny rc=%d", rc)
+	}
+	if !strings.Contains(denyOut.String(), `"permissionDecision":"deny"`) {
+		t.Fatalf("cx Bash 덤프가 deny 아님: %q", denyOut.String())
+	}
+	var ccWarn int
+	if err := reader.QueryRow("SELECT count(*) FROM session_events WHERE session_id LIKE 'cc:%' AND event_type='warning'").Scan(&ccWarn); err != nil {
+		t.Fatalf("cc warning count: %v", err)
+	}
+	if ccWarn != 0 {
+		t.Fatalf("cc warning=%d want 0(cx deny 오귀속 금지)", ccWarn)
+	}
 }
 
 // D35 — 미지 host는 오귀속 대신 drop(bad-host, storeRoot 사이드카) + exit 0.
@@ -1517,6 +1542,34 @@ func TestPsAbsPath(t *testing.T) {
 	}
 }
 
+// TestGuardDumpPath — D47 호스트×GOOS 단독 게이트(스펙 §2·§6): 게이트는 술어+경로해석
+// 묶음 정책이며 직렬·혼합 금지. ②는 psAbsPath의 드라이브 상대 판정이 bash MSYS 변환의
+// 오파일 deny를 재도입하지 않는다는 핀(v0.4 §11.1 파생 ②).
+func TestGuardDumpPath(t *testing.T) {
+	cases := []struct {
+		name    string
+		host    Host
+		goos    string
+		command string
+		want    string
+	}{
+		{"① cx+win PS게이트: Get-Content 백슬래시", HostCodex, "windows", `Get-Content C:\ws\big.txt`, "C:/ws/big.txt"},
+		{"② cx+win: cat /c/… MSYS 오파일 금지 핀", HostCodex, "windows", "cat /c/big.log", ""},
+		{"③ cx+unix bash게이트: cat 절대경로", HostCodex, "linux", "cat /abs/big", "/abs/big"},
+		{"④ cx+win 양쪽 미매치: rg", HostCodex, "windows", "rg pattern C:/ws/f.txt", ""},
+		{"cc+win 현행 유지: cat /c/… MSYS deny 핀", HostClaude, "windows", "cat /c/big.log", "c:/big.log"},
+		{"cc+win 현행 유지: Get-Content은 비덤프", HostClaude, "windows", `Get-Content C:\ws\big.txt`, ""},
+		{"cc+unix 현행 유지", HostClaude, "linux", "cat /abs/big", "/abs/big"},
+		{"cx+win PS게이트: gc 드라이브 슬래시", HostCodex, "windows", "gc C:/ws/big.txt", "C:/ws/big.txt"},
+		{"cx+win PS게이트: 파이프 → allow", HostCodex, "windows", `Get-Content C:\f.txt | Select-Object -First 5`, ""},
+	}
+	for _, c := range cases {
+		if got := guardDumpPath(c.host, c.goos, c.command); got != c.want {
+			t.Fatalf("%s: guardDumpPath=%q want %q", c.name, got, c.want)
+		}
+	}
+}
+
 // runGuardBash — posttooluse-bash.json을 PreToolUse(Bash)로 재정의하고 command만 교체해 Run을
 // 호출한 뒤 stdout(deny JSON 또는 빈 문자열)을 반환한다(runGuard의 Bash 형제). command 조립은
 // 호출자가 filepath.ToSlash로 슬래시화 — Windows t.TempDir() 백슬래시가 bashDumpArg 어휘 판정에서
@@ -1579,6 +1632,104 @@ func TestGuardBashLargeFileDenies(t *testing.T) {
 	}
 	if strings.Contains(summary, cwd) || strings.Contains(summary, filepath.ToSlash(cwd)) {
 		t.Fatalf("warning summary가 절대경로 누출: %q", summary)
+	}
+}
+
+// cxDumpCmd — GOOS별 단일파일 덤프 명령: 비Windows는 bash `cat`, Windows는 raw PS `Get-Content`
+// (§7 실측 — Codex Windows exec는 raw PS 구문). 양 OS CI에서 각자의 게이트를 검증한다(D47).
+func cxDumpCmd(path string) string {
+	if runtime.GOOS == "windows" {
+		return "Get-Content " + path
+	}
+	return "cat " + path
+}
+
+// runCodexBashGuard — cx:<uuid> 세션을 SessionStart로 등록한 뒤 PreToolUse(Bash) 덤프를 발화하고
+// stdout(deny JSON 또는 빈 문자열)을 돌려준다. guardSetup은 cc:만 등록하므로 cx: 등록을 별도 주입한다.
+// runHookHost 4번째 인자는 []byte 계약 — json.Marshal한 바이트를 전달한다.
+func runCodexBashGuard(t *testing.T, storeRoot, ws, uuid, command string, env map[string]string) string {
+	t.Helper()
+	start, _ := json.Marshal(hookInput{HookEventName: "SessionStart", SessionID: uuid, CWD: ws, Source: "startup"})
+	if rc := runHookHost(t, HostCodex, storeRoot, start, env); rc != 0 {
+		t.Fatalf("cx SessionStart rc=%d", rc)
+	}
+	ti, _ := json.Marshal(map[string]string{"command": command})
+	pre, _ := json.Marshal(hookInput{HookEventName: "PreToolUse", ToolName: "Bash", SessionID: uuid, CWD: ws, ToolInput: ti})
+	var out bytes.Buffer
+	if rc := Run(context.Background(), bytes.NewReader(pre), &out, storeRoot, "test", HostCodex, func(k string) string { return env[k] }); rc != 0 {
+		t.Fatalf("cx PreToolUse rc=%d", rc)
+	}
+	return out.String()
+}
+
+// D47 — cx: Bash 덤프 deny: Windows는 PS 게이트(Get-Content), 비Windows는 bash 게이트(cat).
+// deny JSON + warning 이벤트 + 현장 색인 artifact + ctr_search 안내를 단정한다(스펙 §6).
+func TestGuardCodexBashDeny(t *testing.T) {
+	storeRoot := t.TempDir()
+	ws := evalLong(t, t.TempDir())
+	big := filepath.Join(ws, "big.txt")
+	writeSized(t, big, 300*1024) // 임계 256KiB 초과
+	env := map[string]string{"CTR_HOOK_DEADLINE_MS": "60000"}
+	out := runCodexBashGuard(t, storeRoot, ws, "019f0000-0000-7000-8000-0000000000c1", cxDumpCmd(big), env)
+
+	for _, want := range []string{`"permissionDecision":"deny"`, "ctr_search"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("deny 출력에 %q 없음:\n%s", want, out)
+		}
+	}
+	// 현장 인덱싱 artifact 1건(cx:<uuid> 세션) + warning 이벤트 1건 — D32-① 단정을 cx:에 적용.
+	canon, err := ident.Canonicalize(ws)
+	if err != nil {
+		t.Fatalf("canonicalize: %v", err)
+	}
+	if n := contentArtifacts(t, filepath.Join(storeRoot, "projects", canon.ProjectID)); n != 1 {
+		t.Fatalf("artifacts=%d want 1(현장 인덱싱 성공)", n)
+	}
+	reader, err := session.OpenReadOnly(sessDir(t, storeRoot, ws))
+	if err != nil {
+		t.Fatalf("open session.db: %v", err)
+	}
+	defer func() { _ = reader.Close() }()
+	var n int
+	var summary string
+	if err := reader.QueryRow("SELECT count(*), coalesce(max(summary),'') FROM session_events WHERE event_type='warning'").Scan(&n, &summary); err != nil {
+		t.Fatalf("count warning: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("warning events=%d want 1", n)
+	}
+	token := "cat"
+	if runtime.GOOS == "windows" {
+		token = "Get-Content"
+	}
+	for _, want := range []string{"Bash", token, "big.txt", "307200", "ctr_search"} {
+		if !strings.Contains(summary, want) {
+			t.Fatalf("warning summary=%q want 포함 %q", summary, want)
+		}
+	}
+	if strings.Contains(summary, ws) || strings.Contains(summary, filepath.ToSlash(ws)) {
+		t.Fatalf("warning summary가 절대경로 누출: %q", summary)
+	}
+}
+
+// D47/D39 — cx: denylist 파일(.env, Indexed==0 Skipped) 덤프 → allow(무출력) + 미색인.
+// cc: denylist 관례(TestGuardBashDenylistAllows)를 HostCodex+GOOS별 명령으로 복제(스펙 §6).
+func TestGuardCodexBashDenylistAllows(t *testing.T) {
+	storeRoot := t.TempDir()
+	ws := evalLong(t, t.TempDir())
+	envFile := filepath.Join(ws, ".env")
+	writeSized(t, envFile, 300*1024) // 임계 초과라 크기 게이트 통과 → denylist라 Skipped
+	env := map[string]string{"CTR_HOOK_DEADLINE_MS": "60000"}
+	out := runCodexBashGuard(t, storeRoot, ws, "019f0000-0000-7000-8000-0000000000c2", cxDumpCmd(envFile), env)
+	if out != "" {
+		t.Fatalf("stdout=%q want empty (denylist = allow)", out)
+	}
+	canon, err := ident.Canonicalize(ws)
+	if err != nil {
+		t.Fatalf("canonicalize: %v", err)
+	}
+	if n := contentArtifacts(t, filepath.Join(storeRoot, "projects", canon.ProjectID)); n > 0 {
+		t.Fatalf("artifacts=%d want 0/-1(.env 미색인)", n)
 	}
 }
 
