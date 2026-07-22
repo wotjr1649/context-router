@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"time"
 	"unicode/utf8"
@@ -828,8 +829,13 @@ func (s *Store) GCOrphanBlobs(ctx context.Context) (removed int64, err error) {
 			return removed, sanitizeIOErr("gc readdir", err)
 		}
 		for _, e := range entries {
-			hash := e.Name()
-			if len(hash) != 64 || referenced[hash] {
+			name := e.Name()
+			// 크래시로 남은 격리본(<64hex>.purging): reclaimHookBlobs가 rename↔remove 사이에 죽으면
+			// DB 행은 이미 삭제돼 hash가 다시 선택되지 않으므로 이 파일은 영구 고아가 된다(최종리뷰 P2).
+			// hash 참조 대상이 아니므로 참조 대조 없이 age gate만 적용해 수거한다(진행 중 격리는 이미
+			// lockStore로 배제됨 — age gate는 이중방어). 정상 blob은 len==64 + 미참조일 때만 후보.
+			isPurging := len(name) == 64+len(".purging") && strings.HasSuffix(name, ".purging")
+			if !isPurging && (len(name) != 64 || referenced[name]) {
 				continue
 			}
 			info, err := e.Info()
@@ -840,9 +846,9 @@ func (s *Store) GCOrphanBlobs(ctx context.Context) (removed int64, err error) {
 				return removed, sanitizeIOErr("gc stat", err)
 			}
 			if time.Since(info.ModTime()) < gcOrphanMinAge {
-				continue // age gate: 등록 진행 중일 수 있음(§3.5) — 다음 GC로 미룬다
+				continue // age gate: 등록/회수 진행 중일 수 있음(§3.5) — 다음 GC로 미룬다
 			}
-			if err := os.Remove(filepath.Join(dir, hash)); err != nil {
+			if err := os.Remove(filepath.Join(dir, name)); err != nil {
 				return removed, sanitizeIOErr("gc remove", err)
 			}
 			removed++
@@ -1053,11 +1059,12 @@ func (s *Store) PurgeHookOnly(ctx context.Context) (HookPurgeReport, error) {
 }
 
 // purgeHookRows: 단일 tx(txRetry — PurgeOlderThan과 동일 BUSY 내성)에서 shadow 귀속 hash 집합을
-// 술어 재실행으로 산출(회수 목록)하고, sources→chunks→artifacts 순으로 행을 삭제한다(PurgeOlderThan
-// 동형: 귀속 아티팩트의 hook 소스를 지운 뒤 고아가 된 chunks를 artifacts보다 먼저 명시 삭제해
-// AFTER DELETE 트리거로 FTS를 동기화한다). BUSY 재시도로 fn이 재실행될 수 있어 반환 상태를 매 시도
-// 초기화한다. 회수 목록(SELECT)과 삭제(DELETE 서브쿼리)는 같은 tx 스냅샷에서 술어를 재평가하므로 항상
-// 일치한다.
+// 술어 재실행으로 산출(회수 목록)하고, chunks→sources→artifacts 순으로 행을 삭제한다. chunks·sources는
+// sources가 아직 있는 동안 shadow 술어 서브쿼리로 이 purge의 선택분만 지우고(chunks 선삭제로 FTS
+// AFTER DELETE 트리거 동기), artifacts는 sources 삭제 후 술어가 비므로 미리 포착한 hashes 집합에
+// 바인딩해 삭제한다 — PurgeOlderThan의 전역 "NOT IN sources" 고아 sweep과 달리 hook purge는 자기
+// 선택분에만 국한한다(최종리뷰 P1). BUSY 재시도로 fn이 재실행될 수 있어 반환 상태를 매 시도 초기화한다.
+// 회수 목록(SELECT)과 삭제 술어는 같은 tx 스냅샷에서 재평가하므로 항상 일치한다.
 func (s *Store) purgeHookRows(ctx context.Context) ([]string, HookPurgeReport, error) {
 	var hashes []string
 	var rep HookPurgeReport
@@ -1081,19 +1088,32 @@ func (s *Store) purgeHookRows(ctx context.Context) ([]string, HookPurgeReport, e
 		if err != nil {
 			return err
 		}
+		// chunks: shadow 아티팩트의 청크를 sources 삭제 이전에 명시 삭제한다 — 술어가 아직 유효하고
+		// (sources 존재) FTS AFTER DELETE 트리거가 발화한다(cascade는 recursive_triggers OFF라
+		// 트리거 미발화). 이 purge의 선택분에만 국한한다(최종리뷰 P1 — 전역 고아 청크 sweep 금지).
+		if _, err := tx.ExecContext(ctx, `DELETE FROM chunks WHERE artifact_id IN
+			(SELECT id FROM artifacts WHERE content_hash IN (`+shadowOwnedHashQuery+`))`); err != nil {
+			return err
+		}
 		// sources: 귀속 아티팩트의 (전부 hook인) 소스 삭제 — 술어 재실행으로 tx 내 재검증.
 		if _, err := tx.ExecContext(ctx, `DELETE FROM sources WHERE artifact_id IN
 			(SELECT id FROM artifacts WHERE content_hash IN (`+shadowOwnedHashQuery+`))`); err != nil {
 			return err
 		}
-		// chunks: 고아 아티팩트의 청크를 artifacts보다 먼저 명시 삭제(FTS AFTER DELETE 트리거 발화).
-		if _, err := tx.ExecContext(ctx, `DELETE FROM chunks WHERE artifact_id IN
-			(SELECT id FROM artifacts WHERE id NOT IN (SELECT artifact_id FROM sources))`); err != nil {
-			return err
-		}
-		// artifacts: 소스가 사라진 고아 삭제(chunks는 ON DELETE CASCADE로도 정리되나 위에서 선삭제).
-		if _, err := tx.ExecContext(ctx, `DELETE FROM artifacts WHERE id NOT IN (SELECT artifact_id FROM sources)`); err != nil {
-			return err
+		// artifacts: sources가 사라져 고아가 된 이 purge의 선택분만 삭제한다. sources 삭제 후엔 shadow
+		// 술어가 비므로(hook 소스가 사라져 JOIN 실패) 커서에서 미리 포착한 hashes 집합에 바인딩한다 —
+		// store 전역 고아(예: 재색인으로 source가 새 아티팩트로 재지정돼 남은 source-less 잔재)를 지우지
+		// 않는다(최종리뷰 P1). ponytail: IN 리스트는 SQLITE_MAX_VARIABLE_NUMBER(기본 32766) 상한 —
+		// hook purge 1회가 그 이상 hash를 모을 일은 없다(넘으면 temp table로 승격).
+		if len(hashes) > 0 {
+			ph := strings.TrimSuffix(strings.Repeat("?,", len(hashes)), ",")
+			args := make([]any, len(hashes))
+			for i, h := range hashes {
+				args[i] = h
+			}
+			if _, err := tx.ExecContext(ctx, `DELETE FROM artifacts WHERE content_hash IN (`+ph+`)`, args...); err != nil {
+				return err
+			}
 		}
 		rep.Hashes = len(hashes)
 		return nil

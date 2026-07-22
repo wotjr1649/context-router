@@ -1804,6 +1804,25 @@ func TestRecordEventSupersedesMissingIsInvalidArgument(t *testing.T) {
 	}, codeInvalidArgument)
 }
 
+// TestRecordEventSessionAbsentIsNotFound: 최종리뷰 I1 — Task 4b의 append 존재 게이트로 세션
+// 부재 Append도 store.ErrNotFound를 낸다. supersedes를 지정하지 않은 호출은 supersedes 매핑
+// (INVALID_ARGUMENT)이 아니라 NOT_FOUND로 흘러야 한다 — 세션 부재를 supersedes 오류로
+// 오표기하지 않는다.
+func TestRecordEventSessionAbsentIsNotFound(t *testing.T) {
+	cs, _, sess, _ := newRecordEventTestServer(t)
+	// 현재(빈) 세션 행을 공개 API로 제거 — Sweep의 빈-세션 GC(started_at<now-7d)를 미래 now로
+	// 트리거한다(raw SQL 없이 세션 부재를 재현). session_start만 있는 세션은 빈 세션으로 수거된다.
+	rep, err := session.Sweep(context.Background(), sess, time.Now().Add(100*24*time.Hour))
+	if err != nil {
+		t.Fatalf("Sweep: %v", err)
+	}
+	if rep.EmptySessionsDeleted != 1 {
+		t.Fatalf("EmptySessionsDeleted=%d want 1(세션 부재 재현 실패)", rep.EmptySessionsDeleted)
+	}
+	// supersedes 미지정 + 세션 부재 → NOT_FOUND(과거엔 supersedes INVALID_ARGUMENT로 오표기).
+	recordEventErrPrefix(t, cs, RecordEventInput{EventType: "note", Summary: "s"}, codeNotFound)
+}
+
 // TestRecordEventLedgerAppend: 브리프 Step1 ⑥ — 호출마다 LedgerAppend(ctr_fetch/ctr_search
 // 패턴 승계) → ledger.db에 1행.
 func TestRecordEventLedgerAppend(t *testing.T) {

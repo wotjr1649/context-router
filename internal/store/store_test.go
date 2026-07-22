@@ -1466,6 +1466,51 @@ func TestGCOrphanBlobs_AgeGate(t *testing.T) {
 	}
 }
 
+// writePurgingBlob: 테스트용 — dir/artifacts/hash[:2]/hash.purging 격리본을 만들고 mtime을
+// now+age로 강제한다(크래시로 rename 이후·remove 이전에 프로세스가 죽은 상황 모사, 최종리뷰 P2).
+func writePurgingBlob(t *testing.T, storeDir, hash string, age time.Duration) string {
+	t.Helper()
+	dir := filepath.Join(storeDir, "artifacts", hash[:2])
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, hash+".purging")
+	if err := os.WriteFile(path, []byte("purging"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	tm := time.Now().Add(age)
+	if err := os.Chtimes(path, tm, tm); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+// TestGCOrphanBlobsSweepsStalePurging — 최종리뷰 P2: reclaimHookBlobs가 rename 격리 중
+// 크래시하면 DB 행은 이미 삭제돼 hash가 다시 선택되지 않으므로 <64hex>.purging 파일이 영구
+// 고아가 된다. GC가 age gate(1h)를 넘긴 격리본은 수거하고 신선한 것(진행 중일 수 있음)은
+// 보존해야 한다.
+func TestGCOrphanBlobsSweepsStalePurging(t *testing.T) {
+	s := openT(t)
+	staleHash := strings.Repeat("a", 64)
+	stalePath := writePurgingBlob(t, s.dir, staleHash, -2*gcOrphanMinAge)
+	freshHash := strings.Repeat("b", 64)
+	freshPath := writePurgingBlob(t, s.dir, freshHash, 0)
+
+	removed, err := s.GCOrphanBlobs(t.Context())
+	if err != nil {
+		t.Fatalf("GCOrphanBlobs: %v", err)
+	}
+	if removed != 1 {
+		t.Fatalf("removed=%d want 1(오래된 격리본만)", removed)
+	}
+	if _, err := os.Stat(stalePath); !os.IsNotExist(err) {
+		t.Fatalf("오래된 .purging 잔존: err=%v", err)
+	}
+	if _, err := os.Stat(freshPath); err != nil {
+		t.Fatalf("신선한 .purging이 삭제됨(진행 중 회수 오삭제 위험): %v", err)
+	}
+}
+
 // TestAcquireLock_SharedSharedCoexist: 두 shared 잠금이 동시에 성립해야 한다(release 전
 // 둘 다 성공) — 같은 프로세스라도 별도 os.OpenFile 호출이라 open file description/핸들이
 // 갈라져 flock/LockFileEx의 shared+shared 공존이 실제로 검증된다(vacuous하지 않음).
@@ -1947,5 +1992,63 @@ func TestVacuum(t *testing.T) {
 	var n int
 	if err := st.reader.QueryRow("SELECT count(*) FROM artifacts WHERE content_hash=?", hashOf("vacuum-keep")).Scan(&n); err != nil || n != 1 {
 		t.Fatalf("VACUUM 후 데이터 손실: n=%d err=%v", n, err)
+	}
+}
+
+// TestPurgeHookOnlyPreservesReindexResidue — 최종리뷰 P1: purge --hook-only의 고아 정리는
+// 이 purge의 선택분(shadow 귀속 hash)에만 국한돼야 한다. 재색인 잔재(같은 URI를 A→B로
+// 재등록하며 source_kind와 무관하게 생기는 source-less 아티팩트)는 hook과 무관한 store 전역
+// 잔여라 hook-only purge가 건드리면 안 된다 — 잔재 아티팩트 행·청크(FTS 포함)는 보존하고
+// hook-only 행만 삭제해야 한다.
+func TestPurgeHookOnlyPreservesReindexResidue(t *testing.T) {
+	st := openAt(t, t.TempDir())
+	ctx := context.Background()
+	// 재색인 잔재: 같은 URI를 content A→B로 재등록 → content A 아티팩트가 source-less 잔재.
+	const residueURI = "/reindex.txt"
+	const contentA = "reindex-residue-A zzresidue"
+	if _, err := st.Register(ctx, Registration{
+		StoredBytes: []byte(contentA), MediaType: "text/plain",
+		Source: SourceMeta{URI: residueURI, Kind: "file", SrcHash: "sh-A"},
+		Chunks: []Chunk{{Ordinal: 0, Text: contentA}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	residueHash := hashOf(contentA)
+	const contentB = "reindex-current-B"
+	if _, err := st.Register(ctx, Registration{
+		StoredBytes: []byte(contentB), MediaType: "text/plain",
+		Source: SourceMeta{URI: residueURI, Kind: "file", SrcHash: "sh-B"},
+		Chunks: []Chunk{{Ordinal: 0, Text: contentB}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// hook-only 대상.
+	const hookContent = "purge-hook-residue zzneedle"
+	if _, err := st.Register(ctx, Registration{
+		StoredBytes: []byte(hookContent), MediaType: "text/plain",
+		Source: SourceMeta{URI: "shadow:Bash:rr1", Kind: "hook", SrcHash: "h-rr1"},
+		Chunks: []Chunk{{Ordinal: 0, Text: hookContent}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	hookHash := hashOf(hookContent)
+	ageBlobFile(t, st, hookHash, -2*time.Hour) // age gate 통과
+
+	rep, err := st.PurgeHookOnly(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rep.Hashes != 1 {
+		t.Fatalf("rep.Hashes=%d want 1(hook만 — 잔재는 shadow 귀속 아님)", rep.Hashes)
+	}
+	assertHashGone(t, st, hookHash)      // hook-only 행·blob 삭제
+	assertHashIntact(t, st, residueHash) // 잔재 아티팩트 행·blob 보존(전역 고아 sweep 금지)
+	var rn int
+	if err := st.reader.QueryRow("SELECT count(*) FROM fts_porter WHERE fts_porter MATCH 'zzresidue'").Scan(&rn); err != nil || rn != 1 {
+		t.Fatalf("잔재 청크 FTS 소멸(전역 청크 sweep): n=%d err=%v", rn, err)
+	}
+	var hn int
+	if err := st.reader.QueryRow("SELECT count(*) FROM fts_porter WHERE fts_porter MATCH 'zzneedle'").Scan(&hn); err != nil || hn != 0 {
+		t.Fatalf("hook 청크 FTS 잔존(미동기): n=%d err=%v", hn, err)
 	}
 }

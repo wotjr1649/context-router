@@ -170,9 +170,10 @@ func registerRecordEvent(srv *mcp.Server, st *store.Store, sess *session.DB) {
 		_, eventID, ts, err := sess.Append(ev)
 		if err != nil {
 			// C1(설계 §3.1 명문): supersedes 미존재는 INVALID_ARGUMENT(artifact_refs 미존재와
-			// 대칭) — Append가 store.ErrNotFound로 wrap하지만 toToolError의 NOT_FOUND로 흘리지
-			// 않는다(supersedes 이외 경로에서 Append는 ErrNotFound를 내지 않는다).
-			if errors.Is(err, store.ErrNotFound) {
+			// 대칭). Task 4b의 append 존재 게이트로 세션 부재 Append도 store.ErrNotFound를 내므로,
+			// supersedes를 실제 지정한 경우에만 이 매핑을 적용한다 — 세션 부재는 아래
+			// ClassifyStorageErr 경로로 흘려보내 NOT_FOUND로 매핑한다(최종리뷰 I1).
+			if in.Supersedes != "" && errors.Is(err, store.ErrNotFound) {
 				return nil, RecordEventOutput{}, toolErr(codeInvalidArgument, "supersedes 이벤트가 존재하지 않습니다")
 			}
 			// C2 대칭(재검증 Minor 3): supersedes 인터셉트 이후의 런타임 저장 오류도 질의 3곳과
