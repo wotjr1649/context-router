@@ -33,7 +33,7 @@ const releaseURL = "https://api.github.com/repos/wotjr1649/context-router/releas
 const defaultStoreWarnBytes = 100 << 20 // 100MiB
 
 // storeWarnBytes — CTR_STORE_WARN_BYTES 양수만 채택, 파싱 실패·비양수는 기본값(D38 — 측정
-// 실체가 CAS 전체 blob이라 STORE 명명; 구명 CTR_SHADOW_WARN_BYTES는 v0.5 개명, 별칭 없음).
+// 실체가 CAS 전체 blob이라 STORE 명명).
 func storeWarnBytes(getenv func(string) string) int64 {
 	if v, err := strconv.ParseInt(getenv("CTR_STORE_WARN_BYTES"), 10, 64); err == nil && v > 0 {
 		return v
