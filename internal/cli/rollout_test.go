@@ -441,3 +441,87 @@ func TestScanRollouts_SessionFileGroupMerge(t *testing.T) {
 		t.Fatalf("off 세션 계상 실패: off=%d on=%d unknown=%d", len(sc2.off), len(sc2.on), len(sc2.unknown))
 	}
 }
+
+func TestParseRolloutFile_MissingCwdSkipDemote(t *testing.T) {
+	// cwd 부재/null은 발산이 아니라 형식 변경 스킵 강등(§2, Codex P2) — 조용히 배제 금지.
+	root := t.TempDir()
+	folded := ident.Fold(root)
+	// (a) 루트 meta + cwd 없는 meta 혼재 → 채택 유지 + skipped=1.
+	pa := writeRollout(t, t.TempDir(), "2026-07-21T20-51-22", testUUID, []string{
+		metaLine(testUUID, root), metaLine(testUUID, ""), tcLine(1, 0, 0, 1),
+	})
+	ra, err := parseRolloutFile(context.Background(), pa, folded)
+	if err != nil || !ra.cwdAny || ra.cwdOut || ra.skipped != 1 {
+		t.Fatalf("혼재: err=%v %+v", err, ra)
+	}
+	// (b) cwd 없는 meta뿐 → 미채택(cwdAny·cwdOut 모두 false) + skipped=1.
+	pb := writeRollout(t, t.TempDir(), "2026-07-21T20-51-23", testUUID, []string{
+		metaLine(testUUID, ""), tcLine(1, 0, 0, 1),
+	})
+	rb, err := parseRolloutFile(context.Background(), pb, folded)
+	if err != nil || rb.cwdAny || rb.cwdOut || rb.skipped != 1 {
+		t.Fatalf("cwd 전무: err=%v %+v", err, rb)
+	}
+}
+
+func TestParseRolloutFile_RootBoundaryNormalize(t *testing.T) {
+	// foldedRoot가 드라이브/유닉스 루트로 trailing '/'를 가지면 root+"/"가 "c://"·"//"가 되어
+	// 전 하위 cwd가 배제된다 — 비교 직전 양쪽 trailing '/' 정규화(Codex P2).
+	var rootArg, cwd string
+	if runtime.GOOS == "windows" {
+		rootArg, cwd = "c:/", `C:\Users`
+	} else {
+		rootArg, cwd = "/", "/home/user"
+	}
+	p := writeRollout(t, t.TempDir(), "2026-07-21T20-51-22", testUUID, []string{
+		metaLine(testUUID, cwd), tcLine(1, 0, 0, 1),
+	})
+	r, err := parseRolloutFile(context.Background(), p, rootArg)
+	if err != nil || !r.cwdAny || r.cwdOut {
+		t.Fatalf("루트 경계 정규화 실패(%s): err=%v %+v", runtime.GOOS, err, r)
+	}
+}
+
+func TestScanRollouts_AllCwdInvalidPromotedToSkipFiles(t *testing.T) {
+	// cwd 없는 meta뿐인 파일 — 프로젝트 판별 불가 → meta 전무와 동일 skipFiles(미귀속) 승격.
+	projectRoot := t.TempDir()
+	rolloutRoot := t.TempDir()
+	day := filepath.Join(rolloutRoot, "2026", "07", "22")
+	if err := os.MkdirAll(day, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 7, 22, 12, 0, 0, 0, time.Local)
+	writeRollout(t, day, tsFor(now, 24*time.Hour), testUUID, []string{metaLine(testUUID, ""), tcLine(1, 0, 0, 1)})
+	sc, err := scanRollouts(context.Background(), rolloutRoot, projectRoot, nil, false, now)
+	if err != nil {
+		t.Fatalf("err=%v", err)
+	}
+	if sc.skipFiles != 1 || len(sc.on)+len(sc.off)+len(sc.unknown) != 0 {
+		t.Fatalf("cwd 전무 미귀속 승격 실패: skipFiles=%d groups=%d", sc.skipFiles, len(sc.on)+len(sc.off)+len(sc.unknown))
+	}
+}
+
+func TestScanRollouts_UnreadableSubtreeCounted(t *testing.T) {
+	// WalkDir 하위 오류(읽을 수 없는 트리)는 조용히 삼키지 않고 skipFiles로 가시화(Codex P2).
+	if runtime.GOOS != "linux" {
+		t.Skip("chmod 000 디렉터리 권한 케이스는 linux 한정 — windows·darwin 권한/root 모델 상이")
+	}
+	projectRoot := t.TempDir()
+	rolloutRoot := t.TempDir()
+	bad := filepath.Join(rolloutRoot, "2026", "07", "22")
+	if err := os.MkdirAll(bad, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeRollout(t, bad, tsFor(time.Now(), 24*time.Hour), testUUID, []string{metaLine(testUUID, projectRoot), tcLine(1, 0, 0, 1)})
+	if err := os.Chmod(bad, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(bad, 0o755) }) // TempDir 정리 가능하도록 복구
+	sc, err := scanRollouts(context.Background(), rolloutRoot, projectRoot, nil, false, time.Now())
+	if err != nil {
+		t.Fatalf("err=%v", err)
+	}
+	if sc.skipFiles < 1 {
+		t.Fatalf("읽을 수 없는 하위 트리 미계상: skipFiles=%d", sc.skipFiles)
+	}
+}

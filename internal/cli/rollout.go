@@ -25,7 +25,7 @@ import (
 
 type cxUsage struct{ input, cachedInput, output, total int64 }
 
-// cxRollout — rollout 파일 1개의 파싱 결과(파일=세션 — UUID 중복 0 실측 §7).
+// cxRollout — rollout 파일 1개의 파싱 결과(세션 그룹은 scanRollouts가 session_id로 병합 — "파일=세션" 폐기, §2).
 type cxRollout struct {
 	id      string    // session_meta.payload.session_id 권위(§2 — 파일명 UUID는 발견 수단)
 	start   time.Time // 파일명 rollout-<ts> 로컬 시간(§2 — meta에 시각 필드 없음 §7)
@@ -66,6 +66,9 @@ func parseRolloutFile(ctx context.Context, path, foldedRoot string) (cxRollout, 
 	defer func() { _ = f.Close() }()
 	br := bufio.NewReaderSize(f, 64*1024)
 	var r cxRollout
+	// 루트 경계 정규화(양쪽 trailing '/' 제거) — foldedRoot가 드라이브/유닉스 루트("c:/"·"/")면
+	// root+"/"가 "c://"·"//"가 되어 전 하위 cwd가 배제된다(Codex P2).
+	root := strings.TrimSuffix(foldedRoot, "/")
 	metaSeen := false
 	for lineNo := 0; ; lineNo++ {
 		if lineNo%cancelCheckLines == 0 {
@@ -104,8 +107,14 @@ func parseRolloutFile(ctx context.Context, path, foldedRoot string) (cxRollout, 
 						r.id = m.ID
 					}
 				}
-				folded := ident.Fold(m.Cwd)
-				if folded == foldedRoot || strings.HasPrefix(folded, foldedRoot+"/") {
+				if m.Cwd == "" {
+					// cwd 부재/null = 형식 변경 스킵 강등(§2, 필드 부재 규율) — 발산으로 오판해
+					// 프로젝트 rollout을 skip=0인 채 조용히 배제하지 않는다(Codex P2).
+					r.skipped++
+					break
+				}
+				fc := strings.TrimSuffix(ident.Fold(m.Cwd), "/")
+				if fc == root || strings.HasPrefix(fc, root+"/") {
 					r.cwdAny = true
 				} else {
 					r.cwdOut = true
@@ -250,8 +259,12 @@ func scanRollouts(ctx context.Context, rolloutRoot, projectRoot string, cxSet ma
 	}
 	groups := map[string]*cxRollout{} // meta session_id → 병합 누적(파일=세션 폐기, D44 c65da3d)
 	walkErr := filepath.WalkDir(rolloutRoot, func(path string, d fs.DirEntry, err error) error {
-		if err != nil || d.IsDir() {
-			return nil // 하위 오류는 해당 항목만 무시(읽기 전용 관측 채널)
+		if err != nil {
+			sc.skipFiles++ // 읽을 수 없는 하위 트리 — 디렉터리 단위 1회 미귀속 계상(침묵 탈락 금지, Codex P2)
+			return nil
+		}
+		if d.IsDir() {
+			return nil
 		}
 		start, _, ok := rolloutStartFromName(d.Name())
 		if !ok {
@@ -266,7 +279,11 @@ func scanRollouts(ctx context.Context, rolloutRoot, projectRoot string, cxSet ma
 			return nil
 		}
 		if !r.cwdAny {
-			return nil // 타 프로젝트 — 자연 배제(라인 스킵도 미집계 — 경고 오염 방지, 계획 검수 교정)
+			if !r.cwdOut {
+				// 유효 cwd meta 전무(전부 부재/무효) — 프로젝트 판별 불가 = meta 전무와 동일 미귀속(Codex P2).
+				sc.skipFiles++
+			}
+			return nil // cwdOut만(타 프로젝트) → 자연 배제(라인 스킵도 미집계 — 경고 오염 방지)
 		}
 		sc.skipLines += r.skipped // 프로젝트 귀속(채택·발산) 파일의 라인 스킵만 집계(파일 단위)
 		if r.cwdOut {
