@@ -1045,6 +1045,11 @@ func TestEnsureSession_CreatesOnceReentrant(t *testing.T) {
 func TestOpenAppend_AppendUsesExternalSessionID(t *testing.T) {
 	dir := t.TempDir()
 	ad := openAppendT(t, dir, AppendOptions{ExternalSessionID: testCCSessionID, Producer: "context-router/test"})
+	// D42 §4 게이트 전제: 실제 dispatch는 SessionExists==true(=EnsureSession 선행)에서만 Append에
+	// 도달한다. 세션 행 없이 append하면 게이트가 orphan을 막아 거부하므로 여기서 세션을 생성한다.
+	if _, err := ad.EnsureSession(context.Background(), "startup", "/wt"); err != nil {
+		t.Fatalf("EnsureSession: %v", err)
+	}
 
 	_, eventID, _, err := ad.Append(context.Background(), Event{Type: "tool_call", Summary: "Bash: git status"})
 	if err != nil {
@@ -1116,6 +1121,10 @@ func TestOpenAppend_CoexistWithOpen(t *testing.T) {
 	dir := t.TempDir()
 	d := openT(t, dir, Options{Producer: "mcp/test"})
 	ad := openAppendT(t, dir, AppendOptions{ExternalSessionID: testCCSessionID, Producer: "hook/test"})
+	// D42 §4 게이트 전제: cc: 세션 행이 있어야 hook 경로 append가 통과한다(Open() 세션 d는 자체 보유).
+	if _, err := ad.EnsureSession(context.Background(), "startup", "/wt"); err != nil {
+		t.Fatalf("EnsureSession: %v", err)
+	}
 
 	const perConn = 50
 	var wg sync.WaitGroup
@@ -1173,6 +1182,10 @@ func TestOpenAppend_CloseSkipsCheckpoint(t *testing.T) {
 	hook, err := OpenAppend(context.Background(), dir, AppendOptions{ExternalSessionID: testCCSessionID, Producer: "hook"})
 	if err != nil {
 		t.Fatalf("OpenAppend: %v", err)
+	}
+	// D42 §4 게이트 전제: 세션 행이 있어야 append가 통과한다.
+	if _, err := hook.EnsureSession(context.Background(), "startup", "/wt"); err != nil {
+		t.Fatalf("EnsureSession: %v", err)
 	}
 	if _, _, _, err := hook.Append(context.Background(), Event{Type: "note", Summary: "x"}); err != nil {
 		t.Fatalf("Append: %v", err)
@@ -1246,6 +1259,14 @@ func TestOpenAppend_QuickCheckSkipped(t *testing.T) {
 		t.Fatalf("OpenAppend는 quick_check를 생략하므로 성공해야 함, got %v", err)
 	}
 	defer ad.Close()
+
+	// D42 §4 게이트 전제: sessions 행을 직접 시드해 게이트 EXISTS를 만족시킨다(sessions 테이블만
+	// 건드려 손상된 session_events 루트는 우회) — 그래야 손상 감지 지점이 EnsureSession의 session_start
+	// INSERT가 아니라 아래 Append의 session_events INSERT로 유지된다(이 테스트의 검증 대상).
+	if _, err := ad.writer.Exec(`INSERT INTO sessions(session_id, started_at, producer, retention_sec) VALUES(?,?,?,?)`,
+		testCCSessionID, time.Now().Unix(), "p", 0); err != nil {
+		t.Fatalf("seed sessions row: %v", err)
+	}
 
 	_, _, _, appendErr := ad.Append(context.Background(), Event{Type: "note", Summary: "x"})
 	if appendErr == nil {
@@ -1347,5 +1368,79 @@ func TestEnsureSession_AtomicRollback(t *testing.T) {
 	}
 	if sessions != 0 || starts != 0 {
 		t.Fatalf("원자성 위반: sessions=%d session_start=%d want 0/0 (둘 다 롤백)", sessions, starts)
+	}
+}
+
+// TestAppendRejectsDeletedSession — D42 §4: 빈 세션 GC가 세션 행을 지운 뒤 늦게 도착한
+// Append는 이벤트를 커밋하지 않는다(orphan 금지). 훅 append 3종(기본 tool_call + shadowCapture
+// 파생 artifact_created·tool_result_summary)을 세션 계층에서 직접 검증한다 — 셋 다 appendEvent
+// 단일 경로를 지나므로 이 단정이 곧 shadow 경로 커버다(검수 정정: dispatch가 unknown-session을
+// shadowCapture 이전에 drop해 훅 블랙박스는 공허 테스트가 되므로 세션 계층에서 확인한다).
+func TestAppendRejectsDeletedSession(t *testing.T) {
+	dir := t.TempDir()
+	ad := openAppendT(t, dir, AppendOptions{ExternalSessionID: testCCSessionID, Producer: "context-router/test"})
+	ctx := context.Background()
+
+	// 세션 정상 생성(EnsureSession) 후 GC를 모사해 세션 행만 직접 삭제(FK 없음 — session_start 잔존).
+	if _, err := ad.EnsureSession(ctx, "startup", "/wt"); err != nil {
+		t.Fatalf("EnsureSession: %v", err)
+	}
+	if _, err := ad.writer.Exec(`DELETE FROM sessions WHERE session_id=?`, testCCSessionID); err != nil {
+		t.Fatalf("DELETE sessions: %v", err)
+	}
+
+	for _, typ := range []string{"tool_call", "artifact_created", "tool_result_summary"} {
+		_, _, _, err := ad.Append(ctx, Event{Type: typ, Summary: "after GC"})
+		if err == nil {
+			t.Fatalf("삭제된 세션 Append(%s)가 성공 — 게이트 부재", typ)
+		}
+		if !errors.Is(err, store.ErrNotFound) {
+			t.Fatalf("Append(%s) 오류=%v want store.ErrNotFound(기존 매핑 경로)", typ, err)
+		}
+	}
+
+	// orphan 없음: session_start를 제외한 세션 소속 이벤트가 0건이어야 한다.
+	var orphans int64
+	if err := ad.reader.QueryRow(`SELECT COUNT(*) FROM session_events WHERE session_id=? AND event_type<>?`,
+		testCCSessionID, eventTypeSessionStart).Scan(&orphans); err != nil {
+		t.Fatal(err)
+	}
+	if orphans != 0 {
+		t.Fatalf("orphan 이벤트 %d건 — 게이트가 삽입을 막지 못함", orphans)
+	}
+}
+
+// TestSessionStartAfterGCRecreates — D42 §8 resume 자가 회복: GC로 세션 행이 사라진 뒤 같은
+// session_id의 session_start(EnsureSession)가 오면 멱등 재생성되고, 이후 append가 다시 게이트를
+// 통과한다. EnsureSession이 이미 멱등이라 즉시 GREEN — 회귀 고정 가치로 추가(설계 §8 요구).
+func TestSessionStartAfterGCRecreates(t *testing.T) {
+	dir := t.TempDir()
+	ad := openAppendT(t, dir, AppendOptions{ExternalSessionID: testCCSessionID, Producer: "context-router/test", RetentionSec: 7})
+	ctx := context.Background()
+
+	if created, err := ad.EnsureSession(ctx, "startup", "/wt"); err != nil || !created {
+		t.Fatalf("EnsureSession(1st)=%v,%v want true,nil", created, err)
+	}
+	// GC 모사: 세션 행 + 그 이벤트 삭제.
+	if _, err := ad.writer.Exec(`DELETE FROM sessions WHERE session_id=?`, testCCSessionID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ad.writer.Exec(`DELETE FROM session_events WHERE session_id=?`, testCCSessionID); err != nil {
+		t.Fatal(err)
+	}
+	if exists, err := ad.SessionExists(ctx); err != nil || exists {
+		t.Fatalf("SessionExists(after GC)=%v,%v want false,nil", exists, err)
+	}
+
+	// resume: 같은 session_id의 session_start가 오면 멱등 재생성.
+	if created, err := ad.EnsureSession(ctx, "resume", "/wt"); err != nil || !created {
+		t.Fatalf("EnsureSession(resume)=%v,%v want true,nil (재생성 실패)", created, err)
+	}
+	if exists, err := ad.SessionExists(ctx); err != nil || !exists {
+		t.Fatalf("SessionExists(after resume)=%v,%v want true,nil", exists, err)
+	}
+	// 재생성 세션은 게이트를 다시 통과한다(자가 회복 완료).
+	if _, _, _, err := ad.Append(ctx, Event{Type: "tool_call", Summary: "post-resume"}); err != nil {
+		t.Fatalf("재생성 세션 Append 실패: %v", err)
 	}
 }
