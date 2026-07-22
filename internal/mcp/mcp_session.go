@@ -55,7 +55,7 @@ type RecordEventOutput struct {
 // resolveArtifactRefs: artifact_id → content_hash(store.ArtifactHashByID) → 정본 URI
 // `artifact://<session_id>/sha256-<hash>`(설계 §3.1 — 세션 성분은 출처 표시일 뿐, 해석 시에는
 // hash만 쓴다). 미존재 id는 INVALID_ARGUMENT(store.ErrNotFound를 NOT_FOUND로 흘려보내지 않음
-// — supersedes의 NOT_FOUND와 의미가 다르다).
+// — supersedes 미존재도 F3/C1 게이트(in.Supersedes!="") 이후 동일하게 INVALID_ARGUMENT로 매핑된다).
 func resolveArtifactRefs(ctx context.Context, st *store.Store, sessionID string, ids []int64) ([]string, error) {
 	if len(ids) == 0 {
 		return nil, nil

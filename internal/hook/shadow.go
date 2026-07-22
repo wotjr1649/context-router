@@ -88,11 +88,11 @@ func shadowCapture(ctx context.Context, ad *session.AppendDB, in hookInput, dir,
 	}
 
 	ref := "artifact://" + external + "/sha256-" + rep.Hash // 문자열 조립만(url.Parse 금지, §5)
-	shadowAppend(ctx, ad, dir, session.Event{
+	shadowAppend(ctx, ad, dir, external, in.HookEventName, in.ToolName, session.Event{
 		Type: "artifact_created", Summary: summaryLine(in.ToolName, "shadow artifact"),
 		ArtifactRefs: []string{ref},
 	})
-	shadowAppend(ctx, ad, dir, session.Event{
+	shadowAppend(ctx, ad, dir, external, in.HookEventName, in.ToolName, session.Event{
 		Type: "tool_result_summary", Summary: summaryLine(in.ToolName, strconv.Itoa(size)+"B"),
 		ArtifactRefs: []string{ref},
 	})
@@ -139,9 +139,10 @@ func commandDumpPath(in hookInput) string {
 
 // shadowAppend: Shadow 이벤트 1건 append — 실패는 drops 1줄만 남기고 계속한다(부분 성공 허용,
 // fail-open). 요약은 도구명+허용 요소만이라 응답 원문·비밀을 운반하지 않는다(§3 allowlist).
-func shadowAppend(ctx context.Context, ad *session.AppendDB, dir string, ev session.Event) {
+// 실패 drop은 external(세션ID)·event·tool을 담아 다른 shadow drop(oversize·ingest 등)과 필드 정합.
+func shadowAppend(ctx context.Context, ad *session.AppendDB, dir, external, hookEvent, tool string, ev session.Event) {
 	if _, _, _, err := ad.Append(ctx, ev); err != nil {
-		appendDrop(dir, "shadow-append", "", "", "")
+		appendDrop(dir, "shadow-append", external, hookEvent, tool)
 	}
 }
 

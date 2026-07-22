@@ -1125,7 +1125,7 @@ func (s *Store) purgeHookRows(ctx context.Context) ([]string, HookPurgeReport, e
 }
 
 // reclaimHookBlobs: purgeHookRows 커밋 후 호출 — lockStore(s.dir) 하에 hash별 물리 CAS 파일을 rename
-// 격리 프로토콜로 회수한다. ① os.Rename(p, p+".purging") — 원자, 실패(부재)는 skip ② 격리본 re-Stat:
+// 격리 프로토콜로 회수한다. ① os.Rename(p, p+".purging") — 원자, 실패는 부재만 무음 skip·그 외(공유 위반 등)는 Failed++ ② 격리본 re-Stat:
 // mtime이 gcOrphanMinAge(1h) 이내(교체 감지 겸 age gate) 또는 DB 재확인에서 참조 존재 → 원 경로로
 // 롤백 + Deferred++ ③ 아니면 os.Remove + ReclaimedB += size(Remove 실패는 롤백 + Failed++). rename
 // 이후 도착한 Register.writeBlob은 원 경로에 새 파일을 만들 뿐 무충돌, rename 이전 교체분은 격리본의
@@ -1144,7 +1144,10 @@ func (s *Store) reclaimHookBlobs(ctx context.Context, hashes []string, rep *Hook
 		p := filepath.Join(s.dir, "artifacts", h[:2], h) // blobPath 헬퍼 부재 — 인라인 관례
 		q := p + ".purging"
 		if err := os.Rename(p, q); err != nil {
-			continue // 부재 등 — 회수할 파일 없음(이미 없거나 동시 GC가 수거)
+			if !os.IsNotExist(err) { // 부재는 무음 skip(이미 없거나 동시 GC 수거), 그 외(공유 위반 등)는 관측
+				rep.FailedFiles++ // Windows 공유 위반 등 rename 실패 가시성(os.IsNotExist는 LinkError를 unwrap, 314 선례)
+			}
+			continue
 		}
 		fi, statErr := os.Stat(q)
 		if statErr != nil || time.Since(fi.ModTime()) < gcOrphanMinAge || s.stillReferenced(ctx, h) {

@@ -454,6 +454,113 @@ func TestDoctorShadowOwnedIncomplete(t *testing.T) {
 	}
 }
 
+// doctorShadowProjDir — [15] 분해 테스트 공용 셋업: (storeRoot, projectRoot, projDir).
+func doctorShadowProjDir(t *testing.T) (storeRoot, projectRoot, projDir string) {
+	t.Helper()
+	storeRoot = t.TempDir()
+	projectRoot = t.TempDir()
+	canon, err := ident.Canonicalize(projectRoot)
+	if err != nil {
+		t.Fatalf("canonicalize: %v", err)
+	}
+	projDir = filepath.Join(storeRoot, "projects", canon.ProjectID)
+	return
+}
+
+// TestDoctorShadowOwnedShared — D40 §2: 같은 귀속 hash를 cc:·cx: 세션이 함께 참조하면(한 worktree
+// 내 두 세션) shared 버킷으로 집계되고 cc:/cx:/unattributed는 0이다.
+func TestDoctorShadowOwnedShared(t *testing.T) {
+	storeRoot, projectRoot, projDir := doctorShadowProjDir(t)
+	ownedHash := seedShadowContentDB(t, projDir)
+
+	ccSid := "cc:00000000-0000-7000-8000-0000000000aa"
+	cxSid := "cx:00000000-0000-7000-8000-0000000000bb"
+	wt := filepath.Join(projDir, "worktrees", "wt1")
+	seedShadowWorktree(t, wt, ccSid, []string{"artifact://" + ccSid + "/sha256-" + ownedHash})
+	seedShadowWorktree(t, wt, cxSid, []string{"artifact://" + cxSid + "/sha256-" + ownedHash})
+
+	var buf bytes.Buffer
+	if err := runDoctor(context.Background(), &buf, storeRoot, projectRoot, "0.0.1-dev"); err != nil {
+		t.Fatalf("runDoctor err=%v out=%s", err, buf.String())
+	}
+	out := buf.String()
+	for _, want := range []string{"[15] shadow-owned: ", "hashes=1", "cc:=0B cx:=0B shared=", "unattributed=0B"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("shared 버킷 출력에 %q 없음:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "shared=0B") || strings.Contains(out, "incomplete") || strings.Contains(out, "세션 분해 없음") {
+		t.Fatalf("shared 집계 실패(shared=0B/incomplete/분해없음):\n%s", out)
+	}
+}
+
+// TestDoctorShadowOwnedUnattributed — D40 §2: 귀속 hash가 어느 세션에도 참조되지 않으면(세션은
+// 있으나 비귀속 hash만 참조) unattributed 버킷으로 집계된다(usable≥1이라 폴백 아님).
+func TestDoctorShadowOwnedUnattributed(t *testing.T) {
+	storeRoot, projectRoot, projDir := doctorShadowProjDir(t)
+	seedShadowContentDB(t, projDir) // ownedHash 존재하나 아래 세션은 참조하지 않음
+
+	sid := "cc:00000000-0000-7000-8000-0000000000aa"
+	wt := filepath.Join(projDir, "worktrees", "wt1")
+	seedShadowWorktree(t, wt, sid, []string{"artifact://" + sid + "/sha256-" + strings.Repeat("d", 64)}) // 비귀속 hash
+
+	var buf bytes.Buffer
+	if err := runDoctor(context.Background(), &buf, storeRoot, projectRoot, "0.0.1-dev"); err != nil {
+		t.Fatalf("runDoctor err=%v out=%s", err, buf.String())
+	}
+	out := buf.String()
+	if !strings.Contains(out, "cc:=0B cx:=0B shared=0B unattributed=") {
+		t.Fatalf("unattributed 버킷 형식 아님:\n%s", out)
+	}
+	if strings.Contains(out, "unattributed=0B") || strings.Contains(out, "세션 분해 없음") {
+		t.Fatalf("귀속 hash가 unattributed로 집계되지 않음:\n%s", out)
+	}
+}
+
+// TestDoctorShadowOwnedMultiWorktree — D40 §2: worktree 2개의 세션 데이터가 합산된다. wt1(cc:)과
+// wt2(cx:)가 각각 같은 hash를 참조 → shared는 두 worktree를 모두 순회해 접두를 병합했을 때에만
+// 나온다(한쪽만 읽으면 cc:/cx: 단독). shared 결과가 곧 다중 worktree 합산의 증거.
+func TestDoctorShadowOwnedMultiWorktree(t *testing.T) {
+	storeRoot, projectRoot, projDir := doctorShadowProjDir(t)
+	ownedHash := seedShadowContentDB(t, projDir)
+
+	ccSid := "cc:00000000-0000-7000-8000-0000000000aa"
+	cxSid := "cx:00000000-0000-7000-8000-0000000000bb"
+	seedShadowWorktree(t, filepath.Join(projDir, "worktrees", "wt1"), ccSid, []string{"artifact://" + ccSid + "/sha256-" + ownedHash})
+	seedShadowWorktree(t, filepath.Join(projDir, "worktrees", "wt2"), cxSid, []string{"artifact://" + cxSid + "/sha256-" + ownedHash})
+
+	var buf bytes.Buffer
+	if err := runDoctor(context.Background(), &buf, storeRoot, projectRoot, "0.0.1-dev"); err != nil {
+		t.Fatalf("runDoctor err=%v out=%s", err, buf.String())
+	}
+	out := buf.String()
+	if !strings.Contains(out, "cc:=0B cx:=0B shared=") || strings.Contains(out, "shared=0B") {
+		t.Fatalf("2개 worktree 접두 병합(shared) 실패:\n%s", out)
+	}
+	if strings.Contains(out, "incomplete") || strings.Contains(out, "세션 분해 없음") {
+		t.Fatalf("정상 2-worktree 경로인데 incomplete/분해없음:\n%s", out)
+	}
+}
+
+// TestDoctorShadowOwnedNoSessionDecomp — D40 §2: content.db는 있으나 worktrees 세션이 하나도
+// 없으면(usable=0) [15]는 버킷 분해 없이 '세션 분해 없음' 폴백으로 렌더한다(cli.go:1484 경로).
+func TestDoctorShadowOwnedNoSessionDecomp(t *testing.T) {
+	storeRoot, projectRoot, projDir := doctorShadowProjDir(t)
+	seedShadowContentDB(t, projDir) // worktrees 디렉터리 미생성 → usable=0
+
+	var buf bytes.Buffer
+	if err := runDoctor(context.Background(), &buf, storeRoot, projectRoot, "0.0.1-dev"); err != nil {
+		t.Fatalf("runDoctor err=%v out=%s", err, buf.String())
+	}
+	out := buf.String()
+	if !strings.Contains(out, "[15] shadow-owned: ") || !strings.Contains(out, "(세션 분해 없음)") || !strings.Contains(out, "hashes=1") {
+		t.Fatalf("세션 분해 없음 폴백 형식 아님:\n%s", out)
+	}
+	if strings.Contains(out, "cc:=") { // 폴백 경로엔 버킷 분해가 없어야 한다
+		t.Fatalf("폴백인데 버킷 분해 병기:\n%s", out)
+	}
+}
+
 // TestRun_UnknownSub: cli의 관심사가 아닌 미지 서브커맨드는 오류를 반환해야 한다 — main이
 // 이를 통해 미지 단어를 MCP 플래그로 잘못 흡수하지 않도록 한다(설계 §7).
 func TestRun_UnknownSub(t *testing.T) {
@@ -578,7 +685,7 @@ func TestConfirmPurge(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			var out bytes.Buffer
-			err := confirmPurge(tt.in, &out, tt.isTTY, tt.force, "myproj")
+			err := confirmPurge(tt.in, &out, tt.isTTY, tt.force, "전체 삭제는 세션 이벤트 데이터를 포함합니다", "myproj")
 			if (err != nil) != tt.wantErr {
 				t.Fatalf("err=%v wantErr=%v", err, tt.wantErr)
 			}
@@ -1901,6 +2008,13 @@ func TestPurgeHookOnlySinglePrompt(t *testing.T) {
 	}
 	if !strings.Contains(o, "실회수") {
 		t.Fatalf("단일 확인 통과 후 실회수 보고 없음:\n%s", o)
+	}
+	// hook-only 확인 문구는 범위(shadow-owned 한정)를 명시하고 전체삭제(세션 이벤트) 문구를 쓰지 않는다.
+	if strings.Contains(o, "세션 이벤트 데이터를 포함") {
+		t.Fatalf("hook-only인데 전체삭제(세션 이벤트 데이터) 문구:\n%s", o)
+	}
+	if !strings.Contains(o, "explicit 소스는 보존") {
+		t.Fatalf("hook-only 범위(shadow-owned 한정) 문구 없음:\n%s", o)
 	}
 }
 

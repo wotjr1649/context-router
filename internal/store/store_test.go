@@ -1283,6 +1283,12 @@ func TestPurgeOlderThan(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// FTS pre-state 핀: 삭제 전 같은 질의가 실제로 히트해야 이후 무히트 단언(1315)이 공허 통과가 아니다.
+	var pre int
+	if err := s.reader.QueryRow("SELECT count(*) FROM fts_porter WHERE fts_porter MATCH 'old'").Scan(&pre); err != nil || pre == 0 {
+		t.Fatalf("pre-state 'old' 미히트(무히트 단언 무의미): n=%d err=%v", pre, err)
+	}
+
 	gotSources, gotArtifacts, err := s.PurgeOlderThan(t.Context(), cutoff)
 	if err != nil {
 		t.Fatalf("PurgeOlderThan: %v", err)
@@ -1896,6 +1902,11 @@ func TestPurgeHookOnly(t *testing.T) {
 	sharedHash := hashOf("purge-shared")
 
 	ageBlobFile(t, st, hookHash, -2*time.Hour) // age gate 통과(1h 초과)
+	// FTS pre-state 핀: 삭제 전 'zzneedle'가 실제로 히트해야 이후 무히트 단언(1909)이 공허 통과가 아니다.
+	var pre int
+	if err := st.reader.QueryRow("SELECT count(*) FROM fts_porter WHERE fts_porter MATCH 'zzneedle'").Scan(&pre); err != nil || pre == 0 {
+		t.Fatalf("pre-state 'zzneedle' 미히트(무히트 단언 무의미): n=%d err=%v", pre, err)
+	}
 	rep, err := st.PurgeHookOnly(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -1926,6 +1937,29 @@ func TestPurgeHookOnlyAgeGateDefers(t *testing.T) {
 		t.Fatalf("report=%+v want Hashes=1·유예 1·회수 0", rep)
 	}
 	assertBlobFileExists(t, st, h) // 파일 보존(재등록 경합 안전)
+}
+
+// TestPurgeHookOnlyRenameFailureCounts — rename 격리의 os.Rename(p,q) 실패가 부재(무음 skip)가
+// 아닌 경우(공유 위반 등)는 FailedFiles로 관측된다(Windows 공유 위반 가시성). 이식 가능한 유도:
+// 목적지 q(=p+".purging")를 비어있지 않은 디렉터리로 선점 → 파일→디렉터리 rename은 모든 OS에서
+// 부재 아닌 실패. 원 blob은 rename 실패로 그대로 남는다.
+func TestPurgeHookOnlyRenameFailureCounts(t *testing.T) {
+	st := openAt(t, t.TempDir())
+	seedHookOnly(t, st)
+	h := hashOf(soContent)
+	ageBlobFile(t, st, h, -2*time.Hour) // age gate 통과 — 회수(rename) 시도까지 도달
+	p := filepath.Join(st.dir, "artifacts", h[:2], h)
+	if err := os.MkdirAll(filepath.Join(p+".purging", "occupied"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	rep, err := st.PurgeHookOnly(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rep.Hashes != 1 || rep.FailedFiles != 1 || rep.ReclaimedB != 0 || rep.DeferredFiles != 0 {
+		t.Fatalf("report=%+v want Hashes=1·Failed 1·회수 0·유예 0", rep)
+	}
+	assertBlobFileExists(t, st, h) // rename 실패 → 원 blob 잔존
 }
 
 // TestPurgeHookOnlyRevalidates — 견적 후 비-hook source가 생긴 hash는 tx 내 재검증으로 대상 제외
@@ -2033,6 +2067,12 @@ func TestPurgeHookOnlyPreservesReindexResidue(t *testing.T) {
 	}
 	hookHash := hashOf(hookContent)
 	ageBlobFile(t, st, hookHash, -2*time.Hour) // age gate 통과
+
+	// FTS pre-state 핀: 삭제 전 hook 청크('zzneedle')가 실제로 히트해야 이후 무히트 단언(2051)이 공허 통과가 아니다.
+	var preHook int
+	if err := st.reader.QueryRow("SELECT count(*) FROM fts_porter WHERE fts_porter MATCH 'zzneedle'").Scan(&preHook); err != nil || preHook == 0 {
+		t.Fatalf("pre-state 'zzneedle' 미히트(무히트 단언 무의미): n=%d err=%v", preHook, err)
+	}
 
 	rep, err := st.PurgeHookOnly(ctx)
 	if err != nil {
