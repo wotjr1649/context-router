@@ -38,6 +38,8 @@ type hookInput struct {
 	ToolResponse  json.RawMessage `json:"tool_response"` // PostToolUse(성공)만
 	Error         string          `json:"error"`         // PostToolUseFailure만
 	IsInterrupt   bool            `json:"is_interrupt"`  // PostToolUseFailure(선택)
+	AgentID       json.RawMessage `json:"agent_id"`      // D53 — RawMessage 지연 관대 파싱(스펙 v0.10 §0: string 필드 금지)
+	AgentType     json.RawMessage `json:"agent_type"`    // D53 — 〃
 }
 
 // canonicalUUIDRe — session_id의 canonical(8-4-4-4-12 하이픈) UUID 형식 검증(설계 §2.2).
@@ -165,6 +167,15 @@ func dispatch(ctx context.Context, in hookInput, dir, contentDir, worktreeRoot s
 			guardBash(ctx, ad, in, dir, contentDir, worktreeRoot, host, getenv, stdout)
 		case "PowerShell":
 			guardPowerShell(ctx, ad, in, dir, contentDir, worktreeRoot, getenv, stdout)
+		}
+		return
+	}
+	// D53 — 서브에이전트 생애주기(스펙 v0.10 §0): buildEvent→Append 경유, 1 호출 = 1 이벤트.
+	if in.HookEventName == "SubagentStart" || in.HookEventName == "SubagentStop" {
+		if ev, ok := buildEvent(in); ok {
+			if _, _, _, err := ad.Append(ctx, ev); err != nil {
+				appendDrop(dir, "append-failed", external, in.HookEventName, in.ToolName)
+			}
 		}
 		return
 	}
@@ -473,6 +484,14 @@ var bashTokenRe = regexp.MustCompile(`^[A-Za-z0-9_./-]+$`)
 // 추출한 숫자 외 어떤 바이트도 요약에 복사하지 않는다).
 var errCodeRe = regexp.MustCompile(`(?i)(?:status code|exit code|code)\s+(\d+)`)
 
+// agentStrings — D53 관대 추출: RawMessage에서 문자열 언마샬 성공분만, 실패·부재는 빈 문자열.
+// 생애주기 이벤트의 attrs는 빈 값도 기록하므로 ok 게이트가 없다(표식 게이트는 agentFields — T2).
+func agentStrings(in hookInput) (id, typ string) {
+	_ = json.Unmarshal(in.AgentID, &id)
+	_ = json.Unmarshal(in.AgentType, &typ)
+	return id, typ
+}
+
 // classify — 훅 이벤트 1건을 (event_type, summary, attrs)로 매핑한다(설계 §3). 우선순위:
 // error(PostToolUseFailure 이벤트명 기준 — 응답 파싱 아님, T0) > git_diff/build_run/test_run
 // (Bash 패턴표) > file_edit(Write/Edit/NotebookEdit) > tool_call. summary는 `<도구명>: <허용
@@ -481,6 +500,18 @@ var errCodeRe = regexp.MustCompile(`(?i)(?:status code|exit code|code)\s+(\d+)`)
 // (worktreeRoot와 동일 워크스페이스 디렉터리 — canon Fold/RealPath는 store-id 안정화 전용이라
 // 표시 경로에는 불필요). attrs는 allowlist 필드만(exit_code·is_interrupt·matched_pattern) 채운다.
 func classify(in hookInput) (eventType, summary string, attrs map[string]any) {
+	if in.HookEventName == "SubagentStart" || in.HookEventName == "SubagentStop" {
+		et, verb := "subagent_start", "started"
+		if in.HookEventName == "SubagentStop" {
+			et, verb = "subagent_stop", "stopped"
+		}
+		id, typ := agentStrings(in)
+		summary := "subagent " + verb
+		if typ != "" {
+			summary += ": " + typ // 빈 type = 접미 생략(§3 실측 — 빈 summary 드롭 회피)
+		}
+		return et, summary, map[string]any{"agent_id": id, "agent_type": typ}
+	}
 	if in.HookEventName == "PostToolUseFailure" {
 		element, a := classifyError(in.Error, in.IsInterrupt)
 		return "error", summaryLine(in.ToolName, element), a

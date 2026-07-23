@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -589,6 +590,146 @@ func TestHookStdinOversize(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(sessDir(t, storeRoot, cwd), "session.db")); !os.IsNotExist(err) {
 		t.Fatalf("session.db must not exist on oversize stdin, stat err=%v", err)
 	}
+}
+
+// ─── D53: 서브에이전트 생애주기 (스펙 v0.10 §0·§2) ────────────────────────────
+
+// D53 — SubagentStart/Stop 생애주기 이벤트(스펙 v0.10 §0·§2). 등록된 세션에 각 1이벤트,
+// summary는 "subagent started: <type>"·빈 type이면 접미 생략, attrs는 빈 값 포함 2키 기록.
+func TestHookSubagentLifecycle(t *testing.T) {
+	storeRoot := filepath.Join(t.TempDir(), "storeroot")
+	cwd := t.TempDir()
+	sid := "3f2504e0-4f89-41d3-9a0c-0305e82c3301"
+	// SessionStart로 세션 등록(기존 관례)
+	start := mustJSON(t, map[string]any{"hook_event_name": "SessionStart", "session_id": sid, "cwd": cwd, "source": "startup"})
+	if rc := runHook(t, storeRoot, start, nil); rc != 0 {
+		t.Fatalf("SessionStart rc=%d", rc)
+	}
+	cases := []struct {
+		event, agentType, wantType, wantSummary string
+	}{
+		{"SubagentStart", "Explore", "subagent_start", "subagent started: Explore"},
+		{"SubagentStop", "Explore", "subagent_stop", "subagent stopped: Explore"},
+		{"SubagentStart", "", "subagent_start", "subagent started"}, // 빈 type — 접미 생략(§3 실측 근거)
+	}
+	for _, c := range cases {
+		in := mustJSON(t, map[string]any{
+			"hook_event_name": c.event, "session_id": sid, "cwd": cwd,
+			"agent_id": "a1b2c3d4e5f6", "agent_type": c.agentType,
+		})
+		if rc := runHook(t, storeRoot, in, nil); rc != 0 {
+			t.Fatalf("%s rc=%d", c.event, rc)
+		}
+		ev := lastEvent(t, sessDir(t, storeRoot, cwd), sid) // (type, summary, attrs) 조회 헬퍼
+		if ev.Type != c.wantType || ev.Summary != c.wantSummary {
+			t.Fatalf("got (%s,%q) want (%s,%q)", ev.Type, ev.Summary, c.wantType, c.wantSummary)
+		}
+		if ev.Attrs["agent_id"] != "a1b2c3d4e5f6" || ev.Attrs["agent_type"] != c.agentType {
+			t.Fatalf("attrs=%v want agent_id/agent_type 병기(빈 값 포함)", ev.Attrs)
+		}
+	}
+}
+
+// D53 — 미등록 세션의 SubagentStart는 D51 합성 등록 경유 후 기록(파이프라인 합류 회귀).
+func TestHookSubagentUnknownSessionSynthesizes(t *testing.T) {
+	storeRoot := filepath.Join(t.TempDir(), "storeroot")
+	cwd := t.TempDir()
+	sid := "4a2504e0-4f89-41d3-9a0c-0305e82c3302"
+	in := mustJSON(t, map[string]any{
+		"hook_event_name": "SubagentStart", "session_id": sid, "cwd": cwd,
+		"agent_id": "x1", "agent_type": "Explore",
+	})
+	if rc := runHook(t, storeRoot, in, nil); rc != 0 {
+		t.Fatalf("rc=%d", rc)
+	}
+	// session_start(Source="first-event") + subagent_start = 2이벤트
+	n := countEvents(t, sessDir(t, storeRoot, cwd), sid)
+	if n != 2 {
+		t.Fatalf("events=%d want 2 (합성 등록 + subagent_start)", n)
+	}
+}
+
+// D53 비수용 부정(§2): SubagentStop의 last_assistant_message·agent_transcript_path는
+// summary·attrs 어디에도 미출현.
+func TestHookSubagentStopRejectsBodyFields(t *testing.T) {
+	storeRoot := filepath.Join(t.TempDir(), "storeroot")
+	cwd := t.TempDir()
+	sid := "5b2504e0-4f89-41d3-9a0c-0305e82c3303"
+	start := mustJSON(t, map[string]any{"hook_event_name": "SessionStart", "session_id": sid, "cwd": cwd, "source": "startup"})
+	if rc := runHook(t, storeRoot, start, nil); rc != 0 {
+		t.Fatalf("SessionStart rc=%d", rc)
+	}
+	secret := "CANARY" + "SECRET" + "BODY" // 분해 조립(§12)
+	in := mustJSON(t, map[string]any{
+		"hook_event_name": "SubagentStop", "session_id": sid, "cwd": cwd,
+		"agent_id": "x2", "agent_type": "claude",
+		"last_assistant_message": secret, "agent_transcript_path": "C:/tmp/" + secret + ".jsonl",
+	})
+	if rc := runHook(t, storeRoot, in, nil); rc != 0 {
+		t.Fatalf("rc=%d", rc)
+	}
+	ev := lastEvent(t, sessDir(t, storeRoot, cwd), sid)
+	joined := ev.Summary + fmt.Sprint(ev.Attrs)
+	if strings.Contains(joined, secret) {
+		t.Fatalf("본문 필드 유출: %q", joined)
+	}
+}
+
+// evRow — lastEvent 조회 결과(event_type·summary·payload attrs).
+type evRow struct {
+	Type    string
+	Summary string
+	Attrs   map[string]any
+}
+
+// mustJSON — map을 stdin JSON 바이트로 조립한다(json.Marshal 래퍼).
+func mustJSON(t *testing.T, m map[string]any) []byte {
+	t.Helper()
+	b, err := json.Marshal(m)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	return b
+}
+
+// lastEvent — sdir/session.db의 cc:<sid> 세션 최신 이벤트(type·summary·payload attrs)를 읽는다.
+// hook 경로는 이벤트를 cc:+sid로 저장한다(HostClaude 귀속) — id DESC가 append 최신 행.
+func lastEvent(t *testing.T, sdir, sid string) evRow {
+	t.Helper()
+	reader, err := session.OpenReadOnly(sdir)
+	if err != nil {
+		t.Fatalf("open session.db: %v", err)
+	}
+	defer func() { _ = reader.Close() }()
+	var ev evRow
+	var payload sql.NullString
+	if err := reader.QueryRow(
+		"SELECT event_type, summary, payload FROM session_events WHERE session_id=? ORDER BY id DESC LIMIT 1",
+		"cc:"+sid,
+	).Scan(&ev.Type, &ev.Summary, &payload); err != nil {
+		t.Fatalf("last event: %v", err)
+	}
+	if payload.Valid && payload.String != "" {
+		if err := json.Unmarshal([]byte(payload.String), &ev.Attrs); err != nil {
+			t.Fatalf("unmarshal attrs %q: %v", payload.String, err)
+		}
+	}
+	return ev
+}
+
+// countEvents — sdir/session.db의 cc:<sid> 세션 이벤트 총수.
+func countEvents(t *testing.T, sdir, sid string) int {
+	t.Helper()
+	reader, err := session.OpenReadOnly(sdir)
+	if err != nil {
+		t.Fatalf("open session.db: %v", err)
+	}
+	defer func() { _ = reader.Close() }()
+	var n int
+	if err := reader.QueryRow("SELECT count(*) FROM session_events WHERE session_id=?", "cc:"+sid).Scan(&n); err != nil {
+		t.Fatalf("count events: %v", err)
+	}
+	return n
 }
 
 // ─── T5: 계측 매핑 + summary allowlist (설계 §3) ──────────────────────────────

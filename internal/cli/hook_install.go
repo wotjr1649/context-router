@@ -26,7 +26,7 @@ const (
 	dropsFileName  = "session.drops.log" // internal/hook dropsLogName(unexported) 미러 — doctor drops 집계용
 )
 
-// hookRegistrations — 설치 대상 4항목(T0-amended 설계 §7). matcher가 빈 문자열이면 전체 매칭
+// hookRegistrations — 설치 대상 6항목(T0-amended 설계 §7·v0.10 D53 서브에이전트 2항목). matcher가 빈 문자열이면 전체 매칭
 // (SessionStart=시작 방식 전체, Pre/PostToolUse(Failure)=전 도구 — T0 §4). PreToolUse는
 // Read|Bash|PowerShell 정규식 매칭(large-read/dump guard 대상 — v0.4 D36) — 관리 그룹 1개 유지가
 // merge의 동일-이벤트 상호 제거 함정을 회피한다(설계 v0.3 §4).
@@ -38,6 +38,8 @@ var hookRegistrations = []struct {
 	{"PreToolUse", "Read|Bash|PowerShell"},
 	{"PostToolUse", ""},
 	{"PostToolUseFailure", ""},
+	{"SubagentStart", ""},
+	{"SubagentStop", ""},
 }
 
 // ownedHookGroup — 설치가 쓰는 자기 소유 그룹(버전 마커 필드 __ctrManaged 포함, 설계 §7). 타
@@ -655,7 +657,7 @@ func runHookUninstallCodex(user bool, projectRoot string, stdout io.Writer) erro
 
 // scanRegisteredHooks — path의 settings에서 자기 소유 훅 그룹 수와 마커 버전을 함께 수집한다
 // (doctor [9] 등록 상태 + 버전 불일치 감지). 마커 버전은 첫 자기 그룹의 __ctrManaged에서
-// hookMarkerPrefix 뒤 부분이다 — 한 번의 install이 4개 그룹을 동일 버전 마커로 쓰므로(§7) 어느
+// hookMarkerPrefix 뒤 부분이다 — 한 번의 install이 6개 그룹을 동일 버전 마커로 쓰므로(§7) 어느
 // 그룹에서 취하든 값이 같아 map 순회 순서와 무관하게 결정적이다. 파일 미존재·hooks 부재는 (0,""),
 // 파싱 실패만 오류.
 func scanRegisteredHooks(path string) (count int, marker string, err error) {
