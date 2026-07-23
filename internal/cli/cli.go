@@ -583,11 +583,24 @@ func runPurge(ctx context.Context, in io.Reader, w, stderr io.Writer, storeRoot 
 	force := fs.Bool("force", false, "비TTY 환경에서 확인을 생략(자동화 전용)")
 	sessions := fs.Bool("sessions", false, "session.db 파일(계열, -wal/-shm 포함) 삭제 대상 포함 — .bak-*·recover-pending 마커는 제외(설계 §5)")
 	hookOnly := fs.Bool("hook-only", false, "shadow 귀속(참조가 전부 hook) 아티팩트만 선택 삭제(--project 전용) — content.db·explicit 소스는 보존(설계 §3, D41)")
+	vacuum := fs.Bool("vacuum", false, "삭제 후 VACUUM+wal_checkpoint(TRUNCATE)로 content.db 파일 축 회수(--older-than 결합 전용, D50)")
 	if err := fs.Parse(args); err != nil {
 		return fmt.Errorf("purge: 플래그 파싱 실패: %w", err)
 	}
 	if rest := fs.Args(); len(rest) > 0 {
 		return fmt.Errorf("purge: 예상치 않은 인자 %d개", len(rest))
+	}
+	// D50 정적 검증 — 파싱 직후 최우선(기존 --project/--all XOR·--hook-only 조기 분기보다 앞,
+	// 겹치는 입력은 vacuum 조합 오류가 이긴다 — 설계 v0.8 §0): --vacuum은 content.db 행을 실제로
+	// 삭제하는 유일 모드인 --older-than과 결합해서만 유효하다. --gc 단독은 read-only 연결+행
+	// 미삭제(이중 부적합), --hook-only는 이미 무조건 VACUUM을 후행한다(D41).
+	if *vacuum {
+		if *hookOnly {
+			return errors.New("purge: --hook-only는 상시 VACUUM을 수행합니다 — --vacuum 불필요")
+		}
+		if *olderThanFlag == "" {
+			return errors.New("purge: --vacuum은 --older-than과 함께 지정해야 합니다")
+		}
 	}
 	// D41 조기 분기: --hook-only는 전역 confirmPurge(아래)·전체 삭제(os.RemoveAll)에 도달하기
 	// 전에 전용 경로로 인터셉트한다 — 그러지 않으면(예: --sessions처럼 전역 confirm 뒤에 두면)

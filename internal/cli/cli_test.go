@@ -670,6 +670,37 @@ func TestRunPurge_PhantomProjectRejected(t *testing.T) {
 	}
 }
 
+// TestRunPurge_VacuumComboStaticErrors — D50 정적 검증: --vacuum은 --older-than 결합 전용이며
+// 판정은 기존 XOR·--hook-only 조기 분기보다 앞선다(오류 우선순위 명문 — 스펙 §0). 부작용 0
+// (projects/ 미생성) 단정 포함.
+func TestRunPurge_VacuumComboStaticErrors(t *testing.T) {
+	cases := []struct {
+		name, wantMsg string
+		args          []string
+	}{
+		{"단독", "--older-than", []string{"--project", "px", "--vacuum"}},
+		{"gc만", "--older-than", []string{"--project", "px", "--gc", "--vacuum"}},
+		{"sessions만", "--older-than", []string{"--project", "px", "--sessions", "--vacuum"}},
+		{"hook-only", "상시 VACUUM", []string{"--project", "px", "--hook-only", "--vacuum"}},
+		{"hook-only+older-than", "상시 VACUUM", []string{"--project", "px", "--hook-only", "--older-than", "1h", "--vacuum"}},
+		{"전체삭제", "--older-than", []string{"--project", "px", "--force", "--vacuum"}},
+		{"선택자없음(XOR보다 우선)", "--older-than", []string{"--vacuum"}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			storeRoot := t.TempDir()
+			var out bytes.Buffer
+			err := runPurge(context.Background(), failReader{}, &out, io.Discard, storeRoot, c.args, false)
+			if err == nil || !strings.Contains(err.Error(), c.wantMsg) {
+				t.Fatalf("err=%v want substring %q", err, c.wantMsg)
+			}
+			if _, statErr := os.Stat(filepath.Join(storeRoot, "projects")); !errors.Is(statErr, os.ErrNotExist) {
+				t.Fatalf("정적 오류인데 projects/ 생성됨(부작용): %v", statErr)
+			}
+		})
+	}
+}
+
 // TestPurgeProjectID_StoreIDNotShadowedByCwdDir: 리뷰 P2-3(Fix Round 1) — cwd에 store
 // ProjectID와 동명의 디렉터리가 우연히 있어도 --project <id>는 store 쪽 프로젝트를 대상으로
 // 삼아야 한다(예전 로직은 "구분자 없고 cwd에 동명 디렉터리 존재"를 경로로 오인해
