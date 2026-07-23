@@ -675,6 +675,67 @@ func TestHookSubagentStopRejectsBodyFields(t *testing.T) {
 	}
 }
 
+// D53 표식(스펙 §0·§2): agent_id 실린 PostToolUse → attrs 병기, 부재 → 두 키 부재,
+// 빈 값 → 표식 생략, wrong-type → 기본 이벤트 미드롭(RawMessage 기전이 계약 — 재검수 P2).
+func TestHookAgentAttribution(t *testing.T) {
+	cases := []struct {
+		name      string
+		event     string // PostToolUse | PostToolUseFailure(§2 — Failure도 동일 표식, 검수 반영)
+		agentID   any    // nil=필드 자체 생략
+		agentType any
+		wantMark  bool
+		wantType  string // 기본 이벤트 event_type(미드롭 단정)
+	}{
+		{"present", "PostToolUse", "a1b2", "Explore", true, "tool_call"},
+		{"present_failure", "PostToolUseFailure", "a1b2", "Explore", true, "error"},
+		{"absent", "PostToolUse", nil, nil, false, "tool_call"},
+		{"empty_id", "PostToolUse", "", "Explore", false, "tool_call"},                  // best-effort — 표식 생략
+		{"wrong_type", "PostToolUse", 123, map[string]int{"x": 1}, false, "tool_call"}, // 기본 이벤트 미드롭
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			storeRoot := filepath.Join(t.TempDir(), "storeroot")
+			cwd := t.TempDir()
+			sid := "6c2504e0-4f89-41d3-9a0c-0305e82c3304"
+			start := mustJSON(t, map[string]any{"hook_event_name": "SessionStart", "session_id": sid, "cwd": cwd, "source": "startup"})
+			if rc := runHook(t, storeRoot, start, nil); rc != 0 {
+				t.Fatalf("SessionStart rc=%d", rc)
+			}
+			m := map[string]any{
+				"hook_event_name": c.event, "session_id": sid, "cwd": cwd,
+				"tool_name": "Glob", "tool_input": map[string]string{"pattern": "*.go"},
+			}
+			if c.event == "PostToolUseFailure" {
+				m["error"] = "exit code 1"
+			} else {
+				m["tool_response"] = map[string]string{"result": "ok"}
+			}
+			if c.agentID != nil {
+				m["agent_id"] = c.agentID
+			}
+			if c.agentType != nil {
+				m["agent_type"] = c.agentType
+			}
+			if rc := runHook(t, storeRoot, mustJSON(t, m), nil); rc != 0 {
+				t.Fatalf("%s rc=%d", c.event, rc)
+			}
+			ev := lastEvent(t, sessDir(t, storeRoot, cwd), sid)
+			if ev.Type != c.wantType {
+				t.Fatalf("기본 이벤트 소실 — type=%s want %s (드롭 회귀)", ev.Type, c.wantType)
+			}
+			_, hasID := ev.Attrs["agent_id"]
+			_, hasType := ev.Attrs["agent_type"]
+			if c.wantMark {
+				if ev.Attrs["agent_id"] != "a1b2" || ev.Attrs["agent_type"] != "Explore" {
+					t.Fatalf("표식 값 불일치: attrs=%v", ev.Attrs)
+				}
+			} else if hasID || hasType { // 두 키 동시 부재(§2 — 검수 반영: type만 남는 회귀 차단)
+				t.Fatalf("비표식인데 agent 키 잔존: attrs=%v", ev.Attrs)
+			}
+		})
+	}
+}
+
 // evRow — lastEvent 조회 결과(event_type·summary·payload attrs).
 type evRow struct {
 	Type    string

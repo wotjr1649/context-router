@@ -1966,6 +1966,47 @@ func TestRunDoctor_SessionItems(t *testing.T) {
 	})
 }
 
+// TestDoctorEmptyExcludesSubagentLifecycle — D53: subagent_start(생애주기)만 있는 세션은 doctor
+// [6] empty 카운트에서 제외(스펙 §0 상호작용 ①). 세션 2개(A=session_start 단독=empty,
+// B=session_start+subagent_start=non-empty) → "sessions=2 (empty=1)" 단정.
+func TestDoctorEmptyExcludesSubagentLifecycle(t *testing.T) {
+	storeRoot := t.TempDir()
+	projectRoot := t.TempDir()
+	canon, err := ident.Canonicalize(projectRoot)
+	if err != nil {
+		t.Fatalf("canonicalize: %v", err)
+	}
+	dbDir := filepath.Join(storeRoot, "projects", canon.ProjectID, "worktrees", canon.WorktreeID)
+
+	// 세션 B: session_start + subagent_start → non-empty.
+	db, err := session.Open(dbDir, session.Options{Producer: "context-router/test"})
+	if err != nil {
+		t.Fatalf("session.Open(B): %v", err)
+	}
+	if _, _, _, err := db.Append(session.Event{Type: "subagent_start", Summary: "subagent started: Explore"}); err != nil {
+		t.Fatalf("append subagent_start: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close(B): %v", err)
+	}
+	// 세션 A: session_start 단독 → empty(각 Open이 새 자동 세션 1건 등록).
+	da, err := session.Open(dbDir, session.Options{Producer: "context-router/test"})
+	if err != nil {
+		t.Fatalf("session.Open(A): %v", err)
+	}
+	if err := da.Close(); err != nil {
+		t.Fatalf("close(A): %v", err)
+	}
+
+	var buf bytes.Buffer
+	if err := runDoctor(context.Background(), &buf, storeRoot, projectRoot, "0.0.1-dev"); err != nil {
+		t.Fatalf("runDoctor err=%v out=%s", err, buf.String())
+	}
+	if !strings.Contains(buf.String(), "sessions=2 (empty=1)") {
+		t.Fatalf("out missing \"sessions=2 (empty=1)\": %s", buf.String())
+	}
+}
+
 // corruptSessionEvents — 태스크9b CLI 레벨 recover 테스트 전용 손상 헬퍼. session 패키지의
 // recover_test.go seedAndCorruptEvents와 동일한 기법(session_events 루트 페이지의 셀 포인터
 // 배열 영역 훼손 — 실측 확인: quick_check는 malformed를 보고하지만 앞부분 다수 행은 여전히

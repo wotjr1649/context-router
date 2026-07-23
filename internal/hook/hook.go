@@ -492,6 +492,16 @@ func agentStrings(in hookInput) (id, typ string) {
 	return id, typ
 }
 
+// agentFields — D53 표식 게이트(스펙 v0.10 §0): agent_id가 비어있지 않을 때만 ok. 결손·빈 값·
+// 타입 이상은 표식 생략일 뿐 기본 이벤트 처리 불변(best-effort — 재검수 P2 기전).
+func agentFields(in hookInput) (id, typ string, ok bool) {
+	id, typ = agentStrings(in)
+	if id == "" {
+		return "", "", false
+	}
+	return id, typ, true
+}
+
 // classify — 훅 이벤트 1건을 (event_type, summary, attrs)로 매핑한다(설계 §3). 우선순위:
 // error(PostToolUseFailure 이벤트명 기준 — 응답 파싱 아님, T0) > git_diff/build_run/test_run
 // (Bash 패턴표) > file_edit(Write/Edit/NotebookEdit) > tool_call. summary는 `<도구명>: <허용
@@ -595,6 +605,12 @@ func summaryLine(tool, element string) string {
 // (빈 요약 = ValidateEvent 거부 예상 케이스 — fail-open으로 무시).
 func buildEvent(in hookInput) (session.Event, bool) {
 	eventType, summary, attrs := classify(in)
+	if id, typ, ok := agentFields(in); ok { // D53 표식 — PostToolUse/Failure·생애주기 공통(동일 키 덮어쓰기 무해)
+		if attrs == nil {
+			attrs = map[string]any{} // classify 반환 타입과 동일(검수 P1)
+		}
+		attrs["agent_id"], attrs["agent_type"] = id, typ
+	}
 	redaction := "none"
 	if red, spans := ingest.Redact([]byte(summary)); spans > 0 {
 		summary, redaction = string(red), "spans"
