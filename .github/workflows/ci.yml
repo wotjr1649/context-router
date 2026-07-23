@@ -87,3 +87,19 @@ jobs:
             size=$(stat -c%s "$out")
             echo "| ${goos}/${goarch} | ${size} |" >> "$GITHUB_STEP_SUMMARY"
           done
+
+  # D56(스펙 v0.10): 태그와 바이너리 ProductVersion 일치 검증 — -dev 잔존 태그 차단.
+  tag-version:
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - name: verify tag matches ProductVersion
+        run: |
+          got="$(go run ./cmd/context-router version)"
+          want="${GITHUB_REF_NAME#v}"
+          test "$got" = "$want" || { echo "version mismatch: binary=$got tag=$want"; exit 1; }

@@ -16,6 +16,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"time"
@@ -56,8 +57,8 @@ func contentFileWarnBytes(getenv func(string) string) int64 {
 }
 
 // Run: cli 서브커맨드 단일 진입점. storeRoot·projectRoot는 main이 이미 결정해 넘긴다(cli는
-// 재도출하지 않는다 — 설계서 §7 Produces). sub은 main이 7개 이름(doctor·upgrade·stats·purge·
-// session·hook·usage) 중 하나임을 이미 확인했다. args는 doctor·upgrade에서 미사용, stats가 --provider
+// 재도출하지 않는다 — 설계서 §7 Produces). sub은 main이 9개 이름(doctor·upgrade·stats·purge·
+// session·hook·usage·codex-hook·version) 중 하나임을 이미 확인했다. args는 doctor·upgrade에서 미사용, stats가 --provider
 // 고유 플래그 파싱에 쓴다(전용 flag.NewFlagSet, 설계 §7 — main의 serverFlags와 별개). stderr는
 // session export의 worktree 후보 목록·진단 안내 전용(태스크9, §7 stdout purity 게이트 선례 —
 // 그 외 서브커맨드는 여전히 미사용). storeRootExplicit/storeRootRaw는 hook install이 --store-root를
@@ -1683,6 +1684,9 @@ func runDoctor(ctx context.Context, w io.Writer, storeRoot, projectRoot, version
 		}
 	}
 
+	bi, _ := debug.ReadBuildInfo() // 실패 시 nil — formatBuildLine이 생략 처리
+	fmt.Fprintln(w, formatBuildLine(version, bi))
+
 	fmt.Fprintln(w)
 	fmt.Fprint(w, hostSnippet)
 
@@ -1690,6 +1694,33 @@ func runDoctor(ctx context.Context, w io.Writer, storeRoot, projectRoot, version
 		return fmt.Errorf("doctor: 진단 실패 항목 %d개", len(failed))
 	}
 	return nil
+}
+
+// formatBuildLine — doctor [17] build 라인 순수 포매터(D56 — 테스트 주입점, 검수 반영). bi가
+// nil이면 버전만(ReadBuildInfo 실패 경로 — 요소 생략·정보 라인·경고 아님). commit·dirty는
+// marker·stale 비교에 절대 비관여(안정 SemVer 계약 — 스펙 §0).
+func formatBuildLine(version string, bi *debug.BuildInfo) string {
+	parts := []string{}
+	if bi != nil {
+		parts = append(parts, "go="+bi.GoVersion)
+		for _, s := range bi.Settings {
+			switch s.Key {
+			case "vcs.revision":
+				r := s.Value
+				if len(r) > 12 {
+					r = r[:12]
+				}
+				parts = append(parts, "commit="+r)
+			case "vcs.time":
+				parts = append(parts, "time="+s.Value)
+			case "vcs.modified":
+				if s.Value == "true" {
+					parts = append(parts, "dirty")
+				}
+			}
+		}
+	}
+	return fmt.Sprintf("[17] build: %s (%s)", version, strings.Join(parts, " "))
 }
 
 // dirExistsCLI — path가 실재하는 디렉터리인지(doctor 사이드카 프로브 보조 — probeWritable은

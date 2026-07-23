@@ -14,6 +14,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"testing"
@@ -36,6 +37,23 @@ func TestRunVersionSubcommand(t *testing.T) {
 	}
 	if err := Run(context.Background(), "version", []string{"x"}, t.TempDir(), t.TempDir(), "v", false, "", &out, &errOut); err == nil {
 		t.Fatal("잉여 인자 미거부")
+	}
+}
+
+// D56 — formatBuildLine 양 경로(검수 반영 — 순수 포매터라 결정적).
+func TestFormatBuildLine(t *testing.T) {
+	if got := formatBuildLine("9.9.9-test", nil); got != "[17] build: 9.9.9-test ()" {
+		t.Fatalf("nil(실패) 경로: %q", got)
+	}
+	bi := &debug.BuildInfo{GoVersion: "go1.26.5", Settings: []debug.BuildSetting{
+		{Key: "vcs.revision", Value: "abcdef0123456789"},
+		{Key: "vcs.modified", Value: "true"},
+	}}
+	got := formatBuildLine("9.9.9-test", bi)
+	for _, want := range []string{"go=go1.26.5", "commit=abcdef012345", "dirty"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("%q 누락: %q", want, got)
+		}
 	}
 }
 
@@ -2396,6 +2414,9 @@ func TestDoctorCodexMCPLine(t *testing.T) {
 				if strings.Contains(out, absent) {
 					t.Errorf("출력에 %q 있으면 안 됨:\n%s", absent, out)
 				}
+			}
+			if !strings.Contains(out, "[17] build: ") { // D56 — [16] 직후 build 라인(ver 하류)
+				t.Errorf("[17] build 라인 없음:\n%s", out)
 			}
 		})
 	}
