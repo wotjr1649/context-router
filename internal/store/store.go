@@ -1184,3 +1184,31 @@ func (s *Store) Vacuum(ctx context.Context) error {
 	}
 	return nil
 }
+
+// CheckpointTruncate — D50: wal_checkpoint(TRUNCATE)를 실행하고 결과행(busy, log, checkpointed)을
+// 돌려준다. 이 PRAGMA는 미완료를 오류가 아닌 busy=1로 알린다 — Exec nil 반환은 성공 증거가
+// 아니므로(설계 v0.8 §5 실험) 반드시 QueryRow로 결과행을 검증해야 한다. WAL 모드에서 VACUUM의
+// 파일 축소는 이 checkpoint가 완료(busy=0)되어야 main 파일에 반영된다. 호출자는 busy≠0을
+// 실패(라이브 프로세스 추정)로 취급한다.
+func (s *Store) CheckpointTruncate(ctx context.Context) (busy, walFrames, checkpointed int, err error) {
+	if err := s.writer.QueryRowContext(ctx, "PRAGMA wal_checkpoint(TRUNCATE)").Scan(&busy, &walFrames, &checkpointed); err != nil {
+		return 0, 0, 0, fmt.Errorf("store CheckpointTruncate: %w", err)
+	}
+	return busy, walFrames, checkpointed, nil
+}
+
+// IsBusyErr — isBusy의 공개 래퍼(D50 — CLI가 VACUUM 실패를 "라이브 프로세스 추정" 안내로
+// 매핑하는 데 쓴다).
+func IsBusyErr(err error) bool { return isBusy(err) }
+
+// IsDiskErr — SQLITE_FULL(13)/SQLITE_IOERR(10) 여부(확장 코드는 하위 8비트가 기본 코드와
+// 같다 — isBusy와 동일 불변식). D50 --all 루프가 디스크 계열 실패 시 잔여 프로젝트 VACUUM을
+// 중단하는 판별에 쓴다.
+func IsDiskErr(err error) bool {
+	var se *sqlite.Error
+	if !errors.As(err, &se) {
+		return false
+	}
+	code := se.Code() & 0xff
+	return code == 13 || code == 10
+}

@@ -2092,3 +2092,86 @@ func TestPurgeHookOnlyPreservesReindexResidue(t *testing.T) {
 		t.Fatalf("hook 청크 FTS 잔존(미동기): n=%d err=%v", hn, err)
 	}
 }
+
+// TestCheckpointTruncate — D50: 정상 경로에서 busy=0이고 WAL이 0B로 절단된다.
+func TestCheckpointTruncate(t *testing.T) {
+	dir := t.TempDir()
+	st, err := Open(dir, false)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer func() { _ = st.Close() }()
+	if _, err := st.Register(context.Background(), Registration{
+		StoredBytes: []byte("ckpt"), MediaType: "text/plain",
+		Source: SourceMeta{URI: "/ckpt.txt", Kind: "file", SrcHash: "h-ckpt"},
+		Chunks: []Chunk{{Ordinal: 0, Text: "ckpt"}},
+	}); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	busy, _, _, err := st.CheckpointTruncate(context.Background())
+	if err != nil {
+		t.Fatalf("CheckpointTruncate: %v", err)
+	}
+	if busy != 0 {
+		t.Fatalf("busy=%d want 0", busy)
+	}
+	fi, err := os.Stat(filepath.Join(dir, "content.db-wal"))
+	if err == nil && fi.Size() != 0 {
+		t.Fatalf("wal=%dB want 0(TRUNCATE)", fi.Size())
+	}
+}
+
+// TestCheckpointTruncateBusyWithReader — D50: 열린 read 트랜잭션 공존 시 오류가 아니라
+// busy≠0으로 미완료를 알린다(Exec nil을 성공으로 오인하는 회귀 방지 — 스펙 §5 실험 근거).
+// busy_timeout(5000) 소진까지 ~5s 걸리는 것이 정상.
+func TestCheckpointTruncateBusyWithReader(t *testing.T) {
+	dir := t.TempDir()
+	st, err := Open(dir, false)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer func() { _ = st.Close() }()
+	if _, err := st.Register(context.Background(), Registration{
+		StoredBytes: []byte("busy"), MediaType: "text/plain",
+		Source: SourceMeta{URI: "/busy.txt", Kind: "file", SrcHash: "h-busy"},
+		Chunks: []Chunk{{Ordinal: 0, Text: "busy"}},
+	}); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	dbPath := filepath.ToSlash(filepath.Join(dir, "content.db"))
+	locker, err := sql.Open("sqlite", "file:"+dbPath+"?_pragma=busy_timeout(1000)")
+	if err != nil {
+		t.Fatalf("open locker: %v", err)
+	}
+	defer func() { _ = locker.Close() }()
+	conn, err := locker.Conn(context.Background())
+	if err != nil {
+		t.Fatalf("locker conn: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+	if _, err := conn.ExecContext(context.Background(), "BEGIN"); err != nil {
+		t.Fatalf("BEGIN: %v", err)
+	}
+	var n int
+	if err := conn.QueryRowContext(context.Background(), "SELECT count(*) FROM sources").Scan(&n); err != nil {
+		t.Fatalf("read txn: %v", err)
+	}
+	busy, _, _, err := st.CheckpointTruncate(context.Background())
+	if err != nil {
+		t.Fatalf("CheckpointTruncate: %v", err)
+	}
+	if busy == 0 {
+		t.Fatalf("busy=0 — 열린 reader 공존인데 완료로 보고(회귀)")
+	}
+	_, _ = conn.ExecContext(context.Background(), "ROLLBACK")
+}
+
+// TestErrPredicates — 공개 술어의 비-sqlite 오류 음성 판정(양성은 실 BUSY 경로가 간접 커버).
+func TestErrPredicates(t *testing.T) {
+	if IsBusyErr(nil) || IsBusyErr(errors.New("x")) {
+		t.Fatal("IsBusyErr 비-sqlite 오류에 true")
+	}
+	if IsDiskErr(nil) || IsDiskErr(errors.New("x")) {
+		t.Fatal("IsDiskErr 비-sqlite 오류에 true")
+	}
+}
