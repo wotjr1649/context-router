@@ -157,8 +157,8 @@ func dispatch(ctx context.Context, in hookInput, dir, contentDir, worktreeRoot s
 		}
 	}
 	// PreToolUse는 T7 large-read/dump guard 몫 — tool_call로 중복 계상하지 않고 tool_name으로
-	// 분기한다(설계 §4 D25·D32·v0.4 D36). matcher가 Read|Bash|PowerShell라 여기 오는 건 사실상
-	// 이 셋뿐이고, 각 가드가 자체 정적 판정으로 그 외를 통과시킨다.
+	// 분기한다(설계 §4 D25·D32·v0.4 D36·v0.10 D54). matcher가 Read|Bash|PowerShell|Grep라 여기
+	// 오는 건 사실상 이 넷뿐이고, 각 가드가 자체 정적 판정으로 그 외를 통과시킨다.
 	if in.HookEventName == "PreToolUse" {
 		switch in.ToolName {
 		case "Read":
@@ -167,6 +167,8 @@ func dispatch(ctx context.Context, in hookInput, dir, contentDir, worktreeRoot s
 			guardBash(ctx, ad, in, dir, contentDir, worktreeRoot, host, getenv, stdout)
 		case "PowerShell":
 			guardPowerShell(ctx, ad, in, dir, contentDir, worktreeRoot, getenv, stdout)
+		case "Grep":
+			guardGrep(ctx, ad, in, dir, stdout)
 		}
 		return
 	}
@@ -241,7 +243,28 @@ func guardRead(ctx context.Context, ad *session.AppendDB, in hookInput, dir, con
 	if err != nil || rep.Indexed != 1 {
 		return // ①④ 경계 밖·denylist·oversize·색인 실패 → 통과
 	}
-	denyTool(ctx, ad, in, dir, "Read", workspaceRel(in.CWD, f.FilePath)+" "+strconv.FormatInt(info.Size(), 10)+"B", stdout)
+	denyTool(ctx, ad, in, dir, "Read", workspaceRel(in.CWD, f.FilePath)+" "+strconv.FormatInt(info.Size(), 10)+"B", denyReasonIndexed, stdout)
+}
+
+// grepGuardInput — Grep tool_input 중 가드가 보는 필드(설계 v0.10 D54). head_limit은 *int64 —
+// 부재(호스트 기본 250 캡)와 명시 0(무제한)을 구분한다(실측 §3: 미지정 시 필드 자체 부재).
+type grepGuardInput struct {
+	OutputMode string `json:"output_mode"`
+	HeadLimit  *int64 `json:"head_limit"`
+}
+
+// guardGrep — PreToolUse(Grep) 가드(D54). deny 조건은 정확히 하나: output_mode=="content" &&
+// head_limit 명시 0. 색인 단계 없음 — 정적 판정 → denyTool 직행(guard-store 비대상, drop은
+// guard-append만). 그 외 전 조합 통과(allow-bias — 파싱 불가·부재·>0·비-content 전부 allow).
+func guardGrep(ctx context.Context, ad *session.AppendDB, in hookInput, dir string, stdout io.Writer) {
+	var f grepGuardInput
+	if json.Unmarshal(in.ToolInput, &f) != nil {
+		return // 파싱 불가 → 통과
+	}
+	if f.OutputMode != "content" || f.HeadLimit == nil || *f.HeadLimit != 0 {
+		return
+	}
+	denyTool(ctx, ad, in, dir, "Grep", "head_limit=0 content", denyReasonGrep, stdout)
 }
 
 // guardBash — D32 Bash 단일파일 덤프 가드(guardRead의 형제, 설계 v0.3 §4·v0.7 D47). 정적
@@ -280,7 +303,7 @@ func guardBash(ctx context.Context, ad *session.AppendDB, in hookInput, dir, con
 	if host == HostCodex && runtime.GOOS == "windows" {
 		token = strings.Fields(f.Command)[0]
 	}
-	denyTool(ctx, ad, in, dir, "Bash", token+" "+workspaceRel(in.CWD, path)+" "+strconv.FormatInt(info.Size(), 10)+"B — ctr_search/ctr_fetch", stdout)
+	denyTool(ctx, ad, in, dir, "Bash", token+" "+workspaceRel(in.CWD, path)+" "+strconv.FormatInt(info.Size(), 10)+"B — ctr_search/ctr_fetch", denyReasonIndexed, stdout)
 }
 
 // guardPowerShell — D36 PowerShell 단일파일 덤프 가드(guardBash의 형제, 설계 v0.4 §3). 정적
@@ -313,19 +336,26 @@ func guardPowerShell(ctx context.Context, ad *session.AppendDB, in hookInput, di
 	}
 	// detail의 명령 토큰은 psDumpArg 성립 시 화이트리스트 4토큰 중 하나라 원문 운반이 안전하다.
 	cmdToken := strings.Fields(f.Command)[0]
-	denyTool(ctx, ad, in, dir, "PowerShell", cmdToken+" "+workspaceRel(in.CWD, path)+" "+strconv.FormatInt(info.Size(), 10)+"B — ctr_search/ctr_fetch", stdout)
+	denyTool(ctx, ad, in, dir, "PowerShell", cmdToken+" "+workspaceRel(in.CWD, path)+" "+strconv.FormatInt(info.Size(), 10)+"B — ctr_search/ctr_fetch", denyReasonIndexed, stdout)
 }
 
-// denyTool — 4조건 성립 시 deny 출력 헬퍼(설계 §4). stdout에 permissionDecision JSON(T0 검증
+// denyReason* — deny 안내 문구(설계 §4·v0.10 D54). denyTool에 reason으로 전달한다 —
+// 색인형 3가드(Read/Bash/PowerShell)는 denyReasonIndexed, Grep 정적 가드는 denyReasonGrep.
+const (
+	denyReasonIndexed = "이미 인덱스됨 — ctr_search로 검색, ctr_fetch로 바이트 정확 조회"
+	denyReasonGrep    = "무제한 content 검색 — head_limit을 지정하거나 ctr_search로 검색"
+)
+
+// denyTool — 가드 조건 성립 시 deny 출력 헬퍼(설계 §4). stdout에 permissionDecision JSON(T0 검증
 // 스키마)을 **먼저** 쓰고 그다음 warning 이벤트(호출자 조립 detail — 상대 경로·크기 등)를
 // best-effort로 append한다 — 이벤트 기록 실패는 deny 판정에 영향 없다(fail-open은 기록 경로에만;
-// 가드 판정은 DB 없이 성립, §4). stdout은 deny JSON 전용이라(Claude Code가 exit 0 stdout을 파싱)
-// 그 외 바이트는 쓰지 않는다.
-func denyTool(ctx context.Context, ad *session.AppendDB, in hookInput, dir, toolName, detail string, stdout io.Writer) {
+// 가드 판정은 DB 없이 성립, §4). reason은 가드별 안내 문구(D54 — 색인형/Grep 분리). stdout은
+// deny JSON 전용이라(Claude Code가 exit 0 stdout을 파싱) 그 외 바이트는 쓰지 않는다.
+func denyTool(ctx context.Context, ad *session.AppendDB, in hookInput, dir, toolName, detail, reason string, stdout io.Writer) {
 	out := map[string]any{"hookSpecificOutput": map[string]any{
 		"hookEventName":            "PreToolUse",
 		"permissionDecision":       "deny",
-		"permissionDecisionReason": "이미 인덱스됨 — ctr_search로 검색, ctr_fetch로 바이트 정확 조회",
+		"permissionDecisionReason": reason,
 	}}
 	if b, err := json.Marshal(out); err == nil {
 		_, _ = stdout.Write(b)

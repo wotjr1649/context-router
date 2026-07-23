@@ -56,6 +56,16 @@ func runHookHost(t *testing.T, host Host, storeRoot string, in []byte, env map[s
 	return Run(context.Background(), bytes.NewReader(in), io.Discard, storeRoot, "test", host, func(k string) string { return env[k] })
 }
 
+// runHookCaptureStdout — runHook 동형이되 stdout(=guard deny JSON 또는 빈 문자열)을 캡처해 반환한다.
+func runHookCaptureStdout(t *testing.T, storeRoot string, in []byte) string {
+	t.Helper()
+	var out bytes.Buffer
+	if rc := Run(context.Background(), bytes.NewReader(in), &out, storeRoot, "test", HostClaude, func(string) string { return "" }); rc != 0 {
+		t.Fatalf("hook rc=%d want 0", rc)
+	}
+	return out.String()
+}
+
 // D35×D51 — 동일 UUID의 cc/cx 격리: cc SessionStart 후 같은 UUID의 cx 이벤트는 (drop이 아니라)
 // cx: 네임스페이스 세션으로 자동 등록·기록된다. cc: 세션으로의 오귀속 0이 격리 단정의 본체.
 func TestHookHostIsolation(t *testing.T) {
@@ -2179,5 +2189,55 @@ func TestGuardPowerShellMsysFormAllows(t *testing.T) {
 	msys := "/" + strings.ToLower(string(big[0])) + filepath.ToSlash(big[2:]) // C:\x → /c/x
 	if out := runGuardPowerShell(t, storeRoot, cwd, "Get-Content "+msys, nil); out != "" {
 		t.Fatalf("stdout=%q want empty (MSYS형 = PS 드라이브 상대 = allow)", out)
+	}
+}
+
+// D54 — Grep 가드 5분기(스펙 §2 ①~⑤) + 전용 reason. deny는 content+head_limit 0 단 하나.
+func TestGuardGrep(t *testing.T) {
+	cases := []struct {
+		name string
+		ti   map[string]any
+		deny bool
+	}{
+		{"content_unlimited", map[string]any{"pattern": "x", "output_mode": "content", "head_limit": 0}, true},
+		{"content_default", map[string]any{"pattern": "x", "output_mode": "content"}, false},          // 부재=250 캡
+		{"content_capped", map[string]any{"pattern": "x", "output_mode": "content", "head_limit": 50}, false},
+		{"files_unlimited", map[string]any{"pattern": "x", "output_mode": "files_with_matches", "head_limit": 0}, false},
+		{"unparsable", map[string]any{"head_limit": "zero"}, false}, // 파싱 불가 → 통과
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			storeRoot := filepath.Join(t.TempDir(), "storeroot")
+			cwd := t.TempDir()
+			sid := "8e2504e0-4f89-41d3-9a0c-0305e82c3306"
+			start := mustJSON(t, map[string]any{"hook_event_name": "SessionStart", "session_id": sid, "cwd": cwd, "source": "startup"})
+			if rc := runHook(t, storeRoot, start, nil); rc != 0 {
+				t.Fatalf("SessionStart rc=%d", rc)
+			}
+			in := mustJSON(t, map[string]any{
+				"hook_event_name": "PreToolUse", "session_id": sid, "cwd": cwd,
+				"tool_name": "Grep", "tool_input": c.ti,
+			})
+			out := runHookCaptureStdout(t, storeRoot, in)
+			nEv := countEvents(t, sessDir(t, storeRoot, cwd), sid)
+			if c.deny {
+				if !strings.Contains(out, `"permissionDecision":"deny"`) {
+					t.Fatalf("deny 미발화: %q", out)
+				}
+				if !strings.Contains(out, "head_limit") || !strings.Contains(out, "ctr_search") {
+					t.Fatalf("Grep 전용 reason 아님(§2 ① — 하드코딩 회귀): %q", out)
+				}
+				if nEv != 2 { // session_start + warning 1건(§2 ①)
+					t.Fatalf("warning 이벤트 수=%d want 2(start+warning)", nEv)
+				}
+			} else {
+				if out != "" {
+					t.Fatalf("통과 케이스에 출력: %q", out)
+				}
+				if nEv != 1 { // session_start뿐 — 무이벤트(§2 ②)
+					t.Fatalf("통과인데 이벤트 증가: %d", nEv)
+				}
+			}
+		})
 	}
 }

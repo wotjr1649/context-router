@@ -28,14 +28,14 @@ const (
 
 // hookRegistrations — 설치 대상 6항목(T0-amended 설계 §7·v0.10 D53 서브에이전트 2항목). matcher가 빈 문자열이면 전체 매칭
 // (SessionStart=시작 방식 전체, Pre/PostToolUse(Failure)=전 도구 — T0 §4). PreToolUse는
-// Read|Bash|PowerShell 정규식 매칭(large-read/dump guard 대상 — v0.4 D36) — 관리 그룹 1개 유지가
-// merge의 동일-이벤트 상호 제거 함정을 회피한다(설계 v0.3 §4).
+// Read|Bash|PowerShell|Grep 정규식 매칭(large-read/dump guard 대상 — v0.4 D36·v0.10 D54) — 관리
+// 그룹 1개 유지가 merge의 동일-이벤트 상호 제거 함정을 회피한다(설계 v0.3 §4).
 var hookRegistrations = []struct {
 	event   string
 	matcher string
 }{
 	{"SessionStart", ""},
-	{"PreToolUse", "Read|Bash|PowerShell"},
+	{"PreToolUse", "Read|Bash|PowerShell|Grep"},
 	{"PostToolUse", ""},
 	{"PostToolUseFailure", ""},
 	{"SubagentStart", ""},

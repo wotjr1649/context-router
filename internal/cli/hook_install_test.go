@@ -81,7 +81,7 @@ func assertDoctorAscending(t *testing.T, out string) {
 	}
 }
 
-// ① 빈 설정에 install → 6개 이벤트 등록·유효 JSON·PreToolUse matcher "Read|Bash|PowerShell"·timeout 10.
+// ① 빈 설정에 install → 6개 이벤트 등록·유효 JSON·PreToolUse matcher "Read|Bash|PowerShell|Grep"·timeout 10.
 func TestHookInstall_EmptyRegistersFourItems(t *testing.T) {
 	projectRoot := t.TempDir()
 	var out bytes.Buffer
@@ -124,13 +124,13 @@ func TestHookInstall_EmptyRegistersFourItems(t *testing.T) {
 			t.Fatalf("event %q bad command/timeout: %+v", ev, s.Hooks[ev][0])
 		}
 	}
-	if s.Hooks["PreToolUse"][0].Matcher != "Read|Bash|PowerShell" {
-		t.Fatalf("PreToolUse matcher=%q want Read|Bash|PowerShell", s.Hooks["PreToolUse"][0].Matcher)
+	if s.Hooks["PreToolUse"][0].Matcher != "Read|Bash|PowerShell|Grep" {
+		t.Fatalf("PreToolUse matcher=%q want Read|Bash|PowerShell|Grep", s.Hooks["PreToolUse"][0].Matcher)
 	}
 }
 
 // ①-b D32 업그레이드 재설치(설계 §8 설치 게이트): v0.2 형태 settings(marker 0.2.0 + PreToolUse
-// matcher "Read")를 seed → install 재실행 → PreToolUse 관리 그룹 1개·matcher "Read|Bash|PowerShell"·총 6그룹·
+// matcher "Read")를 seed → install 재실행 → PreToolUse 관리 그룹 1개·matcher "Read|Bash|PowerShell|Grep"·총 6그룹·
 // marker 현재 버전으로 갱신(구 matcher 그룹이 잔존하지 않고 대칭 교체된다).
 func TestHookInstall_UpgradeReinstallWidensMatcher(t *testing.T) {
 	projectRoot := t.TempDir()
@@ -181,8 +181,8 @@ func TestHookInstall_UpgradeReinstallWidensMatcher(t *testing.T) {
 	if len(pre) != 1 {
 		t.Fatalf("PreToolUse groups=%d want 1(단일 관리 그룹 유지): %s", len(pre), data)
 	}
-	if pre[0].Matcher != "Read|Bash|PowerShell" {
-		t.Fatalf("PreToolUse matcher=%q want Read|Bash|PowerShell (구 Read 그룹 미교체): %s", pre[0].Matcher, data)
+	if pre[0].Matcher != "Read|Bash|PowerShell|Grep" {
+		t.Fatalf("PreToolUse matcher=%q want Read|Bash|PowerShell|Grep (구 Read 그룹 미교체): %s", pre[0].Matcher, data)
 	}
 	if pre[0].Managed != "context-router/0.3.0" {
 		t.Fatalf("marker=%q want context-router/0.3.0 (버전 미갱신): %s", pre[0].Managed, data)
