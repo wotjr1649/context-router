@@ -753,6 +753,34 @@ func TestMainDispatch_CLI_Upgrade(t *testing.T) {
 	}
 }
 
+// TestMainDispatch_Version_NoStoreRootResolution: F1(최종 리뷰) — version은 CI/패키징
+// 메타데이터 명령이라 cwd/store-root/env 해석 이전에 조기 디스패치돼야 한다. store-root
+// 도출을 깨는 env(3-OS: LOCALAPPDATA/XDG/HOME + CTR_STORE_ROOT 비움, 최소 환경 모사)를
+// 주입해도 version은 store-root 실패로 죽지 않고 정확히 버전 1줄만 출력해야 한다 — 예전엔
+// storeRootFor→defaultStoreRoot 실패가 그대로 전파돼 err!=nil이었다(TestMainDispatch_Hook_
+// AbsorbsPreprocError와 동일 env-강제 관례).
+func TestMainDispatch_Version_NoStoreRootResolution(t *testing.T) {
+	t.Setenv("CTR_STORE_ROOT", "")
+	t.Setenv("LOCALAPPDATA", "")
+	t.Setenv("XDG_DATA_HOME", "")
+	t.Setenv("HOME", "")
+
+	var handled bool
+	var derr error
+	out := captureStdout(t, func() {
+		handled, derr = dispatchCLI(context.Background(), []string{"context-router", "version"})
+	})
+	if !handled {
+		t.Fatal("want handled=true for version subcommand")
+	}
+	if derr != nil {
+		t.Fatalf("version must not fail on store-root resolution, got err=%v", derr)
+	}
+	if out != version+"\n" {
+		t.Fatalf("stdout=%q want %q", out, version+"\n")
+	}
+}
+
 // --- E2E stdio 스모크 (Task 9, 설계 §12-7·10 기초) ---
 //
 // 손수 프레이밍한 JSON-RPC로 실바이너리와 stdin/stdout 파이프를 주고받는다(SDK

@@ -82,7 +82,7 @@ func assertDoctorAscending(t *testing.T, out string) {
 }
 
 // ① 빈 설정에 install → 6개 이벤트 등록·유효 JSON·PreToolUse matcher "Read|Bash|PowerShell|Grep"·timeout 10.
-func TestHookInstall_EmptyRegistersFourItems(t *testing.T) {
+func TestHookInstall_EmptyRegistersSixItems(t *testing.T) {
 	projectRoot := t.TempDir()
 	var out bytes.Buffer
 	if err := runHookInstall(nil, "/store", "", false, projectRoot, "0.1.0", &out); err != nil {

@@ -746,6 +746,76 @@ func TestHookAgentAttribution(t *testing.T) {
 	}
 }
 
+// F2(최종 리뷰): 병적으로 큰 agent_id는 PostToolUse 기본 이벤트를 죽이면 안 된다(스펙 v0.10 §0
+// best-effort). 5000자 agent_id가 attrs로 흘러들면 session.MaxAttributesBytes(4096) 초과로
+// Append가 ValidateEvent에서 실패하고 appendDrop이 기본 이벤트 전체를 버렸다(회귀). 가드 후:
+// 표식만 생략(id 무효→ok=false)되고 tool_call 기본 이벤트는 살아남으며 agent 두 키는 미출현.
+func TestHookAgentAttribution_OversizedIDPreservesBaseEvent(t *testing.T) {
+	storeRoot := filepath.Join(t.TempDir(), "storeroot")
+	cwd := t.TempDir()
+	sid := "7d2504e0-4f89-41d3-9a0c-0305e82c3305"
+	start := mustJSON(t, map[string]any{"hook_event_name": "SessionStart", "session_id": sid, "cwd": cwd, "source": "startup"})
+	if rc := runHook(t, storeRoot, start, nil); rc != 0 {
+		t.Fatalf("SessionStart rc=%d", rc)
+	}
+	hugeID := strings.Repeat("a", 5000) // §12: 리터럴 아님(strings.Repeat) — 시크릿 형태 회피
+	in := mustJSON(t, map[string]any{
+		"hook_event_name": "PostToolUse", "session_id": sid, "cwd": cwd,
+		"tool_name": "Glob", "tool_input": map[string]string{"pattern": "*.go"},
+		"tool_response": map[string]string{"result": "ok"},
+		"agent_id":      hugeID, "agent_type": "Explore",
+	})
+	if rc := runHook(t, storeRoot, in, nil); rc != 0 {
+		t.Fatalf("PostToolUse rc=%d", rc)
+	}
+	ev := lastEvent(t, sessDir(t, storeRoot, cwd), sid)
+	if ev.Type != "tool_call" {
+		t.Fatalf("기본 이벤트 소실 — type=%s want tool_call (거대 agent_id의 attrs 상한 초과로 Append 실패→드롭)", ev.Type)
+	}
+	if _, ok := ev.Attrs["agent_id"]; ok {
+		t.Fatalf("거대 agent_id가 표식으로 실림: attrs=%v", ev.Attrs)
+	}
+	if _, ok := ev.Attrs["agent_type"]; ok {
+		t.Fatalf("agent_type 키 잔존(표식 생략 위반): attrs=%v", ev.Attrs)
+	}
+}
+
+// F2(최종 리뷰): 병적으로 큰 agent_type은 생애주기 이벤트를 죽이면 안 된다(동일 attrs 상한 경로,
+// classify가 두 키를 항상 병기). 가드 후 subagent_start는 살아남고 agent_type만 ""로 기록된다
+// (agent_id는 정상값 유지, 두 키 병기 불변).
+func TestHookSubagentLifecycle_OversizedTypeSurvives(t *testing.T) {
+	storeRoot := filepath.Join(t.TempDir(), "storeroot")
+	cwd := t.TempDir()
+	sid := "8e2504e0-4f89-41d3-9a0c-0305e82c3306"
+	start := mustJSON(t, map[string]any{"hook_event_name": "SessionStart", "session_id": sid, "cwd": cwd, "source": "startup"})
+	if rc := runHook(t, storeRoot, start, nil); rc != 0 {
+		t.Fatalf("SessionStart rc=%d", rc)
+	}
+	hugeType := strings.Repeat("t", 5000) // §12: 리터럴 아님(strings.Repeat)
+	in := mustJSON(t, map[string]any{
+		"hook_event_name": "SubagentStart", "session_id": sid, "cwd": cwd,
+		"agent_id": "a1b2c3d4e5f6", "agent_type": hugeType,
+	})
+	if rc := runHook(t, storeRoot, in, nil); rc != 0 {
+		t.Fatalf("SubagentStart rc=%d", rc)
+	}
+	ev := lastEvent(t, sessDir(t, storeRoot, cwd), sid)
+	if ev.Type != "subagent_start" {
+		t.Fatalf("생애주기 이벤트 소실 — type=%s want subagent_start (거대 agent_type의 attrs 상한 초과로 Append 실패→드롭)", ev.Type)
+	}
+	idVal, hasID := ev.Attrs["agent_id"]
+	typVal, hasType := ev.Attrs["agent_type"]
+	if !hasID || !hasType {
+		t.Fatalf("생애주기 attrs 두 키 병기 위반: attrs=%v", ev.Attrs)
+	}
+	if s, _ := typVal.(string); s != "" {
+		t.Fatalf("거대 agent_type가 그대로 실림(생략 안 됨): len=%d", len(s))
+	}
+	if idVal != "a1b2c3d4e5f6" {
+		t.Fatalf("정상 agent_id 손상: agent_id=%v", idVal)
+	}
+}
+
 // evRow — lastEvent 조회 결과(event_type·summary·payload attrs).
 type evRow struct {
 	Type    string

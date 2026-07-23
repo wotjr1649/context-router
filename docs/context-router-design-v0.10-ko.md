@@ -70,7 +70,11 @@
     UnmarshalTypeError로 실패시켜 이벤트 전체가 bad-input
     drop되므로(hook.Run 파싱 계약과 충돌) 금지. 결손·빈 값·타입
     이상은 표식 생략일 뿐 기본 이벤트 처리(1 호출 = 1 이벤트)를
-    바꾸지 않는다. 중첩 서브에이전트에서 어느
+    바꾸지 않는다. 병적으로 큰 agent 필드(예: 5000자
+    agent_id)도 무효로 취급한다(표식 생략·기본 이벤트
+    보존) — attrs 크기 상한(session.MaxAttributesBytes)을
+    지켜, 무경계면 attrs 초과로 Append가 실패해 기본
+    이벤트 전체가 드롭되는 것을 막는다. 중첩 서브에이전트에서 어느
     수준의 agent_id가 실리는지는 호스트 결정(문서·실측 부재) —
     표식 계약은 "서브발 여부"까지만(캐비앗). 가드 deny는 warning
     이벤트를 만들지만(D54 파이프라인) 병기 대상은 PostToolUse/

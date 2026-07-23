@@ -514,11 +514,28 @@ var bashTokenRe = regexp.MustCompile(`^[A-Za-z0-9_./-]+$`)
 // 추출한 숫자 외 어떤 바이트도 요약에 복사하지 않는다).
 var errCodeRe = regexp.MustCompile(`(?i)(?:status code|exit code|code)\s+(\d+)`)
 
+// maxAgentFieldBytes — agent_id/agent_type 값의 위생 상한(D53 best-effort 경계, F2). 실제
+// agent_id는 ~12 hex, agent_type은 짧은 이름이라 256B면 넉넉하다. 상한 근거: 병적으로 큰 값
+// (예: 5000자 agent_id)이 attrs로 흘러들면 세션 스토어 attrs 상한(session.MaxAttributesBytes=
+// 4096B)을 초과해 Append가 ValidateEvent 단계에서 실패하고, 그 실패가 PostToolUse/생애주기
+// 기본 이벤트 전체를 appendDrop으로 버린다(스펙 v0.10 §0 best-effort 계약 위반). 256B면 두
+// 필드를 합쳐도 attrs 상한에 한참 못 미쳐 안전하다.
+const maxAgentFieldBytes = 256
+
 // agentStrings — D53 관대 추출: RawMessage에서 문자열 언마샬 성공분만, 실패·부재는 빈 문자열.
-// 생애주기 이벤트의 attrs는 빈 값도 기록하므로 ok 게이트가 없다(표식 게이트는 agentFields — T2).
+// 병적으로 큰 값(> maxAgentFieldBytes)도 무효로 취급해 ""를 돌려준다(F2 단일 지점 가드 — attrs
+// 크기 초과로 인한 Append 실패→기본 이벤트 드롭을 차단; PostToolUse 표식·생애주기 attrs 두
+// 소비자를 한 곳에서 보호). 생애주기 이벤트의 attrs는 빈 값도 기록하므로 ok 게이트가 없다(표식
+// 게이트는 agentFields — T2).
 func agentStrings(in hookInput) (id, typ string) {
 	_ = json.Unmarshal(in.AgentID, &id)
 	_ = json.Unmarshal(in.AgentType, &typ)
+	if len(id) > maxAgentFieldBytes {
+		id = ""
+	}
+	if len(typ) > maxAgentFieldBytes {
+		typ = ""
+	}
 	return id, typ
 }
 

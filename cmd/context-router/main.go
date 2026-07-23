@@ -546,6 +546,13 @@ func dispatchCLI(ctx context.Context, args []string) (handled bool, err error) {
 		// 조용히 MCP 서버로 흘려보내면 안 된다(리뷰 Fix Round 3, item 1). 명시 거부.
 		return true, fmt.Errorf("ctr: 미지 서브커맨드: %s", sub)
 	}
+	// version은 CI/패키징 메타데이터 명령 — cwd/store-root/env 해석 이전에 조기 처리한다(F1).
+	// 최소 환경(삭제된 cwd·미설정 HOME/LOCALAPPDATA)에서도 storeRootFor 실패로 죽지 않고 버전만
+	// 출력해야 한다. cli.Run "version" 케이스는 storeRoot/projDir을 쓰지 않으므로(내부: len(args)
+	// 검증 + version 1줄 출력뿐) 빈 값을 넘겨 출력·잉여 인자 검증을 단일 소스로 재사용한다.
+	if sub == "version" {
+		return true, cli.Run(ctx, sub, args[2:], "", "", version, false, "", os.Stdout, os.Stderr)
+	}
 	subArgs := args[2:]
 
 	root, storeRootRaw, rest, err := prescanRootFlags(subArgs)
