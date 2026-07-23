@@ -812,8 +812,8 @@ func vacuumReclaim(ctx context.Context, st *store.Store, projDir string, beforeB
 // ⓪ store open 선행(견적) — 이 분기 한정으로 현행 confirm→open을 open→confirm으로 재배치한다
 // (견적 문구를 confirm에 담기 위해). 견적은 store.SizeStats(projDir)의 ShadowOwned 물리 바이트
 // 합·hash 수다(별도 견적 함수 없음). ① confirmPurge(견적 문구) → ② PurgeHookOnly → ④ 실회수
-// 보고 먼저 → ⑤ VACUUM 후행(실패는 stderr log-and-continue·rc=0 — 부분 성공 노출을 VACUUM 뒤로
-// 미루지 않는다). SizeStats는 content.db가 없으면 (nil,nil)이라, phantom 프로젝트(store.Open이
+// 보고 먼저 → ⑤ VACUUM 후행(D55: vacuumReclaim 합류 — 실패는 rc≠0로 전파·이미 커밋된 삭제분은
+// 유지, 부분 성공 노출을 VACUUM 뒤로 미루지 않는다). SizeStats는 content.db가 없으면 (nil,nil)이라, phantom 프로젝트(store.Open이
 // 없는 대상을 새로 생성)를 막기 위해 열기 전 content.db 실재를 먼저 판정한다(runPurge와 동형).
 func runPurgeHookOnly(ctx context.Context, in io.Reader, w, stderr io.Writer, storeRoot, project string, force, isTTY bool) error {
 	id, err := purgeProjectID(storeRoot, project)
@@ -842,20 +842,23 @@ func runPurgeHookOnly(ctx context.Context, in io.Reader, w, stderr io.Writer, st
 	if err != nil {
 		return err
 	}
+	beforeB := contentFootprint(projDir) // D55: open 후·PurgeHookOnly 전 — 삭제+VACUUM 효과 격리(스펙 §0)
 	rep, purgeErr := st.PurgeHookOnly(ctx)
+	var vacErr error
 	if purgeErr == nil {
 		// ④ 실회수 보고 먼저(스펙 §3 순서) — VACUUM 성패와 무관하게 부분 성공을 즉시 노출한다.
 		fmt.Fprintf(w, "hook-only purge: 실회수 %dB(%d hashes), 유예 %d건, 실패 %d건\n",
 			rep.ReclaimedB, rep.Hashes, rep.DeferredFiles, rep.FailedFiles)
-		// ⑤ VACUUM 후행 — 실패는 log-and-continue(rc=0). 서버 점유 등으로 배타 잠금을 못 잡으면
-		// 실패하는데, 행 삭제는 이미 커밋되어 유효하므로 서버 정지 후 재실행 시 파일 크기가 회수된다.
-		if verr := st.Vacuum(ctx); verr != nil {
-			fmt.Fprintf(stderr, "ctr: VACUUM 실패(계속 진행 — 서버 정지 후 재실행 시 회수): %v\n", verr)
-		}
+		// ⑤ D55: vacuumReclaim 합류 — checkpoint busy 검증·총합 보고, 실패는 rc≠0(본경로 동일).
+		// 이미 커밋된 삭제분은 유지된다(vacuumReclaim 계약 — 호출자 미롤백).
+		vacErr = vacuumReclaim(ctx, st, projDir, beforeB, w)
 	}
 	closeErr := st.Close()
 	if purgeErr != nil {
 		return purgeErr
+	}
+	if vacErr != nil {
+		return vacErr
 	}
 	return closeErr
 }

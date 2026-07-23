@@ -2247,6 +2247,13 @@ func TestPurgeHookOnlyCLI(t *testing.T) {
 	if !strings.Contains(o, "실회수") || !strings.Contains(o, "(1 hashes)") {
 		t.Fatalf("보고 문면 없음:\n%s", o)
 	}
+	if !strings.Contains(o, "purge: content.db(+wal/shm) ") {
+		t.Fatalf("D55 총합 보고 라인 없음:\n%s", o)
+	}
+	// ④ 실회수 보고가 ⑤ 총합 보고보다 먼저(스펙 §0 순서)
+	if strings.Index(o, "실회수") > strings.Index(o, "purge: content.db(+wal/shm) ") {
+		t.Fatalf("보고 순서 역전:\n%s", o)
+	}
 	// 전체 삭제 비도달: content.db 잔존.
 	if _, err := os.Stat(filepath.Join(projDir, "content.db")); err != nil {
 		t.Fatalf("content.db가 사라짐(전체삭제 분기에 도달) : %v", err)
@@ -2460,10 +2467,10 @@ func (b *blockingWriter) Write(p []byte) (int, error) {
 	return n, nil
 }
 
-// TestPurgeHookOnlyVacuumFailureContinues — VACUUM 실패는 log-and-continue(rc=0)이며, 실회수
-// 보고는 VACUUM보다 먼저(스펙 §3 순서) 출력된다. 보고 직후·VACUUM 직전에 별도 연결로 쓰기
-// 잠금(BEGIN IMMEDIATE)을 선점해 VACUUM을 SQLITE_BUSY로 결정적으로 실패시킨다.
-func TestPurgeHookOnlyVacuumFailureContinues(t *testing.T) {
+// TestPurgeHookOnlyVacuumFailurePropagates — D55: VACUUM 실패는 rc≠0로 전파된다(단 이미 커밋된
+// hook-only 삭제분은 유지). 실회수 보고는 VACUUM보다 먼저(스펙 §3 순서) 출력된다. 보고 직후·
+// VACUUM 직전에 별도 연결로 쓰기 잠금(BEGIN IMMEDIATE)을 선점해 VACUUM을 SQLITE_BUSY로 결정적으로 실패시킨다.
+func TestPurgeHookOnlyVacuumFailurePropagates(t *testing.T) {
 	pid, projDir, _ := seedHookOnlyProject(t)
 	storeRoot := storeRootOf(projDir)
 
@@ -2510,13 +2517,11 @@ func TestPurgeHookOnlyVacuumFailureContinues(t *testing.T) {
 	}
 	_, _ = lockConn.ExecContext(context.Background(), "ROLLBACK")
 
-	if rc != nil {
-		t.Fatalf("VACUUM 실패는 log-and-continue여야 하는데 rc=%v", rc)
+	// 반전(D55): VACUUM 실패는 rc≠0로 전파 — 단 이미 커밋된 hook-only 삭제분은 유지.
+	if rc == nil {
+		t.Fatalf("VACUUM BUSY인데 rc=nil — D55 rc≠0 계약 회귀:\n%s", gw.buf.String())
 	}
 	if !strings.Contains(gw.buf.String(), "실회수") {
 		t.Fatalf("실회수 보고가 VACUUM 이전에 안 나옴:\n%s", gw.buf.String())
-	}
-	if !strings.Contains(errOut.String(), "VACUUM 실패") {
-		t.Fatalf("VACUUM 실패 로그 없음(정말 실패했는지 확인):\n%s", errOut.String())
 	}
 }
