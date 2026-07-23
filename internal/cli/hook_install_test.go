@@ -22,6 +22,9 @@ import (
 // 실사용자 ~/.claude를 절대 건드리지 않도록 홈을 프로세스 임시 디렉터리로 돌린다(os.UserHomeDir
 // 이음새 = Windows USERPROFILE / 그 외 HOME). 사용자 범위에 실제로 기록하는 테스트는 t.Setenv로
 // 자기 전용 임시 홈을 덮어써(격리·자동 복원) 이 기본 홈을 오염시키지 않는다.
+// CODEX_HOME도 함께 중화한다 — codexConfigPath/codexHooksPath는 CODEX_HOME을 홈보다 우선하므로,
+// 상속된 CODEX_HOME이 있으면 install/uninstall --codex e2e가 홈 격리를 우회해 실사용자
+// config.toml을 변조·삭제할 수 있다(빈 값 = 미설정 → 임시 홈 폴백; 필요한 테스트는 t.Setenv로 재설정).
 func TestMain(m *testing.M) {
 	home, err := os.MkdirTemp("", "ctr-cli-test-home-")
 	if err != nil {
@@ -30,6 +33,7 @@ func TestMain(m *testing.M) {
 	}
 	_ = os.Setenv("HOME", home)
 	_ = os.Setenv("USERPROFILE", home)
+	_ = os.Setenv("CODEX_HOME", "")
 	code := m.Run()
 	_ = os.RemoveAll(home)
 	os.Exit(code)

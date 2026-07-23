@@ -1678,6 +1678,8 @@ func TestGuardCodexBashDeny(t *testing.T) {
 		}
 	}
 	// 현장 인덱싱 artifact 1건(cx:<uuid> 세션) + warning 이벤트 1건 — D32-① 단정을 cx:에 적용.
+	// warning 카운트는 cx:% 세션 한정 — 필터 없이는 deny가 다른 네임스페이스(cc:/bare)에
+	// 오귀속돼도 통과해 D47 격리 단정이 무력화된다.
 	canon, err := ident.Canonicalize(ws)
 	if err != nil {
 		t.Fatalf("canonicalize: %v", err)
@@ -1692,7 +1694,7 @@ func TestGuardCodexBashDeny(t *testing.T) {
 	defer func() { _ = reader.Close() }()
 	var n int
 	var summary string
-	if err := reader.QueryRow("SELECT count(*), coalesce(max(summary),'') FROM session_events WHERE event_type='warning'").Scan(&n, &summary); err != nil {
+	if err := reader.QueryRow("SELECT count(*), coalesce(max(summary),'') FROM session_events WHERE event_type='warning' AND session_id LIKE 'cx:%'").Scan(&n, &summary); err != nil {
 		t.Fatalf("count warning: %v", err)
 	}
 	if n != 1 {
