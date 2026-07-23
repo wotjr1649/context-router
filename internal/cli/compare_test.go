@@ -9,7 +9,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/wotjr1649/context-router/internal/ident" // wtDirCanon이 사용(계획 검수 Critical 교정)
+	"github.com/wotjr1649/context-router/internal/ident"   // wtDirCanon이 사용(계획 검수 Critical 교정)
+	"github.com/wotjr1649/context-router/internal/session" // D51 합성 세션 등록(source="first-event") — 기존 seedCC/CX 헬퍼가 source="startup" 고정이라 인라인 복제
 )
 
 // runCompareString — runUsageCompare를 고정 기준 시각으로 직접 호출(§6 — 결정론 검증은 주입 시계).
@@ -76,13 +77,13 @@ func TestCompare_FullReport(t *testing.T) {
 		"hooks:on\t1\t2\t15\t5",
 		"hooks:off\t1\t1\t3\t2",
 		"ratio(on/off)\t-\t-\t5.000\t2.500",
-		"excluded(--min-records): 0",
+		"excluded(--min-records): 0 | synthetic=0",
 		"== cx (단위=turn, experimental) ==",
 		"arm\tsessions\tturns\tinput/turn\tcached_input/turn\toutput/turn",
 		"hooks:on\t1\t2\t100\t50\t10",
 		"hooks:off\t1\t1\t40\t20\t5",
 		"ratio(on/off, 대화형(경량) 코호트 한정)\t-\t-\t2.500\t2.500\t2.000",
-		"coverage: on 등록=2 매칭=1 n/a=1 | off 창내미등록=1 | unknown=0 | excluded(--min-records)=0",
+		"coverage: on 등록=2 매칭=1 n/a=1 | off 창내미등록=1 | unknown=0 | excluded(--min-records)=0 | synthetic=0",
 		"skipped: files(미귀속)=0 lines=0 cwd_diverged=0",
 		"주의: 관찰 데이터(무작위화 아님) — 워크로드 교란 존재",
 		"",
@@ -152,5 +153,81 @@ func TestCompare_CLIWiring(t *testing.T) {
 	plain2 := runUsageString(t, storeRoot, projectRoot, tdir)
 	if plain1 != plain2 || strings.Contains(plain1, "== cc") {
 		t.Fatalf("무플래그 경로 오염:\n%s", plain1)
+	}
+}
+
+// TestCompareSyntheticExcluded — D51(v0.9 §0 A/B 측정 무결성): source="first-event" 합성 등록
+// cc: 세션은 --compare 집계에서 기본 제외되고 cc excluded 라인에 synthetic=N으로 보고된다.
+func TestCompareSyntheticExcluded(t *testing.T) {
+	storeRoot, projectRoot, tdir, rolloutRoot := t.TempDir(), t.TempDir(), t.TempDir(), t.TempDir()
+	normal := "aaaaaaaa-0000-0000-0000-0000000000a1" // source="startup"(정상)
+	synth := "bbbbbbbb-0000-0000-0000-0000000000b2"  // source="first-event"(합성)
+	seedCCSession(t, storeRoot, projectRoot, normal)
+	// 합성 등록 세션 — seedCCSession 본문을 복제하되 source만 "first-event"로 교체(브리프 Step 1;
+	// 기존 seedCCSession이 source="startup" 고정이라 새 헬퍼 대신 인라인 복제).
+	canon, err := ident.Canonicalize(projectRoot)
+	if err != nil {
+		t.Fatalf("canon: %v", err)
+	}
+	sessDir := filepath.Join(storeRoot, "projects", canon.ProjectID, "worktrees", canon.WorktreeID)
+	ad, err := session.OpenAppend(context.Background(), sessDir, session.AppendOptions{ExternalSessionID: "cc:" + synth, Producer: "test", RetentionSec: 0})
+	if err != nil {
+		t.Fatalf("OpenAppend: %v", err)
+	}
+	if _, err := ad.EnsureSession(context.Background(), "first-event", ""); err != nil {
+		t.Fatalf("EnsureSession: %v", err)
+	}
+	if err := ad.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	writeUsageTranscript(t, tdir, normal, []string{
+		`{"type":"assistant","message":{"usage":{"input_tokens":100,"output_tokens":20,"cache_read_input_tokens":6,"cache_creation_input_tokens":1}}}`,
+		`{"type":"assistant","message":{"usage":{"input_tokens":50,"output_tokens":10,"cache_read_input_tokens":4,"cache_creation_input_tokens":0}}}`,
+	})
+	writeUsageTranscript(t, tdir, synth, []string{
+		`{"type":"assistant","message":{"usage":{"input_tokens":9,"output_tokens":3,"cache_read_input_tokens":2,"cache_creation_input_tokens":0}}}`,
+	})
+	// --rollouts는 빈 임시 루트로 고정(기본값 ~/.codex/sessions 실데이터 순회 차단 — 결정론).
+	out := runUsageString(t, storeRoot, projectRoot, tdir, "--compare", "--rollouts", rolloutRoot)
+	if !strings.Contains(out, "hooks:on\t1\t") { // 정상 세션만 on(합성 제외로 1세션)
+		t.Fatalf("정상 세션 on=1 미계상(합성 제외 기대):\n%s", out)
+	}
+	if !strings.Contains(out, "hooks:off\t0\t") { // 합성이 off로 새어들지 않음
+		t.Fatalf("합성 세션이 off로 계상됨(off=0 기대):\n%s", out)
+	}
+	if !strings.Contains(out, "excluded(--min-records): 0 | synthetic=1") {
+		t.Fatalf("cc synthetic=1 미보고:\n%s", out)
+	}
+}
+
+// TestCompareSyntheticExcludedCX — D51: source="first-event" 합성 등록 cx: 세션은 rollout이
+// 있어도 on/off/unknown 어디에도 계상되지 않고(cxSet에서도 제외) coverage에 synthetic=1로 보고된다.
+func TestCompareSyntheticExcludedCX(t *testing.T) {
+	storeRoot, projectRoot, tdir, rolloutRoot := t.TempDir(), t.TempDir(), t.TempDir(), t.TempDir()
+	now := time.Date(2026, 7, 22, 12, 0, 0, 0, time.Local)
+	day := filepath.Join(rolloutRoot, "2026", "07", "22")
+	if err := os.MkdirAll(day, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	synth := "019f0000-0000-7000-8000-00000000000a"
+	// 합성 등록 cx: 세션 — seedCXSessionAt 본문 복제, source만 "first-event"로 교체(D51).
+	sessDir := wtDirCanon(t, storeRoot, projectRoot)
+	ad, err := session.OpenAppend(context.Background(), sessDir, session.AppendOptions{ExternalSessionID: "cx:" + synth, Producer: "test", RetentionSec: 0})
+	if err != nil {
+		t.Fatalf("OpenAppend: %v", err)
+	}
+	if _, err := ad.EnsureSession(context.Background(), "first-event", ""); err != nil {
+		t.Fatalf("EnsureSession: %v", err)
+	}
+	if err := ad.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	// 그 UUID의 rollout(창 이내) — 등록됐지만 합성이라 어디에도 미계상.
+	writeRollout(t, day, tsFor(now, 24*time.Hour), synth, []string{metaLine(synth, projectRoot), tcLine(100, 50, 10, 110)})
+	got := runCompareString(t, storeRoot, projectRoot, tdir, rolloutRoot, 0, now)
+	// on/off/unknown·registered 모두 0(합성은 cxSet에서 제외) + synthetic=1.
+	want := "coverage: on 등록=0 매칭=0 n/a=0 | off 창내미등록=0 | unknown=0 | excluded(--min-records)=0 | synthetic=1"
+	if !strings.Contains(got, want) {
+		t.Fatalf("cx 합성 제외/synthetic=1 보고 실패:\n%s", got)
 	}
 }

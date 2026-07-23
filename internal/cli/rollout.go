@@ -172,6 +172,7 @@ type cxScan struct {
 	diverged, skipFiles, skipLines int64
 	incomplete                     bool
 	registered, matched            int
+	syntheticN                     int64 // D51 — source=first-event 합성 등록 세션(on/off/unknown 미계상)
 }
 
 // mustAbs — projectRoot의 절대화(실패는 사실상 없음 — 원본 반환, transcriptDirFor 관례).
@@ -190,20 +191,23 @@ const cxOffWindow = 7 * 24 * time.Hour
 // loadCXSessions — 프로젝트 worktrees/* 전체 session.db를 read-only 순회 병합해 cx: 세션 집합을
 // 만든다(D40 ③ 정합 — [15]와 같은 순회 패턴, loadCCSessions의 단일 worktree 조회 재사용 금지 §2).
 // worktree 단위 실패는 그 worktree만 skip + incomplete=true([15] 폴백 정합 — off 확정 금지 신호).
-func loadCXSessions(ctx context.Context, storeRoot, projectRoot string) (map[string]bool, bool) {
+// D51(v0.9): source="first-event" 합성 등록 세션은 set에서 분리해 synthetic 집합으로 반환한다
+// (--compare 기본 제외 — scanRollouts가 선차 제외). 반환 (set, synthetic, incomplete).
+func loadCXSessions(ctx context.Context, storeRoot, projectRoot string) (map[string]bool, map[string]bool, bool) {
 	// complete 판정은 "진짜 부재"일 때만 — 식별 실패·ReadDir/Stat의 부재 외 오류는 관측 불능이라
 	// incomplete=true(off 확정 금지, §2 — 계획 검수 교정: 관측 실패를 complete로 취급하면
 	// 최근 미등록 rollout이 거짓 off가 된다).
 	canon, err := ident.Canonicalize(projectRoot)
 	if err != nil || canon.ProjectID == "" {
-		return nil, true
+		return nil, nil, true
 	}
 	wtRoot := filepath.Join(storeRoot, "projects", canon.ProjectID, "worktrees")
 	entries, rdErr := os.ReadDir(wtRoot)
 	if rdErr != nil && !os.IsNotExist(rdErr) {
-		return nil, true
+		return nil, nil, true
 	}
 	set := map[string]bool{}
+	synthetic := map[string]bool{} // D51 — source=first-event 합성 등록 세션(set에서 분리)
 	incomplete := false
 	for _, e := range entries {
 		if !e.IsDir() {
@@ -227,24 +231,33 @@ func loadCXSessions(ctx context.Context, storeRoot, projectRoot string) (map[str
 				return openErr
 			}
 			defer func() { _ = db.Close() }()
-			rows, qErr := db.QueryContext(ctx, "SELECT session_id FROM sessions WHERE session_id LIKE 'cx:%'")
+			// D51 — 세션별 session_start payload source를 EXISTS로 동시 판정(0/1 → bool 스캔).
+			rows, qErr := db.QueryContext(ctx, `SELECT s.session_id, EXISTS(
+				SELECT 1 FROM session_events e WHERE e.session_id = s.session_id
+				AND e.event_type='session_start' AND json_extract(e.payload,'$.source')='first-event')
+				FROM sessions s WHERE s.session_id LIKE 'cx:%'`)
 			if qErr != nil {
 				return qErr
 			}
 			defer func() { _ = rows.Close() }()
 			for rows.Next() {
 				var id string
-				if scanErr := rows.Scan(&id); scanErr != nil {
+				var syn bool
+				if scanErr := rows.Scan(&id, &syn); scanErr != nil {
 					return scanErr // 행 관측 실패도 침묵 금지 — worktree 단위 incomplete 강등([15] 폴백 정합)
 				}
-				set[id] = true
+				if syn {
+					synthetic[id] = true // D51 — 합성 등록 세션은 set에서 제외(scanRollouts 선차 제외)
+				} else {
+					set[id] = true
+				}
 			}
 			return rows.Err()
 		}(); err != nil {
 			incomplete = true
 		}
 	}
-	return set, incomplete
+	return set, synthetic, incomplete
 }
 
 // scanRollouts — rolloutRoot 재귀 순회(§2): rollout-*.jsonl만 파싱, 모든 meta cwd가 루트 하위인
@@ -254,7 +267,7 @@ func loadCXSessions(ctx context.Context, storeRoot, projectRoot string) (map[str
 // start는 그룹 최초 파일 ts. arm 분류는 그룹 완성 후 세션 단위 1회(session_id 사전순 결정론 §3):
 // cx: 등록=on; 미등록은 !incomplete이고 시작이 7일 창 이내면 off, 그 밖은 unknown. 반환 오류는
 // 루트 자체를 못 읽는 경우뿐(호출자가 "rollout 루트 없음" 렌더).
-func scanRollouts(ctx context.Context, rolloutRoot, projectRoot string, cxSet map[string]bool, incomplete bool, now time.Time) (cxScan, error) {
+func scanRollouts(ctx context.Context, rolloutRoot, projectRoot string, cxSet, synthetic map[string]bool, incomplete bool, now time.Time) (cxScan, error) {
 	sc := cxScan{incomplete: incomplete, registered: len(cxSet)}
 	foldedRoot := ident.Fold(mustAbs(projectRoot))
 	if _, err := os.Stat(rolloutRoot); err != nil {
@@ -321,6 +334,10 @@ func scanRollouts(ctx context.Context, rolloutRoot, projectRoot string, cxSet ma
 	cutoff := now.Add(-cxOffWindow)
 	for _, id := range ids {
 		g := *groups[id]
+		if synthetic["cx:"+id] { // D51 — 합성 등록 세션 선차 제외(on/off/unknown 어디에도 미계상)
+			sc.syntheticN++
+			continue
+		}
 		switch {
 		case cxSet["cx:"+id]:
 			sc.matched++
