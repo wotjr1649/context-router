@@ -178,6 +178,29 @@ func installCodexConfigBlock(existing []byte) (out []byte, state codexMCPState) 
 	return appendBlock(existing, block, crlf), mcpWritten
 }
 
+// probeCodexMCPBlock — doctor [16] 존재 판별(D52, 스펙 v0.9 §0). install 상태기계는 "무엇을
+// 쓸지"의 분류(classReplace/classAppend→동일 mcpWritten)라 존재/부재 판별에 부적합 — 같은
+// 순수 라인 헬퍼를 재사용해 읽기 전용으로 판정한다. present: 소유 블록(classReplace) 또는
+// 블록 밖 canonical 헤더. anomaly: 마커 무결성 이상 또는 키-경계 충돌(→ [16] warning ⑤).
+// 우선순위는 installCodexConfigBlock과 동일하다 — canonical 헤더 라인은 스스로 mcp_servers·ctr]
+// 신호를 겸해 conflict도 켜므로(예: "[mcp_servers.ctr]"), install처럼 hasHeader를 conflict보다
+// 먼저 판정해야 헤더 실존을 존재(mcpExistingHeader)로, 헤더 없는 충돌만 이상(mcpConflict)으로 본다.
+func probeCodexMCPBlock(existing []byte) (present bool, anomaly bool) {
+	lines := splitLinesKeepEnds(existing)
+	class, begin, end := classifyMarkers(lines)
+	if class == classAnomaly {
+		return false, true
+	}
+	hasHeader, conflict := scanOutside(lines, class, begin, end)
+	if class == classReplace || hasHeader {
+		return true, false
+	}
+	if conflict {
+		return false, true
+	}
+	return false, false
+}
+
 // replaceBlock — 소유 블록 라인[begin..end]을 fresh 블록으로 교체, 앞뒤 라인은 바이트 보존.
 func replaceBlock(lines [][]byte, begin, end int, block []byte) []byte {
 	var out []byte

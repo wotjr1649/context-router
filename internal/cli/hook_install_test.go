@@ -734,6 +734,37 @@ func TestRunHook_NoShadowRunningBranch(t *testing.T) {
 }
 
 // D35 설치 — 병합이 타 그룹·미지 최상위 키를 보존하고 자기 2이벤트만 소유한다.
+// D52 — Codex hooks.json 자기 그룹 marker 버전 추출(v0.9 §0): isOurCodexGroup은 bool만
+// 반환하므로 신설(적대 검수 P1). 파일 부재는 (0,"",nil) — 미설치 정보 분기.
+func TestScanCodexRegisteredHooks(t *testing.T) {
+	// ① 부재: count=0 marker="" err=nil
+	if n, m, err := scanCodexRegisteredHooks(filepath.Join(t.TempDir(), "hooks.json")); n != 0 || m != "" || err != nil {
+		t.Fatalf("부재: n=%d m=%q err=%v want 0/\"\"/nil", n, m, err)
+	}
+	// ② 자기 그룹 존재: mergeCodexHooks(guard 포함 3그룹) 산출을 임시 파일로 쓰고 → count>0, marker 추출.
+	const wantMarker = "0.9.0"
+	self, err := mergeCodexHooks(nil, buildCodexHookCommand(false, "", false), hookMarker(wantMarker), true, true)
+	if err != nil {
+		t.Fatalf("self 조립: %v", err)
+	}
+	selfPath := filepath.Join(t.TempDir(), "hooks.json")
+	if err := os.WriteFile(selfPath, self, 0o600); err != nil {
+		t.Fatalf("self write: %v", err)
+	}
+	if n, m, err := scanCodexRegisteredHooks(selfPath); n <= 0 || m != wantMarker || err != nil {
+		t.Fatalf("자기 그룹: n=%d m=%q err=%v want >0/%q/nil", n, m, err, wantMarker)
+	}
+	// ③ 타인 그룹만: statusMessage 마커 접두 없는 그룹 → count=0, marker=""(isOurCodexGroup 전건 탈락).
+	foreign := []byte(`{"hooks":{"PostToolUse":[{"matcher":"","hooks":[{"type":"command","command":"pwsh -File user.ps1","timeout":10,"statusMessage":"user"}]}]}}`)
+	foreignPath := filepath.Join(t.TempDir(), "hooks.json")
+	if err := os.WriteFile(foreignPath, foreign, 0o600); err != nil {
+		t.Fatalf("foreign write: %v", err)
+	}
+	if n, m, err := scanCodexRegisteredHooks(foreignPath); n != 0 || m != "" || err != nil {
+		t.Fatalf("타인 그룹: n=%d m=%q err=%v want 0/\"\"/nil", n, m, err)
+	}
+}
+
 func TestMergeCodexHooksInstallPreservesForeign(t *testing.T) {
 	existing := []byte(`{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"pwsh -File policy.ps1","timeout":10,"statusMessage":"policy"}]}]},"otherTop":1}`)
 	out, err := mergeCodexHooks(existing, "context-router codex-hook", "context-router/0.4.0", true, false)

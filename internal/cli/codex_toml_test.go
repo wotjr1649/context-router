@@ -76,6 +76,29 @@ func TestUninstallCodexConfigBlock(t *testing.T) {
 	}
 }
 
+// D52 — doctor [16] 존재 판별(v0.9 §0): install 상태기계(classReplace/classAppend→동일
+// mcpWritten)는 존재/부재를 구분하지 못하므로 별도 판별 헬퍼가 필요하다(적대 검수 P1).
+func TestProbeCodexMCPBlock(t *testing.T) {
+	cases := []struct {
+		name    string
+		in      string
+		present bool
+		anomaly bool
+	}{
+		{"빈 파일 — 부재", "", false, false},
+		{"관리 블록 존재", codexBlockBody, true, false},
+		{"블록 밖 맨 헤더", "[mcp_servers.ctr]\ncommand = \"x\"\n", true, false},
+		{"마커 이상 — BEGIN만", codexBlockBegin + "\n[mcp_servers.ctr]\n", false, true},
+		{"무관 내용 — 부재", "[model]\nname = \"gpt\"\n", false, false},
+	}
+	for _, c := range cases {
+		p, a := probeCodexMCPBlock([]byte(c.in))
+		if p != c.present || a != c.anomaly {
+			t.Errorf("%s: present=%v anomaly=%v want %v/%v", c.name, p, a, c.present, c.anomaly)
+		}
+	}
+}
+
 // 왕복 f_uninstall(f_install(x)) — EOF 개행 정규화 제외 바이트 동일(스펙 §0 D48).
 // oracle의 EOF 개행은 파일 지배 개행을 따른다(Codex 검수 — "\n" 하드코딩이면 CRLF
 // 파일에 LF를 붙이는 혼합-EOL 구현이 통과).
