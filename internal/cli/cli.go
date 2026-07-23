@@ -661,6 +661,8 @@ func runPurge(ctx context.Context, in io.Reader, w, stderr io.Writer, storeRoot 
 		}
 	}
 
+	var vacuumFailed int
+	var vacuumDiskAbort bool
 	for _, id := range ids {
 		if err := ctx.Err(); err != nil { // --all 다중 순회 취소 전파
 			return err
@@ -721,7 +723,11 @@ func runPurge(ctx context.Context, in io.Reader, w, stderr io.Writer, storeRoot 
 			continue
 		}
 
-		// 선택 삭제 (+ 후속 --sessions, + 후속 --gc)
+		// 선택 삭제 (+ 후속 --sessions, + 후속 --gc, + 후속 --vacuum(D50))
+		var beforeB int64
+		if *vacuum {
+			beforeB = contentFootprint(projDir) // 전 실측: 삭제 착수 전(삭제 트랜잭션의 WAL 성장까지 포함한 전체 디스크 효과 반영)
+		}
 		st, err := store.Open(projDir, false)
 		if err != nil {
 			return err
@@ -733,6 +739,18 @@ func runPurge(ctx context.Context, in io.Reader, w, stderr io.Writer, storeRoot 
 		if purgeErr == nil && *gc {
 			_, purgeErr = st.GCOrphanBlobs(ctx)
 		}
+		if purgeErr == nil && *vacuum && !vacuumDiskAbort {
+			// D50 집계 계약: VACUUM/checkpoint 실패는 프로젝트별 보고 후 계속 진행하고 루프
+			// 종료 시 비-zero로 집계한다(무성 성공 위장 방지). 디스크 계열(FULL/IOERR)만
+			// 잔여 프로젝트 VACUUM 중단(연쇄 악화 방지).
+			if verr := vacuumReclaim(ctx, st, projDir, beforeB, w); verr != nil {
+				fmt.Fprintf(stderr, "ctr: %s: %v\n", id, verr)
+				vacuumFailed++
+				if store.IsDiskErr(verr) {
+					vacuumDiskAbort = true
+				}
+			}
+		}
 		closeErr := st.Close()
 		if purgeErr != nil {
 			return purgeErr
@@ -741,6 +759,46 @@ func runPurge(ctx context.Context, in io.Reader, w, stderr io.Writer, storeRoot 
 			return closeErr
 		}
 	}
+	if vacuumFailed > 0 {
+		return fmt.Errorf("purge: %d개 프로젝트 VACUUM/checkpoint 실패", vacuumFailed)
+	}
+	return nil
+}
+
+// contentFootprint — content.db+(-wal/-shm) 총합 바이트(부재=0). D50 보고·검증은 main 파일
+// 단독이 아니라 총합으로 한다 — WAL 모드에서 VACUUM 직후 main 단독 실측은 회수 0/WAL 팽창을
+// 성공으로 오인시킨다(설계 v0.8 §0·§5 실험 근거).
+func contentFootprint(projDir string) int64 {
+	var total int64
+	for _, suf := range []string{"", "-wal", "-shm"} {
+		if fi, err := os.Stat(filepath.Join(projDir, "content.db"+suf)); err == nil && !fi.IsDir() {
+			total += fi.Size()
+		}
+	}
+	return total
+}
+
+// vacuumReclaim — D50: VACUUM → wal_checkpoint(TRUNCATE) busy 검증 → 총합 보고. busy 계열
+// (VACUUM 경합·checkpoint 미완료)은 "라이브 프로세스" 안내로 매핑한다. 어느 실패든 이미 커밋된
+// 삭제분은 유지된다(호출자가 되돌리지 않음 — 설계 v0.8 §0). VACUUM은 원본 크기급 임시 공간을
+// 요구한다(도그푸딩 ~100MiB → 여유 ~2배 권고) — 부족 시 SQLITE_FULL/IOERR 실패(무손상)로
+// 표면화되고 --all에서는 잔여 프로젝트 VACUUM 중단 사유다(§0 임시 공간 주석).
+func vacuumReclaim(ctx context.Context, st *store.Store, projDir string, beforeB int64, w io.Writer) error {
+	if err := st.Vacuum(ctx); err != nil {
+		if store.IsBusyErr(err) {
+			return errors.New("purge: VACUUM 경합 — 라이브 프로세스 가동 중 추정 — 종료 후 재시도")
+		}
+		return err
+	}
+	busy, _, _, err := st.CheckpointTruncate(ctx)
+	if err != nil {
+		return err
+	}
+	if busy != 0 {
+		return errors.New("purge: checkpoint 미완료 — 라이브 프로세스 가동 중 추정 — 종료 후 재시도")
+	}
+	after := contentFootprint(projDir)
+	fmt.Fprintf(w, "purge: content.db(+wal/shm) %dB → %dB (파일 축 회수 %dB)\n", beforeB, after, beforeB-after)
 	return nil
 }
 

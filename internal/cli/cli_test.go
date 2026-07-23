@@ -868,6 +868,163 @@ func TestRunPurge_E2E_OlderThanForce(t *testing.T) {
 	}
 }
 
+// seedVacuumProject — D50 테스트 공용: ~256KB 청크를 등록해 삭제 후 VACUUM 회수가 실측
+// 가능한 프로젝트를 만든다. indexed_at 경계(unix 초) 때문에 1100ms 대기까지 포함한다.
+func seedVacuumProject(t *testing.T, storeRoot string) (projectRoot, projDir string) {
+	t.Helper()
+	projectRoot = t.TempDir()
+	canon, err := ident.Canonicalize(projectRoot)
+	if err != nil {
+		t.Fatalf("canonicalize: %v", err)
+	}
+	projDir = filepath.Join(storeRoot, "projects", canon.ProjectID)
+	st, err := store.Open(projDir, false)
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	big := strings.Repeat("v", 256*1024)
+	if _, err := st.Register(t.Context(), store.Registration{
+		StoredBytes: []byte(big), MediaType: "text/plain",
+		Source: store.SourceMeta{URI: "/vac.txt", Kind: "file", SrcHash: "h-vac"},
+		Chunks: []store.Chunk{{Ordinal: 0, Text: big}},
+	}); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	time.Sleep(1100 * time.Millisecond)
+	return projectRoot, projDir
+}
+
+// contentFootprintOf — 테스트측 총합 실측(구현 헬퍼와 독립 계산 — 동일 값 검증이 목적이므로
+// 구현을 import하지 않고 재계산한다).
+func contentFootprintOf(t *testing.T, projDir string) int64 {
+	t.Helper()
+	var total int64
+	for _, suf := range []string{"", "-wal", "-shm"} {
+		if fi, err := os.Stat(filepath.Join(projDir, "content.db"+suf)); err == nil {
+			total += fi.Size()
+		}
+	}
+	return total
+}
+
+// TestRunPurge_E2E_OlderThanVacuum — D50 정상 경로: 총합(db+wal+shm) 전>후 + 보고 라인 +
+// rc=0. main 파일 단독 크기 단정은 하지 않는다(WAL 가변성 — 스펙 §2).
+func TestRunPurge_E2E_OlderThanVacuum(t *testing.T) {
+	storeRoot := t.TempDir()
+	projectRoot, projDir := seedVacuumProject(t, storeRoot)
+	before := contentFootprintOf(t, projDir)
+
+	var out bytes.Buffer
+	args := []string{"--project", projectRoot, "--force", "--older-than", "1ns", "--vacuum"}
+	if err := runPurge(context.Background(), failReader{}, &out, io.Discard, storeRoot, args, false); err != nil {
+		t.Fatalf("runPurge err=%v out=%s", err, out.String())
+	}
+	if !strings.Contains(out.String(), "파일 축 회수") {
+		t.Fatalf("회수 보고 라인 없음:\n%s", out.String())
+	}
+	after := contentFootprintOf(t, projDir)
+	if after >= before {
+		t.Fatalf("총합 %dB→%dB — 감소해야 함", before, after)
+	}
+}
+
+// TestRunPurge_VacuumCheckpointBusyMapsToError — D50: 열린 read 트랜잭션 공존 시 삭제·VACUUM은
+// 통과해도 checkpoint busy≠0 → "라이브 프로세스" 오류로 표면화(무성 성공 위장 봉쇄 — 스펙 §5
+// Codex 실험 시나리오). 삭제분 유지·quick_check=ok 단정 포함. busy_timeout 탓 ~5s 정상.
+func TestRunPurge_VacuumCheckpointBusyMapsToError(t *testing.T) {
+	storeRoot := t.TempDir()
+	projectRoot, projDir := seedVacuumProject(t, storeRoot)
+
+	dbPath := filepath.ToSlash(filepath.Join(projDir, "content.db"))
+	locker, err := sql.Open("sqlite", "file:"+dbPath+"?_pragma=busy_timeout(1000)")
+	if err != nil {
+		t.Fatalf("open locker: %v", err)
+	}
+	defer func() { _ = locker.Close() }()
+	conn, err := locker.Conn(context.Background())
+	if err != nil {
+		t.Fatalf("locker conn: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+	if _, err := conn.ExecContext(context.Background(), "BEGIN"); err != nil {
+		t.Fatalf("BEGIN: %v", err)
+	}
+	var pin int
+	if err := conn.QueryRowContext(context.Background(), "SELECT count(*) FROM sources").Scan(&pin); err != nil {
+		t.Fatalf("read txn: %v", err)
+	}
+
+	var out bytes.Buffer
+	var errOut bytes.Buffer
+	args := []string{"--project", projectRoot, "--force", "--older-than", "1ns", "--vacuum"}
+	rc := runPurge(context.Background(), failReader{}, &out, &errOut, storeRoot, args, false)
+	_, _ = conn.ExecContext(context.Background(), "ROLLBACK")
+	if rc == nil || !strings.Contains(rc.Error(), "VACUUM/checkpoint 실패") {
+		t.Fatalf("rc=%v want 집계 오류", rc)
+	}
+	if !strings.Contains(errOut.String(), "라이브 프로세스") {
+		t.Fatalf("busy 안내 없음:\n%s", errOut.String())
+	}
+	st, err := store.Open(projDir, true)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer func() { _ = st.Close() }()
+	var n int
+	if err := st.Reader().QueryRow("SELECT count(*) FROM sources").Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Fatalf("sources=%d want 0 — checkpoint 실패가 삭제를 되돌리면 안 됨", n)
+	}
+	var qc string
+	if err := st.Reader().QueryRow("PRAGMA quick_check").Scan(&qc); err != nil || qc != "ok" {
+		t.Fatalf("quick_check=%q err=%v want ok(무손상)", qc, err)
+	}
+}
+
+// TestRunPurge_All_VacuumAggregateExit — D50 --all 집계: 한 프로젝트 checkpoint busy 실패,
+// 다른 프로젝트 정상 → 정상 프로젝트 회수 라인은 출력되고(계속 진행) 최종 rc는 비-zero(집계).
+// 순회 순서 무가정 단정. ~5s 정상.
+func TestRunPurge_All_VacuumAggregateExit(t *testing.T) {
+	storeRoot := t.TempDir()
+	_, projDirA := seedVacuumProject(t, storeRoot)
+	seedVacuumProject(t, storeRoot) // B: 정상
+
+	dbPath := filepath.ToSlash(filepath.Join(projDirA, "content.db"))
+	locker, err := sql.Open("sqlite", "file:"+dbPath+"?_pragma=busy_timeout(1000)")
+	if err != nil {
+		t.Fatalf("open locker: %v", err)
+	}
+	defer func() { _ = locker.Close() }()
+	conn, err := locker.Conn(context.Background())
+	if err != nil {
+		t.Fatalf("locker conn: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+	if _, err := conn.ExecContext(context.Background(), "BEGIN"); err != nil {
+		t.Fatalf("BEGIN: %v", err)
+	}
+	var pin int
+	if err := conn.QueryRowContext(context.Background(), "SELECT count(*) FROM sources").Scan(&pin); err != nil {
+		t.Fatalf("read txn: %v", err)
+	}
+
+	var out, errOut bytes.Buffer
+	args := []string{"--all", "--force", "--older-than", "1ns", "--vacuum"}
+	rc := runPurge(context.Background(), failReader{}, &out, &errOut, storeRoot, args, false)
+	_, _ = conn.ExecContext(context.Background(), "ROLLBACK")
+	if rc == nil || !strings.Contains(rc.Error(), "1개 프로젝트 VACUUM/checkpoint 실패") {
+		t.Fatalf("rc=%v want 집계 1개 실패", rc)
+	}
+	if !strings.Contains(out.String(), "파일 축 회수") {
+		t.Fatalf("정상 프로젝트 회수 라인 없음(계속 진행 계약 위반):\n%s", out.String())
+	}
+}
+
 // TestRunPurge_E2E_MismatchLeavesDataIntact: TTY 경로에서 확인 슬러그를 잘못 입력하면
 // runPurge가 오류를 반환하고 sources/artifacts를 전혀 건드리면 안 된다(설계 §7 — 불일치 시
 // 무삭제, self-review 필수 항목). --older-than을 지정하지 않아 전체 삭제(RemoveAll) 분기까지
