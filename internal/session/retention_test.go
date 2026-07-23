@@ -70,6 +70,16 @@ func countSessionsLike(t *testing.T, d *DB, pattern string) int64 {
 	return n
 }
 
+// sessionExists — 세션 행 존재 여부(GC 전후 단정용 소형 COUNT).
+func sessionExists(t *testing.T, d *DB, sessionID string) bool {
+	t.Helper()
+	var n int64
+	if err := d.Reader().QueryRow("SELECT COUNT(*) FROM sessions WHERE session_id=?", sessionID).Scan(&n); err != nil {
+		t.Fatalf("sessionExists(%s): %v", sessionID, err)
+	}
+	return n > 0
+}
+
 // TestSweepEmptySessionGC — D42 §4: 빈 세션 GC 경계. 비-session_start 0건 AND started_at <
 // now-7d인 세션만 GC(retention_sec 무관). openT의 자동 세션(오래된 실시간 started_at + session_start
 // 뿐)도 같은 술어로 GC되어 잔존 목록에 남지 않는다.
@@ -151,5 +161,32 @@ func TestSweepEmptySessionGCPreservesLateEvent(t *testing.T) {
 	}
 	if n := countEventsFor(t, d, "cc:late"); n != 2 { // session_start + late-evt
 		t.Fatalf("보존 세션 이벤트=%d want 2(session_start+실이벤트)", n)
+	}
+}
+
+// TestSweepSubagentLifecycleSession — D53 empty/GC 경계(스펙 §0 상호작용 ①·§2): 생애주기
+// 이벤트만 있는 세션은 empty GC 비대상, retention 만료 시 같은 Sweep 호출에서 수거(추가 7일
+// 유예 없음 — 재검수 정정 계약).
+func TestSweepSubagentLifecycleSession(t *testing.T) {
+	d := openT(t, t.TempDir(), Options{Producer: "test"})
+	now := time.Now()
+	old := now.Add(-40 * 24 * time.Hour).Unix() // started_at 40일 전(7일 게이트 통과·retention 초과)
+	sid := "cc:7d2504e0-4f89-41d3-9a0c-0305e82c3305"
+	seedSession(t, d, sid, old, 2592000) // retention 30일
+	seedSessionStart(t, d, sid, old)
+	insertRawEvent(t, d, "sa-"+sid, sid, "subagent_start", now.Unix(), "subagent started: Explore", nil, nil, nil, "none", "")
+	// 1차 스윕: subagent_start가 신선 → 세션은 non-empty → GC 비대상.
+	if _, err := Sweep(context.Background(), d, now); err != nil {
+		t.Fatal(err)
+	}
+	if !sessionExists(t, d, sid) {
+		t.Fatal("신선한 subagent_start 보유 세션이 GC됨 — empty 술어 회귀")
+	}
+	// 2차 스윕: retention 경과 시점 — 이벤트 만료와 같은 호출에서 세션 행 수거.
+	if _, err := Sweep(context.Background(), d, now.Add(31*24*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if sessionExists(t, d, sid) {
+		t.Fatal("retention 만료 후 같은 Sweep에서 미수거 — 상한 닫힘 회귀")
 	}
 }

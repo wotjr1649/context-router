@@ -81,8 +81,8 @@ func assertDoctorAscending(t *testing.T, out string) {
 	}
 }
 
-// ① 빈 설정에 install → 4개 이벤트 등록·유효 JSON·PreToolUse matcher "Read|Bash|PowerShell"·timeout 10.
-func TestHookInstall_EmptyRegistersFourItems(t *testing.T) {
+// ① 빈 설정에 install → 6개 이벤트 등록·유효 JSON·PreToolUse matcher "Read|Bash|PowerShell|Grep"·timeout 10.
+func TestHookInstall_EmptyRegistersSixItems(t *testing.T) {
 	projectRoot := t.TempDir()
 	var out bytes.Buffer
 	if err := runHookInstall(nil, "/store", "", false, projectRoot, "0.1.0", &out); err != nil {
@@ -100,8 +100,8 @@ func TestHookInstall_EmptyRegistersFourItems(t *testing.T) {
 	if err != nil {
 		t.Fatalf("count: %v", err)
 	}
-	if n != 4 {
-		t.Fatalf("registered=%d want 4\n%s", n, data)
+	if n != 6 {
+		t.Fatalf("registered=%d want 6\n%s", n, data)
 	}
 	var s struct {
 		Hooks map[string][]struct {
@@ -115,7 +115,7 @@ func TestHookInstall_EmptyRegistersFourItems(t *testing.T) {
 	if err := json.Unmarshal(data, &s); err != nil {
 		t.Fatalf("parse: %v", err)
 	}
-	for _, ev := range []string{"SessionStart", "PreToolUse", "PostToolUse", "PostToolUseFailure"} {
+	for _, ev := range []string{"SessionStart", "PreToolUse", "PostToolUse", "PostToolUseFailure", "SubagentStart", "SubagentStop"} {
 		if len(s.Hooks[ev]) != 1 {
 			t.Fatalf("event %q groups=%d want 1: %s", ev, len(s.Hooks[ev]), data)
 		}
@@ -124,13 +124,13 @@ func TestHookInstall_EmptyRegistersFourItems(t *testing.T) {
 			t.Fatalf("event %q bad command/timeout: %+v", ev, s.Hooks[ev][0])
 		}
 	}
-	if s.Hooks["PreToolUse"][0].Matcher != "Read|Bash|PowerShell" {
-		t.Fatalf("PreToolUse matcher=%q want Read|Bash|PowerShell", s.Hooks["PreToolUse"][0].Matcher)
+	if s.Hooks["PreToolUse"][0].Matcher != "Read|Bash|PowerShell|Grep" {
+		t.Fatalf("PreToolUse matcher=%q want Read|Bash|PowerShell|Grep", s.Hooks["PreToolUse"][0].Matcher)
 	}
 }
 
 // ①-b D32 업그레이드 재설치(설계 §8 설치 게이트): v0.2 형태 settings(marker 0.2.0 + PreToolUse
-// matcher "Read")를 seed → install 재실행 → PreToolUse 관리 그룹 1개·matcher "Read|Bash|PowerShell"·총 4그룹·
+// matcher "Read")를 seed → install 재실행 → PreToolUse 관리 그룹 1개·matcher "Read|Bash|PowerShell|Grep"·총 6그룹·
 // marker 현재 버전으로 갱신(구 matcher 그룹이 잔존하지 않고 대칭 교체된다).
 func TestHookInstall_UpgradeReinstallWidensMatcher(t *testing.T) {
 	projectRoot := t.TempDir()
@@ -164,8 +164,8 @@ func TestHookInstall_UpgradeReinstallWidensMatcher(t *testing.T) {
 		t.Fatalf("install: %v", err)
 	}
 
-	if n, _ := countRegisteredHooks(path); n != 4 {
-		t.Fatalf("after upgrade registered=%d want 4 (관리 그룹 중복/누락)", n)
+	if n, _ := countRegisteredHooks(path); n != 6 {
+		t.Fatalf("after upgrade registered=%d want 6 (관리 그룹 중복/누락)", n)
 	}
 	data, _ := os.ReadFile(path)
 	var s struct {
@@ -181,8 +181,8 @@ func TestHookInstall_UpgradeReinstallWidensMatcher(t *testing.T) {
 	if len(pre) != 1 {
 		t.Fatalf("PreToolUse groups=%d want 1(단일 관리 그룹 유지): %s", len(pre), data)
 	}
-	if pre[0].Matcher != "Read|Bash|PowerShell" {
-		t.Fatalf("PreToolUse matcher=%q want Read|Bash|PowerShell (구 Read 그룹 미교체): %s", pre[0].Matcher, data)
+	if pre[0].Matcher != "Read|Bash|PowerShell|Grep" {
+		t.Fatalf("PreToolUse matcher=%q want Read|Bash|PowerShell|Grep (구 Read 그룹 미교체): %s", pre[0].Matcher, data)
 	}
 	if pre[0].Managed != "context-router/0.3.0" {
 		t.Fatalf("marker=%q want context-router/0.3.0 (버전 미갱신): %s", pre[0].Managed, data)
@@ -203,8 +203,8 @@ func TestHookInstall_Idempotent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("count: %v", err)
 	}
-	if n != 4 {
-		t.Fatalf("after 3 installs registered=%d want 4 (멱등 위반)", n)
+	if n != 6 {
+		t.Fatalf("after 3 installs registered=%d want 6 (멱등 위반)", n)
 	}
 	data, _ := os.ReadFile(path)
 	var s struct {
@@ -273,8 +273,8 @@ func TestHookInstall_RoundTripPreservesUnknownAndOtherTools(t *testing.T) {
 		t.Fatalf("install: %v", err)
 	}
 	assertPreserved("after install")
-	if n, _ := countRegisteredHooks(path); n != 4 {
-		t.Fatalf("after install registered=%d want 4", n)
+	if n, _ := countRegisteredHooks(path); n != 6 {
+		t.Fatalf("after install registered=%d want 6", n)
 	}
 
 	if err := runHookUninstall(nil, projectRoot, &out); err != nil {
@@ -616,7 +616,7 @@ func TestDoctor_HookMarkerVersionMatch(t *testing.T) {
 		t.Fatalf("runDoctor err=%v out=%s", err, buf.String())
 	}
 	out := buf.String()
-	if !strings.Contains(out, "project=등록됨(4개, marker 9.9.9)") {
+	if !strings.Contains(out, "project=등록됨(6개, marker 9.9.9)") {
 		t.Fatalf("out missing matched marker version:\n%s", out)
 	}
 	if strings.Contains(out, "≠") {
@@ -638,7 +638,7 @@ func TestDoctor_HookMarkerVersionMismatch(t *testing.T) {
 		t.Fatalf("runDoctor err=%v out=%s", err, buf.String())
 	}
 	out := buf.String()
-	if !strings.Contains(out, "project=등록됨(4개, marker 0.1.0≠0.3.0 — hook install 재실행)") {
+	if !strings.Contains(out, "project=등록됨(6개, marker 0.1.0≠0.3.0 — hook install 재실행)") {
 		t.Fatalf("out missing marker mismatch warning:\n%s", out)
 	}
 }

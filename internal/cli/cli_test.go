@@ -14,6 +14,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"testing"
@@ -23,6 +24,38 @@ import (
 	"github.com/wotjr1649/context-router/internal/session"
 	"github.com/wotjr1649/context-router/internal/store"
 )
+
+// D56 — version 서브커맨드: ProductVersion 1줄만 출력(CI 추출 표면, 스펙 §0).
+func TestRunVersionSubcommand(t *testing.T) {
+	var out, errOut bytes.Buffer
+	err := Run(context.Background(), "version", nil, t.TempDir(), t.TempDir(), "9.9.9-test", false, "", &out, &errOut)
+	if err != nil {
+		t.Fatalf("err=%v", err)
+	}
+	if out.String() != "9.9.9-test\n" {
+		t.Fatalf("out=%q want %q", out.String(), "9.9.9-test\n")
+	}
+	if err := Run(context.Background(), "version", []string{"x"}, t.TempDir(), t.TempDir(), "v", false, "", &out, &errOut); err == nil {
+		t.Fatal("잉여 인자 미거부")
+	}
+}
+
+// D56 — formatBuildLine 양 경로(검수 반영 — 순수 포매터라 결정적).
+func TestFormatBuildLine(t *testing.T) {
+	if got := formatBuildLine("9.9.9-test", nil); got != "[17] build: 9.9.9-test ()" {
+		t.Fatalf("nil(실패) 경로: %q", got)
+	}
+	bi := &debug.BuildInfo{GoVersion: "go1.26.5", Settings: []debug.BuildSetting{
+		{Key: "vcs.revision", Value: "abcdef0123456789"},
+		{Key: "vcs.modified", Value: "true"},
+	}}
+	got := formatBuildLine("9.9.9-test", bi)
+	for _, want := range []string{"go=go1.26.5", "commit=abcdef012345", "dirty"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("%q 누락: %q", want, got)
+		}
+	}
+}
 
 // TestRunUpgrade_Table: httptest 서버로 정상/오류/타임아웃/위생검증 경로를 모두 확인한다
 // (설계 §7 — upgrade 위생: 응답 제공 URL·기타 필드는 절대 출력 금지, tag_name만 취함).
@@ -1966,6 +1999,47 @@ func TestRunDoctor_SessionItems(t *testing.T) {
 	})
 }
 
+// TestDoctorEmptyExcludesSubagentLifecycle — D53: subagent_start(생애주기)만 있는 세션은 doctor
+// [6] empty 카운트에서 제외(스펙 §0 상호작용 ①). 세션 2개(A=session_start 단독=empty,
+// B=session_start+subagent_start=non-empty) → "sessions=2 (empty=1)" 단정.
+func TestDoctorEmptyExcludesSubagentLifecycle(t *testing.T) {
+	storeRoot := t.TempDir()
+	projectRoot := t.TempDir()
+	canon, err := ident.Canonicalize(projectRoot)
+	if err != nil {
+		t.Fatalf("canonicalize: %v", err)
+	}
+	dbDir := filepath.Join(storeRoot, "projects", canon.ProjectID, "worktrees", canon.WorktreeID)
+
+	// 세션 B: session_start + subagent_start → non-empty.
+	db, err := session.Open(dbDir, session.Options{Producer: "context-router/test"})
+	if err != nil {
+		t.Fatalf("session.Open(B): %v", err)
+	}
+	if _, _, _, err := db.Append(session.Event{Type: "subagent_start", Summary: "subagent started: Explore"}); err != nil {
+		t.Fatalf("append subagent_start: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close(B): %v", err)
+	}
+	// 세션 A: session_start 단독 → empty(각 Open이 새 자동 세션 1건 등록).
+	da, err := session.Open(dbDir, session.Options{Producer: "context-router/test"})
+	if err != nil {
+		t.Fatalf("session.Open(A): %v", err)
+	}
+	if err := da.Close(); err != nil {
+		t.Fatalf("close(A): %v", err)
+	}
+
+	var buf bytes.Buffer
+	if err := runDoctor(context.Background(), &buf, storeRoot, projectRoot, "0.0.1-dev"); err != nil {
+		t.Fatalf("runDoctor err=%v out=%s", err, buf.String())
+	}
+	if !strings.Contains(buf.String(), "sessions=2 (empty=1)") {
+		t.Fatalf("out missing \"sessions=2 (empty=1)\": %s", buf.String())
+	}
+}
+
 // corruptSessionEvents — 태스크9b CLI 레벨 recover 테스트 전용 손상 헬퍼. session 패키지의
 // recover_test.go seedAndCorruptEvents와 동일한 기법(session_events 루트 페이지의 셀 포인터
 // 배열 영역 훼손 — 실측 확인: quick_check는 malformed를 보고하지만 앞부분 다수 행은 여전히
@@ -2206,6 +2280,13 @@ func TestPurgeHookOnlyCLI(t *testing.T) {
 	if !strings.Contains(o, "실회수") || !strings.Contains(o, "(1 hashes)") {
 		t.Fatalf("보고 문면 없음:\n%s", o)
 	}
+	if !strings.Contains(o, "purge: content.db(+wal/shm) ") {
+		t.Fatalf("D55 총합 보고 라인 없음:\n%s", o)
+	}
+	// ④ 실회수 보고가 ⑤ 총합 보고보다 먼저(스펙 §0 순서)
+	if strings.Index(o, "실회수") > strings.Index(o, "purge: content.db(+wal/shm) ") {
+		t.Fatalf("보고 순서 역전:\n%s", o)
+	}
 	// 전체 삭제 비도달: content.db 잔존.
 	if _, err := os.Stat(filepath.Join(projDir, "content.db")); err != nil {
 		t.Fatalf("content.db가 사라짐(전체삭제 분기에 도달) : %v", err)
@@ -2334,6 +2415,9 @@ func TestDoctorCodexMCPLine(t *testing.T) {
 					t.Errorf("출력에 %q 있으면 안 됨:\n%s", absent, out)
 				}
 			}
+			if !strings.Contains(out, "[17] build: ") { // D56 — [16] 직후 build 라인(ver 하류)
+				t.Errorf("[17] build 라인 없음:\n%s", out)
+			}
 		})
 	}
 }
@@ -2419,10 +2503,10 @@ func (b *blockingWriter) Write(p []byte) (int, error) {
 	return n, nil
 }
 
-// TestPurgeHookOnlyVacuumFailureContinues — VACUUM 실패는 log-and-continue(rc=0)이며, 실회수
-// 보고는 VACUUM보다 먼저(스펙 §3 순서) 출력된다. 보고 직후·VACUUM 직전에 별도 연결로 쓰기
-// 잠금(BEGIN IMMEDIATE)을 선점해 VACUUM을 SQLITE_BUSY로 결정적으로 실패시킨다.
-func TestPurgeHookOnlyVacuumFailureContinues(t *testing.T) {
+// TestPurgeHookOnlyVacuumFailurePropagates — D55: VACUUM 실패는 rc≠0로 전파된다(단 이미 커밋된
+// hook-only 삭제분은 유지). 실회수 보고는 VACUUM보다 먼저(스펙 §3 순서) 출력된다. 보고 직후·
+// VACUUM 직전에 별도 연결로 쓰기 잠금(BEGIN IMMEDIATE)을 선점해 VACUUM을 SQLITE_BUSY로 결정적으로 실패시킨다.
+func TestPurgeHookOnlyVacuumFailurePropagates(t *testing.T) {
 	pid, projDir, _ := seedHookOnlyProject(t)
 	storeRoot := storeRootOf(projDir)
 
@@ -2469,13 +2553,11 @@ func TestPurgeHookOnlyVacuumFailureContinues(t *testing.T) {
 	}
 	_, _ = lockConn.ExecContext(context.Background(), "ROLLBACK")
 
-	if rc != nil {
-		t.Fatalf("VACUUM 실패는 log-and-continue여야 하는데 rc=%v", rc)
+	// 반전(D55): VACUUM 실패는 rc≠0로 전파 — 단 이미 커밋된 hook-only 삭제분은 유지.
+	if rc == nil {
+		t.Fatalf("VACUUM BUSY인데 rc=nil — D55 rc≠0 계약 회귀:\n%s", gw.buf.String())
 	}
 	if !strings.Contains(gw.buf.String(), "실회수") {
 		t.Fatalf("실회수 보고가 VACUUM 이전에 안 나옴:\n%s", gw.buf.String())
-	}
-	if !strings.Contains(errOut.String(), "VACUUM 실패") {
-		t.Fatalf("VACUUM 실패 로그 없음(정말 실패했는지 확인):\n%s", errOut.String())
 	}
 }

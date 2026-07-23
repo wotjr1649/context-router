@@ -27,8 +27,9 @@ cmd ──┬─ mcp ─┬─ search ──→ store
       ├─ cli ─┬───────────→ store, ident, session   # session — v0.1, export/recover 서브커맨드
       │       └─ hook ─────→ session, ident, store, ingest  # v0.2 §2 — 훅 서브커맨드 위임(store·ingest는 T5~T7 소비)
       ├─ store                            # store.Open 직접 호출
-      └─ ident                            # leaf, 순수 함수
-store · ident · netfetch · transform : internal 상호 의존 0 (leaf)
+      ├─ ident                            # leaf, 순수 함수
+      └─ buildinfo                        # leaf — 단일 상수(v0.10 D56), 직접 소비자 cmd·mcp (cli는 version 인자 하류)
+store · ident · netfetch · transform · buildinfo : internal 상호 의존 0 (leaf)
 search → session: 없음(의도) — search.QueryEvents(v0.1)는 *sql.DB reader를 인자로만 받는다,
                   session 타입을 import하지 않는다(D16 "search→session 타입 의존 없음").
 ```
@@ -125,6 +126,7 @@ fuzz는 CI에서 시드 corpus 회귀만(상시 fuzzing은 로컬 수동), 5,000
 | 쟁점 | 판정 | 근거 |
 |---|---|---|
 | ctrerr 공유 오류 패키지 vs 패키지별 sentinel | **sentinel + mcp 단일 변환** | 매핑이 9×8 고정 소규모라 N×M 우려 불성립, worker 직렬화는 transform 프로토콜 내부 처리 가능, "error framework"는 과잉설계(Codex), 패키지 수 증가는 D13 역행 |
+| `internal/buildinfo` 신설 vs 상수 중복 | **D13 예외** | `internal/buildinfo`는 D13 예외 — 파편화가 아닌 단일 상수 leaf(`store.OpenContext` 예외 선례와 동형, 스펙 v0.10 D56·§5) |
 | doc.go 별도 파일 | **기각** | D13 — 패키지 주석은 주 파일 상단 |
 | 파일 400줄 분리 검토 | **기각 → 300~1,000 밴드** | D13 (사용자 지시) |
 | search를 store로 통합 | **분리 유지** | "항상 같이 import" 기준 불성립 + store 부패 경로 충돌 |

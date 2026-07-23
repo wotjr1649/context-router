@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -53,6 +54,16 @@ func runHook(t *testing.T, storeRoot string, in []byte, env map[string]string) i
 func runHookHost(t *testing.T, host Host, storeRoot string, in []byte, env map[string]string) int {
 	t.Helper()
 	return Run(context.Background(), bytes.NewReader(in), io.Discard, storeRoot, "test", host, func(k string) string { return env[k] })
+}
+
+// runHookCaptureStdout — runHook 동형이되 stdout(=guard deny JSON 또는 빈 문자열)을 캡처해 반환한다.
+func runHookCaptureStdout(t *testing.T, storeRoot string, in []byte) string {
+	t.Helper()
+	var out bytes.Buffer
+	if rc := Run(context.Background(), bytes.NewReader(in), &out, storeRoot, "test", HostClaude, func(string) string { return "" }); rc != 0 {
+		t.Fatalf("hook rc=%d want 0", rc)
+	}
+	return out.String()
 }
 
 // D35×D51 — 동일 UUID의 cc/cx 격리: cc SessionStart 후 같은 UUID의 cx 이벤트는 (drop이 아니라)
@@ -589,6 +600,277 @@ func TestHookStdinOversize(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(sessDir(t, storeRoot, cwd), "session.db")); !os.IsNotExist(err) {
 		t.Fatalf("session.db must not exist on oversize stdin, stat err=%v", err)
 	}
+}
+
+// ─── D53: 서브에이전트 생애주기 (스펙 v0.10 §0·§2) ────────────────────────────
+
+// D53 — SubagentStart/Stop 생애주기 이벤트(스펙 v0.10 §0·§2). 등록된 세션에 각 1이벤트,
+// summary는 "subagent started: <type>"·빈 type이면 접미 생략, attrs는 빈 값 포함 2키 기록.
+func TestHookSubagentLifecycle(t *testing.T) {
+	storeRoot := filepath.Join(t.TempDir(), "storeroot")
+	cwd := t.TempDir()
+	sid := "3f2504e0-4f89-41d3-9a0c-0305e82c3301"
+	// SessionStart로 세션 등록(기존 관례)
+	start := mustJSON(t, map[string]any{"hook_event_name": "SessionStart", "session_id": sid, "cwd": cwd, "source": "startup"})
+	if rc := runHook(t, storeRoot, start, nil); rc != 0 {
+		t.Fatalf("SessionStart rc=%d", rc)
+	}
+	cases := []struct {
+		event, agentType, wantType, wantSummary string
+	}{
+		{"SubagentStart", "Explore", "subagent_start", "subagent started: Explore"},
+		{"SubagentStop", "Explore", "subagent_stop", "subagent stopped: Explore"},
+		{"SubagentStart", "", "subagent_start", "subagent started"}, // 빈 type — 접미 생략(§3 실측 근거)
+	}
+	for _, c := range cases {
+		in := mustJSON(t, map[string]any{
+			"hook_event_name": c.event, "session_id": sid, "cwd": cwd,
+			"agent_id": "a1b2c3d4e5f6", "agent_type": c.agentType,
+		})
+		if rc := runHook(t, storeRoot, in, nil); rc != 0 {
+			t.Fatalf("%s rc=%d", c.event, rc)
+		}
+		ev := lastEvent(t, sessDir(t, storeRoot, cwd), sid) // (type, summary, attrs) 조회 헬퍼
+		if ev.Type != c.wantType || ev.Summary != c.wantSummary {
+			t.Fatalf("got (%s,%q) want (%s,%q)", ev.Type, ev.Summary, c.wantType, c.wantSummary)
+		}
+		if ev.Attrs["agent_id"] != "a1b2c3d4e5f6" || ev.Attrs["agent_type"] != c.agentType {
+			t.Fatalf("attrs=%v want agent_id/agent_type 병기(빈 값 포함)", ev.Attrs)
+		}
+	}
+}
+
+// D53 — 미등록 세션의 SubagentStart는 D51 합성 등록 경유 후 기록(파이프라인 합류 회귀).
+func TestHookSubagentUnknownSessionSynthesizes(t *testing.T) {
+	storeRoot := filepath.Join(t.TempDir(), "storeroot")
+	cwd := t.TempDir()
+	sid := "4a2504e0-4f89-41d3-9a0c-0305e82c3302"
+	in := mustJSON(t, map[string]any{
+		"hook_event_name": "SubagentStart", "session_id": sid, "cwd": cwd,
+		"agent_id": "x1", "agent_type": "Explore",
+	})
+	if rc := runHook(t, storeRoot, in, nil); rc != 0 {
+		t.Fatalf("rc=%d", rc)
+	}
+	// session_start(Source="first-event") + subagent_start = 2이벤트
+	n := countEvents(t, sessDir(t, storeRoot, cwd), sid)
+	if n != 2 {
+		t.Fatalf("events=%d want 2 (합성 등록 + subagent_start)", n)
+	}
+}
+
+// D53 비수용 부정(§2): SubagentStop의 last_assistant_message·agent_transcript_path는
+// summary·attrs 어디에도 미출현.
+func TestHookSubagentStopRejectsBodyFields(t *testing.T) {
+	storeRoot := filepath.Join(t.TempDir(), "storeroot")
+	cwd := t.TempDir()
+	sid := "5b2504e0-4f89-41d3-9a0c-0305e82c3303"
+	start := mustJSON(t, map[string]any{"hook_event_name": "SessionStart", "session_id": sid, "cwd": cwd, "source": "startup"})
+	if rc := runHook(t, storeRoot, start, nil); rc != 0 {
+		t.Fatalf("SessionStart rc=%d", rc)
+	}
+	secret := "CANARY" + "SECRET" + "BODY" // 분해 조립(§12)
+	in := mustJSON(t, map[string]any{
+		"hook_event_name": "SubagentStop", "session_id": sid, "cwd": cwd,
+		"agent_id": "x2", "agent_type": "claude",
+		"last_assistant_message": secret, "agent_transcript_path": "C:/tmp/" + secret + ".jsonl",
+	})
+	if rc := runHook(t, storeRoot, in, nil); rc != 0 {
+		t.Fatalf("rc=%d", rc)
+	}
+	ev := lastEvent(t, sessDir(t, storeRoot, cwd), sid)
+	joined := ev.Summary + fmt.Sprint(ev.Attrs)
+	if strings.Contains(joined, secret) {
+		t.Fatalf("본문 필드 유출: %q", joined)
+	}
+}
+
+// D53 표식(스펙 §0·§2): agent_id 실린 PostToolUse → attrs 병기, 부재 → 두 키 부재,
+// 빈 값 → 표식 생략, wrong-type → 기본 이벤트 미드롭(RawMessage 기전이 계약 — 재검수 P2).
+func TestHookAgentAttribution(t *testing.T) {
+	cases := []struct {
+		name      string
+		event     string // PostToolUse | PostToolUseFailure(§2 — Failure도 동일 표식, 검수 반영)
+		agentID   any    // nil=필드 자체 생략
+		agentType any
+		wantMark  bool
+		wantType  string // 기본 이벤트 event_type(미드롭 단정)
+	}{
+		{"present", "PostToolUse", "a1b2", "Explore", true, "tool_call"},
+		{"present_failure", "PostToolUseFailure", "a1b2", "Explore", true, "error"},
+		{"absent", "PostToolUse", nil, nil, false, "tool_call"},
+		{"empty_id", "PostToolUse", "", "Explore", false, "tool_call"},                  // best-effort — 표식 생략
+		{"wrong_type", "PostToolUse", 123, map[string]int{"x": 1}, false, "tool_call"}, // 기본 이벤트 미드롭
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			storeRoot := filepath.Join(t.TempDir(), "storeroot")
+			cwd := t.TempDir()
+			sid := "6c2504e0-4f89-41d3-9a0c-0305e82c3304"
+			start := mustJSON(t, map[string]any{"hook_event_name": "SessionStart", "session_id": sid, "cwd": cwd, "source": "startup"})
+			if rc := runHook(t, storeRoot, start, nil); rc != 0 {
+				t.Fatalf("SessionStart rc=%d", rc)
+			}
+			m := map[string]any{
+				"hook_event_name": c.event, "session_id": sid, "cwd": cwd,
+				"tool_name": "Glob", "tool_input": map[string]string{"pattern": "*.go"},
+			}
+			if c.event == "PostToolUseFailure" {
+				m["error"] = "exit code 1"
+			} else {
+				m["tool_response"] = map[string]string{"result": "ok"}
+			}
+			if c.agentID != nil {
+				m["agent_id"] = c.agentID
+			}
+			if c.agentType != nil {
+				m["agent_type"] = c.agentType
+			}
+			if rc := runHook(t, storeRoot, mustJSON(t, m), nil); rc != 0 {
+				t.Fatalf("%s rc=%d", c.event, rc)
+			}
+			ev := lastEvent(t, sessDir(t, storeRoot, cwd), sid)
+			if ev.Type != c.wantType {
+				t.Fatalf("기본 이벤트 소실 — type=%s want %s (드롭 회귀)", ev.Type, c.wantType)
+			}
+			_, hasID := ev.Attrs["agent_id"]
+			_, hasType := ev.Attrs["agent_type"]
+			if c.wantMark {
+				if ev.Attrs["agent_id"] != "a1b2" || ev.Attrs["agent_type"] != "Explore" {
+					t.Fatalf("표식 값 불일치: attrs=%v", ev.Attrs)
+				}
+			} else if hasID || hasType { // 두 키 동시 부재(§2 — 검수 반영: type만 남는 회귀 차단)
+				t.Fatalf("비표식인데 agent 키 잔존: attrs=%v", ev.Attrs)
+			}
+		})
+	}
+}
+
+// F2(최종 리뷰): 병적으로 큰 agent_id는 PostToolUse 기본 이벤트를 죽이면 안 된다(스펙 v0.10 §0
+// best-effort). 5000자 agent_id가 attrs로 흘러들면 session.MaxAttributesBytes(4096) 초과로
+// Append가 ValidateEvent에서 실패하고 appendDrop이 기본 이벤트 전체를 버렸다(회귀). 가드 후:
+// 표식만 생략(id 무효→ok=false)되고 tool_call 기본 이벤트는 살아남으며 agent 두 키는 미출현.
+func TestHookAgentAttribution_OversizedIDPreservesBaseEvent(t *testing.T) {
+	storeRoot := filepath.Join(t.TempDir(), "storeroot")
+	cwd := t.TempDir()
+	sid := "7d2504e0-4f89-41d3-9a0c-0305e82c3305"
+	start := mustJSON(t, map[string]any{"hook_event_name": "SessionStart", "session_id": sid, "cwd": cwd, "source": "startup"})
+	if rc := runHook(t, storeRoot, start, nil); rc != 0 {
+		t.Fatalf("SessionStart rc=%d", rc)
+	}
+	hugeID := strings.Repeat("a", 5000) // §12: 리터럴 아님(strings.Repeat) — 시크릿 형태 회피
+	in := mustJSON(t, map[string]any{
+		"hook_event_name": "PostToolUse", "session_id": sid, "cwd": cwd,
+		"tool_name": "Glob", "tool_input": map[string]string{"pattern": "*.go"},
+		"tool_response": map[string]string{"result": "ok"},
+		"agent_id":      hugeID, "agent_type": "Explore",
+	})
+	if rc := runHook(t, storeRoot, in, nil); rc != 0 {
+		t.Fatalf("PostToolUse rc=%d", rc)
+	}
+	ev := lastEvent(t, sessDir(t, storeRoot, cwd), sid)
+	if ev.Type != "tool_call" {
+		t.Fatalf("기본 이벤트 소실 — type=%s want tool_call (거대 agent_id의 attrs 상한 초과로 Append 실패→드롭)", ev.Type)
+	}
+	if _, ok := ev.Attrs["agent_id"]; ok {
+		t.Fatalf("거대 agent_id가 표식으로 실림: attrs=%v", ev.Attrs)
+	}
+	if _, ok := ev.Attrs["agent_type"]; ok {
+		t.Fatalf("agent_type 키 잔존(표식 생략 위반): attrs=%v", ev.Attrs)
+	}
+}
+
+// F2(최종 리뷰): 병적으로 큰 agent_type은 생애주기 이벤트를 죽이면 안 된다(동일 attrs 상한 경로,
+// classify가 두 키를 항상 병기). 가드 후 subagent_start는 살아남고 agent_type만 ""로 기록된다
+// (agent_id는 정상값 유지, 두 키 병기 불변).
+func TestHookSubagentLifecycle_OversizedTypeSurvives(t *testing.T) {
+	storeRoot := filepath.Join(t.TempDir(), "storeroot")
+	cwd := t.TempDir()
+	sid := "8e2504e0-4f89-41d3-9a0c-0305e82c3306"
+	start := mustJSON(t, map[string]any{"hook_event_name": "SessionStart", "session_id": sid, "cwd": cwd, "source": "startup"})
+	if rc := runHook(t, storeRoot, start, nil); rc != 0 {
+		t.Fatalf("SessionStart rc=%d", rc)
+	}
+	hugeType := strings.Repeat("t", 5000) // §12: 리터럴 아님(strings.Repeat)
+	in := mustJSON(t, map[string]any{
+		"hook_event_name": "SubagentStart", "session_id": sid, "cwd": cwd,
+		"agent_id": "a1b2c3d4e5f6", "agent_type": hugeType,
+	})
+	if rc := runHook(t, storeRoot, in, nil); rc != 0 {
+		t.Fatalf("SubagentStart rc=%d", rc)
+	}
+	ev := lastEvent(t, sessDir(t, storeRoot, cwd), sid)
+	if ev.Type != "subagent_start" {
+		t.Fatalf("생애주기 이벤트 소실 — type=%s want subagent_start (거대 agent_type의 attrs 상한 초과로 Append 실패→드롭)", ev.Type)
+	}
+	idVal, hasID := ev.Attrs["agent_id"]
+	typVal, hasType := ev.Attrs["agent_type"]
+	if !hasID || !hasType {
+		t.Fatalf("생애주기 attrs 두 키 병기 위반: attrs=%v", ev.Attrs)
+	}
+	if s, _ := typVal.(string); s != "" {
+		t.Fatalf("거대 agent_type가 그대로 실림(생략 안 됨): len=%d", len(s))
+	}
+	if idVal != "a1b2c3d4e5f6" {
+		t.Fatalf("정상 agent_id 손상: agent_id=%v", idVal)
+	}
+}
+
+// evRow — lastEvent 조회 결과(event_type·summary·payload attrs).
+type evRow struct {
+	Type    string
+	Summary string
+	Attrs   map[string]any
+}
+
+// mustJSON — map을 stdin JSON 바이트로 조립한다(json.Marshal 래퍼).
+func mustJSON(t *testing.T, m map[string]any) []byte {
+	t.Helper()
+	b, err := json.Marshal(m)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	return b
+}
+
+// lastEvent — sdir/session.db의 cc:<sid> 세션 최신 이벤트(type·summary·payload attrs)를 읽는다.
+// hook 경로는 이벤트를 cc:+sid로 저장한다(HostClaude 귀속) — id DESC가 append 최신 행.
+func lastEvent(t *testing.T, sdir, sid string) evRow {
+	t.Helper()
+	reader, err := session.OpenReadOnly(sdir)
+	if err != nil {
+		t.Fatalf("open session.db: %v", err)
+	}
+	defer func() { _ = reader.Close() }()
+	var ev evRow
+	var payload sql.NullString
+	if err := reader.QueryRow(
+		"SELECT event_type, summary, payload FROM session_events WHERE session_id=? ORDER BY id DESC LIMIT 1",
+		"cc:"+sid,
+	).Scan(&ev.Type, &ev.Summary, &payload); err != nil {
+		t.Fatalf("last event: %v", err)
+	}
+	if payload.Valid && payload.String != "" {
+		if err := json.Unmarshal([]byte(payload.String), &ev.Attrs); err != nil {
+			t.Fatalf("unmarshal attrs %q: %v", payload.String, err)
+		}
+	}
+	return ev
+}
+
+// countEvents — sdir/session.db의 cc:<sid> 세션 이벤트 총수.
+func countEvents(t *testing.T, sdir, sid string) int {
+	t.Helper()
+	reader, err := session.OpenReadOnly(sdir)
+	if err != nil {
+		t.Fatalf("open session.db: %v", err)
+	}
+	defer func() { _ = reader.Close() }()
+	var n int
+	if err := reader.QueryRow("SELECT count(*) FROM session_events WHERE session_id=?", "cc:"+sid).Scan(&n); err != nil {
+		t.Fatalf("count events: %v", err)
+	}
+	return n
 }
 
 // ─── T5: 계측 매핑 + summary allowlist (설계 §3) ──────────────────────────────
@@ -1977,5 +2259,55 @@ func TestGuardPowerShellMsysFormAllows(t *testing.T) {
 	msys := "/" + strings.ToLower(string(big[0])) + filepath.ToSlash(big[2:]) // C:\x → /c/x
 	if out := runGuardPowerShell(t, storeRoot, cwd, "Get-Content "+msys, nil); out != "" {
 		t.Fatalf("stdout=%q want empty (MSYS형 = PS 드라이브 상대 = allow)", out)
+	}
+}
+
+// D54 — Grep 가드 5분기(스펙 §2 ①~⑤) + 전용 reason. deny는 content+head_limit 0 단 하나.
+func TestGuardGrep(t *testing.T) {
+	cases := []struct {
+		name string
+		ti   map[string]any
+		deny bool
+	}{
+		{"content_unlimited", map[string]any{"pattern": "x", "output_mode": "content", "head_limit": 0}, true},
+		{"content_default", map[string]any{"pattern": "x", "output_mode": "content"}, false},          // 부재=250 캡
+		{"content_capped", map[string]any{"pattern": "x", "output_mode": "content", "head_limit": 50}, false},
+		{"files_unlimited", map[string]any{"pattern": "x", "output_mode": "files_with_matches", "head_limit": 0}, false},
+		{"unparsable", map[string]any{"head_limit": "zero"}, false}, // 파싱 불가 → 통과
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			storeRoot := filepath.Join(t.TempDir(), "storeroot")
+			cwd := t.TempDir()
+			sid := "8e2504e0-4f89-41d3-9a0c-0305e82c3306"
+			start := mustJSON(t, map[string]any{"hook_event_name": "SessionStart", "session_id": sid, "cwd": cwd, "source": "startup"})
+			if rc := runHook(t, storeRoot, start, nil); rc != 0 {
+				t.Fatalf("SessionStart rc=%d", rc)
+			}
+			in := mustJSON(t, map[string]any{
+				"hook_event_name": "PreToolUse", "session_id": sid, "cwd": cwd,
+				"tool_name": "Grep", "tool_input": c.ti,
+			})
+			out := runHookCaptureStdout(t, storeRoot, in)
+			nEv := countEvents(t, sessDir(t, storeRoot, cwd), sid)
+			if c.deny {
+				if !strings.Contains(out, `"permissionDecision":"deny"`) {
+					t.Fatalf("deny 미발화: %q", out)
+				}
+				if !strings.Contains(out, "head_limit") || !strings.Contains(out, "ctr_search") {
+					t.Fatalf("Grep 전용 reason 아님(§2 ① — 하드코딩 회귀): %q", out)
+				}
+				if nEv != 2 { // session_start + warning 1건(§2 ①)
+					t.Fatalf("warning 이벤트 수=%d want 2(start+warning)", nEv)
+				}
+			} else {
+				if out != "" {
+					t.Fatalf("통과 케이스에 출력: %q", out)
+				}
+				if nEv != 1 { // session_start뿐 — 무이벤트(§2 ②)
+					t.Fatalf("통과인데 이벤트 증가: %d", nEv)
+				}
+			}
+		})
 	}
 }

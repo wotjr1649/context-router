@@ -18,6 +18,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/wotjr1649/context-router/internal/buildinfo"
 	"github.com/wotjr1649/context-router/internal/cli"
 	"github.com/wotjr1649/context-router/internal/ident"
 	"github.com/wotjr1649/context-router/internal/mcp"
@@ -26,7 +27,7 @@ import (
 	"github.com/wotjr1649/context-router/internal/transform"
 )
 
-const version = "0.9.0"
+var version = buildinfo.ProductVersion()
 
 type serverFlags struct {
 	Root, StoreRoot, LogLevel   string
@@ -467,7 +468,7 @@ const transformWorkerArg = "__transform-worker"
 // "hook"은 v0.2 추가(설계 §2) — Claude Code 훅 서브프로세스(stdin JSON 1건→cc: 세션 append).
 // "usage"는 v0.2 추가(설계 §6) — 로컬 transcript 세션별 토큰 집계 + cc: 스트림 대조(읽기 전용).
 // "codex-hook"은 v0.4 추가(설계 §2 D35) — Codex 러닝 훅 전용, 구버전 바이너리 오귀속 차단 게이트(§11.2 F3).
-var cliSubcommands = map[string]bool{"doctor": true, "stats": true, "purge": true, "upgrade": true, "session": true, "hook": true, "usage": true, "codex-hook": true}
+var cliSubcommands = map[string]bool{"doctor": true, "stats": true, "purge": true, "upgrade": true, "session": true, "hook": true, "usage": true, "codex-hook": true, "version": true}
 
 // prescanRootFlags: cli 서브커맨드 args에서 --root/--store-root(단대시 -root/-store-root,
 // "--f v"·"--f=v" 두 형태 모두)만 수동으로 뽑아내고 그 토큰을 제거한 나머지를 반환한다.
@@ -544,6 +545,13 @@ func dispatchCLI(ctx context.Context, args []string) (handled bool, err error) {
 		// "-"로 시작하지 않는데 4개 서브커맨드도 아니다 — `context-router stat` 같은 오타를
 		// 조용히 MCP 서버로 흘려보내면 안 된다(리뷰 Fix Round 3, item 1). 명시 거부.
 		return true, fmt.Errorf("ctr: 미지 서브커맨드: %s", sub)
+	}
+	// version은 CI/패키징 메타데이터 명령 — cwd/store-root/env 해석 이전에 조기 처리한다(F1).
+	// 최소 환경(삭제된 cwd·미설정 HOME/LOCALAPPDATA)에서도 storeRootFor 실패로 죽지 않고 버전만
+	// 출력해야 한다. cli.Run "version" 케이스는 storeRoot/projDir을 쓰지 않으므로(내부: len(args)
+	// 검증 + version 1줄 출력뿐) 빈 값을 넘겨 출력·잉여 인자 검증을 단일 소스로 재사용한다.
+	if sub == "version" {
+		return true, cli.Run(ctx, sub, args[2:], "", "", version, false, "", os.Stdout, os.Stderr)
 	}
 	subArgs := args[2:]
 
