@@ -237,6 +237,21 @@ Codex(GPT 계열)가 두 문서를 독립적으로 읽고 낸 의견. 자문이�
 | Q11 upgrade/purge CLI 제한 | §4.2 CLI 전용 | 권장안 제시 |
 | Q12 ELv2 고지 파일 | 설계서 Phase 0 문서 세트에 포함 | 미결 |
 
+## 수렴 로드맵 (D57, 2026-07-23 — 결정 원본: design-v0.10 §0)
+
+- **종착지 = context-router.** ctxscribe(사용자의 mksglu/context-mode
+  하드 포크)는 대체 시까지의 브리지 — 대체 후 포크 유지보수(업스트림
+  선택 포팅 노동)를 종료한다.
+- **대체 게이트 = exec 3종(D21 트랙).** exec가 ctr에 이식되면
+  ctxscribe의 잔여 고유 가치(think-in-code 실행 샌드박스)가 소멸한다.
+  v0.11+ 주력 후보로 격상.
+- **근거 실측(2026-07-23, session-26)**: ctr MCP 도구 호출 8회 vs
+  ctxscribe 422회(본 프로젝트 전 기간) — ctr의 고유 가치는 능동
+  도구가 아니라 배경 레이어(zero-reliance 훅 캡처·A/B 계측·가드)에
+  있고, 이는 ctxscribe가 구조적으로 갖지 못하는 축.
+- **병행 축**: 회수 경로 채택 개선(ctr_search/ctr_fetch 사용 유도 —
+  캡처의 가치는 소비가 만든다).
+
 ---
 
 *폐기 항목 재도입 없음 확인: 단일 전역 DB(×), ncruces 즉시 채택(×), driver interface(×), "2개만 노출하면 안전"(×), bytes/4 절약 주장(×), prompt caching=창 절약(×).*
