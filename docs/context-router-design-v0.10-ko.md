@@ -56,15 +56,31 @@
     (§3 — 세션-25 SDD 세션의 구현자 file_edit 70건 실존). 수용
     재상정은 §4.
   - **이벤트 표식 병기**: hookInput에 `agent_id`/`agent_type` 필드
-    2개를 파싱해, 존재 시 PostToolUse/PostToolUseFailure 기본
-    이벤트의 attrs에 병기한다. 판별 계약(실측 §3): 서브에이전트
-    내부 도구 호출에만 두 필드가 실리고 부모 세션 호출에는
-    부재한다 — attrs 부재=부모발, 존재=서브발. PreToolUse 가드
-    경로는 이벤트를 만들지 않으므로 무관(warning 이벤트에는 병기
-    하지 않는다 — 가드 문면 최소 변경).
-  - **상호작용 명문**: ① doctor [6] empty(session_start 단독)
-    판정 — subagent_start가 기록된 세션은 empty에서 빠진다.
-    서브에이전트를 실제 spawn한 세션이므로 의도된 방향. ② usage
+    2개를 파싱해, `agent_id`가 비어있지 않으면 PostToolUse/
+    PostToolUseFailure 기본 이벤트의 attrs에 두 키를 병기한다.
+    판별 계약(실측 §3): 서브에이전트 내부 도구 호출에만 두 필드가
+    실리고 부모 세션 호출에는 부재한다 — 판별 기준은 attrs 일반
+    존재가 아니라 **`agent_id`/`agent_type` 키의 존재**다(기존
+    attrs — matched_pattern·exit_code 등 — 는 부모 이벤트에도
+    실린다, 검수 반영). 표식은 **best-effort**: agent 필드의
+    결손·빈 값·타입 이상은 표식 생략일 뿐 기본 이벤트 처리(1
+    호출 = 1 이벤트)를 바꾸지 않는다. 중첩 서브에이전트에서 어느
+    수준의 agent_id가 실리는지는 호스트 결정(문서·실측 부재) —
+    표식 계약은 "서브발 여부"까지만(캐비앗). 가드 deny는 warning
+    이벤트를 만들지만(D54 파이프라인) 병기 대상은 PostToolUse/
+    Failure 기본 이벤트로 한정한다(가드 문면 최소 변경 — 검수
+    반영: 종전 "가드는 이벤트를 만들지 않는다" 근거 서술은 실코드
+    denyTool의 warning append와 반대라 교정).
+  - **상호작용 명문**: ① empty 술어(비-session_start 이벤트
+    부재)는 doctor [6] 수치와 **D42 empty GC 삭제 경로가
+    공유**한다(검수 반영 — doctor 수치만이 아니다): subagent_start
+    가 기록된 세션은 양쪽 모두에서 empty가 아니게 되어 7일 GC
+    대상에서 빠진다. 서브에이전트를 spawn한 세션의 생애주기
+    기록은 실활동 보존이 의도 — 수명은 기존 상한 체계로 닫힌다
+    (기본 retention 30일 스윕이 이벤트를 비우면 empty GC가 수거,
+    ≈retention+7일. `CTR_HOOK_RETENTION_SEC=0` 무기한은 기존
+    0=무기한 계약의 의도된 귀결 — v0.9 D51 캐비앗과 동형. FTS
+    색인은 이벤트 삭제 시 기존 트리거 동기 그대로). ② usage
     --compare records는 CC transcript(.jsonl)의 usage record 수라
     session_events 행 증가와 무관(실측 §3 — A/B 계측 무영향). ③
     D51과 동일 dispatch 파이프라인 통과 — 부모 미등록 엣지는
@@ -84,17 +100,25 @@
     offset/limit 관례 재사용). 그 외 전 조합(-A/-B/-C 대값,
     files_with_matches, count, head_limit>0, 파싱 불가)은 전부
     통과 — allow-bias 관례(불확실하면 통과) 유지.
-  - **deny 동작**: 기존 가드와 동형 — permissionDecision deny +
-    reason(`head_limit` 지정 또는 `ctr_search` 대체 안내), warning
-    이벤트 1건 append(guard-append/guard-store drop 계약 포함
-    기존 가드 파이프라인 그대로).
+  - **deny 동작**: permissionDecision deny + warning 이벤트 1건
+    append. **denyTool의 reason은 현행 하드코딩("이미 인덱스됨…")
+    이라 Grep에는 사실 불일치**(검수 P2) — reason을 파라미터로
+    승격(공유 헬퍼 시그니처 변경, 기존 3가드는 현행 문구를 그대로
+    전달)하고 Grep은 전용 문구(`head_limit` 지정 또는 `ctr_search`
+    대체 안내)를 전달한다. Grep 가드는 색인 단계가 없어(정적 판정
+    → denyTool 직행 — store 열기·현장 색인을 넣지 말 것) drop
+    계약은 **guard-append만** 해당·guard-store 비대상(검수 P2
+    정정).
   - **cx 무관**: Codex에 Grep 내장 도구가 없다(cx 훅은 Bash 계열
     가드만 — 기존 D35 계약 불변).
 - **D55** hook-only VACUUM 소급(D50 사후 이월분 채택):
   - `runPurgeHookOnly`의 ⑤ VACUUM 후행(현행: `st.Vacuum` 실패 시
     stderr log-and-continue·rc=0, Exec nil을 성공 간주)을 D50
     본경로의 `vacuumReclaim` 호출로 교체한다 — `contentFootprint`
-    before 측정(store open 후·PurgeHookOnly 실행 전) → VACUUM →
+    before 측정(store open 후·PurgeHookOnly 실행 전 — 본경로의
+    "명령 착수 전 기준점"과 다른 시점이며 의도다: hook-only는
+    open 후 측정이 삭제+VACUUM 효과만 격리해 보고한다, 검수 반영)
+    → VACUUM →
     `wal_checkpoint(TRUNCATE)` QueryRow busy 검증 → 총합 보고
     (`content.db(+wal/shm) AB → BB (파일 축 회수 CB)`).
   - **rc 정책**(사용자 결정): 본경로 동일 — busy 계열은 "라이브
@@ -106,7 +130,8 @@
     계약 그대로 — 호출자가 되돌리지 않음).
   - **테스트 반전**: `TestPurgeHookOnlyVacuumFailureContinues`(현행
     rc=0 단정)를 실패 시 오류 반환 단정으로 반전 + 성공 시 총합
-    보고 라인 단정 추가.
+    보고 라인 단정 추가. 반전 시 테스트명도 동작에 맞게 리네임
+    (`...FailurePropagates`류 — 검수 반영).
 - **D56** 버전 중앙 집중화(`internal/buildinfo` — 사용자 지정
   접근):
   - **단일 소스**: 신규 패키지 `internal/buildinfo` — unexported
@@ -127,9 +152,19 @@
     문자열 불변(cx 재신뢰 불필요) — marker 변경은 릴리스 경계
     1회로 수렴하고, 그 경계에서 doctor 스테일 탐지(D52)가 정확히
     발화한다(의도된 개선 — 종전에는 개발/릴리스 빌드가 동일
-    문자열이라 경계 비가시). Producer에 `-dev`가 노출되는 것은
-    진단 가치(어느 빌드가 캡처했는지)로 수용 — compare arm
-    판정·synthetic 판별은 Producer를 쓰지 않아 무영향.
+    문자열이라 경계 비가시). 역방향(릴리스 marker + `-dev` 재빌드
+    바이너리)의 스테일 발화도 정당(재설치 유도 — 검수 반영 명문).
+    **-dev 고정의 트레이드오프 캐비앗**(검수 high 반영): dev
+    사이클 내 훅 표면 변화(이번 D53·D54의 4→6이벤트·matcher
+    확장이 정확히 해당)는 marker 문자열 불변으로 doctor가 탐지
+    하지 못한다 — 도그푸딩 재설치를 dev 중간이 아닌 전 태스크
+    완료 후 1회로 절차 규정해 커버하고, marker 훅 형상
+    fingerprint는 §4 이월(단일 사용자 도그푸딩에서 marker 재설계
+    는 과잉). Producer의 `-dev` 노출은 **세션 생성 빌드** 표시다
+    (검수 반영 — sessions.producer는 EnsureSession 최초 1회 기록,
+    세션 도중 바이너리 교체는 미반영이라 이벤트별 캡처 빌드
+    진단이 아님) — compare arm 판정·synthetic 판별은 Producer를
+    쓰지 않아 무영향.
   - **VCS 진단(doctor 한정)**: `runtime/debug.ReadBuildInfo()`의
     vcs.revision(12hex 절단)·vcs.time·vcs.modified·Go toolchain을
     doctor 정보 라인 1개로 병기(`build:` — ReadBuildInfo 실패·
@@ -137,12 +172,22 @@
     pseudo-version은 marker·stale 비교에 절대 불포함**(안정
     SemVer 계약 — 웹 리서치 §3: Go 1.24+ VCS 스탬핑은 워킹트리
     더티/태그 비정위치에서 커밋마다 변해 등호 비교 기반 스테일
-    탐지를 오탐으로 파괴한다. `--version`류 기본 출력도
-    ProductVersion만).
+    탐지를 오탐으로 파괴한다. 기동 배너·향후 `--version`류 기본
+    출력도 ProductVersion만 — 현행 버전 노출 소비처는 배너뿐,
+    검수 반영).
   - **릴리스 CI 태그 검증**: ci.yml에 태그 push 조건부
     (`startsWith(github.ref, 'refs/tags/v')`) 검증 잡 추가 —
     빌드한 바이너리의 버전 출력(ProductVersion)과 태그의 v접두
     제거값 일치를 단정, 불일치(예: -dev 잔존 태그)는 실패로 차단.
+  - **아키텍처 규약 정합**(검수 P2 반영): `internal/buildinfo`
+    신설은 코드 아키텍처 문서의 "확정 의존 그래프·표에 없는
+    import 금지"와 "패키지 수 증가는 D13 역행" 규약에 저촉되므로,
+    아키텍처 문서 그래프에 buildinfo(무의존 leaf)와 cmd→/mcp→
+    buildinfo 엣지를 추가하고 D13 예외 근거(파편화가 아닌 단일
+    상수 leaf — `store.OpenContext` 예외 선례와 동형)를 명문화
+    하는 문서 갱신을 D56 범위에 포함한다. in-graph 대안(cmd가
+    `mcp.ServerVersion`을 직접 소비 — 신규 패키지 0)은 §5 기각
+    기록 참조.
   - **비도입**(사용자 결정): `VERSION` 평문 파일·`//go:embed` —
     Go 외부 패키징 도구나 다중 언어가 같은 파일을 읽어야 할 때만
     재상정(§4).
@@ -173,7 +218,8 @@
 - D54 Grep 가드 — matcher 확장·단일 deny 조건·warning 이벤트.
 - D55 hook-only VACUUM 소급 — vacuumReclaim 합류·rc≠0·테스트 반전.
 - D56 버전 중앙화 — internal/buildinfo·전 소비처 단일화·-dev 스킴·
-  doctor build 라인·CI 태그 검증 잡.
+  doctor build 라인·CI 태그 검증 잡·아키텍처 문서 의존 그래프
+  갱신(D13 예외 명문).
 - D57 수렴 로드맵 — vision 문서 갱신(문서 태스크).
 - 버전 0.10.0 범프(단일 지점 — D56 이후), 도그푸딩: 재설치 후
   subagent_start/stop 실관측·Grep 가드 존재 확인·doctor build 라인
@@ -211,22 +257,34 @@
   미러) → subagent_start/stop 이벤트 각 1건·attrs
   {agent_id,agent_type} 단정. agent_type="" 픽스처 → 접미 생략
   summary·attrs 빈 값 기록 단정. 미등록 세션의 SubagentStart →
-  D51 합성 등록 경유 후 기록 단정(파이프라인 합류 회귀).
+  D51 합성 등록 경유 후 기록 단정(파이프라인 합류 회귀). 비수용
+  부정 테스트(검수 반영): SubagentStop 픽스처에
+  last_assistant_message·agent_transcript_path를 채워도 이벤트
+  summary·attrs 어디에도 미출현 단정. empty 경계(검수 반영):
+  생애주기 이벤트만 있는 세션이 doctor [6] empty 카운트와 D42
+  empty GC 대상에서 모두 빠짐 단정 + retention 스윕 후 empty GC
+  수거 경로 단정(상한 닫힘 회귀).
 - D53 표식: agent_id 실린 PostToolUse 픽스처 → 기본 이벤트 attrs
-  병기 단정, 부재 픽스처 → attrs에 두 키 부재 단정(부모발 오표식
-  0 회귀). PostToolUseFailure도 동일 1건.
+  병기 단정, 부재 픽스처 → attrs에 agent_id/agent_type 두 키
+  부재 단정(부모발 오표식 0 회귀 — 기존 attrs 키와 무관).
+  PostToolUseFailure도 동일 1건. best-effort(검수 반영):
+  agent_id="" 픽스처 → 표식 생략 + 기본 이벤트 정상 기록 단정,
+  agent 필드 비문자열(wrong-type) 픽스처 → 기본 이벤트 미드롭
+  단정.
 - D53 install: hook install 후 settings.json에 6이벤트(기존 4 +
   SubagentStart/Stop) 단정·재실행 멱등 단정(기존 install 테스트
   관례 확장).
-- D54: ① content+head_limit 0 → deny 출력·warning 이벤트 단정 ②
-  content+head_limit 부재 → 통과(무출력·무이벤트) ③
+- D54: ① content+head_limit 0 → deny 출력(reason에 Grep 전용
+  문구 — head_limit/ctr_search — 단정, 검수 반영)·warning 이벤트
+  단정 ② content+head_limit 부재 → 통과(무출력·무이벤트) ③
   content+head_limit>0 → 통과 ④ files_with_matches+0 → 통과 ⑤
-  tool_input 파싱 불가 → 통과. matcher 문자열 갱신 단정(install
-  테스트).
+  tool_input 파싱 불가 → 통과 ⑥ 기존 Read/Bash/PowerShell 가드
+  deny reason 문구 불변 단정(denyTool 파라미터화 회귀 — 검수
+  반영). matcher 문자열 갱신 단정(install 테스트).
 - D55: 성공 경로 — hook-only purge 후 총합 보고 라인 단정. 실패
-  경로 — `TestPurgeHookOnlyVacuumFailureContinues` 반전(오류
-  반환·이미 커밋된 삭제분 유지 단정). ④→⑤ 순서(실회수 보고 선행)
-  단정.
+  경로 — `TestPurgeHookOnlyVacuumFailureContinues` 반전·리네임
+  (오류 반환·이미 커밋된 삭제분 유지 단정). ④→⑤ 순서(실회수
+  보고 선행) 단정.
 - D56: buildinfo 단일 소스 — 기동 배너·Producer·marker·doctor·
   MCP serverInfo가 전부 ProductVersion() 하류임을 단정(잔존 버전
   리터럴 grep 0 — 테스트 픽스처 제외 목록 명시). 핀 테스트 삭제.
@@ -297,8 +355,9 @@
 - **exec 3종(D21 트랙) — D57 수렴 로드맵의 대체 게이트로 격상,
   v0.11+ 주력 후보**(OS 격리 설계 선행 필요는 종전 문면 유지).
 - 회수 경로 채택 개선(신규 — D57 근거 실측 8 vs 422): ctr_search/
-  ctr_fetch 사용 유도 — 도구 설명·스킬·가드 deny 문구 연계 등
-  표면 설계는 미정.
+  ctr_fetch 사용 유도 — 도구 설명·스킬 표면 등(D54 deny reason의
+  ctr_search 언급은 v0.10에서 소진 — 이 후보는 그 너머), 설계
+  미정.
 - 무작위 A/B 하네스·OTel(D27) — cx arm n 정체 지속으로 cc 축
   우선 검토가 자연.
 - 서브에이전트 캡처 확장 — last_assistant_message 수용(응답 본문
@@ -315,10 +374,60 @@
   buildinfo가 여지 확보).
 - plugin manifest, semantic 보강, spill journal, `repository{}`
   기입, `invalidates`, Producer 버전 기반 A/B treatment 자동 경계
-  표기, Bash 가드 잔여(Grep 절반은 D54로 소진) — 종전 문면 유지.
+  표기, Bash 가드 잔여(Grep 절반은 D54로 소진 — §1.2의 -A/-B/-C
+  휴리스틱 확장은 거부이지 이월이 아님), marker 훅 형상
+  fingerprint(D56 캐비앗 — dev 사이클 내 훅 표면 변화 탐지가
+  실제로 필요해질 때) — 종전 문면 유지.
 - v0.7 §9 잔존 리스크(전역 블록 수명 원인 규명·스테일 가드
   문서화·라인 스캔 한계) — 종전 문면 유지, D52가 탐지 담당.
 
 ## 5. 적대 검수 처리 기록 (2026-07-23, 설계 체크포인트)
 
-- (검수 후 기입)
+- 이중 적대 검수(초안 6b60d3c 대상): 서브에이전트(opus) P1 0·
+  P2 3·M 다수 + Codex adversarial-review needs-attention(high 1·
+  medium 3). 양쪽 백그라운드 병렬 1패스(세션-25 포그라운드
+  타임아웃 킬 교훈 준수).
+- **수렴 채택**:
+  - D54 deny 경로 정정(서브 P2×2): denyTool reason 하드코딩("이미
+    인덱스됨")이 Grep에 사실 불일치 → reason 파라미터화 + Grep
+    전용 문구 명문. guard-store drop은 색인 경로 전용이라 Grep
+    비대상 → guard-append만으로 정정(불필요한 store 열기·색인
+    유입 차단).
+  - D56 아키텍처 규약 정합(서브 P2): buildinfo 신설이 확정 의존
+    그래프·"패키지 수 증가=D13 역행" 규약과 충돌함을 스펙이
+    무언급 → 아키텍처 문서 갱신을 D56 범위에 포함 + D13 예외
+    근거(단일 상수 leaf, OpenContext 선례 동형) 명문화.
+  - D56 -dev 형상 미탐 캐비앗(Codex high의 실질 채택분): dev
+    사이클 내 훅 표면 변화(이번 D53·D54가 해당)는 marker 불변으로
+    doctor 미탐 → 도그푸딩 재설치를 전 태스크 완료 후 1회로 절차
+    규정 + 형상 fingerprint §4 이월. Producer 문면 축소(Codex
+    medium — sessions.producer는 세션 생성 빌드 1회 고정, 이벤트
+    별 캡처 빌드 진단 아님). 역방향(릴리스 marker+dev 바이너리)
+    스테일 발화 정당 명문.
+  - D53 정밀화(Codex medium + 서브 M×2): 판별 기준을 attrs 일반
+    존재가 아닌 agent_id/agent_type 키 존재로 교정(부모 이벤트도
+    기존 attrs를 실음), 표식 best-effort(agent 필드 이상=표식
+    생략, 기본 이벤트 불변)·중첩 캐비앗·"가드는 이벤트를 만들지
+    않는다" 근거 오류 교정(denyTool은 warning을 만든다). empty
+    술어가 doctor 수치+D42 GC 삭제 경로 공유임을 명문(Codex
+    medium) — 생애주기만 세션은 실활동 보존 의도·상한
+    ≈retention+7일로 닫힘·FTS 트리거 동기 언급.
+  - D55 정밀화(서브 M×2): before 측정 시점이 본경로("명령 착수
+    전")와 다른 의도(효과 격리) 명문 + 테스트 리네임.
+  - §2 보강(서브 M×3 + Codex): 비수용 부정 테스트·empty/GC 경계
+    테스트·deny reason 문구 단정·기존 3가드 reason 회귀·
+    best-effort 픽스처(빈 값·wrong-type). §4 문면 다듬기(Grep
+    "소진"과 §1.2 거부의 관계·회수 후보와 D54 reason의 경계).
+- **기각 3건**:
+  - marker 훅 형상 fingerprint 즉시 도입(Codex high의 재설계안)
+    — 단일 사용자 도그푸딩에서 marker 재설계는 과잉(YAGNI),
+    절차 커버 + §4 이월로 갈음. doctor/host PATH 불일치는 기존
+    리스크로 신규 아님([10]이 실경로 표시).
+  - 이벤트별 producer 저장·origin 3상태(parent/subagent/unknown)
+    스키마(Codex medium 2건의 확장 제안) — 문면 정정·best-effort
+    캐비앗으로 충분, 스키마 확장은 과설계.
+  - in-graph 대안(cmd가 `mcp.ServerVersion` 직접 소비 — 신규
+    패키지 0, 서브 P2 부속 제안) — 게으른 해법이나 사용자 지정
+    접근이 buildinfo(의미상 버전의 주인·ldflags 주입 지점)를
+    명시했고 mcp를 버전의 주인으로 삼는 의미 왜곡을 피함 —
+    아키텍처 문서 갱신으로 규약 정합 확보 측을 채택.
