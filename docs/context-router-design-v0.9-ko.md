@@ -83,7 +83,12 @@
     전후 지표 변화가 훅 효과인지 표본 구성 변경인지 판별 불가,
     §5). 판별 근거는 session_start payload의
     Source="first-event"(합성 마커). 별도 synthetic arm 분해는
-    비도입(제외+보고로 충분).
+    비도입(제외+보고로 충분). **판별 유효 창 캐비앗**(최종 Codex
+    리뷰 P2, §5): retention 스윕은 session_start도 만료 대상이라
+    (retention.go §5 — event_type 면제 없음), 자기 retention
+    창보다 오래 생존한 세션은 표식 소실로 일반 등록 분류로
+    되돌아간다(우아한 퇴행 — synthetic 과소 보고, 기본 30일에선
+    희귀). 표식 영속화는 §4 재상정 후보.
 - **D52** doctor Codex MCP 등록 상태 검사(v0.8 §4 이월분 채택 —
   §9-2 전역 블록 수명 리스크의 조기 탐지 장치):
   - **신규 라인 [16]**: `codex:` — 기존 경로 해석을 재사용해
@@ -222,7 +227,9 @@ plugin manifest, semantic 보강, spill journal, `repository{}` 기입,
 content.db 회수 자동화(sweep 스케줄 — D50 수동 트리거 실효 검증
 후), hook-only VACUUM에 checkpoint 검증·총합 보고 소급(D50 사후),
 수명주기 공유 락(D50 사후 검증 불충분 실증 시만), doctor drops 전
-프로젝트 집계(§1.2 재상정 조건). v0.7 §9 잔존 리스크 중 전역 블록
+프로젝트 집계(§1.2 재상정 조건), synthetic 표식 영속화(retention
+창 초과 생존 세션의 오분류 실증 시 — §0 D51 캐비앗·최종 Codex
+리뷰 P2). v0.7 §9 잔존 리스크 중 전역 블록
 수명은 D52가 탐지를 담당(원인 규명은 계속 — 다음 소멸 시 mtime
 증거 보존), 스테일 가드=문서화 유지·라인 스캔 한계는 그대로 유효.
 
@@ -270,3 +277,14 @@ content.db 회수 자동화(sweep 스케줄 — D50 수동 트리거 실효 검�
     이벤트에도 원자 보존을 약속하지 않는 fail-open(deadline·
     drop)이라 신규 API가 지키는 불변식이 제품 계약에 없음. 문면
     정밀화로 갈음.
+- **최종 이중 리뷰 기록(구현 체크포인트, 브랜치 520b134..1e9bd3b
+  5커밋)**: 태스크 리뷰 4회(fix 1라운드 — T3 probe 우선순위 발산
+  셀 false-healthy를 install 정확 미러로 교정) 후 서브(opus)
+  whole-branch **Yes**(Critical/Important 0 — §2 계약 전수 대조
+  누락 0·비범위 침범 0·마커 3지점 일치, Minor 전건 이월 수용) +
+  Codex review **P2 1건**(위 판별 유효 창 — 문서화 채택, 표식
+  영속화는 §4 조건부 이월: 스키마 변경이 엣지 대비 과대하고
+  퇴행이 우아함). 참고: §2의 "PostToolUse→총 2이벤트" 계약은 전용
+  테스트가 담당하고, 반전①(PreToolUse 픽스처)은 가드 통과 무이벤트
+  특성상 session_start 단독(1이벤트) 단정이 정확 — 구현 커버리지가
+  문면보다 정밀(서브 최종 리뷰 M-D).
