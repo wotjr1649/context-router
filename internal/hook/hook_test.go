@@ -699,7 +699,7 @@ func TestHookAgentAttribution(t *testing.T) {
 		{"present", "PostToolUse", "a1b2", "Explore", true, "tool_call"},
 		{"present_failure", "PostToolUseFailure", "a1b2", "Explore", true, "error"},
 		{"absent", "PostToolUse", nil, nil, false, "tool_call"},
-		{"empty_id", "PostToolUse", "", "Explore", false, "tool_call"},                  // best-effort — 표식 생략
+		{"empty_id", "PostToolUse", "", "Explore", false, "tool_call"},                 // best-effort — 표식 생략
 		{"wrong_type", "PostToolUse", 123, map[string]int{"x": 1}, false, "tool_call"}, // 기본 이벤트 미드롭
 	}
 	for _, c := range cases {
@@ -2270,7 +2270,7 @@ func TestGuardGrep(t *testing.T) {
 		deny bool
 	}{
 		{"content_unlimited", map[string]any{"pattern": "x", "output_mode": "content", "head_limit": 0}, true},
-		{"content_default", map[string]any{"pattern": "x", "output_mode": "content"}, false},          // 부재=250 캡
+		{"content_default", map[string]any{"pattern": "x", "output_mode": "content"}, false}, // 부재=250 캡
 		{"content_capped", map[string]any{"pattern": "x", "output_mode": "content", "head_limit": 50}, false},
 		{"files_unlimited", map[string]any{"pattern": "x", "output_mode": "files_with_matches", "head_limit": 0}, false},
 		{"unparsable", map[string]any{"head_limit": "zero"}, false}, // 파싱 불가 → 통과
