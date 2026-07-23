@@ -180,11 +180,14 @@ func installCodexConfigBlock(existing []byte) (out []byte, state codexMCPState) 
 
 // probeCodexMCPBlock — doctor [16] 존재 판별(D52, 스펙 v0.9 §0). install 상태기계는 "무엇을
 // 쓸지"의 분류(classReplace/classAppend→동일 mcpWritten)라 존재/부재 판별에 부적합 — 같은
-// 순수 라인 헬퍼를 재사용해 읽기 전용으로 판정한다. present: 소유 블록(classReplace) 또는
-// 블록 밖 canonical 헤더. anomaly: 마커 무결성 이상 또는 키-경계 충돌(→ [16] warning ⑤).
-// 우선순위는 installCodexConfigBlock과 동일하다 — canonical 헤더 라인은 스스로 mcp_servers·ctr]
-// 신호를 겸해 conflict도 켜므로(예: "[mcp_servers.ctr]"), install처럼 hasHeader를 conflict보다
-// 먼저 판정해야 헤더 실존을 존재(mcpExistingHeader)로, 헤더 없는 충돌만 이상(mcpConflict)으로 본다.
+// 순수 라인 헬퍼를 재사용해 읽기 전용으로 판정한다. present: 블록 밖 canonical 헤더 또는
+// (충돌 없는) 소유 블록(classReplace). anomaly: 마커 무결성 이상 또는 키-경계 충돌(→ [16]
+// warning ⑤). 우선순위는 installCodexConfigBlock과 1:1 대응(hasHeader > conflict > classReplace)
+// — canonical 헤더 라인은 스스로 mcp_servers·ctr] 신호를 겸해 conflict도 켜므로(예:
+// "[mcp_servers.ctr]"), install처럼 hasHeader를 conflict보다 먼저 봐야 헤더 실존을 존재로 본다.
+// 그다음 conflict를 classReplace보다 먼저 판정해야 한다 — install은 class와 무관하게 conflict면
+// mcpConflict로 반환(교체 분기 진입 자체를 막음)하므로, 소유 블록(classReplace)이라도 블록 밖에
+// 진짜 충돌(예: 루트 mcp_servers 대입)이 있으면 존재가 아니라 이상으로 본다.
 func probeCodexMCPBlock(existing []byte) (present bool, anomaly bool) {
 	lines := splitLinesKeepEnds(existing)
 	class, begin, end := classifyMarkers(lines)
@@ -192,11 +195,14 @@ func probeCodexMCPBlock(existing []byte) (present bool, anomaly bool) {
 		return false, true
 	}
 	hasHeader, conflict := scanOutside(lines, class, begin, end)
-	if class == classReplace || hasHeader {
+	if hasHeader {
 		return true, false
 	}
 	if conflict {
 		return false, true
+	}
+	if class == classReplace {
+		return true, false
 	}
 	return false, false
 }

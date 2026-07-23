@@ -90,6 +90,7 @@ func TestProbeCodexMCPBlock(t *testing.T) {
 		{"블록 밖 맨 헤더", "[mcp_servers.ctr]\ncommand = \"x\"\n", true, false},
 		{"마커 이상 — BEGIN만", codexBlockBegin + "\n[mcp_servers.ctr]\n", false, true},
 		{"무관 내용 — 부재", "[model]\nname = \"gpt\"\n", false, false},
+		{"소유 블록 + 외부 충돌 — 이상", codexBlockBody + "\nmcp_servers = { ctr = { command = \"other\" } }\n", false, true},
 	}
 	for _, c := range cases {
 		p, a := probeCodexMCPBlock([]byte(c.in))
