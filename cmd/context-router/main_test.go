@@ -1951,17 +1951,19 @@ func TestE2E_HookForcedChannel(t *testing.T) {
 			t.Fatalf("PostToolUse #%d rc=%d want 0", i, rc)
 		}
 	}
-	// 미지 세션(SessionStart 없이) PostToolUse → drop, 이벤트 미추가(같은 worktree 세션 dir).
+	// D51 — 미지 세션(SessionStart 없이) PostToolUse → drop이 아니라 합성 등록(source="first-event")
+	// 후 트리거 이벤트까지 기록된다(같은 worktree 세션 dir). posttooluse-bash.json은 test_run이라
+	// 새 cc: 세션에 session_start 1건 + test_run 1건이 추가된다.
 	unknownSID := "11111111-2222-4333-8444-555555555555"
 	if rc, _ := runHookOneShot(t, bin, storeRoot, hookFixture(t, "posttooluse-bash.json", map[string]any{"cwd": proj, "session_id": unknownSID}), nil); rc != 0 {
-		t.Fatalf("unknown-session rc=%d want 0", rc)
+		t.Fatalf("first-event rc=%d want 0", rc)
 	}
 
 	dbDir := hookSessionDir(t, storeRoot, proj)
 	counts := countEventsByType(t, dbDir)
-	// session_start 1건(멱등), test_run 2건(bash 소·대 — 미지 세션 건은 drop되어 미포함),
+	// session_start 2건(기존 멱등 1 + D51 합성 등록 1), test_run 3건(bash 소·대 + 합성 세션 트리거),
 	// file_edit 1건, shadow 이벤트 2건(artifact_created·tool_result_summary).
-	want := map[string]int{"session_start": 1, "test_run": 2, "file_edit": 1, "artifact_created": 1, "tool_result_summary": 1}
+	want := map[string]int{"session_start": 2, "test_run": 3, "file_edit": 1, "artifact_created": 1, "tool_result_summary": 1}
 	for et, n := range want {
 		if counts[et] != n {
 			t.Fatalf("event_type %q count=%d want %d (all=%+v)", et, counts[et], n, counts)
@@ -1982,22 +1984,26 @@ func TestE2E_HookForcedChannel(t *testing.T) {
 	if n := contentArtifactCount(t, hookContentDir(t, storeRoot, proj)); n != 1 {
 		t.Fatalf("content artifacts=%d want 1 (shadow 미저장)", n)
 	}
-	// 미지 세션 drop 기록.
-	if got := readHookDrops(t, dbDir); !strings.Contains(got, "unknown-session") {
-		t.Fatalf("drops=%q want unknown-session", got)
-	}
-	// sessions 행이 cc:<uuid>로 등록됐는지 확인.
+	// D51 — 기존 세션(cc:3f25, source=startup)과 합성 등록 세션(cc:1111)이 둘 다 cc: 네임스페이스로
+	// 존재하고, 합성 세션의 session_start payload가 source=first-event 마커를 담는다(E2E 층 D51 증명).
 	reader, err := session.OpenReadOnly(dbDir)
 	if err != nil {
 		t.Fatalf("open session.db: %v", err)
 	}
 	defer func() { _ = reader.Close() }()
-	var sid string
-	if err := reader.QueryRow("SELECT session_id FROM sessions WHERE session_id LIKE 'cc:%'").Scan(&sid); err != nil {
-		t.Fatalf("sessions row: %v", err)
+	var ccSessions int
+	if err := reader.QueryRow("SELECT count(*) FROM sessions WHERE session_id LIKE 'cc:%'").Scan(&ccSessions); err != nil {
+		t.Fatalf("cc sessions count: %v", err)
 	}
-	if want := "cc:3f2504e0-4f89-41d3-9a0c-0305e82c3301"; sid != want {
-		t.Fatalf("session_id=%q want %q", sid, want)
+	if ccSessions != 2 {
+		t.Fatalf("cc sessions=%d want 2 (기존 + D51 합성 등록)", ccSessions)
+	}
+	var synPayload string
+	if err := reader.QueryRow("SELECT payload FROM session_events WHERE session_id=? AND event_type='session_start'", "cc:"+unknownSID).Scan(&synPayload); err != nil {
+		t.Fatalf("합성 세션 session_start payload: %v", err)
+	}
+	if !strings.Contains(synPayload, `"source":"first-event"`) {
+		t.Fatalf("합성 세션 payload=%q want source=first-event (D51 마커)", synPayload)
 	}
 }
 

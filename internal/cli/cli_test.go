@@ -2251,6 +2251,93 @@ func TestPurgeHookOnlyComboRejected(t *testing.T) {
 	}
 }
 
+// TestDoctorCodexMCPLine — D52 doctor [16] 5분기(v0.9 §0). CODEX_HOME 격리 하에 각 분기 출력을
+// 단정한다. 버전은 runDoctor에 넘긴 ver로 스레딩하고 픽스처 marker도 같은 ver로 조립해([9]식
+// marker≠version 불일치 문구 회피) 0.9.0 하드코딩 없이 범프 후에도 유효하게 유지한다.
+func TestDoctorCodexMCPLine(t *testing.T) {
+	const ver = "9.9.9-test" // 바이너리 기본 version과 무관한 합성값 — doctor가 인자 version을 쓰는지 검증
+	selfHooks, err := mergeCodexHooks(nil, buildCodexHookCommand(false, "", false), hookMarker(ver), true, true)
+	if err != nil {
+		t.Fatalf("selfHooks 조립: %v", err)
+	}
+	write := func(t *testing.T, path string, data []byte) {
+		t.Helper()
+		if err := os.WriteFile(path, data, 0o600); err != nil {
+			t.Fatalf("write %s: %v", filepath.Base(path), err)
+		}
+	}
+	cases := []struct {
+		name        string
+		setup       func(t *testing.T, codexHome, projectRoot string)
+		wantContain []string
+		wantAbsent  []string
+	}{
+		{
+			name:        "① config.toml 부재 → 미사용/미설치",
+			setup:       func(t *testing.T, codexHome, projectRoot string) {}, // 아무것도 안 만듦
+			wantContain: []string{"[16] codex: config.toml 없음 — 미사용/미설치"},
+			wantAbsent:  []string{"[16] warning:"},
+		},
+		{
+			name: "② marker 존재 + 블록 부재 → §9-2 소멸 시그니처 경고",
+			setup: func(t *testing.T, codexHome, projectRoot string) {
+				write(t, filepath.Join(codexHome, "config.toml"), []byte("[model]\nname = \"gpt\"\n"))
+				write(t, filepath.Join(codexHome, "hooks.json"), selfHooks)
+			},
+			wantContain: []string{"[16] warning:", "hook install --codex"},
+		},
+		{
+			name: "③ 블록 부재·marker 부재 → 정보 라인",
+			setup: func(t *testing.T, codexHome, projectRoot string) {
+				write(t, filepath.Join(codexHome, "config.toml"), []byte("[model]\nname = \"gpt\"\n"))
+			},
+			wantContain: []string{"hook install --codex"},
+			wantAbsent:  []string{"[16] warning:"},
+		},
+		{
+			name: "④ 블록 존재 + marker 존재(user) → 블록=존재·project 미등록",
+			setup: func(t *testing.T, codexHome, projectRoot string) {
+				write(t, filepath.Join(codexHome, "config.toml"), []byte(codexBlockBody))
+				write(t, filepath.Join(codexHome, "hooks.json"), selfHooks) // user 레벨만 등록
+				// <projectRoot>/.codex/hooks.json은 미생성 → project=미등록
+			},
+			wantContain: []string{"블록=존재", "marker " + ver, "project=미등록"},
+			wantAbsent:  []string{"[16] warning:"},
+		},
+		{
+			name: "⑤ 마커 이상(BEGIN만) → 수동 확인 경고",
+			setup: func(t *testing.T, codexHome, projectRoot string) {
+				write(t, filepath.Join(codexHome, "config.toml"), []byte(codexBlockBegin+"\n[mcp_servers.ctr]\n"))
+			},
+			wantContain: []string{"[16] warning:", "수동 확인"},
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			codexHome := t.TempDir()
+			t.Setenv("CODEX_HOME", codexHome)
+			storeRoot := t.TempDir()
+			projectRoot := t.TempDir()
+			c.setup(t, codexHome, projectRoot)
+			var buf bytes.Buffer
+			if err := runDoctor(context.Background(), &buf, storeRoot, projectRoot, ver); err != nil {
+				t.Fatalf("runDoctor err=%v out=%s", err, buf.String())
+			}
+			out := buf.String()
+			for _, want := range c.wantContain {
+				if !strings.Contains(out, want) {
+					t.Errorf("출력에 %q 없음:\n%s", want, out)
+				}
+			}
+			for _, absent := range c.wantAbsent {
+				if strings.Contains(out, absent) {
+					t.Errorf("출력에 %q 있으면 안 됨:\n%s", absent, out)
+				}
+			}
+		})
+	}
+}
+
 // TestDoctorWarnMentionsHookOnly — [14] 경고 신문구가 --hook-only 선택 삭제를 안내하고 옛 문구
 // ('무구분')는 사라졌다(설계 §8 / D38 승격).
 func TestDoctorWarnMentionsHookOnly(t *testing.T) {

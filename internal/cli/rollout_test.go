@@ -253,12 +253,15 @@ func TestLoadCXSessions_MergesWorktrees(t *testing.T) {
 	u2 := "019f0000-0000-7000-8000-0000000000b2"
 	seedCXSessionAt(t, filepath.Join(storeRoot, "projects", canon.ProjectID, "worktrees", canon.WorktreeID), u1)
 	seedCXSessionAt(t, wtDir(t, storeRoot, projectRoot, "otherwt"), u2)
-	set, incomplete := loadCXSessions(context.Background(), storeRoot, projectRoot)
+	set, syn, incomplete := loadCXSessions(context.Background(), storeRoot, projectRoot)
 	if incomplete {
 		t.Fatal("정상 순회가 incomplete")
 	}
 	if !set["cx:"+u1] || !set["cx:"+u2] || len(set) != 2 {
 		t.Fatalf("병합 실패: %v", set)
+	}
+	if len(syn) != 0 { // D51 — startup 등록은 합성(first-event)이 아니다
+		t.Fatalf("synthetic 오분류: %v", syn)
 	}
 }
 
@@ -275,7 +278,7 @@ func TestLoadCXSessions_UnusableDBIsIncomplete(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(bad, "session.db"), []byte("not a sqlite db"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	set, incomplete := loadCXSessions(context.Background(), storeRoot, projectRoot)
+	set, _, incomplete := loadCXSessions(context.Background(), storeRoot, projectRoot)
 	if !incomplete {
 		t.Fatal("손상 DB가 incomplete=false")
 	}
@@ -284,7 +287,7 @@ func TestLoadCXSessions_UnusableDBIsIncomplete(t *testing.T) {
 	}
 	// 진짜 부재(빈 스토어)는 complete — 등록이 없었던 것이지 관측 불능이 아니다(계획 검수 교정:
 	// complete=부재일 때만, ReadDir/Stat의 그 외 오류·Canonicalize 실패는 incomplete).
-	set2, inc2 := loadCXSessions(context.Background(), t.TempDir(), projectRoot)
+	set2, _, inc2 := loadCXSessions(context.Background(), t.TempDir(), projectRoot)
 	if inc2 || len(set2) != 0 {
 		t.Fatalf("빈 스토어: incomplete=%v set=%v", inc2, set2)
 	}
@@ -320,7 +323,7 @@ func TestScanRollouts_ArmClassification(t *testing.T) {
 	writeRollout(t, day, tsFor(now, 24*time.Hour), "019f0000-0000-7000-8000-00000000000f", []string{tcLine(1, 0, 0, 1)})
 
 	cxSet := map[string]bool{"cx:" + uOn: true, "cx:019f0000-0000-7000-8000-0000000000ff": true} // 후자=rollout 부재(n/a K)
-	sc, err := scanRollouts(context.Background(), rolloutRoot, projectRoot, cxSet, false, now)
+	sc, err := scanRollouts(context.Background(), rolloutRoot, projectRoot, cxSet, nil, false, now)
 	if err != nil {
 		t.Fatalf("err=%v", err)
 	}
@@ -349,7 +352,7 @@ func TestScanRollouts_IncompleteDemotesOffToUnknown(t *testing.T) {
 	now := time.Date(2026, 7, 22, 12, 0, 0, 0, time.Local)
 	u := "019f0000-0000-7000-8000-00000000000b"
 	writeRollout(t, day, tsFor(now, 24*time.Hour), u, []string{metaLine(u, projectRoot), tcLine(1, 0, 0, 1)})
-	sc, err := scanRollouts(context.Background(), rolloutRoot, projectRoot, nil, true, now)
+	sc, err := scanRollouts(context.Background(), rolloutRoot, projectRoot, nil, nil, true, now)
 	if err != nil {
 		t.Fatalf("err=%v", err)
 	}
@@ -370,7 +373,7 @@ func TestScanRollouts_WindowBoundaryInclusive(t *testing.T) {
 	now := time.Date(2026, 7, 22, 12, 0, 0, 0, time.Local)
 	u := "019f0000-0000-7000-8000-00000000000b"
 	writeRollout(t, day, tsFor(now, cxOffWindow), u, []string{metaLine(u, projectRoot), tcLine(1, 0, 0, 1)})
-	sc, err := scanRollouts(context.Background(), rolloutRoot, projectRoot, nil, false, now)
+	sc, err := scanRollouts(context.Background(), rolloutRoot, projectRoot, nil, nil, false, now)
 	if err != nil {
 		t.Fatalf("err=%v", err)
 	}
@@ -391,7 +394,7 @@ func TestScanRollouts_MetaIDAuthority(t *testing.T) {
 	fileUUID := "019f0000-0000-7000-8000-0000000000f1"
 	metaUUID := "019f0000-0000-7000-8000-0000000000f2"
 	writeRollout(t, day, tsFor(now, 24*time.Hour), fileUUID, []string{metaLine(metaUUID, projectRoot), tcLine(1, 0, 0, 1)})
-	sc, err := scanRollouts(context.Background(), rolloutRoot, projectRoot, map[string]bool{"cx:" + metaUUID: true}, false, now)
+	sc, err := scanRollouts(context.Background(), rolloutRoot, projectRoot, map[string]bool{"cx:" + metaUUID: true}, nil, false, now)
 	if err != nil {
 		t.Fatalf("err=%v", err)
 	}
@@ -418,7 +421,7 @@ func TestScanRollouts_SessionFileGroupMerge(t *testing.T) {
 	writeRollout(t, day, tsFor(now, 48*time.Hour), fileB, []string{metaLine(sess, projectRoot), tcLine(50, 20, 5, 55)})
 
 	// 등록 시: on 세션 1개·turns=2·use 필드별 합·start=이른 쪽·matched=1.
-	sc, err := scanRollouts(context.Background(), rolloutRoot, projectRoot, map[string]bool{"cx:" + sess: true}, false, now)
+	sc, err := scanRollouts(context.Background(), rolloutRoot, projectRoot, map[string]bool{"cx:" + sess: true}, nil, false, now)
 	if err != nil {
 		t.Fatalf("err=%v", err)
 	}
@@ -433,7 +436,7 @@ func TestScanRollouts_SessionFileGroupMerge(t *testing.T) {
 	}
 
 	// 등록 없이 창 내 2파일 → off=1(세션 단위 계상 — 파일 2개로 세지 않는다).
-	sc2, err := scanRollouts(context.Background(), rolloutRoot, projectRoot, nil, false, now)
+	sc2, err := scanRollouts(context.Background(), rolloutRoot, projectRoot, nil, nil, false, now)
 	if err != nil {
 		t.Fatalf("err=%v", err)
 	}
@@ -492,7 +495,7 @@ func TestScanRollouts_AllCwdInvalidPromotedToSkipFiles(t *testing.T) {
 	}
 	now := time.Date(2026, 7, 22, 12, 0, 0, 0, time.Local)
 	writeRollout(t, day, tsFor(now, 24*time.Hour), testUUID, []string{metaLine(testUUID, ""), tcLine(1, 0, 0, 1)})
-	sc, err := scanRollouts(context.Background(), rolloutRoot, projectRoot, nil, false, now)
+	sc, err := scanRollouts(context.Background(), rolloutRoot, projectRoot, nil, nil, false, now)
 	if err != nil {
 		t.Fatalf("err=%v", err)
 	}
@@ -517,7 +520,7 @@ func TestScanRollouts_UnreadableSubtreeCounted(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = os.Chmod(bad, 0o755) }) // TempDir 정리 가능하도록 복구
-	sc, err := scanRollouts(context.Background(), rolloutRoot, projectRoot, nil, false, time.Now())
+	sc, err := scanRollouts(context.Background(), rolloutRoot, projectRoot, nil, nil, false, time.Now())
 	if err != nil {
 		t.Fatalf("err=%v", err)
 	}

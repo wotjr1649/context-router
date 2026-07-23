@@ -702,6 +702,55 @@ func scanRegisteredHooks(path string) (count int, marker string, err error) {
 	return count, marker, nil
 }
 
+// scanCodexRegisteredHooks — scanRegisteredHooks의 Codex 형제(D52, 스펙 v0.9 §0): hooks.json
+// 자기 그룹 수와 marker 버전(statusMessage의 hookMarkerPrefix 뒤)을 읽는다. 최상위는
+// mergeCodexHooks와 동일한 {"hooks":{event:[group...]}} 래퍼로 파싱한다(형제 구조 미러링).
+// 파일 부재·hooks 부재는 (0,"",nil) — 미설치 정보 분기. isOurCodexGroup(전건 판정)을 그대로
+// 재사용한다. 읽기 실패 오류에는 절대경로를 담지 않는다(§12 canary — *PathError는 경로 포함).
+func scanCodexRegisteredHooks(path string) (count int, marker string, err error) {
+	data, rerr := os.ReadFile(path)
+	if rerr != nil {
+		if errors.Is(rerr, os.ErrNotExist) {
+			return 0, "", nil
+		}
+		return 0, "", errors.New("hook: 설정 파일 읽기 실패")
+	}
+	if len(bytes.TrimSpace(data)) == 0 {
+		return 0, "", nil
+	}
+	var settings map[string]json.RawMessage
+	if err := json.Unmarshal(data, &settings); err != nil {
+		return 0, "", err
+	}
+	raw, ok := settings["hooks"]
+	if !ok {
+		return 0, "", nil
+	}
+	var hooks map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &hooks); err != nil {
+		return 0, "", err
+	}
+	for _, arr := range hooks {
+		var groups []json.RawMessage
+		if json.Unmarshal(arr, &groups) != nil {
+			continue // 배열이 아닌 이벤트는 우리 소유 아님 — 건너뜀
+		}
+		for _, g := range groups {
+			if !isOurCodexGroup(g) {
+				continue
+			}
+			count++
+			if marker == "" { // 첫 자기 그룹의 마커만(install이 모든 그룹에 동일 버전 마커를 씀)
+				var p codexGroupProbe
+				if json.Unmarshal(g, &p) == nil && len(p.Hooks) > 0 {
+					marker = strings.TrimPrefix(p.Hooks[0].StatusMessage, hookMarkerPrefix())
+				}
+			}
+		}
+	}
+	return count, marker, nil
+}
+
 // countRegisteredHooks — scanRegisteredHooks의 개수 부분만(기존 호출부·테스트 호환 얇은 래퍼).
 func countRegisteredHooks(path string) (int, error) {
 	n, _, err := scanRegisteredHooks(path)

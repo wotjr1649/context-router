@@ -1621,6 +1621,57 @@ func runDoctor(ctx context.Context, w io.Writer, storeRoot, projectRoot, version
 			ownedBytes, ownedHashes, ccB, cxB, sharedB, unattrB, suffix)
 	}
 
+	// [16] codex 등록 상태(D52, 스펙 v0.9 §0) — 읽기 전용 5분기. 경고는 [14]와 동일하게
+	// failed에 미계상(doctor exit 계약 무변경). trust 해시 검증은 비범위(스펙 §1.2).
+	codexHooksScope := func(path string, pathErr error) (string, bool) { // (표시, marker존재)
+		if pathErr != nil {
+			return "확인불가", false
+		}
+		n, marker, scanErr := scanCodexRegisteredHooks(path)
+		switch {
+		case scanErr != nil:
+			return "파싱실패", false
+		case n == 0:
+			return "미등록", false
+		case marker != "" && marker != version:
+			return fmt.Sprintf("등록됨(%d개, marker %s≠%s — hook install --codex 재실행)", n, marker, version), true
+		default:
+			return fmt.Sprintf("등록됨(%d개, marker %s)", n, marker), true
+		}
+	}
+	projCodexHooks, _ := codexHooksPath(false, projectRoot)
+	userCodexHooks, userCodexHooksErr := codexHooksPath(true, projectRoot)
+	projScope, projMarker := codexHooksScope(projCodexHooks, nil)
+	userScope, userMarker := codexHooksScope(userCodexHooks, userCodexHooksErr)
+	markerPresent := projMarker || userMarker
+	cfgPath, cfgPathErr := codexConfigPath()
+	switch {
+	case cfgPathErr != nil:
+		fmt.Fprintln(w, "[16] codex: config.toml 경로 확인불가")
+	default:
+		cfgData, readErr := os.ReadFile(cfgPath)
+		switch {
+		case os.IsNotExist(readErr): // 분기① — 마커 여부 무관(상태 루트 부재=미사용, 소멸 시그니처 아님)
+			fmt.Fprintf(w, "[16] codex: config.toml 없음 — 미사용/미설치 (hooks: project=%s user=%s)\n", projScope, userScope)
+		case readErr != nil:
+			fmt.Fprintln(w, "[16] codex: config.toml 읽기 실패")
+		default:
+			present, anomaly := probeCodexMCPBlock(cfgData)
+			switch {
+			case anomaly: // 분기⑤
+				fmt.Fprintf(w, "[16] codex: [mcp_servers.ctr] 블록=이상 (hooks: project=%s user=%s)\n", projScope, userScope)
+				fmt.Fprintln(w, "[16] warning: config.toml 관리 마커 이상/키-경계 충돌 — 수동 확인 필요(hook install --codex 안내 참조)")
+			case present: // 분기④
+				fmt.Fprintf(w, "[16] codex: [mcp_servers.ctr] 블록=존재 (hooks: project=%s user=%s)\n", projScope, userScope)
+			case markerPresent: // 분기② — §9-2 소멸 시그니처
+				fmt.Fprintf(w, "[16] codex: [mcp_servers.ctr] 블록=부재 (hooks: project=%s user=%s)\n", projScope, userScope)
+				fmt.Fprintln(w, "[16] warning: 훅은 설치됐으나 MCP 블록 부재 — deny 안내가 가리키는 ctr_search/ctr_fetch를 Codex가 볼 수 없음. hook install --codex 재기입 권장")
+			default: // 분기③
+				fmt.Fprintf(w, "[16] codex: [mcp_servers.ctr] 블록=부재·훅 미설치 — hook install --codex (hooks: project=%s user=%s)\n", projScope, userScope)
+			}
+		}
+	}
+
 	fmt.Fprintln(w)
 	fmt.Fprint(w, hostSnippet)
 

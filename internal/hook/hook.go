@@ -58,8 +58,9 @@ const (
 	defaultDeadlineMS   = 2000
 	defaultRetentionSec = 2592000 // 30일 — 훅 세션 기본 retention(설계 §2.2)
 	dropsLogName        = "session.drops.log"
-	maxStdinBytes       = 8 << 20 // stdin 읽기 상한(fail-open 봉인) — CTR_SHADOW_MAX 1MiB + JSON 이스케이프·대형 Write tool_input 여유
-	maxSourceBytes      = 64      // SessionStart source 길이 봉인(최종 리뷰 C4) — 문서 enum 최대 7B, 여유 포함
+	maxStdinBytes       = 8 << 20       // stdin 읽기 상한(fail-open 봉인) — CTR_SHADOW_MAX 1MiB + JSON 이스케이프·대형 Write tool_input 여유
+	maxSourceBytes      = 64            // SessionStart source 길이 봉인(최종 리뷰 C4) — 문서 enum 최대 7B, 여유 포함
+	sourceFirstEvent    = "first-event" // D51 합성 등록 마커 — session_start payload source(스펙 v0.9 §0)
 )
 
 // Run — 훅 이벤트 1건을 처리한다(설계 §2). **항상 0을 반환한다**(fail-open §2.3): 어떤 실패도
@@ -145,8 +146,13 @@ func dispatch(ctx context.Context, in hookInput, dir, contentDir, worktreeRoot s
 		return
 	}
 	if !exists {
-		appendDrop(dir, "unknown-session", external, in.HookEventName, in.ToolName) // 미지 세션의 후속 이벤트는 drop(설계 §2.2)
-		return
+		// D51 register-on-first-event(v0.9 §0): 미지 세션은 drop 대신 합성 등록 후 그대로 계속
+		// 처리한다(트리거 이벤트 포함). EnsureSession은 INSERT OR IGNORE 멱등이라 동시 경쟁 무해.
+		// 등록 커밋~append 사이 실패는 기존 append-failed 계약과 동일(원자 결합 비도입 — §5).
+		if _, ensErr := ad.EnsureSession(ctx, sourceFirstEvent, worktreeRoot); ensErr != nil {
+			appendDrop(dir, "ensure-failed", external, in.HookEventName, in.ToolName)
+			return
+		}
 	}
 	// PreToolUse는 T7 large-read/dump guard 몫 — tool_call로 중복 계상하지 않고 tool_name으로
 	// 분기한다(설계 §4 D25·D32·v0.4 D36). matcher가 Read|Bash|PowerShell라 여기 오는 건 사실상

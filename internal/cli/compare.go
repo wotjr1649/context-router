@@ -13,6 +13,9 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/wotjr1649/context-router/internal/ident"
+	"github.com/wotjr1649/context-router/internal/session"
 )
 
 // ccCompareArm — cc: 한 arm의 세션·합계 누적(--min-records 적용 후).
@@ -49,6 +52,41 @@ func defaultRolloutRoot() string {
 	return filepath.Join(home, ".codex", "sessions")
 }
 
+// loadCCSynthetic — D51(v0.9): source="first-event" 합성 등록 cc: 세션 집합(--compare 전용
+// 기본 제외 — 구성상 불완전 표본). loadCCSessions 본문을 복제하되 SQL만 교체한다(재사용 금지 —
+// loadCCSessions는 무플래그 본표(cli.go:456)와 공유하는 byte-for-byte 게이트). 실패는 빈 집합
+// (fail-soft, loadCCSessions와 동형). read-only라 대상 DB를 오염시키지 않는다.
+func loadCCSynthetic(ctx context.Context, storeRoot, projectRoot string) map[string]bool {
+	canon, err := ident.Canonicalize(projectRoot)
+	if err != nil || canon.ProjectID == "" {
+		return nil
+	}
+	sessDir := filepath.Join(storeRoot, "projects", canon.ProjectID, "worktrees", canon.WorktreeID)
+	if fi, statErr := os.Stat(filepath.Join(sessDir, "session.db")); statErr != nil || fi.IsDir() {
+		return nil
+	}
+	db, err := session.OpenReadOnly(sessDir)
+	if err != nil {
+		return nil
+	}
+	defer func() { _ = db.Close() }()
+	rows, err := db.QueryContext(ctx, `SELECT s.session_id FROM sessions s JOIN session_events e
+		ON e.session_id = s.session_id WHERE s.session_id LIKE 'cc:%'
+		AND e.event_type='session_start' AND json_extract(e.payload,'$.source')='first-event'`)
+	if err != nil {
+		return nil
+	}
+	defer func() { _ = rows.Close() }()
+	set := make(map[string]bool)
+	for rows.Next() {
+		var id string
+		if rows.Scan(&id) == nil {
+			set[id] = true
+		}
+	}
+	return set
+}
+
 // runUsageCompare — D45 리포트(§3 출력 계약 — byte 단위 고정). now는 관측 창 게이트의 기준
 // 시각(테스트 주입 — 결정론 §6). 반환 오류에 절대경로 금지(§12 canary).
 func runUsageCompare(ctx context.Context, w io.Writer, storeRoot, projectRoot, tdir, rolloutRoot string, minRecords int64, now time.Time) error {
@@ -61,8 +99,9 @@ func runUsageCompare(ctx context.Context, w io.Writer, storeRoot, projectRoot, t
 		return errors.New("usage: transcript 디렉터리 열기 실패")
 	}
 	ccSet := loadCCSessions(ctx, storeRoot, projectRoot)
+	ccSyn := loadCCSynthetic(ctx, storeRoot, projectRoot) // D51 — 합성 등록 세션(source=first-event)
 	var on, off ccCompareArm
-	var ccExcluded int64
+	var ccExcluded, ccSynthetic int64
 	for _, e := range entries {
 		if e.IsDir() || !strings.HasSuffix(e.Name(), ".jsonl") {
 			continue
@@ -75,8 +114,13 @@ func runUsageCompare(ctx context.Context, w io.Writer, storeRoot, projectRoot, t
 			ccExcluded++
 			continue
 		}
+		id := "cc:" + strings.TrimSuffix(e.Name(), ".jsonl")
+		if ccSyn[id] {
+			ccSynthetic++ // D51 — 합성 등록 세션은 양 arm 모두에서 제외(불완전 표본)
+			continue
+		}
 		grp := &off
-		if ccSet["cc:"+strings.TrimSuffix(e.Name(), ".jsonl")] {
+		if ccSet[id] {
 			grp = &on
 		}
 		grp.sessions++
@@ -92,12 +136,12 @@ func runUsageCompare(ctx context.Context, w io.Writer, storeRoot, projectRoot, t
 	fmt.Fprintf(w, "ratio(on/off)\t-\t-\t%s\t%s\n",
 		ratioStr(on.sums.output, on.sums.records, off.sums.output, off.sums.records),
 		ratioStr(on.sums.cacheRead, on.sums.records, off.sums.cacheRead, off.sums.records))
-	fmt.Fprintf(w, "excluded(--min-records): %d\n", ccExcluded)
+	fmt.Fprintf(w, "excluded(--min-records): %d | synthetic=%d\n", ccExcluded, ccSynthetic)
 
 	// ── cx 블록(experimental — 비공표 내부 형식 의존 등급 표명 §5).
 	fmt.Fprintln(w, "== cx (단위=turn, experimental) ==")
-	cxSet, incomplete := loadCXSessions(ctx, storeRoot, projectRoot)
-	sc, scanErr := scanRollouts(ctx, rolloutRoot, projectRoot, cxSet, incomplete, now)
+	cxSet, cxSyn, incomplete := loadCXSessions(ctx, storeRoot, projectRoot)
+	sc, scanErr := scanRollouts(ctx, rolloutRoot, projectRoot, cxSet, cxSyn, incomplete, now)
 	if scanErr != nil {
 		if cerr := ctx.Err(); cerr != nil {
 			return cerr
@@ -141,8 +185,8 @@ func runUsageCompare(ctx context.Context, w io.Writer, storeRoot, projectRoot, t
 		if sc.incomplete {
 			inc = " (incomplete)"
 		}
-		fmt.Fprintf(w, "coverage: on 등록=%d 매칭=%d n/a=%d | off 창내미등록=%d | unknown=%d%s | excluded(--min-records)=%d\n",
-			sc.registered, sc.matched, sc.registered-sc.matched, len(sc.off), unknownN, inc, cxExcluded)
+		fmt.Fprintf(w, "coverage: on 등록=%d 매칭=%d n/a=%d | off 창내미등록=%d | unknown=%d%s | excluded(--min-records)=%d | synthetic=%d\n",
+			sc.registered, sc.matched, sc.registered-sc.matched, len(sc.off), unknownN, inc, cxExcluded, sc.syntheticN)
 		fmt.Fprintf(w, "skipped: files(미귀속)=%d lines=%d cwd_diverged=%d\n", sc.skipFiles, sc.skipLines, sc.diverged)
 	}
 	fmt.Fprintln(w, "주의: 관찰 데이터(무작위화 아님) — 워크로드 교란 존재")
