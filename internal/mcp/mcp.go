@@ -27,7 +27,7 @@ import (
 
 // ServerVersion: MCP Implementation.Version. cmd/context-router의 `version` 상수와 항상 같아야
 // 한다(범프 시 2지점 동시 갱신) — cmd 쪽 핀 테스트가 등가를 강제한다. export는 그 핀의 이음새.
-const ServerVersion = "0.8.0"
+const ServerVersion = "0.9.0"
 
 // Config — Serve/NewServer 입력 (설계 §4, §8).
 type Config struct {
