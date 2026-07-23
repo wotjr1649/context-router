@@ -931,6 +931,55 @@ func TestRunPurge_E2E_OlderThanVacuum(t *testing.T) {
 	}
 }
 
+// TestVacuumReclaimBusyMapsToGuidance — D50: VACUUM 자체가 BUSY로 실패하는 경로(final review I1의
+// 결정 재현 가능 부분)의 "라이브 프로세스" 매핑을 직접 단정한다. 별도 연결 BEGIN IMMEDIATE 선점
+// 상태에서 vacuumReclaim을 직접 호출 — busy_timeout 소진 ~5s 정상. disk 계열(SQLITE_FULL)은
+// 결정 재현 불가로 미커버(문서화된 갭).
+func TestVacuumReclaimBusyMapsToGuidance(t *testing.T) {
+	storeRoot := t.TempDir()
+	projectRoot := t.TempDir()
+	canon, err := ident.Canonicalize(projectRoot)
+	if err != nil {
+		t.Fatalf("canonicalize: %v", err)
+	}
+	projDir := filepath.Join(storeRoot, "projects", canon.ProjectID)
+	st, err := store.Open(projDir, false)
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	defer func() { _ = st.Close() }()
+	if _, err := st.Register(t.Context(), store.Registration{
+		StoredBytes: []byte("busy"), MediaType: "text/plain",
+		Source: store.SourceMeta{URI: "/busy.txt", Kind: "file", SrcHash: "h-vrb"},
+		Chunks: []store.Chunk{{Ordinal: 0, Text: "busy"}},
+	}); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	dbPath := filepath.ToSlash(filepath.Join(projDir, "content.db"))
+	locker, err := sql.Open("sqlite", "file:"+dbPath+"?_pragma=busy_timeout(1000)")
+	if err != nil {
+		t.Fatalf("open locker: %v", err)
+	}
+	defer func() { _ = locker.Close() }()
+	conn, err := locker.Conn(context.Background())
+	if err != nil {
+		t.Fatalf("locker conn: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+	if _, err := conn.ExecContext(context.Background(), "BEGIN IMMEDIATE"); err != nil {
+		t.Fatalf("BEGIN IMMEDIATE: %v", err)
+	}
+	var out bytes.Buffer
+	verr := vacuumReclaim(context.Background(), st, projDir, contentFootprintOf(t, projDir), &out)
+	_, _ = conn.ExecContext(context.Background(), "ROLLBACK")
+	if verr == nil || !strings.Contains(verr.Error(), "VACUUM 경합") || !strings.Contains(verr.Error(), "라이브 프로세스") {
+		t.Fatalf("verr=%v want VACUUM 경합·라이브 프로세스 매핑", verr)
+	}
+	if out.Len() != 0 {
+		t.Fatalf("실패 경로인데 보고 출력 존재: %q", out.String())
+	}
+}
+
 // TestRunPurge_VacuumCheckpointBusyMapsToError — D50: 열린 read 트랜잭션 공존 시 삭제·VACUUM은
 // 통과해도 checkpoint busy≠0 → "라이브 프로세스" 오류로 표면화(무성 성공 위장 봉쇄 — 스펙 §5
 // Codex 실험 시나리오). 삭제분 유지·quick_check=ok 단정 포함. busy_timeout 탓 ~5s 정상.

@@ -2116,7 +2116,10 @@ func TestCheckpointTruncate(t *testing.T) {
 		t.Fatalf("busy=%d want 0", busy)
 	}
 	fi, err := os.Stat(filepath.Join(dir, "content.db-wal"))
-	if err == nil && fi.Size() != 0 {
+	if err != nil {
+		t.Fatalf("wal stat: %v (TRUNCATE는 파일을 0B로 자를 뿐 삭제하지 않음)", err)
+	}
+	if fi.Size() != 0 {
 		t.Fatalf("wal=%dB want 0(TRUNCATE)", fi.Size())
 	}
 }

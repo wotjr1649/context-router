@@ -726,7 +726,7 @@ func runPurge(ctx context.Context, in io.Reader, w, stderr io.Writer, storeRoot 
 		// 선택 삭제 (+ 후속 --sessions, + 후속 --gc, + 후속 --vacuum(D50))
 		var beforeB int64
 		if *vacuum {
-			beforeB = contentFootprint(projDir) // 전 실측: 삭제 착수 전(삭제 트랜잭션의 WAL 성장까지 포함한 전체 디스크 효과 반영)
+			beforeB = contentFootprint(projDir) // 전 실측 = 명령 착수 전 기준점 — 보고 Δ는 명령 전체(삭제+VACUUM+checkpoint)의 총점유 순감소다
 		}
 		st, err := store.Open(projDir, false)
 		if err != nil {
@@ -750,6 +750,11 @@ func runPurge(ctx context.Context, in io.Reader, w, stderr io.Writer, storeRoot 
 					vacuumDiskAbort = true
 				}
 			}
+		} else if purgeErr == nil && *vacuum && vacuumDiskAbort {
+			// 앞선 프로젝트의 디스크 계열 실패로 잔여 VACUUM이 중단된 상태 — 이 프로젝트는
+			// 시도조차 하지 않았음을 통지한다(집계 미변경: vacuumFailed 미증가). else 분기라
+			// 디스크 실패를 처음 유발한 프로젝트가 "생략"으로 이중 통지되지 않는다.
+			fmt.Fprintf(stderr, "ctr: %s: VACUUM 생략(디스크 계열 실패로 잔여 중단)\n", id)
 		}
 		closeErr := st.Close()
 		if purgeErr != nil {
