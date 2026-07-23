@@ -24,6 +24,21 @@ import (
 	"github.com/wotjr1649/context-router/internal/store"
 )
 
+// D56 — version 서브커맨드: ProductVersion 1줄만 출력(CI 추출 표면, 스펙 §0).
+func TestRunVersionSubcommand(t *testing.T) {
+	var out, errOut bytes.Buffer
+	err := Run(context.Background(), "version", nil, t.TempDir(), t.TempDir(), "9.9.9-test", false, "", &out, &errOut)
+	if err != nil {
+		t.Fatalf("err=%v", err)
+	}
+	if out.String() != "9.9.9-test\n" {
+		t.Fatalf("out=%q want %q", out.String(), "9.9.9-test\n")
+	}
+	if err := Run(context.Background(), "version", []string{"x"}, t.TempDir(), t.TempDir(), "v", false, "", &out, &errOut); err == nil {
+		t.Fatal("잉여 인자 미거부")
+	}
+}
+
 // TestRunUpgrade_Table: httptest 서버로 정상/오류/타임아웃/위생검증 경로를 모두 확인한다
 // (설계 §7 — upgrade 위생: 응답 제공 URL·기타 필드는 절대 출력 금지, tag_name만 취함).
 func TestRunUpgrade_Table(t *testing.T) {

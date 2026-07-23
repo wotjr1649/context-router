@@ -16,6 +16,7 @@ import (
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
+	"github.com/wotjr1649/context-router/internal/buildinfo"
 	"github.com/wotjr1649/context-router/internal/ident"
 	"github.com/wotjr1649/context-router/internal/ingest"
 	"github.com/wotjr1649/context-router/internal/netfetch"
@@ -24,10 +25,6 @@ import (
 	"github.com/wotjr1649/context-router/internal/store"
 	"github.com/wotjr1649/context-router/internal/transform"
 )
-
-// ServerVersion: MCP Implementation.Version. cmd/context-router의 `version` 상수와 항상 같아야
-// 한다(범프 시 2지점 동시 갱신) — cmd 쪽 핀 테스트가 등가를 강제한다. export는 그 핀의 이음새.
-const ServerVersion = "0.9.0"
 
 // Config — Serve/NewServer 입력 (설계 §4, §8).
 type Config struct {
@@ -66,7 +63,7 @@ func NewServer(cfg Config) (*mcp.Server, error) {
 	if cfg.TransformTimeout == 0 {
 		cfg.TransformTimeout = 10 * time.Second
 	}
-	srv := mcp.NewServer(&mcp.Implementation{Name: "context-router", Version: ServerVersion}, nil)
+	srv := mcp.NewServer(&mcp.Implementation{Name: "context-router", Version: buildinfo.ProductVersion()}, nil)
 	// 경로 허용(ingest root)·상대화(search/fetch relativize) 기준 = WorktreeRoot — linked git
 	// worktree에서 ProjectRoot(주 checkout)를 쓰면 현재 worktree 파일이 WORKSPACE_VIOLATION이
 	// 된다(저장소 디렉터리 명명 ProjectID는 ProjectRoot 기반 그대로, main.go 참조).
@@ -832,7 +829,7 @@ func NewGlobalServer(cfg GlobalConfig) (*mcp.Server, error) {
 	if len(cfg.Projects) == 0 {
 		return nil, fmt.Errorf("mcp: global-search에는 최소 1개 프로젝트가 필요합니다")
 	}
-	srv := mcp.NewServer(&mcp.Implementation{Name: "ctr-global", Version: ServerVersion}, nil)
+	srv := mcp.NewServer(&mcp.Implementation{Name: "ctr-global", Version: buildinfo.ProductVersion()}, nil)
 	registerGlobalSearch(srv, cfg.Projects)
 	return srv, nil
 }

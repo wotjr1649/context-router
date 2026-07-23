@@ -65,6 +65,14 @@ func contentFileWarnBytes(getenv func(string) string) int64 {
 // 명시/기본을 구분할 수 없으므로 main이 전달, 설계 §7).
 func Run(ctx context.Context, sub string, args []string, storeRoot, projectRoot, version string, storeRootExplicit bool, storeRootRaw string, stdout, stderr io.Writer) error {
 	switch sub {
+	case "version":
+		// D56 — ProductVersion 1줄(CI 태그 검증·사용자 확인용 추출 표면). 부가 정보 없음 —
+		// 상세 commit/dirty는 doctor build 라인 전담(스펙 §0 분리).
+		if len(args) > 0 {
+			return fmt.Errorf("cli: version: 예상치 않은 인자 %d개", len(args))
+		}
+		fmt.Fprintln(stdout, version)
+		return nil
 	case "doctor":
 		if len(args) > 0 {
 			// 사용자 입력(원시 args)을 오류 문구에 에코하지 않는다 — 개수만(규약 §6, 리뷰
