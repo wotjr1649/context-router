@@ -55,12 +55,11 @@ func runHookHost(t *testing.T, host Host, storeRoot string, in []byte, env map[s
 	return Run(context.Background(), bytes.NewReader(in), io.Discard, storeRoot, "test", host, func(k string) string { return env[k] })
 }
 
-// D35 — 동일 UUID의 cc/cx 오귀속 금지: cc SessionStart 후 같은 UUID의 cx 이벤트는
-// unknown-session drop, cx SessionStart를 거쳐야 cx 이벤트가 기록된다(네임스페이스 격리).
+// D35×D51 — 동일 UUID의 cc/cx 격리: cc SessionStart 후 같은 UUID의 cx 이벤트는 (drop이 아니라)
+// cx: 네임스페이스 세션으로 자동 등록·기록된다. cc: 세션으로의 오귀속 0이 격리 단정의 본체.
 func TestHookHostIsolation(t *testing.T) {
 	storeRoot := t.TempDir()
 	cwd := evalLong(t, t.TempDir())
-	// 느린 CI 러너에서 기본 2s 데드라인이 fail-open drop을 유발 — 테스트는 러너 속도 무의존이어야 함.
 	env := map[string]string{"CTR_HOOK_DEADLINE_MS": "60000"}
 	start := fixtureWith(t, "sessionstart.json", map[string]any{"cwd": cwd})
 	post := fixtureWith(t, "posttooluse-codex-bash.json", map[string]any{"cwd": cwd})
@@ -72,71 +71,25 @@ func TestHookHostIsolation(t *testing.T) {
 		t.Fatalf("cx PostToolUse rc=%d", rc)
 	}
 	sdir := sessDir(t, storeRoot, cwd)
-	if got := readDrops(t, sdir); !strings.Contains(got, "unknown-session") {
-		t.Fatalf("drops=%q want unknown-session (cx 미등록 — cc로 오귀속 금지)", got)
-	}
-	if rc := runHookHost(t, HostCodex, storeRoot, start, env); rc != 0 { // cx 세션 등록
-		t.Fatalf("cx SessionStart rc=%d", rc)
-	}
-	if rc := runHookHost(t, HostCodex, storeRoot, post, env); rc != 0 {
-		t.Fatalf("cx PostToolUse(등록 후) rc=%d", rc)
-	}
 	reader, err := session.OpenReadOnly(sdir)
 	if err != nil {
 		t.Fatalf("open session.db: %v", err)
 	}
-	defer func() { _ = reader.Close() }()
-	var cc, cx, cxEv int
-	if err := reader.QueryRow(`SELECT
-		(SELECT count(*) FROM sessions WHERE session_id LIKE 'cc:%'),
-		(SELECT count(*) FROM sessions WHERE session_id LIKE 'cx:%'),
-		(SELECT count(*) FROM session_events WHERE session_id LIKE 'cx:%')`).Scan(&cc, &cx, &cxEv); err != nil {
-		t.Fatalf("count: %v", err)
+	var cxSessions, ccEvents int
+	e1 := reader.QueryRow("SELECT count(*) FROM sessions WHERE session_id LIKE 'cx:%'").Scan(&cxSessions)
+	e2 := reader.QueryRow("SELECT count(*) FROM session_events e JOIN sessions s ON s.session_id=e.session_id WHERE s.session_id LIKE 'cc:%' AND e.event_type<>'session_start'").Scan(&ccEvents)
+	_ = reader.Close()
+	if e1 != nil || e2 != nil {
+		t.Fatalf("query: %v %v", e1, e2)
 	}
-	if cc != 1 || cx != 1 || cxEv == 0 {
-		t.Fatalf("cc=%d cx=%d cxEv=%d want 1,1,>0 (네임스페이스 격리)", cc, cx, cxEv)
+	if cxSessions != 1 {
+		t.Fatalf("cx sessions=%d want 1 (D51 합성 등록)", cxSessions)
 	}
-
-	// 결정표 행 1 수용(§11.1 G1) — cx 이벤트도 shadow 캡처되고 artifact ref가 cx: 네임스페이스를
-	// 운반한다(D35+D30, 기존 dispatch·shadowCapture 재사용 경로의 계약 고정).
-	bigPost := fixtureWith(t, "posttooluse-codex-bash.json", map[string]any{
-		"cwd": cwd, "tool_response": bigStdout(20000),
-	})
-	if rc := runHookHost(t, HostCodex, storeRoot, bigPost, env); rc != 0 {
-		t.Fatalf("cx big PostToolUse rc=%d", rc)
+	if ccEvents != 0 {
+		t.Fatalf("cc 비-session_start 이벤트=%d want 0 (cx→cc 오귀속 금지)", ccEvents)
 	}
-	var refs string
-	if err := reader.QueryRow(`SELECT coalesce(max(artifact_refs),'') FROM session_events
-		WHERE session_id LIKE 'cx:%' AND event_type='artifact_created'`).Scan(&refs); err != nil {
-		t.Fatalf("refs: %v", err)
-	}
-	if !strings.Contains(refs, "artifact://cx:") {
-		t.Fatalf("refs=%q want artifact://cx: 접두(D35 네임스페이스 운반)", refs)
-	}
-
-	// D47 — cx: Bash 덤프 deny가 cc:<uuid> 세션에 오귀속되지 않는다(격리). 같은 UUID의 cx deny
-	// 발화 후 cc: 이벤트에 warning이 없어야 한다. 기존 reader(session.db)를 재사용해 조회한다.
-	big := filepath.Join(cwd, "big.txt")
-	writeSized(t, big, 300*1024)
-	pre := fixtureWith(t, "posttooluse-codex-bash.json", map[string]any{
-		"hook_event_name": "PreToolUse",
-		"tool_name":       "Bash",
-		"cwd":             cwd,
-		"tool_input":      map[string]any{"command": cxDumpCmd(big)},
-	})
-	var denyOut bytes.Buffer
-	if rc := Run(context.Background(), bytes.NewReader(pre), &denyOut, storeRoot, "test", HostCodex, func(k string) string { return env[k] }); rc != 0 {
-		t.Fatalf("cx Bash deny rc=%d", rc)
-	}
-	if !strings.Contains(denyOut.String(), `"permissionDecision":"deny"`) {
-		t.Fatalf("cx Bash 덤프가 deny 아님: %q", denyOut.String())
-	}
-	var ccWarn int
-	if err := reader.QueryRow("SELECT count(*) FROM session_events WHERE session_id LIKE 'cc:%' AND event_type='warning'").Scan(&ccWarn); err != nil {
-		t.Fatalf("cc warning count: %v", err)
-	}
-	if ccWarn != 0 {
-		t.Fatalf("cc warning=%d want 0(cx deny 오귀속 금지)", ccWarn)
+	if got := readDropsOpt(t, sdir); strings.Contains(got, "unknown-session") {
+		t.Fatalf("drops=%q — D51 후 unknown-session 미발생", got)
 	}
 }
 
@@ -169,6 +122,18 @@ func readDrops(t *testing.T, dir string) string {
 	b, err := os.ReadFile(filepath.Join(dir, "session.drops.log"))
 	if err != nil {
 		t.Fatalf("read drops in %s: %v", dir, err)
+	}
+	return string(b)
+}
+
+// readDropsOpt — drops 파일이 없으면 ""(부재=드롭 0건)로 관대하게 읽는다. D51 후 unknown-session
+// 드롭이 소멸해 드롭 파일 자체가 안 생기는 경로의 "특정 사유 미발생" 단정용(readDrops는 파일
+// 필수라 부재 시 Fatal — 부재가 곧 통과인 케이스에 부적합).
+func readDropsOpt(t *testing.T, dir string) string {
+	t.Helper()
+	b, err := os.ReadFile(filepath.Join(dir, "session.drops.log"))
+	if err != nil {
+		return ""
 	}
 	return string(b)
 }
@@ -338,7 +303,8 @@ func TestHookSessionStartSourceRuneBoundary(t *testing.T) {
 	}
 }
 
-// ③ 비-SessionStart 이벤트를 미지 세션으로 → 이벤트 0건 + drops 1줄(unknown-session).
+// ③ 비-SessionStart 이벤트를 미지 세션으로 → D51: drop 대신 합성 등록(source="first-event") 후 계속.
+// PreToolUse(Read)는 가드 통과 시 이벤트를 만들지 않으므로 session_start 1건만 남는다.
 func TestHookUnknownSession(t *testing.T) {
 	storeRoot := filepath.Join(t.TempDir(), "storeroot")
 	cwd := t.TempDir()
@@ -353,30 +319,31 @@ func TestHookUnknownSession(t *testing.T) {
 		t.Fatalf("open session.db: %v", err)
 	}
 	var n int
+	var payload string
 	qErr := reader.QueryRow("SELECT count(*) FROM session_events").Scan(&n)
+	pErr := reader.QueryRow("SELECT payload FROM session_events WHERE event_type='session_start'").Scan(&payload)
 	_ = reader.Close()
-	if qErr != nil {
-		t.Fatalf("count events: %v", qErr)
+	if qErr != nil || pErr != nil {
+		t.Fatalf("query: count=%v payload=%v", qErr, pErr)
 	}
-	if n != 0 {
-		t.Fatalf("events=%d want 0 (unknown session must not append)", n)
+	if n != 1 {
+		t.Fatalf("events=%d want 1 (session_start 합성 등록만 — PreToolUse 통과는 무이벤트)", n)
 	}
-	if got := readDrops(t, dir); !strings.Contains(got, "unknown-session") {
-		t.Fatalf("drops=%q want unknown-session", got)
+	if !strings.Contains(payload, `"source":"first-event"`) {
+		t.Fatalf("payload=%q want source=first-event(합성 마커)", payload)
+	}
+	if got := readDropsOpt(t, dir); strings.Contains(got, "unknown-session") {
+		t.Fatalf("drops=%q — D51 후 unknown-session은 신규 발생 소멸", got)
 	}
 }
 
-// TestDropLineDiagnosticFields — D43: unknown-session drop 라인이 5필드
-// (ts, reason, sid8, hook_event, tool)를 기록한다. 미상 필드는 "-".
-func TestDropLineDiagnosticFields(t *testing.T) {
+// D51 — 미지 세션의 PostToolUse: 합성 등록(session_start) + tool_call까지 총 2이벤트가
+// 기록된다(트리거 이벤트도 정상 처리 경로 — 스펙 §2).
+func TestHookFirstEventRegistrationPostToolUse(t *testing.T) {
 	storeRoot := filepath.Join(t.TempDir(), "storeroot")
 	cwd := t.TempDir()
-	// 미지 세션(SessionStart 없음)의 PostToolUse/Read → unknown-session drop.
-	// session_id는 맨 canonical UUID — 호스트 접두(cc:)는 dispatch가 부여하므로
-	// sid8은 "cc:99999"가 된다(접두 UUID 앞 8자). 맨 UUID를 넘기면 "99999999"로 실패.
 	in := fixtureWith(t, "pretooluse-read.json", map[string]any{
 		"cwd":             cwd,
-		"session_id":      "99999999-0000-7000-8000-000000000000",
 		"hook_event_name": "PostToolUse",
 		"tool_name":       "Read",
 	})
@@ -385,19 +352,111 @@ func TestDropLineDiagnosticFields(t *testing.T) {
 		t.Fatalf("rc=%d want 0", rc)
 	}
 	dir := sessDir(t, storeRoot, cwd)
-	line := strings.TrimSpace(readDrops(t, dir))
-	fields := strings.Split(line, "\t")
-	if len(fields) != 5 {
-		t.Fatalf("fields=%d want 5 (line=%q)", len(fields), line)
+	reader, err := session.OpenReadOnly(dir)
+	if err != nil {
+		t.Fatalf("open session.db: %v", err)
 	}
-	if fields[1] != "unknown-session" {
-		t.Fatalf("reason=%q want unknown-session", fields[1])
+	var starts, calls int
+	e1 := reader.QueryRow("SELECT count(*) FROM session_events WHERE event_type='session_start'").Scan(&starts)
+	e2 := reader.QueryRow("SELECT count(*) FROM session_events WHERE event_type='tool_call'").Scan(&calls)
+	_ = reader.Close()
+	if e1 != nil || e2 != nil {
+		t.Fatalf("query: %v %v", e1, e2)
 	}
-	if fields[2] != "cc:99999" { // 세션ID 앞 8자(호스트 접두 포함)
-		t.Fatalf("sid8=%q want cc:99999", fields[2])
+	if starts != 1 || calls != 1 {
+		t.Fatalf("session_start=%d tool_call=%d want 1/1", starts, calls)
 	}
-	if fields[3] != "PostToolUse" || fields[4] != "Read" {
-		t.Fatalf("event/tool=%q/%q want PostToolUse/Read", fields[3], fields[4])
+}
+
+// D51 — 동일 미지 세션 이벤트 2연속: 세션 1행·session_start 1건(EnsureSession 멱등의
+// 신규 호출 지점 재확인 — 스펙 §2).
+func TestHookFirstEventIdempotent(t *testing.T) {
+	storeRoot := filepath.Join(t.TempDir(), "storeroot")
+	cwd := t.TempDir()
+	in := fixtureWith(t, "pretooluse-read.json", map[string]any{
+		"cwd": cwd, "hook_event_name": "PostToolUse", "tool_name": "Read",
+	})
+	env := map[string]string{"CTR_HOOK_DEADLINE_MS": "60000"}
+	for i := 0; i < 2; i++ {
+		if rc := runHook(t, storeRoot, in, env); rc != 0 {
+			t.Fatalf("run %d rc=%d want 0", i, rc)
+		}
+	}
+	dir := sessDir(t, storeRoot, cwd)
+	reader, err := session.OpenReadOnly(dir)
+	if err != nil {
+		t.Fatalf("open session.db: %v", err)
+	}
+	var sessions, starts int
+	e1 := reader.QueryRow("SELECT count(*) FROM sessions").Scan(&sessions)
+	e2 := reader.QueryRow("SELECT count(*) FROM session_events WHERE event_type='session_start'").Scan(&starts)
+	_ = reader.Close()
+	if e1 != nil || e2 != nil {
+		t.Fatalf("query: %v %v", e1, e2)
+	}
+	if sessions != 1 || starts != 1 {
+		t.Fatalf("sessions=%d starts=%d want 1/1 (멱등)", sessions, starts)
+	}
+}
+
+// D51 — 가드가 ad를 쓰는 유일 경로 회귀(스펙 §2): SessionStart 없이 대형 in-boundary 파일의
+// PreToolUse(Read)를 발화하면 합성 등록 후 가드가 deny를 내고, 그 warning이 합성 세션에 1건
+// 기록된다. guardSetup(선등록)을 쓰지 않는 게 핵심 — deny 경로의 ad.Append가 first-event 자동
+// 등록 세션 위에서 성립함을 고정한다. 대형 파일은 writeSized(strings.Repeat)로 임계 초과 조립.
+func TestHookFirstEventGuardDenyWarning(t *testing.T) {
+	storeRoot := filepath.Join(t.TempDir(), "storeroot")
+	cwd := evalLong(t, t.TempDir())
+	big := filepath.Join(cwd, "big.txt")
+	writeSized(t, big, 300*1024) // 임계 256KiB 초과 — in-boundary
+	env := map[string]string{"CTR_HOOK_DEADLINE_MS": "60000"}
+	out := runGuard(t, storeRoot, map[string]any{
+		"cwd":        cwd,
+		"tool_input": map[string]any{"file_path": big},
+	}, env)
+	if !strings.Contains(out, `"permissionDecision":"deny"`) {
+		t.Fatalf("deny 출력 없음(합성 등록 후 가드 발화): %q", out)
+	}
+	reader, err := session.OpenReadOnly(sessDir(t, storeRoot, cwd))
+	if err != nil {
+		t.Fatalf("open session.db: %v", err)
+	}
+	var starts, warns int
+	e1 := reader.QueryRow("SELECT count(*) FROM session_events WHERE event_type='session_start'").Scan(&starts)
+	e2 := reader.QueryRow("SELECT count(*) FROM session_events WHERE event_type='warning'").Scan(&warns)
+	_ = reader.Close()
+	if e1 != nil || e2 != nil {
+		t.Fatalf("query: %v %v", e1, e2)
+	}
+	if starts != 1 || warns != 1 {
+		t.Fatalf("session_start=%d warning=%d want 1/1(합성 등록 + 가드 deny warning)", starts, warns)
+	}
+}
+
+// TestAppendDropLineFormat — D43 5필드 포맷 핀(v0.9 이관): unknown-session 소멸로 결정적
+// 발화 경로가 사라져 appendDrop을 직접 호출해 라인 계약을 고정한다(스펙 §2).
+// "<unix-ts>\t<reason>\t<sid8>\t<hook_event>\t<tool>\n", sid8=앞 8자, 미상="-", 탭·개행 sanitize.
+func TestAppendDropLineFormat(t *testing.T) {
+	dir := t.TempDir()
+	appendDrop(dir, "format-probe", "cc:99999999-0000-7000-8000-000000000000", "PostToolUse", "Read")
+	appendDrop(dir, "tab\tnewline\n", "", "", "")
+	data, err := os.ReadFile(filepath.Join(dir, "session.drops.log"))
+	if err != nil {
+		t.Fatalf("read drops: %v", err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("lines=%d want 2", len(lines))
+	}
+	f := strings.Split(lines[0], "\t")
+	if len(f) != 5 {
+		t.Fatalf("fields=%d want 5 (line=%q)", len(f), lines[0])
+	}
+	if f[1] != "format-probe" || f[2] != "cc:99999" || f[3] != "PostToolUse" || f[4] != "Read" {
+		t.Fatalf("fields=%v want [ts format-probe cc:99999 PostToolUse Read]", f)
+	}
+	g := strings.Split(lines[1], "\t")
+	if len(g) != 5 || g[1] != "tab newline " || g[2] != "-" || g[3] != "-" || g[4] != "-" {
+		t.Fatalf("sanitize/미상 필드 위반: %v", g)
 	}
 }
 
