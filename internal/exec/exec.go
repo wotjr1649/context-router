@@ -414,7 +414,11 @@ func csEnv(scratch string) []string {
 	// shared-memory를 열다 landlock RO /tmp에서 EACCES로 실패한다.
 	xdg := filepath.Join(scratch, "xdg")
 	migrations := filepath.Join(xdg, "NuGet", "Migrations")
-	for _, d := range []string{home, nuget, nugetHTTP, nugetPlugins, migrations} {
+	// macOS는 ~/Library/Application Support/dotnet(Cocoa NSApplicationSupportDirectory)를 쓰는데
+	// DOTNET_CLI_HOME으로 못 옮긴다 — Foundation이 존중하는 CFFIXED_USER_HOME(+HOME)을 scratch
+	// 하위로 돌려 SBPL subpath 안에 넣고, first-run 워크로드 무결성 검사(네트워크)를 스킵한다.
+	userHome := filepath.Join(scratch, "home")
+	for _, d := range []string{home, nuget, nugetHTTP, nugetPlugins, migrations, userHome} {
 		_ = os.MkdirAll(d, 0o700)
 	}
 	_ = os.WriteFile(filepath.Join(migrations, "1"), nil, 0o600)
@@ -424,6 +428,9 @@ func csEnv(scratch string) []string {
 		"NUGET_HTTP_CACHE_PATH=" + nugetHTTP,
 		"NUGET_PLUGINS_CACHE_PATH=" + nugetPlugins,
 		"XDG_DATA_HOME=" + xdg,
+		"HOME=" + userHome,
+		"CFFIXED_USER_HOME=" + userHome,
+		"DOTNET_SKIP_WORKLOAD_INTEGRITY_CHECK=1",
 		"DOTNET_NOLOGO=1",
 		"DOTNET_CLI_TELEMETRY_OPTOUT=1",
 		"DOTNET_CLI_DO_NOT_USE_MSBUILD_SERVER=1",
