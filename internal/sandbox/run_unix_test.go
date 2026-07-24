@@ -8,7 +8,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"sync"
 	"testing"
 	"time"
@@ -32,9 +31,6 @@ func testSelfExe(t *testing.T) string {
 			return
 		}
 		bin := filepath.Join(dir, "ctr-test")
-		if runtime.GOOS == "windows" {
-			bin += ".exe"
-		}
 		cmd := exec.Command("go", "build", "-o", bin, "github.com/wotjr1649/context-router/cmd/context-router")
 		if out, err := cmd.CombinedOutput(); err != nil {
 			testExeErr = &buildErr{err: err, out: string(out)}
