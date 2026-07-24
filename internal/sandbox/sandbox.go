@@ -23,6 +23,10 @@ type Spec struct {
 	Timeout   time.Duration // 호출 계층에서 클램프 완료(120s 기본·1800s 상한)
 	StdoutCap int           // 32768 (D61)
 	StderrCap int           // 8192 (D61)
+
+	// Windows Job Object 캡(D59, 0=기본값). unix 구현은 무시한다.
+	MemLimitBytes uint64 // 잡 메모리 상한(0=4GiB)
+	ProcLimit     uint32 // 활성 프로세스 상한(0=64)
 }
 
 type Result struct {
