@@ -18,13 +18,34 @@ func wrapArgv(scratch string, argv []string, selfExe string) []string {
 	return append(out, argv...)
 }
 
-// applyLauncherRestriction: 쓰기=scratch·읽기=전역(BestEffort). 미지원 커널은 통과한다.
-// /dev/null 쓰기는 허용(셸 리다이렉트 등 일상 유틸 경로 — 검토 반영). scratch에는 REFER를
-// 부여해 스크래치 내부 rename/link(빌드·캐시·원자적 쓰기 패턴)를 ABI 2+ 커널에서 허용한다
-// — WithRefer 없이는 modern 커널에서 이 정당한 연산이 거부된다(#3).
+// applyLauncherRestriction: 쓰기=scratch·읽기=전역. /dev/null 쓰기 허용(셸 리다이렉트 등
+// 일상 유틸 경로). scratch에는 REFER를 부여해 스크래치 내부 rename/link(빌드·캐시·원자적
+// 쓰기 패턴)를 허용한다.
+//
+// ABI 게이트(#3 fix round 2): WithRefer는 go-landlock BestEffort에서 landlock ABI-1
+// 커널(5.13–5.18, 예: Ubuntu 22.04/5.15)일 때 refer 룰을 다운그레이드 못 해 룰셋 전체를
+// no-op으로 폐기한다(FSRule.downgrade→false ⇒ restrict.go가 v0 반환) — FS 격리가 조용히
+// 사라지는 회귀다. 그래서 refer는 하드(비-BestEffort) 구성으로 시도한다: 하드 구성은 커널
+// ABI 미달 시 landlock syscall 전에 compatibleWithABI 게이트가 error만 반환하고 아무 제한도
+// 걸지 않으므로, 실패를 안전한 분기점으로 쓸 수 있다.
+//   - ABI 2+ 커널: 최고 ABI부터 하드 시도 → 첫 성공이 이 커널의 최대 FS 격리 수준(+refer).
+//     상한은 V5(라운드 1 천장 유지 — V6+ RestrictPaths는 FS 동일, V9만 유닉스소켓 권한을
+//     추가로 걸어 러너 동작을 바꿀 수 있어 제외).
+//   - ABI 1 커널: 위 하드 시도가 모두 실패 → refer 없는 BestEffort로 격리 유지(폐기 회피).
+//   - landlock 미지원 커널: BestEffort no-op(정상 적용 경로 — ErrSetup 아님).
 func applyLauncherRestriction(scratch string) error {
-	return landlock.V5.BestEffort().RestrictPaths(
+	referRules := []landlock.Rule{
 		landlock.RWDirs(scratch).WithRefer(),
+		landlock.RODirs("/"),
+		landlock.RWFiles("/dev/null"),
+	}
+	for _, cfg := range []landlock.Config{landlock.V5, landlock.V4, landlock.V3, landlock.V2} {
+		if err := cfg.RestrictPaths(referRules...); err == nil {
+			return nil
+		}
+	}
+	return landlock.V5.BestEffort().RestrictPaths(
+		landlock.RWDirs(scratch),
 		landlock.RODirs("/"),
 		landlock.RWFiles("/dev/null"),
 	)
