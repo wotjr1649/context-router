@@ -45,6 +45,12 @@ Two tiers, matching the ADR/KEP/RFC industry split — do not conflate:
   parallel (cross-model, multi-angle), then merge findings before fixing.
   Re-reviews after fix rounds are subagent-only — Codex stays at max one pass
   per checkpoint (usage guard).
+- **Codex secure-review (Fable-safe, enforced)**: the controller must never pull
+  Codex review text into its own context — a PreToolUse hook denies `result` and
+  non-`--background` `review`/`adversarial-review` in the main session (subagents
+  allowed). Start reviews with `review --background`; delegate raw-review reading +
+  merge to an opus coordinator subagent that returns concept-level findings only.
+  Full protocol + dispatch template: `docs/codex-secure-review.md`.
 - **Execution**: superpowers `subagent-driven-development` — fresh subagent per task,
   task review (spec + quality), fix → re-review. BASE from the ledger, never `HEAD~1`.
 - **Subagent hygiene**: response-splitting discipline (no whole-file rewrites; build
