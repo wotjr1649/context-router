@@ -30,6 +30,7 @@ import (
 	"github.com/wotjr1649/context-router/internal/ident"
 	"github.com/wotjr1649/context-router/internal/ingest"
 	"github.com/wotjr1649/context-router/internal/netfetch"
+	"github.com/wotjr1649/context-router/internal/sandbox"
 	"github.com/wotjr1649/context-router/internal/session"
 	"github.com/wotjr1649/context-router/internal/store"
 	"github.com/wotjr1649/context-router/internal/transform"
@@ -205,6 +206,15 @@ func TestNewServerProfileGating(t *testing.T) {
 				// (skipDarwinNoIsolation 주석 참조) — 이 서브테스트가 검증하는 프로필별
 				// ingest/net 게이팅 자체는 darwin에서도 유효하니 그 부분은 계속 확인한다.
 				want = slices.DeleteFunc(slices.Clone(tt.want), func(s string) bool { return s == "ctr_transform" })
+			}
+			if sandbox.Probe(context.Background()) != nil {
+				// exec: sandbox.Probe 실패 환경(예: Job Object 미가용 windows)에서 NewServer는
+				// fail-closed로 ctr_execute·ctr_execute_file를 미등록한다(mcp.go:93-98). 프로필
+				// 게이팅 자체 검증은 유지한 채 두 도구만 기대에서 제외한다(위 darwin ctr_transform
+				// 선례와 동형 — 형제 TestExecuteRegisteredAndRuns의 skip과 동일 프로브 인지).
+				want = slices.DeleteFunc(slices.Clone(want), func(s string) bool {
+					return s == "ctr_execute" || s == "ctr_execute_file"
+				})
 			}
 			cs, _ := newTestServer(t, tt.enable)
 			lt, err := cs.ListTools(context.Background(), nil)
