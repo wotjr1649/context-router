@@ -1330,7 +1330,7 @@ const hostSnippet = `--- host adapter snippets (설계 §9) ---
 permissions (.claude/settings.json 예시 — ingest/net/global/exec는 기본 ask):
 {
   "permissions": {
-    "ask": ["mcp__ctr__ctr_index", "mcp__ctr__ctr_fetch_and_index", "mcp__ctr-global__*", "mcp__ctr__ctr_execute", "mcp__ctr__ctr_execute_file"]
+    "ask": ["mcp__ctr__ctr_index", "mcp__ctr__ctr_fetch_and_index", "mcp__ctr-global__*", "mcp__ctr-exec__ctr_execute", "mcp__ctr-exec__ctr_execute_file"]
   }
 }
 
