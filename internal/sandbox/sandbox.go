@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"time"
 )
 
@@ -32,12 +33,16 @@ type Result struct {
 	Duration                 time.Duration
 }
 
+// scratchPrefix: NewScratch가 만드는 스크래치 이름 접두 — SweepStale은 이 접두 항목만
+// 스윕 대상으로 삼아 공유 OS temp 하위 타 항목을 건드리지 않는다.
+const scratchPrefix = "run-"
+
 // NewScratch: 실행별 고유 스크래치(0700). 이름 충돌은 MkdirTemp가 회피.
 func NewScratch(parent string) (string, error) {
 	if err := os.MkdirAll(parent, 0o700); err != nil {
 		return "", fmt.Errorf("%w: 스크래치 부모 생성 실패", ErrSetup)
 	}
-	dir, err := os.MkdirTemp(parent, "run-")
+	dir, err := os.MkdirTemp(parent, scratchPrefix)
 	if err != nil {
 		return "", fmt.Errorf("%w: 스크래치 생성 실패", ErrSetup)
 	}
@@ -46,14 +51,24 @@ func NewScratch(parent string) (string, error) {
 
 // SweepStale: 기동 시 24h+ 스테일 스윕(D61 — best-effort, 실패 무시).
 func SweepStale(parent string, ttl time.Duration) {
+	// 부모가 실제 디렉터리가 아니면(심링크/정션 등 리파스 포인트) 스윕 생략 — 공유 OS
+	// temp 하위라 링크를 따라가 표적 밖을 지우지 않게(Lstat은 링크 자신을 보고, IsDir는
+	// 리파스 포인트에 대해 false).
+	if info, err := os.Lstat(parent); err != nil || !info.IsDir() {
+		return
+	}
 	ents, err := os.ReadDir(parent)
 	if err != nil {
 		return
 	}
 	cut := time.Now().Add(-ttl)
 	for _, e := range ents {
+		// NewScratch가 만든 접두 항목만 대상 — 타 항목은 스윕 밖.
+		if !e.IsDir() || !strings.HasPrefix(e.Name(), scratchPrefix) {
+			continue
+		}
 		info, err := e.Info()
-		if err != nil || !e.IsDir() {
+		if err != nil {
 			continue
 		}
 		if info.ModTime().Before(cut) {
@@ -74,10 +89,13 @@ func baseKeys() []string {
 	return []string{"PATH", "HOME", "TMPDIR", "LANG", "LC_ALL"}
 }
 
-// BaseEnv: 닫힌 표에 있는 변수만 현재 프로세스에서 복사(값 존재분만).
+// BaseEnv: 닫힌 표에 있는 변수만 현재 프로세스에서 복사(값 존재분만). 표 밖 변수가
+// 하나도 안 잡혀도 nil이 아닌 빈 슬라이스를 반환한다 — nil Env는 exec.Cmd에서 부모
+// 환경 전체 상속을 뜻해 닫힌 표를 무력화하므로.
 func BaseEnv() []string {
-	var out []string
-	for _, k := range baseKeys() {
+	keys := baseKeys()
+	out := make([]string, 0, len(keys))
+	for _, k := range keys {
 		if v, ok := os.LookupEnv(k); ok {
 			out = append(out, k+"="+v)
 		}

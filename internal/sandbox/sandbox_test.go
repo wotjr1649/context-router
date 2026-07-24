@@ -44,6 +44,37 @@ func TestSweepStaleRemovesOldKeepsFresh(t *testing.T) {
 	}
 }
 
+func TestSweepStaleSkipsNonScratchEntries(t *testing.T) {
+	parent := t.TempDir()
+	keep := filepath.Join(parent, "keep-me") // run- 접두 아님 → 스윕 밖
+	if err := os.Mkdir(keep, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	past := time.Now().Add(-48 * time.Hour)
+	if err := os.Chtimes(keep, past, past); err != nil {
+		t.Fatal(err)
+	}
+	SweepStale(parent, 24*time.Hour)
+	if _, err := os.Stat(keep); err != nil {
+		t.Fatalf("비-스크래치 항목 오삭제: %v", err)
+	}
+}
+
+func TestBaseEnvNeverNil(t *testing.T) {
+	// 닫힌 표의 모든 키를 지워 빈 케이스를 강제(t.Setenv가 원값 원복 등록 후 Unsetenv).
+	for _, k := range baseKeys() {
+		t.Setenv(k, "x")
+		os.Unsetenv(k)
+	}
+	got := BaseEnv()
+	if got == nil {
+		t.Fatalf("빈 케이스에서 nil — 부모 환경 상속 위험")
+	}
+	if len(got) != 0 {
+		t.Fatalf("빈 케이스인데 비어있지 않음: %v", got)
+	}
+}
+
 func TestBaseEnvClosedTable(t *testing.T) {
 	t.Setenv("CTR_TEST_EXCLUDED_VAR", "marker")
 	t.Setenv("PATH", os.Getenv("PATH")) // 존재 보장
