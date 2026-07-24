@@ -96,7 +96,7 @@ func table() map[string]runner {
 func Run(ctx context.Context, scratchParent, selfExe string, req Request) (Response, error) {
 	r, ok := table()[req.Language]
 	if !ok {
-		return Response{}, fmt.Errorf("%w: %s", ErrUnsupportedLang, req.Language)
+		return Response{}, ErrUnsupportedLang // I3: 입력 원문 에코 금지(오류 규칙·로그 인젝션)
 	}
 	bin, version, err := r.detect()
 	if err != nil {
@@ -126,7 +126,7 @@ func Run(ctx context.Context, scratchParent, selfExe string, req Request) (Respo
 	env = append(env, "CTR_SCRATCH="+scratch)
 
 	file := filepath.Join(scratch, r.file)
-	if err := os.WriteFile(file, []byte(req.Code), 0o600); err != nil {
+	if err := os.WriteFile(file, snippetContent(r.file, req.Code), 0o600); err != nil {
 		return Response{}, fmt.Errorf("%w: 스니펫 기록 실패", sandbox.ErrSetup)
 	}
 	spec := sandbox.Spec{
@@ -169,6 +169,16 @@ func runnerLabel(lang, bin, version string) string {
 func fileArgv(bin, file string) []string { return []string{bin, file} }
 func goArgv(bin, file string) []string   { return []string{bin, "run", file} }
 func csArgv(bin, file string) []string   { return []string{bin, "run", file} }
+
+// snippetContent: 스니펫 파일에 기록할 바이트. .ps1은 UTF-8 BOM을 선두에 붙인다(I2) —
+// powershell.exe 5.1이 BOM 없는 .ps1을 시스템 ANSI 코드페이지로 디코딩해 비ASCII를 손상시키기
+// 때문(한국어 Windows에서 관측). pwsh 7은 BOM을 허용하므로 fallback 양쪽 모두 안전하다.
+func snippetContent(fileName, code string) []byte {
+	if strings.HasSuffix(fileName, ".ps1") {
+		return append([]byte{0xEF, 0xBB, 0xBF}, code...)
+	}
+	return []byte(code)
+}
 
 func shellRunner() runner {
 	if runtime.GOOS == "windows" {
@@ -219,15 +229,51 @@ func tsRunner() runner {
 	}
 }
 
-// 버전 게이트는 프로세스 실행(node --version / dotnet --list-sdks)이 필요하므로 그 결과만
-// 서버 수명 sync.Once로 캐시한다(검토 반영 — 매 호출 재실행 금지). LookPath는 매 호출 유지.
+// 버전 게이트는 프로세스 실행(node --version / dotnet --list-sdks)이 필요하다. 프로브가
+// 성공해 확정한 결과(통과/버전미달)만 서버 수명 캐시하고(검토 반영 — 매 호출 재실행 금지),
+// 프로브 자체 실패(타임아웃/exec 오류)는 캐시하지 않아 다음 호출에서 재프로브한다(I1 —
+// sync.Once는 일시 실패도 영구 고정해 부적합). LookPath는 매 호출 유지.
 // ponytail: 서버 실행 중 toolchain이 교체되는 경우는 재기동으로 갱신(D60 문면 — 서버 수명 캐시).
+const gateProbeTimeout = 5 * time.Second
+
 var (
-	nodeGateOnce   sync.Once
-	nodeGateErr    error
-	dotnetGateOnce sync.Once
-	dotnetGateErr  error
+	nodeGateState   gate
+	dotnetGateState gate
 )
+
+// gate: 성공 프로브가 확정한 결과만 캐시하는 잠금(sync.Once 대체).
+type gate struct {
+	mu     sync.Mutex
+	cached bool
+	err    error
+}
+
+// do: probe가 (definitive, err)를 반환한다 — definitive=false(프로브 자체 실패)면 캐시하지
+// 않고 그대로 반환해 다음 호출에서 재시도한다.
+func (g *gate) do(probe func() (bool, error)) error {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.cached {
+		return g.err
+	}
+	definitive, err := probe()
+	if definitive {
+		g.cached, g.err = true, err
+	}
+	return err
+}
+
+// probeVersion: 버전 프로브에 고정 시한을 걸어 웜지 않은 toolchain이 exec·doctor를 무기한
+// 블록하지 못하게 한다(I1). ok=false는 프로브 자체 실패(타임아웃/exec 오류) — 캐시 금지.
+func probeVersion(bin string, timeout time.Duration, args ...string) (string, bool) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, bin, args...).Output()
+	if err != nil {
+		return "", false
+	}
+	return string(out), true
+}
 
 // detectTS: bun 우선, 없으면 node ≥22.7 게이트.
 func detectTS() (string, string, error) {
@@ -245,17 +291,16 @@ func detectTS() (string, string, error) {
 }
 
 func nodeGate(node string) error {
-	nodeGateOnce.Do(func() {
-		out, err := exec.Command(node, "--version").Output() // "v22.7.0\n"
-		if err != nil {
-			nodeGateErr = ErrToolchainMissing
-			return
+	return nodeGateState.do(func() (bool, error) {
+		out, ok := probeVersion(node, gateProbeTimeout, "--version") // "v22.7.0\n"
+		if !ok {
+			return false, ErrToolchainMissing // transient — 캐시 금지
 		}
-		if !nodeAtLeast(strings.TrimSpace(string(out)), 22, 7) {
-			nodeGateErr = fmt.Errorf("%w: node ≥22.7 필요", ErrVersionGate)
+		if !nodeAtLeast(strings.TrimSpace(out), 22, 7) {
+			return true, fmt.Errorf("%w: node ≥22.7 필요", ErrVersionGate)
 		}
+		return true, nil
 	})
-	return nodeGateErr
 }
 
 // nodeAtLeast: "vMAJOR.MINOR.PATCH"가 (major,minor) 이상인가.
@@ -322,17 +367,16 @@ func detectCS() (string, string, error) {
 }
 
 func dotnetGate(dotnet string) error {
-	dotnetGateOnce.Do(func() {
-		out, err := exec.Command(dotnet, "--list-sdks").Output()
-		if err != nil {
-			dotnetGateErr = ErrToolchainMissing
-			return
+	return dotnetGateState.do(func() (bool, error) {
+		out, ok := probeVersion(dotnet, gateProbeTimeout, "--list-sdks")
+		if !ok {
+			return false, ErrToolchainMissing // transient — 캐시 금지
 		}
-		if !dotnetHasMajor(string(out), 10) {
-			dotnetGateErr = fmt.Errorf("%w: .NET SDK ≥10 필요", ErrVersionGate)
+		if !dotnetHasMajor(out, 10) {
+			return true, fmt.Errorf("%w: .NET SDK ≥10 필요", ErrVersionGate)
 		}
+		return true, nil
 	})
-	return dotnetGateErr
 }
 
 // dotnetHasMajor: --list-sdks 출력에 major 이상 SDK가 하나라도 있는가.
@@ -352,15 +396,24 @@ func dotnetHasMajor(list string, major int) bool {
 
 // csEnv: dotnet CLI/NuGet 홈을 스크래치 하위로 재지정(그 디렉터리 생성)하고, in-job 실행에
 // 맞춰 MSBuild 서버/노드 재사용·공유 컴파일을 끈다(스크래치 수명 밖 프로세스 잔존 방지).
+// NUGET_PACKAGES는 global-packages만 재지정하므로 http/plugins 캐시도 스크래치 하위로 옮긴다
+// (I5 — 안 하면 HOME/LOCALAPPDATA로 이탈해 landlock write-deny로 실패하거나 D61 잔존물이 남음).
+// cold DOTNET_CLI_HOME는 매 실행 first-run이라 배너/텔레메트리가 stdout을 오염시킨다 — 끈다(I4).
 func csEnv(scratch string) []string {
 	home := filepath.Join(scratch, "dotnet")
 	nuget := filepath.Join(scratch, "nuget")
-	for _, d := range []string{home, nuget} {
+	nugetHTTP := filepath.Join(scratch, "nuget-http")
+	nugetPlugins := filepath.Join(scratch, "nuget-plugins")
+	for _, d := range []string{home, nuget, nugetHTTP, nugetPlugins} {
 		_ = os.MkdirAll(d, 0o700)
 	}
 	return []string{
 		"DOTNET_CLI_HOME=" + home,
 		"NUGET_PACKAGES=" + nuget,
+		"NUGET_HTTP_CACHE_PATH=" + nugetHTTP,
+		"NUGET_PLUGINS_CACHE_PATH=" + nugetPlugins,
+		"DOTNET_NOLOGO=1",
+		"DOTNET_CLI_TELEMETRY_OPTOUT=1",
 		"DOTNET_CLI_DO_NOT_USE_MSBUILD_SERVER=1",
 		"MSBUILDDISABLENODEREUSE=1",
 		"UseSharedCompilation=false",

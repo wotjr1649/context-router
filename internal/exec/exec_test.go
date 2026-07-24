@@ -1,7 +1,9 @@
 package exec
 
 import (
+	"bytes"
 	"context"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -9,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 // testSelfExe: 실 ctr 바이너리를 1회만 빌드해(sync.Once) 재사용한다 — transform 패키지의
@@ -83,11 +86,36 @@ func TestRunShellEcho(t *testing.T) {
 	}
 }
 
+// TestSnippetPS1BOM: I2 — .ps1 스니펫은 선두에 UTF-8 BOM(EF BB BF)이 붙어야 powershell.exe
+// 5.1이 비ASCII를 ANSI 코드페이지로 오독하지 않는다. 다른 확장자는 BOM이 붙지 않는다.
+func TestSnippetPS1BOM(t *testing.T) {
+	got := snippetContent("snippet.ps1", "Write-Output '한글'")
+	if !bytes.HasPrefix(got, []byte{0xEF, 0xBB, 0xBF}) {
+		t.Fatalf(".ps1 UTF-8 BOM 미기록: 선두=%x", got[:min(3, len(got))])
+	}
+	if !bytes.HasSuffix(got, []byte("Write-Output '한글'")) {
+		t.Fatalf("BOM 뒤 코드 원문 손상")
+	}
+	for _, f := range []string{"snippet.sh", "snippet.js", "snippet.py", "snippet.go", "snippet.cs"} {
+		if bytes.HasPrefix(snippetContent(f, "x"), []byte{0xEF, 0xBB, 0xBF}) {
+			t.Errorf("%s에 BOM 오부착", f)
+		}
+	}
+}
+
 func TestUnsupportedLang(t *testing.T) {
+	const lang = "brainfuck-마커-XYZ" // 원문 에코 여부를 구분할 유일 표식
 	_, err := Run(context.Background(), t.TempDir(), selfExe(t),
-		Request{Language: "brainfuck", Code: "+"})
+		Request{Language: lang, Code: "+"})
 	if err == nil || !strings.Contains(err.Error(), "지원") {
 		t.Fatalf("미지원 언어 오류 아님: %v", err)
+	}
+	// I3: 오류는 sentinel만 담고 사용자 입력 원문을 에코하지 않는다(오류 규칙·로그 인젝션).
+	if !errors.Is(err, ErrUnsupportedLang) {
+		t.Fatalf("sentinel(ErrUnsupportedLang) 아님: %v", err)
+	}
+	if strings.Contains(err.Error(), lang) {
+		t.Fatalf("오류에 입력 원문 에코: %v", err)
 	}
 }
 
@@ -153,6 +181,56 @@ func TestDotnetHasMajor(t *testing.T) {
 		if got := dotnetHasMajor(c.list, 10); got != c.want {
 			t.Errorf("dotnetHasMajor(%q)=%v want %v", c.list, got, c.want)
 		}
+	}
+}
+
+// TestGateCache: I1 — 프로브 자체 실패(definitive=false)는 캐시하지 않아 재프로브하고,
+// 확정 결과(definitive=true)는 서버 수명 캐시해 재프로브하지 않는다.
+func TestGateCache(t *testing.T) {
+	var g gate
+	calls := 0
+	transient := func() (bool, error) { calls++; return false, ErrToolchainMissing }
+	if err := g.do(transient); !errors.Is(err, ErrToolchainMissing) {
+		t.Fatalf("transient 1차: %v", err)
+	}
+	if err := g.do(transient); !errors.Is(err, ErrToolchainMissing) {
+		t.Fatalf("transient 2차: %v", err)
+	}
+	if calls != 2 {
+		t.Fatalf("transient 캐시됨(재프로브 안 함): calls=%d want 2", calls)
+	}
+	definitive := func() (bool, error) { calls++; return true, ErrVersionGate }
+	if err := g.do(definitive); !errors.Is(err, ErrVersionGate) {
+		t.Fatalf("definitive 1차: %v", err)
+	}
+	before := calls
+	if err := g.do(definitive); !errors.Is(err, ErrVersionGate) {
+		t.Fatalf("definitive 2차: %v", err)
+	}
+	if calls != before {
+		t.Fatalf("definitive 재프로브됨(캐시 미작동): calls=%d want %d", calls, before)
+	}
+}
+
+// TestProbeVersionTimeout: I1 — 프로브에 시한이 걸려 웜지 않은(sleeping) 프로세스가 무기한
+// 블록하지 않고 ok=false로 유한시간에 반환한다. 셸 미설치면 Skip(러너 의존).
+func TestProbeVersionTimeout(t *testing.T) {
+	sh, err := exec.LookPath(shellName())
+	if err != nil {
+		t.Skip("shell 미설치")
+	}
+	var args []string
+	if runtime.GOOS == "windows" {
+		args = []string{"-NoProfile", "-NonInteractive", "-Command", "Start-Sleep -Seconds 5"}
+	} else {
+		args = []string{"-c", "sleep 5"}
+	}
+	start := time.Now()
+	if out, ok := probeVersion(sh, 100*time.Millisecond, args...); ok {
+		t.Fatalf("시한 안에 안 끝났어야: out=%q", out)
+	}
+	if d := time.Since(start); d > 3*time.Second {
+		t.Fatalf("프로브 시한 미적용(5s sleep이 완주): %v", d)
 	}
 }
 
@@ -290,7 +368,22 @@ func TestCSEnvInjection(t *testing.T) {
 	if m["DOTNET_CLI_DO_NOT_USE_MSBUILD_SERVER"] != "1" {
 		t.Errorf("MSBUILD 서버 비활성 플래그 미주입")
 	}
-	for _, sub := range []string{"dotnet", "nuget"} { // 쓰기 계약 — 러너가 존재를 전제
+	// I4: cold DOTNET_CLI_HOME first-run 배너/텔레메트리가 stdout을 오염하지 않게 억제.
+	if m["DOTNET_NOLOGO"] != "1" {
+		t.Errorf("DOTNET_NOLOGO 미주입")
+	}
+	if m["DOTNET_CLI_TELEMETRY_OPTOUT"] != "1" {
+		t.Errorf("DOTNET_CLI_TELEMETRY_OPTOUT 미주입")
+	}
+	// I5: NuGet http/plugins 캐시도 스크래치 하위여야 한다(안 그러면 HOME/LOCALAPPDATA로 이탈).
+	if got := m["NUGET_HTTP_CACHE_PATH"]; got != filepath.Join(scratch, "nuget-http") {
+		t.Errorf("NUGET_HTTP_CACHE_PATH=%q (스크래치 하위 아님)", got)
+	}
+	if got := m["NUGET_PLUGINS_CACHE_PATH"]; got != filepath.Join(scratch, "nuget-plugins") {
+		t.Errorf("NUGET_PLUGINS_CACHE_PATH=%q (스크래치 하위 아님)", got)
+	}
+	// 쓰기 계약 — 러너가 재지정 디렉터리 존재를 전제(NuGet aux 캐시 포함)
+	for _, sub := range []string{"dotnet", "nuget", "nuget-http", "nuget-plugins"} {
 		if fi, err := os.Stat(filepath.Join(scratch, sub)); err != nil || !fi.IsDir() {
 			t.Errorf("재지정 디렉터리 %q 미생성: %v", sub, err)
 		}
