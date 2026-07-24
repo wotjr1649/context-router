@@ -21,6 +21,7 @@ import (
 	"strings"
 	"time"
 
+	ctrexec "github.com/wotjr1649/context-router/internal/exec"
 	"github.com/wotjr1649/context-router/internal/ident"
 	"github.com/wotjr1649/context-router/internal/session"
 	"github.com/wotjr1649/context-router/internal/store"
@@ -1314,20 +1315,22 @@ func probeFTS5(ctx context.Context, reader *sql.DB) error {
 }
 
 // hostSnippet: doctor 마지막에 출력하는 호스트 등록 안내(설계 §9) — Claude Code(.mcp.json +
-// permissions ask 규칙)와 Codex(config.toml 기본 6-도구 프로필 + approval prompt 권장).
+// permissions ask 규칙)와 Codex(config.toml 기본 6-도구 프로필 + approval prompt 권장). exec는
+// 기본 OFF·프로필 opt-in(--enable exec, D58)이라 활성 예시와 ask/enabled_tools 확장을 병기한다.
 const hostSnippet = `--- host adapter snippets (설계 §9) ---
 
 ## Claude Code (.mcp.json)
 {
   "mcpServers": {
     "ctr": { "command": "context-router", "args": [] },
-    "ctr-global": { "command": "context-router", "args": ["--profile", "global-search", "--projects", "<path-or-id,...>"] }
+    "ctr-global": { "command": "context-router", "args": ["--profile", "global-search", "--projects", "<path-or-id,...>"] },
+    "ctr-exec": { "command": "context-router", "args": ["--enable", "exec"] }
   }
 }
-permissions (.claude/settings.json 예시 — ingest/net/global은 기본 ask):
+permissions (.claude/settings.json 예시 — ingest/net/global/exec는 기본 ask):
 {
   "permissions": {
-    "ask": ["mcp__ctr__ctr_index", "mcp__ctr__ctr_fetch_and_index", "mcp__ctr-global__*"]
+    "ask": ["mcp__ctr__ctr_index", "mcp__ctr__ctr_fetch_and_index", "mcp__ctr-global__*", "mcp__ctr__ctr_execute", "mcp__ctr__ctr_execute_file"]
   }
 }
 
@@ -1337,6 +1340,7 @@ command = "context-router"
 args = []
 enabled_tools = ["ctr_search", "ctr_fetch", "ctr_transform", "ctr_record_event", "ctr_session_summary", "ctr_export_events"]
 # ingest/net 활성화 시 권장: default_tools_approval_mode = "prompt"
+# exec 프로필(--enable exec) 활성 시 enabled_tools에 "ctr_execute","ctr_execute_file" 추가 — approval prompt 권장.
 `
 
 // runDoctor: 5항목 진단(저장 루트/프로젝트 식별/content.db/FTS5/ledger.db) + 호스트 등록
@@ -1753,6 +1757,22 @@ func runDoctor(ctx context.Context, w io.Writer, storeRoot, projectRoot, version
 
 	bi, _ := debug.ReadBuildInfo() // 실패 시 nil — formatBuildLine이 생략 처리
 	fmt.Fprintln(w, formatBuildLine(version, bi))
+
+	// [18] exec 러너 감지(설계 v0.11 D58 — 실행 없음, LookPath/버전 게이트만). 정보성 라인 —
+	// exec는 기본 OFF·프로필 opt-in이라 미검출이어도 failed에 세지 않는다.
+	var parts []string
+	for _, s := range ctrexec.RunnerStatus() {
+		if s.OK {
+			label := s.Runner
+			if s.Version != "" {
+				label += "/" + s.Version
+			}
+			parts = append(parts, s.Lang+"="+label)
+		} else {
+			parts = append(parts, s.Lang+"=미검출")
+		}
+	}
+	fmt.Fprintf(w, "[18] exec runners: %s\n", strings.Join(parts, " "))
 
 	fmt.Fprintln(w)
 	fmt.Fprint(w, hostSnippet)
