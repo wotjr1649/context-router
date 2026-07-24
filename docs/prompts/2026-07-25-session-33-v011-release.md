@@ -49,7 +49,17 @@
      closed 6(T6 F1/F2·T7 F1 plan_conflict 존중, T3 deadline TimedOut 코드 처리 확인). v0.12+ 후보.
    - **관찰 이월(session-28~)**: D46 139MB 회수(사용자 창), empty GC 회수, doctor dirty=untracked
      .claude/.codex 코스메틱.
-   - 다음 = v0.12 스코프 브레인스토밍 or 도그푸딩 마무리 관측(사용자 지시 대기).
+   - **v0.12 브레인스토밍 시드(사용자 요청 2026-07-25)**: MCP 서버 등록/exec 활성화의 **수동 3파일
+     편집**(Claude `.mcp.json` ctr-exec·`settings.json` ask·Codex `config.toml` ctr-exec)을 **원커맨드
+     자동 설치/업데이트**로 개선. 사용자 지적 = 수동 설치·mcp 수정은 배포·MCP 개발론상 최악. 자문 결론:
+     가능·인프라 절반 존재 — `hook install`이 이미 멱등 병합·관리 블록·마커로 Claude settings.json hooks +
+     Codex config.toml `[mcp_servers.ctr]` + hooks.json을 자동 관리(비대칭 갭: Claude `.mcp.json` MCP 등록·
+     `permissions.ask`·exec opt-in만 수동). 방향: ① `hook install`/신규 `ctr setup` 원커맨드가 Claude
+     `.mcp.json`+ask까지 병합(멱등=설치·업데이트 겸용) ② self-heal marker 비교 갱신(doctor `[16][17]` 이미 표시)
+     ③ exec는 보안상 명시 opt-in 플래그(`--enable-exec`). 리서치: Claude Code 프로그래매틱 MCP 등록 경로
+     (`claude mcp add` CLI vs `.mcp.json`), 배포 채널, MCP 설치 표준. 설계 D-number 후보. 상세 메모리
+     [[v012-install-deploy-automation]].
+   - 다음 = v0.12 스코프 브레인스토밍(위 배포 자동화 포함) or 도그푸딩 마무리 관측(사용자 지시 대기).
 
 6. **Standing protocols** (유지):
    - **크로스모델 리뷰 = 중립 프레이밍 + 구조화 JSON findings**(hook 폐기, session-32 근본재설계).
@@ -69,6 +79,9 @@
    > 실검증 완료(격리 결함 4라운드 근본해소, 전부 격리 무손상). **다음 후보**: ① 도그푸딩 마무리(사용자 액션
    > — `hook install` cc/cx marker 0.11.0 갱신·MCP `--enable exec` 재기동 실사용·cx `/hooks` 재신뢰,
    > doctor `[16]` 0.10.0≠0.11.0 지적) ② v0.11 실관측(exec 실사용·adoption 베이스라인) ③ v0.12 스코프
-   > 브레인스토밍. 이월 Minor(`.superpowers/sdd/final-review-findings.json` defer 9)는 v0.12+ triage.
+   > 브레인스토밍(**사용자 요청 신규 항목: 설치/배포 자동화** — MCP 등록·exec 활성화 수동 3파일 편집을
+   > 원커맨드 자동 설치/업데이트로 개선; hook install 병합 인프라 확장·self-heal·exec 명시 opt-in;
+   > 상세 핸드오프 5번 Carryovers + 메모리 v012-install-deploy-automation). 이월 Minor
+   > (`.superpowers/sdd/final-review-findings.json` defer 9)는 v0.12+ triage.
    > 크로스모델 리뷰=중립 프레이밍+JSON findings(`docs/codex-secure-review.md`), 막히면 웹+Codex 협업,
    > CI 3-OS가 unix 실검증 권위(`gh pr checks` 전체 확인). Fable 유지+보안 서술 최소화. 사용자 지시 대기.
