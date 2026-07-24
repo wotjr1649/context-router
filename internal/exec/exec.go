@@ -1,0 +1,401 @@
+// Package exec — ctr_execute/execute_file의 러너 테이블(설계 v0.11 D60).
+// sandbox 위에서 언어별 toolchain을 감지·실행한다. 내장 인터프리터 없음.
+package exec
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/wotjr1649/context-router/internal/sandbox"
+)
+
+var (
+	ErrUnsupportedLang  = errors.New("exec: 지원하지 않는 언어")
+	ErrToolchainMissing = errors.New("exec: toolchain 미설치")
+	ErrVersionGate      = errors.New("exec: toolchain 버전 미달")
+)
+
+const (
+	defaultTimeout = 120_000
+	maxTimeout     = 1_800_000
+	stdoutCap      = 32768
+	stderrCap      = 8192
+)
+
+type Request struct {
+	Language, Code, FilePath string
+	WorktreeRoot             string // CTR_WORKTREE로 노출(D58 — cwd는 스크래치, 워크트리 접근은 env로)
+	TimeoutMS                int
+}
+
+type Response struct {
+	Stdout, Stderr string
+	ExitCode       *int // timed_out 시 nil (D61)
+	TimedOut       bool
+	StdoutTrunc    bool
+	StderrTrunc    bool
+	DurationMS     int64
+	Runner         string
+}
+
+func clampTimeout(ms int) time.Duration {
+	if ms <= 0 {
+		ms = defaultTimeout
+	} else if ms > maxTimeout {
+		ms = maxTimeout
+	}
+	return time.Duration(ms) * time.Millisecond
+}
+
+// runner: 한 언어의 실행 계약.
+type runner struct {
+	file   string // 스니펫 파일명
+	detect func() (bin, version string, err error)
+	argv   func(bin, file string) []string
+	extra  func(scratch string) []string // 러너별 재지정/강제 env (nil 가능)
+}
+
+func shellName() string {
+	if runtime.GOOS == "windows" {
+		return "pwsh"
+	}
+	return "sh"
+}
+
+// lookVersioned: bins를 우선순위로 찾는다(버전 게이트가 없는 언어용 — 첫 발견 반환).
+func lookVersioned(bins []string) (string, error) {
+	for _, b := range bins {
+		if p, err := exec.LookPath(b); err == nil {
+			return p, nil
+		}
+	}
+	return "", ErrToolchainMissing
+}
+
+func table() map[string]runner {
+	return map[string]runner{
+		"shell":      shellRunner(),
+		"javascript": {file: "snippet.js", detect: detectJS, argv: fileArgv},
+		"typescript": tsRunner(),
+		"python":     {file: "snippet.py", detect: detectPy, argv: fileArgv, extra: pyEnv},
+		"go":         {file: "snippet.go", detect: detectGo, argv: goArgv, extra: goEnv},
+		"csharp":     {file: "snippet.cs", detect: detectCS, argv: csArgv, extra: csEnv},
+	}
+}
+
+func Run(ctx context.Context, scratchParent, selfExe string, req Request) (Response, error) {
+	r, ok := table()[req.Language]
+	if !ok {
+		return Response{}, fmt.Errorf("%w: %s", ErrUnsupportedLang, req.Language)
+	}
+	bin, version, err := r.detect()
+	if err != nil {
+		return Response{}, err // ErrToolchainMissing / ErrVersionGate
+	}
+	scratch, err := sandbox.NewScratch(scratchParent)
+	if err != nil {
+		return Response{}, err // ErrSetup
+	}
+	defer func() { // D61: 삭제 실패는 warning — 회수는 기동 시 SweepStale
+		if rmErr := os.RemoveAll(scratch); rmErr != nil {
+			slog.Warn("exec: 스크래치 삭제 실패 — 기동 스윕이 회수", "error", rmErr)
+		}
+	}()
+
+	env := append(sandbox.BaseEnv(), tmpEnv(scratch)...) // 공통 temp 재지정(중복 키는 마지막 값 승리)
+	if r.extra != nil {
+		env = append(env, r.extra(scratch)...)
+	}
+	// execute_file: 파일 경로를 CTR_FILE로 노출(스니펫이 읽음)
+	if req.FilePath != "" {
+		env = append(env, "CTR_FILE="+req.FilePath)
+	}
+	if req.WorktreeRoot != "" {
+		env = append(env, "CTR_WORKTREE="+req.WorktreeRoot) // D58·검수 ⑩
+	}
+	env = append(env, "CTR_SCRATCH="+scratch)
+
+	file := filepath.Join(scratch, r.file)
+	if err := os.WriteFile(file, []byte(req.Code), 0o600); err != nil {
+		return Response{}, fmt.Errorf("%w: 스니펫 기록 실패", sandbox.ErrSetup)
+	}
+	spec := sandbox.Spec{
+		Argv: r.argv(bin, file), Dir: scratch, Env: env, SelfExe: selfExe,
+		Timeout: clampTimeout(req.TimeoutMS), StdoutCap: stdoutCap, StderrCap: stderrCap,
+	}
+	res, err := sandbox.Run(ctx, spec)
+	if err != nil {
+		return Response{}, err // ErrSetup 계열 또는 pre-Start ctx 오류
+	}
+	resp := Response{
+		Stdout: string(res.Stdout), Stderr: string(res.Stderr),
+		StdoutTrunc: res.StdoutTrunc, StderrTrunc: res.StderrTrunc,
+		DurationMS: res.Duration.Milliseconds(), Runner: runnerLabel(req.Language, bin, version),
+	}
+	// 취소/타임아웃 판정: res.TimedOut 단독으로 부족하다 — unix는 인플라이트 부모 deadline을
+	// ctx.Done() 경로로 처리해 TimedOut=false·ExitCode=-1로 반환하는 알려진 미세 불일치가
+	// 있다(태스크 계약). ctx.Err()를 함께 봐서 살해된 프로세스의 -1을 정상 종료로 오분류하지
+	// 않는다.
+	switch {
+	case res.TimedOut || errors.Is(ctx.Err(), context.DeadlineExceeded):
+		resp.TimedOut = true // ExitCode는 nil로 남긴다(D61)
+	case errors.Is(ctx.Err(), context.Canceled):
+		return Response{}, ctx.Err() // 부모 취소 — 오류로 전파(정상 결과로 위장 금지)
+	default:
+		ec := res.ExitCode
+		resp.ExitCode = &ec
+	}
+	return resp, nil
+}
+
+func runnerLabel(lang, bin, version string) string {
+	name := filepath.Base(bin)
+	if version != "" {
+		return name + " " + version
+	}
+	return name
+}
+
+func fileArgv(bin, file string) []string { return []string{bin, file} }
+func goArgv(bin, file string) []string   { return []string{bin, "run", file} }
+func csArgv(bin, file string) []string   { return []string{bin, "run", file} }
+
+func shellRunner() runner {
+	if runtime.GOOS == "windows" {
+		return runner{
+			file: "snippet.ps1",
+			detect: func() (string, string, error) {
+				if p, err := exec.LookPath("pwsh"); err == nil {
+					return p, "7", nil
+				}
+				if p, err := exec.LookPath("powershell"); err == nil {
+					return p, "5.1", nil // runner 필드로 5.1 가시화 (D60)
+				}
+				return "", "", ErrToolchainMissing
+			},
+			argv: func(bin, file string) []string {
+				return []string{bin, "-NoProfile", "-NonInteractive", "-File", file}
+			},
+		}
+	}
+	return runner{
+		file: "snippet.sh",
+		detect: func() (string, string, error) {
+			p, err := exec.LookPath("sh")
+			if err != nil {
+				return "", "", ErrToolchainMissing
+			}
+			return p, "", nil
+		},
+		argv: func(bin, file string) []string { return []string{bin, file} },
+	}
+}
+
+func detectJS() (string, string, error) {
+	p, err := lookVersioned([]string{"bun", "node"})
+	return p, "", err
+}
+
+func tsRunner() runner {
+	return runner{
+		file:   "snippet.ts",
+		detect: detectTS,
+		argv: func(bin, file string) []string {
+			if strings.HasPrefix(filepath.Base(bin), "bun") {
+				return []string{bin, file}
+			}
+			return []string{bin, "--experimental-transform-types", file}
+		},
+	}
+}
+
+// 버전 게이트는 프로세스 실행(node --version / dotnet --list-sdks)이 필요하므로 그 결과만
+// 서버 수명 sync.Once로 캐시한다(검토 반영 — 매 호출 재실행 금지). LookPath는 매 호출 유지.
+// ponytail: 서버 실행 중 toolchain이 교체되는 경우는 재기동으로 갱신(D60 문면 — 서버 수명 캐시).
+var (
+	nodeGateOnce   sync.Once
+	nodeGateErr    error
+	dotnetGateOnce sync.Once
+	dotnetGateErr  error
+)
+
+// detectTS: bun 우선, 없으면 node ≥22.7 게이트.
+func detectTS() (string, string, error) {
+	if p, err := exec.LookPath("bun"); err == nil {
+		return p, "", nil
+	}
+	p, err := exec.LookPath("node")
+	if err != nil {
+		return "", "", ErrToolchainMissing
+	}
+	if err := nodeGate(p); err != nil {
+		return "", "", err
+	}
+	return p, "", nil
+}
+
+func nodeGate(node string) error {
+	nodeGateOnce.Do(func() {
+		out, err := exec.Command(node, "--version").Output() // "v22.7.0\n"
+		if err != nil {
+			nodeGateErr = ErrToolchainMissing
+			return
+		}
+		if !nodeAtLeast(strings.TrimSpace(string(out)), 22, 7) {
+			nodeGateErr = fmt.Errorf("%w: node ≥22.7 필요", ErrVersionGate)
+		}
+	})
+	return nodeGateErr
+}
+
+// nodeAtLeast: "vMAJOR.MINOR.PATCH"가 (major,minor) 이상인가.
+func nodeAtLeast(v string, major, minor int) bool {
+	v = strings.TrimPrefix(v, "v")
+	parts := strings.SplitN(v, ".", 3)
+	if len(parts) < 2 {
+		return false
+	}
+	maj, _ := strconv.Atoi(parts[0])
+	min, _ := strconv.Atoi(parts[1])
+	if maj != major {
+		return maj > major
+	}
+	return min >= minor
+}
+
+func detectPy() (string, string, error) {
+	p, err := lookVersioned([]string{"python3", "python"})
+	return p, "", err
+}
+
+func pyEnv(scratch string) []string {
+	cache := filepath.Join(scratch, "pycache")
+	_ = os.MkdirAll(cache, 0o700)
+	return []string{"PYTHONPYCACHEPREFIX=" + cache}
+}
+
+func detectGo() (string, string, error) {
+	p, err := exec.LookPath("go")
+	if err != nil {
+		return "", "", ErrToolchainMissing
+	}
+	return p, "", nil
+}
+
+// goEnv: 빌드 캐시·모듈·임시를 스크래치 하위로 재지정하고 그 디렉터리를 생성한다.
+// GOTMPDIR은 go가 스스로 만들지 않으므로(내부적으로 그 안에 임시 하위만 생성) 사전 생성이
+// 필수다 — 없으면 `go run`이 work dir 생성에 실패한다.
+func goEnv(scratch string) []string {
+	build := filepath.Join(scratch, "go-build")
+	gopath := filepath.Join(scratch, "go")
+	gotmp := filepath.Join(scratch, "go-tmp")
+	for _, d := range []string{build, gopath, gotmp} {
+		_ = os.MkdirAll(d, 0o700)
+	}
+	return []string{
+		"GOCACHE=" + build,
+		"GOPATH=" + gopath,
+		"GOTMPDIR=" + gotmp,
+	}
+}
+
+// detectCS: dotnet + SDK ≥10 게이트.
+func detectCS() (string, string, error) {
+	p, err := exec.LookPath("dotnet")
+	if err != nil {
+		return "", "", ErrToolchainMissing
+	}
+	if err := dotnetGate(p); err != nil {
+		return "", "", err
+	}
+	return p, "10+", nil
+}
+
+func dotnetGate(dotnet string) error {
+	dotnetGateOnce.Do(func() {
+		out, err := exec.Command(dotnet, "--list-sdks").Output()
+		if err != nil {
+			dotnetGateErr = ErrToolchainMissing
+			return
+		}
+		if !dotnetHasMajor(string(out), 10) {
+			dotnetGateErr = fmt.Errorf("%w: .NET SDK ≥10 필요", ErrVersionGate)
+		}
+	})
+	return dotnetGateErr
+}
+
+// dotnetHasMajor: --list-sdks 출력에 major 이상 SDK가 하나라도 있는가.
+func dotnetHasMajor(list string, major int) bool {
+	for _, line := range strings.Split(list, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		maj, _ := strconv.Atoi(strings.SplitN(line, ".", 2)[0])
+		if maj >= major {
+			return true
+		}
+	}
+	return false
+}
+
+// csEnv: dotnet CLI/NuGet 홈을 스크래치 하위로 재지정(그 디렉터리 생성)하고, in-job 실행에
+// 맞춰 MSBuild 서버/노드 재사용·공유 컴파일을 끈다(스크래치 수명 밖 프로세스 잔존 방지).
+func csEnv(scratch string) []string {
+	home := filepath.Join(scratch, "dotnet")
+	nuget := filepath.Join(scratch, "nuget")
+	for _, d := range []string{home, nuget} {
+		_ = os.MkdirAll(d, 0o700)
+	}
+	return []string{
+		"DOTNET_CLI_HOME=" + home,
+		"NUGET_PACKAGES=" + nuget,
+		"DOTNET_CLI_DO_NOT_USE_MSBUILD_SERVER=1",
+		"MSBUILDDISABLENODEREUSE=1",
+		"UseSharedCompilation=false",
+	}
+}
+
+// tmpEnv: 공통 temp 재지정 — Unix는 TMPDIR, Windows는 TEMP·TMP를 스크래치 하위 tmp로
+// 돌리고 그 디렉터리를 생성한다(검토 반영). dotnet file-based 앱 산출물 등 temp 기록이
+// 스크래치 수명 안에 들어와 러너의 쓰기 계약과 충돌하지 않게 한다.
+func tmpEnv(scratch string) []string {
+	tmp := filepath.Join(scratch, "tmp")
+	_ = os.MkdirAll(tmp, 0o700)
+	if runtime.GOOS == "windows" {
+		return []string{"TEMP=" + tmp, "TMP=" + tmp}
+	}
+	return []string{"TMPDIR=" + tmp}
+}
+
+// RunnerStatus: doctor [18]용 — 각 언어의 감지 결과(실행 없음).
+type LangStatus struct {
+	Lang, Runner, Version string
+	OK                    bool
+}
+
+func RunnerStatus() []LangStatus {
+	langs := []string{"shell", "javascript", "typescript", "python", "go", "csharp"}
+	out := make([]LangStatus, 0, len(langs))
+	for _, l := range langs {
+		r := table()[l]
+		bin, ver, err := r.detect()
+		st := LangStatus{Lang: l, OK: err == nil, Version: ver}
+		if err == nil {
+			st.Runner = filepath.Base(bin)
+		}
+		out = append(out, st)
+	}
+	return out
+}
