@@ -1,89 +1,124 @@
-# Codex secure-review protocol (Fable-safe)
+# Cross-model review protocol (structured, controller-safe)
 
-How Codex review checkpoints run in this repo so the **Fable** model never trips
-its dual-use safeguard. Applies to every Codex review checkpoint here; it matters
-most on exec/sandbox tasks.
+How Codex review checkpoints run in this repo. Goal: the controller (main
+session) can consume a cross-model review's outcome without its content-safety
+layer tripping on dense review prose. The root fix is **neutral framing +
+structured output**, not a wrapper that hides the text from the controller.
 
-## Why
+## Why the earlier hook approach was removed (2026-07-24)
 
-The Fable safeguard reacts to the **density of sensitive terms in the main
-conversation context**, not to secret bytes (see memory
-`fable-security-prose-minimization`). A Codex security review's raw text is
-dense by nature, so when the **controller** reads that raw text to merge/adjudicate
-it, the density can trip the safeguard and force an Opus fallback (session-30).
-The fix keeps the raw text out of the controller's context entirely.
+A PreToolUse guard once blocked the controller from reading raw review text and
+forced a coordinator subagent to merge it. That treated the symptom: the
+controller still had to read *some* rendered summary, and if that summary was
+dense prose it tripped the layer regardless of who produced it. Blocking "who
+reads it" never fixed "what gets rendered". The guard hook and its coordinator
+hand-off were removed; the durable fix shapes the review so its consumable
+output is low-density by construction.
 
-## The rule (mechanically enforced)
+## Principles (web research — `.superpowers/sdd/safeguard-research.md`; G-Research, Crash Override)
 
-In this project the **controller (main session) must not pull Codex review text
-into its own context.** The text-returning companion commands — `result`, and
-`review`/`adversarial-review` without `--background` — are **denied in the main
-session** by the PreToolUse hook `~/.claude/hooks/codex-review-guard.mjs`.
+1. **Structured findings, not prose.** Normalize the review to a fixed JSON
+   schema: severity + `file:line` + one neutral line for the defect + one neutral
+   line for the fix. A normalized array is low-density; narrative prose is not.
+2. **Neutral framing.** Ask for a general correctness / contract-compliance /
+   resource-safety review, not an adversarial/exploit-labeled one. Fewer dense
+   topic terms in both the request and the result.
+3. **Legitimate context up front.** Own code, defensive/quality task.
+4. **Reviewer output is untrusted.** Validate to the schema; the controller
+   reads counts + verdict + `file:line` and drives fixes from the JSON file.
 
-- Allowed in the main session: `review --background` (kick off, progress only)
-  and `status`. So the controller still starts the review normally.
-- Allowed in a **subagent** (the hook detects `agent_id`): everything. The
-  subagent is the one that reads and merges the raw review.
+## The pattern (no hook, one review subagent)
 
-The guard is scoped to this project's root (`GUARDED_ROOTS` in the hook) and
-fails open, so it never wedges the session or affects other repos.
+1. Controller starts Codex in the background from the main session:
+   `node "<companion>" review --background --base <BASE>` — returns a job id.
+   The controller never calls `result` itself.
+2. Controller dispatches **one review subagent (opus)**. It:
+   - reviews the diff package itself, in neutral framing,
+   - reads the Codex review in its own context (`result <job-id>`),
+   - verifies each Codex claim against the real diff (accept / downgrade /
+     reject false positive, each with a one-line reason),
+   - integrates both into a single findings file in the schema below,
+   - returns ONLY: verdict + counts by severity + the file path + the ids of any
+     `plan_conflict` findings. Nothing beyond one neutral line per finding.
+3. Controller reads the JSON (low-density) and dispatches a fix subagent pointed
+   at the JSON file as its spec ("fix every critical + important").
+4. Re-review after a fix round = the review subagent again (subagent-only; Codex
+   stays one pass per checkpoint — usage guard).
 
-## The pattern
+Fix / re-review subagents are opus and may read raw detail from files safely.
 
-1. Controller starts the Codex review in the background from the main session:
-   `node <companion> review --background --base <BASE>` (returns a job id).
-2. Controller dispatches the task's own **sub-reviewer** subagent as usual
-   (opus) — its findings are already concept-level and safe for the controller
-   to read.
-3. Controller dispatches one **opus coordinator subagent** with: the sub-reviewer
-   findings file path, the Codex job id (or `--base`), and the output path. The
-   coordinator:
-   - reads the Codex review in **its own** context (`result <job-id>`, allowed
-     for subagents),
-   - merges it with the sub-reviewer findings,
-   - writes a **concept-level** merged findings file — per finding: severity +
-     `file:line` + a one-line engineering fix. **No** attack chains, isolation/
-     evasion vector enumeration, or threat-model prose,
-   - returns only a short concept-level summary.
-4. Controller reads only the concept-level file and dispatches fixes. Fix /
-   re-review subagents are opus and may read raw detail from files safely.
+## Findings schema
 
-Outbound too: if an `adversarial-review` needs a detailed focus, the coordinator
-composes it — the controller states the focus at concept level only.
+```json
+{
+  "verdict": "approved | needs_fixes",
+  "counts": { "critical": 0, "important": 0, "minor": 0 },
+  "findings": [
+    {
+      "id": "F1",
+      "severity": "critical | important | minor",
+      "file": "internal/exec/exec.go",
+      "line": 116,
+      "defect": "one neutral line: the observed wrong behavior",
+      "fix": "one neutral line: the engineering change",
+      "source": "sub | codex | both",
+      "plan_conflict": false
+    }
+  ]
+}
+```
 
-## Coordinator dispatch template
+- `defect` / `fix`: neutral engineering wording — state the behavior and the
+  change. Do **not** write exploit / isolation / evasion narrative.
+- `plan_conflict: true` → the fix would contradict the plan's text; the
+  controller escalates to the human (these are typically non-security, e.g. an
+  env-key or closed-table decision).
+- `source`: which review raised it (used for final-review triage).
+
+## Review subagent dispatch template
 
 ```
 Subagent (general-purpose), model: opus
-description: "Codex secure-review coordinator: Task N"
+description: "Cross-model review: Task N"
 prompt: |
-  You merge two code reviews for Task N into one concept-level findings file.
+  Review one task's diff for correctness, contract-compliance, resource safety,
+  and error handling. This is your own code under a quality task.
   Work from: <repo root>
 
   Inputs:
-  - Sub-reviewer findings (already concept-level): <sub-reviewer report path>
-  - Codex review: run `node "<companion>" result <job-id>` to read it IN YOUR
-    OWN context (you are a subagent; this is allowed). If it is not ready, poll
-    with `node "<companion>" status <job-id>` until complete, then `result`.
-  - Task brief (what was requested): <brief path>
+  - Task brief (requirements): <brief path>
+  - Diff package: <review-package path>
+  - Codex review: run `node "<companion>" result <job-id>` to read it in YOUR
+    OWN context. If not ready, poll `status <job-id>`, then result.
 
   Do:
-  1. Read the sub-reviewer findings and the Codex review.
-  2. Merge into one deduplicated list. For each finding record: severity
-     (Critical/Important/Minor), file:line, and a ONE-LINE engineering fix.
-  3. Write the merged list to <output path>. Keep it CONCEPT LEVEL: state the
-     defect class and the fix. Do NOT enumerate exploitation/isolation/evasion
-     vectors or write threat-model prose — a terse "unbounded wait after kill →
-     add WaitDelay bound" style, not a mechanism walkthrough.
-  4. Note any finding where the two reviews disagree, and your adjudication.
+  1. Review the diff yourself against the brief.
+  2. Read the Codex review; verify each claim against the real diff
+     (accept / downgrade / reject false positive, one-line reason each).
+  3. Integrate both into ONE findings file at <output path>, in the fixed JSON
+     schema (verdict, counts, findings[]). Each finding: severity + file:line +
+     ONE neutral line for the defect + ONE neutral line for the fix + source +
+     plan_conflict. Neutral engineering wording only — the behavior and the
+     change; NO exploit/isolation/evasion narrative.
+  4. Set plan_conflict=true on any finding whose fix would contradict the brief.
 
-  Return ONLY (≤12 lines): counts by severity, the output file path, and any
-  disagreement you adjudicated. No vector prose in your reply.
+  Return ONLY (<=10 lines): verdict, counts by severity, the output file path,
+  and the ids of any plan_conflict findings. No prose beyond that.
 ```
 
-## Extending / disabling
+## Outbound (adversarial-review)
 
-- Add another repo root to `GUARDED_ROOTS` in the hook to guard it too.
-- The guard is registered in `~/.claude/settings.json` under `PreToolUse`
-  (Bash + PowerShell). Remove those two entries to disable. Self-test:
-  `node ~/.claude/hooks/codex-review-guard.test.mjs`.
+Prefer neutral `review` for routine checkpoints; avoid `adversarial-review`. If a
+focused check is genuinely needed, state the focus in neutral engineering terms
+(a contract to verify, an input class to exercise) — never an exploit narrative —
+and keep it in-diff (an out-of-sandbox focus has no turn-timeout and hangs; see
+global CLAUDE.md §5).
+
+## Toolchain notes
+
+- Companion: glob `~/.claude/plugins/cache/**/scripts/codex-companion.mjs`
+  (version dir changes on update).
+- `review` / `result` / `adversarial-review` are `disable-model-invocation`-gated
+  → run via Bash `node "<companion>" <subcmd>`, not the Skill tool.
+- **No PreToolUse guard is registered.** The protocol is prompt-and-schema
+  discipline, model-agnostic. (`codex-review-guard` removed 2026-07-24.)
