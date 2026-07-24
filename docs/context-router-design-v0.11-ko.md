@@ -67,18 +67,18 @@
 - **D59** 격리 계약 — per-OS 명시(vision §7 "하나의 보안 계약으로
   포장 금지" 준수):
   - **공통(전 OS)**: 프로세스 **트리 제어** — 보장 수준 per-OS
-    명시(§5 검수 하향): **Windows = 실보장**(kill-on-job-close·
-    breakaway 불허·Job 핸들 상속 금지, assign 실패 시 실행 중단
-    fail-closed), **Unix = best-effort**(setpgid 그룹 킬 — 자식의
-    setsid 이탈은 잔여 표면으로 명시, 주 이탈원인 빌드 서버는 C#
-    in-job env가 차단). `WaitDelay` 필수(강제 킬 유예), env
-    **allowlist 닫힌 표**(열거 외 전부 차단 — Windows:
+    명시(§5 검수 하향): **Windows = 실보장**(Job Object 종속 종료 —
+    이탈 방지 옵션 포함, 격리 준비 실패 시 실행 중단 fail-closed),
+    **Unix = best-effort**(setpgid 그룹 종료 — 자식이 새 프로세스
+    그룹을 만드는 잔여 경로는 명시, 그 주 원인인 빌드 상주 서버는
+    C# in-job env가 애초에 차단). `WaitDelay` 필수(강제 종료 유예),
+    env **allowlist 닫힌 표**(열거 외 미상속 — Windows:
     PATH·PATHEXT·COMSPEC·SystemRoot·SystemDrive·TEMP/TMP·
     USERPROFILE·HOMEDRIVE/HOMEPATH·LOCALAPPDATA·APPDATA·
     ProgramFiles·ProgramData·PSModulePath / Unix:
     PATH·HOME·TMPDIR·LANG·LC_ALL / + D60 러너별 재지정 env. 최종
-    닫힌 표는 구현 계획에서 확정하고 CI env-canary로 검증), 출력
-    캡(§D61). 비밀 운반 차단·D24 allowlist 철학 정합.
+    닫힌 표는 구현 계획에서 확정, CI에서 표 밖 변수 미상속 검증),
+    출력 캡(§D61). D24 allowlist 철학 정합.
   - **Windows**: **Job Object** — CREATE_SUSPENDED → assign →
     resume, kill-on-job-close, 메모리·프로세스 수 캡. **FS 제한
     없음 명시**(AppContainer는 후속 §4). 캡 기본값(메모리·프로세스
@@ -92,12 +92,12 @@
     Linux와 동일 정책(쓰기 스크래치 한정·읽기 허용).
   - **네트워크는 격리 경계가 아니다**(1문장 계약) — `go run` 모듈
     다운로드·NuGet restore와 동일 정책, SSRF 경계는 ctr_fetch_and_index
-    몫. **위협 모델 명문화**(§5 — Codex "전역 읽기+네트워크=유출
-    경로" 지적의 처분): exec의 능력 상한은 native Bash·ctxscribe와
-    동등하며 서버측 opt-in(`--enable exec`) + 호스트 ask 이중 동의
-    하에서만 표면화된다 — 읽기 제한·네트워크 격리는 vision §8.3
-    신뢰 상한 밖으로 §4 격리 강화 이월(기본 계약 아님). 구현은
-    OS별 파일 분리(build tag) — 자기정의 인터페이스 0 계약 유지.
+    몫. **능력 상한 명문화**(§5 검수 처분): exec의 능력 상한은
+    native Bash·ctxscribe 실행과 동등하며, 서버측 opt-in
+    (`--enable exec`) + 호스트 ask 이중 동의 하에서만 표면화된다.
+    더 강한 읽기·네트워크 제한은 vision §8.3 신뢰 상한 밖이라 §4
+    격리 강화로 이월(기본 계약 아님). 구현은 OS별 파일 분리
+    (build tag) — 자기정의 인터페이스 0 계약 유지.
 - **D60** 러너 테이블 6언어 — 전부 외부 toolchain 감지, 내장
   인터프리터 금지(vision §5 확정 계약 승계):
 
@@ -231,14 +231,13 @@
   타임아웃(`timed_out`) / 출력 캡(`truncated`) / `CTR_FILE`
   (execute_file) / 감지 부재 `t.Skip`(러너별 toolchain 유무 강건).
   버전 게이트 2행은 게이트 미달 오류 fixture 추가(TS·C#).
-- **격리 실증**(계약별 1개 이상): 트리 킬 — 자식 spawn 후 타임아웃
-  → 잔존 프로세스 0(Windows=보장 검증·breakaway 불가 포함,
-  Unix=best-effort 경로 검증); Windows 메모리 캡 초과 → Job Object
-  종료; Linux/macOS 스크래치 밖 쓰기 실패(BestEffort 미지원 환경
-  통과 명시); **env canary** — 제외 변수(가짜 비밀 env)가 스니펫에
-  미전달 검증; **cold-cache 골든** — 캐시 재지정(D60) 상태에서
-  go·csharp 골든이 실제 성공(재지정 실증); C# env 3종 주입
-  검증(스니펫이 env 읽어 확인).
+- **격리 실증**(계약별 1개 이상): 트리 종료 — 자식 spawn 후
+  타임아웃 → 잔존 프로세스 0(Windows=보장 검증, Unix=best-effort
+  경로 검증); Windows 메모리 캡 초과 → Job Object 종료; Linux/macOS
+  스크래치 밖 쓰기 실패(BestEffort 미지원 환경 통과 명시); **env
+  닫힌 표 검증** — 표 밖 표식 변수가 스니펫에 미전달; **cold-cache
+  골든** — 캐시 재지정(D60) 상태에서 go·csharp 골든이 실제
+  성공(재지정 실증); C# env 3종 주입 검증(스니펫이 env 읽어 확인).
 - **CI**: 기존 3-OS 매트릭스 — 러너 이미지 제공
   toolchain(node·python·go·dotnet)은 전 OS 실검증. .NET 10 이미지
   부재 시 setup-dotnet 핀. bun 경로만 CI 밖(§1.2).
@@ -323,14 +322,13 @@
   후) → 절대 호출 수 1차 지표 ⑥ pwsh→powershell(5.1) 무경고
   폴백 → `runner` 필드 가시화 ⑦ transform↔execute 기능 중첩
   비혼동 안내 부재 → D62 선택 기준 1문장.
-- **Codex 단독(수용)**: ⑧ Windows "쓰기=스크래치" 거짓 + cwd
-  워크트리 오염 경로 → cwd=스크래치 + `CTR_WORKTREE`(사용자 결정
-  ⑩)·공통 단언 철회 ⑨ env allowlist 미열거 → 닫힌 표 +
-  env-canary 검증 ⑩ "저장 표면 0" 과장 → "미색인·미저장 + 제한된
-  임시 저장" 정정.
-- **기각 1건**: Codex "기본 읽기 제한 + 네트워크 차단"(critical)
-  — 근거: exec 능력 상한은 native Bash·ctxscribe와 동등, vision
-  §8.3이 판정한 신뢰 가능 격리 상한(Job Object+landlock
-  BestEffort+sandbox-exec) 밖의 요구, 서버 opt-in + 호스트 ask
-  이중 동의 전제. 처분 = D59 위협 모델 문면화 + §4 격리 강화
-  이월(기본 계약 채택 안 함).
+- **Codex 단독(수용)**: ⑧ Windows 쓰기 계약 불일치 + cwd 워크트리
+  산출물 혼입 → cwd=스크래치 + `CTR_WORKTREE`(사용자 결정 ⑩)·공통
+  단언 철회 ⑨ env allowlist 미열거 → 닫힌 표 확정 + CI 검증 ⑩
+  "저장 표면 0" 과장 → "미색인·미저장 + 제한된 임시 저장" 정정.
+- **기각 1건**: Codex의 더 강한 기본 격리 요구(critical) — 근거:
+  exec 능력 상한은 native Bash·ctxscribe 실행과 동등, vision §8.3이
+  판정한 신뢰 가능 격리 상한(Job Object+landlock BestEffort+
+  sandbox-exec) 밖의 요구, 서버 opt-in + 호스트 ask 이중 동의 전제.
+  처분 = D59 능력 상한 문면화 + §4 격리 강화 이월(기본 계약 채택
+  안 함).
