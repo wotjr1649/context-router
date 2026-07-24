@@ -10,6 +10,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os/exec"
 	"sync"
 	"syscall"
@@ -145,14 +146,20 @@ func Run(ctx context.Context, s Spec) (Result, error) {
 		return Result{}, fmt.Errorf("%w: Job 준비: %v", ErrSetup, err)
 	}
 	var once sync.Once
-	// closeJob: 마지막 잡 핸들 close → KILL_ON_JOB_CLOSE로 트리 종료·핸들 해제. Cancel과
-	// defer 양쪽에서 호출되므로 sync.Once로 이중 close를 막는다.
-	closeJob := func() error {
+	// terminateJob: 타임아웃/취소·정상 정리 공통의 1차 teardown. TerminateJobObject로 잡의
+	// 전 프로세스를 결정적으로 종료한 뒤 핸들을 닫는다 — 핸들 수와 무관하게 트리를 끝내므로
+	// KILL_ON_JOB_CLOSE의 "마지막 핸들" 전제가 무너져도(핸들이 어디선가 살아있어도) 잔존이
+	// 없다. KILL_ON_JOB_CLOSE는 정리 없이 죽는 크래시 경로의 백스톱으로만 남긴다. Cancel과
+	// defer 양쪽에서 불려 sync.Once로 1회화.
+	terminateJob := func() error {
 		var e error
-		once.Do(func() { e = windows.CloseHandle(job) })
+		once.Do(func() {
+			_ = windows.TerminateJobObject(job, 1)
+			e = windows.CloseHandle(job)
+		})
 		return e
 	}
-	defer closeJob()
+	defer terminateJob()
 
 	timeoutCtx, cancel := context.WithTimeout(ctx, s.Timeout)
 	defer cancel()
@@ -166,25 +173,36 @@ func Run(ctx context.Context, s Spec) (Result, error) {
 	cmd.Stdout, cmd.Stderr = out, errw
 	// Cancel/WaitDelay는 반드시 Start() 전에 설정한다 — Start() 내부 watchCtx 고루틴이 이
 	// 필드를 동기화 없이 읽으므로 Start() 후 재대입은 데이터 레이스(transform worker 리뷰
-	// 선례). ctx 만료 시 잡 클로즈로 트리째 종료하고, WaitDelay 내 파이프가 안 닫히면
-	// os/exec가 강제 회수해 Wait가 부분 출력으로 반환한다(D59).
-	cmd.Cancel = closeJob
+	// 선례). ctx 만료 시 잡을 명시적으로 종료해 트리째 끝내고, WaitDelay 내 파이프가 안
+	// 닫히면 os/exec가 강제 회수해 Wait가 부분 출력으로 반환한다(D59).
+	cmd.Cancel = terminateJob
 	cmd.WaitDelay = waitDelay
 
 	start := time.Now()
 	if err := cmd.Start(); err != nil {
-		return Result{}, fmt.Errorf("%w: 프로세스 시작: %v", ErrSetup, err)
+		// ctx가 Start 전/중에 이미 만료·취소된 경우는 격리 준비 실패가 아니다: deadline은
+		// 타임아웃 Result로, cancel은 context 오류로 전파한다(ErrSetup으로 감싸지 않음).
+		switch {
+		case errors.Is(err, context.DeadlineExceeded):
+			return Result{TimedOut: true, ExitCode: -1, Duration: time.Since(start)}, nil
+		case errors.Is(err, context.Canceled):
+			return Result{}, context.Canceled
+		}
+		// 원본 err는 해석된 실행 파일 경로를 담을 수 있어 로그로만 남기고, 반환 메시지는
+		// 경로 없이 유지한다.
+		slog.Error("sandbox: 자식 프로세스 시작 실패", "err", err)
+		return Result{}, fmt.Errorf("%w: 프로세스 시작", ErrSetup)
 	}
 
 	// CREATE_SUSPENDED → 배정 → 재개: 자식이 잡 배정 전에 손자를 만들지 못하게 한다.
 	if err := assignToJob(job, cmd.Process.Pid); err != nil {
-		_ = cmd.Process.Kill() // 아직 잡 미배정 — 직접 kill(배정 후면 closeJob이 커버)
+		_ = cmd.Process.Kill() // 아직 잡 미배정 — 직접 kill(배정 후면 terminateJob이 커버)
 		_ = cmd.Wait()         // reap + watchCtx 고루틴 회수
 		return Result{}, fmt.Errorf("%w: Job 배정: %v", ErrSetup, err)
 	}
 	if err := resumeMainThread(cmd.Process.Pid); err != nil {
-		_ = closeJob() // 자식은 잡에 배정됨 → 잡 클로즈로 (미재개 상태라도) 종료
-		_ = cmd.Wait() // reap
+		_ = terminateJob() // 자식은 잡에 배정됨 → 잡 종료로 (미재개 상태라도) 정리
+		_ = cmd.Wait()     // reap
 		return Result{}, fmt.Errorf("%w: 스레드 재개: %v", ErrSetup, err)
 	}
 
