@@ -424,6 +424,8 @@ func runUsage(ctx context.Context, w io.Writer, args []string, storeRoot, projec
 	compare := fs.Bool("compare", false, "채널(cc/cx)×hooks:on/off 비교 리포트(설계 v0.6 D45 — 본표 대체)")
 	minRecords := fs.Int64("min-records", 0, "집계 제외 임계(cc=records, cx=turns; --compare 전용)")
 	rollouts := fs.String("rollouts", "", "Codex rollout 루트(--compare 전용, 생략 시 ~/.codex/sessions)")
+	adoption := fs.Bool("adoption", false, "ctr vs ctxscribe MCP 호출 채택 계측(session.db 집계 — transcript 토큰 집계와 별개, 설계 v0.11 D62)")
+	days := fs.Int("days", 0, "최근 N일로 제한(--adoption 전용, 0=전체)")
 	if err := fs.Parse(args); err != nil {
 		return fmt.Errorf("usage: 플래그 파싱 실패: %w", err)
 	}
@@ -435,6 +437,15 @@ func runUsage(ctx context.Context, w io.Writer, args []string, storeRoot, projec
 	}
 	if !*compare && (*minRecords != 0 || *rollouts != "") {
 		return errors.New("usage: --min-records/--rollouts는 --compare 전용입니다")
+	}
+	if *adoption && (*compare || *totals) {
+		return errors.New("usage: --adoption은 --compare/--totals와 함께 쓸 수 없습니다")
+	}
+	if !*adoption && *days != 0 {
+		return errors.New("usage: --days는 --adoption 전용입니다")
+	}
+	if *adoption {
+		return runUsageAdoption(ctx, w, storeRoot, projectRoot, *days, time.Now())
 	}
 	if *compare {
 		dir := *transcripts
@@ -493,6 +504,62 @@ func runUsage(ctx context.Context, w io.Writer, args []string, storeRoot, projec
 	if *totals {
 		fmt.Fprintf(w, "TOTAL:hooks:on\t%d\t%d\t%d\t%d\t%d\thooks:on\n", onSum.input, onSum.output, onSum.cacheRead, onSum.cacheCreate, onSum.records)
 		fmt.Fprintf(w, "TOTAL:hooks:off\t%d\t%d\t%d\t%d\t%d\thooks:off\n", offSum.input, offSum.output, offSum.cacheRead, offSum.cacheCreate, offSum.records)
+	}
+	return nil
+}
+
+// openSessionDBReadOnly — 현재 worktree의 session.db를 read-only로 연다(loadCCSessions의 열기
+// 관례 재사용: canonicalize → sessDir → session.OpenReadOnly). 대상 DB를 오염시키지 않는다.
+func openSessionDBReadOnly(storeRoot, projectRoot string) (*sql.DB, error) {
+	canon, err := ident.Canonicalize(projectRoot)
+	if err != nil || canon.ProjectID == "" {
+		// §12 canary: Canonicalize의 *fs.PathError는 절대경로를 담는다 — 정적 메시지만.
+		return nil, errors.New("usage: 프로젝트 식별 실패")
+	}
+	sessDir := filepath.Join(storeRoot, "projects", canon.ProjectID, "worktrees", canon.WorktreeID)
+	return session.OpenReadOnly(sessDir)
+}
+
+// runUsageAdoption: session_events(tool_call)를 ctr/ctxscribe로 분류 집계한다(설계 v0.11 D62).
+// 1차 지표 = 절대 호출 수. 비율은 참고(브리지 종료 후 분모 붕괴 — 스펙 명시). read-only라 대상
+// DB를 오염시키지 않는다.
+func runUsageAdoption(ctx context.Context, w io.Writer, storeRoot, projectRoot string, days int, now time.Time) error {
+	db, err := openSessionDBReadOnly(storeRoot, projectRoot) // loadCCSessions의 열기 관례 재사용
+	if err != nil {
+		return errors.New("usage: 세션 저장소를 열 수 없습니다")
+	}
+	defer func() { _ = db.Close() }()
+	q := "SELECT summary, COUNT(*) FROM session_events WHERE event_type='tool_call'"
+	var args []any
+	if days > 0 {
+		q += " AND ts >= ?"
+		args = append(args, now.AddDate(0, 0, -days).Unix())
+	}
+	q += " GROUP BY summary"
+	rows, err := db.QueryContext(ctx, q, args...)
+	if err != nil {
+		return errors.New("usage: 집계 조회 실패")
+	}
+	defer func() { _ = rows.Close() }()
+	var nCtr, nCtx int64 // 파라미터 ctx(context.Context)와의 재선언 충돌 회피
+	for rows.Next() {
+		var s string
+		var n int64
+		if err := rows.Scan(&s, &n); err != nil {
+			return errors.New("usage: 행 스캔 실패")
+		}
+		switch {
+		case strings.Contains(s, "ctr_") || strings.Contains(s, "mcp__ctr__"):
+			nCtr += n
+		case strings.Contains(s, "ctx_") || strings.Contains(s, "ctxscribe"):
+			nCtx += n
+		}
+	}
+	fmt.Fprintln(w, "tool\tcalls")
+	fmt.Fprintf(w, "ctr\t%d\n", nCtr)
+	fmt.Fprintf(w, "ctxscribe\t%d\n", nCtx)
+	if nCtr+nCtx > 0 {
+		fmt.Fprintf(w, "# ratio(참고, 분모 붕괴 주의): %.1f%%\n", 100*float64(nCtr)/float64(nCtr+nCtx))
 	}
 	return nil
 }

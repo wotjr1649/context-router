@@ -287,3 +287,57 @@ func TestUsage_TotalsFlag(t *testing.T) {
 		t.Fatalf("--totals suffix 불일치:\n got %q\nwant %q", suffix, wantSuffix)
 	}
 }
+
+// adoptionDirs — seedAdoptionEvents가 돌려주는 storeRoot·projRoot(runUsage 인자).
+type adoptionDirs struct{ storeRoot, projRoot string }
+
+// seedAdoptionEvents — tool_call 이벤트를 summary별 지정 횟수만큼 session.db에 주입한다(hook
+// 런타임과 동일한 OpenAppend+EnsureSession+Append 경로 — seedCCSession 확장, D62). summary별
+// 반복 append로 긴 리터럴 없이 카운트를 만든다.
+func seedAdoptionEvents(t *testing.T, counts map[string]int) adoptionDirs {
+	t.Helper()
+	storeRoot, projectRoot := t.TempDir(), t.TempDir()
+	canon, err := ident.Canonicalize(projectRoot)
+	if err != nil {
+		t.Fatalf("canon: %v", err)
+	}
+	sessDir := filepath.Join(storeRoot, "projects", canon.ProjectID, "worktrees", canon.WorktreeID)
+	ctx := context.Background()
+	ad, err := session.OpenAppend(ctx, sessDir, session.AppendOptions{ExternalSessionID: "cc:adopt", Producer: "test", RetentionSec: 0})
+	if err != nil {
+		t.Fatalf("OpenAppend: %v", err)
+	}
+	if _, err := ad.EnsureSession(ctx, "startup", ""); err != nil {
+		t.Fatalf("EnsureSession: %v", err)
+	}
+	for summary, n := range counts {
+		for i := 0; i < n; i++ {
+			if _, _, _, err := ad.Append(ctx, session.Event{Type: "tool_call", Summary: summary}); err != nil {
+				t.Fatalf("Append %s: %v", summary, err)
+			}
+		}
+	}
+	if err := ad.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	return adoptionDirs{storeRoot, projectRoot}
+}
+
+// TestUsageAdoptionCounts — D62: tool_call 이벤트(ctr_search 2·ctx_execute 5)를 summary별
+// 집계해 ctr/ctxscribe 절대 호출 수와 ratio 참고 문면을 출력한다.
+func TestUsageAdoptionCounts(t *testing.T) {
+	dir := seedAdoptionEvents(t, map[string]int{
+		"mcp__ctr__ctr_search": 2, "mcp__plugin_ctxscribe_mcp__ctx_execute": 5,
+	})
+	var buf bytes.Buffer
+	if err := runUsage(context.Background(), &buf, []string{"--adoption"}, dir.storeRoot, dir.projRoot); err != nil {
+		t.Fatalf("runUsage: %v", err)
+	}
+	got := buf.String()
+	if !strings.Contains(got, "ctr\t2") || !strings.Contains(got, "ctxscribe\t5") {
+		t.Fatalf("집계 누락:\n%s", got)
+	}
+	if !strings.Contains(got, "ratio") {
+		t.Fatalf("ratio 참고 문면 누락:\n%s", got)
+	}
+}
