@@ -47,7 +47,7 @@ func parseFlags(args []string) (serverFlags, error) {
 	fs.StringVar(&f.Root, "root", "", "project root (default: cwd)")
 	fs.StringVar(&f.StoreRoot, "store-root", "", "store root override")
 	fs.StringVar(&profile, "profile", "search,fetch,transform", "tool profile")
-	fs.StringVar(&enable, "enable", "", "opt-in profiles: ingest,net")
+	fs.StringVar(&enable, "enable", "", "opt-in profiles: ingest,net,exec")
 	fs.StringVar(&f.LogLevel, "log-level", "info", "log level")
 	fs.Func("allow-path", "extra ingest root (repeatable)", func(v string) error {
 		f.AllowPaths = append(f.AllowPaths, v)
@@ -450,8 +450,12 @@ func run(ctx context.Context, args []string, stderr io.Writer) error {
 	if err != nil {
 		return err
 	}
+	scratchRoot := filepath.Join(os.TempDir(), "ctr-exec-"+canon.ProjectID) // D58: OS temp 하위
+	if slices.Contains(f.Enable, "exec") {
+		sandbox.SweepStale(scratchRoot, 24*time.Hour) // D61: 기동 시 24h+ 스테일 스윕
+	}
 	return mcp.Serve(ctx, mcp.Config{
-		Canon: canon, Store: st, SelfExe: selfExe,
+		Canon: canon, Store: st, SelfExe: selfExe, ScratchRoot: scratchRoot,
 		Profile: f.Profile, Enable: f.Enable, AllowPaths: allowPaths,
 		NetAllowLocal: f.NetAllowLocal, NetPorts: f.NetPorts,
 		Session: sessDB,
