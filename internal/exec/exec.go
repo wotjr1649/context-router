@@ -269,7 +269,11 @@ func (g *gate) do(probe func() (bool, error)) error {
 func probeVersion(bin string, timeout time.Duration, args ...string) (string, bool) {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
-	out, err := exec.CommandContext(ctx, bin, args...).Output()
+	cmd := exec.CommandContext(ctx, bin, args...)
+	// WaitDelay: ctx 취소 후 자손 프로세스(예: dash가 fork한 sleep)가 stdout 파이프를 계속
+	// 점유해도 1s 안에 파이프를 강제로 닫아 유한시간에 반환한다(프로브 전용 — sandbox 5s와 별개).
+	cmd.WaitDelay = time.Second
+	out, err := cmd.Output()
 	if err != nil {
 		return "", false
 	}
@@ -405,14 +409,21 @@ func csEnv(scratch string) []string {
 	nuget := filepath.Join(scratch, "nuget")
 	nugetHTTP := filepath.Join(scratch, "nuget-http")
 	nugetPlugins := filepath.Join(scratch, "nuget-plugins")
-	for _, d := range []string{home, nuget, nugetHTTP, nugetPlugins} {
+	// XDG_DATA_HOME 밑 NuGet/Migrations/1 sentinel을 미리 만들어 MigrationRunner를 단락시킨다 —
+	// 없으면 NuGet-Migrations named mutex가 /tmp/.dotnet(TMPDIR 무시 하드코딩, dotnet/runtime#49822)에
+	// shared-memory를 열다 landlock RO /tmp에서 EACCES로 실패한다.
+	xdg := filepath.Join(scratch, "xdg")
+	migrations := filepath.Join(xdg, "NuGet", "Migrations")
+	for _, d := range []string{home, nuget, nugetHTTP, nugetPlugins, migrations} {
 		_ = os.MkdirAll(d, 0o700)
 	}
+	_ = os.WriteFile(filepath.Join(migrations, "1"), nil, 0o600)
 	return []string{
 		"DOTNET_CLI_HOME=" + home,
 		"NUGET_PACKAGES=" + nuget,
 		"NUGET_HTTP_CACHE_PATH=" + nugetHTTP,
 		"NUGET_PLUGINS_CACHE_PATH=" + nugetPlugins,
+		"XDG_DATA_HOME=" + xdg,
 		"DOTNET_NOLOGO=1",
 		"DOTNET_CLI_TELEMETRY_OPTOUT=1",
 		"DOTNET_CLI_DO_NOT_USE_MSBUILD_SERVER=1",
