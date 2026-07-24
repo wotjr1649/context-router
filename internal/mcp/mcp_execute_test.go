@@ -2,11 +2,16 @@ package mcp
 
 import (
 	"context"
+	"errors"
+	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+
+	"github.com/wotjr1649/context-router/internal/exec"
 )
 
 // listToolNames: cs의 tools/list 이름 집합(exec 게이팅 검증 공용).
@@ -21,6 +26,38 @@ func listToolNames(t *testing.T, cs *mcp.ClientSession) []string {
 		names[i] = tl.Name
 	}
 	return names
+}
+
+// TestValidateExecPath: 경로 검증 분기 — 비절대·미존재·디렉터리는 ErrInvalidPath, 정규 파일만
+// 입력 절대경로를 그대로 반환한다. 디렉터리 케이스가 IsRegular 배제를 실증한다(Windows 로컬은
+// FIFO·소켓 등 비정규 파일을 이식성 있게 만들 수 없어 디렉터리로 충분).
+func TestValidateExecPath(t *testing.T) {
+	dir := t.TempDir()
+	file := filepath.Join(dir, "snippet.go")
+	if err := os.WriteFile(file, []byte("package x\n"), 0o600); err != nil {
+		t.Fatalf("write file: %v", err)
+	}
+
+	// 비절대: 존재하는 상대 경로여도 거부.
+	if _, err := validateExecPath("rel/path.go"); !errors.Is(err, exec.ErrInvalidPath) {
+		t.Errorf("비절대: err=%v want ErrInvalidPath", err)
+	}
+	// 미존재: 절대이지만 없는 경로.
+	if _, err := validateExecPath(filepath.Join(dir, "missing.go")); !errors.Is(err, exec.ErrInvalidPath) {
+		t.Errorf("미존재: err=%v want ErrInvalidPath", err)
+	}
+	// 디렉터리: 절대·존재하지만 정규 파일 아님(IsRegular 배제).
+	if _, err := validateExecPath(dir); !errors.Is(err, exec.ErrInvalidPath) {
+		t.Errorf("디렉터리: err=%v want ErrInvalidPath", err)
+	}
+	// 정규 파일: 통과, 입력 절대경로 그대로 반환.
+	got, err := validateExecPath(file)
+	if err != nil {
+		t.Fatalf("정규 파일: unexpected err=%v", err)
+	}
+	if got != file {
+		t.Errorf("정규 파일: got=%q want %q", got, file)
+	}
 }
 
 // TestExecuteNotRegisteredWithoutProfile: exec 프로필 미활성 시 두 도구 모두 미등록(삼중

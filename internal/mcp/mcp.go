@@ -569,7 +569,7 @@ func validateExecPath(p string) (string, error) {
 		return "", exec.ErrInvalidPath
 	}
 	fi, err := os.Stat(p)
-	if err != nil || fi.IsDir() {
+	if err != nil || !fi.Mode().IsRegular() {
 		return "", exec.ErrInvalidPath
 	}
 	return p, nil
