@@ -23,6 +23,7 @@ var (
 	ErrUnsupportedLang  = errors.New("exec: 지원하지 않는 언어")
 	ErrToolchainMissing = errors.New("exec: toolchain 미설치")
 	ErrVersionGate      = errors.New("exec: toolchain 버전 미달")
+	ErrInvalidPath      = errors.New("exec: 잘못된 파일 경로")
 )
 
 const (

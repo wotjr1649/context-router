@@ -149,7 +149,9 @@ func newTestServer(t *testing.T, enable []string) (*mcp.ClientSession, ident.Can
 	}
 	t.Cleanup(func() { st.Close() })
 
-	srv, err := NewServer(Config{Canon: canon, Store: st, SelfExe: testSelfExe(t), Enable: enable})
+	// ScratchRoot: exec 프로필(Enable "exec")이 sandbox.NewScratch 부모로 쓴다 — 빈 값이면
+	// exec.Run이 ErrSetup. t.TempDir()는 OS temp 하위(D58)이고 테스트 종료 시 자동 정리된다.
+	srv, err := NewServer(Config{Canon: canon, Store: st, SelfExe: testSelfExe(t), ScratchRoot: t.TempDir(), Enable: enable})
 	if err != nil {
 		t.Fatalf("new server: %v", err)
 	}

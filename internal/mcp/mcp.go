@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"io/fs"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"slices"
 	"sort"
 	"strings"
@@ -17,9 +19,11 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"github.com/wotjr1649/context-router/internal/buildinfo"
+	"github.com/wotjr1649/context-router/internal/exec"
 	"github.com/wotjr1649/context-router/internal/ident"
 	"github.com/wotjr1649/context-router/internal/ingest"
 	"github.com/wotjr1649/context-router/internal/netfetch"
+	"github.com/wotjr1649/context-router/internal/sandbox"
 	"github.com/wotjr1649/context-router/internal/search"
 	"github.com/wotjr1649/context-router/internal/session"
 	"github.com/wotjr1649/context-router/internal/store"
@@ -31,8 +35,9 @@ type Config struct {
 	Canon         ident.Canon
 	Store         *store.Store
 	SelfExe       string   // transform worker 재실행 경로(os.Executable(), §4.3) — 격리 프로브·Spawn에 사용
+	ScratchRoot   string   // exec 스크래치 부모(OS temp 하위, D58) — T6이 main.go에서 채운다. 빈 값이면 exec.Run이 ErrSetup
 	Profile       []string // 예약: transform/global-search 게이팅용 — v0.0.1은 미분기(§8)
-	Enable        []string // opt-in: "ingest"·"net"
+	Enable        []string // opt-in: "ingest"·"net"·"exec"
 	AllowPaths    []string // 이미 canonicalize된 ctr_index 허용 root (cmd가 검증 — §4.4)
 	NetAllowLocal bool     // --net-allow-local (§4.5, ctr_fetch_and_index)
 	NetPorts      []int    // --net-ports 추가 허용 포트 (§4.5)
@@ -81,6 +86,16 @@ func NewServer(cfg Config) (*mcp.Server, error) {
 	}
 	if slices.Contains(cfg.Enable, "net") {
 		registerFetchAndIndex(srv, cfg.Store, cfg.NetAllowLocal, cfg.NetPorts)
+	}
+	// exec: 삼중 게이트 중 서버측 2개 — Enable "exec"(프로필) + sandbox.Probe(OS 격리 가능
+	// 여부, transform ProbeIsolation 선례와 동형). 프로브 실패 시 slog.Warn + 미등록(첫 실제
+	// 호출에서야 실패를 알리지 않는다, fail-closed).
+	if slices.Contains(cfg.Enable, "exec") {
+		if err := sandbox.Probe(context.Background()); err != nil {
+			slog.Warn("mcp: exec 격리 프로브 실패 — ctr_execute 비활성화", "error", err)
+		} else {
+			registerExecute(srv, cfg.Store, cfg.ScratchRoot, cfg.SelfExe, cfg.Canon.WorktreeRoot)
+		}
 	}
 	if cfg.Session != nil {
 		registerRecordEvent(srv, cfg.Store, cfg.Session)
@@ -141,6 +156,12 @@ func toToolError(err error) error {
 		return toolErr(codeUnsupportedFile, "지원하지 않는 미디어 타입입니다")
 	case errors.Is(err, fs.ErrNotExist):
 		return toolErr(codeNotFound, "대상을 찾을 수 없습니다")
+	case errors.Is(err, exec.ErrUnsupportedLang), errors.Is(err, exec.ErrInvalidPath):
+		return toolErr(codeInvalidArgument, "잘못된 실행 요청입니다")
+	case errors.Is(err, exec.ErrToolchainMissing), errors.Is(err, exec.ErrVersionGate):
+		return toolErr(codeUnsupportedFile, "요청한 실행 환경을 사용할 수 없습니다")
+	case errors.Is(err, sandbox.ErrSetup):
+		return toolErr(codeStorageUnavailable, "격리 실행을 준비할 수 없습니다")
 	default:
 		slog.Error("mcp: internal tool error", "error", err)
 		return toolErr(codeInternal, "내부 오류가 발생했습니다")
@@ -504,6 +525,100 @@ func registerFetch(srv *mcp.Server, st *store.Store, worktreeRoot string) {
 			Untrusted:         true,
 		}
 		st.LedgerAppend("ctr_fetch", 0, jsonLen(out), time.Since(start).Milliseconds())
+		return nil, out, nil
+	})
+}
+
+// --- ctr_execute / ctr_execute_file (설계 v0.11 D58, Enable "exec" + 프로브 게이트) ---
+
+type ExecuteInput struct {
+	Language  string `json:"language" jsonschema:"실행 언어: shell|javascript|typescript|python|go|csharp"`
+	Code      string `json:"code" jsonschema:"실행할 코드 — 파생 답만 print(대형 원문은 코드 내에서 집계·필터). 저장본의 무 I/O 변환은 ctr_transform"`
+	TimeoutMS int    `json:"timeout_ms,omitempty" jsonschema:"실행 시간 상한(ms), 기본 120000, 최대 1800000"`
+}
+
+type ExecuteFileInput struct {
+	Language  string `json:"language" jsonschema:"실행 언어: shell|javascript|typescript|python|go|csharp"`
+	Path      string `json:"path" jsonschema:"CTR_FILE로 스니펫에 전달할 파일 경로(절대·존재)"`
+	Code      string `json:"code" jsonschema:"CTR_FILE을 처리하는 코드"`
+	TimeoutMS int    `json:"timeout_ms,omitempty" jsonschema:"실행 시간 상한(ms), 기본 120000, 최대 1800000"`
+}
+
+type ExecuteOutput struct {
+	Stdout      string `json:"stdout"`
+	Stderr      string `json:"stderr"`
+	ExitCode    *int   `json:"exit_code"` // timed_out 시 null (D61)
+	TimedOut    bool   `json:"timed_out"`
+	StdoutTrunc bool   `json:"stdout_truncated"`
+	StderrTrunc bool   `json:"stderr_truncated"`
+	DurationMS  int64  `json:"duration_ms"`
+	Runner      string `json:"runner"`
+}
+
+func toExecuteOutput(r exec.Response) ExecuteOutput {
+	return ExecuteOutput{
+		Stdout: r.Stdout, Stderr: r.Stderr, ExitCode: r.ExitCode, TimedOut: r.TimedOut,
+		StdoutTrunc: r.StdoutTrunc, StderrTrunc: r.StderrTrunc,
+		DurationMS: r.DurationMS, Runner: r.Runner,
+	}
+}
+
+// validateExecPath: 절대·존재·일반 파일 검증(원문 에코 없음, §6 — sentinel 문구만).
+func validateExecPath(p string) (string, error) {
+	if !filepath.IsAbs(p) {
+		return "", exec.ErrInvalidPath
+	}
+	fi, err := os.Stat(p)
+	if err != nil || fi.IsDir() {
+		return "", exec.ErrInvalidPath
+	}
+	return p, nil
+}
+
+func registerExecute(srv *mcp.Server, st *store.Store, scratchRoot, selfExe, worktreeRoot string) {
+	mcp.AddTool(srv, &mcp.Tool{
+		Name: "ctr_execute",
+		Description: "샌드박스에서 코드를 실행하고 stdout만 반환한다(think-in-code — 큰 데이터는 " +
+			"코드 안에서 집계해 파생 답만 print; 출력 초과 시 ctr_search 연계). 저장된 artifact의 " +
+			"무 I/O·결정적 변환은 ctr_transform, 툴체인·파일시스템이 필요한 실행은 이 도구.",
+	}, func(ctx context.Context, _ *mcp.CallToolRequest, in ExecuteInput) (*mcp.CallToolResult, ExecuteOutput, error) {
+		start := time.Now()
+		resp, err := exec.Run(ctx, scratchRoot, selfExe,
+			exec.Request{Language: in.Language, Code: in.Code, WorktreeRoot: worktreeRoot, TimeoutMS: in.TimeoutMS})
+		if err != nil {
+			return nil, ExecuteOutput{}, toToolError(err)
+		}
+		// post-Start 부모 취소/데드라인: exec.Run이 nil 오류로 부분 출력을 돌려줘도 정상 결과로
+		// 반환·원장 기록하지 않고 ctx.Err()를 그대로 전파한다(SDK가 취소 처리 — toToolError 최상단
+		// passthrough와 동일 취급). 도구 자체 TimeoutMS(부모 ctx에 데드라인 없음)는 res.TimedOut로
+		// 정상 결과가 되고 이 분기에 걸리지 않는다.
+		if ctx.Err() != nil {
+			return nil, ExecuteOutput{}, ctx.Err()
+		}
+		out := toExecuteOutput(resp)
+		st.LedgerAppend("ctr_execute", 0, jsonLen(out), time.Since(start).Milliseconds())
+		return nil, out, nil
+	})
+	// ctr_execute_file: path 검증 후 CTR_FILE로 전달(동일 계약).
+	mcp.AddTool(srv, &mcp.Tool{
+		Name:        "ctr_execute_file",
+		Description: "ctr_execute와 동일하되 CTR_FILE 환경변수로 파일 경로를 스니펫에 전달한다.",
+	}, func(ctx context.Context, _ *mcp.CallToolRequest, in ExecuteFileInput) (*mcp.CallToolResult, ExecuteOutput, error) {
+		start := time.Now()
+		abs, verr := validateExecPath(in.Path)
+		if verr != nil {
+			return nil, ExecuteOutput{}, toToolError(verr)
+		}
+		resp, err := exec.Run(ctx, scratchRoot, selfExe,
+			exec.Request{Language: in.Language, Code: in.Code, FilePath: abs, WorktreeRoot: worktreeRoot, TimeoutMS: in.TimeoutMS})
+		if err != nil {
+			return nil, ExecuteOutput{}, toToolError(err)
+		}
+		if ctx.Err() != nil {
+			return nil, ExecuteOutput{}, ctx.Err()
+		}
+		out := toExecuteOutput(resp)
+		st.LedgerAppend("ctr_execute_file", 0, jsonLen(out), time.Since(start).Milliseconds())
 		return nil, out, nil
 	})
 }
