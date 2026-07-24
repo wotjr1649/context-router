@@ -83,10 +83,20 @@ func TestRunUnixEchoExit(t *testing.T) {
 	}
 }
 
+// TestRunUnixTimeoutKillsGroup: 타임아웃 시 그룹을 종료하고 유한 시간 내 반환하는지.
+// stdout 파이프를 점유하는 백그라운드 자손을 함께 띄워 finding #1(WaitDelay)의 회귀를
+// 겸해 잡는다. Linux는 setsid로 자손을 프로세스 그룹에서 이탈시켜 그룹 kill이 못 미치게
+// 하므로, WaitDelay가 stdout 파이프를 강제 회수하지 못하면 cmd.Wait가 자손이 죽을
+// 때(30s)까지 블록한다 → 15s 경계로 회귀를 잡는다. setsid 미보유 환경(예: macOS)은
+// 그룹 내 백그라운드 자손으로 대체해 유한 반환만 단정한다.
 func TestRunUnixTimeoutKillsGroup(t *testing.T) {
 	dir := t.TempDir()
+	spawn := "sleep 30 & sleep 30" // 파이프 점유 백그라운드 자손 + 포그라운드 대기
+	if _, err := exec.LookPath("setsid"); err == nil {
+		spawn = "setsid sleep 30 & sleep 30" // 자손을 그룹 이탈시켜 WaitDelay 경로 강제
+	}
 	s := Spec{
-		Argv: []string{"/bin/sh", "-c", "sleep 30"},
+		Argv: []string{"/bin/sh", "-c", spawn},
 		Dir:  dir, Env: BaseEnv(), SelfExe: selfExe(t),
 		Timeout: 1 * time.Second, StdoutCap: 32768, StderrCap: 8192,
 	}
@@ -95,8 +105,10 @@ func TestRunUnixTimeoutKillsGroup(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
-	if !r.TimedOut || time.Since(start) > 10*time.Second {
-		t.Fatalf("그룹 미종료 TimedOut=%v dur=%v", r.TimedOut, time.Since(start))
+	// timeout 1s + WaitDelay 5s + 오버헤드 → ~7s 이내. WaitDelay 미설정 시 이탈 자손이
+	// 파이프를 붙든 30s까지 블록 → 이 경계가 finding #1 회귀를 잡는다.
+	if !r.TimedOut || time.Since(start) > 15*time.Second {
+		t.Fatalf("그룹 미종료/WaitDelay 미회수 TimedOut=%v dur=%v", r.TimedOut, time.Since(start))
 	}
 }
 

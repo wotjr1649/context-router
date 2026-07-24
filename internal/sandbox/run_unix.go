@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"os"
 	"os/exec"
 	"runtime"
 	"syscall"
@@ -42,12 +43,38 @@ func Run(ctx context.Context, s Spec) (Result, error) {
 	out := &capWriter{cap: s.StdoutCap}
 	errw := &capWriter{cap: s.StderrCap}
 	cmd.Stdout, cmd.Stderr = out, errw
+	// WaitDelay: 킬 후 파이프 회수 시한(전 OS 공통, D59). 반드시 Start 전에 설정한다.
+	// 그룹 kill이 못 미친 자손(예: setsid로 그룹 이탈)이 stdout 파이프를 붙들면 cmd.Wait의
+	// I/O 대기가 무한 블록하는데, WaitDelay 초과 시 os/exec가 파이프를 강제 회수해 Wait가
+	// 부분 출력으로 반환한다(run_windows.go 선례와 동형).
+	cmd.WaitDelay = waitDelay
+
+	// statusR: Linux 런처가 격리 준비 실패를 알리는 상태 파이프(자식 fd 3). 런처는 성공 시
+	// exec 직전 CLOEXEC로 이 fd를 닫아 부모가 EOF(=정상)를 보고, 실패 시 1바이트를 써 부모가
+	// ErrSetup으로 매핑한다(D61 fail-closed). 대상의 정당한 exit code와 겹치지 않는다 —
+	// 신호는 런처 실패 경로에서만 나오고, exec 성공 후 대상 프로세스는 fd 3을 갖지 않는다.
+	var statusR, statusW *os.File
+	if runtime.GOOS == "linux" {
+		r, w, perr := os.Pipe()
+		if perr != nil {
+			return Result{}, fmt.Errorf("%w: 상태 파이프", ErrSetup)
+		}
+		statusR, statusW = r, w
+		cmd.ExtraFiles = []*os.File{w} // 자식에서 fd 3
+		defer func() { _ = statusR.Close() }()
+		defer func() { _ = statusW.Close() }() // Start 실패 경로 안전망(성공 경로는 아래서 즉시 닫음)
+	}
 
 	if err := cmd.Start(); err != nil {
 		// 원본 err는 해석된 실행 파일 경로를 담을 수 있어 로그로만 남기고, 반환 메시지는
 		// 경로 없이 유지한다(run_windows.go 선례와 동일).
 		slog.Error("sandbox: 자식 프로세스 시작 실패", "err", err)
 		return Result{}, fmt.Errorf("%w: 프로세스 시작", ErrSetup)
+	}
+	// 부모 쪽 write end를 즉시 닫아 자식 종료 시 read가 EOF를 관측하게 한다(안 닫으면 블록).
+	if statusW != nil {
+		_ = statusW.Close()
+		statusW = nil
 	}
 	pgid := cmd.Process.Pid // Setpgid로 pgid == pid
 	kill := func() { _ = syscall.Kill(-pgid, syscall.SIGKILL) }
@@ -61,6 +88,16 @@ func Run(ctx context.Context, s Spec) (Result, error) {
 	var res Result
 	select {
 	case werr := <-done:
+		// 런처 setup 실패 신호 확인 — 자식이 종료해 write end가 닫혔으므로 read는 즉시
+		// 반환한다(1바이트+=실패, EOF=정상). 실패면 exit code 1을 정상 종료로 오분류하지
+		// 않고 ErrSetup으로 매핑한다(#2 fail-closed).
+		if statusR != nil {
+			var b [1]byte
+			if n, _ := statusR.Read(b[:]); n > 0 {
+				slog.Error("sandbox: 런처 격리 준비 실패 신호")
+				return Result{}, fmt.Errorf("%w: 런처 제한 적용", ErrSetup)
+			}
+		}
 		res.ExitCode = exitCodeOf(werr, cmd)
 	case <-timer.C:
 		res.TimedOut = true

@@ -20,11 +20,10 @@ import (
 )
 
 // Job 캡 기본값(D59, 구현 계획에서 확정): 잡 메모리 4GiB·활성 프로세스 64.
-// WaitDelay: 킬 후 파이프 회수 대기 시한(초과 시 부분 출력으로 반환, D59 계약).
+// (WaitDelay는 sandbox.go의 공통 waitDelay 상수 — 전 OS 동일.)
 const (
-	defaultJobMemoryBytes uint64        = 4 << 30
-	defaultProcLimit      uint32        = 64
-	waitDelay             time.Duration = 5 * time.Second
+	defaultJobMemoryBytes uint64 = 4 << 30
+	defaultProcLimit      uint32 = 64
 )
 
 // newJob: kill-on-job-close + 메모리·활성 프로세스 캡을 건 Job Object를 만든다.

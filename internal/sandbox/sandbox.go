@@ -17,6 +17,10 @@ import (
 // 사용자 코드 실패와 구분되어 mcp toToolError에서 SANDBOX_UNAVAILABLE로 매핑).
 var ErrSetup = errors.New("sandbox: 격리 준비 실패")
 
+// waitDelay — 킬 후 파이프 회수 대기 시한(전 OS 공통, D59 계약). exec.Cmd.WaitDelay에 설정 —
+// 초과 시 os/exec가 stdout/stderr 파이프를 강제 회수해 Wait가 부분 출력으로 반환하고 대기를 끊는다.
+const waitDelay = 5 * time.Second
+
 type Spec struct {
 	Argv      []string      // argv[0]은 LookPath 완료된 실행 파일
 	Dir       string        // cwd = 스크래치(D58)
