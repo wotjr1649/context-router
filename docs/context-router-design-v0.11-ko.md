@@ -115,7 +115,12 @@
     "쓰기=스크래치" 계약을 성립시킨다 — go:
     `GOCACHE`·`GOPATH`(GOMODCACHE 파생)·`GOTMPDIR` / csharp:
     `DOTNET_CLI_HOME`·`NUGET_PACKAGES` / python:
-    `PYTHONPYCACHEPREFIX` / js·ts·shell: 필수 캐시 없음. 대가 =
+    `PYTHONPYCACHEPREFIX` / js·ts·shell: 필수 캐시 없음 / **공통(전
+    러너)**: OS temp 변수(`TMPDIR`·Unix / `TEMP`·`TMP`·Windows)를
+    스크래치 하위로 재지정 — 러너가 temp에 남기는 빌드
+    산출물(예: dotnet file-based 앱 아티팩트)을 스크래치 수명 안으로
+    흡수해 Unix 쓰기 계약(D59)·ephemeral 정책(D61)과 정합(2026-07-24
+    SDD 전 검토 반영). 대가 =
     매 실행 콜드 컴파일(go ≈2–5s·dotnet ≈5–15s — timeout 기본
     120s로 수용). 웜 캐시 허용(캐시 경로 쓰기 개방)은 성능 실증
     시 §4 재평가.
