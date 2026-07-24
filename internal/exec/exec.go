@@ -418,7 +418,11 @@ func csEnv(scratch string) []string {
 	// DOTNET_CLI_HOME으로 못 옮긴다 — Foundation이 존중하는 CFFIXED_USER_HOME(+HOME)을 scratch
 	// 하위로 돌려 SBPL subpath 안에 넣고, first-run 워크로드 무결성 검사(네트워크)를 스킵한다.
 	userHome := filepath.Join(scratch, "home")
-	for _, d := range []string{home, nuget, nugetHTTP, nugetPlugins, migrations, userHome} {
+	// file-based dotnet run의 artifacts temp는 LocalApplicationData(macOS=<home>/Library/Application
+	// Support)에서 결정되는데 NSSearchPath는 경로를 만들지 않아, 미존재 시 빈 문자열→temp 경로 결정 실패로
+	// 죽는다 — env에 할당·파생한 경로는 전부 사전 생성한다(goEnv GOTMPDIR 규칙). SBPL scratch subpath 안.
+	appSupport := filepath.Join(userHome, "Library", "Application Support")
+	for _, d := range []string{home, nuget, nugetHTTP, nugetPlugins, migrations, appSupport} {
 		_ = os.MkdirAll(d, 0o700)
 	}
 	_ = os.WriteFile(filepath.Join(migrations, "1"), nil, 0o600)
@@ -431,6 +435,7 @@ func csEnv(scratch string) []string {
 		"HOME=" + userHome,
 		"CFFIXED_USER_HOME=" + userHome,
 		"DOTNET_SKIP_WORKLOAD_INTEGRITY_CHECK=1",
+		"DOTNET_GENERATE_ASPNET_CERTIFICATE=false", // macOS first-run dev-cert가 SBPL 밖 로그인 키체인 접근 예방
 		"DOTNET_NOLOGO=1",
 		"DOTNET_CLI_TELEMETRY_OPTOUT=1",
 		"DOTNET_CLI_DO_NOT_USE_MSBUILD_SERVER=1",
