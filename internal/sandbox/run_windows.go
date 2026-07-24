@@ -6,7 +6,6 @@
 package sandbox
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -27,30 +26,6 @@ const (
 	defaultProcLimit      uint32        = 64
 	waitDelay             time.Duration = 5 * time.Second
 )
-
-// capWriter: 상한까지만 담고 이후는 버린다(트렁케이션 표시). Write는 항상 len(p)를
-// 반환해 파이프를 계속 소비한다 — 러너가 EPIPE로 죽지 않게. os/exec가 stdout/stderr를
-// 각각 단일 고루틴으로 복사하고 Wait가 그 고루틴 종료를 기다리므로, Wait 반환 후 buf
-// 읽기에 경합이 없다.
-type capWriter struct {
-	buf   bytes.Buffer
-	cap   int
-	trunc bool
-}
-
-func (c *capWriter) Write(p []byte) (int, error) {
-	if room := c.cap - c.buf.Len(); room > 0 {
-		if len(p) > room {
-			c.buf.Write(p[:room])
-			c.trunc = true
-		} else {
-			c.buf.Write(p)
-		}
-	} else if len(p) > 0 {
-		c.trunc = true
-	}
-	return len(p), nil
-}
 
 // newJob: kill-on-job-close + 메모리·활성 프로세스 캡을 건 Job Object를 만든다.
 func newJob(s Spec) (windows.Handle, error) {
@@ -95,6 +70,10 @@ func Probe(context.Context) error {
 	windows.CloseHandle(h)
 	return nil
 }
+
+// RunLauncher: windows는 Job Object 모델이라 런처 재실행 경로 미사용(darwin 선례와 동일 스텁).
+// main.go의 __exec-launcher 분기가 모든 OS에서 이 심볼을 참조하므로 정의가 필요하다.
+func RunLauncher([]string) error { return fmt.Errorf("exec-launcher: windows 미사용") }
 
 // assignToJob: pid의 프로세스 핸들을 열어 잡에 배정한다(least-privilege 권한).
 func assignToJob(job windows.Handle, pid int) error {

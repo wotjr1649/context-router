@@ -22,6 +22,7 @@ import (
 	"github.com/wotjr1649/context-router/internal/cli"
 	"github.com/wotjr1649/context-router/internal/ident"
 	"github.com/wotjr1649/context-router/internal/mcp"
+	"github.com/wotjr1649/context-router/internal/sandbox"
 	"github.com/wotjr1649/context-router/internal/session"
 	"github.com/wotjr1649/context-router/internal/store"
 	"github.com/wotjr1649/context-router/internal/transform"
@@ -461,6 +462,12 @@ func run(ctx context.Context, args []string, stderr io.Writer) error {
 // 먼저 분기해야 한다 — stdout은 Result JSON 1건이어야 하고 배너·로그가 섞이면 안 된다.
 const transformWorkerArg = "__transform-worker"
 
+// execLauncherArg: sandbox 런처 재실행 숨김 모드 인자(설계 v0.11 D59). Linux는 landlock을
+// 자식 자신이 걸어야 해 `__exec-launcher <scratch> -- <argv...>`로 재실행한다 — 이 분기가
+// 제한을 건 뒤 syscall.Exec로 실제 argv로 대체한다. transformWorkerArg와 마찬가지로 플래그
+// 파싱보다 먼저 분기해야 한다.
+const execLauncherArg = "__exec-launcher"
+
 // cliSubcommands: internal/cli가 처리하는 서브커맨드 이름(설계 §7). 이 중 하나가 아닌 첫
 // 인자는 dispatchCLI의 관심사가 아니다 — MCP 서버 플래그로 그대로 흘려보낸다. "session"은
 // v0.1 태스크9 추가(§6.3·§7) — export(9a)·recover(9b) 두 하위 서브커맨드를 cli.Run이 내부
@@ -589,6 +596,14 @@ func main() {
 			os.Exit(1)
 		}
 		return
+	}
+
+	if len(os.Args) > 1 && os.Args[1] == execLauncherArg {
+		if err := sandbox.RunLauncher(os.Args[2:]); err != nil {
+			fmt.Fprintln(os.Stderr, "ctr:", err)
+			os.Exit(1)
+		}
+		return // 성공 시 syscall.Exec로 대체되어 도달 안 함(darwin/other는 오류)
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)

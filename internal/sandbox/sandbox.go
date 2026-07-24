@@ -3,6 +3,7 @@
 package sandbox
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"os"
@@ -24,6 +25,10 @@ type Spec struct {
 	StdoutCap int           // 32768 (D61)
 	StderrCap int           // 8192 (D61)
 
+	// SelfExe — 자기 바이너리 경로. Linux는 landlock을 자식 자신이 걸어야 해
+	// `SelfExe __exec-launcher …`로 재실행한다(D59). windows/darwin/other는 미사용.
+	SelfExe string
+
 	// Windows Job Object 캡(D59, 0=기본값). unix 구현은 무시한다.
 	MemLimitBytes uint64 // 잡 메모리 상한(0=4GiB)
 	ProcLimit     uint32 // 활성 프로세스 상한(0=64)
@@ -35,6 +40,30 @@ type Result struct {
 	ExitCode                 int // TimedOut=true면 -1(무의미 — MCP 계층이 null로 변환)
 	TimedOut                 bool
 	Duration                 time.Duration
+}
+
+// capWriter: 상한까지만 담고 이후는 버린다(트렁케이션 표시). Write는 항상 len(p)를
+// 반환해 파이프를 계속 소비한다 — 러너가 EPIPE로 죽지 않게. os/exec가 stdout/stderr를
+// 각각 단일 고루틴으로 복사하고 Wait가 그 고루틴 종료를 기다리므로, Wait 반환 후 buf
+// 읽기에 경합이 없다.
+type capWriter struct {
+	buf   bytes.Buffer
+	cap   int
+	trunc bool
+}
+
+func (c *capWriter) Write(p []byte) (int, error) {
+	if room := c.cap - c.buf.Len(); room > 0 {
+		if len(p) > room {
+			c.buf.Write(p[:room])
+			c.trunc = true
+		} else {
+			c.buf.Write(p)
+		}
+	} else if len(p) > 0 {
+		c.trunc = true
+	}
+	return len(p), nil
 }
 
 // scratchPrefix: NewScratch가 만드는 스크래치 이름 접두 — SweepStale은 이 접두 항목만
