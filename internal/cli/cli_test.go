@@ -2422,6 +2422,16 @@ func TestDoctorCodexMCPLine(t *testing.T) {
 	}
 }
 
+// TestDoctorShowsRunnerLine — [18] exec 러너 감지 라인(D58). 감지 결과는 환경 의존이라 접두만
+// 검증한다(exec는 opt-in 프로필이라 미검출이어도 실패 게이트가 아님 — err 무시).
+func TestDoctorShowsRunnerLine(t *testing.T) {
+	var buf bytes.Buffer
+	_ = runDoctor(context.Background(), &buf, t.TempDir(), t.TempDir(), "0.11.0")
+	if !strings.Contains(buf.String(), "[18] exec runners:") {
+		t.Fatalf("[18] 누락:\n%s", buf.String())
+	}
+}
+
 // TestDoctorWarnMentionsHookOnly — [14] 경고 신문구가 --hook-only 선택 삭제를 안내하고 옛 문구
 // ('무구분')는 사라졌다(설계 §8 / D38 승격).
 func TestDoctorWarnMentionsHookOnly(t *testing.T) {

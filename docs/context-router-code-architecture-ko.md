@@ -23,13 +23,18 @@ cmd ──┬─ mcp ─┬─ search ──→ store
       │       ├─ ingest ──→ store, ident
       │       ├─ transform → store        # blob 경로 조회용
       │       ├─ netfetch                 # leaf — 저장하지 않는다
+      │       ├─ exec ──→ sandbox          # v0.11 D60 — 러너 테이블, 실행은 sandbox 경유
+      │       ├─ sandbox                  # v0.11 D59 — Probe·ErrSetup(격리 준비 판정)
       │       └─ store, ident             # Config 배선(Store 포인터·Canon)
       ├─ cli ─┬───────────→ store, ident, session   # session — v0.1, export/recover 서브커맨드
+      │       ├─ exec                      # v0.11 T8 — RunnerStatus(doctor). stdlib os/exec 선점유 → 별칭 ctrexec
       │       └─ hook ─────→ session, ident, store, ingest  # v0.2 §2 — 훅 서브커맨드 위임(store·ingest는 T5~T7 소비)
+      ├─ sandbox                          # v0.11 D59 — launcher 분기·SweepStale(스크래치 스윕)
       ├─ store                            # store.Open 직접 호출
       ├─ ident                            # leaf, 순수 함수
       └─ buildinfo                        # leaf — 단일 상수(v0.10 D56), 직접 소비자 cmd·mcp (cli는 version 인자 하류)
-store · ident · netfetch · transform · buildinfo : internal 상호 의존 0 (leaf)
+store · ident · netfetch · transform · buildinfo · sandbox : internal 상호 의존 0 (leaf)
+sandbox : 외부 x/sys·go-landlock에만 의존(v0.11 D59) — exec는 internal 중 sandbox만 의존(D60)
 search → session: 없음(의도) — search.QueryEvents(v0.1)는 *sql.DB reader를 인자로만 받는다,
                   session 타입을 import하지 않는다(D16 "search→session 타입 의존 없음").
 ```
@@ -76,7 +81,7 @@ search → session: 없음(의도) — search.QueryEvents(v0.1)는 *sql.DB reade
 
 ## 6. 오류 규약
 
-- **패키지별 sentinel**(자기 의미만 소유, MCP 코드 import 금지): `store.ErrNotFound`·`store.ErrUnavailable`, `ingest.ErrWorkspace`·`ingest.ErrUnsupported`, `netfetch.ErrDenied`, `transform.ErrBudget`·`transform.ErrOutputLimit`.
+- **패키지별 sentinel**(자기 의미만 소유, MCP 코드 import 금지): `store.ErrNotFound`·`store.ErrUnavailable`, `ingest.ErrWorkspace`·`ingest.ErrUnsupported`, `netfetch.ErrDenied`, `transform.ErrBudget`·`transform.ErrOutputLimit`, `exec.ErrUnsupportedLang`·`exec.ErrToolchainMissing`·`exec.ErrVersionGate`·`exec.ErrInvalidPath`, `sandbox.ErrSetup`(v0.11 D59/D60).
 - **단일 변환 지점**: `internal/mcp`의 `toToolError(error)` 하나가 sentinel→MCP 코드 9종(설계 §4.0) 매핑을 전담. 매핑 없는 오류는 `INTERNAL`로 뭉개고 상세는 stderr slog에만. *(별도 ctrerr 패키지는 기각 — "error framework" 과잉설계이며 D13과 상충. worker 경계의 오류 직렬화는 transform이 자기 프로토콜 안에서 kind 문자열로 처리.)*
 - 문맥 wrap은 항상 `fmt.Errorf("동작: %w", err)` — 사용자 입력·절대경로·env·비밀값 미포함(생성 시점 위생, §12 canary가 오류 메시지도 검사). 판정은 `errors.Is`(제한 수치 필요한 typed error만 `errors.As`). 문자열 비교·`%v` 재포장 금지.
 - cancellation은 SDK로 그대로 반환. cli는 자체적으로 오류→종료 메시지 변환(MCP 코드 무관), `os.Exit`은 main에서만.
@@ -115,7 +120,7 @@ fuzz는 CI에서 시드 corpus 회귀만(상시 fuzzing은 로컬 수동), 5,000
 
 ## 10. 부패 방지 계약 (rot-path 예방 — 3채널 병합)
 
-1. **mcp god package 방지**: 핸들러 = decode/validate → 구체 호출 ≤2회 → encode, ≤50줄. mcp는 `database/sql`·`net/http`·`os/exec` **import 금지**(기계적 검사 가능).
+1. **mcp god package 방지**: 핸들러 = decode/validate → 구체 호출 ≤2회 → encode, ≤50줄. mcp는 `database/sql`·`net/http`·`os/exec` **import 금지**(기계적 검사 가능) — 코드 실행은 `internal/exec` 경유(v0.11 D60). cli는 stdlib `os/exec`를 선점유해 `internal/exec`를 별칭 `ctrexec`로 import하는데, 이 별칭은 mcp의 `os/exec` 금지 규칙과 무관하다(cli는 애초에 금지 대상이 아니며 별칭은 이름 충돌 회피용).
 2. **store 만능화 방지**: 영속성 불변식만 소유 — ranking·redaction·경로 정책 유입 금지. 기능 질의 조립은 기능 패키지가, 원시 SQL·트랜잭션·blob은 store가.
 3. **ingest 잡동사니화 방지**: 정규화→redaction→chunk→등록 파이프라인만 — `net/http`·복구 SQL import 금지.
 4. **표면 증식 방지**: 설계서 §번호가 없는 신규 동작·플래그 금지(설계서 개정 선행). 플래그 5개 초과 시 재검토(설계 §8).

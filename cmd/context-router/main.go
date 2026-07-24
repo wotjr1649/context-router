@@ -22,6 +22,7 @@ import (
 	"github.com/wotjr1649/context-router/internal/cli"
 	"github.com/wotjr1649/context-router/internal/ident"
 	"github.com/wotjr1649/context-router/internal/mcp"
+	"github.com/wotjr1649/context-router/internal/sandbox"
 	"github.com/wotjr1649/context-router/internal/session"
 	"github.com/wotjr1649/context-router/internal/store"
 	"github.com/wotjr1649/context-router/internal/transform"
@@ -46,7 +47,7 @@ func parseFlags(args []string) (serverFlags, error) {
 	fs.StringVar(&f.Root, "root", "", "project root (default: cwd)")
 	fs.StringVar(&f.StoreRoot, "store-root", "", "store root override")
 	fs.StringVar(&profile, "profile", "search,fetch,transform", "tool profile")
-	fs.StringVar(&enable, "enable", "", "opt-in profiles: ingest,net")
+	fs.StringVar(&enable, "enable", "", "opt-in profiles: ingest,net,exec")
 	fs.StringVar(&f.LogLevel, "log-level", "info", "log level")
 	fs.Func("allow-path", "extra ingest root (repeatable)", func(v string) error {
 		f.AllowPaths = append(f.AllowPaths, v)
@@ -449,8 +450,12 @@ func run(ctx context.Context, args []string, stderr io.Writer) error {
 	if err != nil {
 		return err
 	}
+	scratchRoot := filepath.Join(os.TempDir(), "ctr-exec-"+canon.ProjectID) // D58: OS temp 하위
+	if slices.Contains(f.Enable, "exec") {
+		sandbox.SweepStale(scratchRoot, 24*time.Hour) // D61: 기동 시 24h+ 스테일 스윕
+	}
 	return mcp.Serve(ctx, mcp.Config{
-		Canon: canon, Store: st, SelfExe: selfExe,
+		Canon: canon, Store: st, SelfExe: selfExe, ScratchRoot: scratchRoot,
 		Profile: f.Profile, Enable: f.Enable, AllowPaths: allowPaths,
 		NetAllowLocal: f.NetAllowLocal, NetPorts: f.NetPorts,
 		Session: sessDB,
@@ -460,6 +465,12 @@ func run(ctx context.Context, args []string, stderr io.Writer) error {
 // transformWorkerArg: worker 프로세스 재실행 숨김 모드 인자(설계 §4.3). 플래그 파싱보다
 // 먼저 분기해야 한다 — stdout은 Result JSON 1건이어야 하고 배너·로그가 섞이면 안 된다.
 const transformWorkerArg = "__transform-worker"
+
+// execLauncherArg: sandbox 런처 재실행 숨김 모드 인자(설계 v0.11 D59). Linux는 landlock을
+// 자식 자신이 걸어야 해 `__exec-launcher <scratch> -- <argv...>`로 재실행한다 — 이 분기가
+// 제한을 건 뒤 syscall.Exec로 실제 argv로 대체한다. transformWorkerArg와 마찬가지로 플래그
+// 파싱보다 먼저 분기해야 한다.
+const execLauncherArg = "__exec-launcher"
 
 // cliSubcommands: internal/cli가 처리하는 서브커맨드 이름(설계 §7). 이 중 하나가 아닌 첫
 // 인자는 dispatchCLI의 관심사가 아니다 — MCP 서버 플래그로 그대로 흘려보낸다. "session"은
@@ -589,6 +600,14 @@ func main() {
 			os.Exit(1)
 		}
 		return
+	}
+
+	if len(os.Args) > 1 && os.Args[1] == execLauncherArg {
+		if err := sandbox.RunLauncher(os.Args[2:]); err != nil {
+			fmt.Fprintln(os.Stderr, "ctr:", err)
+			os.Exit(1)
+		}
+		return // 성공 시 syscall.Exec로 대체되어 도달 안 함(darwin/other는 오류)
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)

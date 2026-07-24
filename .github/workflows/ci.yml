@@ -18,6 +18,12 @@ jobs:
         with:
           go-version-file: go.mod
 
+      # csharp 러너(internal/exec) 실행 테스트용 .NET 10 보장 — ubuntu/macos 이미지엔 부재.
+      # setup-dotnet은 프리인스톨을 먼저 확인 후 스킵하므로 windows 조건 분기 없이 3-OS 무조건으로 둔다.
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+
       # 메모리 캡 규율(CLAUDE.md): 전체 스위트는 -p 1 필수.
       # store 2-프로세스 경합, transform worker RLIMIT_AS/트리킬 서브프로세스 테스트를 포함해
       # 3-OS에서 처음 실행된다 — ubuntu/macos 로그가 unix RLIMIT_AS self-apply 실측(게이트 8)이다.

@@ -30,6 +30,7 @@ import (
 	"github.com/wotjr1649/context-router/internal/ident"
 	"github.com/wotjr1649/context-router/internal/ingest"
 	"github.com/wotjr1649/context-router/internal/netfetch"
+	"github.com/wotjr1649/context-router/internal/sandbox"
 	"github.com/wotjr1649/context-router/internal/session"
 	"github.com/wotjr1649/context-router/internal/store"
 	"github.com/wotjr1649/context-router/internal/transform"
@@ -149,7 +150,9 @@ func newTestServer(t *testing.T, enable []string) (*mcp.ClientSession, ident.Can
 	}
 	t.Cleanup(func() { st.Close() })
 
-	srv, err := NewServer(Config{Canon: canon, Store: st, SelfExe: testSelfExe(t), Enable: enable})
+	// ScratchRoot: exec 프로필(Enable "exec")이 sandbox.NewScratch 부모로 쓴다 — 빈 값이면
+	// exec.Run이 ErrSetup. t.TempDir()는 OS temp 하위(D58)이고 테스트 종료 시 자동 정리된다.
+	srv, err := NewServer(Config{Canon: canon, Store: st, SelfExe: testSelfExe(t), ScratchRoot: t.TempDir(), Enable: enable})
 	if err != nil {
 		t.Fatalf("new server: %v", err)
 	}
@@ -189,6 +192,11 @@ func TestNewServerProfileGating(t *testing.T) {
 		{"base", nil, []string{"ctr_fetch", "ctr_search", "ctr_transform"}},
 		{"ingest", []string{"ingest"}, []string{"ctr_fetch", "ctr_index", "ctr_search", "ctr_transform"}},
 		{"net", []string{"net"}, []string{"ctr_fetch", "ctr_fetch_and_index", "ctr_search", "ctr_transform"}},
+		// exec 프로필: sandbox.Probe 통과 시 ctr_execute·ctr_execute_file 2종을 추가 등록한다
+		// (unix Probe는 no-op nil, windows는 Job Object 실게이트지만 테스트 환경에서 통과 —
+		// T5 TestExecuteRegisteredAndRuns가 실왕복 실증). darwin은 아래 DeleteFunc가 ctr_transform만
+		// 제거하고 exec 2종은 그대로 남긴다(exec는 격리 프로브가 unix에서 무조건 성공).
+		{"exec", []string{"exec"}, []string{"ctr_execute", "ctr_execute_file", "ctr_fetch", "ctr_search", "ctr_transform"}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -198,6 +206,15 @@ func TestNewServerProfileGating(t *testing.T) {
 				// (skipDarwinNoIsolation 주석 참조) — 이 서브테스트가 검증하는 프로필별
 				// ingest/net 게이팅 자체는 darwin에서도 유효하니 그 부분은 계속 확인한다.
 				want = slices.DeleteFunc(slices.Clone(tt.want), func(s string) bool { return s == "ctr_transform" })
+			}
+			if sandbox.Probe(context.Background()) != nil {
+				// exec: sandbox.Probe 실패 환경(예: Job Object 미가용 windows)에서 NewServer는
+				// fail-closed로 ctr_execute·ctr_execute_file를 미등록한다(mcp.go:93-98). 프로필
+				// 게이팅 자체 검증은 유지한 채 두 도구만 기대에서 제외한다(위 darwin ctr_transform
+				// 선례와 동형 — 형제 TestExecuteRegisteredAndRuns의 skip과 동일 프로브 인지).
+				want = slices.DeleteFunc(slices.Clone(want), func(s string) bool {
+					return s == "ctr_execute" || s == "ctr_execute_file"
+				})
 			}
 			cs, _ := newTestServer(t, tt.enable)
 			lt, err := cs.ListTools(context.Background(), nil)
@@ -216,25 +233,26 @@ func TestNewServerProfileGating(t *testing.T) {
 	}
 }
 
-// maxToolSchemaBytes: 게이트 11(스키마 토큰 예산, 설계 §2.3·§3.5) — v0.1의 기본 표면은
-// session.db가 정상 open된 6-도구(ctr_search/ctr_fetch/ctr_transform + ctr_record_event/
-// ctr_session_summary/ctr_export_events, ProbeIsolation 성공 환경)이므로 게이트도 그 표면을
-// 측정한다(코디네이터 판정, 설계 §3.5 "세션 3종+scope+문구를 반영해 재기준화" 문면 그대로 —
-// 이전 태스크7 1차 구현은 3-도구만 측정해 재작업). tools/list 결과 JSON 직렬화 바이트 상한.
-// 재실측값 10024B × 1.2 = 12028.8 → 올림 12029로 재기준화(이전 3-도구 기준 4359B×1.2=5231,
-// 태스크7 1차 3-도구 재측정 5139B×1.2=6167 — 둘 다 폐기, 완충 비율 1.2·올림 방식은 동일 유지) —
-// 회귀(설명 문구 비대화 등) 조기 감지용 상한이지 정밀 예산이 아니다. 실측값·근거는
-// docs/gates-v0.0.1-ko.md 게이트 11 항목 참조(정식 갱신은 v0.1 게이트 문서 마일스톤에서).
-const maxToolSchemaBytes = 12029
+// maxToolSchemaBytes: 게이트 11(스키마 토큰 예산, 설계 §2.3·§3.5) — D62 재기준화로 측정 표면이
+// session.db 정상 open된 6-도구(ctr_search/ctr_fetch/ctr_transform + ctr_record_event/
+// ctr_session_summary/ctr_export_events) + exec 프로필 2종(ctr_execute/ctr_execute_file) =
+// 8-도구가 됐다(exec가 회수 경로의 1급 도구로 편입 + ctr_search/ctr_fetch 회수-유도 문구 보강분
+// 포함). tools/list 결과 JSON 직렬화 바이트 상한 — 설명 문구 비대화 회귀 조기 감지용이다. D62부터는
+// 이전 1.2× 완충 대신 실측 + 최소 여유로 재기준화한다(과대 상향 금지 — 완충이 크면 문구 비대화가
+// 상한 아래로 숨어 감지력이 떨어진다). 실측 12864B에 최소 여유를 더해 13000으로 상향(폐기된 이전
+// 값: 6-도구 10024B×1.2=12029, 태스크7 1차 3-도구 5139B×1.2=6167, v0.0.1 3-도구 4359B×1.2=5231).
+// 실측값·근거는 docs/gates-v0.0.1-ko.md 게이트 11 항목 참조(정식 갱신은 게이트 문서 마일스톤에서).
+const maxToolSchemaBytes = 13000
 
 // TestSchemaTokenBudget: tools/list 결과(ListToolsResult 전체 — 실제 클라이언트가 받는
 // JSON 그대로) 직렬화 바이트가 maxToolSchemaBytes를 넘지 않는지 확인한다(게이트 11). 근사
 // 토큰 수 = bytes/4는 로그로만 남긴다 — Claude 정확 tokenizer는 비공개라 근사치일 뿐이고,
 // 실질 게이트는 바이트 상한 쪽이다.
 func TestSchemaTokenBudget(t *testing.T) {
-	// newRecordEventTestServer: Enable 없음(ingest/net 미등록) + Session 배선 — v0.1 기본
-	// 표면(6-도구)과 정확히 일치(기존 세션 헬퍼 재사용, 신규 헬퍼 불요).
-	cs, _, _, _ := newRecordEventTestServer(t)
+	// newRecordEventTestServer(t, "exec"): Session 6-도구 + exec 프로필 2종(ctr_execute·
+	// ctr_execute_file) = 8-도구 표면(D62 재기준화 — exec가 회수 경로의 1급 도구로 편입됨).
+	// exec 프로브가 실패하는 환경이면 6-도구로 줄지만 상한은 상계이므로 여전히 통과한다.
+	cs, _, _, _ := newRecordEventTestServer(t, "exec")
 	lt, err := cs.ListTools(context.Background(), nil)
 	if err != nil {
 		t.Fatalf("list tools: %v", err)
@@ -1543,7 +1561,7 @@ func TestRecordEventSchemaAttributesFloat64Caveat(t *testing.T) {
 
 // newRecordEventTestServer: newTestServer와 동형이지만 Session DB까지 배선해 ctr_record_event를
 // 기본 표면에 등록한다. storeDir을 함께 반환한다(LedgerStats(dir) 재조회용, ⑥).
-func newRecordEventTestServer(t *testing.T) (cs *mcp.ClientSession, st *store.Store, sess *session.DB, storeDir string) {
+func newRecordEventTestServer(t *testing.T, enable ...string) (cs *mcp.ClientSession, st *store.Store, sess *session.DB, storeDir string) {
 	t.Helper()
 	canon, err := ident.Canonicalize(t.TempDir())
 	if err != nil {
@@ -1561,7 +1579,9 @@ func newRecordEventTestServer(t *testing.T) (cs *mcp.ClientSession, st *store.St
 	}
 	t.Cleanup(func() { sess.Close() })
 
-	srv, err := NewServer(Config{Canon: canon, Store: st, SelfExe: testSelfExe(t), Session: sess})
+	// ScratchRoot: enable에 "exec"가 실리면 registerExecute가 등록되므로 sandbox 부모가 필요하다
+	// (TestSchemaTokenBudget 8-도구 재기준화 경로). 다른 호출자는 enable 비어 6-도구 그대로.
+	srv, err := NewServer(Config{Canon: canon, Store: st, SelfExe: testSelfExe(t), ScratchRoot: t.TempDir(), Session: sess, Enable: enable})
 	if err != nil {
 		t.Fatalf("new server: %v", err)
 	}

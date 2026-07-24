@@ -6,7 +6,7 @@ package buildinfo
 // productVersion — 릴리스 수동 지점 유일 1곳. dev 사이클 중 "-dev" 접미, 정식 릴리스 커밋에서
 // 제거(마커 경계·도그푸딩 절차는 스펙 v0.10 D56·§1.3). var(const 아님) — 향후 -ldflags -X
 // 주입 전환 여지(unexported + accessor = 외부 변경 차단).
-var productVersion = "0.10.0"
+var productVersion = "0.11.0"
 
 // ProductVersion — 전 소비처(CLI 배너·hook Producer·marker·doctor·MCP serverInfo·version
 // 서브커맨드)의 유일 입구.

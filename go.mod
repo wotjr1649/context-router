@@ -6,6 +6,7 @@ require (
 	codeberg.org/readeck/go-readability/v2 v2.1.2
 	github.com/JohannesKaufmann/html-to-markdown/v2 v2.5.2
 	github.com/google/uuid v1.6.0
+	github.com/landlock-lsm/go-landlock v0.9.0
 	github.com/modelcontextprotocol/go-sdk v1.6.1
 	go.starlark.net v0.0.0-20260708150628-5395d018f003
 	golang.org/x/net v0.57.0
@@ -29,6 +30,7 @@ require (
 	github.com/yosida95/uritemplate/v3 v3.0.2 // indirect
 	golang.org/x/oauth2 v0.35.0 // indirect
 	golang.org/x/text v0.40.0 // indirect
+	kernel.org/pub/linux/libs/security/libcap/psx v1.2.77 // indirect
 	modernc.org/libc v1.74.1 // indirect
 	modernc.org/mathutil v1.7.1 // indirect
 	modernc.org/memory v1.11.0 // indirect

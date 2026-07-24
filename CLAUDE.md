@@ -41,10 +41,19 @@ Two tiers, matching the ADR/KEP/RFC industry split — do not conflate:
 - **Stuck** (implementer BLOCKED / 2–3 failed attempts / unclear fix): collaborate —
   Codex rescue for design/root-cause, web or context7 for library facts. No blind retry.
 - **Reviews — task/integration/final (user directive 2026-07-18)**: every review
-  checkpoint runs a subagent reviewer **plus** Codex `review --base <ref>` in
-  parallel (cross-model, multi-angle), then merge findings before fixing.
-  Re-reviews after fix rounds are subagent-only — Codex stays at max one pass
-  per checkpoint (usage guard).
+  checkpoint runs a subagent reviewer **plus** Codex `review --base <ref>`
+  (cross-model, multi-angle). Re-reviews after fix rounds are subagent-only —
+  Codex stays at max one pass per checkpoint (usage guard).
+- **Cross-model review (controller-safe, 2026-07-24 근본 개선)**: root fix is
+  neutral framing + structured output, not a hook. Controller starts Codex with
+  `review --background` (never calls `result`), then dispatches **one review
+  subagent (opus)** that reads the Codex result in its own context, verifies it
+  against the diff, and integrates both reviews into a fixed **JSON findings
+  schema** (severity + `file:line` + one neutral line for defect + one for fix).
+  The controller consumes only that low-density JSON (counts/verdict/`file:line`)
+  and points the fix subagent at the JSON file. Neutral engineering wording only —
+  no exploit/isolation/evasion narrative. No PreToolUse guard (`codex-review-guard`
+  removed). Full protocol + schema + dispatch template: `docs/codex-secure-review.md`.
 - **Execution**: superpowers `subagent-driven-development` — fresh subagent per task,
   task review (spec + quality), fix → re-review. BASE from the ledger, never `HEAD~1`.
 - **Subagent hygiene**: response-splitting discipline (no whole-file rewrites; build
