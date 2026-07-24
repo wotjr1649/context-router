@@ -328,7 +328,8 @@ func buildSearchOutput(queries []string, qrs []search.QueryResult, evs [][]event
 func registerSearch(srv *mcp.Server, st *store.Store, worktreeRoot string, sess *session.DB) {
 	mcp.AddTool(srv, &mcp.Tool{
 		Name: "ctr_search",
-		Description: "프로젝트 색인을 BM25+RRF로 검색해 스니펫을 반환한다. scope로 content(기본)/" +
+		Description: "프로젝트 색인을 BM25+RRF로 검색해 스니펫을 반환한다 — 저장한 원문·대형 출력을 " +
+			"다시 읽기 전에 먼저 여기서 검색한다(질의로 필요한 조각만 회수). scope로 content(기본)/" +
 			"events/all을 선택한다 — events/all은 세션 이벤트도 함께 검색한다(세션 저장소 불용 시 STORAGE_UNAVAILABLE).",
 		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true},
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, in SearchInput) (*mcp.CallToolResult, SearchOutput, error) {
@@ -486,7 +487,8 @@ func applyFetchBudget(res store.RangeResult, maxBytes int) (text []byte, byteEnd
 func registerFetch(srv *mcp.Server, st *store.Store, worktreeRoot string) {
 	mcp.AddTool(srv, &mcp.Tool{
 		Name: "ctr_fetch",
-		Description: "artifact 저장본에서 선택자 범위를 그대로 회수한다 — 저장된 artifact의 " +
+		Description: "artifact 저장본에서 선택자(chunk/line/byte) 범위를 그대로 회수한다 — ctr_search로 " +
+			"찾은 원문을 다시 읽지 말고 여기서 회수하는 게 회수 경로다. 저장된 artifact의 " +
 			"byte-exact 조회이며 웹 fetch가 아니다(웹은 ctr_fetch_and_index).",
 		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true},
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, in FetchInput) (*mcp.CallToolResult, FetchOutput, error) {
