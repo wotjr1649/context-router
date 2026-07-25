@@ -486,6 +486,49 @@ func TestHookInstallReportsExistingApprovalScope(t *testing.T) {
 	if !strings.Contains(out.String(), "enabledMcpjsonServers") {
 		t.Errorf("보고 문면이 없다:\n%s", out.String())
 	}
+	// 적용되는 스코프를 라벨로 알려야 한다 — project와 user는 파일명이 둘 다 settings.json이라
+	// 파일명으로는 사용자가 어느 파일을 손댈지 가릴 수 없다(리뷰 T6-7).
+	if !strings.Contains(out.String(), "local 스코프") {
+		t.Errorf("적용 스코프 라벨(local)이 없다:\n%s", out.String())
+	}
+	if strings.Contains(out.String(), "settings.json") {
+		t.Errorf("모호한 파일명으로 알린다:\n%s", out.String())
+	}
+}
+
+// TestHookInstallUserScopeSkipsApprovalKey: --user 설치는 승인 키를 어느 파일에도 쓰지 않고 사유를
+// 보고한다. 이 키는 프로젝트 .mcp.json 등록을 이름으로 승인하는 장치라, 사용자 스코프에 쓰면 이
+// 머신 모든 프로젝트의 동명 항목까지(소유 검증 없이) 승인하게 된다 — 사용자 스코프 서버는
+// ~/.claude.json에 살고 승인 키가 필요 없다(리뷰 T6-1). .mcp.json 등록 자체는 그대로 수행한다.
+func TestHookInstallUserScopeSkipsApprovalKey(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home) // Windows os.UserHomeDir 이음새
+	proj := t.TempDir()
+	var out bytes.Buffer
+	if err := runHookInstall([]string{"--user"}, t.TempDir(), "", false, proj, "0.12.0", &out); err != nil {
+		t.Fatalf("install: %v", err)
+	}
+	userPath, err := hookSettingsPath(true, proj)
+	if err != nil {
+		t.Fatal(err)
+	}
+	projectPath, err := hookSettingsPath(false, proj)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range []string{userPath, projectPath} {
+		if b, readErr := os.ReadFile(p); readErr == nil && bytes.Contains(b, []byte("enabledMcpjsonServers")) {
+			t.Errorf("--user 설치가 승인 키를 썼다(%s): %s", filepath.Base(p), b)
+		}
+	}
+	if !strings.Contains(out.String(), "--user") {
+		t.Errorf("건너뛴 사유를 알리지 않았다:\n%s", out.String())
+	}
+	// .mcp.json 등록은 --user에서도 그대로 수행한다(프로젝트 스코프 파일이라 대안이 없다).
+	if _, err := os.Stat(mcpConfigPath(proj)); err != nil {
+		t.Errorf(".mcp.json 등록까지 건너뛰었다: %v", err)
+	}
 }
 
 // TestHookInstallSkipsApprovalKeyOnMCPConflict: .mcp.json 등록이 멈추면 승인 키도 쓰지 않는다.
@@ -516,6 +559,13 @@ func TestHookInstallSkipsApprovalKeyOnMCPConflict(t *testing.T) {
 	if bytes.Contains(sb, []byte("enabledMcpjsonServers")) {
 		t.Errorf("등록이 멈췄는데 승인 키를 썼다: %s", sb)
 	}
+	// 정지 사실과 조치 안내가 출력돼야 한다 — 문면이 사라지면 사용자는 부분 성공을 성공으로 읽는다
+	// (해상도 5, 리뷰 T6-4).
+	for _, want := range []string{"멈췄습니다", "다시 실행"} {
+		if !strings.Contains(out.String(), want) {
+			t.Errorf("정지·조치 문면(%q)이 없다:\n%s", want, out.String())
+		}
+	}
 }
 
 // TestHookInstallRejectsExecWithCodex: --codex는 config.toml 경로라 .mcp.json을 만들지 않고,
@@ -541,6 +591,11 @@ func TestHostSnippetSingleServerRegistration(t *testing.T) {
 	}
 	if !strings.Contains(hostSnippet, `"`+ctrMCPServerName+`": {`) {
 		t.Errorf("단일 서버 등록 예시가 없다:\n%s", hostSnippet)
+	}
+	// 전 프로젝트 사용의 공식 경로는 사용자 스코프 등록이다 — 그쪽은 승인 키가 필요 없으므로
+	// --user 설치가 승인 키를 건너뛴 사용자가 갈 곳이 안내에 있어야 한다(리뷰 T6-1).
+	if !strings.Contains(hostSnippet, "claude mcp add --scope user") {
+		t.Errorf("사용자 스코프 등록 안내가 없다:\n%s", hostSnippet)
 	}
 }
 
@@ -713,6 +768,35 @@ func TestHookUninstallKeepsForeignEntryUnderOurName(t *testing.T) {
 	}
 	if _, statErr := os.Stat(settingsPath); statErr == nil {
 		t.Error("uninstall이 없던 settings 파일을 만들었다")
+	}
+}
+
+// TestHookUninstallCleansMCPWhenSettingsUnparsable: 훅 설정이 깨져 정리에 실패해도 .mcp.json
+// 정리는 진행하고 오류는 마지막에 반환한다(종료코드 유지). 실패 자리에서 즉시 반환하면 우리 등록이
+// 영구 잔존해, 같은 블록이 선언한 "부분 설치에서 잔존 방지" 규칙이 미존재 경우에만 적용된다(T6-2).
+func TestHookUninstallCleansMCPWhenSettingsUnparsable(t *testing.T) {
+	proj := t.TempDir()
+	settingsPath, err := hookSettingsPath(false, proj)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(settingsPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(settingsPath, []byte(`{"hooks":`), 0o600); err != nil { // 깨진 JSON
+		t.Fatal(err)
+	}
+	ours := `{"mcpServers":{"` + ctrMCPServerName + `":{"command":"context-router","args":[],` +
+		`"__ctrManaged":"context-router/0.12.0"}}}`
+	if err := os.WriteFile(mcpConfigPath(proj), []byte(ours), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	if uninstallErr := runHookUninstall(nil, proj, &out); uninstallErr == nil {
+		t.Error("훅 설정 정리 실패가 오류로 반환되지 않았다 — 종료코드가 실패를 반영해야 한다")
+	}
+	if b := mustReadFile(t, mcpConfigPath(proj)); bytes.Contains(b, []byte(ctrMCPServerName)) {
+		t.Errorf(".mcp.json 정리가 시도되지 않았다: %s", b)
 	}
 }
 

@@ -179,6 +179,20 @@ func enabledServersScope(projectRoot string, readFile func(string) ([]byte, erro
 	return winner, defined, nil
 }
 
+// enabledServersScopeLabel — enabledServersScope가 돌려준 경로를 스코프 라벨로 바꾼다. 진단 라인은
+// 파일명이 아니라 이 라벨을 낸다 — project와 user는 파일명이 둘 다 settings.json이어서 파일명만으로는
+// 사용자가 어느 파일을 손댈지 가릴 수 없고, 절대경로는 실을 수 없다(§12 canary, 리뷰 T6-7).
+func enabledServersScopeLabel(projectRoot, path string) string {
+	projectPath, _ := hookSettingsPath(false, projectRoot) // user=false에는 오류 경로가 없다
+	switch path {
+	case filepath.Join(projectRoot, ".claude", "settings.local.json"):
+		return "local"
+	case projectPath:
+		return "project"
+	}
+	return "user" // enabledServersScope가 조사하는 세 경로 중 남는 하나
+}
+
 // mergeEnabledServers — settings 문서(existing, 빈 슬라이스 허용)의 enabledMcpjsonServers에
 // add면 name을 더하고 아니면 name을 뺀 JSON을 반환한다. 다른 키·다른 원소는 원문 그대로
 // 보존한다(json.RawMessage). 이미 있으면(제거 시엔 이미 없으면) 배열을 그대로 둔다 — 재실행이

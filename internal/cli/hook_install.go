@@ -557,14 +557,19 @@ func runHookInstall(args []string, storeRoot, storeRootRaw string, storeRootExpl
 	// 대신 자동 승인해 주는 셈이 된다(소유 관문의 연장).
 	if !mcpRegistered {
 		fmt.Fprintln(stdout, "mcp: .mcp.json 등록이 확정되지 않아 승인 키는 건드리지 않았습니다")
+	} else if *user {
+		// 이 키는 프로젝트 .mcp.json 등록을 "이름으로" 승인하는 장치다. 사용자 스코프에 쓰면 이 머신
+		// 모든 프로젝트의 동명 항목까지 소유 검증 없이 승인하게 되므로 쓰지 않는다(리뷰 T6-1).
+		// 전 프로젝트 사용의 정식 경로는 사용자 스코프 서버 등록이고, 그쪽은 이 키가 필요 없다.
+		fmt.Fprintln(stdout, "mcp: --user 설치는 승인 키를 쓰지 않았습니다 — enabledMcpjsonServers는 프로젝트 .mcp.json 등록에만 적용됩니다. 모든 프로젝트에서 쓰려면 doctor 안내의 사용자 스코프 등록을 쓰세요(승인 키가 필요 없습니다)")
 	} else if winner, defined, scopeErr := enabledServersScope(projectRoot, os.ReadFile); scopeErr != nil {
 		fmt.Fprintln(stdout, "mcp: 승인 키 스코프를 판정하지 못해 건너뜁니다")
 	} else if len(defined) > 0 {
-		// 실제로 적용되는 파일만 파일명으로 알린다 — 절대경로는 싣지 않는다(§12 canary 규율).
-		// "추가하세요"가 아니라 "있는지 확인하세요"인 이유: 직전 설치가 쓴 파일이 그대로 winner인
-		// 재설치에서는 이름이 이미 들어 있어, 추가를 지시하면 매번 거짓 경보가 된다.
-		fmt.Fprintf(stdout, "mcp: enabledMcpjsonServers는 이미 %d개 스코프에 정의돼 있어 이번 설치가 쓰지 않았습니다(적용되는 것은 최상위 %s 1개) — 자동 승인이 안 되면 그 파일의 목록에 %q가 있는지 확인하세요\n",
-			len(defined), filepath.Base(winner), ctrMCPServerName)
+		// 실제로 적용되는 스코프를 라벨로 알린다 — 파일명은 project와 user가 같아 구분되지 않고,
+		// 절대경로는 싣지 않는다(§12 canary 규율). "추가하세요"가 아니라 "있는지 확인하세요"인 이유:
+		// 직전 설치가 쓴 파일이 그대로 winner인 재설치에서는 이름이 이미 들어 있어 거짓 경보가 된다.
+		fmt.Fprintf(stdout, "mcp: enabledMcpjsonServers는 이미 %d개 스코프에 정의돼 있어 이번 설치가 쓰지 않았습니다(적용되는 것은 최상위 %s 스코프 1개) — 자동 승인이 안 되면 그 파일의 목록에 %q가 있는지 확인하세요\n",
+			len(defined), enabledServersScopeLabel(projectRoot, winner), ctrMCPServerName)
 	} else {
 		// path는 위쪽 훅 병합이 이미 쓴 파일이다 — 그 쓰기가 끝난 뒤 다시 읽어 병합해야 한다.
 		// 순서가 뒤집히면 훅 쓰기가 승인 키를 덮는다(둘 다 성공하고 결과만 조용히 사라진다).
@@ -669,16 +674,18 @@ func runHookUninstall(args []string, projectRoot string, stdout io.Writer) error
 	// settings.json 미존재는 no-op으로 알리되 .mcp.json 정리는 그와 무관하게 시도한다 — 부분 설치
 	// (settings만 수동 삭제)에서 우리 등록이 영구 잔존하는 것을 막는다. runHookUninstallCodex가
 	// config.toml에 대해 이미 채택한 규칙(Codex P2)과 같다.
+	// 훅 설정 정리 실패도 그 자리에서 반환하지 않는다 — 미존재와 같은 이유다(리뷰 T6-2). 실패를
+	// 보고하고 아래 정리를 마친 뒤 마지막에 hookErr을 반환해 종료코드가 실패를 반영하게 한다.
+	var hookErr error
 	if _, statErr := os.Stat(path); errors.Is(statErr, os.ErrNotExist) {
 		fmt.Fprintln(stdout, "hook uninstall: 설정 파일 없음 — 제거할 항목 없음")
+	} else if merged, mergeErr := mergeSettingsFile(path, "", "", false); mergeErr != nil { // command/marker는 제거 경로에서 미사용
+		fmt.Fprintln(stdout, "hook uninstall: 훅 설정 정리 실패 — .mcp.json 정리는 계속합니다")
+		hookErr = mergeErr
+	} else if writeErr := atomicWriteFile(path, merged); writeErr != nil {
+		fmt.Fprintln(stdout, "hook uninstall: 훅 설정 쓰기 실패 — .mcp.json 정리는 계속합니다")
+		hookErr = errors.New("hook uninstall: 설정 쓰기 실패")
 	} else {
-		merged, err := mergeSettingsFile(path, "", "", false) // command/marker는 제거 경로에서 미사용
-		if err != nil {
-			return err
-		}
-		if err := atomicWriteFile(path, merged); err != nil {
-			return errors.New("hook uninstall: 설정 쓰기 실패")
-		}
 		fmt.Fprintln(stdout, "hook uninstall: 훅 항목 제거 완료")
 	}
 
@@ -711,7 +718,7 @@ func runHookUninstall(args []string, projectRoot string, stdout io.Writer) error
 	} else if !errors.Is(prevErr, os.ErrNotExist) {
 		fmt.Fprintln(stdout, "mcp: 기존 settings를 읽지 못해 승인 키 정리를 건너뜁니다")
 	}
-	return nil
+	return hookErr
 }
 
 // runHookUninstallCodex — --codex 제거 대칭(스펙 v0.7 §3, D47+D48). hooks.json 자기 그룹(가드

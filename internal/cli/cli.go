@@ -1413,6 +1413,13 @@ const hostSnippet = `--- host adapter snippets (설계 §9) ---
 # alwaysLoad는 Claude Code v2.1.121 이상에서만 동작한다 — 그 이전 호스트는 이 필드를 조용히 무시한다.
 # 과거의 "ctr" 등록은 이 항목의 도구 집합에 완전히 포함된다 — 함께 두면 6개 도구가 중복
 # 노출되므로 "context-router hook install"이 자동으로 제거한다.
+# 모든 프로젝트에서 쓰려면 프로젝트 .mcp.json이 아니라 사용자 스코프로 등록한다 — 사용자 스코프
+# 서버는 ~/.claude.json에 저장돼 프로젝트를 가로질러 쓰이고, enabledMcpjsonServers 승인이 필요 없다
+# (그 키는 저장소가 제공하는 프로젝트 .mcp.json 서버를 승인하는 장치다):
+#   claude mcp add --scope user ctr-exec -- context-router --enable exec
+# -- 는 claude 자신의 플래그와 서버 명령을 가른다(없으면 --enable을 claude가 자기 옵션으로 읽는다).
+# 이 플래그 형태로 alwaysLoad를 설정하는 수단은 문서에 없다 — 임의 필드가 필요하면 서버 설정 스키마를
+# 그대로 받는 claude mcp add-json 형태를 쓴다(--scope user 동일 적용).
 # global-search는 별개 프로필이라 필요할 때만 따로 등록한다(설치기가 만들지 않는다):
 #   "ctr-global": { "command": "context-router", "args": ["--profile", "global-search", "--projects", "<path-or-id,...>"] }
 permissions (.claude/settings.json 예시 — ingest/net/global은 기본 ask):
