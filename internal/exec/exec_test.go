@@ -388,11 +388,27 @@ func TestCSEnvInjection(t *testing.T) {
 			t.Errorf("재지정 디렉터리 %q 미생성: %v", sub, err)
 		}
 	}
+	// 호스트 NuGet 구성 상속 차단 — NUGET_* env는 캐시·패키지 경로만 재지정하고 구성 파일
+	// 검색 경로는 격리하지 않는다(부재 로컬 소스 → 복원 NU1301, config globalPackagesFolder는
+	// NUGET_PACKAGES env보다 우선해 패키지를 스크래치 밖에 쓴다). 스크래치 로컬 구성이 탐색
+	// 체인 말단에서 섹션별 <clear />로 상위 병합분을 지운다.
+	cfg, err := os.ReadFile(filepath.Join(scratch, "nuget.config"))
+	if err != nil {
+		t.Fatalf("nuget.config 미생성: %v", err)
+	}
+	if n := strings.Count(string(cfg), "<clear />"); n != 5 {
+		t.Errorf("<clear /> %d개 — config·packageSources·disabledPackageSources·packageSourceMapping·fallbackPackageFolders 5개 필요", n)
+	}
+	if !strings.Contains(string(cfg), "https://api.nuget.org/v3/index.json") {
+		t.Errorf("clear 후 복원 가능한 소스가 없다 — nuget.org 미등록")
+	}
 }
 
 // TestRunCS: C# 골든 + env 주입 런타임 왕복 — file-based 앱이 실행되고 스니펫이 읽은
-// 재지정 env가 스크래치 하위를 담는다. dotnet 복원이 환경(예: 머신 NuGet.Config 소스 부재)
-// 때문에 실패하면 Skip한다 — 러너 미감지 Skip과 동류의 "toolchain 비가용" 처리(CI 검증).
+// 재지정 env가 스크래치 하위를 담는다. 호스트 NuGet 구성 상속은 csEnv의 스크래치 로컬
+// nuget.config가 끊으므로 더 이상 Skip 사유가 아니다 — 그 전에는 부재 로컬 소스로 인한
+// NU1301이 이 Skip에 흡수돼 실사용 실패가 테스트에 드러나지 않았다. 남은 Skip은 소스 도달
+// 불가 등 진짜 환경 비가용이며, 러너 미감지 Skip과 동류로 처리한다(CI 검증).
 func TestRunCS(t *testing.T) {
 	requireLang(t, "csharp")
 	resp := run(t, Request{

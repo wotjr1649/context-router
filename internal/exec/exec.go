@@ -399,6 +399,36 @@ func dotnetHasMajor(list string, major int) bool {
 	return false
 }
 
+// nugetConfig: 스크래치 로컬 NuGet 구성 — 호스트 설정 상속을 끊는다.
+// NUGET_* env는 캐시·패키지 "경로"만 재지정할 뿐 구성 파일 검색 경로는 격리하지 않아, 사용자
+// 전역(Windows %APPDATA%\NuGet\NuGet.Config, unix ~/.nuget/NuGet/NuGet.Config)과 머신 레벨
+// 구성이 그대로 병합된다. 등록된 로컬 소스 디렉터리가 없으면 복원이 NU1301로 죽고(로컬
+// 도그푸딩에서 관측), config 섹션의 globalPackagesFolder는 NUGET_PACKAGES env보다 우선해
+// 패키지를 스크래치 밖에 쓴다 — 격리 계약과 D61 정리 대상 밖 잔존물 양쪽에 걸린다.
+// unix는 HOME 재지정이 사용자 구성을 우연히 가렸으므로 CI 3-OS가 이 경로를 보지 못했다.
+// 스크래치는 cwd이자 file-based 프로젝트 디렉터리라 여기 둔 구성이 탐색 체인의 말단이 되고,
+// 각 섹션의 <clear />가 상위에서 병합된 값을 전부 지운다 — 호스트와 무관하게 결정적이다.
+const nugetConfig = `<?xml version="1.0" encoding="utf-8"?>
+<configuration>
+  <config>
+    <clear />
+  </config>
+  <packageSources>
+    <clear />
+    <add key="nuget.org" value="https://api.nuget.org/v3/index.json" protocolVersion="3" />
+  </packageSources>
+  <disabledPackageSources>
+    <clear />
+  </disabledPackageSources>
+  <packageSourceMapping>
+    <clear />
+  </packageSourceMapping>
+  <fallbackPackageFolders>
+    <clear />
+  </fallbackPackageFolders>
+</configuration>
+`
+
 // csEnv: dotnet CLI/NuGet 홈을 스크래치 하위로 재지정(그 디렉터리 생성)하고, in-job 실행에
 // 맞춰 MSBuild 서버/노드 재사용·공유 컴파일을 끈다(스크래치 수명 밖 프로세스 잔존 방지).
 // NUGET_PACKAGES는 global-packages만 재지정하므로 http/plugins 캐시도 스크래치 하위로 옮긴다
@@ -426,6 +456,11 @@ func csEnv(scratch string) []string {
 		_ = os.MkdirAll(d, 0o700)
 	}
 	_ = os.WriteFile(filepath.Join(migrations, "1"), nil, 0o600)
+	// 이 파일이 호스트 구성 차단의 유일한 시행점이라 조용한 실패는 격리 없이 실행되는 것과
+	// 같다 — 러너 오류로 올리지는 않되(다른 재지정과 동일한 best-effort 계약) 관측은 남긴다.
+	if err := os.WriteFile(filepath.Join(scratch, "nuget.config"), []byte(nugetConfig), 0o600); err != nil {
+		slog.Warn("exec: NuGet 구성 기록 실패 — 호스트 구성이 병합된 채로 실행", "error", err)
+	}
 	return []string{
 		"DOTNET_CLI_HOME=" + home,
 		"NUGET_PACKAGES=" + nuget,
