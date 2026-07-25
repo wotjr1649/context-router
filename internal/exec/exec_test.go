@@ -12,6 +12,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/wotjr1649/context-router/internal/sandbox"
 )
 
 // testSelfExe: 실 ctr 바이너리를 1회만 빌드해(sync.Once) 재사용한다 — transform 패키지의
@@ -370,6 +372,76 @@ func TestRunGoIgnoresHostGoEnv(t *testing.T) {
 	}
 	if !strings.Contains(resp.Stdout, "go-env") {
 		t.Errorf("GOENV가 스크래치 하위가 아니다: %q", resp.Stdout)
+	}
+}
+
+// TestRunGoScratchGoEnvWins: 호스트 go env 파일이 실재하는 픽스처를 만들어 스크래치 구성이
+// 이긴다는 것을 확인한다(D65 검증 계약). 양방향을 다 본다 — 격리를 뺀 절반은 호스트 파일의
+// GOFLAGS가 툴체인까지 도달해 빌드가 깨지고(픽스처가 실효적이라는 증거), 격리를 넣은 절반은
+// 같은 스니펫이 정상 종료한다. 한 방향만 보면 파일이 비었거나 도달하지 않아도 통과하는 공허한
+// 테스트가 된다(TestRunGoIgnoresHostGoEnv는 전파만 고정하므로 이 테스트가 반영을 맡는다).
+// 호스트 config 위치는 os.UserConfigDir() 규칙상 OS별로 달라 분기가 필요하다 — 자식 env
+// allowlist가 통과시키는 포인터가 windows APPDATA · unix HOME이므로 unix는 HOME 경유로
+// 고정한다(XDG_CONFIG_HOME은 allowlist 밖이라 자식이 못 본다). unix 실행은 3-OS CI가 검증한다.
+func TestRunGoScratchGoEnvWins(t *testing.T) {
+	requireLang(t, "go")
+	// 픽스처를 심기 전에 sync.Once 빌드를 끝낸다 — 심은 뒤면 그 go build가 깨지고 실패가
+	// testExeErr에 캐시돼 패키지 전체가 오염된다.
+	selfExe(t)
+
+	fake := t.TempDir()
+	if runtime.GOOS == "windows" {
+		t.Setenv("APPDATA", fake)
+	} else {
+		t.Setenv("XDG_CONFIG_HOME", "") // 자식과 같은 해석 경로(HOME)로 통일
+		t.Setenv("HOME", fake)
+	}
+	cfgDir, err := os.UserConfigDir()
+	if err != nil {
+		t.Fatalf("UserConfigDir: %v", err)
+	}
+	hostEnv := filepath.Join(cfgDir, "go", "env")
+	if err := os.MkdirAll(filepath.Dir(hostEnv), 0o700); err != nil {
+		t.Fatalf("호스트 config 디렉터리 생성 실패: %v", err)
+	}
+	// 반영되면 go가 플래그 파싱에서 즉시 죽는 값 — 관측이 종료코드로 갈리고 네트워크가 필요 없다.
+	if err := os.WriteFile(hostEnv, []byte("GOFLAGS=-bogusflag\n"), 0o600); err != nil {
+		t.Fatalf("호스트 go env 픽스처 기록 실패: %v", err)
+	}
+
+	code := "package main\n\nimport \"fmt\"\n\nfunc main() { fmt.Println(\"go-ok\") }\n"
+
+	// ① 격리 없음 — goEnv에서 GOENV만 뺀 환경으로 직접 실행한다(프로덕션에 토글을 심지 않기
+	// 위해 이 절반만 테스트가 환경을 조립한다). 나머지 재지정은 그대로여서 차이는 GOENV뿐이다.
+	scratch := t.TempDir()
+	file := filepath.Join(scratch, "snippet.go")
+	if err := os.WriteFile(file, []byte(code), 0o600); err != nil {
+		t.Fatalf("스니펫 기록 실패: %v", err)
+	}
+	env := sandbox.BaseEnv() // 닫힌 표 그대로 — 개발자 셸의 GOFLAGS/GOPROXY가 실험을 흐리지 않게
+	for _, kv := range goEnv(scratch) {
+		if !strings.HasPrefix(kv, "GOENV=") {
+			env = append(env, kv)
+		}
+	}
+	cmd := exec.Command("go", "run", file)
+	cmd.Dir, cmd.Env = scratch, env
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("픽스처 무효 — GOENV 없이도 성공했다(호스트 파일이 툴체인에 도달하지 않음): %s", out)
+	}
+	if !strings.Contains(string(out), "bogusflag") {
+		t.Fatalf("호스트 GOFLAGS가 실패 원인이 아니다(다른 이유로 실패): %v: %s", err, out)
+	}
+
+	// ② 격리 있음 — 같은 픽스처·같은 스니펫이 러너에서 정상 종료한다.
+	resp := run(t, Request{Language: "go", Code: code})
+	if resp.ExitCode == nil || *resp.ExitCode != 0 {
+		t.Fatalf("스크래치 go env가 호스트에 지고 있다: timedout=%v stdout=%q stderr=%q",
+			resp.TimedOut, resp.Stdout, resp.Stderr)
+	}
+	if !strings.Contains(resp.Stdout, "go-ok") {
+		t.Errorf("골든 출력 부재: %q", resp.Stdout)
 	}
 }
 
