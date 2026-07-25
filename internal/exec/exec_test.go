@@ -278,6 +278,33 @@ func TestNonZeroExit(t *testing.T) {
 	}
 }
 
+// TestShellExitCodeIsLastCommand: 중간 명령이 실패해도 마지막 명령이 성공하면 exit 0이고,
+// 실패 흔적은 stderr에만 남는다. 러너가 엄격 모드를 주입하지 않는다는 계약의 회귀 방지다
+// (설계 v0.12 D66 — 셸 일반의 정의된 동작이며 언어별로 다르게 굴지 않는다).
+func TestShellExitCodeIsLastCommand(t *testing.T) {
+	requireLang(t, "shell")
+	var code string
+	if runtime.GOOS == "windows" {
+		// 존재하지 않는 경로 접근 = 비종결 오류. 그 뒤 정상 출력으로 끝난다.
+		code = "Get-Content 'Z:\\ctr-no-such-file.txt'\nWrite-Output 'done'"
+	} else {
+		code = "cat /ctr-no-such-file.txt\necho done"
+	}
+	resp := run(t, Request{Language: "shell", Code: code})
+	if resp.ExitCode == nil {
+		t.Fatalf("ExitCode=nil (timed_out=%v)", resp.TimedOut)
+	}
+	if *resp.ExitCode != 0 {
+		t.Fatalf("exit=%d want 0 — 러너가 엄격 모드를 주입했을 수 있다. stderr=%q", *resp.ExitCode, resp.Stderr)
+	}
+	if !strings.Contains(resp.Stdout, "done") {
+		t.Errorf("마지막 명령이 실행되지 않았다: stdout=%q", resp.Stdout)
+	}
+	if strings.TrimSpace(resp.Stderr) == "" {
+		t.Errorf("실패 흔적이 stderr에 없다 — 호출자가 판정할 근거가 사라진다")
+	}
+}
+
 // TestTruncation: stdout이 상한(32768)을 넘으면 잘리고 StdoutTrunc가 선다.
 func TestTruncation(t *testing.T) {
 	requireLang(t, "javascript")
