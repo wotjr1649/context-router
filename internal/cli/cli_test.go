@@ -2452,6 +2452,27 @@ func TestDoctorWarnMentionsHookOnly(t *testing.T) {
 	}
 }
 
+// TestHostSnippetNoExecAskRule: 호스트 안내가 exec 도구를 permissions.ask에 넣게 하지
+// 않는다. ask는 무프롬프트 모드에서도 프롬프트를 강제하고 allow를 이기므로, 승인 강도는
+// 호스트 권한 모드가 정하게 둔다(설계 v0.12 D64).
+func TestHostSnippetNoExecAskRule(t *testing.T) {
+	// ask 배열 줄에 exec 도구가 있으면 안 된다.
+	for _, line := range strings.Split(hostSnippet, "\n") {
+		if !strings.Contains(line, `"ask"`) {
+			continue
+		}
+		for _, tool := range []string{"ctr_execute", "ctr_execute_file"} {
+			if strings.Contains(line, tool) {
+				t.Errorf("ask 안내에 exec 도구가 남아 있다: %s", line)
+			}
+		}
+	}
+	// 대신 모드 기반 설명이 있어야 한다.
+	if !strings.Contains(hostSnippet, "권한 모드") {
+		t.Errorf("승인 강도를 호스트 권한 모드가 정한다는 안내가 없다")
+	}
+}
+
 // TestPurgeHookOnlySinglePrompt — TTY 경로에서 확인 프롬프트가 정확히 1회만 출력된다(전역
 // confirmPurge와의 중복 방지 회귀 — 조기 분기가 전역 confirm 앞에 있어야 함). 견적 슬러그를
 // 정확히 재구성해 입력하면 통과하고 실회수 보고까지 진행된다.

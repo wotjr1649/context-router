@@ -1398,8 +1398,9 @@ func probeFTS5(ctx context.Context, reader *sql.DB) error {
 }
 
 // hostSnippet: doctor 마지막에 출력하는 호스트 등록 안내(설계 §9) — Claude Code(.mcp.json +
-// permissions ask 규칙)와 Codex(config.toml 기본 6-도구 프로필 + approval prompt 권장). exec는
-// 기본 OFF·프로필 opt-in(--enable exec, D58)이라 활성 예시와 ask/enabled_tools 확장을 병기한다.
+// ingest/net/global ask 규칙)와 Codex(config.toml 기본 6-도구 프로필). exec는 기본 OFF·프로필
+// opt-in(--enable exec, D58)이라 활성 예시와 enabled_tools 확장을 병기하되, 승인 강도는 호스트
+// 권한 모드가 정하게 둔다 — exec를 ask에 넣지 않는다(D64).
 const hostSnippet = `--- host adapter snippets (설계 §9) ---
 
 ## Claude Code (.mcp.json)
@@ -1410,12 +1411,17 @@ const hostSnippet = `--- host adapter snippets (설계 §9) ---
     "ctr-exec": { "command": "context-router", "args": ["--enable", "exec"] }
   }
 }
-permissions (.claude/settings.json 예시 — ingest/net/global/exec는 기본 ask):
+permissions (.claude/settings.json 예시 — ingest/net/global은 기본 ask):
 {
   "permissions": {
-    "ask": ["mcp__ctr__ctr_index", "mcp__ctr__ctr_fetch_and_index", "mcp__ctr-global__*", "mcp__ctr-exec__ctr_execute", "mcp__ctr-exec__ctr_execute_file"]
+    "ask": ["mcp__ctr__ctr_index", "mcp__ctr__ctr_fetch_and_index", "mcp__ctr-global__*"]
   }
 }
+# exec 2종(ctr_execute·ctr_execute_file)은 ask에 넣지 않는다 — 승인 강도는 호스트 권한 모드가
+# 정한다. default 모드에서는 MCP 기본 프롬프트가 그대로 작동하고, 사용자가 무프롬프트 모드를
+# 명시적으로 고른 경우에만 즉시 실행된다. ask 규칙을 넣으면 그 모드에서도 프롬프트가 강제되고,
+# 평가 순서(deny→ask→allow) 때문에 더 구체적인 allow도 ask를 이기지 못한다.
+# 이중 동의는 유지된다: ① --enable exec 서버 프로필(기동 시) ② 호스트 권한 모델.
 
 ## Codex (~/.codex/config.toml)
 [mcp_servers.ctr]
@@ -1423,7 +1429,7 @@ command = "context-router"
 args = []
 enabled_tools = ["ctr_search", "ctr_fetch", "ctr_transform", "ctr_record_event", "ctr_session_summary", "ctr_export_events"]
 # ingest/net 활성화 시 권장: default_tools_approval_mode = "prompt"
-# exec 프로필(--enable exec) 활성 시 enabled_tools에 "ctr_execute","ctr_execute_file" 추가 — approval prompt 권장.
+# exec 프로필(--enable exec) 활성 시 enabled_tools에 "ctr_execute","ctr_execute_file" 추가 — 승인 강도는 Codex 승인 모드가 정한다.
 `
 
 // runDoctor: 5항목 진단(저장 루트/프로젝트 식별/content.db/FTS5/ledger.db) + 호스트 등록
