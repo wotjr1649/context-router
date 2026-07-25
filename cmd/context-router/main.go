@@ -361,6 +361,41 @@ func parseLogLevel(s string) slog.Level {
 	}
 }
 
+// defaultShadowRetention — shadow 귀속 아티팩트 보존 기간(설계 v0.12 D67). 훅이 가로챈
+// 출력은 대개 해당 세션 안에서 소비되므로 짧게 잡는다.
+const defaultShadowRetention = 72 * time.Hour
+
+// shadowRetention — CTR_SHADOW_RETENTION(time.ParseDuration 형식) 양수만 채택한다.
+// 파싱 실패·비양수는 기본값(storeWarnBytes와 같은 규율 — 잘못된 값이 정책을 무력화하지
+// 않게 한다).
+func shadowRetention(getenv func(string) string) time.Duration {
+	if d, err := time.ParseDuration(getenv("CTR_SHADOW_RETENTION")); err == nil && d > 0 {
+		return d
+	}
+	return defaultShadowRetention
+}
+
+// startupPurgeBudget — 기동 회수에 주는 시간 예산. 이 구간은 mcp.Serve 앞이고, 상시 로드
+// (alwaysLoad, D63③)로 등록된 서버는 호스트가 연결을 마칠 때까지 세션 시작 자체를 막으며 그
+// 한도는 표준 연결 타임아웃 5s다 — 즉 여기서 쓰는 시간은 initialize 왕복 지연이 아니라 사용자
+// 세션 시작 지연이다. 그래서 그 한도의 작은 몫만 쓰고 못 끝낸 몫은 다음 기동이 이어받는다.
+// 이 값이 실제 상한이 되는 구간은 행 삭제 tx다(실측 5/50/150ms 예산에서 소요 5.5/50.2/154ms).
+// 예외: 다른 프로세스가 쓰기 락을 잡고 있으면 SQLite busy handler는 interrupt 플래그를 보지
+// 않아 busy_timeout(5s) 대기가 이 예산을 넘길 수 있다.
+const startupPurgeBudget = 300 * time.Millisecond
+
+// startupPurgeMaxHashes — 1회 회수 상한(정상상태 안전판). reclaimHookBlobs는 hash마다
+// rename·stat·참조조회·remove를 하며 그동안 store 락을 잡는다. 파일 회수 구간의 실질 한도는
+// 이 건수다 — 시간 예산이 끊는 것은 행 삭제 tx까지이고(드라이버가 ctx 취소를 sqlite3_interrupt로
+// 전달한다), 회수 루프는 hash 사이에서 ctx를 보지 않아 예산이 소진돼도 남은 hash를 유예
+// 처리하며 목록 끝까지 돈다(store.reclaimHookBlobs).
+// ponytail: 두 예산은 서로 독립이 아니다 — 행 삭제가 단일 tx라 예산을 넘긴 배치는 통째로
+// 롤백되어 진행이 0이다(부분 진행 없음). 210MiB·shadow 1252해시 실측에서 200해시 배치는
+// 1.57s, 25해시 배치는 0.37~0.52s였다. 즉 이 상한만큼 적체가 쌓인 store에서는 기동 회수가
+// 진행되지 않고 예산만 소모하며, 그 구제는 수동 purge --hook-only다(doctor [14] 안내).
+// 적체 자체를 기동으로 흡수하려면 300ms에 확실히 커밋되는 규모(수십 해시)로 낮춰야 한다.
+const startupPurgeMaxHashes = 200
+
 func run(ctx context.Context, args []string, stderr io.Writer) error {
 	f, err := parseFlags(args)
 	if err != nil {
@@ -453,6 +488,36 @@ func run(ctx context.Context, args []string, stderr io.Writer) error {
 	scratchRoot := filepath.Join(os.TempDir(), "ctr-exec-"+canon.ProjectID) // D58: OS temp 하위
 	if slices.Contains(f.Enable, "exec") {
 		sandbox.SweepStale(scratchRoot, 24*time.Hour) // D61: 기동 시 24h+ 스테일 스윕
+	}
+	// D67: shadow 귀속 보존 기간 초과분을 기동 시 1회 회수한다. exec 프로필과 무관하다.
+	// VACUUM은 하지 않는다 — free page 재사용으로 파일이 정상상태에 머무는 것이 목표이고,
+	// 현재 규모(200MiB급) VACUUM은 기동 지연이 크다. 시간·건수 예산으로 mcp.Serve 진입 지연을
+	// 억제하며, 실패도 기동을 막지 않는다: 행 삭제가 실패하면 다음 기동이 같은 배치를 다시
+	// 시도하고, 커밋 뒤 파일 회수에서 유예·실패한 몫은 행이 이미 없어 다음 기동 술어에 잡히지
+	// 않으므로 purge --gc가 회수한다(store.reclaimHookBlobs 계약).
+	purgeCtx, cancelPurge := context.WithTimeout(ctx, startupPurgeBudget)
+	rep, purgeErr := st.PurgeHookOnlyOlderThan(purgeCtx,
+		time.Now().Add(-shadowRetention(os.Getenv)).Unix(), startupPurgeMaxHashes)
+	// 예산 소진 판정은 cancelPurge 앞에서 한다 — ctx.Err()는 최초 종료 사유로 latch되므로 취소를
+	// 먼저 부르면 deadline이 Canceled로 덮인다. 오류 모양이 아니라 ctx를 보는 이유: 관측된 모양은
+	// context.DeadlineExceeded였지만 드라이버가 문장 중간 취소를 sqlite3_interrupt로 처리하므로
+	// SQLITE_INTERRUPT로 올라올 수도 있고, 파일 회수 단계는 예산을 넘겨도 오류를 만들지 않는다.
+	budgetSpent := errors.Is(purgeCtx.Err(), context.DeadlineExceeded)
+	cancelPurge()
+	switch {
+	case purgeErr != nil && budgetSpent:
+		// 예산 소진은 정상 경로다 — 경고가 아니다. 이 분기의 오류는 행 삭제 tx에서만 나오고 그
+		// 단계는 실패 시 빈 리포트를 반환하므로(store.purgeHookRows) 건수를 싣지 않는다. 남은
+		// 파일은 참조 재확인이 실패하면 보수적으로 유예되므로(stillReferenced가 오류를 "참조
+		// 있음"으로 취급) 오삭제는 없다.
+		slog.Info("기동 shadow 회수 예산 소진 — 다음 기동에서 이어서 회수")
+	case purgeErr != nil:
+		slog.Warn("기동 shadow 회수 실패 — 다음 기동에서 재시도", "error", purgeErr)
+	case rep.Hashes > 0:
+		// budget_spent·capped: 어느 예산이 이번 회수를 끊었는지 관측용(D67 임계값 재설정 입력).
+		slog.Info("기동 shadow 회수", "hashes", rep.Hashes, "bytes", rep.ReclaimedB,
+			"deferred", rep.DeferredFiles, "capped", rep.Hashes == startupPurgeMaxHashes,
+			"budget_spent", budgetSpent)
 	}
 	return mcp.Serve(ctx, mcp.Config{
 		Canon: canon, Store: st, SelfExe: selfExe, ScratchRoot: scratchRoot,

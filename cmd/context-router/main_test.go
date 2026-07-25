@@ -2245,3 +2245,25 @@ func TestE2E_HookConcurrentSummaryExport(t *testing.T) {
 		t.Fatalf("process exit: %v (stderr=%s)", err, stderrBuf.String())
 	}
 }
+
+// TestShadowRetentionDefault: 기본 보존 기간이 3일이고, 환경변수로만 조정된다.
+// 임의 상향으로 정책이 조용히 무력화되지 않도록 파싱 실패·비양수는 기본값을 쓴다
+// (storeWarnBytes와 같은 규율).
+func TestShadowRetentionDefault(t *testing.T) {
+	cases := []struct {
+		env  string
+		want time.Duration
+	}{
+		{"", 72 * time.Hour},
+		{"24h", 24 * time.Hour},
+		{"0", 72 * time.Hour},
+		{"-5h", 72 * time.Hour},
+		{"garbage", 72 * time.Hour},
+	}
+	for _, c := range cases {
+		got := shadowRetention(func(string) string { return c.env })
+		if got != c.want {
+			t.Errorf("shadowRetention(%q)=%v want %v", c.env, got, c.want)
+		}
+	}
+}
