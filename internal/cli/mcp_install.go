@@ -158,3 +158,65 @@ func enabledServersScope(projectRoot string, readFile func(string) ([]byte, erro
 	}
 	return winner, defined, nil
 }
+
+// permissionRules — settings 파일에서 읽는 규칙 배열.
+type permissionRules struct {
+	Permissions struct {
+		Ask   []string `json:"ask"`
+		Allow []string `json:"allow"`
+	} `json:"permissions"`
+}
+
+// ruleMatches — ask 규칙 r이 allow 규칙 a가 가리키는 도구를 덮는가. 리터럴 완전 일치와
+// 도구 위치 접미 glob("mcp__server__prefix_*")만 다룬다. 서버 세그먼트에는 glob이 오지 않는다.
+func ruleMatches(r, a string) bool {
+	if r == a {
+		return true
+	}
+	if !strings.HasSuffix(r, "*") {
+		return false
+	}
+	return strings.HasPrefix(a, strings.TrimSuffix(r, "*"))
+}
+
+// askShadowedAllows — 모든 스코프의 permissions를 모아, ask가 덮는 allow 항목을 보고한다.
+// 규칙 평가가 deny→ask→allow 순이라 이 조합에서 allow는 효력이 없다(설계 v0.12 D64).
+// permission 규칙은 스코프 간 concat+dedup으로 병합되므로 전 스코프를 합쳐 판정한다 —
+// enabledServersScope와 달리 덮어쓰기가 아니라 합집합이라 순회 순서가 결과를 바꾸지 않는다.
+func askShadowedAllows(projectRoot string, readFile func(string) ([]byte, error)) ([]string, error) {
+	userPath, err := hookSettingsPath(true, projectRoot)
+	if err != nil {
+		return nil, err
+	}
+	projectPath, err := hookSettingsPath(false, projectRoot)
+	if err != nil {
+		return nil, err
+	}
+	localPath := filepath.Join(projectRoot, ".claude", "settings.local.json")
+
+	var asks, allows []string
+	for _, p := range []string{userPath, projectPath, localPath} {
+		b, err := readFile(p)
+		if err != nil {
+			continue
+		}
+		var doc permissionRules
+		if err := json.Unmarshal(b, &doc); err != nil {
+			continue
+		}
+		asks = append(asks, doc.Permissions.Ask...)
+		allows = append(allows, doc.Permissions.Allow...)
+	}
+	var shadowed []string
+	seen := map[string]bool{}
+	for _, a := range allows {
+		for _, r := range asks {
+			if ruleMatches(r, a) && !seen[a] {
+				seen[a] = true
+				shadowed = append(shadowed, a)
+				break
+			}
+		}
+	}
+	return shadowed, nil
+}

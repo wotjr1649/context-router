@@ -1867,6 +1867,19 @@ func runDoctor(ctx context.Context, w io.Writer, storeRoot, projectRoot, version
 	}
 	fmt.Fprintf(w, "[18] exec runners: %s\n", strings.Join(parts, " "))
 
+	// [19] 승인 규칙 정합 — ask가 allow를 덮는 조합은 "설정을 바꿨는데 계속 물어본다"로만
+	// 드러나 사용자가 알아채기 어렵다(설계 v0.12 D64). 결과는 세 갈래다: 충돌 발견·충돌 없음·
+	// 판정 자체 실패. 판정이 실패했을 때 "충돌 없음"을 찍으면 확인하지 않은 것을 확인했다고
+	// 말하는 셈이라 침묵보다 나쁘다 — 세 번째 라인을 따로 둔다. 오류는 문면에 담지 않는다(§12).
+	if shadowed, err := askShadowedAllows(projectRoot, os.ReadFile); err != nil {
+		fmt.Fprintln(w, "[19] permissions: ask/allow 판정 불가 — 설정 스코프 경로를 해석하지 못해 확인하지 못했다(충돌 없음이 아니다)")
+	} else if len(shadowed) > 0 {
+		fmt.Fprintf(w, "[19] permissions: ask가 allow를 덮는 항목 %d건 — %s (평가 순서 deny→ask→allow, ask를 지우면 호스트 권한 모드가 승인 강도를 정한다)\n",
+			len(shadowed), strings.Join(shadowed, ", "))
+	} else {
+		fmt.Fprintln(w, "[19] permissions: ask/allow 충돌 없음")
+	}
+
 	fmt.Fprintln(w)
 	fmt.Fprint(w, hostSnippet)
 

@@ -253,3 +253,70 @@ func TestScopeKeyForTestSeparatesUserAndProject(t *testing.T) {
 		}
 	}
 }
+
+// TestAskShadowedAllows: ask와 allow가 같은 도구를 가리키면 그 도구를 보고한다.
+// 평가 순서가 deny→ask→allow라 이 조합에서 allow는 효력이 없다.
+func TestAskShadowedAllows(t *testing.T) {
+	proj := t.TempDir()
+	files := map[string]string{
+		"PROJECT": `{"permissions":{"ask":["mcp__ctr-exec__ctr_execute","mcp__ctr-exec__ctr_execute_file"]}}`,
+		"LOCAL":   `{"permissions":{"allow":["mcp__ctr-exec__ctr_execute"]}}`,
+		"USER":    `{}`,
+	}
+	read := func(p string) ([]byte, error) {
+		if s, ok := files[scopeKeyForTest(proj, p)]; ok {
+			return []byte(s), nil
+		}
+		return nil, os.ErrNotExist
+	}
+	got, err := askShadowedAllows(proj, read)
+	if err != nil {
+		t.Fatalf("askShadowedAllows: %v", err)
+	}
+	if len(got) != 1 || got[0] != "mcp__ctr-exec__ctr_execute" {
+		t.Errorf("got=%v, [mcp__ctr-exec__ctr_execute] 여야 한다", got)
+	}
+}
+
+// TestAskShadowedAllowsGlob: ask의 도구 위치 glob이 allow의 리터럴을 덮는 경우도 잡는다.
+func TestAskShadowedAllowsGlob(t *testing.T) {
+	proj := t.TempDir()
+	files := map[string]string{
+		"PROJECT": `{"permissions":{"ask":["mcp__ctr-exec__ctr_*"]}}`,
+		"LOCAL":   `{"permissions":{"allow":["mcp__ctr-exec__ctr_execute"]}}`,
+	}
+	read := func(p string) ([]byte, error) {
+		if s, ok := files[scopeKeyForTest(proj, p)]; ok {
+			return []byte(s), nil
+		}
+		return nil, os.ErrNotExist
+	}
+	got, err := askShadowedAllows(proj, read)
+	if err != nil {
+		t.Fatalf("askShadowedAllows: %v", err)
+	}
+	if len(got) != 1 {
+		t.Errorf("got=%v, glob이 리터럴을 덮는 조합을 잡아야 한다", got)
+	}
+}
+
+// TestAskShadowedAllowsClean: 겹치지 않으면 빈 목록이다.
+func TestAskShadowedAllowsClean(t *testing.T) {
+	proj := t.TempDir()
+	files := map[string]string{
+		"LOCAL": `{"permissions":{"allow":["mcp__ctr-exec__ctr_execute"]}}`,
+	}
+	read := func(p string) ([]byte, error) {
+		if s, ok := files[scopeKeyForTest(proj, p)]; ok {
+			return []byte(s), nil
+		}
+		return nil, os.ErrNotExist
+	}
+	got, err := askShadowedAllows(proj, read)
+	if err != nil {
+		t.Fatalf("askShadowedAllows: %v", err)
+	}
+	if len(got) != 0 {
+		t.Errorf("got=%v, 비어야 한다", got)
+	}
+}

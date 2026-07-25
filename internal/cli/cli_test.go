@@ -2592,3 +2592,48 @@ func TestPurgeHookOnlyVacuumFailurePropagates(t *testing.T) {
 		t.Fatalf("실회수 보고가 VACUUM 이전에 안 나옴:\n%s", gw.buf.String())
 	}
 }
+
+// TestDoctorShowsPermissionLine: [19] 라인이 항상 나온다(충돌 유무와 무관).
+func TestDoctorShowsPermissionLine(t *testing.T) {
+	var buf bytes.Buffer
+	_ = runDoctor(context.Background(), &buf, t.TempDir(), t.TempDir(), "0.12.0")
+	if !strings.Contains(buf.String(), "[19] permissions:") {
+		t.Fatalf("[19] 누락:\n%s", buf.String())
+	}
+}
+
+// TestDoctorReportsAskShadowedAllow: 프로젝트 settings의 ask가 allow를 덮으면 doctor가 그 도구
+// 이름을 [19]로 보고한다 — 디스크의 실제 파일에서 doctor 라인까지의 배선을 잇는 테스트다.
+// USER 스코프는 임시 홈으로 돌려 실환경 설정이 건수에 섞이지 않게 한다(판정은 전 스코프 합집합).
+func TestDoctorReportsAskShadowedAllow(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("USERPROFILE", home) // windows
+	t.Setenv("HOME", home)        // unix
+	projectRoot := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(projectRoot, ".claude"), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	rules := `{"permissions":{"ask":["mcp__ctr-exec__ctr_execute"],"allow":["mcp__ctr-exec__ctr_execute"]}}`
+	if err := os.WriteFile(filepath.Join(projectRoot, ".claude", "settings.json"), []byte(rules), 0o600); err != nil {
+		t.Fatalf("write settings: %v", err)
+	}
+	var buf bytes.Buffer
+	_ = runDoctor(context.Background(), &buf, t.TempDir(), projectRoot, "0.12.0")
+	if !strings.Contains(buf.String(), "[19] permissions: ask가 allow를 덮는 항목 1건 — mcp__ctr-exec__ctr_execute") {
+		t.Fatalf("[19] 충돌 보고 누락:\n%s", buf.String())
+	}
+}
+
+// TestDoctorPermissionLineOnCheckFailure: 판정 자체가 실패하면 "충돌 없음"이 아니라 판정 불가를
+// 알린다 — 확인하지 않은 것을 확인했다고 말하는 진단은 침묵보다 사용자를 더 오도한다. 홈 디렉터리
+// 해석이 유일한 실패 경로라 USERPROFILE/HOME을 비워 재현한다. [19]는 한 줄만 나오므로 판정 불가
+// 라인의 존재가 곧 "충돌 없음"을 찍지 않았다는 증거다.
+func TestDoctorPermissionLineOnCheckFailure(t *testing.T) {
+	t.Setenv("USERPROFILE", "") // windows
+	t.Setenv("HOME", "")        // unix
+	var buf bytes.Buffer
+	_ = runDoctor(context.Background(), &buf, t.TempDir(), t.TempDir(), "0.12.0")
+	if !strings.Contains(buf.String(), "[19] permissions: ask/allow 판정 불가") {
+		t.Fatalf("판정 실패인데 판정 불가 라인이 없다:\n%s", buf.String())
+	}
+}
