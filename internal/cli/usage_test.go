@@ -341,3 +341,27 @@ func TestUsageAdoptionCounts(t *testing.T) {
 		t.Fatalf("ratio 참고 문면 누락:\n%s", got)
 	}
 }
+
+// TestMCPServerOf: summary에서 MCP 서버 네임스페이스를 뽑는다. 서버 이름에 밑줄이 있어도
+// 첫 "__" 구분자에서 끊는다(mcp__<server>__<tool>).
+func TestMCPServerOf(t *testing.T) {
+	cases := []struct {
+		in     string
+		server string
+		ok     bool
+	}{
+		{"mcp__ctr-exec__ctr_execute", "ctr-exec", true},
+		{"mcp__ctr__ctr_search", "ctr", true},
+		{"mcp__plugin_ctxscribe_mcp__ctx_execute", "plugin_ctxscribe_mcp", true},
+		{"Read", "", false},
+		{"Bash: cd", "", false},
+		{"mcp__", "", false},
+		{"mcp__onlyserver", "", false},
+	}
+	for _, c := range cases {
+		got, ok := mcpServerOf(c.in)
+		if got != c.server || ok != c.ok {
+			t.Errorf("mcpServerOf(%q)=(%q,%v) want (%q,%v)", c.in, got, ok, c.server, c.ok)
+		}
+	}
+}

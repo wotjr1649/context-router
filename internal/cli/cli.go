@@ -521,6 +521,22 @@ func openSessionDBReadOnly(storeRoot, projectRoot string) (*sql.DB, error) {
 	return session.OpenReadOnly(sessDir)
 }
 
+// mcpServerOf: "mcp__<server>__<tool>" 형태의 도구 이름에서 서버 네임스페이스를 뽑는다.
+// 서버 세그먼트에는 밑줄이 들어갈 수 있으므로(예: plugin_ctxscribe_mcp) 접두 제거 후
+// 첫 "__"에서 끊는다. MCP 도구가 아니면 ok=false.
+func mcpServerOf(summary string) (string, bool) {
+	const prefix = "mcp__"
+	if !strings.HasPrefix(summary, prefix) {
+		return "", false
+	}
+	rest := summary[len(prefix):]
+	i := strings.Index(rest, "__")
+	if i <= 0 || i+2 >= len(rest) {
+		return "", false
+	}
+	return rest[:i], true
+}
+
 // runUsageAdoption: session_events(tool_call)를 ctr/ctxscribe로 분류 집계한다(설계 v0.11 D62).
 // 1차 지표 = 절대 호출 수. 비율은 참고(브리지 종료 후 분모 붕괴 — 스펙 명시). read-only라 대상
 // DB를 오염시키지 않는다.
