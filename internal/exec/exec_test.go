@@ -582,20 +582,36 @@ func TestRunTS(t *testing.T) {
 	}
 }
 
-// TestJSEnvIsolatesUserConfig: npm 사용자 구성 경로가 스크래치로 고정된다.
+// TestJSEnvIsolatesUserConfig: npm 사용자 구성과 bun 사용자 레벨 bunfig 탐색이 스크래치로
+// 고정된다. npmrc만 덮으면 절반이다 — bun은 홈 포인터로 자기 사용자 구성(preload 포함)을
+// 찾는다(jsEnv 주석 ②).
 func TestJSEnvIsolatesUserConfig(t *testing.T) {
+	want := func(root string) map[string]string {
+		return map[string]string{
+			"NPM_CONFIG_USERCONFIG": filepath.Join(root, "npmrc"),
+			"HOME":                  filepath.Join(root, "home"),
+			"XDG_CONFIG_HOME":       filepath.Join(root, "home", ".config"),
+		}
+	}
 	scratch := t.TempDir()
 	m := map[string]string{}
 	for _, kv := range jsEnv(scratch) {
 		k, v, _ := strings.Cut(kv, "=")
 		m[k] = v
 	}
-	want := filepath.Join(scratch, "npmrc")
-	if got := m["NPM_CONFIG_USERCONFIG"]; got != want {
-		t.Errorf("NPM_CONFIG_USERCONFIG=%q want %q", got, want)
+	for k, w := range want(scratch) {
+		if got := m[k]; got != w {
+			t.Errorf("%s=%q want %q", k, got, w)
+		}
 	}
-	if _, err := os.Stat(want); err != nil {
+	// env에 할당한 경로는 전부 사전 생성한다(goEnv GOTMPDIR 규칙) — npmrc는 파일, 홈·XDG는 디렉터리.
+	if _, err := os.Stat(m["NPM_CONFIG_USERCONFIG"]); err != nil {
 		t.Errorf("npmrc 사전 생성 안 됨: %v", err)
+	}
+	for _, k := range []string{"HOME", "XDG_CONFIG_HOME"} {
+		if fi, err := os.Stat(m[k]); err != nil || !fi.IsDir() {
+			t.Errorf("%s 디렉터리 사전 생성 안 됨: %v", k, err)
+		}
 	}
 	// 양쪽 배선을 표에서 직접 본다 — typescript는 tsRunner()가 따로 조립하므로 한쪽만 배선해도
 	// 위 검사는 통과한다. 러너 미설치 환경에서도(런타임 테스트가 Skip돼도) 누락을 잡는다.
@@ -606,37 +622,108 @@ func TestJSEnvIsolatesUserConfig(t *testing.T) {
 			continue
 		}
 		sub := t.TempDir()
-		got := ""
+		sm := map[string]string{}
 		for _, kv := range r.extra(sub) {
-			if k, v, _ := strings.Cut(kv, "="); k == "NPM_CONFIG_USERCONFIG" {
-				got = v
-			}
+			k, v, _ := strings.Cut(kv, "=")
+			sm[k] = v
 		}
-		if want := filepath.Join(sub, "npmrc"); got != want {
-			t.Errorf("%s: NPM_CONFIG_USERCONFIG=%q want %q", lang, got, want)
+		for k, w := range want(sub) {
+			if got := sm[k]; got != w {
+				t.Errorf("%s: %s=%q want %q", lang, k, got, w)
+			}
 		}
 	}
 }
 
-// TestRunJSIgnoresHostNpmrc: 러너 안에서 관측한 NPM_CONFIG_USERCONFIG가 스크래치 하위다
-// (적용 실증의 전파 절반 — 구성 해석 절반은 TestNpmrcScratchConfigWins가 맡는다).
-// javascript·typescript 양쪽을 본다: 한쪽만 배선되면 그 서브테스트에서 갈린다.
-func TestRunJSIgnoresHostNpmrc(t *testing.T) {
+// TestRunJSIsolatesUserConfig: 러너 안에서 관측한 사용자 구성 포인터 셋이 전부 스크래치 하위다
+// (적용 실증의 전파 절반 — npm 구성 해석은 TestNpmrcScratchConfigWins, bun preload는
+// TestRunJSScratchBunfigWins가 맡는다). javascript·typescript 양쪽을 본다: 한쪽만 배선되면 그
+// 서브테스트에서 갈린다. 실패 시 어느 변수가 새는지 출력에 남긴다.
+func TestRunJSIsolatesUserConfig(t *testing.T) {
 	for _, lang := range []string{"javascript", "typescript"} {
 		t.Run(lang, func(t *testing.T) {
 			requireLang(t, lang)
 			resp := run(t, Request{
 				Language: lang,
-				Code: "const rc = String(process.env.NPM_CONFIG_USERCONFIG)\n" +
-					"console.log(rc.startsWith(String(process.env.CTR_SCRATCH)) ? 'RC-IN-SCRATCH' : 'RC=' + rc)\n",
+				Code: "const s = String(process.env.CTR_SCRATCH)\n" +
+					"const keys = ['NPM_CONFIG_USERCONFIG', 'HOME', 'XDG_CONFIG_HOME']\n" +
+					"const leak = keys.filter((k) => !String(process.env[k]).startsWith(s))\n" +
+					"console.log(leak.length === 0 ? 'ALL-IN-SCRATCH' : 'LEAK ' + leak.map((k) => k + '=' + process.env[k]).join(' '))\n",
 			})
 			if resp.ExitCode == nil || *resp.ExitCode != 0 {
 				t.Fatalf("exit=%v stderr=%q", resp.ExitCode, resp.Stderr)
 			}
-			if !strings.Contains(resp.Stdout, "RC-IN-SCRATCH") {
-				t.Errorf("NPM_CONFIG_USERCONFIG가 스크래치 하위가 아니다: %q", resp.Stdout)
+			if !strings.Contains(resp.Stdout, "ALL-IN-SCRATCH") {
+				t.Errorf("사용자 구성 포인터가 스크래치 하위가 아니다: %q", resp.Stdout)
 			}
 		})
+	}
+}
+
+// TestRunJSScratchBunfigWins: bun 사용자 레벨 bunfig(`$HOME/.bunfig.toml`)에 preload를 심어
+// 격리가 이긴다는 것을 확인한다. preload는 스니펫보다 먼저 실행되므로 상속되면 사용자 코드 앞에
+// 임의 모듈이 끼어들고, detectJS가 bun을 먼저 고르니 러너의 기본 경로다.
+// 이 픽스처는 플랫폼·bun 버전에 따라 무효일 수 있다 — windows 1.3.14에서는 어떤 홈 포인터로도
+// 전역 bunfig가 적용되지 않는 것을 실측했다. 그래서 격리 없는 절반으로 픽스처 실효성을 먼저
+// 확인하고, 무효면 그 사실을 Skip 문면에 남긴다(조용한 통과 금지). 실효적이면 러너 절반을
+// 단정한다. bun이 없으면 읽는 주체가 없다 — node는 bunfig를 쓰지 않는다.
+func TestRunJSScratchBunfigWins(t *testing.T) {
+	bun, err := exec.LookPath("bun")
+	if err != nil {
+		t.Skip("bun 미설치 — bunfig를 읽는 주체가 없다(node는 bunfig를 쓰지 않는다)")
+	}
+	// 픽스처를 심기 전에 sync.Once 빌드를 끝낸다 — 심은 뒤면 그 go build가 깨지고 실패가
+	// testExeErr에 캐시돼 패키지 전체가 오염된다.
+	selfExe(t)
+
+	fake := t.TempDir()
+	t.Setenv("HOME", fake) // unix 닫힌 표가 통과시키는 포인터 — 격리가 없으면 자식이 이걸 본다
+	t.Setenv("XDG_CONFIG_HOME", fake)
+	preload := filepath.Join(fake, "host-preload.js")
+	if err := os.WriteFile(preload, []byte("console.log('HOST-PRELOAD')\n"), 0o600); err != nil {
+		t.Fatalf("preload 픽스처 기록 실패: %v", err)
+	}
+	// TOML 문자열이라 경로는 슬래시로 — windows 백슬래시 이스케이프를 피한다.
+	cfg := []byte("preload = [\"" + filepath.ToSlash(preload) + "\"]\n")
+	if err := os.WriteFile(filepath.Join(fake, ".bunfig.toml"), cfg, 0o600); err != nil {
+		t.Fatalf("호스트 bunfig 픽스처 기록 실패: %v", err)
+	}
+	code := "console.log('snippet-ok')\n"
+
+	// ① 격리 없음 — jsEnv에서 홈 포인터만 뺀 환경으로 직접 실행하고, 픽스처 홈을 명시로 얹는다
+	// (windows 닫힌 표에는 HOME이 없어 BaseEnv 경유로는 실효성 자체를 확인할 수 없다).
+	scratch := t.TempDir()
+	file := filepath.Join(scratch, "snippet.js")
+	if err := os.WriteFile(file, []byte(code), 0o600); err != nil {
+		t.Fatalf("스니펫 기록 실패: %v", err)
+	}
+	env := sandbox.BaseEnv()
+	for _, kv := range jsEnv(scratch) {
+		if !strings.HasPrefix(kv, "HOME=") && !strings.HasPrefix(kv, "XDG_CONFIG_HOME=") {
+			env = append(env, kv)
+		}
+	}
+	env = append(env, "HOME="+fake, "XDG_CONFIG_HOME="+fake)
+	cmd := exec.Command(bun, file)
+	cmd.Dir, cmd.Env = scratch, env
+	raw, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("격리 없는 절반이 실행 자체에 실패했다: %v: %s", err, raw)
+	}
+	if !strings.Contains(string(raw), "HOST-PRELOAD") {
+		t.Skipf("이 플랫폼·bun 버전에서 전역 bunfig가 적용되지 않아 픽스처가 무효다 — 격리가 닫는 것은 문서상 unix 경로다: %s", raw)
+	}
+
+	// ② 격리 있음 — 같은 픽스처가 러너에서 preload되지 않는다.
+	resp := run(t, Request{Language: "javascript", Code: code})
+	if resp.ExitCode == nil || *resp.ExitCode != 0 {
+		t.Fatalf("exit=%v stderr=%q", resp.ExitCode, resp.Stderr)
+	}
+	if strings.Contains(resp.Stdout, "HOST-PRELOAD") {
+		t.Errorf("호스트 bunfig의 preload가 러너에서 실행됐다: %q", resp.Stdout)
+	}
+	if !strings.Contains(resp.Stdout, "snippet-ok") {
+		t.Errorf("골든 출력 부재: %q", resp.Stdout)
 	}
 }
 

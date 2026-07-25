@@ -217,20 +217,39 @@ func detectJS() (string, string, error) {
 	return p, "", err
 }
 
-// jsEnv: node/bun의 사용자 npmrc를 스크래치로 고정한다(D65). 인터프리터 자체는 npmrc를 읽지
-// 않으므로(`node file.js`·`bun file.js`) 스니펫 실행에는 반영 지점이 없지만, 스니펫이 npm·bun
-// install을 호출하면 호스트 사용자 구성의 레지스트리·프록시·스크립트 설정이 그대로 적용된다 —
-// env 닫힌 표가 통과시키는 USERPROFILE/HOME이 ~/.npmrc로 가는 포인터이기 때문이다. npm과 bun
-// 양쪽이 이 변수를 존중한다(bun 1.3.14 실측 — 이 변수만 바꿔도 install의 레지스트리 해석이
-// 바뀐다). 파일 사전 생성은 격리의 시행점이 아니라 이중 안전장치다: 경로가 부재해도 npm은
-// 호스트 파일로 되돌아가지 않고 내장 기본(공개 레지스트리)으로 간다(실측). pyEnv의 pip.conf는
-// 반대로 파일 실재 여부가 시행점이다.
+// jsEnv: node/bun의 사용자 레벨 구성을 스크래치로 가둔다(D65). 두 갈래다.
+//
+// ① npmrc — 인터프리터 자체는 npmrc를 읽지 않으므로(`node file.js`·`bun file.js`) 스니펫 실행
+// 에는 반영 지점이 없지만, 스니펫이 npm·bun install을 호출하면 호스트 사용자 구성의 레지스트리·
+// 프록시·스크립트 설정이 그대로 적용된다 — env 닫힌 표가 통과시키는 USERPROFILE/HOME이
+// ~/.npmrc로 가는 포인터이기 때문이다. npm과 bun 양쪽이 이 변수를 존중한다(bun 1.3.14 실측 —
+// 이 변수만 바꿔도 install의 레지스트리 해석이 바뀐다). 파일 사전 생성은 격리의 시행점이 아니라
+// 이중 안전장치다: 경로가 부재해도 npm은 호스트 파일로 되돌아가지 않고 내장 기본(공개
+// 레지스트리)으로 간다(실측). pyEnv의 pip.conf는 반대로 파일 실재 여부가 시행점이다.
+//
+// ② bunfig — bun은 `$HOME/.bunfig.toml`·`$XDG_CONFIG_HOME/.bunfig.toml`을 사용자 레벨 구성으로
+// 읽는다(bun 문서). 그중 preload는 스니펫보다 먼저 실행되므로 이 상속은 사용자 코드 앞에 임의
+// 모듈이 끼어드는 경로이고, detectJS가 bun을 먼저 고르니 러너의 기본 경로에서 열려 있다.
+// 스크래치 로컬 bunfig로 덮는 방법은 불완전하다: 얕은 병합은 열거한 키만 덮고, 전역 preload를
+// 지우려는 `preload = []`는 bun이 구성 오류로 거부한다("Expected preload to be an array" —
+// 1.3.14 실측). 그래서 키에 무관한 레버인 홈 포인터 자체를 스크래치로 돌린다(csEnv 선례).
+// 검증 한계를 밝혀 둔다: windows 1.3.14에서는 어떤 홈 포인터(HOME·XDG_CONFIG_HOME·USERPROFILE·
+// HOMEDRIVE+HOMEPATH)로도 전역 bunfig가 적용되지 않아(실측) 이 갈래가 닫는 것은 문서상 unix
+// 경로이며, CI에 bun이 없어 3-OS 실증 대상이 아니다. USERPROFILE은 돌리지 않는다 — windows에서
+// 효과가 없고(실측) node/npm 쪽 부작용만 크다.
 func jsEnv(scratch string) []string {
 	rc := filepath.Join(scratch, "npmrc")
 	if err := os.WriteFile(rc, nil, 0o600); err != nil {
 		slog.Warn("exec: npmrc 기록 실패 — 격리는 유지(호스트 사용자 구성 미적용), npm 내장 기본으로 실행", "error", err)
 	}
-	return []string{"NPM_CONFIG_USERCONFIG=" + rc}
+	home := filepath.Join(scratch, "home")
+	xdg := filepath.Join(home, ".config") // XDG 기본 배치 — MkdirAll이 home까지 만든다
+	_ = os.MkdirAll(xdg, 0o700)
+	return []string{
+		"NPM_CONFIG_USERCONFIG=" + rc,
+		"HOME=" + home,
+		"XDG_CONFIG_HOME=" + xdg,
+	}
 }
 
 func tsRunner() runner {
