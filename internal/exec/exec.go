@@ -345,6 +345,14 @@ func detectGo() (string, string, error) {
 // goEnv: 빌드 캐시·모듈·임시를 스크래치 하위로 재지정하고 그 디렉터리를 생성한다.
 // GOTMPDIR은 go가 스스로 만들지 않으므로(내부적으로 그 안에 임시 하위만 생성) 사전 생성이
 // 필수다 — 없으면 `go run`이 work dir 생성에 실패한다.
+// GOENV는 호스트 go env 파일(os.UserConfigDir()/go/env)이 GOFLAGS·GOPROXY·GOTOOLCHAIN을
+// 샌드박스 빌드에 공급하는 경로를 끊는다(D65) — env allowlist가 통과시키는 APPDATA/HOME이
+// 그 파일로 가는 포인터이기 때문이다. go는 이 파일을 만들지 않으므로 사전 생성한다. 빈 파일은
+// "설정 없음"이 아니라 go 내장 기본(공개 모듈 프록시 + 툴체인 자동 다운로드)이므로 의도한
+// 값을 적는다: GOFLAGS 없음 · 툴체인은 설치본 고정 · 모듈 다운로드 없음. 스니펫은 단일 파일
+// stdlib 실행이라 이 값들로 정상 동작한다(GOPATH가 스크래치라 어차피 모듈 캐시가 비어 있다).
+const goEnvFile = "GOFLAGS=\nGOTOOLCHAIN=local\nGOPROXY=off\n"
+
 func goEnv(scratch string) []string {
 	build := filepath.Join(scratch, "go-build")
 	gopath := filepath.Join(scratch, "go")
@@ -352,10 +360,17 @@ func goEnv(scratch string) []string {
 	for _, d := range []string{build, gopath, gotmp} {
 		_ = os.MkdirAll(d, 0o700)
 	}
+	goenv := filepath.Join(scratch, "go-env")
+	if err := os.WriteFile(goenv, []byte(goEnvFile), 0o600); err != nil {
+		// 기록 실패 시 GOENV는 부재 파일을 가리킨다 — go는 그 경우 호스트 파일로 되돌아가지
+		// 않고(격리는 유지) 내장 기본으로 동작한다. 잃는 것은 의도한 값이다.
+		slog.Warn("exec: go env 파일 기록 실패 — go 내장 기본(공개 모듈 프록시·툴체인 자동 다운로드)으로 실행", "error", err)
+	}
 	return []string{
 		"GOCACHE=" + build,
 		"GOPATH=" + gopath,
 		"GOTMPDIR=" + gotmp,
+		"GOENV=" + goenv,
 	}
 }
 

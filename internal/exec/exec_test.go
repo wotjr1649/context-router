@@ -329,6 +329,50 @@ func TestRunGo(t *testing.T) {
 	}
 }
 
+// TestGoEnvIsolatesGOENV: go env 파일 경로가 스크래치 안으로 고정되고 그 파일이 실재한다.
+// 호스트 go env 파일이 GOFLAGS·GOPROXY·GOTOOLCHAIN을 공급하지 못하게 하는 계약이다.
+func TestGoEnvIsolatesGOENV(t *testing.T) {
+	scratch := t.TempDir()
+	m := map[string]string{}
+	for _, kv := range goEnv(scratch) {
+		k, v, _ := strings.Cut(kv, "=")
+		m[k] = v
+	}
+	want := filepath.Join(scratch, "go-env")
+	if got := m["GOENV"]; got != want {
+		t.Errorf("GOENV=%q want %q", got, want)
+	}
+	// go는 GOENV 파일을 스스로 만들지 않으므로 사전 생성한다(GOTMPDIR 사전 생성과 같은 규율).
+	// 빈 파일이면 "설정 없음"이 아니라 "go 내장 기본"이 된다 — 공개 모듈 프록시와 툴체인
+	// 자동 다운로드가 그 기본에 포함되므로, 의도한 값을 명시적으로 적는다.
+	b, err := os.ReadFile(want)
+	if err != nil {
+		t.Fatalf("GOENV 파일 미생성: %v", err)
+	}
+	for _, line := range []string{"GOFLAGS=", "GOTOOLCHAIN=local", "GOPROXY=off"} {
+		if !strings.Contains(string(b), line) {
+			t.Errorf("go env 파일에 %q 없음:\n%s", line, b)
+		}
+	}
+}
+
+// TestRunGoIgnoresHostGoEnv: 러너 안에서 관측한 GOENV가 스크래치 하위다(적용 실증).
+// 파일 생성만이 아니라 go 툴체인이 실제로 그 경로를 쓰는지 확인한다.
+func TestRunGoIgnoresHostGoEnv(t *testing.T) {
+	requireLang(t, "go")
+	resp := run(t, Request{
+		Language: "go",
+		Code: "package main\n\nimport (\n\t\"fmt\"\n\t\"os\"\n)\n\n" +
+			"func main() { fmt.Println(\"GOENV=\" + os.Getenv(\"GOENV\")) }\n",
+	})
+	if resp.ExitCode == nil || *resp.ExitCode != 0 {
+		t.Fatalf("exit=%v stderr=%q", resp.ExitCode, resp.Stderr)
+	}
+	if !strings.Contains(resp.Stdout, "go-env") {
+		t.Errorf("GOENV가 스크래치 하위가 아니다: %q", resp.Stdout)
+	}
+}
+
 func TestRunPython(t *testing.T) {
 	requireLang(t, "python")
 	resp := run(t, Request{Language: "python", Code: "print('py-ok')"})
