@@ -476,19 +476,27 @@ func shadowOffGetenv(k string) string {
 	return os.Getenv(k)
 }
 
-// runHookInstall — install 서브커맨드(설계 §7). --user/--no-shadow만 자체 flagset으로 파싱한다
-// (--root/--store-root는 main의 prescanRootFlags가 이미 소비·전달 — storeRootExplicit/Raw).
+// runHookInstall — install 서브커맨드(설계 §7). --user/--no-shadow/--enable-exec/--codex를 자체
+// flagset으로 파싱한다(--root/--store-root는 main의 prescanRootFlags가 이미 소비·전달 —
+// storeRootExplicit/Raw). Claude 경로는 훅 병합에 이어 .mcp.json 등록과 승인 키까지 다룬다(D64) —
+// 어느 하나가 실패해도 앞선 성공은 유지하고 사유만 보고한다(부분 성공을 감추지 않는다).
 func runHookInstall(args []string, storeRoot, storeRootRaw string, storeRootExplicit bool, projectRoot, version string, stdout io.Writer) error {
 	fs := flag.NewFlagSet("hook install", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	user := fs.Bool("user", false, "~/.claude/settings.json에 등록(기본: 프로젝트)")
 	noShadow := fs.Bool("no-shadow", false, "Shadow Recall 비활성(훅 명령에 --no-shadow 주입)")
+	enableExec := fs.Bool("enable-exec", false, ".mcp.json 항목에 exec 프로필(--enable exec)을 켠다")
 	codex := fs.Bool("codex", false, "Codex CLI hooks.json에 등록(기본: Claude settings.json)")
 	if err := fs.Parse(args); err != nil {
 		return fmt.Errorf("hook install: 플래그 파싱 실패: %w", err)
 	}
 	if rest := fs.Args(); len(rest) > 0 {
 		return fmt.Errorf("hook install: 예상치 않은 인자 %d개", len(rest))
+	}
+	// --codex는 config.toml/hooks.json 경로라 .mcp.json을 만들지 않고, 관리 블록의 도구 목록도
+	// 고정이라 exec 프로필이 반영될 자리가 없다. 조용히 무시하면 사용자는 exec가 켜졌다고 오인한다.
+	if *codex && *enableExec {
+		return errors.New("hook install: --enable-exec은 --codex와 함께 쓸 수 없습니다(.mcp.json은 Claude Code 전용)")
 	}
 	if *codex {
 		return runHookInstallCodex(*user, *noShadow, storeRootExplicit, storeRootRaw, projectRoot, version, stdout)
@@ -513,6 +521,64 @@ func runHookInstall(args []string, storeRoot, storeRootRaw string, storeRootExpl
 		return errors.New("hook install: 설정 쓰기 실패")
 	}
 	fmt.Fprintf(stdout, "hook install: %d개 이벤트 등록 완료\n", len(hookRegistrations))
+
+	// .mcp.json 병합 — 훅과 같은 멱등 계약(설계 v0.12 D64). 실패해도 훅 설치 결과는 유지하고
+	// 사유만 보고한다(설치가 부분 성공임을 감춘 채 성공으로 보이지 않게 한다).
+	mcpRegistered := false
+	mcpPath := mcpConfigPath(projectRoot)
+	existing, readErr := os.ReadFile(mcpPath)
+	if readErr != nil && !errors.Is(readErr, os.ErrNotExist) {
+		fmt.Fprintln(stdout, "mcp: 기존 설정을 읽지 못해 .mcp.json 병합을 건너뜁니다")
+	} else {
+		entry := mcpServerEntry{
+			Command: hookBinaryName, Args: mcpArgsForProfile(*enableExec),
+			AlwaysLoad: true, Managed: hookMarker(version),
+		}
+		// setProfile=*enableExec: 플래그가 없으면 기존 항목의 args를 보존한다(재설치가 이미 켠
+		// exec를 끄지 않는다). 마커는 setProfile과 무관하게 항상 갱신된다(self-heal).
+		mcpMerged, mergeErr := mergeMCPServers(existing, ctrMCPServerName, entry, true, *enableExec)
+		if mergeErr != nil {
+			// 실패 사유는 둘뿐이다 — 우리 이름 자리에 우리 소유가 아닌 항목이 있거나(소유 관문),
+			// 파일이 해석되지 않거나. 어느 쪽이든 사용자가 손댈 대상을 알려야 조치할 수 있다.
+			fmt.Fprintf(stdout, "mcp: .mcp.json 병합을 멈췄습니다(훅 설치는 완료) — %q 이름에 우리가 소유하지 않은 항목이 있거나 파일을 해석할 수 없습니다. 그 항목을 정리하거나 파일을 고친 뒤 다시 실행하세요\n", ctrMCPServerName)
+		} else if writeErr := atomicWriteFile(mcpPath, mcpMerged); writeErr != nil {
+			fmt.Fprintln(stdout, "mcp: .mcp.json 기록 실패 — 훅 설치는 완료되었습니다")
+		} else {
+			mcpRegistered = true
+			fmt.Fprintf(stdout, "mcp: .mcp.json 병합 완료(서버 %s)\n", ctrMCPServerName)
+		}
+	}
+
+	// 승인 키 — 아무도 정의하지 않았으면 이번 설치 스코프에 쓰고, 이미 정의가 있으면 보고만 한다.
+	// 이 키는 스코프 간 병합되지 않고 최상위 정의가 통째로 override 하므로, 정의가 있는 상태에서
+	// 다른 스코프에 쓰면 조용히 무시될 값을 남기는 셈이다(설계 D64 스코프 규칙).
+	// 등록이 확정되지 않은 상태에서는 승인 키도 건드리지 않는다 — 이 키는 이름으로 .mcp.json 항목을
+	// 미리 승인하므로, 우리 이름 자리에 남의 항목이 남아 있는 채로 이름을 넣으면 그 남의 항목을
+	// 대신 자동 승인해 주는 셈이 된다(소유 관문의 연장).
+	if !mcpRegistered {
+		fmt.Fprintln(stdout, "mcp: .mcp.json 등록이 확정되지 않아 승인 키는 건드리지 않았습니다")
+	} else if winner, defined, scopeErr := enabledServersScope(projectRoot, os.ReadFile); scopeErr != nil {
+		fmt.Fprintln(stdout, "mcp: 승인 키 스코프를 판정하지 못해 건너뜁니다")
+	} else if len(defined) > 0 {
+		// 실제로 적용되는 파일만 파일명으로 알린다 — 절대경로는 싣지 않는다(§12 canary 규율).
+		// "추가하세요"가 아니라 "있는지 확인하세요"인 이유: 직전 설치가 쓴 파일이 그대로 winner인
+		// 재설치에서는 이름이 이미 들어 있어, 추가를 지시하면 매번 거짓 경보가 된다.
+		fmt.Fprintf(stdout, "mcp: enabledMcpjsonServers는 이미 %d개 스코프에 정의돼 있어 이번 설치가 쓰지 않았습니다(적용되는 것은 최상위 %s 1개) — 자동 승인이 안 되면 그 파일의 목록에 %q가 있는지 확인하세요\n",
+			len(defined), filepath.Base(winner), ctrMCPServerName)
+	} else {
+		// path는 위쪽 훅 병합이 이미 쓴 파일이다 — 그 쓰기가 끝난 뒤 다시 읽어 병합해야 한다.
+		// 순서가 뒤집히면 훅 쓰기가 승인 키를 덮는다(둘 다 성공하고 결과만 조용히 사라진다).
+		prev, prevErr := os.ReadFile(path)
+		if prevErr != nil && !errors.Is(prevErr, os.ErrNotExist) {
+			fmt.Fprintln(stdout, "mcp: 기존 settings를 읽지 못해 승인 키 기록을 건너뜁니다")
+		} else if next, mergeErr := mergeEnabledServers(prev, ctrMCPServerName); mergeErr != nil {
+			fmt.Fprintln(stdout, "mcp: 승인 키 병합 실패 — 훅 설치는 완료되었습니다")
+		} else if writeErr := atomicWriteFile(path, next); writeErr != nil {
+			fmt.Fprintln(stdout, "mcp: 승인 키 기록 실패 — 훅 설치는 완료되었습니다")
+		} else {
+			fmt.Fprintf(stdout, "mcp: enabledMcpjsonServers에 %q를 기록했습니다\n", ctrMCPServerName)
+		}
+	}
 	return nil
 }
 

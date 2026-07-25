@@ -8,6 +8,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 )
 
@@ -34,6 +35,16 @@ type mcpServerEntry struct {
 // mcpConfigPath — 프로젝트 루트의 .mcp.json 경로.
 func mcpConfigPath(projectRoot string) string {
 	return filepath.Join(projectRoot, ".mcp.json")
+}
+
+// mcpArgsForProfile — .mcp.json 항목의 args. exec 활성화는 명시 opt-in이므로 설치 시
+// 플래그가 있을 때만 프로필을 켠다(설계 v0.12 D64). 빈 슬라이스를 반환해 JSON에 "args": []
+// 가 남게 한다 — nil이면 키가 사라져 멱등 비교가 흔들린다.
+func mcpArgsForProfile(enableExec bool) []string {
+	if enableExec {
+		return []string{"--enable", "exec"}
+	}
+	return []string{}
 }
 
 // mergeMCPServers — existing(빈 슬라이스 허용)에 name 항목을 install 여부에 따라
@@ -158,6 +169,42 @@ func enabledServersScope(projectRoot string, readFile func(string) ([]byte, erro
 		}
 	}
 	return winner, defined, nil
+}
+
+// mergeEnabledServers — settings 문서(existing, 빈 슬라이스 허용)의 enabledMcpjsonServers에
+// name을 더한 JSON을 반환한다. 다른 키는 원문 그대로 보존한다(json.RawMessage). 이미 들어
+// 있으면 배열을 그대로 둔다 — 재설치가 파일 바이트를 흔들지 않게 하는 멱등 조건이다.
+// 직렬화 형식(2-space MarshalIndent + 개행)은 mergeHookSettings와 같아야 한다 — 같은 파일을
+// 한 번의 설치에서 차례로 쓰므로 형식이 갈리면 재설치마다 바이트가 진동한다.
+func mergeEnabledServers(existing []byte, name string) ([]byte, error) {
+	doc := map[string]json.RawMessage{}
+	if len(bytes.TrimSpace(existing)) > 0 { // 공백뿐인 파일은 빈 병합 기반(mergeMCPServers 형제)
+		if err := json.Unmarshal(existing, &doc); err != nil {
+			return nil, errors.New("mcp: settings 파싱 실패") // 경로·원문 미포함
+		}
+		if doc == nil { // JSON `null` → Unmarshal이 맵을 nil로 설정(할당 시 패닉 — mergeMCPServers:53 형제)
+			doc = map[string]json.RawMessage{}
+		}
+	}
+	var list []string
+	if raw, ok := doc["enabledMcpjsonServers"]; ok {
+		if err := json.Unmarshal(raw, &list); err != nil {
+			return nil, errors.New("mcp: enabledMcpjsonServers 파싱 실패")
+		}
+	}
+	if !slices.Contains(list, name) {
+		list = append(list, name)
+	}
+	b, err := json.Marshal(list)
+	if err != nil {
+		return nil, errors.New("mcp: enabledMcpjsonServers 직렬화 실패")
+	}
+	doc["enabledMcpjsonServers"] = b
+	out, err := json.MarshalIndent(doc, "", "  ")
+	if err != nil {
+		return nil, errors.New("mcp: settings 직렬화 실패")
+	}
+	return append(out, '\n'), nil
 }
 
 // permissionRules — settings 파일에서 읽는 규칙 배열.

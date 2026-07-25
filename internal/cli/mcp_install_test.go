@@ -1,10 +1,12 @@
 package cli
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -376,5 +378,168 @@ func TestAskShadowedAllowsIgnoresNonMCPRules(t *testing.T) {
 	}
 	if len(got) != 1 || got[0] != "mcp__ctr-exec__ctr_execute" {
 		t.Errorf("got=%v, mcp__ 규칙 1건만이어야 한다(비-MCP 규칙은 경로를 담을 수 있어 출력 금지)", got)
+	}
+}
+
+// TestHookInstallWritesMCPConfig: hook install이 .mcp.json에 우리 서버를 멱등하게 쓰고,
+// 승인 키를 아무도 정의하지 않았으면 설치 스코프에 직접 쓴다(설계 D64 스코프 규칙).
+func TestHookInstallWritesMCPConfig(t *testing.T) {
+	proj := t.TempDir()
+	var out bytes.Buffer
+	if err := runHookInstall(nil, t.TempDir(), "", false, proj, "0.12.0", &out); err != nil {
+		t.Fatalf("install: %v", err)
+	}
+	b1, err := os.ReadFile(mcpConfigPath(proj))
+	if err != nil {
+		t.Fatalf(".mcp.json 미생성: %v", err)
+	}
+	ours, ok := mcpServersOf(t, b1)[ctrMCPServerName]
+	if !ok {
+		t.Fatalf("우리 서버 항목이 없다: %s", b1)
+	}
+	if ours.Managed != hookMarker("0.12.0") || !ours.AlwaysLoad {
+		t.Errorf("마커·상시 로드 불일치: %+v", ours)
+	}
+	if len(ours.Args) != 0 {
+		t.Errorf("플래그 없는 설치인데 프로필이 붙었다: %v", ours.Args)
+	}
+
+	// 아무 스코프도 enabledMcpjsonServers를 정의하지 않았으므로 설치 스코프에 직접 써야 한다.
+	settingsPath, err := hookSettingsPath(false, proj)
+	if err != nil {
+		t.Fatalf("hookSettingsPath: %v", err)
+	}
+	sb, err := os.ReadFile(settingsPath)
+	if err != nil {
+		t.Fatalf("settings 미생성: %v", err)
+	}
+	var settings struct {
+		Enabled []string `json:"enabledMcpjsonServers"`
+	}
+	if err := json.Unmarshal(sb, &settings); err != nil {
+		t.Fatalf("settings 파싱: %v", err)
+	}
+	if !slices.Contains(settings.Enabled, ctrMCPServerName) {
+		t.Errorf("승인 키가 기록되지 않았다: %s", sb)
+	}
+
+	// 두 번째 설치가 바이트를 바꾸지 않는다 — .mcp.json과 settings 양쪽 모두. settings는 한 번의
+	// 설치 안에서 훅 병합과 승인 키 기록이 차례로 쓰는 파일이라, 두 병합의 직렬화 형식이 서로
+	// 왕복 안정임을 여기서 함께 고정한다(형식이 갈리면 재설치마다 바이트가 진동한다).
+	if err := runHookInstall(nil, t.TempDir(), "", false, proj, "0.12.0", &out); err != nil {
+		t.Fatalf("install 2: %v", err)
+	}
+	b2, _ := os.ReadFile(mcpConfigPath(proj))
+	if !bytes.Equal(b1, b2) {
+		t.Errorf("멱등 위반:\n1: %s\n2: %s", b1, b2)
+	}
+	sb2, _ := os.ReadFile(settingsPath)
+	if !bytes.Equal(sb, sb2) {
+		t.Errorf("settings 멱등 위반:\n1: %s\n2: %s", sb, sb2)
+	}
+}
+
+// TestHookInstallKeepsExecProfileWithoutFlag: --enable-exec으로 켠 프로필이, 플래그 없는
+// 재설치에서 살아남는다. 이미 설정된 머신에서 재설치가 exec를 끄면 안 된다.
+func TestHookInstallKeepsExecProfileWithoutFlag(t *testing.T) {
+	proj := t.TempDir()
+	var out bytes.Buffer
+	if err := runHookInstall([]string{"--enable-exec"}, t.TempDir(), "", false, proj, "0.12.0", &out); err != nil {
+		t.Fatalf("install exec: %v", err)
+	}
+	if err := runHookInstall(nil, t.TempDir(), "", false, proj, "0.12.0", &out); err != nil {
+		t.Fatalf("install again: %v", err)
+	}
+	b, err := os.ReadFile(mcpConfigPath(proj))
+	if err != nil {
+		t.Fatalf("읽기: %v", err)
+	}
+	ours := mcpServersOf(t, b)[ctrMCPServerName]
+	if !slices.Equal(ours.Args, []string{"--enable", "exec"}) {
+		t.Errorf("exec 프로필이 재설치에서 꺼졌다: %v", ours.Args)
+	}
+}
+
+// TestHookInstallReportsExistingApprovalScope: 이미 정의된 스코프가 있으면 쓰지 않고
+// 보고만 한다 — 최상위 정의가 통째로 override 하므로 다른 곳에 쓰면 무시된다.
+func TestHookInstallReportsExistingApprovalScope(t *testing.T) {
+	proj := t.TempDir()
+	local := filepath.Join(proj, ".claude", "settings.local.json")
+	if err := os.MkdirAll(filepath.Dir(local), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(local, []byte(`{"enabledMcpjsonServers":["other"]}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	if err := runHookInstall(nil, t.TempDir(), "", false, proj, "0.12.0", &out); err != nil {
+		t.Fatalf("install: %v", err)
+	}
+	settingsPath, err := hookSettingsPath(false, proj)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sb, _ := os.ReadFile(settingsPath)
+	if bytes.Contains(sb, []byte("enabledMcpjsonServers")) {
+		t.Errorf("이미 정의가 있는데 다른 스코프에 썼다: %s", sb)
+	}
+	if !strings.Contains(out.String(), "enabledMcpjsonServers") {
+		t.Errorf("보고 문면이 없다:\n%s", out.String())
+	}
+}
+
+// TestHookInstallSkipsApprovalKeyOnMCPConflict: .mcp.json 등록이 멈추면 승인 키도 쓰지 않는다.
+// 이 키는 이름으로 항목을 미리 승인하므로, 우리 이름 자리에 남의 항목이 남아 있는 채로 이름만
+// 승인 목록에 넣으면 그 남의 항목을 대신 자동 승인해 주는 셈이다(소유 관문의 연장).
+func TestHookInstallSkipsApprovalKeyOnMCPConflict(t *testing.T) {
+	proj := t.TempDir()
+	foreign := []byte(`{"mcpServers":{"` + ctrMCPServerName + `":{"command":"someone-else","args":["--x"]}}}`)
+	if err := os.WriteFile(mcpConfigPath(proj), foreign, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	if err := runHookInstall(nil, t.TempDir(), "", false, proj, "0.12.0", &out); err != nil {
+		t.Fatalf("install: %v", err) // 훅 설치 자체는 성공한다(부분 성공을 오류로 승격하지 않는다)
+	}
+	after, err := os.ReadFile(mcpConfigPath(proj))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(after, foreign) {
+		t.Errorf("남의 .mcp.json 항목을 고쳤다: %s", after)
+	}
+	settingsPath, err := hookSettingsPath(false, proj)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sb, _ := os.ReadFile(settingsPath)
+	if bytes.Contains(sb, []byte("enabledMcpjsonServers")) {
+		t.Errorf("등록이 멈췄는데 승인 키를 썼다: %s", sb)
+	}
+}
+
+// TestHookInstallRejectsExecWithCodex: --codex는 config.toml 경로라 .mcp.json을 만들지 않고,
+// 관리 블록의 도구 목록도 고정이라 --enable-exec이 반영될 자리가 없다. 조용히 무시하면 사용자가
+// exec가 켜졌다고 오인하므로 조합 자체를 거부한다.
+func TestHookInstallRejectsExecWithCodex(t *testing.T) {
+	var out bytes.Buffer
+	err := runHookInstall([]string{"--codex", "--enable-exec"}, "", "", false, t.TempDir(), "0.12.0", &out)
+	if err == nil {
+		t.Fatalf("--codex와 --enable-exec 조합을 거부하지 않았다: %s", out.String())
+	}
+	// 플래그가 아예 없어서 나는 파싱 오류로는 통과하지 못한다 — 조합 판정이 실제로 존재해야 한다.
+	if strings.Contains(err.Error(), "플래그 파싱") {
+		t.Errorf("조합 판정이 아니라 파싱 오류다: %v", err)
+	}
+}
+
+// TestHostSnippetSingleServerRegistration: 안내의 .mcp.json 예시가 단일 서버다. 설치기가
+// ctr을 은퇴시키는데 안내가 3개를 계속 제시하면 사용자가 이중 등록을 되살린다(D63 ②).
+func TestHostSnippetSingleServerRegistration(t *testing.T) {
+	if strings.Contains(hostSnippet, `"ctr": {`) {
+		t.Errorf("대체된 ctr 등록 예시가 남아 있다:\n%s", hostSnippet)
+	}
+	if !strings.Contains(hostSnippet, `"`+ctrMCPServerName+`": {`) {
+		t.Errorf("단일 서버 등록 예시가 없다:\n%s", hostSnippet)
 	}
 }

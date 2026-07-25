@@ -1403,14 +1403,18 @@ func probeFTS5(ctx context.Context, reader *sql.DB) error {
 // 권한 모드가 정하게 둔다 — exec를 ask에 넣지 않는다(D64).
 const hostSnippet = `--- host adapter snippets (설계 §9) ---
 
-## Claude Code (.mcp.json)
+## Claude Code (.mcp.json — 단일 서버가 표준이다, D63 ②)
 {
   "mcpServers": {
-    "ctr": { "command": "context-router", "args": [] },
-    "ctr-global": { "command": "context-router", "args": ["--profile", "global-search", "--projects", "<path-or-id,...>"] },
-    "ctr-exec": { "command": "context-router", "args": ["--enable", "exec"] }
+    "ctr-exec": { "command": "context-router", "args": ["--enable", "exec"], "alwaysLoad": true }
   }
 }
+# 이 블록은 "context-router hook install"이 자동으로 병합한다(exec 프로필은 --enable-exec opt-in).
+# alwaysLoad는 Claude Code v2.1.121 이상에서만 동작한다 — 그 이전 호스트는 이 필드를 조용히 무시한다.
+# 과거의 "ctr" 등록은 이 항목의 도구 집합에 완전히 포함된다 — 함께 두면 6개 도구가 중복
+# 노출되므로 "context-router hook install"이 자동으로 제거한다.
+# global-search는 별개 프로필이라 필요할 때만 따로 등록한다(설치기가 만들지 않는다):
+#   "ctr-global": { "command": "context-router", "args": ["--profile", "global-search", "--projects", "<path-or-id,...>"] }
 permissions (.claude/settings.json 예시 — ingest/net/global은 기본 ask):
 {
   "permissions": {
