@@ -118,3 +118,43 @@ func mergeMCPServers(existing []byte, name string, entry mcpServerEntry, install
 	}
 	return append(out, '\n'), nil
 }
+
+// enabledServersScope — enabledMcpjsonServers 키를 정의한 스코프를 우선순위 순으로 조사한다.
+// 이 키는 permission 규칙과 달리 스코프 간 병합되지 않고 최상위 정의가 하위를 덮으므로,
+// 낮은 스코프에 쓰면 조용히 무시된다(설계 D64). readFile은 테스트 주입 seam이다.
+func enabledServersScope(projectRoot string, readFile func(string) ([]byte, error)) (string, []string, error) {
+	userPath, err := hookSettingsPath(true, projectRoot)
+	if err != nil {
+		return "", nil, err
+	}
+	projectPath, err := hookSettingsPath(false, projectRoot)
+	if err != nil {
+		return "", nil, err
+	}
+	localPath := filepath.Join(projectRoot, ".claude", "settings.local.json")
+
+	var defined []string
+	winner := ""
+	// 높은 우선순위부터 — local(가장 좁음) > project > user. 관리자 정책·CLI 인자 스코프는
+	// local보다 높지만 단일 사용자 로컬 도구의 판정 범위 밖이라 보지 않는다.
+	for _, p := range []string{localPath, projectPath, userPath} {
+		b, err := readFile(p)
+		if err != nil {
+			continue // 미존재·읽기 실패는 "정의 없음"으로 본다
+		}
+		var doc struct {
+			Enabled []string `json:"enabledMcpjsonServers"`
+		}
+		if err := json.Unmarshal(b, &doc); err != nil {
+			continue // 깨진 파일은 이 판정에서 무시한다(설치기가 건드리지 않는다)
+		}
+		if doc.Enabled == nil {
+			continue
+		}
+		defined = append(defined, p)
+		if winner == "" {
+			winner = p
+		}
+	}
+	return winner, defined, nil
+}

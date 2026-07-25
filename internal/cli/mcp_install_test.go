@@ -2,6 +2,9 @@ package cli
 
 import (
 	"encoding/json"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -168,5 +171,85 @@ func TestMergeMCPServersRejectsMalformed(t *testing.T) {
 	_, err := mergeMCPServers([]byte(`{"mcpServers":`), ctrMCPServerName, mcpServerEntry{Command: "x"}, true, true)
 	if err == nil {
 		t.Fatal("깨진 JSON에 오류가 없다")
+	}
+}
+
+// scopeKeyForTest — 주입된 readFile이 받은 경로를 스코프 라벨로 바꾼다. 판별 순서가
+// 중요하다: local도 projectRoot 하위이므로 파일명 검사가 먼저다.
+func scopeKeyForTest(projectRoot, p string) string {
+	sp, root := filepath.ToSlash(p), filepath.ToSlash(projectRoot)
+	switch {
+	case strings.HasSuffix(sp, "/settings.local.json"):
+		return "LOCAL"
+	case strings.HasPrefix(sp, root+"/"):
+		return "PROJECT"
+	case strings.HasSuffix(sp, "/.claude/settings.json"):
+		return "USER"
+	}
+	return ""
+}
+
+// TestEnabledServersScopePicksHighest: 여러 스코프가 키를 정의하면 우선순위가 가장 높은
+// 파일이 winner가 되고, 정의한 모든 경로가 defined에 담긴다. 우선순위는 좁은 스코프가
+// 높다(local > project > user). 여기서 LOCAL은 파일은 있으나 키가 없어 정의로 세지 않으므로
+// 키를 정의한 최고 스코프는 PROJECT이고, defined에는 PROJECT·USER가 담긴다.
+func TestEnabledServersScopePicksHighest(t *testing.T) {
+	proj := t.TempDir()
+	files := map[string][]byte{
+		"USER":    []byte(`{"enabledMcpjsonServers":["ctr-exec"]}`),
+		"PROJECT": []byte(`{"enabledMcpjsonServers":["other"]}`),
+		"LOCAL":   []byte(`{}`),
+	}
+	read := func(p string) ([]byte, error) {
+		if b, ok := files[scopeKeyForTest(proj, p)]; ok {
+			return b, nil
+		}
+		return nil, os.ErrNotExist
+	}
+	winner, defined, err := enabledServersScope(proj, read)
+	if err != nil {
+		t.Fatalf("scope: %v", err)
+	}
+	if scopeKeyForTest(proj, winner) != "PROJECT" {
+		t.Errorf("winner=%q, project 스코프여야 한다(local은 키를 정의하지 않았다)", winner)
+	}
+	if len(defined) != 2 {
+		t.Errorf("defined=%v, 2개여야 한다(PROJECT·USER)", defined)
+	}
+}
+
+// TestEnabledServersScopeNoneDefined: 아무 스코프도 정의하지 않으면 winner가 비고
+// defined도 빈다 — 이 경우 설치기가 최고 우선순위 스코프에 직접 쓴다(T6).
+func TestEnabledServersScopeNoneDefined(t *testing.T) {
+	read := func(string) ([]byte, error) { return nil, os.ErrNotExist }
+	winner, defined, err := enabledServersScope(t.TempDir(), read)
+	if err != nil {
+		t.Fatalf("scope: %v", err)
+	}
+	if winner != "" || len(defined) != 0 {
+		t.Errorf("winner=%q defined=%v, 둘 다 비어야 한다", winner, defined)
+	}
+}
+
+// TestScopeKeyForTestSeparatesUserAndProject: 스텁 라벨러 자체의 회귀 방지. Windows에서
+// t.TempDir()이 %USERPROFILE%\AppData\Local\Temp 하위라, 홈 접두로 가르면 project 경로까지
+// USER로 찍혀 T5의 ask/allow 테스트가 빈 목록을 읽는다.
+func TestScopeKeyForTestSeparatesUserAndProject(t *testing.T) {
+	proj := t.TempDir()
+	userPath, err := hookSettingsPath(true, proj)
+	if err != nil {
+		t.Fatalf("hookSettingsPath(user): %v", err)
+	}
+	projectPath, err := hookSettingsPath(false, proj)
+	if err != nil {
+		t.Fatalf("hookSettingsPath(project): %v", err)
+	}
+	localPath := filepath.Join(proj, ".claude", "settings.local.json")
+	for _, c := range []struct{ path, want string }{
+		{userPath, "USER"}, {projectPath, "PROJECT"}, {localPath, "LOCAL"},
+	} {
+		if got := scopeKeyForTest(proj, c.path); got != c.want {
+			t.Errorf("scopeKeyForTest(%q)=%q want %q", c.path, got, c.want)
+		}
 	}
 }
