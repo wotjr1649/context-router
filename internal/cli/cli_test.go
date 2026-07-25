@@ -2624,6 +2624,24 @@ func TestDoctorReportsAskShadowedAllow(t *testing.T) {
 	}
 }
 
+// TestDoctorIndeterminateOnUnreadableScope: 읽을 수 없는 스코프가 하나라도 있으면 [19]는
+// "충돌 없음"이 아니라 판정 불가로 떨어진다(리뷰 F1 — 거짓 clean 방지). settings.json 자리에
+// 디렉터리를 두어 os.ReadFile이 미존재가 아닌 오류를 내게 만든다. USER 스코프는 임시 홈으로 돌린다.
+func TestDoctorIndeterminateOnUnreadableScope(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("USERPROFILE", home) // windows
+	t.Setenv("HOME", home)        // unix
+	projectRoot := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(projectRoot, ".claude", "settings.json"), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	var buf bytes.Buffer
+	_ = runDoctor(context.Background(), &buf, t.TempDir(), projectRoot, "0.12.0")
+	if !strings.Contains(buf.String(), "[19] permissions: ask/allow 판정 불가") {
+		t.Fatalf("읽을 수 없는 스코프인데 판정 불가가 아니다:\n%s", buf.String())
+	}
+}
+
 // TestDoctorPermissionLineOnCheckFailure: 판정 자체가 실패하면 "충돌 없음"이 아니라 판정 불가를
 // 알린다 — 확인하지 않은 것을 확인했다고 말하는 진단은 침묵보다 사용자를 더 오도한다. 홈 디렉터리
 // 해석이 유일한 실패 경로라 USERPROFILE/HOME을 비워 재현한다. [19]는 한 줄만 나오므로 판정 불가

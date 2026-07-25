@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"os"
 	"path/filepath"
 	"strings"
 )
@@ -169,7 +170,13 @@ type permissionRules struct {
 
 // ruleMatches — ask 규칙 r이 allow 규칙 a가 가리키는 도구를 덮는가. 리터럴 완전 일치와
 // 도구 위치 접미 glob("mcp__server__prefix_*")만 다룬다. 서버 세그먼트에는 glob이 오지 않는다.
+// 판정은 mcp__ 접두 규칙에 한정한다: 매칭 규칙이 그 형태에만 정의돼 있고, 비-MCP 규칙(Read/Edit
+// 형태)은 인자에 절대경로를 담을 수 있어 진단 라인에 그대로 실리면 안 된다(리뷰 F5, §12).
+// 두 인자 모두를 걸러 여기 한 곳에서 비교 범위와 출력 범위가 함께 좁혀진다.
 func ruleMatches(r, a string) bool {
+	if !strings.HasPrefix(r, "mcp__") || !strings.HasPrefix(a, "mcp__") {
+		return false
+	}
 	if r == a {
 		return true
 	}
@@ -194,15 +201,21 @@ func askShadowedAllows(projectRoot string, readFile func(string) ([]byte, error)
 	}
 	localPath := filepath.Join(projectRoot, ".claude", "settings.local.json")
 
+	// 확인하지 못한 스코프는 "규칙 없음"이 아니다 — 조용히 건너뛰면 doctor가 거짓 clean을
+	// 찍는다(리뷰 F1). 미존재만 확인된 상태("그 스코프에 규칙 없음")로 보고, 그 밖의 읽기·파싱
+	// 실패는 판정 불가로 올린다. 오류 문면에는 경로·원문을 담지 않는다(§12).
 	var asks, allows []string
 	for _, p := range []string{userPath, projectPath, localPath} {
 		b, err := readFile(p)
 		if err != nil {
-			continue
+			if errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+			return nil, errors.New("permissions: 설정 파일 읽기 실패")
 		}
 		var doc permissionRules
 		if err := json.Unmarshal(b, &doc); err != nil {
-			continue
+			return nil, errors.New("permissions: 설정 파싱 실패")
 		}
 		asks = append(asks, doc.Permissions.Ask...)
 		allows = append(allows, doc.Permissions.Allow...)

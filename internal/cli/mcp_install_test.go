@@ -2,6 +2,7 @@ package cli
 
 import (
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -318,5 +319,62 @@ func TestAskShadowedAllowsClean(t *testing.T) {
 	}
 	if len(got) != 0 {
 		t.Errorf("got=%v, 비어야 한다", got)
+	}
+}
+
+// TestAskShadowedAllowsReportsUnreadableScope: 확인하지 못한 스코프가 있으면 오류를 반환한다 —
+// 조용히 건너뛰면 doctor가 "충돌 없음"이라는 거짓 clean을 찍는다(리뷰 F1). 미존재(os.ErrNotExist)만
+// "그 스코프에 규칙 없음"으로 확인된 상태다. 오류 문면에는 경로가 들어가지 않는다(§12).
+func TestAskShadowedAllowsReportsUnreadableScope(t *testing.T) {
+	proj := t.TempDir()
+	for _, c := range []struct {
+		name string
+		read func(string) ([]byte, error)
+	}{
+		{"읽기 실패", func(p string) ([]byte, error) {
+			if scopeKeyForTest(proj, p) == "LOCAL" {
+				return nil, errors.New("읽기 거부") // 미존재가 아닌 오류
+			}
+			return nil, os.ErrNotExist
+		}},
+		{"파싱 실패", func(p string) ([]byte, error) {
+			if scopeKeyForTest(proj, p) == "LOCAL" {
+				return []byte(`{"permissions":`), nil
+			}
+			return nil, os.ErrNotExist
+		}},
+	} {
+		got, err := askShadowedAllows(proj, c.read)
+		if err == nil {
+			t.Errorf("%s: 오류가 없다(got=%v) — 확인 못 한 스코프를 충돌 없음으로 세면 안 된다", c.name, got)
+			continue
+		}
+		if strings.Contains(err.Error(), proj) {
+			t.Errorf("%s: 오류 문면에 경로가 새어나온다", c.name)
+		}
+	}
+}
+
+// TestAskShadowedAllowsIgnoresNonMCPRules: 비-MCP 규칙(Read/Edit 형태)은 인자에 절대경로를 담을
+// 수 있어 비교·출력 범위 밖이다(리뷰 F5 — 진단 라인은 도구 이름만 낸다). 같은 픽스처의 mcp__
+// 규칙은 그대로 잡아야 하므로 이 테스트는 "빈 목록"으로 통과할 수 없다.
+func TestAskShadowedAllowsIgnoresNonMCPRules(t *testing.T) {
+	proj := t.TempDir()
+	files := map[string]string{
+		"PROJECT": `{"permissions":{"ask":["Read(/abs/path/x.txt)","mcp__ctr-exec__ctr_execute"]}}`,
+		"LOCAL":   `{"permissions":{"allow":["Read(/abs/path/x.txt)","mcp__ctr-exec__ctr_execute"]}}`,
+	}
+	read := func(p string) ([]byte, error) {
+		if s, ok := files[scopeKeyForTest(proj, p)]; ok {
+			return []byte(s), nil
+		}
+		return nil, os.ErrNotExist
+	}
+	got, err := askShadowedAllows(proj, read)
+	if err != nil {
+		t.Fatalf("askShadowedAllows: %v", err)
+	}
+	if len(got) != 1 || got[0] != "mcp__ctr-exec__ctr_execute" {
+		t.Errorf("got=%v, mcp__ 규칙 1건만이어야 한다(비-MCP 규칙은 경로를 담을 수 있어 출력 금지)", got)
 	}
 }
