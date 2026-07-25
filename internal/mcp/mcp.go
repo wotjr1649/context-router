@@ -534,13 +534,13 @@ func registerFetch(srv *mcp.Server, st *store.Store, worktreeRoot string) {
 // --- ctr_execute / ctr_execute_file (설계 v0.11 D58, Enable "exec" + 프로브 게이트) ---
 
 type ExecuteInput struct {
-	Language  string `json:"language" jsonschema:"실행 언어: shell(win=pwsh, unix=sh)|javascript|typescript|python|go|csharp"`
+	Language  string `json:"language" jsonschema:"실행 언어: shell(win=PowerShell, unix=sh)|javascript|typescript|python|go|csharp"`
 	Code      string `json:"code" jsonschema:"실행할 코드 — 파생 답만 print(대형 원문은 코드 내에서 집계·필터). 저장본의 무 I/O 변환은 ctr_transform"`
 	TimeoutMS int    `json:"timeout_ms,omitempty" jsonschema:"실행 시간 상한(ms), 기본 120000, 최대 1800000"`
 }
 
 type ExecuteFileInput struct {
-	Language  string `json:"language" jsonschema:"실행 언어: shell(win=pwsh, unix=sh)|javascript|typescript|python|go|csharp"`
+	Language  string `json:"language" jsonschema:"실행 언어: shell(win=PowerShell, unix=sh)|javascript|typescript|python|go|csharp"`
 	Path      string `json:"path" jsonschema:"CTR_FILE로 스니펫에 전달할 파일 경로(절대·존재)"`
 	Code      string `json:"code" jsonschema:"CTR_FILE을 처리하는 코드"`
 	TimeoutMS int    `json:"timeout_ms,omitempty" jsonschema:"실행 시간 상한(ms), 기본 120000, 최대 1800000"`

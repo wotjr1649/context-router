@@ -456,7 +456,11 @@ func csEnv(scratch string) []string {
 		_ = os.MkdirAll(d, 0o700)
 	}
 	_ = os.WriteFile(filepath.Join(migrations, "1"), nil, 0o600)
-	_ = os.WriteFile(filepath.Join(scratch, "nuget.config"), []byte(nugetConfig), 0o600)
+	// 이 파일이 호스트 구성 차단의 유일한 시행점이라 조용한 실패는 격리 없이 실행되는 것과
+	// 같다 — 러너 오류로 올리지는 않되(다른 재지정과 동일한 best-effort 계약) 관측은 남긴다.
+	if err := os.WriteFile(filepath.Join(scratch, "nuget.config"), []byte(nugetConfig), 0o600); err != nil {
+		slog.Warn("exec: NuGet 구성 기록 실패 — 호스트 구성이 병합된 채로 실행", "error", err)
+	}
 	return []string{
 		"DOTNET_CLI_HOME=" + home,
 		"NUGET_PACKAGES=" + nuget,
