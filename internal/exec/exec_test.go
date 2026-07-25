@@ -305,6 +305,40 @@ func TestShellExitCodeIsLastCommand(t *testing.T) {
 	}
 }
 
+// TestShellNativeExitNotPropagated: 계약의 안전망(exit_code + stderr를 함께 보기)이 잡지
+// 못하는 부류를 고정한다 — windows 인터프리터는 -File 실행에서 exit이나 종결 오류가 없으면 0을
+// 돌려주므로, 마지막 줄이 비 0으로 죽은 네이티브 명령이어도 exit_code 0이고 stderr까지 비어
+// 실패가 두 채널 어디에도 남지 않는다($ErrorActionPreference = 'Stop'도 이 부류는 멈추지
+// 못한다 — pwsh 7.6.0·powershell 5.1 실측). 안내가 PowerShell에 exit $LASTEXITCODE 전파를
+// 지시하는 근거이고, 러너가 언젠가 네이티브 종료를 전파하기 시작하면 안내 문면을 고쳐야
+// 하므로 이 테스트가 먼저 깨져 알린다. sh는 반대로 마지막 명령의 상태를 문자 그대로
+// 전파하며(안내의 sh 문면 근거) 두 절반이 그 대비를 함께 고정한다(설계 v0.12 D66).
+func TestShellNativeExitNotPropagated(t *testing.T) {
+	requireLang(t, "shell")
+	if runtime.GOOS != "windows" {
+		resp := run(t, Request{Language: "shell", Code: "sh -c 'exit 5'"})
+		if resp.ExitCode == nil {
+			t.Fatalf("ExitCode=nil (timed_out=%v)", resp.TimedOut)
+		}
+		if *resp.ExitCode != 5 {
+			t.Fatalf("exit=%d want 5 — sh가 마지막 명령의 상태를 전파하지 않는다. stderr=%q",
+				*resp.ExitCode, resp.Stderr)
+		}
+		return
+	}
+	resp := run(t, Request{Language: "shell", Code: "cmd /c exit 5"})
+	if resp.ExitCode == nil {
+		t.Fatalf("ExitCode=nil (timed_out=%v)", resp.TimedOut)
+	}
+	if *resp.ExitCode != 0 {
+		t.Fatalf("exit=%d want 0 — 네이티브 종료가 전파되기 시작했다면 안내 문면을 고친다. stderr=%q",
+			*resp.ExitCode, resp.Stderr)
+	}
+	if s := strings.TrimSpace(resp.Stderr); s != "" {
+		t.Errorf("stderr가 비어 있지 않다 — 실패가 관측 가능해졌다면 안내 문면을 고친다: %q", s)
+	}
+}
+
 // TestTruncation: stdout이 상한(32768)을 넘으면 잘리고 StdoutTrunc가 선다.
 func TestTruncation(t *testing.T) {
 	requireLang(t, "javascript")

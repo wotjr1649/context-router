@@ -1447,9 +1447,15 @@ enabled_tools = ["ctr_search", "ctr_fetch", "ctr_transform", "ctr_record_event",
 # exec 프로필(--enable exec) 활성 시 enabled_tools에 "ctr_execute","ctr_execute_file" 추가 — 승인 강도는 Codex 승인 모드가 정한다.
 
 ## exec 결과 읽기(호스트 공통)
-# shell 러너: exit_code는 마지막 명령의 상태다(중간 비종결 오류는 반영되지 않는다).
-# 성공 판정은 exit_code와 stderr를 함께 본다. 엄격 동작이 필요하면 스니펫 첫 줄에
-# 직접 적는다: PowerShell은 $ErrorActionPreference = 'Stop', sh는 set -e.
+# shell 러너: exit_code는 스니펫의 종료 상태다(중간 비종결 오류는 반영되지 않는다).
+# "마지막 명령의 상태"가 문자 그대로인 것은 sh뿐이다 — PowerShell -File은 exit이나 종결
+# 오류가 없으면 0이라, 마지막 줄이 비 0으로 죽은 네이티브 명령이면 exit_code 0에 stderr까지
+# 비어 실패가 두 채널 어디에도 남지 않는다($ErrorActionPreference = 'Stop'도 이 부류는
+# 멈추지 못한다 — pwsh 7.6.0·powershell 5.1 실측).
+# 판정은 exit_code와 stderr를 함께 보고, 엄격 동작은 스니펫에 직접 적는다:
+#   PowerShell: 첫 줄 $ErrorActionPreference = 'Stop'(cmdlet 오류) + 네이티브 명령은
+#               $LASTEXITCODE 확인, 마지막 줄 exit $LASTEXITCODE로 전파.
+#   sh: 첫 줄 set -e — 네이티브 비 0 종료에서도 멈춘다.
 `
 
 // runDoctor: 5항목 진단(저장 루트/프로젝트 식별/content.db/FTS5/ledger.db) + 호스트 등록
