@@ -127,6 +127,25 @@ func TestMergeMCPServersUninstallKeepsOthers(t *testing.T) {
 	}
 }
 
+// TestMergeMCPServersRejectsForeignSameName: 우리 이름 자리에 마커도 우리 명령도 아닌 항목이
+// 있으면 install(교체)·uninstall(삭제) 어느 쪽도 손대지 않고 충돌 오류를 낸다 — 사용자가 직접
+// 넣은 남의 항목이 한 번의 설치/제거로 유실되지 않게 하는 관문이다(isOurHookGroup의 보존 철학).
+func TestMergeMCPServersRejectsForeignSameName(t *testing.T) {
+	existing := []byte(`{"mcpServers":{"` + ctrMCPServerName + `":{"command":"someone-else","args":["--x"]}}}`)
+	entry := mcpServerEntry{Command: hookBinaryName, AlwaysLoad: true, Managed: hookMarker("0.12.0")}
+	for _, install := range []bool{true, false} {
+		out, err := mergeMCPServers(existing, ctrMCPServerName, entry, install, true)
+		if err == nil {
+			t.Errorf("install=%v: 남의 항목을 충돌 없이 처리했다: %s", install, out)
+		}
+	}
+	// 마커 없이 명령만 우리 것인 항목(마커 도입 전 등록)은 우리 것이라 계속 갱신·제거된다.
+	ours := []byte(`{"mcpServers":{"` + ctrMCPServerName + `":{"command":"context-router","args":["--x"]}}}`)
+	if _, err := mergeMCPServers(ours, ctrMCPServerName, entry, true, true); err != nil {
+		t.Errorf("마커 없는 우리 항목을 남의 것으로 봤다: %v", err)
+	}
+}
+
 // TestMergeMCPServersEmptyOrNullTolerant: 공백뿐인 파일과 JSON `null`·`{"mcpServers":null}`
 // (모두 구문상 유효하거나 사실상 빈 파일)에서도 install이 패닉·오류 없이 병합한다. null은
 // Unmarshal이 맵을 nil로 설정해 뒤이은 할당이 패닉하던 경로다 — mergeHookSettings·

@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"path/filepath"
+	"strings"
 )
 
 // ctrMCPServerName — .mcp.json에 등록하는 서버 이름. 설계 D63 ②가 단일 서버 등록을
@@ -61,15 +62,25 @@ func mergeMCPServers(existing []byte, name string, entry mcpServerEntry, install
 			servers = map[string]json.RawMessage{}
 		}
 	}
+	// 우리 이름 자리의 기존 항목은 소유가 확인될 때만 교체·삭제한다 — 마커 접두(hookMarkerPrefix)
+	// 또는 우리 명령 중 하나면 우리 것으로 본다. 둘 다 아니면 사용자가 직접 넣은 남의 항목이라
+	// install·uninstall 모두 손대지 않고 충돌로 알린다(isOurHookGroup:95의 "마커 없는 수동 항목은
+	// 보존" 철학 — 파손 금지 > 멱등 완전성). 훅과 달리 AND가 아니라 OR인 이유는 마커 이전 버전이
+	// 남긴 우리 항목(마커 없음·명령 일치)도 우리 것이라 대칭 제거 대상이기 때문이다.
+	var prev mcpServerEntry
+	var prevExists bool
+	if raw, ok := servers[name]; ok {
+		if err := json.Unmarshal(raw, &prev); err != nil {
+			return nil, errors.New("mcp: 기존 항목 파싱 실패")
+		}
+		if !strings.HasPrefix(prev.Managed, hookMarkerPrefix()) && prev.Command != hookBinaryName {
+			return nil, errors.New("mcp: 같은 이름의 다른 서버 항목이 있어 갱신을 멈춘다")
+		}
+		prevExists = true
+	}
 	if install {
-		if raw, ok := servers[name]; ok {
-			var prev mcpServerEntry
-			if err := json.Unmarshal(raw, &prev); err != nil {
-				return nil, errors.New("mcp: 기존 항목 파싱 실패")
-			}
-			if !setProfile {
-				entry.Args = prev.Args // 프로필 유지 — 명시 플래그 없이는 profile을 바꾸지 않는다
-			}
+		if prevExists && !setProfile {
+			entry.Args = prev.Args // 프로필 유지 — 명시 플래그 없이는 profile을 바꾸지 않는다
 		}
 		if entry.Args == nil {
 			entry.Args = []string{} // "args": [] 고정 — nil은 null로 나가 멱등 비교가 흔들린다
