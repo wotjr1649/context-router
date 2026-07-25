@@ -17,6 +17,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime/debug"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -425,7 +426,7 @@ func runUsage(ctx context.Context, w io.Writer, args []string, storeRoot, projec
 	compare := fs.Bool("compare", false, "채널(cc/cx)×hooks:on/off 비교 리포트(설계 v0.6 D45 — 본표 대체)")
 	minRecords := fs.Int64("min-records", 0, "집계 제외 임계(cc=records, cx=turns; --compare 전용)")
 	rollouts := fs.String("rollouts", "", "Codex rollout 루트(--compare 전용, 생략 시 ~/.codex/sessions)")
-	adoption := fs.Bool("adoption", false, "ctr vs ctxscribe MCP 호출 채택 계측(session.db 집계 — transcript 토큰 집계와 별개, 설계 v0.11 D62)")
+	adoption := fs.Bool("adoption", false, "MCP 서버별 호출·세션 채택 계측(session.db 집계 — transcript 토큰 집계와 별개, 설계 v0.12 D63)")
 	days := fs.Int("days", 0, "최근 N일로 제한(--adoption 전용, 0=전체)")
 	if err := fs.Parse(args); err != nil {
 		return fmt.Errorf("usage: 플래그 파싱 실패: %w", err)
@@ -537,47 +538,113 @@ func mcpServerOf(summary string) (string, bool) {
 	return rest[:i], true
 }
 
-// runUsageAdoption: session_events(tool_call)를 ctr/ctxscribe로 분류 집계한다(설계 v0.11 D62).
-// 1차 지표 = 절대 호출 수. 비율은 참고(브리지 종료 후 분모 붕괴 — 스펙 명시). read-only라 대상
-// DB를 오염시키지 않는다.
+// runUsageAdoption: session_events(tool_call)를 MCP 서버 네임스페이스 단위로 집계한다(설계
+// v0.12 D63 ①). v0.11의 부분 문자열 버킷팅(ctr_)은 mcp__ctr__*와 mcp__ctr-exec__*를 한
+// 카운터에 합쳐 서버 등록 형태의 차이를 지웠고, 세션 분모가 없어 "한 세션에서 몰아 쓴 것"과
+// "여러 세션에서 고루 쓴 것"이 구분되지 않았다. 지금은 서버별 절대 호출 수 + 그 서버를 부른
+// 고유 세션 수를 tool_call 세션 분모와 함께 낸다. ratio 참고 문면은 폐기했다 — 브리지 종료 후
+// 분모가 붕괴하는 지표였고 세션 분모가 그 자리를 대신한다. read-only라 대상 DB를 오염시키지
+// 않는다.
 func runUsageAdoption(ctx context.Context, w io.Writer, storeRoot, projectRoot string, days int, now time.Time) error {
+	if days < 0 {
+		return errors.New("usage: --days는 음수일 수 없습니다")
+	}
+	// 사전 점검: session.db가 없으면 "실패"가 아니라 "아직 데이터 없음"이다(loadCCSessions:372
+	// 관례 — os.Stat + IsDir). 경로는 메시지에 담지 않는다(§12 canary).
+	canon, err := ident.Canonicalize(projectRoot)
+	if err != nil || canon.ProjectID == "" {
+		return errors.New("usage: 프로젝트 식별 실패")
+	}
+	sessDir := filepath.Join(storeRoot, "projects", canon.ProjectID, "worktrees", canon.WorktreeID)
+	if fi, statErr := os.Stat(filepath.Join(sessDir, "session.db")); statErr != nil || fi.IsDir() {
+		fmt.Fprintln(w, "# 세션 이벤트가 아직 없습니다(훅 미설치 또는 첫 세션 전) — hook install 후 다시 실행하세요")
+		return nil
+	}
 	db, err := openSessionDBReadOnly(storeRoot, projectRoot) // loadCCSessions의 열기 관례 재사용
 	if err != nil {
 		return errors.New("usage: 세션 저장소를 열 수 없습니다")
 	}
 	defer func() { _ = db.Close() }()
-	q := "SELECT summary, COUNT(*) FROM session_events WHERE event_type='tool_call'"
+	// days 경계는 세 쿼리에 같은 값으로 적용한다 — 호출 수·분자·분모가 서로 다른 창을 서술하면
+	// 서버별 세션 수가 분모와 짝이 맞지 않는다.
+	var since string
 	var args []any
 	if days > 0 {
-		q += " AND ts >= ?"
+		since = " AND ts >= ?"
 		args = append(args, now.AddDate(0, 0, -days).Unix())
 	}
-	q += " GROUP BY summary"
-	rows, err := db.QueryContext(ctx, q, args...)
+	rows, err := db.QueryContext(ctx, "SELECT summary, COUNT(*) FROM session_events WHERE event_type='tool_call'"+since+" GROUP BY summary", args...)
 	if err != nil {
 		return errors.New("usage: 집계 조회 실패")
 	}
 	defer func() { _ = rows.Close() }()
-	var nCtr, nCtx int64 // 파라미터 ctx(context.Context)와의 재선언 충돌 회피
+	calls := make(map[string]int64) // 서버 네임스페이스 → 절대 호출 수
+	var nonMCP int64                // MCP 도구가 아닌 호출(Read·Bash 등) 합
 	for rows.Next() {
 		var s string
 		var n int64
 		if err := rows.Scan(&s, &n); err != nil {
 			return errors.New("usage: 행 스캔 실패")
 		}
-		switch {
-		case strings.Contains(s, "ctr_") || strings.Contains(s, "mcp__ctr__"):
-			nCtr += n
-		case strings.Contains(s, "ctx_") || strings.Contains(s, "ctxscribe"):
-			nCtx += n
+		if server, ok := mcpServerOf(s); ok {
+			calls[server] += n
+			continue
 		}
+		nonMCP += n
 	}
-	fmt.Fprintln(w, "tool\tcalls")
-	fmt.Fprintf(w, "ctr\t%d\n", nCtr)
-	fmt.Fprintf(w, "ctxscribe\t%d\n", nCtx)
-	if nCtr+nCtx > 0 {
-		fmt.Fprintf(w, "# ratio(참고, 분모 붕괴 주의): %.1f%%\n", 100*float64(nCtr)/float64(nCtr+nCtx))
+	if err := rows.Err(); err != nil {
+		return errors.New("usage: 집계 조회 중단")
 	}
+	_ = rows.Close() // 다음 조회 전에 연결을 돌려준다(defer의 중복 Close는 무해)
+	// 분모: 도구 호출이 하나라도 있는 세션 수(빈 세션 제외 — sessions 테이블 전체가 아니다).
+	const qDenom = `SELECT COUNT(DISTINCT session_id) FROM session_events WHERE event_type='tool_call'`
+	var denom int64
+	if err := db.QueryRowContext(ctx, qDenom+since, args...).Scan(&denom); err != nil {
+		return errors.New("usage: 세션 분모 조회 실패")
+	}
+	// 분자: 서버별로, 그 서버 도구를 한 번이라도 부른 세션 수.
+	const qPerServer = `SELECT session_id, summary FROM session_events WHERE event_type='tool_call'`
+	srows, err := db.QueryContext(ctx, qPerServer+since, args...)
+	if err != nil {
+		return errors.New("usage: 세션 집계 조회 실패")
+	}
+	defer func() { _ = srows.Close() }()
+	sessionsBy := make(map[string]map[string]struct{}) // 서버 → 세션 id 집합(고유 세션 수)
+	for srows.Next() {
+		var sid, s string
+		if err := srows.Scan(&sid, &s); err != nil {
+			return errors.New("usage: 행 스캔 실패")
+		}
+		server, ok := mcpServerOf(s) // 행 수가 커질 수 있으므로 summary는 파싱만 하고 보관하지 않는다
+		if !ok {
+			continue
+		}
+		if sessionsBy[server] == nil {
+			sessionsBy[server] = make(map[string]struct{})
+		}
+		sessionsBy[server][sid] = struct{}{}
+	}
+	if err := srows.Err(); err != nil {
+		return errors.New("usage: 세션 집계 조회 중단")
+	}
+	// 출력 결정성: 호출 수 내림차순, 동수는 서버 이름 오름차순 — map 순회 순서가 출력으로
+	// 새어 나오면 안 된다.
+	servers := make([]string, 0, len(calls))
+	for server := range calls {
+		servers = append(servers, server)
+	}
+	sort.Slice(servers, func(i, j int) bool {
+		if calls[servers[i]] != calls[servers[j]] {
+			return calls[servers[i]] > calls[servers[j]]
+		}
+		return servers[i] < servers[j]
+	})
+	fmt.Fprintln(w, "server\tcalls\tsessions")
+	for _, server := range servers {
+		fmt.Fprintf(w, "%s\t%d\t%d\n", server, calls[server], len(sessionsBy[server]))
+	}
+	fmt.Fprintf(w, "# tool_call 세션 분모: %d\n", denom)
+	fmt.Fprintf(w, "# 비-MCP 도구 호출: %d\n", nonMCP)
 	return nil
 }
 

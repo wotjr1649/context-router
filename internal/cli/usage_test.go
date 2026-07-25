@@ -323,8 +323,9 @@ func seedAdoptionEvents(t *testing.T, counts map[string]int) adoptionDirs {
 	return adoptionDirs{storeRoot, projectRoot}
 }
 
-// TestUsageAdoptionCounts — D62: tool_call 이벤트(ctr_search 2·ctx_execute 5)를 summary별
-// 집계해 ctr/ctxscribe 절대 호출 수와 ratio 참고 문면을 출력한다.
+// TestUsageAdoptionCounts — D63: summary를 서버 네임스페이스 단위로 버킷팅하고 세션 분모를
+// 병기한다. v0.11의 ctr/ctxscribe 2행 + ratio 참고 문면은 없어졌다 — ratio는 브리지 종료 후
+// 분모가 붕괴하는 지표였고, tool_call 세션 분모가 그 자리를 대신한다.
 func TestUsageAdoptionCounts(t *testing.T) {
 	dir := seedAdoptionEvents(t, map[string]int{
 		"mcp__ctr__ctr_search": 2, "mcp__plugin_ctxscribe_mcp__ctx_execute": 5,
@@ -334,11 +335,13 @@ func TestUsageAdoptionCounts(t *testing.T) {
 		t.Fatalf("runUsage: %v", err)
 	}
 	got := buf.String()
-	if !strings.Contains(got, "ctr\t2") || !strings.Contains(got, "ctxscribe\t5") {
-		t.Fatalf("집계 누락:\n%s", got)
+	for _, want := range []string{"server\tcalls\tsessions", "ctr\t2\t1", "plugin_ctxscribe_mcp\t5\t1"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("집계 누락(%q):\n%s", want, got)
+		}
 	}
-	if !strings.Contains(got, "ratio") {
-		t.Fatalf("ratio 참고 문면 누락:\n%s", got)
+	if strings.Contains(got, "ratio") {
+		t.Fatalf("폐기된 ratio 문면이 남아 있다:\n%s", got)
 	}
 }
 
@@ -363,5 +366,75 @@ func TestMCPServerOf(t *testing.T) {
 		if got != c.server || ok != c.ok {
 			t.Errorf("mcpServerOf(%q)=(%q,%v) want (%q,%v)", c.in, got, ok, c.server, c.ok)
 		}
+	}
+}
+
+// TestUsageAdoptionBucketsByServer: 같은 도구 접두(ctr_)를 공유하는 두 서버가 분리 집계되고,
+// 비-MCP 도구가 서버 행에 섞이지 않으며, 세션 분모 라인이 출력된다.
+func TestUsageAdoptionBucketsByServer(t *testing.T) {
+	dir := seedAdoptionEvents(t, map[string]int{
+		"mcp__ctr-exec__ctr_execute":             3,
+		"mcp__plugin_ctxscribe_mcp__ctx_execute": 5,
+		"Read":                                   2,
+	})
+	var buf bytes.Buffer
+	if err := runUsage(context.Background(), &buf, []string{"--adoption"}, dir.storeRoot, dir.projRoot); err != nil {
+		t.Fatalf("runUsage: %v", err)
+	}
+	out := buf.String()
+	for _, want := range []string{
+		"server\tcalls\tsessions",
+		"ctr-exec\t3\t1",
+		"plugin_ctxscribe_mcp\t5\t1",
+		"# tool_call 세션 분모: 1",
+		"# 비-MCP 도구 호출: 2",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("출력에 %q 없음:\n%s", want, out)
+		}
+	}
+	// "ctr\t"로 시작하는 행은 서버 구분 없는 합산의 잔재다("ctr-exec\t"는 탭이 아니라 '-'가
+	// 뒤따르므로 걸리지 않는다).
+	if strings.Contains(out, "\nctr\t") {
+		t.Errorf("서버 구분 없는 합산 행이 남아 있다:\n%s", out)
+	}
+}
+
+// TestUsageAdoptionDaysWindow — --days 경계는 세 쿼리(호출 수·세션 분모·서버별 세션)에 같은
+// 값으로 바인딩된다. 방금 시드한 이벤트는 창 안이므로 무필터와 같은 값이 나와야 한다 — 셋 중
+// 하나만 조립이 깨져도(또는 분모·분자가 다른 창을 보면) 여기서 걸린다.
+func TestUsageAdoptionDaysWindow(t *testing.T) {
+	dir := seedAdoptionEvents(t, map[string]int{"mcp__ctr__ctr_search": 2, "Read": 1})
+	var buf bytes.Buffer
+	if err := runUsage(context.Background(), &buf, []string{"--adoption", "--days=1"}, dir.storeRoot, dir.projRoot); err != nil {
+		t.Fatalf("runUsage: %v", err)
+	}
+	got := buf.String()
+	for _, want := range []string{"ctr\t2\t1", "# tool_call 세션 분모: 1", "# 비-MCP 도구 호출: 1"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("출력에 %q 없음:\n%s", want, got)
+		}
+	}
+}
+
+// TestUsageAdoptionGuards — 이월 Minor 두 건: ① 음수 --days는 오류(파일시스템·DB 접근 전에
+// 걸러 출력이 전혀 나오지 않아야 한다), ② session.db 미초기화는 오류가 아니라 안내다(훅을 한
+// 번도 쓰지 않은 프로젝트에서 "저장소를 열 수 없습니다"로 끝나던 오해 소지를 없앤다).
+func TestUsageAdoptionGuards(t *testing.T) {
+	var buf bytes.Buffer
+	err := runUsage(context.Background(), &buf, []string{"--adoption", "--days=-1"}, t.TempDir(), t.TempDir())
+	if err == nil || !strings.Contains(err.Error(), "음수") {
+		t.Fatalf("음수 --days 오류 누락: err=%v", err)
+	}
+	if buf.Len() != 0 {
+		t.Fatalf("음수 --days인데 출력이 있다: %q", buf.String())
+	}
+
+	buf.Reset()
+	if err := runUsage(context.Background(), &buf, []string{"--adoption"}, t.TempDir(), t.TempDir()); err != nil {
+		t.Fatalf("session.db 미초기화는 오류가 아니어야 한다: %v", err)
+	}
+	if !strings.Contains(buf.String(), "세션 이벤트가 아직 없습니다") {
+		t.Fatalf("미초기화 안내 누락:\n%s", buf.String())
 	}
 }
