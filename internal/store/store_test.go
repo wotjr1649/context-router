@@ -1990,7 +1990,7 @@ func TestPurgeHookOnlyReplacedFileRollsBack(t *testing.T) {
 	h := hashOf(soContent)
 	ageBlobFile(t, st, h, -2*time.Hour) // 원본은 age gate를 통과할 만큼 오래됨
 
-	hashes, rep, err := st.purgeHookRows(context.Background()) // ① 행 삭제 tx만 커밋
+	hashes, rep, err := st.purgeHookRows(context.Background(), 0, 0) // ① 행 삭제 tx만 커밋
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2090,6 +2090,114 @@ func TestPurgeHookOnlyPreservesReindexResidue(t *testing.T) {
 	var hn int
 	if err := st.reader.QueryRow("SELECT count(*) FROM fts_porter WHERE fts_porter MATCH 'zzneedle'").Scan(&hn); err != nil || hn != 0 {
 		t.Fatalf("hook 청크 FTS 잔존(미동기): n=%d err=%v", hn, err)
+	}
+}
+
+// --- D67: 나이 필터 shadow purge (Task 11) ----------------------------------
+
+// TestPurgeHookOnlyOlderThan: cutoff보다 새 shadow 아티팩트는 남고 오래된 것만 지워진다.
+// explicit 소스는 나이와 무관하게 보존된다(--hook-only 계약 유지).
+//
+// 주의: 기존 TestPurgeHookOnlyAgeGateDefers(store_test.go:1927)의 age gate는 파일 unlink
+// 유예(mtime 1시간)이고, 이 태스크가 더하는 것은 artifacts.created_at 기준 대상 선택이다.
+// 서로 다른 축이므로 두 테스트가 함께 통과해야 한다.
+func TestPurgeHookOnlyOlderThan(t *testing.T) {
+	st := openAt(t, t.TempDir())
+	regSource(t, st, "old-shadow", "text/plain", "shadow:Bash:old", "hook")
+	regSource(t, st, "new-shadow", "text/plain", "shadow:Bash:new", "hook")
+	regSource(t, st, "kept-explicit", "text/plain", "file:///kept.txt", "file")
+
+	oldHash := hashOf("old-shadow")
+	// CAS 파일도 나이를 먹여야 reclaimHookBlobs의 mtime 1시간 유예를 통과한다 — 그러지 않으면
+	// 모든 unlink가 Deferred로 끝나고 ReclaimedB가 0이라 행 수만 검증하게 된다.
+	ageBlobFile(t, st, oldHash, -2*gcOrphanMinAge)
+
+	// regSource는 created_at을 받지 않으므로 직접 내린다(쓰기 핸들은 패키지 사설 st.writer).
+	cutoff := time.Now().Add(-72 * time.Hour).Unix()
+	oldTS := time.Now().Add(-96 * time.Hour).Unix()
+	if _, err := st.writer.Exec(
+		`UPDATE artifacts SET created_at=? WHERE content_hash=?`, oldTS, oldHash,
+	); err != nil {
+		t.Fatalf("나이 조정: %v", err)
+	}
+	// regSource는 Registration.Chunks를 넘기지 않아 청크 행이 생기지 않는다(store.go:426 루프가
+	// 빈 슬라이스를 돈다). chunks DELETE 경로를 덮으려면 새 shadow에 청크를 직접 심어야 한다.
+	if _, err := st.writer.Exec(
+		`INSERT INTO chunks(artifact_id, ordinal, text)
+		 SELECT artifact_id, 0, 'new-chunk' FROM sources WHERE uri='shadow:Bash:new'`,
+	); err != nil {
+		t.Fatalf("청크 시드: %v", err)
+	}
+
+	rep, err := st.PurgeHookOnlyOlderThan(t.Context(), cutoff, 0)
+	if err != nil {
+		t.Fatalf("PurgeHookOnlyOlderThan: %v", err)
+	}
+	if rep.Hashes != 1 {
+		t.Fatalf("rep.Hashes=%d want 1(오래된 shadow만)", rep.Hashes)
+	}
+	if rep.ReclaimedB == 0 {
+		t.Errorf("물리 파일이 회수되지 않았다: deferred=%d failed=%d", rep.DeferredFiles, rep.FailedFiles)
+	}
+	var n int
+	if err := st.Reader().QueryRow(
+		`SELECT COUNT(*) FROM sources WHERE uri IN ('shadow:Bash:new','file:///kept.txt')`,
+	).Scan(&n); err != nil {
+		t.Fatalf("잔존 조회: %v", err)
+	}
+	if n != 2 {
+		t.Errorf("잔존 소스=%d want 2(새 shadow + explicit)", n)
+	}
+	// 나이 조건이 회수 목록 SELECT에만 걸리면, cutoff 이후 shadow의 청크·소스는 서브쿼리
+	// 기반 DELETE에 그대로 쓸려 나가고 artifacts 행만 남는다. 그 비대칭을 여기서 잡는다.
+	var chunks int
+	if err := st.Reader().QueryRow(
+		`SELECT COUNT(*) FROM chunks WHERE artifact_id IN
+		 (SELECT artifact_id FROM sources WHERE uri='shadow:Bash:new')`,
+	).Scan(&chunks); err != nil {
+		t.Fatalf("청크 조회: %v", err)
+	}
+	if chunks == 0 {
+		t.Errorf("cutoff 이후 shadow의 청크가 지워졌다 — 나이 조건이 세 문장 전부에 걸리지 않았다")
+	}
+}
+
+// TestPurgeHookOnlyOlderThanZeroMeansAll: cutoff<=0·maxHashes<=0이면 예산 없이 전부 지운다 —
+// 호출자가 "필터 있음/없음"으로 분기하지 않게 하는 계약이다.
+func TestPurgeHookOnlyOlderThanZeroMeansAll(t *testing.T) {
+	st := openAt(t, t.TempDir())
+	regSource(t, st, "s1", "text/plain", "shadow:Bash:1", "hook")
+	regSource(t, st, "s2", "text/plain", "shadow:Bash:2", "hook")
+
+	rep, err := st.PurgeHookOnlyOlderThan(t.Context(), 0, 0)
+	if err != nil {
+		t.Fatalf("PurgeHookOnlyOlderThan: %v", err)
+	}
+	if rep.Hashes != 2 {
+		t.Errorf("rep.Hashes=%d want 2(예산 없음)", rep.Hashes)
+	}
+}
+
+// TestPurgeHookOnlyOlderThanCapsPerRun: maxHashes가 1회 회수량을 제한하고 나머지는 다음
+// 호출로 넘어간다 — 기동 경로가 적체 전체를 한 번에 처리하지 않게 하는 예산(설계 v0.12 D67).
+func TestPurgeHookOnlyOlderThanCapsPerRun(t *testing.T) {
+	st := openAt(t, t.TempDir())
+	for _, s := range []string{"cap1", "cap2", "cap3"} {
+		regSource(t, st, s, "text/plain", "shadow:Bash:"+s, "hook")
+	}
+	rep, err := st.PurgeHookOnlyOlderThan(t.Context(), 0, 2)
+	if err != nil {
+		t.Fatalf("1회차: %v", err)
+	}
+	if rep.Hashes != 2 {
+		t.Fatalf("1회차 rep.Hashes=%d want 2(상한)", rep.Hashes)
+	}
+	rep2, err := st.PurgeHookOnlyOlderThan(t.Context(), 0, 2)
+	if err != nil {
+		t.Fatalf("2회차: %v", err)
+	}
+	if rep2.Hashes != 1 {
+		t.Errorf("2회차 rep.Hashes=%d want 1(잔여분)", rep2.Hashes)
 	}
 }
 

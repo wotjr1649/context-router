@@ -1042,13 +1042,42 @@ type HookPurgeReport struct {
 	FailedFiles   int   // unlink 실패(orphan 잔존) 건수
 }
 
-// PurgeHookOnly — D41 §3: shadow 귀속(그 hash를 참조하는 소스가 전부 hook) hash의 행을 단일 tx로
-// 삭제한 뒤(술어를 tx 안에서 재실행해 외부 견적을 신뢰하지 않는다), 커밋 후 lockStore 하에 물리 CAS
-// 파일을 rename 격리 프로토콜로 회수한다. 행 삭제와 파일 회수를 내부 두 단계(purgeHookRows·
-// reclaimHookBlobs)로 나눠, 커밋↔회수 사이의 재등록 경합(Register.writeBlob 교체)을 rename 격리로
-// 폐쇄하고 테스트가 그 창에 개입할 수 있게 한다(신규 공개 표면 아님).
+// shadowOwnedFilter — shadowOwnedHashQuery에 나이(cutoffUnix)·건수(maxHashes) 예산을 붙인
+// SQL과 그 위치 인자를 만든다. purgeHookRows의 세 사용처가 모두 이 결과를 쓴다 — 하나라도
+// 원본 상수를 그대로 쓰면 문장마다 다른 집합을 보게 되어 행이 어긋난다.
+// ORDER BY는 LIMIT을 결정적으로 만들기 위한 것이다(같은 tx 스냅샷에서 세 번 평가되므로 순서가
+// 고정돼야 같은 집합이 나온다). content_hash는 DISTINCT 결과 열이라 SQLite가 정렬을 허용한다.
+// created_at은 unix 초다(store.go:188).
+func shadowOwnedFilter(cutoffUnix int64, maxHashes int) (string, []any) {
+	q := shadowOwnedHashQuery
+	var args []any
+	if cutoffUnix > 0 {
+		q += "\n  AND a.created_at < ?"
+		args = append(args, cutoffUnix)
+	}
+	if maxHashes > 0 {
+		q += "\nORDER BY a.content_hash LIMIT ?"
+		args = append(args, maxHashes)
+	}
+	return q, args
+}
+
+// PurgeHookOnly — 예산 없이 shadow 귀속 아티팩트를 지운다(기존 계약 유지).
 func (s *Store) PurgeHookOnly(ctx context.Context) (HookPurgeReport, error) {
-	hashes, rep, err := s.purgeHookRows(ctx)
+	return s.PurgeHookOnlyOlderThan(ctx, 0, 0)
+}
+
+// PurgeHookOnlyOlderThan — D41 §3 + D67: shadow 귀속(그 hash를 참조하는 소스가 전부 hook) 아티팩트
+// 중 created_at이 cutoffUnix보다 오래된 것을 최대 maxHashes개까지, 행을 단일 tx로 삭제한 뒤(술어를
+// tx 안에서 재실행해 외부 견적을 신뢰하지 않는다), 커밋 후 lockStore 하에 물리 CAS 파일을 rename
+// 격리 프로토콜로 회수한다. 행 삭제와 파일 회수를 내부 두 단계(purgeHookRows·reclaimHookBlobs)로
+// 나눠, 커밋↔회수 사이의 재등록 경합(Register.writeBlob 교체)을 rename 격리로 폐쇄하고 테스트가 그
+// 창에 개입할 수 있게 한다(신규 공개 표면 아님). cutoffUnix<=0이면 나이 필터가, maxHashes<=0이면
+// 건수 상한이 없다(둘 다 0이면 PurgeHookOnly와 동일 — 호출자 단순화). VACUUM은 하지 않는다 —
+// 자동 회수 경로는 free page 재사용으로 성장을 억제하고, 파일 축소가 필요할 때만 호출자가 별도로
+// 수행한다(설계 v0.12 D67).
+func (s *Store) PurgeHookOnlyOlderThan(ctx context.Context, cutoffUnix int64, maxHashes int) (HookPurgeReport, error) {
+	hashes, rep, err := s.purgeHookRows(ctx, cutoffUnix, maxHashes)
 	if err != nil {
 		return rep, err
 	}
@@ -1064,14 +1093,16 @@ func (s *Store) PurgeHookOnly(ctx context.Context) (HookPurgeReport, error) {
 // AFTER DELETE 트리거 동기), artifacts는 sources 삭제 후 술어가 비므로 미리 포착한 hashes 집합에
 // 바인딩해 삭제한다 — PurgeOlderThan의 전역 "NOT IN sources" 고아 sweep과 달리 hook purge는 자기
 // 선택분에만 국한한다(최종리뷰 P1). BUSY 재시도로 fn이 재실행될 수 있어 반환 상태를 매 시도 초기화한다.
-// 회수 목록(SELECT)과 삭제 술어는 같은 tx 스냅샷에서 재평가하므로 항상 일치한다.
-func (s *Store) purgeHookRows(ctx context.Context) ([]string, HookPurgeReport, error) {
+// 회수 목록(SELECT)과 삭제 술어는 같은 tx 스냅샷에서 재평가하므로 항상 일치한다 — D67 예산(나이·건수)도
+// shadowOwnedFilter 한 곳에서 만든 sel/selArgs를 세 문장이 공유해 그 일치를 유지한다.
+func (s *Store) purgeHookRows(ctx context.Context, cutoffUnix int64, maxHashes int) ([]string, HookPurgeReport, error) {
+	sel, selArgs := shadowOwnedFilter(cutoffUnix, maxHashes)
 	var hashes []string
 	var rep HookPurgeReport
 	err := s.txRetry(ctx, func(tx *sql.Tx) error {
 		hashes = hashes[:0]
 		rep.Hashes = 0
-		rows, err := tx.QueryContext(ctx, shadowOwnedHashQuery)
+		rows, err := tx.QueryContext(ctx, sel, selArgs...)
 		if err != nil {
 			return err
 		}
@@ -1091,13 +1122,15 @@ func (s *Store) purgeHookRows(ctx context.Context) ([]string, HookPurgeReport, e
 		// chunks: shadow 아티팩트의 청크를 sources 삭제 이전에 명시 삭제한다 — 술어가 아직 유효하고
 		// (sources 존재) FTS AFTER DELETE 트리거가 발화한다(cascade는 recursive_triggers OFF라
 		// 트리거 미발화). 이 purge의 선택분에만 국한한다(최종리뷰 P1 — 전역 고아 청크 sweep 금지).
+		// 서브쿼리도 같은 예산을 받는다(selArgs를 그대로 넘긴다 — ?는 sel에만 있다). 예산을 SELECT에만
+		// 걸면 여기서 cutoff 이후 shadow의 청크까지 지워져 소스·청크 없는 고아 아티팩트가 남는다(D67).
 		if _, err := tx.ExecContext(ctx, `DELETE FROM chunks WHERE artifact_id IN
-			(SELECT id FROM artifacts WHERE content_hash IN (`+shadowOwnedHashQuery+`))`); err != nil {
+			(SELECT id FROM artifacts WHERE content_hash IN (`+sel+`))`, selArgs...); err != nil {
 			return err
 		}
-		// sources: 귀속 아티팩트의 (전부 hook인) 소스 삭제 — 술어 재실행으로 tx 내 재검증.
+		// sources: 귀속 아티팩트의 (전부 hook인) 소스 삭제 — 술어 재실행으로 tx 내 재검증. 예산 동일.
 		if _, err := tx.ExecContext(ctx, `DELETE FROM sources WHERE artifact_id IN
-			(SELECT id FROM artifacts WHERE content_hash IN (`+shadowOwnedHashQuery+`))`); err != nil {
+			(SELECT id FROM artifacts WHERE content_hash IN (`+sel+`))`, selArgs...); err != nil {
 			return err
 		}
 		// artifacts: sources가 사라져 고아가 된 이 purge의 선택분만 삭제한다. sources 삭제 후엔 shadow
