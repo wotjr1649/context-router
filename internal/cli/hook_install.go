@@ -571,7 +571,7 @@ func runHookInstall(args []string, storeRoot, storeRootRaw string, storeRootExpl
 		prev, prevErr := os.ReadFile(path)
 		if prevErr != nil && !errors.Is(prevErr, os.ErrNotExist) {
 			fmt.Fprintln(stdout, "mcp: 기존 settings를 읽지 못해 승인 키 기록을 건너뜁니다")
-		} else if next, mergeErr := mergeEnabledServers(prev, ctrMCPServerName); mergeErr != nil {
+		} else if next, mergeErr := mergeEnabledServers(prev, ctrMCPServerName, true); mergeErr != nil {
 			fmt.Fprintln(stdout, "mcp: 승인 키 병합 실패 — 훅 설치는 완료되었습니다")
 		} else if writeErr := atomicWriteFile(path, next); writeErr != nil {
 			fmt.Fprintln(stdout, "mcp: 승인 키 기록 실패 — 훅 설치는 완료되었습니다")
@@ -666,18 +666,51 @@ func runHookUninstall(args []string, projectRoot string, stdout io.Writer) error
 	if err != nil {
 		return err
 	}
+	// settings.json 미존재는 no-op으로 알리되 .mcp.json 정리는 그와 무관하게 시도한다 — 부분 설치
+	// (settings만 수동 삭제)에서 우리 등록이 영구 잔존하는 것을 막는다. runHookUninstallCodex가
+	// config.toml에 대해 이미 채택한 규칙(Codex P2)과 같다.
 	if _, statErr := os.Stat(path); errors.Is(statErr, os.ErrNotExist) {
 		fmt.Fprintln(stdout, "hook uninstall: 설정 파일 없음 — 제거할 항목 없음")
-		return nil
+	} else {
+		merged, err := mergeSettingsFile(path, "", "", false) // command/marker는 제거 경로에서 미사용
+		if err != nil {
+			return err
+		}
+		if err := atomicWriteFile(path, merged); err != nil {
+			return errors.New("hook uninstall: 설정 쓰기 실패")
+		}
+		fmt.Fprintln(stdout, "hook uninstall: 훅 항목 제거 완료")
 	}
-	merged, err := mergeSettingsFile(path, "", "", false) // command/marker는 제거 경로에서 미사용
-	if err != nil {
-		return err
+
+	// .mcp.json 항목 제거 — install의 대칭(D64). 소유 관문은 양방향이라 우리 이름 자리에 남의
+	// 항목이 있으면 install과 똑같이 손대지 않고 사유만 보고한다. 파일은 지우지 않는다.
+	mcpPath := mcpConfigPath(projectRoot)
+	if existing, readErr := os.ReadFile(mcpPath); readErr == nil {
+		if mcpMerged, mergeErr := mergeMCPServers(existing, ctrMCPServerName, mcpServerEntry{}, false, true); mergeErr != nil {
+			fmt.Fprintf(stdout, "mcp: .mcp.json 항목 제거를 멈췄습니다 — %q 이름에 우리가 소유하지 않은 항목이 있거나 파일을 해석할 수 없습니다. 그 항목은 그대로 두었습니다\n", ctrMCPServerName)
+		} else if writeErr := atomicWriteFile(mcpPath, mcpMerged); writeErr != nil {
+			fmt.Fprintln(stdout, "mcp: .mcp.json 기록 실패 — 훅 항목 제거는 완료되었습니다")
+		} else {
+			fmt.Fprintf(stdout, "mcp: .mcp.json 항목 제거 완료(서버 %s)\n", ctrMCPServerName)
+		}
+	} else if !errors.Is(readErr, os.ErrNotExist) {
+		fmt.Fprintln(stdout, "mcp: 기존 설정을 읽지 못해 .mcp.json 정리를 건너뜁니다")
 	}
-	if err := atomicWriteFile(path, merged); err != nil {
-		return errors.New("hook uninstall: 설정 쓰기 실패")
+
+	// 승인 키 — 우리가 쓴 스코프(이번 uninstall이 겨냥한 그 파일)에서만 우리 이름을 뺀다. 다른
+	// 스코프에는 애초에 쓰지 않았으므로 건드리지 않는다. 파일이 없으면 지울 것도 없다(만들지 않는다).
+	// 훅 쓰기가 끝난 뒤 다시 읽는다 — 순서가 뒤집히면 훅 쓰기가 이 편집을 덮는다.
+	if prev, prevErr := os.ReadFile(path); prevErr == nil {
+		if next, mergeErr := mergeEnabledServers(prev, ctrMCPServerName, false); mergeErr != nil {
+			fmt.Fprintln(stdout, "mcp: 승인 키 병합 실패 — 훅 항목 제거는 완료되었습니다")
+		} else if writeErr := atomicWriteFile(path, next); writeErr != nil {
+			fmt.Fprintln(stdout, "mcp: 승인 키 기록 실패 — 훅 항목 제거는 완료되었습니다")
+		} else {
+			fmt.Fprintf(stdout, "mcp: enabledMcpjsonServers에서 %q를 제거했습니다(없었으면 무변)\n", ctrMCPServerName)
+		}
+	} else if !errors.Is(prevErr, os.ErrNotExist) {
+		fmt.Fprintln(stdout, "mcp: 기존 settings를 읽지 못해 승인 키 정리를 건너뜁니다")
 	}
-	fmt.Fprintln(stdout, "hook uninstall: 훅 항목 제거 완료")
 	return nil
 }
 

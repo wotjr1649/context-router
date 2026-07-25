@@ -543,3 +543,185 @@ func TestHostSnippetSingleServerRegistration(t *testing.T) {
 		t.Errorf("단일 서버 등록 예시가 없다:\n%s", hostSnippet)
 	}
 }
+
+// TestHostSnippetUsesCurrentServerPrefix: permission 예시가 은퇴한 서버 이름을 가리키지 않는다.
+// 단일 서버 표준(D63 ②)에서 ingest 2종은 ctr-exec 아래 노출되므로, mcp__ctr__ 접두 규칙을 그대로
+// 복사한 사용자는 아무것도 매칭하지 않는 ask 규칙을 갖게 되고 ingest가 무보호로 남는다.
+// ctr-global은 설치기가 만들지도 지우지도 않는 별개 프로필이라 그 접두는 유효하다.
+func TestHostSnippetUsesCurrentServerPrefix(t *testing.T) {
+	if strings.Contains(hostSnippet, "mcp__ctr__") {
+		t.Errorf("은퇴한 ctr 서버 접두가 남아 있다:\n%s", hostSnippet)
+	}
+	for _, want := range []string{
+		"mcp__" + ctrMCPServerName + "__ctr_index",
+		"mcp__" + ctrMCPServerName + "__ctr_fetch_and_index",
+		"mcp__ctr-global__*",
+	} {
+		if !strings.Contains(hostSnippet, want) {
+			t.Errorf("%q 규칙이 안내에서 사라졌다", want)
+		}
+	}
+}
+
+// TestMergeEnabledServersRemove: 제거는 우리 이름만 빼고, 우리가 배열을 비웠으면 키째로 지운다
+// (mergeHookSettings:167·177의 빈 컨테이너 제거 규칙과 같은 규칙). 우리 이름이 없으면 배열을
+// 손대지 않는다 — 사용자가 의도적으로 비워 둔 []를 지우면 그 스코프가 "정의됨"에서 "미정의"로
+// 바뀌어 하위 스코프를 덮으려던 의도가 사라진다.
+func TestMergeEnabledServersRemove(t *testing.T) {
+	for _, c := range []struct{ name, existing, want string }{
+		{"단독 원소는 키째로 제거", `{"enabledMcpjsonServers":["` + ctrMCPServerName + `"]}`, `{}`},
+		{"다른 원소는 보존", `{"enabledMcpjsonServers":["other","` + ctrMCPServerName + `"]}`, `{"enabledMcpjsonServers":["other"]}`},
+		{"의도적 빈 배열은 보존", `{"enabledMcpjsonServers":[]}`, `{"enabledMcpjsonServers":[]}`},
+		{"키가 없으면 무변", `{"other":1}`, `{"other":1}`},
+	} {
+		got, err := mergeEnabledServers([]byte(c.existing), ctrMCPServerName, false)
+		if err != nil {
+			t.Errorf("%s: %v", c.name, err)
+			continue
+		}
+		var buf bytes.Buffer
+		if err := json.Compact(&buf, got); err != nil {
+			t.Errorf("%s: compact: %v", c.name, err)
+			continue
+		}
+		if buf.String() != c.want {
+			t.Errorf("%s: got %s want %s", c.name, buf.String(), c.want)
+		}
+	}
+}
+
+// TestHookUninstallRemovesMCPConfigAndApprovalKey: install의 대칭 — uninstall이 .mcp.json 항목과
+// 승인 키 원소를 되돌린다. 우리가 비운 컨테이너는 키째로 지우고, 파일 자체는 지우지 않는다.
+func TestHookUninstallRemovesMCPConfigAndApprovalKey(t *testing.T) {
+	proj := t.TempDir()
+	var out bytes.Buffer
+	if err := runHookInstall(nil, t.TempDir(), "", false, proj, "0.12.0", &out); err != nil {
+		t.Fatalf("install: %v", err)
+	}
+	if err := runHookUninstall(nil, proj, &out); err != nil {
+		t.Fatalf("uninstall: %v", err)
+	}
+	b, err := os.ReadFile(mcpConfigPath(proj))
+	if err != nil {
+		t.Fatalf(".mcp.json 파일이 사라졌다(파일은 지우지 않는다): %v", err)
+	}
+	if bytes.Contains(b, []byte(ctrMCPServerName)) {
+		t.Errorf("우리 항목이 남아 있다: %s", b)
+	}
+	if bytes.Contains(b, []byte("mcpServers")) {
+		t.Errorf("우리가 비운 컨테이너가 남아 있다: %s", b)
+	}
+	settingsPath, err := hookSettingsPath(false, proj)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sb, err := os.ReadFile(settingsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(sb, []byte("enabledMcpjsonServers")) {
+		t.Errorf("승인 키가 남아 있다: %s", sb)
+	}
+}
+
+// TestHookUninstallPreservesForeignEntriesAndKeys: uninstall은 우리 것만 되돌린다 — 남의 서버
+// 항목이 있으면 mcpServers 컨테이너를 유지하고, settings의 다른 최상위 키도 보존한다.
+func TestHookUninstallPreservesForeignEntriesAndKeys(t *testing.T) {
+	proj := t.TempDir()
+	settingsPath, err := hookSettingsPath(false, proj)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(settingsPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(settingsPath, []byte(`{"otherTool":{"keep":true}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(mcpConfigPath(proj), []byte(`{"mcpServers":{"other":{"command":"x","args":[]}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	if err := runHookInstall(nil, t.TempDir(), "", false, proj, "0.12.0", &out); err != nil {
+		t.Fatalf("install: %v", err)
+	}
+	if err := runHookUninstall(nil, proj, &out); err != nil {
+		t.Fatalf("uninstall: %v", err)
+	}
+	servers := mcpServersOf(t, mustReadFile(t, mcpConfigPath(proj)))
+	if _, ok := servers["other"]; !ok {
+		t.Errorf("남의 서버 항목이 사라졌다: %s", mustReadFile(t, mcpConfigPath(proj)))
+	}
+	if _, ok := servers[ctrMCPServerName]; ok {
+		t.Errorf("우리 항목이 남아 있다: %s", mustReadFile(t, mcpConfigPath(proj)))
+	}
+	sb := mustReadFile(t, settingsPath)
+	if !bytes.Contains(sb, []byte("otherTool")) {
+		t.Errorf("settings의 다른 최상위 키가 사라졌다: %s", sb)
+	}
+	if bytes.Contains(sb, []byte("enabledMcpjsonServers")) {
+		t.Errorf("승인 키가 남아 있다: %s", sb)
+	}
+}
+
+// TestHookUninstallIdempotentBytes: uninstall을 두 번 돌려도 두 파일의 바이트가 같다.
+func TestHookUninstallIdempotentBytes(t *testing.T) {
+	proj := t.TempDir()
+	settingsPath, err := hookSettingsPath(false, proj)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	if err := runHookInstall(nil, t.TempDir(), "", false, proj, "0.12.0", &out); err != nil {
+		t.Fatalf("install: %v", err)
+	}
+	if err := runHookUninstall(nil, proj, &out); err != nil {
+		t.Fatalf("uninstall 1: %v", err)
+	}
+	mcp1, set1 := mustReadFile(t, mcpConfigPath(proj)), mustReadFile(t, settingsPath)
+	if err := runHookUninstall(nil, proj, &out); err != nil {
+		t.Fatalf("uninstall 2: %v", err)
+	}
+	if mcp2 := mustReadFile(t, mcpConfigPath(proj)); !bytes.Equal(mcp1, mcp2) {
+		t.Errorf(".mcp.json 멱등 위반:\n1: %s\n2: %s", mcp1, mcp2)
+	}
+	if set2 := mustReadFile(t, settingsPath); !bytes.Equal(set1, set2) {
+		t.Errorf("settings 멱등 위반:\n1: %s\n2: %s", set1, set2)
+	}
+}
+
+// TestHookUninstallKeepsForeignEntryUnderOurName: 우리 이름 자리에 남의 항목이 있으면 uninstall도
+// 손대지 않는다 — T2의 소유 관문은 install·uninstall 양쪽에 대칭으로 적용된다. settings.json이
+// 없어도 .mcp.json 정리는 시도한다(부분 설치에서 우리 항목이 영구 잔존하는 것을 막는다 —
+// runHookUninstallCodex가 config.toml에 대해 이미 채택한 규칙).
+func TestHookUninstallKeepsForeignEntryUnderOurName(t *testing.T) {
+	proj := t.TempDir()
+	foreign := []byte(`{"mcpServers":{"` + ctrMCPServerName + `":{"command":"someone-else","args":["--x"]}}}`)
+	if err := os.WriteFile(mcpConfigPath(proj), foreign, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	if err := runHookUninstall(nil, proj, &out); err != nil {
+		t.Fatalf("uninstall: %v", err)
+	}
+	if after := mustReadFile(t, mcpConfigPath(proj)); !bytes.Equal(after, foreign) {
+		t.Errorf("남의 항목을 고쳤다: %s", after)
+	}
+	settingsPath, err := hookSettingsPath(false, proj)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, statErr := os.Stat(settingsPath); statErr == nil {
+		t.Error("uninstall이 없던 settings 파일을 만들었다")
+	}
+}
+
+// mustReadFile — 테스트 공용 읽기(실패 즉시 중단).
+func mustReadFile(t *testing.T, path string) []byte {
+	t.Helper()
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("읽기 실패: %v", err)
+	}
+	return b
+}

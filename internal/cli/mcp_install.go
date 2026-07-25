@@ -119,11 +119,19 @@ func mergeMCPServers(existing []byte, name string, entry mcpServerEntry, install
 	} else {
 		delete(servers, name)
 	}
-	sb, err := json.Marshal(servers)
-	if err != nil {
-		return nil, errors.New("mcp: mcpServers 직렬화 실패")
+	if len(servers) == 0 {
+		// 빈 컨테이너는 키째로 지운다 — mergeHookSettings(:167·:177)와 같은 무조건 형태다(T2 리뷰 F3).
+		// {"mcpServers":{}}와 키 부재는 "등록된 서버 없음"으로 의미가 같으므로 보존할 사용자 의도가
+		// 없고, 조건을 달면 제거 후 재실행이 빈 컨테이너를 다시 써 멱등이 깨진다(실측).
+		// install에서는 우리 항목이 항상 들어가 len>=1이라 이 분기에 오지 않는다.
+		delete(doc, "mcpServers")
+	} else {
+		sb, err := json.Marshal(servers)
+		if err != nil {
+			return nil, errors.New("mcp: mcpServers 직렬화 실패")
+		}
+		doc["mcpServers"] = sb
 	}
-	doc["mcpServers"] = sb
 	out, err := json.MarshalIndent(doc, "", "  ")
 	if err != nil {
 		return nil, errors.New("mcp: 설정 직렬화 실패")
@@ -172,11 +180,12 @@ func enabledServersScope(projectRoot string, readFile func(string) ([]byte, erro
 }
 
 // mergeEnabledServers — settings 문서(existing, 빈 슬라이스 허용)의 enabledMcpjsonServers에
-// name을 더한 JSON을 반환한다. 다른 키는 원문 그대로 보존한다(json.RawMessage). 이미 들어
-// 있으면 배열을 그대로 둔다 — 재설치가 파일 바이트를 흔들지 않게 하는 멱등 조건이다.
+// add면 name을 더하고 아니면 name을 뺀 JSON을 반환한다. 다른 키·다른 원소는 원문 그대로
+// 보존한다(json.RawMessage). 이미 있으면(제거 시엔 이미 없으면) 배열을 그대로 둔다 — 재실행이
+// 파일 바이트를 흔들지 않게 하는 멱등 조건이다.
 // 직렬화 형식(2-space MarshalIndent + 개행)은 mergeHookSettings와 같아야 한다 — 같은 파일을
 // 한 번의 설치에서 차례로 쓰므로 형식이 갈리면 재설치마다 바이트가 진동한다.
-func mergeEnabledServers(existing []byte, name string) ([]byte, error) {
+func mergeEnabledServers(existing []byte, name string, add bool) ([]byte, error) {
 	doc := map[string]json.RawMessage{}
 	if len(bytes.TrimSpace(existing)) > 0 { // 공백뿐인 파일은 빈 병합 기반(mergeMCPServers 형제)
 		if err := json.Unmarshal(existing, &doc); err != nil {
@@ -192,14 +201,27 @@ func mergeEnabledServers(existing []byte, name string) ([]byte, error) {
 			return nil, errors.New("mcp: enabledMcpjsonServers 파싱 실패")
 		}
 	}
-	if !slices.Contains(list, name) {
-		list = append(list, name)
+	before := len(list)
+	if add {
+		if !slices.Contains(list, name) {
+			list = append(list, name)
+		}
+	} else {
+		list = slices.DeleteFunc(list, func(s string) bool { return s == name })
 	}
-	b, err := json.Marshal(list)
-	if err != nil {
-		return nil, errors.New("mcp: enabledMcpjsonServers 직렬화 실패")
+	switch {
+	case len(list) == 0 && before > 0:
+		// 우리가 비운 배열만 키째로 지운다 — mergeHookSettings(:167·:177)의 빈 컨테이너 제거 규칙과
+		// 같은 규칙이다(제거 뒤 흔적을 남기지 않는다). 원래 비어 있던 []는 손대지 않는다: 그것은
+		// 하위 스코프를 덮으려는 사용자 의도이고, 키를 지우면 "정의됨"이 "미정의"로 뒤집힌다.
+		delete(doc, "enabledMcpjsonServers")
+	case len(list) > 0:
+		b, err := json.Marshal(list)
+		if err != nil {
+			return nil, errors.New("mcp: enabledMcpjsonServers 직렬화 실패")
+		}
+		doc["enabledMcpjsonServers"] = b
 	}
-	doc["enabledMcpjsonServers"] = b
 	out, err := json.MarshalIndent(doc, "", "  ")
 	if err != nil {
 		return nil, errors.New("mcp: settings 직렬화 실패")
