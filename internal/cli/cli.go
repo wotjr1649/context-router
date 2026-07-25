@@ -1418,10 +1418,14 @@ permissions (.claude/settings.json 예시 — ingest/net/global은 기본 ask):
   }
 }
 # exec 2종(ctr_execute·ctr_execute_file)은 ask에 넣지 않는다 — 승인 강도는 호스트 권한 모드가
-# 정한다. default 모드에서는 MCP 기본 프롬프트가 그대로 작동하고, 사용자가 무프롬프트 모드를
-# 명시적으로 고른 경우에만 즉시 실행된다. ask 규칙을 넣으면 그 모드에서도 프롬프트가 강제되고,
-# 평가 순서(deny→ask→allow) 때문에 더 구체적인 allow도 ask를 이기지 못한다.
-# 이중 동의는 유지된다: ① --enable exec 서버 프로필(기동 시) ② 호스트 권한 모델.
+# 정한다. default 모드에서는 MCP 기본 프롬프트가 그대로 작동하고, 무프롬프트 모드이거나 그
+# 도구를 덮는 allow 규칙(프롬프트의 '다시 묻지 않기'·--allowedTools가 남기는 항목)이 있으면
+# 프롬프트 없이 실행된다 — 기존 ask를 지우면 그동안 가려져 있던 allow가 유효해진다(실측: ask
+# 2종이 allow 1종을 무력화). ask 규칙을 넣으면 두 경우 모두 프롬프트가 강제된다: 무프롬프트
+# 모드에서도 ask는 프롬프트를 띄우고, 평가 순서(deny→ask→allow) 때문에 더 구체적인 allow도
+# ask를 이기지 못한다.
+# 이중 동의는 유지된다: ① --enable exec 서버 프로필(기동 시) ② 호스트 권한 모델(모드에 따름 —
+# 무프롬프트 모드에서는 이 층이 프롬프트를 만들지 않는다).
 
 ## Codex (~/.codex/config.toml)
 [mcp_servers.ctr]
