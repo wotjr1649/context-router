@@ -75,6 +75,19 @@ func TestBaseEnvNeverNil(t *testing.T) {
 	}
 }
 
+// TestBaseKeysExcludesPSModulePath: 닫힌 표가 호스트 PowerShell 모듈 경로를 통과시키지
+// 않는다. 통과시키면 호스트 설치 모듈이 샌드박스 스니펫에서 자동 로드된다(D65).
+func TestBaseKeysExcludesPSModulePath(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("Windows 전용 키")
+	}
+	for _, k := range baseKeys() {
+		if k == "PSModulePath" {
+			t.Fatalf("PSModulePath가 닫힌 표에 남아 있다")
+		}
+	}
+}
+
 func TestBaseEnvClosedTable(t *testing.T) {
 	t.Setenv("CTR_TEST_EXCLUDED_VAR", "marker")
 	t.Setenv("PATH", os.Getenv("PATH")) // 존재 보장

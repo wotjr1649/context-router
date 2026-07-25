@@ -777,6 +777,114 @@ func TestNpmrcScratchConfigWins(t *testing.T) {
 	}
 }
 
+// TestRunShellPSModulePathHasNoHostUserPath: 러너 안에서 관측한 유효 PSModulePath에 호스트
+// 사용자 모듈 경로가 없고 인터프리터 설치본의 Modules가 들어 있다(적용 실증). 기본 cmdlet도
+// 그대로 동작한다 — 격리가 러너를 망가뜨리지 않았다는 증거를 같은 왕복에서 얻는다.
+func TestRunShellPSModulePathHasNoHostUserPath(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("PSModulePath는 Windows 전용 키")
+	}
+	requireLang(t, "shell")
+	resp := run(t, Request{
+		Language: "shell",
+		Code:     "$env:PSModulePath\n\"YEAR=\" + (Get-Date -Format yyyy)\n",
+	})
+	if resp.ExitCode == nil || *resp.ExitCode != 0 {
+		t.Fatalf("exit=%v stderr=%q", resp.ExitCode, resp.Stderr)
+	}
+	if !strings.Contains(resp.Stdout, "YEAR=") {
+		t.Errorf("기본 cmdlet이 동작하지 않는다: stdout=%q stderr=%q", resp.Stdout, resp.Stderr)
+	}
+	bin, _, err := table()["shell"].detect()
+	if err != nil {
+		t.Fatalf("detect: %v", err)
+	}
+	if want := filepath.Join(filepath.Dir(bin), "Modules"); !strings.Contains(resp.Stdout, want) {
+		t.Errorf("인터프리터 설치본 Modules(%q)가 유효 경로에 없다:\n%s", want, resp.Stdout)
+	}
+	// 호스트 사용자 모듈 경로가 남아 있으면 호스트 설치 모듈이 스니펫에서 자동 로드된다.
+	// 스크래치는 %LOCALAPPDATA%\Temp 하위라 <USERPROFILE>\Documents 접두와 겹치지 않는다.
+	hostDocs := filepath.Join(os.Getenv("USERPROFILE"), "Documents")
+	if strings.Contains(resp.Stdout, hostDocs) {
+		t.Errorf("호스트 사용자 모듈 경로(%q)가 남아 있다:\n%s", hostDocs, resp.Stdout)
+	}
+}
+
+// TestRunShellScratchModulePathWins: 호스트 사용자 모듈 경로에 임포트 가능한 모듈이 실재하는
+// 픽스처를 만들어 스크래치 구성이 이긴다는 것을 확인한다(D65 검증 계약 — 형제 태스크 T7·T8과
+// 같은 양방향 형태). 위 테스트는 유효 경로 문자열을 보지만 이 테스트는 로드 가능성 자체를 본다.
+// 픽스처는 t.Setenv로 호스트 USERPROFILE 자체를 임시 디렉터리로 돌려 심는다 — 사용자의 실제
+// Documents에 쓰지 않는다. pwsh는 USERPROFILE 유도 사용자 모듈 경로를 PSModulePath 앞에
+// 덧붙이므로(실측) 격리 없는 절반에서 픽스처가 실제로 도달한다.
+func TestRunShellScratchModulePathWins(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("PSModulePath는 Windows 전용 키")
+	}
+	requireLang(t, "shell")
+	// 픽스처를 심기 전에 sync.Once 빌드를 끝낸다 — 심은 뒤면 그 go build가 USERPROFILE 유도
+	// GOPATH를 잃고 깨지며 실패가 testExeErr에 캐시돼 패키지 전체가 오염된다.
+	selfExe(t)
+
+	fake := t.TempDir()
+	// pwsh 사용자 모듈 경로 규약: <USERPROFILE>\Documents\PowerShell\Modules\<Name>\<Name>.psm1
+	const modName = "CtrHostCanary"
+	modDir := filepath.Join(fake, "Documents", "PowerShell", "Modules", modName)
+	if err := os.MkdirAll(modDir, 0o700); err != nil {
+		t.Fatalf("픽스처 모듈 디렉터리 생성 실패: %v", err)
+	}
+	psm1 := []byte("function Get-CtrHostCanary { 'HOST-MODULE-LOADED' }\n")
+	if err := os.WriteFile(filepath.Join(modDir, modName+".psm1"), psm1, 0o600); err != nil {
+		t.Fatalf("픽스처 모듈 기록 실패: %v", err)
+	}
+	t.Setenv("USERPROFILE", fake) // 닫힌 표가 통과시키는 포인터 — 격리가 없으면 자식이 이걸 본다
+
+	// 임포트 성공/실패가 stdout 표식으로 갈린다 — 종료코드는 양쪽 다 0으로 둔다.
+	code := "try { Import-Module " + modName + " -ErrorAction Stop; \"CANARY=\" + (Get-CtrHostCanary) }" +
+		" catch { \"IMPORT_FAILED\" }\n"
+
+	// ① 격리 없음 — shellRunner의 extra에서 USERPROFILE 재지정만 뺀 환경으로 직접 실행한다
+	// (프로덕션에 토글을 심지 않기 위해 이 절반만 테스트가 환경을 조립한다). detect → extra
+	// 순서는 Run과 같게 유지한다 — extra가 읽는 psHome을 detect가 채운다.
+	r := table()["shell"]
+	bin, _, err := r.detect()
+	if err != nil {
+		t.Fatalf("detect: %v", err)
+	}
+	scratch := t.TempDir()
+	file := filepath.Join(scratch, "snippet.ps1")
+	if err := os.WriteFile(file, snippetContent("snippet.ps1", code), 0o600); err != nil {
+		t.Fatalf("스니펫 기록 실패: %v", err)
+	}
+	env := sandbox.BaseEnv() // 닫힌 표 그대로 — PSModulePath는 이미 표 밖이다
+	for _, kv := range r.extra(scratch) {
+		if !strings.HasPrefix(kv, "USERPROFILE=") {
+			env = append(env, kv)
+		}
+	}
+	cmd := exec.Command(bin, "-NoProfile", "-NonInteractive", "-File", file)
+	cmd.Dir, cmd.Env = scratch, env
+	raw, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("격리 없는 절반이 실행 자체에 실패했다: %v: %s", err, raw)
+	}
+	if !strings.Contains(string(raw), "HOST-MODULE-LOADED") {
+		t.Fatalf("픽스처 무효 — USERPROFILE 재지정 없이도 호스트 모듈이 로드되지 않았다: %s", raw)
+	}
+
+	// ② 격리 있음 — 같은 픽스처가 러너에서 임포트되지 않는다.
+	resp := run(t, Request{Language: "shell", Code: code})
+	if resp.ExitCode == nil || *resp.ExitCode != 0 {
+		t.Fatalf("exit=%v stderr=%q", resp.ExitCode, resp.Stderr)
+	}
+	if strings.Contains(resp.Stdout, "HOST-MODULE-LOADED") {
+		t.Errorf("호스트 사용자 모듈이 러너에서 로드됐다: %q", resp.Stdout)
+	}
+	if !strings.Contains(resp.Stdout, "IMPORT_FAILED") {
+		t.Errorf("임포트 실패 표식 부재 — 관측이 성립하지 않았다: stdout=%q stderr=%q",
+			resp.Stdout, resp.Stderr)
+	}
+}
+
 // TestCSEnvInjection: C# env 재지정이 스크래치 하위 경로·강제 플래그로 주입되고 재지정
 // 디렉터리가 생성됨을 결정적으로 검증한다(dotnet 실행/복원 불필요 — 배선 자체 확인).
 // 런타임 왕복은 TestRunCS(CI)가 겸한다.
