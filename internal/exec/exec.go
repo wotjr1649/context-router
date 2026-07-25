@@ -86,7 +86,7 @@ func lookVersioned(bins []string) (string, error) {
 func table() map[string]runner {
 	return map[string]runner{
 		"shell":      shellRunner(),
-		"javascript": {file: "snippet.js", detect: detectJS, argv: fileArgv},
+		"javascript": {file: "snippet.js", detect: detectJS, argv: fileArgv, extra: jsEnv},
 		"typescript": tsRunner(),
 		"python":     {file: "snippet.py", detect: detectPy, argv: fileArgv, extra: pyEnv},
 		"go":         {file: "snippet.go", detect: detectGo, argv: goArgv, extra: goEnv},
@@ -217,10 +217,27 @@ func detectJS() (string, string, error) {
 	return p, "", err
 }
 
+// jsEnv: node/bun의 사용자 npmrc를 스크래치로 고정한다(D65). 인터프리터 자체는 npmrc를 읽지
+// 않으므로(`node file.js`·`bun file.js`) 스니펫 실행에는 반영 지점이 없지만, 스니펫이 npm·bun
+// install을 호출하면 호스트 사용자 구성의 레지스트리·프록시·스크립트 설정이 그대로 적용된다 —
+// env 닫힌 표가 통과시키는 USERPROFILE/HOME이 ~/.npmrc로 가는 포인터이기 때문이다. npm과 bun
+// 양쪽이 이 변수를 존중한다(bun 1.3.14 실측 — 이 변수만 바꿔도 install의 레지스트리 해석이
+// 바뀐다). 파일 사전 생성은 격리의 시행점이 아니라 이중 안전장치다: 경로가 부재해도 npm은
+// 호스트 파일로 되돌아가지 않고 내장 기본(공개 레지스트리)으로 간다(실측). pyEnv의 pip.conf는
+// 반대로 파일 실재 여부가 시행점이다.
+func jsEnv(scratch string) []string {
+	rc := filepath.Join(scratch, "npmrc")
+	if err := os.WriteFile(rc, nil, 0o600); err != nil {
+		slog.Warn("exec: npmrc 기록 실패 — 격리는 유지(호스트 사용자 구성 미적용), npm 내장 기본으로 실행", "error", err)
+	}
+	return []string{"NPM_CONFIG_USERCONFIG=" + rc}
+}
+
 func tsRunner() runner {
 	return runner{
 		file:   "snippet.ts",
 		detect: detectTS,
+		extra:  jsEnv, // javascript와 같은 러너(node/bun)라 사용자 구성 격리도 같다(D65)
 		argv: func(bin, file string) []string {
 			if strings.HasPrefix(filepath.Base(bin), "bun") {
 				return []string{bin, file}
@@ -328,10 +345,25 @@ func detectPy() (string, string, error) {
 	return p, "", err
 }
 
+// pyEnv: 바이트코드 캐시를 스크래치로 돌리고(기존), user site-packages와 pip 사용자 구성을
+// 차단한다(D65 — env 닫힌 표가 통과시키는 APPDATA/HOME이 그 두 경로로 가는 포인터다).
+// pip.conf 사전 생성은 jsEnv의 npmrc와 달리 이중 안전장치가 아니라 격리의 시행점이다: pip은
+// PIP_CONFIG_FILE 경로가 실재할 때만 사용자 구성을 로드 목록에서 뺀다(pip 내부
+// iter_config_files의 os.path.exists 조건 — 부재 경로면 호스트 사용자 구성이 그대로 로드되는
+// 것을 실측). 머신 전역 구성(/etc/pip.conf · %ProgramData%\pip\pip.ini)은 이 레버 밖이며,
+// 여기서 끊는 것은 사용자 구성 상속이다.
 func pyEnv(scratch string) []string {
 	cache := filepath.Join(scratch, "pycache")
 	_ = os.MkdirAll(cache, 0o700)
-	return []string{"PYTHONPYCACHEPREFIX=" + cache}
+	conf := filepath.Join(scratch, "pip.conf")
+	if err := os.WriteFile(conf, nil, 0o600); err != nil {
+		slog.Warn("exec: pip 구성 기록 실패 — 호스트 pip 사용자 구성이 그대로 로드된다(파일 실재가 시행점)", "error", err)
+	}
+	return []string{
+		"PYTHONPYCACHEPREFIX=" + cache,
+		"PYTHONNOUSERSITE=1",
+		"PIP_CONFIG_FILE=" + conf,
+	}
 }
 
 func detectGo() (string, string, error) {

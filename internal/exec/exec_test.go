@@ -453,6 +453,123 @@ func TestRunPython(t *testing.T) {
 	}
 }
 
+// TestPyEnvIsolatesUserSite: user site-packages와 pip 구성이 차단된다.
+func TestPyEnvIsolatesUserSite(t *testing.T) {
+	scratch := t.TempDir()
+	m := map[string]string{}
+	for _, kv := range pyEnv(scratch) {
+		k, v, _ := strings.Cut(kv, "=")
+		m[k] = v
+	}
+	if m["PYTHONNOUSERSITE"] != "1" {
+		t.Errorf("PYTHONNOUSERSITE 미주입")
+	}
+	want := filepath.Join(scratch, "pip.conf")
+	if got := m["PIP_CONFIG_FILE"]; got != want {
+		t.Errorf("PIP_CONFIG_FILE=%q want %q", got, want)
+	}
+	// 사전 생성이 pip 격리의 시행점이다 — pip은 PIP_CONFIG_FILE 경로가 실재할 때만 사용자
+	// 구성을 로드 목록에서 뺀다(pyEnv 주석). 파일이 없으면 경로만 맞고 격리는 없다.
+	if _, err := os.Stat(want); err != nil {
+		t.Errorf("pip 구성 사전 생성 안 됨: %v", err)
+	}
+	if got := m["PYTHONPYCACHEPREFIX"]; got != filepath.Join(scratch, "pycache") {
+		t.Errorf("기존 PYTHONPYCACHEPREFIX 계약이 깨졌다: %q", got)
+	}
+}
+
+// TestRunPyIgnoresUserSite: 러너 안에서 user site가 비활성임을 실증한다.
+func TestRunPyIgnoresUserSite(t *testing.T) {
+	requireLang(t, "python")
+	resp := run(t, Request{
+		Language: "python",
+		Code:     "import site\nprint('USER_SITE=' + str(site.ENABLE_USER_SITE))\n",
+	})
+	if resp.ExitCode == nil || *resp.ExitCode != 0 {
+		t.Fatalf("exit=%v stderr=%q", resp.ExitCode, resp.Stderr)
+	}
+	if !strings.Contains(resp.Stdout, "USER_SITE=False") {
+		t.Errorf("user site가 비활성이 아니다: %q", resp.Stdout)
+	}
+}
+
+// TestRunPyScratchUserSiteWins: 호스트 user site-packages에 임포트 가능한 모듈이 실재하는
+// 픽스처를 만들어 격리가 이긴다는 것을 확인한다(D65 검증 계약). 양방향을 다 본다 — 격리를 뺀
+// 절반은 그 모듈이 임포트되고(픽스처가 실효적이라는 증거), 넣은 절반은 같은 스니펫이
+// ModuleNotFoundError로 죽는다. 한 방향만 보면 경로 계산이 틀려 아무도 안 보는 디렉터리에
+// 심어도 통과하는 공허한 테스트가 된다(TestRunPyIgnoresUserSite는 플래그 관측만 맡는다).
+// user site 경로 규칙은 플랫폼·버전에 달려 있으므로(windows %APPDATA%\Python\PythonXY,
+// unix ~/.local/lib/pythonX.Y, macOS 프레임워크 빌드 ~/Library/Python/X.Y) 인터프리터에게 직접
+// 묻는다. 자식 env 닫힌 표가 통과시키는 홈 포인터가 windows APPDATA · unix HOME이라 그쪽을
+// 돌려 픽스처를 심는다. unix 실행은 3-OS CI가 검증한다.
+func TestRunPyScratchUserSiteWins(t *testing.T) {
+	requireLang(t, "python")
+	// 픽스처를 심기 전에 sync.Once 빌드를 끝낸다 — 심은 뒤면 그 go build가 깨지고 실패가
+	// testExeErr에 캐시돼 패키지 전체가 오염된다.
+	selfExe(t)
+
+	py, _, err := detectPy()
+	if err != nil {
+		t.Fatalf("python 미감지: %v", err)
+	}
+	fake := t.TempDir()
+	if runtime.GOOS == "windows" {
+		t.Setenv("APPDATA", fake) // site._getuserbase(): nt는 %APPDATA%\Python
+	} else {
+		t.Setenv("HOME", fake)
+	}
+	probe := exec.Command(py, "-c", "import site; print(site.getusersitepackages())")
+	probe.Env = sandbox.BaseEnv() // 자식과 같은 표로 물어야 자식이 볼 경로가 나온다
+	out, err := probe.Output()
+	if err != nil {
+		t.Fatalf("user site 경로 조회 실패: %v", err)
+	}
+	userSite := strings.TrimSpace(string(out))
+	if !strings.HasPrefix(userSite, fake) {
+		t.Fatalf("픽스처가 user site 경로를 못 잡았다(호스트 홈을 가리킨다) — 심지 않고 중단: %q", userSite)
+	}
+	if err := os.MkdirAll(userSite, 0o700); err != nil {
+		t.Fatalf("user site 디렉터리 생성 실패: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(userSite, "ctr_host_site_marker.py"),
+		[]byte("VALUE = \"host-user-site\"\n"), 0o600); err != nil {
+		t.Fatalf("user site 픽스처 기록 실패: %v", err)
+	}
+	code := "import ctr_host_site_marker\nprint(ctr_host_site_marker.VALUE)\n"
+
+	// ① 격리 없음 — pyEnv에서 PYTHONNOUSERSITE만 뺀 환경으로 직접 실행한다(프로덕션에 토글을
+	// 심지 않기 위해 이 절반만 테스트가 환경을 조립한다). 나머지 재지정은 그대로다.
+	scratch := t.TempDir()
+	file := filepath.Join(scratch, "snippet.py")
+	if err := os.WriteFile(file, []byte(code), 0o600); err != nil {
+		t.Fatalf("스니펫 기록 실패: %v", err)
+	}
+	env := sandbox.BaseEnv()
+	for _, kv := range pyEnv(scratch) {
+		if !strings.HasPrefix(kv, "PYTHONNOUSERSITE=") {
+			env = append(env, kv)
+		}
+	}
+	cmd := exec.Command(py, file)
+	cmd.Dir, cmd.Env = scratch, env
+	raw, err := cmd.CombinedOutput()
+	if err != nil || !strings.Contains(string(raw), "host-user-site") {
+		t.Fatalf("픽스처 무효 — 격리 없이도 호스트 user site 모듈이 임포트되지 않았다: %v: %s", err, raw)
+	}
+
+	// ② 격리 있음 — 같은 픽스처·같은 스니펫이 러너에서 임포트에 실패한다.
+	resp := run(t, Request{Language: "python", Code: code})
+	if resp.TimedOut || resp.ExitCode == nil {
+		t.Fatalf("러너가 종료코드를 남기지 않았다: timedout=%v stderr=%q", resp.TimedOut, resp.Stderr)
+	}
+	if *resp.ExitCode == 0 {
+		t.Fatalf("호스트 user site 모듈이 러너에서 임포트됐다: stdout=%q", resp.Stdout)
+	}
+	if !strings.Contains(resp.Stderr, "ModuleNotFoundError") {
+		t.Errorf("임포트 실패가 아닌 다른 이유로 죽었다(격리 확인 불가): stderr=%q", resp.Stderr)
+	}
+}
+
 // TestRunTS: TypeScript 골든 — 타입 표기가 스트립되고 실행된다(bun 또는 node ≥22.7).
 func TestRunTS(t *testing.T) {
 	requireLang(t, "typescript")
@@ -462,6 +579,114 @@ func TestRunTS(t *testing.T) {
 	})
 	if resp.ExitCode == nil || *resp.ExitCode != 0 || !strings.Contains(resp.Stdout, "ts-42") {
 		t.Fatalf("exit=%v stdout=%q stderr=%q", resp.ExitCode, resp.Stdout, resp.Stderr)
+	}
+}
+
+// TestJSEnvIsolatesUserConfig: npm 사용자 구성 경로가 스크래치로 고정된다.
+func TestJSEnvIsolatesUserConfig(t *testing.T) {
+	scratch := t.TempDir()
+	m := map[string]string{}
+	for _, kv := range jsEnv(scratch) {
+		k, v, _ := strings.Cut(kv, "=")
+		m[k] = v
+	}
+	want := filepath.Join(scratch, "npmrc")
+	if got := m["NPM_CONFIG_USERCONFIG"]; got != want {
+		t.Errorf("NPM_CONFIG_USERCONFIG=%q want %q", got, want)
+	}
+	if _, err := os.Stat(want); err != nil {
+		t.Errorf("npmrc 사전 생성 안 됨: %v", err)
+	}
+	// 양쪽 배선을 표에서 직접 본다 — typescript는 tsRunner()가 따로 조립하므로 한쪽만 배선해도
+	// 위 검사는 통과한다. 러너 미설치 환경에서도(런타임 테스트가 Skip돼도) 누락을 잡는다.
+	for _, lang := range []string{"javascript", "typescript"} {
+		r := table()[lang]
+		if r.extra == nil {
+			t.Errorf("%s: extra 미배선", lang)
+			continue
+		}
+		sub := t.TempDir()
+		got := ""
+		for _, kv := range r.extra(sub) {
+			if k, v, _ := strings.Cut(kv, "="); k == "NPM_CONFIG_USERCONFIG" {
+				got = v
+			}
+		}
+		if want := filepath.Join(sub, "npmrc"); got != want {
+			t.Errorf("%s: NPM_CONFIG_USERCONFIG=%q want %q", lang, got, want)
+		}
+	}
+}
+
+// TestRunJSIgnoresHostNpmrc: 러너 안에서 관측한 NPM_CONFIG_USERCONFIG가 스크래치 하위다
+// (적용 실증의 전파 절반 — 구성 해석 절반은 TestNpmrcScratchConfigWins가 맡는다).
+// javascript·typescript 양쪽을 본다: 한쪽만 배선되면 그 서브테스트에서 갈린다.
+func TestRunJSIgnoresHostNpmrc(t *testing.T) {
+	for _, lang := range []string{"javascript", "typescript"} {
+		t.Run(lang, func(t *testing.T) {
+			requireLang(t, lang)
+			resp := run(t, Request{
+				Language: lang,
+				Code: "const rc = String(process.env.NPM_CONFIG_USERCONFIG)\n" +
+					"console.log(rc.startsWith(String(process.env.CTR_SCRATCH)) ? 'RC-IN-SCRATCH' : 'RC=' + rc)\n",
+			})
+			if resp.ExitCode == nil || *resp.ExitCode != 0 {
+				t.Fatalf("exit=%v stderr=%q", resp.ExitCode, resp.Stderr)
+			}
+			if !strings.Contains(resp.Stdout, "RC-IN-SCRATCH") {
+				t.Errorf("NPM_CONFIG_USERCONFIG가 스크래치 하위가 아니다: %q", resp.Stdout)
+			}
+		})
+	}
+}
+
+// TestNpmrcScratchConfigWins: 호스트 사용자 npmrc가 실재하는 픽스처를 만들어 스크래치 구성이
+// 이긴다는 것을 확인한다(D65 검증 계약). npmrc를 읽는 주체는 인터프리터가 아니라 패키지
+// 관리자다 — `node file.js`/`bun file.js`는 npmrc를 전혀 읽지 않으므로 스니펫 실행만으로는
+// 반영을 관측할 수 없고, 반영은 스니펫이 npm/bun install을 호출할 때 일어난다. 그래서 적용
+// 실증은 그 구성을 실제로 해석하는 npm으로 한다(`config get`은 네트워크를 쓰지 않는다).
+// 양방향을 다 본다 — 격리를 뺀 절반은 호스트 registry가 나오고(픽스처가 실효적이라는 증거),
+// 넣은 절반은 그 값이 사라진다. 자식 env 닫힌 표가 통과시키는 홈 포인터가 windows USERPROFILE ·
+// unix HOME이라(npm은 os.homedir()로 ~를 정한다) 픽스처를 그쪽에 심는다. 상위 우선순위인
+// 프로젝트 구성이 실험을 흐리지 않게 cwd는 빈 디렉터리로 둔다. unix 실행은 3-OS CI가 검증한다.
+func TestNpmrcScratchConfigWins(t *testing.T) {
+	if _, err := exec.LookPath("npm"); err != nil {
+		t.Skip("npm 미설치 — npmrc를 해석하는 주체가 없다")
+	}
+	fake := t.TempDir()
+	t.Setenv("HOME", fake)
+	t.Setenv("USERPROFILE", fake)
+	const marker = "http://ctr-host-npmrc-marker.invalid/"
+	if err := os.WriteFile(filepath.Join(fake, ".npmrc"), []byte("registry="+marker+"\n"), 0o600); err != nil {
+		t.Fatalf("호스트 npmrc 픽스처 기록 실패: %v", err)
+	}
+	registry := func(extra []string) string {
+		t.Helper()
+		var cmd *exec.Cmd
+		if runtime.GOOS == "windows" {
+			// npm은 .cmd 래퍼라 CreateProcess로 직접 실행되지 않는다 — cmd.exe 경유.
+			cmd = exec.Command("cmd", "/c", "npm", "config", "get", "registry")
+		} else {
+			cmd = exec.Command("npm", "config", "get", "registry")
+		}
+		cmd.Dir, cmd.Env = t.TempDir(), append(sandbox.BaseEnv(), extra...)
+		out, err := cmd.Output()
+		if err != nil {
+			t.Fatalf("npm config get registry: %v", err)
+		}
+		return strings.TrimSpace(string(out))
+	}
+	if got := registry(nil); got != marker {
+		t.Fatalf("픽스처 무효 — 호스트 사용자 npmrc가 npm에 반영되지 않는다: %q", got)
+	}
+	// 내장 기본으로 떨어지는지가 아니라 "호스트 사용자 구성 값이 아닌지"를 본다 — 머신 레벨
+	// npmrc가 registry를 정한 호스트에서도 판정이 흔들리지 않게(사용자 구성 상속만이 계약이다).
+	// 빈 출력은 통과가 아니다 — 값을 못 읽은 것과 격리된 것을 구분한다.
+	switch got := registry(jsEnv(t.TempDir())); {
+	case got == marker:
+		t.Errorf("스크래치 npmrc가 호스트 사용자 구성에 지고 있다: %q", got)
+	case got == "":
+		t.Errorf("registry 값을 못 읽었다 — 격리 판정 불가")
 	}
 }
 
