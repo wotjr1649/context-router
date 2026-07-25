@@ -24,6 +24,34 @@ jobs:
         with:
           dotnet-version: 10.0.x
 
+      # js/ts·python 러너도 같은 이유로 명시 설치한다 — node/npm/python은 러너 이미지 프리인스톨에
+      # 의존했고 bun은 아예 없었다. 미감지 toolchain은 t.Skip이라 D65 사용자 구성 격리 실증이
+      # 초록 속에서 조용히 빠질 수 있다. 세 액션 모두 setup-dotnet과 같이 3-OS 무조건이다.
+
+      # node: npm 실증(TestNpmrcScratchConfigWins)의 구성 해석 주체가 node 배포에 딸려 오고,
+      # 22 라인은 TS 게이트 ≥22.7을 충족한다(개발기 실측 v22.19.0). 라인만 고정하고 패치는
+      # 흘린다 — 그 실증은 격리 없는 절반이 호스트 registry를 못 보면 Fatal이라 패치 이동이
+      # 거짓 초록을 만들지 못한다.
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+
+      # bun: 이미지에 없어 TestRunJSScratchBunfigWins가 3-OS 전부 Skip이었다(bunfig 갈래 미검증).
+      # detect가 bun을 먼저 고르므로 이 설치로 CI의 js/ts 실행이 node에서 bun 경로로 바뀐다 —
+      # bun이 기본 러너라는 계약대로다(node 쪽은 npm 실증으로 남는다). 정확 버전으로 고정한다:
+      # exec.go의 bunfig 관측이 1.3.14 실측이고 이 테스트는 픽스처 무효 시 Fatal이 아니라 Skip이라,
+      # 버전이 흐르면 실증이 초록 속에서 조용히 없어진다. 올리는 일은 커밋으로 드러낸다.
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.14
+
+      # python: user site·pip.conf 실증(TestRunPyScratchUserSiteWins)용. 개발기 실측 3.14.2와 같은
+      # 라인에 두고 패치는 흘린다 — 이 실증은 픽스처 무효 시 Fatal이라 조용한 통과 경로가 없다.
+      # 따옴표 필수: 3.10 같은 값은 YAML 부동소수로 해석돼 3.1로 잘린다.
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.14'
+
       # 메모리 캡 규율(CLAUDE.md): 전체 스위트는 -p 1 필수.
       # store 2-프로세스 경합, transform worker RLIMIT_AS/트리킬 서브프로세스 테스트를 포함해
       # 3-OS에서 처음 실행된다 — ubuntu/macos 로그가 unix RLIMIT_AS self-apply 실측(게이트 8)이다.
