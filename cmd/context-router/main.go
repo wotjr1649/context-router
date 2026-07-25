@@ -377,7 +377,7 @@ func shadowRetention(getenv func(string) string) time.Duration {
 
 // startupPurgeBudget — 기동 회수 고루틴의 폭주 가드. 회수는 mcp.Serve를 막지 않는 별도 고루틴이라
 // 이 값은 세션 시작 지연이 아니고, 정상적으로 느린 회수를 끊지 않을 만큼 넉넉해야 한다: 실측
-// 200해시 배치가 1.57s(≈8ms/hash, 210MiB store)이고 거기에 txRetry BUSY 백오프(50/200/800ms)와
+// 배치 보유가 100해시 약 0.63s(6~9ms/hash, 210MiB store)이고 거기에 txRetry BUSY 백오프(50/200/800ms)와
 // 문장마다 최악 busy_timeout(5s) 대기가 겹칠 수 있다. 60s는 그 합보다 크게 잡은 값이다 — 소진은
 // 정상 경로가 아니라 이상 신호이므로 경고로 남긴다(짧은 예산을 걸었을 때의 실측 결과는 정반대였다:
 // 예산을 넘긴 배치는 단일 tx라 통째 롤백돼 회수가 전혀 진행되지 않았다).
@@ -389,13 +389,17 @@ func shadowRetention(getenv func(string) string) time.Duration {
 // 플래그를 보지 않아 다른 프로세스가 쥔 락을 기다리는 busy_timeout(5s)은 이 예산을 넘길 수 있다.
 const startupPurgeBudget = 60 * time.Second
 
-// startupPurgeMaxHashes — 1회 회수 배치 상한. 실측 ≈8ms/hash(210MiB store에서 200해시 배치 1.57s)
-// 이므로 200은 기동당 약 1.6s의 백그라운드 작업이다. 정상상태 유입이 세션당 shadow 약 67해시라 이
-// 상한이 유입을 여유 있게 앞지르고, 실측 적체 840해시는 4~5회 기동에 흡수된다. 더 키우지 않는
-// 이유는 행 삭제가 단일 tx여서 배치가 클수록 writer 직렬 구간과 롤백 위험이 함께 커지기 때문이다
-// (예산을 넘긴 배치는 통째 롤백 — 부분 진행이 없다). reclaimHookBlobs는 hash마다
-// rename·stat·참조조회·remove를 하며 그동안 store 락을 잡으므로, 이 건수가 그 구간의 실질 한도다.
-const startupPurgeMaxHashes = 200
+// startupPurgeMaxHashes — 1회 회수 배치 상한. 이 값이 묶는 것은 기동당 작업량이 아니라 **잠금 보유
+// 시간**이다: 배치는 행 삭제 tx로 content.db 쓰기 락을, 이어서 파일 회수로 lockStore를 잡는데, 그
+// 창에서 훅의 Read 가드가 writable Open에 실패하면 색인을 포기하고 가드를 조용히 통과시킨다(훅 총예산
+// 2000ms). 그래서 보유 시간이 그 예산의 일부에 머무는 값을 실측으로 골랐다 — 100해시 배치의 보유는
+// 632·633ms(6.3ms/hash), 80해시는 734ms(같은 노이즈 대역), 아티팩트 1254개 시절의 7.9ms/hash로는
+// 100해시가 약 790ms다. 최악에도 훅 예산의 1/3~2/5만 쓰고 1.2s 이상을 남긴다(경합 프로세스의
+// writable Open 자체는 실측 약 31ms만 지연됐다 — 무경합 78ms vs 109ms).
+// 더 내리지 않는 이유: 정상상태 유입이 세션당 shadow 약 67해시라 그보다 낮으면 회수가 유입을 못
+// 따라간다. 더 올리지 않는 이유: 보유 시간이 훅 예산을 잠식하고, 행 삭제가 단일 tx라 배치가 클수록
+// 롤백 시 잃는 진행분도 커진다(예산을 넘긴 배치는 통째 롤백 — 부분 진행이 없다).
+const startupPurgeMaxHashes = 100
 
 func run(ctx context.Context, args []string, stderr io.Writer) error {
 	f, err := parseFlags(args)
@@ -493,7 +497,7 @@ func run(ctx context.Context, args []string, stderr io.Writer) error {
 	// D67: shadow 귀속 보존 기간 초과분을 기동 시 1회 회수한다. exec 프로필과 무관해 그 if 밖이다.
 	// mcp.Serve를 막지 않는 별도 고루틴으로 돌린다 — 인라인이면 상시 로드(alwaysLoad, D63③)에서
 	// 호스트가 서버 연결까지 세션 시작 자체를 막으므로 회수 시간이 그대로 사용자 대기가 되고, 그
-	// 제약에 맞춘 짧은 예산에서는 실측 1.57s 배치가 통째 롤백돼(단일 tx) 회수가 전혀 진행되지
+	// 제약에 맞춘 짧은 예산에서는 실측 1.57s 배치(당시 상한 200해시)가 통째 롤백돼(단일 tx) 회수가 전혀 진행되지
 	// 않았다. VACUUM은 하지 않는다 — free page 재사용으로 파일이 정상상태에 머무는 것이 목표이고
 	// 200MiB급 VACUUM은 기동 지연이 크다. 어느 실패든 기동을 막지 않는다(로그만 남긴다): 행 삭제가
 	// 실패하면 다음 기동이 같은 배치를 다시 시도하고, 커밋 뒤 파일 회수에서 유예·실패한 몫은 행이
@@ -503,15 +507,28 @@ func run(ctx context.Context, args []string, stderr io.Writer) error {
 	// 다중 고루틴 사용이 계약이다. 쓰기는 writer SetMaxOpenConns(1)로 직렬화돼 이 tx와 핸들러의
 	// Register tx가 섞이지 않으며(뒤엣것이 풀에서 대기), 프로세스 간 BUSY는 txRetry+busy_timeout이
 	// 흡수한다. 직렬화 밖인 blob 물리 삭제는 rename 격리 프로토콜이 Register.writeBlob 경합을 닫고
-	// 의심되면(mtime 1h 이내·참조 재확인 실패) 삭제 대신 유예한다. lockStore를 잡는 것은
-	// Open·GCOrphanBlobs·reclaimHookBlobs뿐이고 internal/mcp는 그중 무엇도 부르지 않으므로 이
-	// 고루틴의 잠금이 요청 경로를 막지 않는다.
+	// 의심되면(mtime 1h 이내·참조 재확인 실패) 삭제 대신 유예한다.
+	//
+	// 잠금 보유자는 프로세스 안팎을 함께 봐야 한다: lockStore를 잡는 코드는 store.Open(writable)·
+	// GCOrphanBlobs·reclaimHookBlobs이고, 이 서버 프로세스에서 그것을 부르는 것은 이 고루틴뿐이다
+	// (internal/mcp는 셋 다 부르지 않아 요청 경로가 막히지 않는다). **다른 프로세스**로는 CLI purge
+	// 계열과 훅이 있는데, 훅의 Read 가드는 총예산 2000ms 안에서 writable store.OpenContext를 하고
+	// 실패하면 색인을 포기해 가드를 조용히 통과시킨다(internal/hook guardRead의 guard-store drop).
+	// 그래서 이 배치의 잠금·쓰기 락 보유 시간은 그 예산의 일부만 쓰도록 건수로 묶는다
+	// (startupPurgeMaxHashes 주석의 실측 근거).
+	cutoff := time.Now().Add(-shadowRetention(os.Getenv)).Unix()
 	purgeCtx, cancelPurge := context.WithTimeout(ctx, startupPurgeBudget)
 	purgeDone := make(chan struct{})
 	go func() {
 		defer close(purgeDone)
-		rep, purgeErr := st.PurgeHookOnlyOlderThan(purgeCtx,
-			time.Now().Add(-shadowRetention(os.Getenv)).Unix(), startupPurgeMaxHashes)
+		if cutoff <= 0 {
+			// 보존 기간이 epoch 경과분(약 56년)보다 크면 cutoff가 0 이하로 내려가는데, store는 그 값을
+			// "나이 필터 없음"으로 읽는다(shadowOwnedFilter) — 보존을 늘리려는 설정이 나이 무관 전량
+			// 삭제로 반전된다. 클램프하면 그 반전은 막아도 무의미한 배치를 한 번 돌리므로(쓰기 락을
+			// 잡는다) 회수 자체를 건너뛴다. 그 설정의 의도된 결과와도 같다 — 적격 대상이 없다.
+			return
+		}
+		rep, purgeErr := st.PurgeHookOnlyOlderThan(purgeCtx, cutoff, startupPurgeMaxHashes)
 		// 결과 분류를 오류 모양이 아니라 ctx의 종료 사유로 하는 이유: 예산 소진의 관측된 모양은
 		// context.DeadlineExceeded였지만 드라이버가 문장 중간 취소를 sqlite3_interrupt로 처리하므로
 		// SQLITE_INTERRUPT로 올라올 수도 있고, 파일 회수 단계는 예산을 넘겨도 오류를 만들지 않는다.
@@ -531,7 +548,10 @@ func run(ctx context.Context, args []string, stderr io.Writer) error {
 			// (stillReferenced가 오류를 "참조 있음"으로 취급) 오삭제는 없다.
 			slog.Warn("기동 shadow 회수 예산 소진 — 행 삭제 미완료, 다음 기동에서 재시도")
 		case purgeErr != nil:
-			slog.Warn("기동 shadow 회수 실패 — 다음 기동에서 재시도", "error", purgeErr)
+			// 두 실패가 이 분기로 온다: 행 삭제 실패(다음 기동이 같은 배치를 다시 집는다)와 커밋 뒤
+			// 파일 회수 실패(lockStore 실패 등 — 행이 이미 없어 다음 기동 술어에 안 잡히므로 purge --gc가
+			// 회수 경로다). 어느 쪽인지 로그에서 구분할 수 없으므로 두 경로를 함께 적는다.
+			slog.Warn("기동 shadow 회수 실패 — 행 삭제분은 다음 기동에서 재시도, 파일 회수분은 purge --gc", "error", purgeErr)
 		case rep.Hashes > 0:
 			// capped·budget_spent: 어느 예산이 이번 배치를 끊었는지 관측용(D67 임계값 재설정 입력).
 			slog.Info("기동 shadow 회수", "hashes", rep.Hashes, "bytes", rep.ReclaimedB,
