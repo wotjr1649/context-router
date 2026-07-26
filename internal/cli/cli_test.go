@@ -2452,6 +2452,27 @@ func TestDoctorWarnMentionsHookOnly(t *testing.T) {
 	}
 }
 
+// TestHostSnippetNoExecAskRule: 호스트 안내가 exec 도구를 permissions.ask에 넣게 하지
+// 않는다. ask는 무프롬프트 모드에서도 프롬프트를 강제하고 allow를 이기므로, 승인 강도는
+// 호스트 권한 모드가 정하게 둔다(설계 v0.12 D64).
+func TestHostSnippetNoExecAskRule(t *testing.T) {
+	// ask 배열 줄에 exec 도구가 있으면 안 된다.
+	for _, line := range strings.Split(hostSnippet, "\n") {
+		if !strings.Contains(line, `"ask"`) {
+			continue
+		}
+		for _, tool := range []string{"ctr_execute", "ctr_execute_file"} {
+			if strings.Contains(line, tool) {
+				t.Errorf("ask 안내에 exec 도구가 남아 있다: %s", line)
+			}
+		}
+	}
+	// 대신 모드 기반 설명이 있어야 한다.
+	if !strings.Contains(hostSnippet, "권한 모드") {
+		t.Errorf("승인 강도를 호스트 권한 모드가 정한다는 안내가 없다")
+	}
+}
+
 // TestPurgeHookOnlySinglePrompt — TTY 경로에서 확인 프롬프트가 정확히 1회만 출력된다(전역
 // confirmPurge와의 중복 방지 회귀 — 조기 분기가 전역 confirm 앞에 있어야 함). 견적 슬러그를
 // 정확히 재구성해 입력하면 통과하고 실회수 보고까지 진행된다.
@@ -2569,5 +2590,78 @@ func TestPurgeHookOnlyVacuumFailurePropagates(t *testing.T) {
 	}
 	if !strings.Contains(gw.buf.String(), "실회수") {
 		t.Fatalf("실회수 보고가 VACUUM 이전에 안 나옴:\n%s", gw.buf.String())
+	}
+}
+
+// TestDoctorShowsPermissionLine: [19] 라인이 항상 나오고, 규칙이 없는 환경에서는 세 갈래 중
+// "충돌 없음"이다. 라인 접두("[19] permissions:")만 단정하면 판정이 통째로 무력화돼도(예: ruleMatches가
+// 항상 false를 돌려주는 회귀) 통과하므로 문면까지 고정한다(G5). USER 스코프는 임시 홈으로 돌려
+// 실환경 설정이 판정에 섞이지 않게 한다 — 그러지 않으면 세 갈래 중 어느 것이 나올지 환경에 달린다.
+func TestDoctorShowsPermissionLine(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("USERPROFILE", home) // windows
+	t.Setenv("HOME", home)        // unix
+	var buf bytes.Buffer
+	_ = runDoctor(context.Background(), &buf, t.TempDir(), t.TempDir(), "0.12.0")
+	if !strings.Contains(buf.String(), "[19] permissions: ask/allow 충돌 없음") {
+		t.Fatalf("[19] 충돌 없음 라인 누락:\n%s", buf.String())
+	}
+}
+
+// TestDoctorReportsAskShadowedAllow: 프로젝트 settings의 ask와 도구가 겹치는 allow가 있으면 doctor가
+// 그 규칙 이름을 [19]로 보고한다 — 디스크의 실제 파일에서 doctor 라인까지의 배선을 잇는 테스트다.
+// 두 번째 allow(서버 단위)는 ask와 일부만 겹친다 — 겹치는 도구에서만 무력화되고 나머지 도구에서는
+// 그대로 유효하므로, 문면이 "덮는다"가 아니라 "겹친다"여야 한다(R4). 판정이 교집합으로 바뀐 뒤에도
+// "덮는다"로 남으면 진단이 사용자에게 그 allow 전체가 죽었다고 잘못 읽힌다.
+// USER 스코프는 임시 홈으로 돌려 실환경 설정이 건수에 섞이지 않게 한다(판정은 전 스코프 합집합).
+func TestDoctorReportsAskShadowedAllow(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("USERPROFILE", home) // windows
+	t.Setenv("HOME", home)        // unix
+	projectRoot := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(projectRoot, ".claude"), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	rules := `{"permissions":{"ask":["mcp__ctr-exec__ctr_execute"],` +
+		`"allow":["mcp__ctr-exec__ctr_execute","mcp__ctr-exec"]}}`
+	if err := os.WriteFile(filepath.Join(projectRoot, ".claude", "settings.json"), []byte(rules), 0o600); err != nil {
+		t.Fatalf("write settings: %v", err)
+	}
+	var buf bytes.Buffer
+	_ = runDoctor(context.Background(), &buf, t.TempDir(), projectRoot, "0.12.0")
+	if !strings.Contains(buf.String(), "[19] permissions: ask와 겹치는 allow 항목 2건 — mcp__ctr-exec__ctr_execute, mcp__ctr-exec") {
+		t.Fatalf("[19] 충돌 보고 누락:\n%s", buf.String())
+	}
+}
+
+// TestDoctorIndeterminateOnUnreadableScope: 읽을 수 없는 스코프가 하나라도 있으면 [19]는
+// "충돌 없음"이 아니라 판정 불가로 떨어진다(리뷰 F1 — 거짓 clean 방지). settings.json 자리에
+// 디렉터리를 두어 os.ReadFile이 미존재가 아닌 오류를 내게 만든다. USER 스코프는 임시 홈으로 돌린다.
+func TestDoctorIndeterminateOnUnreadableScope(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("USERPROFILE", home) // windows
+	t.Setenv("HOME", home)        // unix
+	projectRoot := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(projectRoot, ".claude", "settings.json"), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	var buf bytes.Buffer
+	_ = runDoctor(context.Background(), &buf, t.TempDir(), projectRoot, "0.12.0")
+	if !strings.Contains(buf.String(), "[19] permissions: ask/allow 판정 불가") {
+		t.Fatalf("읽을 수 없는 스코프인데 판정 불가가 아니다:\n%s", buf.String())
+	}
+}
+
+// TestDoctorPermissionLineOnCheckFailure: 판정 자체가 실패하면 "충돌 없음"이 아니라 판정 불가를
+// 알린다 — 확인하지 않은 것을 확인했다고 말하는 진단은 침묵보다 사용자를 더 오도한다. 홈 디렉터리
+// 해석이 유일한 실패 경로라 USERPROFILE/HOME을 비워 재현한다. [19]는 한 줄만 나오므로 판정 불가
+// 라인의 존재가 곧 "충돌 없음"을 찍지 않았다는 증거다.
+func TestDoctorPermissionLineOnCheckFailure(t *testing.T) {
+	t.Setenv("USERPROFILE", "") // windows
+	t.Setenv("HOME", "")        // unix
+	var buf bytes.Buffer
+	_ = runDoctor(context.Background(), &buf, t.TempDir(), t.TempDir(), "0.12.0")
+	if !strings.Contains(buf.String(), "[19] permissions: ask/allow 판정 불가") {
+		t.Fatalf("판정 실패인데 판정 불가 라인이 없다:\n%s", buf.String())
 	}
 }

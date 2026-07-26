@@ -12,6 +12,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/wotjr1649/context-router/internal/sandbox"
 )
 
 // testSelfExe: 실 ctr 바이너리를 1회만 빌드해(sync.Once) 재사용한다 — transform 패키지의
@@ -65,6 +67,16 @@ func TestMain(m *testing.M) {
 }
 
 func selfExe(t *testing.T) string { return testSelfExe(t) }
+
+// mustEnv: extra류(격리 준비) 함수의 (env, error)를 호출부 잡음 없이 펼친다. 준비 실패는
+// 테스트 픽스처가 깨진 것이므로 즉시 끊는다 — t를 받는 헬퍼로는 f(g()) 형태로 다중값을
+// 전달할 수 없어(Go 호출 규칙) panic으로 끊는다. panic도 해당 테스트만 실패시킨다.
+func mustEnv(kv []string, err error) []string {
+	if err != nil {
+		panic("격리 준비 실패: " + err.Error())
+	}
+	return kv
+}
 
 func TestRunShellEcho(t *testing.T) {
 	if _, err := exec.LookPath(shellName()); err != nil {
@@ -276,6 +288,67 @@ func TestNonZeroExit(t *testing.T) {
 	}
 }
 
+// TestShellExitCodeIsLastCommand: 중간 명령이 실패해도 마지막 명령이 성공하면 exit 0이고,
+// 실패 흔적은 stderr에만 남는다. 러너가 엄격 모드를 주입하지 않는다는 계약의 회귀 방지다
+// (설계 v0.12 D66 — 셸 일반의 정의된 동작이며 언어별로 다르게 굴지 않는다).
+func TestShellExitCodeIsLastCommand(t *testing.T) {
+	requireLang(t, "shell")
+	var code string
+	if runtime.GOOS == "windows" {
+		// 존재하지 않는 경로 접근 = 비종결 오류. 그 뒤 정상 출력으로 끝난다.
+		code = "Get-Content 'Z:\\ctr-no-such-file.txt'\nWrite-Output 'done'"
+	} else {
+		code = "cat /ctr-no-such-file.txt\necho done"
+	}
+	resp := run(t, Request{Language: "shell", Code: code})
+	if resp.ExitCode == nil {
+		t.Fatalf("ExitCode=nil (timed_out=%v)", resp.TimedOut)
+	}
+	if *resp.ExitCode != 0 {
+		t.Fatalf("exit=%d want 0 — 러너가 엄격 모드를 주입했을 수 있다. stderr=%q", *resp.ExitCode, resp.Stderr)
+	}
+	if !strings.Contains(resp.Stdout, "done") {
+		t.Errorf("마지막 명령이 실행되지 않았다: stdout=%q", resp.Stdout)
+	}
+	if strings.TrimSpace(resp.Stderr) == "" {
+		t.Errorf("실패 흔적이 stderr에 없다 — 호출자가 판정할 근거가 사라진다")
+	}
+}
+
+// TestShellNativeExitNotPropagated: 계약의 안전망(exit_code + stderr를 함께 보기)이 잡지
+// 못하는 부류를 고정한다 — windows 인터프리터는 -File 실행에서 exit이나 종결 오류가 없으면 0을
+// 돌려주므로, 마지막 줄이 비 0으로 죽은 네이티브 명령이어도 exit_code 0이고 stderr까지 비어
+// 실패가 두 채널 어디에도 남지 않는다($ErrorActionPreference = 'Stop'도 이 부류는 멈추지
+// 못한다 — pwsh 7.6.0·powershell 5.1 실측). 안내가 PowerShell에 exit $LASTEXITCODE 전파를
+// 지시하는 근거이고, 러너가 언젠가 네이티브 종료를 전파하기 시작하면 안내 문면을 고쳐야
+// 하므로 이 테스트가 먼저 깨져 알린다. sh는 반대로 마지막 명령의 상태를 문자 그대로
+// 전파하며(안내의 sh 문면 근거) 두 절반이 그 대비를 함께 고정한다(설계 v0.12 D66).
+func TestShellNativeExitNotPropagated(t *testing.T) {
+	requireLang(t, "shell")
+	if runtime.GOOS != "windows" {
+		resp := run(t, Request{Language: "shell", Code: "sh -c 'exit 5'"})
+		if resp.ExitCode == nil {
+			t.Fatalf("ExitCode=nil (timed_out=%v)", resp.TimedOut)
+		}
+		if *resp.ExitCode != 5 {
+			t.Fatalf("exit=%d want 5 — sh가 마지막 명령의 상태를 전파하지 않는다. stderr=%q",
+				*resp.ExitCode, resp.Stderr)
+		}
+		return
+	}
+	resp := run(t, Request{Language: "shell", Code: "cmd /c exit 5"})
+	if resp.ExitCode == nil {
+		t.Fatalf("ExitCode=nil (timed_out=%v)", resp.TimedOut)
+	}
+	if *resp.ExitCode != 0 {
+		t.Fatalf("exit=%d want 0 — 네이티브 종료가 전파되기 시작했다면 안내 문면을 고친다. stderr=%q",
+			*resp.ExitCode, resp.Stderr)
+	}
+	if s := strings.TrimSpace(resp.Stderr); s != "" {
+		t.Errorf("stderr가 비어 있지 않다 — 실패가 관측 가능해졌다면 안내 문면을 고친다: %q", s)
+	}
+}
+
 // TestTruncation: stdout이 상한(32768)을 넘으면 잘리고 StdoutTrunc가 선다.
 func TestTruncation(t *testing.T) {
 	requireLang(t, "javascript")
@@ -329,11 +402,242 @@ func TestRunGo(t *testing.T) {
 	}
 }
 
+// TestGoEnvIsolatesGOENV: go env 파일 경로가 스크래치 안으로 고정되고 그 파일이 실재한다.
+// 호스트 go env 파일이 GOFLAGS·GOPROXY·GOTOOLCHAIN을 공급하지 못하게 하는 계약이다.
+func TestGoEnvIsolatesGOENV(t *testing.T) {
+	scratch := t.TempDir()
+	m := map[string]string{}
+	for _, kv := range mustEnv(goEnv(scratch)) {
+		k, v, _ := strings.Cut(kv, "=")
+		m[k] = v
+	}
+	want := filepath.Join(scratch, "go-env")
+	if got := m["GOENV"]; got != want {
+		t.Errorf("GOENV=%q want %q", got, want)
+	}
+	// go는 GOENV 파일을 스스로 만들지 않으므로 사전 생성한다(GOTMPDIR 사전 생성과 같은 규율).
+	// 빈 파일이면 "설정 없음"이 아니라 "go 내장 기본"이 된다 — 공개 모듈 프록시와 툴체인
+	// 자동 다운로드가 그 기본에 포함되므로, 의도한 값을 명시적으로 적는다.
+	b, err := os.ReadFile(want)
+	if err != nil {
+		t.Fatalf("GOENV 파일 미생성: %v", err)
+	}
+	for _, line := range []string{"GOFLAGS=", "GOTOOLCHAIN=local", "GOPROXY=off"} {
+		if !strings.Contains(string(b), line) {
+			t.Errorf("go env 파일에 %q 없음:\n%s", line, b)
+		}
+	}
+}
+
+// TestRunGoIgnoresHostGoEnv: 러너 안에서 관측한 GOENV가 스크래치 하위다(적용 실증).
+// 파일 생성만이 아니라 go 툴체인이 실제로 그 경로를 쓰는지 확인한다.
+func TestRunGoIgnoresHostGoEnv(t *testing.T) {
+	requireLang(t, "go")
+	resp := run(t, Request{
+		Language: "go",
+		Code: "package main\n\nimport (\n\t\"fmt\"\n\t\"os\"\n)\n\n" +
+			"func main() { fmt.Println(\"GOENV=\" + os.Getenv(\"GOENV\")) }\n",
+	})
+	if resp.ExitCode == nil || *resp.ExitCode != 0 {
+		t.Fatalf("exit=%v stderr=%q", resp.ExitCode, resp.Stderr)
+	}
+	if !strings.Contains(resp.Stdout, "go-env") {
+		t.Errorf("GOENV가 스크래치 하위가 아니다: %q", resp.Stdout)
+	}
+}
+
+// TestRunGoScratchGoEnvWins: 호스트 go env 파일이 실재하는 픽스처를 만들어 스크래치 구성이
+// 이긴다는 것을 확인한다(D65 검증 계약). 양방향을 다 본다 — 격리를 뺀 절반은 호스트 파일의
+// GOFLAGS가 툴체인까지 도달해 빌드가 깨지고(픽스처가 실효적이라는 증거), 격리를 넣은 절반은
+// 같은 스니펫이 정상 종료한다. 한 방향만 보면 파일이 비었거나 도달하지 않아도 통과하는 공허한
+// 테스트가 된다(TestRunGoIgnoresHostGoEnv는 전파만 고정하므로 이 테스트가 반영을 맡는다).
+// 호스트 config 위치는 os.UserConfigDir() 규칙상 OS별로 달라 분기가 필요하다 — 자식 env
+// allowlist가 통과시키는 포인터가 windows APPDATA · unix HOME이므로 unix는 HOME 경유로
+// 고정한다(XDG_CONFIG_HOME은 allowlist 밖이라 자식이 못 본다). unix 실행은 3-OS CI가 검증한다.
+func TestRunGoScratchGoEnvWins(t *testing.T) {
+	requireLang(t, "go")
+	// 픽스처를 심기 전에 sync.Once 빌드를 끝낸다 — 심은 뒤면 그 go build가 깨지고 실패가
+	// testExeErr에 캐시돼 패키지 전체가 오염된다.
+	selfExe(t)
+
+	fake := t.TempDir()
+	if runtime.GOOS == "windows" {
+		t.Setenv("APPDATA", fake)
+	} else {
+		t.Setenv("XDG_CONFIG_HOME", "") // 자식과 같은 해석 경로(HOME)로 통일
+		t.Setenv("HOME", fake)
+	}
+	cfgDir, err := os.UserConfigDir()
+	if err != nil {
+		t.Fatalf("UserConfigDir: %v", err)
+	}
+	hostEnv := filepath.Join(cfgDir, "go", "env")
+	if err := os.MkdirAll(filepath.Dir(hostEnv), 0o700); err != nil {
+		t.Fatalf("호스트 config 디렉터리 생성 실패: %v", err)
+	}
+	// 반영되면 go가 플래그 파싱에서 즉시 죽는 값 — 관측이 종료코드로 갈리고 네트워크가 필요 없다.
+	if err := os.WriteFile(hostEnv, []byte("GOFLAGS=-bogusflag\n"), 0o600); err != nil {
+		t.Fatalf("호스트 go env 픽스처 기록 실패: %v", err)
+	}
+
+	code := "package main\n\nimport \"fmt\"\n\nfunc main() { fmt.Println(\"go-ok\") }\n"
+
+	// ① 격리 없음 — goEnv에서 GOENV만 뺀 환경으로 직접 실행한다(프로덕션에 토글을 심지 않기
+	// 위해 이 절반만 테스트가 환경을 조립한다). 나머지 재지정은 그대로여서 차이는 GOENV뿐이다.
+	scratch := t.TempDir()
+	file := filepath.Join(scratch, "snippet.go")
+	if err := os.WriteFile(file, []byte(code), 0o600); err != nil {
+		t.Fatalf("스니펫 기록 실패: %v", err)
+	}
+	env := sandbox.BaseEnv() // 닫힌 표 그대로 — 개발자 셸의 GOFLAGS/GOPROXY가 실험을 흐리지 않게
+	for _, kv := range mustEnv(goEnv(scratch)) {
+		if !strings.HasPrefix(kv, "GOENV=") {
+			env = append(env, kv)
+		}
+	}
+	cmd := exec.Command("go", "run", file)
+	cmd.Dir, cmd.Env = scratch, env
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("픽스처 무효 — GOENV 없이도 성공했다(호스트 파일이 툴체인에 도달하지 않음): %s", out)
+	}
+	if !strings.Contains(string(out), "bogusflag") {
+		t.Fatalf("호스트 GOFLAGS가 실패 원인이 아니다(다른 이유로 실패): %v: %s", err, out)
+	}
+
+	// ② 격리 있음 — 같은 픽스처·같은 스니펫이 러너에서 정상 종료한다.
+	resp := run(t, Request{Language: "go", Code: code})
+	if resp.ExitCode == nil || *resp.ExitCode != 0 {
+		t.Fatalf("스크래치 go env가 호스트에 지고 있다: timedout=%v stdout=%q stderr=%q",
+			resp.TimedOut, resp.Stdout, resp.Stderr)
+	}
+	if !strings.Contains(resp.Stdout, "go-ok") {
+		t.Errorf("골든 출력 부재: %q", resp.Stdout)
+	}
+}
+
 func TestRunPython(t *testing.T) {
 	requireLang(t, "python")
 	resp := run(t, Request{Language: "python", Code: "print('py-ok')"})
 	if resp.ExitCode == nil || *resp.ExitCode != 0 || !strings.Contains(resp.Stdout, "py-ok") {
 		t.Fatalf("exit=%v stdout=%q stderr=%q", resp.ExitCode, resp.Stdout, resp.Stderr)
+	}
+}
+
+// TestPyEnvIsolatesUserSite: user site-packages와 pip 구성이 차단된다.
+func TestPyEnvIsolatesUserSite(t *testing.T) {
+	scratch := t.TempDir()
+	m := map[string]string{}
+	for _, kv := range mustEnv(pyEnv(scratch)) {
+		k, v, _ := strings.Cut(kv, "=")
+		m[k] = v
+	}
+	if m["PYTHONNOUSERSITE"] != "1" {
+		t.Errorf("PYTHONNOUSERSITE 미주입")
+	}
+	want := filepath.Join(scratch, "pip.conf")
+	if got := m["PIP_CONFIG_FILE"]; got != want {
+		t.Errorf("PIP_CONFIG_FILE=%q want %q", got, want)
+	}
+	// 사전 생성이 pip 격리의 시행점이다 — pip은 PIP_CONFIG_FILE 경로가 실재할 때만 사용자
+	// 구성을 로드 목록에서 뺀다(pyEnv 주석). 파일이 없으면 경로만 맞고 격리는 없다.
+	if _, err := os.Stat(want); err != nil {
+		t.Errorf("pip 구성 사전 생성 안 됨: %v", err)
+	}
+	if got := m["PYTHONPYCACHEPREFIX"]; got != filepath.Join(scratch, "pycache") {
+		t.Errorf("기존 PYTHONPYCACHEPREFIX 계약이 깨졌다: %q", got)
+	}
+}
+
+// TestRunPyIgnoresUserSite: 러너 안에서 user site가 비활성임을 실증한다.
+func TestRunPyIgnoresUserSite(t *testing.T) {
+	requireLang(t, "python")
+	resp := run(t, Request{
+		Language: "python",
+		Code:     "import site\nprint('USER_SITE=' + str(site.ENABLE_USER_SITE))\n",
+	})
+	if resp.ExitCode == nil || *resp.ExitCode != 0 {
+		t.Fatalf("exit=%v stderr=%q", resp.ExitCode, resp.Stderr)
+	}
+	if !strings.Contains(resp.Stdout, "USER_SITE=False") {
+		t.Errorf("user site가 비활성이 아니다: %q", resp.Stdout)
+	}
+}
+
+// TestRunPyScratchUserSiteWins: 호스트 user site-packages에 임포트 가능한 모듈이 실재하는
+// 픽스처를 만들어 격리가 이긴다는 것을 확인한다(D65 검증 계약). 양방향을 다 본다 — 격리를 뺀
+// 절반은 그 모듈이 임포트되고(픽스처가 실효적이라는 증거), 넣은 절반은 같은 스니펫이
+// ModuleNotFoundError로 죽는다. 한 방향만 보면 경로 계산이 틀려 아무도 안 보는 디렉터리에
+// 심어도 통과하는 공허한 테스트가 된다(TestRunPyIgnoresUserSite는 플래그 관측만 맡는다).
+// user site 경로 규칙은 플랫폼·버전에 달려 있으므로(windows %APPDATA%\Python\PythonXY,
+// unix ~/.local/lib/pythonX.Y, macOS 프레임워크 빌드 ~/Library/Python/X.Y) 인터프리터에게 직접
+// 묻는다. 자식 env 닫힌 표가 통과시키는 홈 포인터가 windows APPDATA · unix HOME이라 그쪽을
+// 돌려 픽스처를 심는다. unix 실행은 3-OS CI가 검증한다.
+func TestRunPyScratchUserSiteWins(t *testing.T) {
+	requireLang(t, "python")
+	// 픽스처를 심기 전에 sync.Once 빌드를 끝낸다 — 심은 뒤면 그 go build가 깨지고 실패가
+	// testExeErr에 캐시돼 패키지 전체가 오염된다.
+	selfExe(t)
+
+	py, _, err := detectPy()
+	if err != nil {
+		t.Fatalf("python 미감지: %v", err)
+	}
+	fake := t.TempDir()
+	if runtime.GOOS == "windows" {
+		t.Setenv("APPDATA", fake) // site._getuserbase(): nt는 %APPDATA%\Python
+	} else {
+		t.Setenv("HOME", fake)
+	}
+	probe := exec.Command(py, "-c", "import site; print(site.getusersitepackages())")
+	probe.Env = sandbox.BaseEnv() // 자식과 같은 표로 물어야 자식이 볼 경로가 나온다
+	out, err := probe.Output()
+	if err != nil {
+		t.Fatalf("user site 경로 조회 실패: %v", err)
+	}
+	userSite := strings.TrimSpace(string(out))
+	if !strings.HasPrefix(userSite, fake) {
+		t.Fatalf("픽스처가 user site 경로를 못 잡았다(호스트 홈을 가리킨다) — 심지 않고 중단: %q", userSite)
+	}
+	if err := os.MkdirAll(userSite, 0o700); err != nil {
+		t.Fatalf("user site 디렉터리 생성 실패: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(userSite, "ctr_host_site_marker.py"),
+		[]byte("VALUE = \"host-user-site\"\n"), 0o600); err != nil {
+		t.Fatalf("user site 픽스처 기록 실패: %v", err)
+	}
+	code := "import ctr_host_site_marker\nprint(ctr_host_site_marker.VALUE)\n"
+
+	// ① 격리 없음 — pyEnv에서 PYTHONNOUSERSITE만 뺀 환경으로 직접 실행한다(프로덕션에 토글을
+	// 심지 않기 위해 이 절반만 테스트가 환경을 조립한다). 나머지 재지정은 그대로다.
+	scratch := t.TempDir()
+	file := filepath.Join(scratch, "snippet.py")
+	if err := os.WriteFile(file, []byte(code), 0o600); err != nil {
+		t.Fatalf("스니펫 기록 실패: %v", err)
+	}
+	env := sandbox.BaseEnv()
+	for _, kv := range mustEnv(pyEnv(scratch)) {
+		if !strings.HasPrefix(kv, "PYTHONNOUSERSITE=") {
+			env = append(env, kv)
+		}
+	}
+	cmd := exec.Command(py, file)
+	cmd.Dir, cmd.Env = scratch, env
+	raw, err := cmd.CombinedOutput()
+	if err != nil || !strings.Contains(string(raw), "host-user-site") {
+		t.Fatalf("픽스처 무효 — 격리 없이도 호스트 user site 모듈이 임포트되지 않았다: %v: %s", err, raw)
+	}
+
+	// ② 격리 있음 — 같은 픽스처·같은 스니펫이 러너에서 임포트에 실패한다.
+	resp := run(t, Request{Language: "python", Code: code})
+	if resp.TimedOut || resp.ExitCode == nil {
+		t.Fatalf("러너가 종료코드를 남기지 않았다: timedout=%v stderr=%q", resp.TimedOut, resp.Stderr)
+	}
+	if *resp.ExitCode == 0 {
+		t.Fatalf("호스트 user site 모듈이 러너에서 임포트됐다: stdout=%q", resp.Stdout)
+	}
+	if !strings.Contains(resp.Stderr, "ModuleNotFoundError") {
+		t.Errorf("임포트 실패가 아닌 다른 이유로 죽었다(격리 확인 불가): stderr=%q", resp.Stderr)
 	}
 }
 
@@ -349,13 +653,391 @@ func TestRunTS(t *testing.T) {
 	}
 }
 
+// TestJSEnvIsolatesUserConfig: npm 사용자 구성과 bun 사용자 레벨 bunfig 탐색이 스크래치로
+// 고정된다. npmrc만 덮으면 절반이다 — bun은 홈 포인터로 자기 사용자 구성(preload 포함)을
+// 찾는다(jsEnv 주석 ②).
+func TestJSEnvIsolatesUserConfig(t *testing.T) {
+	want := func(root string) map[string]string {
+		return map[string]string{
+			"NPM_CONFIG_USERCONFIG": filepath.Join(root, "npmrc"),
+			"HOME":                  filepath.Join(root, "home"),
+			"XDG_CONFIG_HOME":       filepath.Join(root, "home", ".config"),
+		}
+	}
+	scratch := t.TempDir()
+	m := map[string]string{}
+	for _, kv := range mustEnv(jsEnv(scratch)) {
+		k, v, _ := strings.Cut(kv, "=")
+		m[k] = v
+	}
+	for k, w := range want(scratch) {
+		if got := m[k]; got != w {
+			t.Errorf("%s=%q want %q", k, got, w)
+		}
+	}
+	// env에 할당한 경로는 전부 사전 생성한다(goEnv GOTMPDIR 규칙) — npmrc는 파일, 홈·XDG는 디렉터리.
+	if _, err := os.Stat(m["NPM_CONFIG_USERCONFIG"]); err != nil {
+		t.Errorf("npmrc 사전 생성 안 됨: %v", err)
+	}
+	for _, k := range []string{"HOME", "XDG_CONFIG_HOME"} {
+		if fi, err := os.Stat(m[k]); err != nil || !fi.IsDir() {
+			t.Errorf("%s 디렉터리 사전 생성 안 됨: %v", k, err)
+		}
+	}
+	// 양쪽 배선을 표에서 직접 본다 — typescript는 tsRunner()가 따로 조립하므로 한쪽만 배선해도
+	// 위 검사는 통과한다. 러너 미설치 환경에서도(런타임 테스트가 Skip돼도) 누락을 잡는다.
+	for _, lang := range []string{"javascript", "typescript"} {
+		r := table()[lang]
+		if r.extra == nil {
+			t.Errorf("%s: extra 미배선", lang)
+			continue
+		}
+		sub := t.TempDir()
+		sm := map[string]string{}
+		for _, kv := range mustEnv(r.extra(sub)) {
+			k, v, _ := strings.Cut(kv, "=")
+			sm[k] = v
+		}
+		for k, w := range want(sub) {
+			if got := sm[k]; got != w {
+				t.Errorf("%s: %s=%q want %q", lang, k, got, w)
+			}
+		}
+	}
+}
+
+// TestRunJSIsolatesUserConfig: 러너 안에서 관측한 사용자 구성 포인터 셋이 전부 스크래치 하위다
+// (적용 실증의 전파 절반 — npm 구성 해석은 TestNpmrcScratchConfigWins, bun preload는
+// TestRunJSScratchBunfigWins가 맡는다). javascript·typescript 양쪽을 본다: 한쪽만 배선되면 그
+// 서브테스트에서 갈린다. 실패 시 어느 변수가 새는지 출력에 남긴다.
+func TestRunJSIsolatesUserConfig(t *testing.T) {
+	for _, lang := range []string{"javascript", "typescript"} {
+		t.Run(lang, func(t *testing.T) {
+			requireLang(t, lang)
+			resp := run(t, Request{
+				Language: lang,
+				Code: "const s = String(process.env.CTR_SCRATCH)\n" +
+					"const keys = ['NPM_CONFIG_USERCONFIG', 'HOME', 'XDG_CONFIG_HOME']\n" +
+					"const leak = keys.filter((k) => !String(process.env[k]).startsWith(s))\n" +
+					"console.log(leak.length === 0 ? 'ALL-IN-SCRATCH' : 'LEAK ' + leak.map((k) => k + '=' + process.env[k]).join(' '))\n",
+			})
+			if resp.ExitCode == nil || *resp.ExitCode != 0 {
+				t.Fatalf("exit=%v stderr=%q", resp.ExitCode, resp.Stderr)
+			}
+			if !strings.Contains(resp.Stdout, "ALL-IN-SCRATCH") {
+				t.Errorf("사용자 구성 포인터가 스크래치 하위가 아니다: %q", resp.Stdout)
+			}
+		})
+	}
+}
+
+// TestRunJSScratchBunfigWins: bun 사용자 레벨 bunfig(`$HOME/.bunfig.toml`)에 preload를 심어
+// 격리가 이긴다는 것을 확인한다. preload는 스니펫보다 먼저 실행되므로 상속되면 사용자 코드 앞에
+// 임의 모듈이 끼어들고, detectJS가 bun을 먼저 고르니 러너의 기본 경로다.
+// 이 픽스처는 플랫폼·bun 버전에 따라 무효일 수 있다 — windows 1.3.14에서는 어떤 홈 포인터로도
+// 전역 bunfig가 적용되지 않는 것을 실측했다. 그래서 격리 없는 절반으로 픽스처 실효성을 먼저
+// 확인하고, 무효면 그 사실을 Skip 문면에 남긴다(조용한 통과 금지). 실효적이면 러너 절반을
+// 단정한다. bun이 없으면 읽는 주체가 없다 — node는 bunfig를 쓰지 않는다.
+func TestRunJSScratchBunfigWins(t *testing.T) {
+	bun, err := exec.LookPath("bun")
+	if err != nil {
+		t.Skip("bun 미설치 — bunfig를 읽는 주체가 없다(node는 bunfig를 쓰지 않는다)")
+	}
+	// 픽스처를 심기 전에 sync.Once 빌드를 끝낸다 — 심은 뒤면 그 go build가 깨지고 실패가
+	// testExeErr에 캐시돼 패키지 전체가 오염된다.
+	selfExe(t)
+
+	fake := t.TempDir()
+	t.Setenv("HOME", fake) // unix 닫힌 표가 통과시키는 포인터 — 격리가 없으면 자식이 이걸 본다
+	t.Setenv("XDG_CONFIG_HOME", fake)
+	preload := filepath.Join(fake, "host-preload.js")
+	if err := os.WriteFile(preload, []byte("console.log('HOST-PRELOAD')\n"), 0o600); err != nil {
+		t.Fatalf("preload 픽스처 기록 실패: %v", err)
+	}
+	// TOML 문자열이라 경로는 슬래시로 — windows 백슬래시 이스케이프를 피한다.
+	cfg := []byte("preload = [\"" + filepath.ToSlash(preload) + "\"]\n")
+	if err := os.WriteFile(filepath.Join(fake, ".bunfig.toml"), cfg, 0o600); err != nil {
+		t.Fatalf("호스트 bunfig 픽스처 기록 실패: %v", err)
+	}
+	code := "console.log('snippet-ok')\n"
+
+	// ① 격리 없음 — jsEnv에서 홈 포인터만 뺀 환경으로 직접 실행하고, 픽스처 홈을 명시로 얹는다
+	// (windows 닫힌 표에는 HOME이 없어 BaseEnv 경유로는 실효성 자체를 확인할 수 없다).
+	scratch := t.TempDir()
+	file := filepath.Join(scratch, "snippet.js")
+	if err := os.WriteFile(file, []byte(code), 0o600); err != nil {
+		t.Fatalf("스니펫 기록 실패: %v", err)
+	}
+	env := sandbox.BaseEnv()
+	for _, kv := range mustEnv(jsEnv(scratch)) {
+		if !strings.HasPrefix(kv, "HOME=") && !strings.HasPrefix(kv, "XDG_CONFIG_HOME=") {
+			env = append(env, kv)
+		}
+	}
+	env = append(env, "HOME="+fake, "XDG_CONFIG_HOME="+fake)
+	cmd := exec.Command(bun, file)
+	cmd.Dir, cmd.Env = scratch, env
+	raw, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("격리 없는 절반이 실행 자체에 실패했다: %v: %s", err, raw)
+	}
+	if !strings.Contains(string(raw), "HOST-PRELOAD") {
+		t.Skipf("이 플랫폼·bun 버전에서 전역 bunfig가 적용되지 않아 픽스처가 무효다 — 격리가 닫는 것은 문서상 unix 경로다: %s", raw)
+	}
+
+	// ② 격리 있음 — 같은 픽스처가 러너에서 preload되지 않는다.
+	resp := run(t, Request{Language: "javascript", Code: code})
+	if resp.ExitCode == nil || *resp.ExitCode != 0 {
+		t.Fatalf("exit=%v stderr=%q", resp.ExitCode, resp.Stderr)
+	}
+	if strings.Contains(resp.Stdout, "HOST-PRELOAD") {
+		t.Errorf("호스트 bunfig의 preload가 러너에서 실행됐다: %q", resp.Stdout)
+	}
+	if !strings.Contains(resp.Stdout, "snippet-ok") {
+		t.Errorf("골든 출력 부재: %q", resp.Stdout)
+	}
+}
+
+// TestNpmrcScratchConfigWins: 호스트 사용자 npmrc가 실재하는 픽스처를 만들어 스크래치 구성이
+// 이긴다는 것을 확인한다(D65 검증 계약). npmrc를 읽는 주체는 인터프리터가 아니라 패키지
+// 관리자다 — `node file.js`/`bun file.js`는 npmrc를 전혀 읽지 않으므로 스니펫 실행만으로는
+// 반영을 관측할 수 없고, 반영은 스니펫이 npm/bun install을 호출할 때 일어난다. 그래서 적용
+// 실증은 그 구성을 실제로 해석하는 npm으로 한다(`config get`은 네트워크를 쓰지 않는다).
+// 양방향을 다 본다 — 격리를 뺀 절반은 호스트 registry가 나오고(픽스처가 실효적이라는 증거),
+// 넣은 절반은 그 값이 사라진다. 자식 env 닫힌 표가 통과시키는 홈 포인터가 windows USERPROFILE ·
+// unix HOME이라(npm은 os.homedir()로 ~를 정한다) 픽스처를 그쪽에 심는다. 상위 우선순위인
+// 프로젝트 구성이 실험을 흐리지 않게 cwd는 빈 디렉터리로 둔다. unix 실행은 3-OS CI가 검증한다.
+func TestNpmrcScratchConfigWins(t *testing.T) {
+	if _, err := exec.LookPath("npm"); err != nil {
+		t.Skip("npm 미설치 — npmrc를 해석하는 주체가 없다")
+	}
+	fake := t.TempDir()
+	t.Setenv("HOME", fake)
+	t.Setenv("USERPROFILE", fake)
+	const marker = "http://ctr-host-npmrc-marker.invalid/"
+	if err := os.WriteFile(filepath.Join(fake, ".npmrc"), []byte("registry="+marker+"\n"), 0o600); err != nil {
+		t.Fatalf("호스트 npmrc 픽스처 기록 실패: %v", err)
+	}
+	registry := func(extra []string) string {
+		t.Helper()
+		var cmd *exec.Cmd
+		if runtime.GOOS == "windows" {
+			// npm은 .cmd 래퍼라 CreateProcess로 직접 실행되지 않는다 — cmd.exe 경유.
+			cmd = exec.Command("cmd", "/c", "npm", "config", "get", "registry")
+		} else {
+			cmd = exec.Command("npm", "config", "get", "registry")
+		}
+		cmd.Dir, cmd.Env = t.TempDir(), append(sandbox.BaseEnv(), extra...)
+		out, err := cmd.Output()
+		if err != nil {
+			t.Fatalf("npm config get registry: %v", err)
+		}
+		return strings.TrimSpace(string(out))
+	}
+	if got := registry(nil); got != marker {
+		t.Fatalf("픽스처 무효 — 호스트 사용자 npmrc가 npm에 반영되지 않는다: %q", got)
+	}
+	// 내장 기본으로 떨어지는지가 아니라 "호스트 사용자 구성 값이 아닌지"를 본다 — 머신 레벨
+	// npmrc가 registry를 정한 호스트에서도 판정이 흔들리지 않게(사용자 구성 상속만이 계약이다).
+	// 빈 출력은 통과가 아니다 — 값을 못 읽은 것과 격리된 것을 구분한다.
+	switch got := registry(mustEnv(jsEnv(t.TempDir()))); got {
+	case marker:
+		t.Errorf("스크래치 npmrc가 호스트 사용자 구성에 지고 있다: %q", got)
+	case "":
+		t.Errorf("registry 값을 못 읽었다 — 격리 판정 불가")
+	}
+}
+
+// TestRunShellPSModulePathHasNoHostUserPath: 러너 안에서 관측한 유효 PSModulePath에 호스트
+// 사용자 모듈 경로가 없고 인터프리터 설치본의 Modules가 들어 있다(적용 실증). 기본 cmdlet도
+// 그대로 동작한다 — 격리가 러너를 망가뜨리지 않았다는 증거를 같은 왕복에서 얻는다.
+func TestRunShellPSModulePathHasNoHostUserPath(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("PSModulePath는 Windows 전용 키")
+	}
+	requireLang(t, "shell")
+	resp := run(t, Request{
+		Language: "shell",
+		Code:     "$env:PSModulePath\n\"YEAR=\" + (Get-Date -Format yyyy)\n",
+	})
+	if resp.ExitCode == nil || *resp.ExitCode != 0 {
+		t.Fatalf("exit=%v stderr=%q", resp.ExitCode, resp.Stderr)
+	}
+	if !strings.Contains(resp.Stdout, "YEAR=") {
+		t.Errorf("기본 cmdlet이 동작하지 않는다: stdout=%q stderr=%q", resp.Stdout, resp.Stderr)
+	}
+	bin, _, err := table()["shell"].detect()
+	if err != nil {
+		t.Fatalf("detect: %v", err)
+	}
+	if want := filepath.Join(filepath.Dir(bin), "Modules"); !strings.Contains(resp.Stdout, want) {
+		t.Errorf("인터프리터 설치본 Modules(%q)가 유효 경로에 없다:\n%s", want, resp.Stdout)
+	}
+	// 호스트 사용자 모듈 경로가 남아 있으면 호스트 설치 모듈이 스니펫에서 자동 로드된다.
+	// 스크래치는 %LOCALAPPDATA%\Temp 하위라 <USERPROFILE>\Documents 접두와 겹치지 않는다.
+	hostDocs := filepath.Join(os.Getenv("USERPROFILE"), "Documents")
+	if strings.Contains(resp.Stdout, hostDocs) {
+		t.Errorf("호스트 사용자 모듈 경로(%q)가 남아 있다:\n%s", hostDocs, resp.Stdout)
+	}
+}
+
+// TestRunShellScratchModulePathWins: 호스트 사용자 모듈 경로에 임포트 가능한 모듈이 실재하는
+// 픽스처를 만들어 스크래치 구성이 이긴다는 것을 확인한다(D65 검증 계약 — 형제 태스크 T7·T8과
+// 같은 양방향 형태). 위 테스트는 유효 경로 문자열을 보지만 이 테스트는 로드 가능성 자체를 본다.
+// 픽스처는 t.Setenv로 호스트 USERPROFILE 자체를 임시 디렉터리로 돌려 심는다 — 사용자의 실제
+// Documents에 쓰지 않는다. pwsh는 USERPROFILE 유도 사용자 모듈 경로를 PSModulePath 앞에
+// 덧붙이므로(실측) 격리 없는 절반에서 픽스처가 실제로 도달한다.
+func TestRunShellScratchModulePathWins(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("PSModulePath는 Windows 전용 키")
+	}
+	requireLang(t, "shell")
+	// 픽스처를 심기 전에 sync.Once 빌드를 끝낸다 — 심은 뒤면 그 go build가 USERPROFILE 유도
+	// GOPATH를 잃고 깨지며 실패가 testExeErr에 캐시돼 패키지 전체가 오염된다.
+	selfExe(t)
+
+	fake := t.TempDir()
+	// pwsh 사용자 모듈 경로 규약: <USERPROFILE>\Documents\PowerShell\Modules\<Name>\<Name>.psm1
+	const modName = "CtrHostCanary"
+	modDir := filepath.Join(fake, "Documents", "PowerShell", "Modules", modName)
+	if err := os.MkdirAll(modDir, 0o700); err != nil {
+		t.Fatalf("픽스처 모듈 디렉터리 생성 실패: %v", err)
+	}
+	psm1 := []byte("function Get-CtrHostCanary { 'HOST-MODULE-LOADED' }\n")
+	if err := os.WriteFile(filepath.Join(modDir, modName+".psm1"), psm1, 0o600); err != nil {
+		t.Fatalf("픽스처 모듈 기록 실패: %v", err)
+	}
+	t.Setenv("USERPROFILE", fake) // 닫힌 표가 통과시키는 포인터 — 격리가 없으면 자식이 이걸 본다
+
+	// 임포트 성공/실패가 stdout 표식으로 갈린다 — 종료코드는 양쪽 다 0으로 둔다.
+	code := "try { Import-Module " + modName + " -ErrorAction Stop; \"CANARY=\" + (Get-CtrHostCanary) }" +
+		" catch { \"IMPORT_FAILED\" }\n"
+
+	// ① 격리 없음 — shellRunner의 extra에서 USERPROFILE 재지정만 뺀 환경으로 직접 실행한다
+	// (프로덕션에 토글을 심지 않기 위해 이 절반만 테스트가 환경을 조립한다). detect → extra
+	// 순서는 Run과 같게 유지한다 — extra가 읽는 psHome을 detect가 채운다.
+	r := table()["shell"]
+	bin, _, err := r.detect()
+	if err != nil {
+		t.Fatalf("detect: %v", err)
+	}
+	scratch := t.TempDir()
+	file := filepath.Join(scratch, "snippet.ps1")
+	if err := os.WriteFile(file, snippetContent("snippet.ps1", code), 0o600); err != nil {
+		t.Fatalf("스니펫 기록 실패: %v", err)
+	}
+	env := sandbox.BaseEnv() // 닫힌 표 그대로 — PSModulePath는 이미 표 밖이다
+	for _, kv := range mustEnv(r.extra(scratch)) {
+		if !strings.HasPrefix(kv, "USERPROFILE=") {
+			env = append(env, kv)
+		}
+	}
+	cmd := exec.Command(bin, "-NoProfile", "-NonInteractive", "-File", file)
+	cmd.Dir, cmd.Env = scratch, env
+	raw, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("격리 없는 절반이 실행 자체에 실패했다: %v: %s", err, raw)
+	}
+	if !strings.Contains(string(raw), "HOST-MODULE-LOADED") {
+		t.Fatalf("픽스처 무효 — USERPROFILE 재지정 없이도 호스트 모듈이 로드되지 않았다: %s", raw)
+	}
+
+	// ② 격리 있음 — 같은 픽스처가 러너에서 임포트되지 않는다.
+	resp := run(t, Request{Language: "shell", Code: code})
+	if resp.ExitCode == nil || *resp.ExitCode != 0 {
+		t.Fatalf("exit=%v stderr=%q", resp.ExitCode, resp.Stderr)
+	}
+	if strings.Contains(resp.Stdout, "HOST-MODULE-LOADED") {
+		t.Errorf("호스트 사용자 모듈이 러너에서 로드됐다: %q", resp.Stdout)
+	}
+	if !strings.Contains(resp.Stdout, "IMPORT_FAILED") {
+		t.Errorf("임포트 실패 표식 부재 — 관측이 성립하지 않았다: stdout=%q stderr=%q",
+			resp.Stdout, resp.Stderr)
+	}
+}
+
+// TestRunShellPS51ProviderWriteReturns: 출하 유도(psModulePath)로 조립한 값이 **5.1**
+// 인터프리터에서 프로바이더 cmdlet 쓰기를 돌아오게 하는지 본다. shellRunner의 detect는 pwsh 7이
+// 있으면 그것을 먼저 고르므로 Run 경유로는 5.1 갈래가 CI에서 한 번도 실행되지 않는데, 측정된
+// 정지는 그 갈래에서만 났다(CI windows-latest + Windows PowerShell 5.1, 2026-07-25). 그래서
+// detect만 5.1로 대체하고 값 유도·env 조립·격리 경로는 출하와 같게 둔다 — 프로덕션에 토글을
+// 심지 않기 위해 이 테스트가 argv를 직접 조립한다(위 TestRunShellScratchModulePathWins와 같은
+// 방식). 5.1만 있는 호스트에서 ctr_execute{language:"shell"}가 실제로 받는 구성이 이것이다.
+//
+// 판정 둘이다.
+//
+//	① 구조 요건 — 주입 값의 첫 항목이 인자로 준(=우리가 만든) 실재 디렉터리다. 이분탐색이
+//	   지목한 유일한 해제 조건이라 유도가 이 성질을 잃으면 정지 조건이 돌아온다. 첫 항목의
+//	   신원까지 보는 이유: <PSHOME>\Modules로 "단순화"해도 그 경로는 실재하므로 존재 검사만으로는
+//	   그 회귀가 통과한다.
+//	② 동작 요건 — 같은 값으로 띄운 5.1에서 Set-Content가 돌아온다. 정지가 재발하면 여기서 잡힌다.
+//
+// 예산 10s로 묶는다: 5.1 기동은 실측 170~194ms이고 이 스니펫은 손자를 스폰하지 않으므로 건강한
+// 실행은 1s 안쪽이다. 예산이 만료되면 sandbox.Run이 잡을 종료하므로(+WaitDelay 5s) 정지가
+// 재발해도 패키지가 매달리지 않는다. 재발 시 판별 계측은 internal/sandbox/run_windows_test.go
+// TestRunWindowsTimeoutKillsTree의 실패 경로에 있다.
+func TestRunShellPS51ProviderWriteReturns(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("PowerShell 5.1 갈래는 Windows 전용")
+	}
+	psExe, err := exec.LookPath("powershell")
+	if err != nil {
+		t.Skipf("powershell.exe(5.1) 미해석 — 5.1 갈래 검증 불가: %v", err)
+	}
+
+	scratch := t.TempDir()
+	mods := filepath.Join(scratch, "psmodules") // shellRunner의 extra와 같은 배치·같은 이름
+	if err := os.MkdirAll(mods, 0o700); err != nil {
+		t.Fatalf("스크래치 모듈 디렉터리 생성 실패 — 주입 값의 전제가 깨진다: %v", err)
+	}
+	psmod := psModulePath(mods, filepath.Dir(psExe), "WindowsPowerShell")
+
+	first, _, _ := strings.Cut(psmod, ";")
+	fi, statErr := os.Stat(first)
+	if first != mods || statErr != nil || !fi.IsDir() {
+		t.Fatalf("주입 값의 첫 항목이 우리가 만든 실재 디렉터리가 아니다 — CI 5.1 프로바이더 "+
+			"cmdlet 정지의 유일한 해제 조건이다(D65): first=%q want=%q stat=%v", first, mods, statErr)
+	}
+
+	// 표식은 Set-Content **뒤에** 찍는다 — 파일 존재만 보면 "쓰기는 됐는데 호출이 돌아오지
+	// 않았다"를 구분하지 못하고, 정지의 서명이 정확히 그 자리다.
+	const marker = "PROVIDER-WRITE-RETURNED"
+	out := filepath.Join(scratch, "provider.out")
+	code := "'x' | Set-Content -LiteralPath '" + out + "'\nWrite-Output '" + marker + "'\n"
+	file := filepath.Join(scratch, "snippet.ps1")
+	if err := os.WriteFile(file, snippetContent("snippet.ps1", code), 0o600); err != nil {
+		t.Fatalf("스니펫 기록 실패: %v", err)
+	}
+	env := append(sandbox.BaseEnv(), tmpEnv(scratch)...)
+	env = append(env, "PSModulePath="+psmod, "USERPROFILE="+scratch) // extra가 주입하는 그대로
+	res, err := sandbox.Run(context.Background(), sandbox.Spec{
+		Argv: []string{psExe, "-NoProfile", "-NonInteractive", "-File", file},
+		Dir:  scratch, Env: env, Timeout: 10 * time.Second,
+		StdoutCap: stdoutCap, StderrCap: stderrCap,
+	})
+	if err != nil {
+		t.Fatalf("sandbox.Run: %v", err)
+	}
+	if res.TimedOut {
+		t.Fatalf("5.1에서 프로바이더 cmdlet이 돌아오지 않았다(정지 재발): stdout=%q stderr=%q",
+			res.Stdout, res.Stderr)
+	}
+	if res.ExitCode != 0 || !strings.Contains(string(res.Stdout), marker) {
+		t.Fatalf("exit=%d stdout=%q stderr=%q — 표식 부재는 Set-Content 뒤가 실행되지 않았다는 뜻",
+			res.ExitCode, res.Stdout, res.Stderr)
+	}
+	if b, err := os.ReadFile(out); err != nil || string(bytes.TrimSpace(b)) != "x" {
+		t.Fatalf("프로바이더 쓰기 결과가 없다: %q err=%v", b, err)
+	}
+}
+
 // TestCSEnvInjection: C# env 재지정이 스크래치 하위 경로·강제 플래그로 주입되고 재지정
 // 디렉터리가 생성됨을 결정적으로 검증한다(dotnet 실행/복원 불필요 — 배선 자체 확인).
 // 런타임 왕복은 TestRunCS(CI)가 겸한다.
 func TestCSEnvInjection(t *testing.T) {
 	scratch := t.TempDir()
 	m := map[string]string{}
-	for _, kv := range csEnv(scratch) {
+	for _, kv := range mustEnv(csEnv(scratch)) {
 		k, v, _ := strings.Cut(kv, "=")
 		m[k] = v
 	}
@@ -432,6 +1114,81 @@ func TestRunCS(t *testing.T) {
 }
 
 // TestRunnerStatus: doctor용 — 6언어 모두 항목이 나오고 현재 환경의 러너들이 OK다.
+// TestExtraSetupFailureIsErrSetup: 격리 시행점의 준비 실패는 러너 오류(sandbox.ErrSetup)로
+// 오르고 env는 비어서 돌아온다 — 경고만 남기고 계속하면 실재하지 않는 경로를 가리키는 env로
+// 실행되고, pip·NuGet은 그 상태에서 호스트 사용자 구성을 다시 로드한다(exec.go runner.extra
+// 주석의 분류 기준).
+//
+// 픽스처는 프로덕션에 훅을 심지 않고 실제 OS 오류를 만든다: 파일이 놓일 자리에 디렉터리를 미리
+// 만들면 os.WriteFile이(unix EISDIR / windows 액세스 거부), 디렉터리가 놓일 자리에 파일을 미리
+// 만들면 os.MkdirAll이(ENOTDIR) 실패한다. 각 케이스는 같은 함수가 블로커 없는 스크래치에서
+// 정상 반환하는 것까지 확인해 블로커가 실패의 원인임을 고정한다.
+func TestExtraSetupFailureIsErrSetup(t *testing.T) {
+	cases := []struct {
+		name    string                         // 시행점
+		blocker string                         // 스크래치 하위에 미리 만들 상대 경로
+		asDir   bool                           // true=디렉터리로 만든다(파일 기록을 막음), false=파일(디렉터리 생성을 막음)
+		env     func(string) ([]string, error) // 대상 extra
+	}{
+		{"pip.conf", "pip.conf", true, pyEnv},
+		{"nuget.config", "nuget.config", true, csEnv},
+		{"nuget-migrations-sentinel", filepath.Join("xdg", "NuGet", "Migrations", "1"), true, csEnv},
+		{"dotnet-cli-home", "dotnet", false, csEnv},
+		{"gotmpdir", "go-tmp", false, goEnv},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			scratch := t.TempDir()
+			blocker := filepath.Join(scratch, tc.blocker)
+			if tc.asDir {
+				if err := os.MkdirAll(blocker, 0o700); err != nil {
+					t.Fatalf("블로커 디렉터리 생성 실패: %v", err)
+				}
+			} else if err := os.WriteFile(blocker, nil, 0o600); err != nil {
+				t.Fatalf("블로커 파일 기록 실패: %v", err)
+			}
+			kv, err := tc.env(scratch)
+			if !errors.Is(err, sandbox.ErrSetup) {
+				t.Fatalf("격리 준비 실패가 ErrSetup으로 오르지 않았다: err=%v", err)
+			}
+			if kv != nil {
+				t.Errorf("실패 시 env를 돌려주면 격리가 빠진 채로 실행된다: %v", kv)
+			}
+			// 블로커가 없으면 같은 함수가 정상 반환한다(해피 패스 대조).
+			if kv, err := tc.env(t.TempDir()); err != nil || len(kv) == 0 {
+				t.Fatalf("깨끗한 스크래치에서 준비 실패: kv=%v err=%v", kv, err)
+			}
+		})
+	}
+}
+
+// TestShellExtraModuleDirFailureIsErrSetup: windows shell 러너의 psmodules 생성 실패도 시행점이다.
+// PSModulePath 첫 항목이 실재해야 5.1 프로바이더 cmdlet 영구 정지를 피한다(psModulePath 주석의
+// 실측) — 부재 경로를 첫 항목으로 주고 실행하면 그 정지가 타임아웃까지 매달린다.
+func TestShellExtraModuleDirFailureIsErrSetup(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("windows 전용 시행점 — 다른 OS의 shell 러너는 extra가 없다")
+	}
+	r := table()["shell"]
+	if _, _, err := r.detect(); err != nil { // extra가 읽는 psHome을 detect가 채운다(Run과 같은 순서)
+		t.Skipf("pwsh/powershell 미설치: %v", err)
+	}
+	scratch := t.TempDir()
+	if err := os.WriteFile(filepath.Join(scratch, "psmodules"), nil, 0o600); err != nil {
+		t.Fatalf("블로커 파일 기록 실패: %v", err)
+	}
+	kv, err := r.extra(scratch)
+	if !errors.Is(err, sandbox.ErrSetup) {
+		t.Fatalf("모듈 디렉터리 생성 실패가 ErrSetup으로 오르지 않았다: err=%v", err)
+	}
+	if kv != nil {
+		t.Errorf("실패 시 env를 돌려주면 부재 경로가 첫 항목인 PSModulePath로 실행된다: %v", kv)
+	}
+	if kv, err := r.extra(t.TempDir()); err != nil || len(kv) == 0 {
+		t.Fatalf("깨끗한 스크래치에서 준비 실패: kv=%v err=%v", kv, err)
+	}
+}
+
 func TestRunnerStatus(t *testing.T) {
 	st := RunnerStatus()
 	if len(st) != 6 {

@@ -17,6 +17,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime/debug"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -425,7 +426,7 @@ func runUsage(ctx context.Context, w io.Writer, args []string, storeRoot, projec
 	compare := fs.Bool("compare", false, "채널(cc/cx)×hooks:on/off 비교 리포트(설계 v0.6 D45 — 본표 대체)")
 	minRecords := fs.Int64("min-records", 0, "집계 제외 임계(cc=records, cx=turns; --compare 전용)")
 	rollouts := fs.String("rollouts", "", "Codex rollout 루트(--compare 전용, 생략 시 ~/.codex/sessions)")
-	adoption := fs.Bool("adoption", false, "ctr vs ctxscribe MCP 호출 채택 계측(session.db 집계 — transcript 토큰 집계와 별개, 설계 v0.11 D62)")
+	adoption := fs.Bool("adoption", false, "MCP 서버별 호출·세션 채택 계측(session.db 집계 — transcript 토큰 집계와 별개, 설계 v0.12 D63)")
 	days := fs.Int("days", 0, "최근 N일로 제한(--adoption 전용, 0=전체)")
 	if err := fs.Parse(args); err != nil {
 		return fmt.Errorf("usage: 플래그 파싱 실패: %w", err)
@@ -521,47 +522,129 @@ func openSessionDBReadOnly(storeRoot, projectRoot string) (*sql.DB, error) {
 	return session.OpenReadOnly(sessDir)
 }
 
-// runUsageAdoption: session_events(tool_call)를 ctr/ctxscribe로 분류 집계한다(설계 v0.11 D62).
-// 1차 지표 = 절대 호출 수. 비율은 참고(브리지 종료 후 분모 붕괴 — 스펙 명시). read-only라 대상
-// DB를 오염시키지 않는다.
+// mcpServerOf: "mcp__<server>__<tool>" 형태의 도구 이름에서 서버 네임스페이스를 뽑는다.
+// 서버 세그먼트에는 밑줄이 들어갈 수 있으므로(예: plugin_ctxscribe_mcp) 접두 제거 후
+// 첫 "__"에서 끊는다. MCP 도구가 아니면 ok=false.
+func mcpServerOf(summary string) (string, bool) {
+	const prefix = "mcp__"
+	if !strings.HasPrefix(summary, prefix) {
+		return "", false
+	}
+	rest := summary[len(prefix):]
+	i := strings.Index(rest, "__")
+	if i <= 0 || i+2 >= len(rest) {
+		return "", false
+	}
+	return rest[:i], true
+}
+
+// runUsageAdoption: session_events(tool_call)를 MCP 서버 네임스페이스 단위로 집계한다(설계
+// v0.12 D63 ①). v0.11의 부분 문자열 버킷팅(ctr_)은 mcp__ctr__*와 mcp__ctr-exec__*를 한
+// 카운터에 합쳐 서버 등록 형태의 차이를 지웠고, 세션 분모가 없어 "한 세션에서 몰아 쓴 것"과
+// "여러 세션에서 고루 쓴 것"이 구분되지 않았다. 지금은 서버별 절대 호출 수 + 그 서버를 부른
+// 고유 세션 수를 tool_call 세션 분모와 함께 낸다. ratio 참고 문면은 폐기했다 — 브리지 종료 후
+// 분모가 붕괴하는 지표였고 세션 분모가 그 자리를 대신한다. read-only라 대상 DB를 오염시키지
+// 않는다.
 func runUsageAdoption(ctx context.Context, w io.Writer, storeRoot, projectRoot string, days int, now time.Time) error {
+	if days < 0 {
+		return errors.New("usage: --days는 음수일 수 없습니다")
+	}
+	// 사전 점검: session.db가 없으면 "실패"가 아니라 "아직 데이터 없음"이다(loadCCSessions:372
+	// 관례 — os.Stat + IsDir). 경로는 메시지에 담지 않는다(§12 canary).
+	canon, err := ident.Canonicalize(projectRoot)
+	if err != nil || canon.ProjectID == "" {
+		return errors.New("usage: 프로젝트 식별 실패")
+	}
+	sessDir := filepath.Join(storeRoot, "projects", canon.ProjectID, "worktrees", canon.WorktreeID)
+	if fi, statErr := os.Stat(filepath.Join(sessDir, "session.db")); statErr != nil || fi.IsDir() {
+		fmt.Fprintln(w, "# 세션 이벤트가 아직 없습니다(훅 미설치 또는 첫 세션 전) — hook install 후 다시 실행하세요")
+		return nil
+	}
 	db, err := openSessionDBReadOnly(storeRoot, projectRoot) // loadCCSessions의 열기 관례 재사용
 	if err != nil {
 		return errors.New("usage: 세션 저장소를 열 수 없습니다")
 	}
 	defer func() { _ = db.Close() }()
-	q := "SELECT summary, COUNT(*) FROM session_events WHERE event_type='tool_call'"
+	// days 경계는 세 쿼리에 같은 값으로 적용한다 — 호출 수·분자·분모가 서로 다른 창을 서술하면
+	// 서버별 세션 수가 분모와 짝이 맞지 않는다.
+	var since string
 	var args []any
 	if days > 0 {
-		q += " AND ts >= ?"
+		since = " AND ts >= ?"
 		args = append(args, now.AddDate(0, 0, -days).Unix())
 	}
-	q += " GROUP BY summary"
-	rows, err := db.QueryContext(ctx, q, args...)
+	rows, err := db.QueryContext(ctx, "SELECT summary, COUNT(*) FROM session_events WHERE event_type='tool_call'"+since+" GROUP BY summary", args...)
 	if err != nil {
 		return errors.New("usage: 집계 조회 실패")
 	}
 	defer func() { _ = rows.Close() }()
-	var nCtr, nCtx int64 // 파라미터 ctx(context.Context)와의 재선언 충돌 회피
+	calls := make(map[string]int64) // 서버 네임스페이스 → 절대 호출 수
+	var nonMCP int64                // MCP 도구가 아닌 호출(Read·Bash 등) 합
 	for rows.Next() {
 		var s string
 		var n int64
 		if err := rows.Scan(&s, &n); err != nil {
 			return errors.New("usage: 행 스캔 실패")
 		}
-		switch {
-		case strings.Contains(s, "ctr_") || strings.Contains(s, "mcp__ctr__"):
-			nCtr += n
-		case strings.Contains(s, "ctx_") || strings.Contains(s, "ctxscribe"):
-			nCtx += n
+		if server, ok := mcpServerOf(s); ok {
+			calls[server] += n
+			continue
 		}
+		nonMCP += n
 	}
-	fmt.Fprintln(w, "tool\tcalls")
-	fmt.Fprintf(w, "ctr\t%d\n", nCtr)
-	fmt.Fprintf(w, "ctxscribe\t%d\n", nCtx)
-	if nCtr+nCtx > 0 {
-		fmt.Fprintf(w, "# ratio(참고, 분모 붕괴 주의): %.1f%%\n", 100*float64(nCtr)/float64(nCtr+nCtx))
+	if err := rows.Err(); err != nil {
+		return errors.New("usage: 집계 조회 중단")
 	}
+	_ = rows.Close() // 다음 조회 전에 연결을 돌려준다(defer의 중복 Close는 무해)
+	// 분모: 도구 호출이 하나라도 있는 세션 수(빈 세션 제외 — sessions 테이블 전체가 아니다).
+	const qDenom = `SELECT COUNT(DISTINCT session_id) FROM session_events WHERE event_type='tool_call'`
+	var denom int64
+	if err := db.QueryRowContext(ctx, qDenom+since, args...).Scan(&denom); err != nil {
+		return errors.New("usage: 세션 분모 조회 실패")
+	}
+	// 분자: 서버별로, 그 서버 도구를 한 번이라도 부른 세션 수.
+	const qPerServer = `SELECT session_id, summary FROM session_events WHERE event_type='tool_call'`
+	srows, err := db.QueryContext(ctx, qPerServer+since, args...)
+	if err != nil {
+		return errors.New("usage: 세션 집계 조회 실패")
+	}
+	defer func() { _ = srows.Close() }()
+	sessionsBy := make(map[string]map[string]struct{}) // 서버 → 세션 id 집합(고유 세션 수)
+	for srows.Next() {
+		var sid, s string
+		if err := srows.Scan(&sid, &s); err != nil {
+			return errors.New("usage: 행 스캔 실패")
+		}
+		server, ok := mcpServerOf(s) // 행 수가 커질 수 있으므로 summary는 파싱만 하고 보관하지 않는다
+		if !ok {
+			continue
+		}
+		if sessionsBy[server] == nil {
+			sessionsBy[server] = make(map[string]struct{})
+		}
+		sessionsBy[server][sid] = struct{}{}
+	}
+	if err := srows.Err(); err != nil {
+		return errors.New("usage: 세션 집계 조회 중단")
+	}
+	// 출력 결정성: 호출 수 내림차순, 동수는 서버 이름 오름차순 — map 순회 순서가 출력으로
+	// 새어 나오면 안 된다.
+	servers := make([]string, 0, len(calls))
+	for server := range calls {
+		servers = append(servers, server)
+	}
+	sort.Slice(servers, func(i, j int) bool {
+		if calls[servers[i]] != calls[servers[j]] {
+			return calls[servers[i]] > calls[servers[j]]
+		}
+		return servers[i] < servers[j]
+	})
+	fmt.Fprintln(w, "server\tcalls\tsessions")
+	for _, server := range servers {
+		fmt.Fprintf(w, "%s\t%d\t%d\n", server, calls[server], len(sessionsBy[server]))
+	}
+	fmt.Fprintf(w, "# tool_call 세션 분모: %d\n", denom)
+	fmt.Fprintf(w, "# 비-MCP 도구 호출: %d\n", nonMCP)
 	return nil
 }
 
@@ -1315,24 +1398,51 @@ func probeFTS5(ctx context.Context, reader *sql.DB) error {
 }
 
 // hostSnippet: doctor 마지막에 출력하는 호스트 등록 안내(설계 §9) — Claude Code(.mcp.json +
-// permissions ask 규칙)와 Codex(config.toml 기본 6-도구 프로필 + approval prompt 권장). exec는
-// 기본 OFF·프로필 opt-in(--enable exec, D58)이라 활성 예시와 ask/enabled_tools 확장을 병기한다.
+// ingest/net/global ask 규칙)와 Codex(config.toml 기본 6-도구 프로필). exec는 기본 OFF·프로필
+// opt-in(--enable exec, D58)이라 활성 예시와 enabled_tools 확장을 병기하되, 승인 강도는 호스트
+// 권한 모드가 정하게 둔다 — exec를 ask에 넣지 않는다(D64).
 const hostSnippet = `--- host adapter snippets (설계 §9) ---
 
-## Claude Code (.mcp.json)
+## Claude Code (.mcp.json — 단일 서버가 표준이다, D63 ②)
 {
   "mcpServers": {
-    "ctr": { "command": "context-router", "args": [] },
-    "ctr-global": { "command": "context-router", "args": ["--profile", "global-search", "--projects", "<path-or-id,...>"] },
-    "ctr-exec": { "command": "context-router", "args": ["--enable", "exec"] }
+    "ctr-exec": { "command": "context-router", "args": ["--enable", "exec"], "alwaysLoad": true }
   }
 }
-permissions (.claude/settings.json 예시 — ingest/net/global/exec는 기본 ask):
+# 이 블록은 "context-router hook install"이 자동으로 병합한다(exec 프로필은 --enable-exec opt-in).
+# alwaysLoad는 Claude Code v2.1.121 이상에서만 동작한다 — 그 이전 호스트는 이 필드를 조용히 무시한다.
+# 과거의 "ctr" 등록은 이 항목의 도구 집합에 완전히 포함된다 — 함께 두면 6개 도구가 중복
+# 노출되므로 "context-router hook install"이 자동으로 제거한다.
+# 모든 프로젝트에서 쓰려면 프로젝트 .mcp.json이 아니라 사용자 스코프로 등록한다 — 사용자 스코프
+# 서버는 ~/.claude.json에 저장돼 프로젝트를 가로질러 쓰이고, enabledMcpjsonServers 승인이 필요 없다
+# (그 키는 저장소가 제공하는 프로젝트 .mcp.json 서버를 승인하는 장치다):
+#   claude mcp add --scope user ctr-exec -- context-router --enable exec
+# -- 는 claude 자신의 플래그와 서버 명령을 가른다(없으면 --enable을 claude가 자기 옵션으로 읽는다).
+# 이 플래그 형태로 alwaysLoad를 설정하는 수단은 문서에 없다 — 임의 필드가 필요하면 서버 설정 스키마를
+# 그대로 받는 claude mcp add-json 형태를 쓴다(--scope user 동일 적용).
+# global-search는 별개 프로필이라 필요할 때만 따로 등록한다(설치기가 만들지 않는다):
+#   "ctr-global": { "command": "context-router", "args": ["--profile", "global-search", "--projects", "<path-or-id,...>"] }
+permissions (.claude/settings.json 예시 — ingest/net/global 도구에 ask를 건다):
 {
   "permissions": {
-    "ask": ["mcp__ctr__ctr_index", "mcp__ctr__ctr_fetch_and_index", "mcp__ctr-global__*", "mcp__ctr-exec__ctr_execute", "mcp__ctr-exec__ctr_execute_file"]
+    "ask": ["mcp__ctr-exec__ctr_index", "mcp__ctr-exec__ctr_fetch_and_index", "mcp__ctr-global__*"]
   }
 }
+# 이 두 도구 규칙은 그 프로필을 켠 등록에서만 대상이 있다 — ctr_index는 --enable ingest,
+# ctr_fetch_and_index는 --enable net에서만 등록되므로, 위의 exec만 켠 등록에는 두 도구 자체가 없고
+# 규칙은 아무것도 매치하지 않는다(게이트한 것처럼 보이지만 게이트할 도구가 없다). 두 프로필까지
+# 쓰려면 위 등록의 args를 ["--enable", "exec,ingest,net"]으로 바꾼다 — 플래그 없는 재설치는 그 args를
+# 보존하고 "hook install --enable-exec"은 exec만으로 되돌린다. mcp__ctr-global__*도 위의 ctr-global
+# 등록을 따로 만든 경우에만 대상이 있다.
+# exec 2종(ctr_execute·ctr_execute_file)은 ask에 넣지 않는다 — 승인 강도는 호스트 권한 모드가
+# 정한다. default 모드에서는 MCP 기본 프롬프트가 그대로 작동하고, 무프롬프트 모드이거나 그
+# 도구를 덮는 allow 규칙(프롬프트의 '다시 묻지 않기'·--allowedTools가 남기는 항목)이 있으면
+# 프롬프트 없이 실행된다 — 기존 ask를 지우면 그동안 가려져 있던 allow가 유효해진다(실측: ask
+# 2종이 allow 1종을 무력화). ask 규칙을 넣으면 두 경우 모두 프롬프트가 강제된다: 무프롬프트
+# 모드에서도 ask는 프롬프트를 띄우고, 평가 순서(deny→ask→allow) 때문에 더 구체적인 allow도
+# ask를 이기지 못한다.
+# 이중 동의는 유지된다: ① --enable exec 서버 프로필(기동 시) ② 호스트 권한 모델(모드와 규칙에
+# 따름 — 무프롬프트 모드이거나 덮는 allow 규칙이 있으면 이 층은 프롬프트를 만들지 않는다).
 
 ## Codex (~/.codex/config.toml)
 [mcp_servers.ctr]
@@ -1340,7 +1450,18 @@ command = "context-router"
 args = []
 enabled_tools = ["ctr_search", "ctr_fetch", "ctr_transform", "ctr_record_event", "ctr_session_summary", "ctr_export_events"]
 # ingest/net 활성화 시 권장: default_tools_approval_mode = "prompt"
-# exec 프로필(--enable exec) 활성 시 enabled_tools에 "ctr_execute","ctr_execute_file" 추가 — approval prompt 권장.
+# exec 프로필(--enable exec) 활성 시 enabled_tools에 "ctr_execute","ctr_execute_file" 추가 — 승인 강도는 Codex 승인 모드가 정한다.
+
+## exec 결과 읽기(호스트 공통)
+# shell 러너: exit_code는 스니펫의 종료 상태다(중간 비종결 오류는 반영되지 않는다).
+# "마지막 명령의 상태"가 문자 그대로인 것은 sh뿐이다 — PowerShell -File은 exit이나 종결
+# 오류가 없으면 0이라, 마지막 줄이 비 0으로 죽은 네이티브 명령이면 exit_code 0에 stderr까지
+# 비어 실패가 두 채널 어디에도 남지 않는다($ErrorActionPreference = 'Stop'도 이 부류는
+# 멈추지 못한다 — pwsh 7.6.0·powershell 5.1 실측).
+# 판정은 exit_code와 stderr를 함께 보고, 엄격 동작은 스니펫에 직접 적는다:
+#   PowerShell: 첫 줄 $ErrorActionPreference = 'Stop'(cmdlet 오류) + 네이티브 명령은
+#               $LASTEXITCODE 확인, 마지막 줄 exit $LASTEXITCODE로 전파.
+#   sh: 첫 줄 set -e — 네이티브 비 0 종료에서도 멈춘다.
 `
 
 // runDoctor: 5항목 진단(저장 루트/프로젝트 식별/content.db/FTS5/ledger.db) + 호스트 등록
@@ -1773,6 +1894,23 @@ func runDoctor(ctx context.Context, w io.Writer, storeRoot, projectRoot, version
 		}
 	}
 	fmt.Fprintf(w, "[18] exec runners: %s\n", strings.Join(parts, " "))
+
+	// [19] 승인 규칙 정합 — ask와 도구가 겹치는 allow는 "설정을 바꿨는데 계속 물어본다"로만
+	// 드러나 사용자가 알아채기 어렵다(설계 v0.12 D64). 판정이 도구 집합 교집합이라 일부만 겹치는
+	// allow도 보고에 든다 — 그쪽은 겹치는 도구에서만 무력하고 나머지 도구에서는 유효하므로 문면은
+	// "덮는다"가 아니라 "겹친다"다(전부 죽었다고 읽히면 사용자가 규칙을 통째로 지운다).
+	// 결과는 세 갈래다: 겹침 발견·충돌 없음·판정 불가.
+	// 판정이 실패했을 때 "충돌 없음"을 찍으면 확인하지 않은 것을 확인했다고
+	// 말하는 셈이라 침묵보다 나쁘다 — 세 번째 라인을 따로 둔다(스코프 경로 해석·읽기·파싱 중
+	// 어느 것이 실패해도 이 갈래다). 오류·경로는 문면에 담지 않는다(§12).
+	if shadowed, err := askShadowedAllows(projectRoot, os.ReadFile); err != nil {
+		fmt.Fprintln(w, "[19] permissions: ask/allow 판정 불가 — 설정 스코프를 확인하지 못했다(경로 해석·읽기·파싱 중 하나가 실패, 충돌 없음이 아니다)")
+	} else if len(shadowed) > 0 {
+		fmt.Fprintf(w, "[19] permissions: ask와 겹치는 allow 항목 %d건 — %s (평가 순서 deny→ask→allow — 겹치는 도구에서는 allow가 효력이 없고 겹치지 않는 도구에서는 그대로 유효하다. ask를 지우면 호스트 권한 모드가 승인 강도를 정한다)\n",
+			len(shadowed), strings.Join(shadowed, ", "))
+	} else {
+		fmt.Fprintln(w, "[19] permissions: ask/allow 충돌 없음")
+	}
 
 	fmt.Fprintln(w)
 	fmt.Fprint(w, hostSnippet)

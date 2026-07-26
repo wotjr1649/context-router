@@ -2245,3 +2245,51 @@ func TestE2E_HookConcurrentSummaryExport(t *testing.T) {
 		t.Fatalf("process exit: %v (stderr=%s)", err, stderrBuf.String())
 	}
 }
+
+// TestShadowRetentionDefault: 기본 보존 기간이 3일이고, 환경변수로만 조정된다.
+// 임의 상향으로 정책이 조용히 무력화되지 않도록 파싱 실패·비양수는 기본값을 쓴다
+// (storeWarnBytes와 같은 규율).
+func TestShadowRetentionDefault(t *testing.T) {
+	cases := []struct {
+		env  string
+		want time.Duration
+	}{
+		{"", 72 * time.Hour},
+		{"24h", 24 * time.Hour},
+		{"0", 72 * time.Hour},
+		{"-5h", 72 * time.Hour},
+		{"garbage", 72 * time.Hour},
+	}
+	for _, c := range cases {
+		got := shadowRetention(func(string) string { return c.env })
+		if got != c.want {
+			t.Errorf("shadowRetention(%q)=%v want %v", c.env, got, c.want)
+		}
+	}
+}
+
+// TestShadowCutoffBoundary: shadowCutoff의 0 경계를 고정한다. 보존 기간이 epoch 경과분보다 크면
+// 경계가 0 이하로 내려가고, store는 cutoffUnix<=0을 "나이 필터 없음"으로 읽는다
+// (store.TestPurgeHookOnlyOlderThanZeroMeansAll이 그 계약을 고정한다) — 보존을 늘리려는 설정이
+// 나이 무관 전량 삭제로 반전되는 데이터 손실형 결함이다(T12-F1). 기동 경로의 `cutoff <= 0` 건너뛰기가
+// 그 반전을 막는데, 판정을 `< 0`으로 좁히면 정확히 0인 경계(아래 세 번째 케이스)가 그대로 store에
+// 전달된다. 경계가 어디인지 여기서 고정해 조용한 이동을 막는다.
+func TestShadowCutoffBoundary(t *testing.T) {
+	now := time.Unix(1_800_000_000, 0) // 고정 기준 — 실행 시각에 흔들리지 않는다
+	for _, c := range []struct {
+		name string
+		d    time.Duration
+		want int64
+	}{
+		// 기대값은 리터럴로 적는다 — now.Add(-d).Unix()로 적으면 구현과 같은 식이라 부호·단위
+		// 오류를 잡지 못한다. 1_800_000_000 - 72h(259_200s).
+		{"기본 보존(72h)", defaultShadowRetention, 1_799_740_800},
+		{"epoch 직전", time.Duration(now.Unix()-1) * time.Second, 1},
+		{"epoch 정각 — 여기서부터 반전", time.Duration(now.Unix()) * time.Second, 0},
+		{"epoch 초과", time.Duration(now.Unix()+1) * time.Second, -1},
+	} {
+		if got := shadowCutoff(now, c.d); got != c.want {
+			t.Errorf("%s: shadowCutoff(_, %v)=%d want %d", c.name, c.d, got, c.want)
+		}
+	}
+}

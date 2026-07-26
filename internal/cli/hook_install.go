@@ -476,19 +476,27 @@ func shadowOffGetenv(k string) string {
 	return os.Getenv(k)
 }
 
-// runHookInstall — install 서브커맨드(설계 §7). --user/--no-shadow만 자체 flagset으로 파싱한다
-// (--root/--store-root는 main의 prescanRootFlags가 이미 소비·전달 — storeRootExplicit/Raw).
+// runHookInstall — install 서브커맨드(설계 §7). --user/--no-shadow/--enable-exec/--codex를 자체
+// flagset으로 파싱한다(--root/--store-root는 main의 prescanRootFlags가 이미 소비·전달 —
+// storeRootExplicit/Raw). Claude 경로는 훅 병합에 이어 .mcp.json 등록과 승인 키까지 다룬다(D64) —
+// 어느 하나가 실패해도 앞선 성공은 유지하고 사유만 보고한다(부분 성공을 감추지 않는다).
 func runHookInstall(args []string, storeRoot, storeRootRaw string, storeRootExplicit bool, projectRoot, version string, stdout io.Writer) error {
 	fs := flag.NewFlagSet("hook install", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	user := fs.Bool("user", false, "~/.claude/settings.json에 등록(기본: 프로젝트)")
 	noShadow := fs.Bool("no-shadow", false, "Shadow Recall 비활성(훅 명령에 --no-shadow 주입)")
+	enableExec := fs.Bool("enable-exec", false, ".mcp.json 항목에 exec 프로필(--enable exec)을 켠다")
 	codex := fs.Bool("codex", false, "Codex CLI hooks.json에 등록(기본: Claude settings.json)")
 	if err := fs.Parse(args); err != nil {
 		return fmt.Errorf("hook install: 플래그 파싱 실패: %w", err)
 	}
 	if rest := fs.Args(); len(rest) > 0 {
 		return fmt.Errorf("hook install: 예상치 않은 인자 %d개", len(rest))
+	}
+	// --codex는 config.toml/hooks.json 경로라 .mcp.json을 만들지 않고, 관리 블록의 도구 목록도
+	// 고정이라 exec 프로필이 반영될 자리가 없다. 조용히 무시하면 사용자는 exec가 켜졌다고 오인한다.
+	if *codex && *enableExec {
+		return errors.New("hook install: --enable-exec은 --codex와 함께 쓸 수 없습니다(.mcp.json은 Claude Code 전용)")
 	}
 	if *codex {
 		return runHookInstallCodex(*user, *noShadow, storeRootExplicit, storeRootRaw, projectRoot, version, stdout)
@@ -513,6 +521,81 @@ func runHookInstall(args []string, storeRoot, storeRootRaw string, storeRootExpl
 		return errors.New("hook install: 설정 쓰기 실패")
 	}
 	fmt.Fprintf(stdout, "hook install: %d개 이벤트 등록 완료\n", len(hookRegistrations))
+
+	// .mcp.json 병합 — 훅과 같은 멱등 계약(설계 v0.12 D64). 실패해도 훅 설치 결과는 유지하고
+	// 사유만 보고한다(설치가 부분 성공임을 감춘 채 성공으로 보이지 않게 한다).
+	mcpRegistered := false
+	mcpPath := mcpConfigPath(projectRoot)
+	existing, readErr := os.ReadFile(mcpPath)
+	if readErr != nil && !errors.Is(readErr, os.ErrNotExist) {
+		fmt.Fprintln(stdout, "mcp: 기존 설정을 읽지 못해 .mcp.json 병합을 건너뜁니다")
+	} else {
+		entry := mcpServerEntry{
+			Command: hookBinaryName, Args: mcpArgsForProfile(*enableExec),
+			AlwaysLoad: true, Managed: hookMarker(version),
+		}
+		// setProfile=*enableExec: 플래그가 없으면 기존 항목의 args를 보존한다(재설치가 이미 켠
+		// exec를 끄지 않는다). 마커는 setProfile과 무관하게 항상 갱신된다(self-heal).
+		// changed는 install 경로에서 항상 true라 쓰지 않는다(마커 self-heal이 무변경을 배제한다).
+		mcpMerged, _, mergeErr := mergeMCPServers(existing, ctrMCPServerName, entry, true, *enableExec)
+		if mergeErr != nil {
+			// 실패 사유는 둘뿐이다 — 우리 이름 자리에 우리 소유가 아닌 항목이 있거나(소유 관문),
+			// 파일이 해석되지 않거나. 어느 쪽이든 사용자가 손댈 대상을 알려야 조치할 수 있다.
+			fmt.Fprintf(stdout, "mcp: .mcp.json 병합을 멈췄습니다(훅 설치는 완료) — %q 이름에 우리가 소유하지 않은 항목이 있거나 파일을 해석할 수 없습니다. 그 항목을 정리하거나 파일을 고친 뒤 다시 실행하세요\n", ctrMCPServerName)
+		} else if writeErr := atomicWriteFile(mcpPath, mcpMerged); writeErr != nil {
+			fmt.Fprintln(stdout, "mcp: .mcp.json 기록 실패 — 훅 설치는 완료되었습니다")
+		} else {
+			mcpRegistered = true
+			fmt.Fprintf(stdout, "mcp: .mcp.json 병합 완료(서버 %s)\n", ctrMCPServerName)
+		}
+	}
+
+	// 승인 키 — 아무도 정의하지 않았거나 최상위 정의가 이번 설치 스코프 자신이면 그 파일에 쓰고,
+	// 다른 스코프가 이기고 있으면 보고만 한다.
+	// 이 키는 스코프 간 병합되지 않고 최상위 정의가 통째로 override 하므로, 남의 스코프가 이기는 상태에서
+	// 우리 스코프에 쓰면 조용히 무시될 값을 남기는 셈이다(설계 D64 스코프 규칙).
+	// 등록이 확정되지 않은 상태에서는 승인 키도 건드리지 않는다 — 이 키는 이름으로 .mcp.json 항목을
+	// 미리 승인하므로, 우리 이름 자리에 남의 항목이 남아 있는 채로 이름을 넣으면 그 남의 항목을
+	// 대신 자동 승인해 주는 셈이 된다(소유 관문의 연장).
+	if !mcpRegistered {
+		fmt.Fprintln(stdout, "mcp: .mcp.json 등록이 확정되지 않아 승인 키는 건드리지 않았습니다")
+	} else if *user {
+		// 이 키는 프로젝트 .mcp.json 등록을 "이름으로" 승인하는 장치다. 사용자 스코프에 쓰면 이 머신
+		// 모든 프로젝트의 동명 항목까지 소유 검증 없이 승인하게 되므로 쓰지 않는다(리뷰 T6-1).
+		// 전 프로젝트 사용의 정식 경로는 사용자 스코프 서버 등록이고, 그쪽은 이 키가 필요 없다.
+		fmt.Fprintln(stdout, "mcp: --user 설치는 승인 키를 쓰지 않았습니다 — enabledMcpjsonServers는 프로젝트 .mcp.json 등록에만 적용됩니다. 모든 프로젝트에서 쓰려면 doctor 안내의 사용자 스코프 등록을 쓰세요(승인 키가 필요 없습니다)")
+	} else if winner, defined, scopeErr := enabledServersScope(projectRoot, os.ReadFile); scopeErr != nil {
+		fmt.Fprintln(stdout, "mcp: 승인 키 스코프를 판정하지 못해 건너뜁니다")
+	} else if len(defined) > 0 && winner != path {
+		// 실제로 적용되는 스코프를 라벨로 알린다 — 파일명은 project와 user가 같아 구분되지 않고,
+		// 절대경로는 싣지 않는다(§12 canary 규율). 여기 오는 것은 이기는 정의가 이번 설치가 쓰는
+		// 파일이 아닌 경우뿐이다: 더 좁은 스코프(local)는 사용자가 그 스코프로 관리하기로 정한 것이고,
+		// 더 넓은 스코프(user)만 정의한 경우에는 project에 쓰는 순간 그 목록을 통째로 덮는다 — 어느
+		// 쪽도 우리가 대신 고칠 자리가 아니라 보고가 맞다. "추가하세요"가 아니라 "있는지 확인하세요"인
+		// 이유는 그 파일의 목록에 사용자가 이미 이름을 넣어 뒀을 수 있어서다(그러면 거짓 경보가 된다).
+		fmt.Fprintf(stdout, "mcp: enabledMcpjsonServers는 이미 %d개 스코프에 정의돼 있어 이번 설치가 쓰지 않았습니다(적용되는 것은 최상위 %s 스코프 1개) — 자동 승인이 안 되면 그 파일의 목록에 %q가 있는지 확인하세요\n",
+			len(defined), enabledServersScopeLabel(projectRoot, winner), ctrMCPServerName)
+	} else {
+		// 아무도 정의하지 않았거나(흔한 첫 설치) 이기는 정의가 곧 이 파일이다. 후자는 uninstall이
+		// 하위 스코프 보호를 위해 남긴 빈 배열([])로 만들어지는 흔한 상태다 — 그 상태를 "이미 정의됨"으로
+		// 보고로 넘기면 같은 프로젝트의 재설치가 .mcp.json 등록만 되돌려 놓고 승인 이름은 빼놓아, 등록된
+		// 서버가 자동 승인되지 않은 채 "설치 완료"만 남는다. 설계 D64 스코프 규칙의 "사용 중인 최고
+		// 우선순위 스코프에 쓴다"가 이 경우를 지시한다(무시될 값을 쓰는 것이 아니다 — 이기는 파일이다).
+		// path는 위쪽 훅 병합이 이미 쓴 파일이다 — 그 쓰기가 끝난 뒤 다시 읽어 병합해야 한다.
+		// 순서가 뒤집히면 훅 쓰기가 승인 키를 덮는다(둘 다 성공하고 결과만 조용히 사라진다).
+		// mergeEnabledServers는 이미 든 이름을 다시 넣지 않으므로, 이름이 있는 목록에는 같은 바이트가
+		// 나온다 — 이 분기가 재설치마다 도는 것이 파일을 흔들지 않는 근거다.
+		prev, prevErr := os.ReadFile(path)
+		if prevErr != nil && !errors.Is(prevErr, os.ErrNotExist) {
+			fmt.Fprintln(stdout, "mcp: 기존 settings를 읽지 못해 승인 키 기록을 건너뜁니다")
+		} else if next, mergeErr := mergeEnabledServers(prev, ctrMCPServerName, true, false); mergeErr != nil {
+			fmt.Fprintln(stdout, "mcp: 승인 키 병합 실패 — 훅 설치는 완료되었습니다")
+		} else if writeErr := atomicWriteFile(path, next); writeErr != nil {
+			fmt.Fprintln(stdout, "mcp: 승인 키 기록 실패 — 훅 설치는 완료되었습니다")
+		} else {
+			fmt.Fprintf(stdout, "mcp: enabledMcpjsonServers에 %q를 기록했습니다\n", ctrMCPServerName)
+		}
+	}
 	return nil
 }
 
@@ -600,19 +683,71 @@ func runHookUninstall(args []string, projectRoot string, stdout io.Writer) error
 	if err != nil {
 		return err
 	}
+	// settings.json 미존재는 no-op으로 알리되 .mcp.json 정리는 그와 무관하게 시도한다 — 부분 설치
+	// (settings만 수동 삭제)에서 우리 등록이 영구 잔존하는 것을 막는다. runHookUninstallCodex가
+	// config.toml에 대해 이미 채택한 규칙(Codex P2)과 같다.
+	// 훅 설정 정리 실패도 그 자리에서 반환하지 않는다 — 미존재와 같은 이유다(리뷰 T6-2). 실패를
+	// 보고하고 아래 정리를 마친 뒤 마지막에 hookErr을 반환해 종료코드가 실패를 반영하게 한다.
+	var hookErr error
 	if _, statErr := os.Stat(path); errors.Is(statErr, os.ErrNotExist) {
 		fmt.Fprintln(stdout, "hook uninstall: 설정 파일 없음 — 제거할 항목 없음")
-		return nil
+	} else if merged, mergeErr := mergeSettingsFile(path, "", "", false); mergeErr != nil { // command/marker는 제거 경로에서 미사용
+		fmt.Fprintln(stdout, "hook uninstall: 훅 설정 정리 실패 — .mcp.json 정리는 계속합니다")
+		hookErr = mergeErr
+	} else if writeErr := atomicWriteFile(path, merged); writeErr != nil {
+		fmt.Fprintln(stdout, "hook uninstall: 훅 설정 쓰기 실패 — .mcp.json 정리는 계속합니다")
+		hookErr = errors.New("hook uninstall: 설정 쓰기 실패")
+	} else {
+		fmt.Fprintln(stdout, "hook uninstall: 훅 항목 제거 완료")
 	}
-	merged, err := mergeSettingsFile(path, "", "", false) // command/marker는 제거 경로에서 미사용
-	if err != nil {
-		return err
+
+	// .mcp.json 항목 제거 — install의 대칭(D64). 소유 관문은 양방향이라 우리 이름 자리에 남의
+	// 항목이 있으면 install과 똑같이 손대지 않고 사유만 보고한다. 파일은 지우지 않는다.
+	// 대체된 과거 등록 이름(D63 ②)도 install과 같은 소유 기준으로 함께 지운다 — 그쪽 정리가 install
+	// 분기에만 있으면 대칭이 아니고, 우리 명령을 가리키는 옛 항목이 제거 뒤에도 영구 잔존한다.
+	mcpPath := mcpConfigPath(projectRoot)
+	if existing, readErr := os.ReadFile(mcpPath); readErr == nil {
+		if mcpMerged, changed, mergeErr := mergeMCPServers(existing, ctrMCPServerName, mcpServerEntry{}, false, true); mergeErr != nil {
+			fmt.Fprintf(stdout, "mcp: .mcp.json 항목 제거를 멈췄습니다 — %q 이름에 우리가 소유하지 않은 항목이 있거나 파일을 해석할 수 없습니다. 그 항목은 그대로 두었습니다\n", ctrMCPServerName)
+		} else if !changed {
+			// 우리 항목이 하나도 없으면 쓰지 않는다 — 재기록은 바이트 중립이 아니어서(키 정렬·유니코드
+			// 이스케이프) 남의 서버만 담긴 손으로 쓴 파일을 우리가 고쳐 놓게 된다. 문면도 하지 않은
+			// 일을 했다고 말하지 않는다(형제 승인 키 문면이 이미 "없었으면 무변"으로 유보한다).
+			// "하나도"인 이유: changed는 현재 이름과 대체된 과거 등록 이름 중 어느 것을 지워도 참이라,
+			// 이 분기는 둘 다 없었을 때만 온다.
+			fmt.Fprintf(stdout, "mcp: .mcp.json에 우리 항목(%q·대체된 과거 등록 이름)이 없어 파일을 그대로 두었습니다\n", ctrMCPServerName)
+		} else if writeErr := atomicWriteFile(mcpPath, mcpMerged); writeErr != nil {
+			fmt.Fprintln(stdout, "mcp: .mcp.json 기록 실패 — 훅 항목 제거는 완료되었습니다")
+		} else {
+			// 지운 것이 현재 이름일 수도, 대체된 과거 등록 이름일 수도 있다 — 둘 다 changed를 올리므로
+			// 없던 이름까지 지웠다고 말하지 않는다(위 "없었으면 무변"과 같은 유보다).
+			fmt.Fprintf(stdout, "mcp: .mcp.json 항목 제거 완료 — %q와 대체된 과거 등록 이름 중 있던 것만 지웠습니다\n", ctrMCPServerName)
+		}
+	} else if !errors.Is(readErr, os.ErrNotExist) {
+		fmt.Fprintln(stdout, "mcp: 기존 설정을 읽지 못해 .mcp.json 정리를 건너뜁니다")
 	}
-	if err := atomicWriteFile(path, merged); err != nil {
-		return errors.New("hook uninstall: 설정 쓰기 실패")
+
+	// 승인 키 — 우리가 쓴 스코프(이번 uninstall이 겨냥한 그 파일)에서만 우리 이름을 뺀다. 다른
+	// 스코프에는 애초에 쓰지 않았으므로 건드리지 않는다. 파일이 없으면 지울 것도 없다(만들지 않는다).
+	// 훅 쓰기가 끝난 뒤 다시 읽는다 — 순서가 뒤집히면 훅 쓰기가 이 편집을 덮는다.
+	// --user는 install이 이 키를 쓰지 않는 스코프다(위 --user 분기) — 그 파일의 목록은 사용자가 직접
+	// 넣은 것이므로 제거도 하지 않는다. "설치가 쓸 수 있었던 스코프만 되돌린다"의 대칭이다.
+	if *user {
+		fmt.Fprintln(stdout, "mcp: --user 제거는 승인 키를 건드리지 않았습니다 — --user 설치가 그 키를 쓰지 않으므로 사용자 스코프의 enabledMcpjsonServers는 직접 넣은 목록입니다")
+	} else if prev, prevErr := os.ReadFile(path); prevErr == nil {
+		// keepEmpty: 우리 이름을 빼서 배열이 비더라도 하위 스코프가 같은 키를 정의하면 키를 지우지
+		// 않는다 — 지우는 순간 그 목록이 살아나 이 프로젝트에 넣지 않은 이름이 승인된다.
+		if next, mergeErr := mergeEnabledServers(prev, ctrMCPServerName, false, lowerScopeDefinesEnabled(projectRoot, os.ReadFile)); mergeErr != nil {
+			fmt.Fprintln(stdout, "mcp: 승인 키 병합 실패 — 훅 항목 제거는 완료되었습니다")
+		} else if writeErr := atomicWriteFile(path, next); writeErr != nil {
+			fmt.Fprintln(stdout, "mcp: 승인 키 기록 실패 — 훅 항목 제거는 완료되었습니다")
+		} else {
+			fmt.Fprintf(stdout, "mcp: enabledMcpjsonServers에서 %q를 제거했습니다(없었으면 무변)\n", ctrMCPServerName)
+		}
+	} else if !errors.Is(prevErr, os.ErrNotExist) {
+		fmt.Fprintln(stdout, "mcp: 기존 settings를 읽지 못해 승인 키 정리를 건너뜁니다")
 	}
-	fmt.Fprintln(stdout, "hook uninstall: 훅 항목 제거 완료")
-	return nil
+	return hookErr
 }
 
 // runHookUninstallCodex — --codex 제거 대칭(스펙 v0.7 §3, D47+D48). hooks.json 자기 그룹(가드
