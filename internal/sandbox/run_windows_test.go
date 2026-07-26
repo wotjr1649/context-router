@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -52,9 +53,9 @@ func TestRunWindowsEchoAndExit(t *testing.T) {
 // 재구성하므로, 명시 주입이 자식의 모듈 경로를 호스트와 무관하게 고정한다. bare BaseEnv()로
 // "단순화"하지 말 것 — 표에 되돌려 넣는 것도 금지다(그건 D65가 닫은 호스트 상속이다).
 //
-// 이 주입이 아래 CI 실패의 원인 교정은 아니다: 모듈 경로 가설은 CI 런 2회로 반증됐다(주입
-// 전·후 모두 6.04s에 동일 실패). 원인 미확정 상태이므로 이 테스트에는 임시 진단 계측이
-// 붙어 있다 — treeKillScript의 빵가루와 dumpTreeKillDiag. 원인이 확정되면 계측을 제거한다.
+// 이 주입이 아래 CI 실패의 원인 교정은 아니다: 주입 전(값 없음)·후(단일 항목) 모두 6.04s에
+// 동일 실패였다. 원인 미확정 상태이므로 이 테스트에는 임시 진단 계측이 붙어 있다 —
+// treeKillScript의 빵가루와 dumpTreeKillDiag. 원인이 확정되면 계측을 제거한다.
 func TestRunWindowsTimeoutKillsTree(t *testing.T) {
 	psExe, err := exec.LookPath("powershell.exe")
 	if err != nil {
@@ -202,19 +203,22 @@ func rootOutput(r Result) string {
 // 재현되지 않는다. 실패 서명은 "TimedOut=true, 두 스트림 모두 빈 값, 손자 PID 파일 부재"다.
 //
 // 반증된 가설 — 되살리지 말 것:
-//  1. PSModulePath 제거로 Set-Content 미해석: 5.1 기본 세션 상태에서 해석되고, 경로를 다시
-//     주입한 런도 동일 실패였다.
-//  2. 3s 예산 부족: 20s 프로브도 같은 지점에서 멈춘다.
-//  3. "probe-noiso가 env 격리 없이 돈다"는 근거로 닫힌 표를 배제한 결론: 그 판본은 cmd.Env를
-//     s.Env로 고정하고 있었으므로 env를 갈라낸 적이 없다. 닫힌 표는 여전히 후보다.
+//  1. 3s 예산 부족: 20s 프로브도 같은 지점에서 멈춘다.
+//  2. "probe-noiso가 env 격리 없이 돈다"는 근거로 닫힌 표를 배제한 결론: 그 판본은 cmd.Env를
+//     s.Env로 고정하고 있었으므로 env를 갈라낸 적이 없다.
+//  3. PATH: 2항목(62B)·합성 81항목(2380B)·상속 81항목(3018B) 세 변종이 모두 동일하게 멈췄다.
 //
-// 확정된 사실: 인터프리터는 정상 기동하고(170~194ms, FullLanguage, ConsoleHost) 빵가루 01을
-// [IO.File]::AppendAllText로 남기는 데 성공한 뒤, 예외·오류 레코드·출력 없이 그 다음에서 멈춘다.
-// 남기지 못하는 PID 파일은 Set-Content로 쓴다 — .NET 직접 쓰기는 되고 cmdlet 경로는 안 되는
-// 이 비대칭이 지금 가진 가장 날카로운 단서이므로, treeKillScript의 판별 3단계가 그 비대칭을
-// 정면으로 가른다(02 파이프라인 / 03 .NET 쓰기 / 04 프로바이더 쓰기).
-// 원인이 확정되면 판별 3단계·빵가루 문장과 dumpTreeKillDiag/probe*/synthPath/logBreadcrumbs를
-// 함께 제거하고 스크립트를 원래 5문장으로 되돌린다.
+// 확정된 사실(직전 CI 런의 빵가루):
+//   - 격리 실행 전부(본 테스트·probe-long·PATH 3변종)가 01(진입)·02(파이프라인)·03([IO.File]
+//     직접 쓰기)까지 남기고, .provider.cmdlet 동반 파일이 없다 = Set-Content가 돌아오지 않는다.
+//     인터프리터는 정상 기동한다(170~194ms, FullLanguage, ConsoleHost). 예외도 오류 레코드도 없다.
+//   - 같은 런의 probe-noiso(부모 환경 전체 상속)만 .provider.cmdlet까지 쓰고 4.38s에 완주했다.
+//
+// 남은 단 하나의 차이는 "닫힌 표가 어느 변수를 넘기는가"다. 정지는 부하·PATH·예산이 아니라
+// 그 집합이 결정한다. probeEnvVariants가 그 집합을 세 갈래로 가른다(psmod-inherited /
+// psmod-absent / plus-omitted). 원인이 확정되면 판별 3단계·빵가루 문장과 dumpTreeKillDiag/
+// probe*/synthPath/logBreadcrumbs/logDroppedEnv/bisect*를 함께 제거하고 스크립트를 원래 5문장으로
+// 되돌린다.
 
 // treeKillScript: 손자를 스폰·기록하고 종료를 기다리는 루트 스크립트. 검증 경로
 // (New-Object → Process::Start → Set-Content → WaitForExit)는 v0.11과 동일하게 두고 그 앞에
@@ -292,6 +296,7 @@ func dumpTreeKillDiag(t *testing.T, s Spec, dir, psExe, bcPath string, r Result,
 	for _, kv := range s.Env {
 		t.Logf("[diag]   %s", kv)
 	}
+	logDroppedEnv(t)
 	t.Logf("[diag] Result: TimedOut=%v ExitCode=%d Duration=%v stdout(%dB,trunc=%v)=%q stderr(%dB,trunc=%v)=%q",
 		r.TimedOut, r.ExitCode, r.Duration,
 		len(r.Stdout), r.StdoutTrunc, r.Stdout, len(r.Stderr), r.StderrTrunc, r.Stderr)
@@ -305,6 +310,29 @@ func dumpTreeKillDiag(t *testing.T, s Spec, dir, psExe, bcPath string, r Result,
 	probeNoIsolation(t, s, dir)
 	probeLongBudget(t, s, dir)
 	probePathVariants(t, s, psExe, dir)
+	probeEnvVariants(t, s, dir)
+}
+
+// logDroppedEnv: 부모에는 있는데 닫힌 표가 떨어뜨리는 변수의 이름과 값 길이. 값은 남기지
+// 않는다 — 러너 환경에는 토큰류가 섞여 있어 값을 CI 로그에 찍는 것 자체가 유출이다. 아래
+// plus-omitted 묶음이 러너에서 실제로 무엇을 놓치는지는 이 목록과 나란히 놓아야 읽힌다.
+func logDroppedEnv(t *testing.T) {
+	t.Helper()
+	kept := make(map[string]bool, len(baseKeys()))
+	for _, k := range baseKeys() {
+		kept[strings.ToLower(k)] = true
+	}
+	var names []string
+	for _, kv := range os.Environ() {
+		k, v, _ := strings.Cut(kv, "=")
+		// Windows는 =C:=... 형태의 빈 이름 항목을 실을 수 있다 — 표 밖이지만 신호가 아니다.
+		if k == "" || kept[strings.ToLower(k)] {
+			continue
+		}
+		names = append(names, fmt.Sprintf("%s(%dB)", k, len(v)))
+	}
+	slices.Sort(names)
+	t.Logf("[diag] 닫힌 표가 떨어뜨리는 부모 변수 %d개(이름·길이만): %s", len(names), strings.Join(names, " "))
 }
 
 // dumpScratch: 스크래치의 모든 항목과 내용. 없는 빵가루는 있는 빵가루만큼의 정보다.
@@ -408,10 +436,7 @@ func probePathVariants(t *testing.T, s Spec, psExe, dir string) {
 		bc := filepath.Join(dir, "probe-path-"+v.name+".bc")
 		p := s
 		p.Argv = probeArgv(s.Argv, treeKillScript(bc, filepath.Join(dir, "probe-path-"+v.name+".pid"), 2))
-		// 닫힌 표를 복제한 뒤 PATH만 덧붙인다. exec.Cmd는 중복 키에서 마지막 값을 쓰므로
-		// (os/exec Cmd.Env 계약) 이 한 줄이 표의 PATH를 대체한다. s.Env를 직접 append하면
-		// 백업 배열을 공유해 변종끼리 서로를 덮으므로 반드시 복제한다.
-		p.Env = append(append([]string(nil), s.Env...), "PATH="+v.path)
+		p.Env = envWith(s.Env, "PATH="+v.path)
 		p.Timeout = pathProbeBudget
 		start := time.Now()
 		r, err := Run(context.Background(), p)
@@ -451,6 +476,127 @@ func synthPath(t *testing.T, inherited string) string {
 	// 하위 디렉터리가 상속 항목 수보다 적으면 있는 만큼으로 간다 — 로그의 항목 수가 그 사실을
 	// 그대로 드러내므로 조용히 왜곡되지 않는다.
 	return strings.Join(out, ";")
+}
+
+// envWith: 닫힌 표 사본에 재지정을 덧붙인다. exec.Cmd는 중복 키에서 마지막 값을 쓰므로
+// (os/exec Cmd.Env 계약, Windows는 키 대소문자 무시) 덧붙임이 표의 값을 대체한다. base를 직접
+// append하면 백업 배열을 공유해 변종끼리 서로를 덮으므로 반드시 복제한다.
+func envWith(base []string, kv ...string) []string {
+	return append(append([]string(nil), base...), kv...)
+}
+
+// omittedWindowsKeys: 닫힌 표가 떨어뜨리는 것 중 Windows 구성요소가 통상 요구하는 표준 머신
+// 변수. 러너·툴체인·사용자 앱 변수는 넣지 않는다 — 거기까지 넣으면 probe-noiso(부모 환경 전체
+// 상속)와 같아져 아무것도 가려내지 못하고, CI 토큰류 값이 자식과 로그로 흘러간다. 순서는
+// 이분탐색의 첫 반쪽이 "시스템 경로·아키텍처", 둘째 반쪽이 "계정·세션 신원"으로 갈리게 둔다.
+func omittedWindowsKeys() []string {
+	return []string{
+		"windir", "OS", "DriverData", "PROCESSOR_ARCHITECTURE", "NUMBER_OF_PROCESSORS",
+		"CommonProgramFiles", "CommonProgramFiles(x86)", "CommonProgramW6432",
+		"ProgramFiles(x86)", "ProgramW6432",
+		"ALLUSERSPROFILE", "PUBLIC", "USERNAME", "USERDOMAIN", "COMPUTERNAME",
+		"SESSIONNAME", "LOGONSERVER",
+		"PROCESSOR_IDENTIFIER", "PROCESSOR_LEVEL", "PROCESSOR_REVISION",
+	}
+}
+
+// envOf: 주어진 키 중 부모에 값이 있는 것만 KEY=VALUE로. 부재 키는 조용히 빠지지 않고 로그의
+// 개수·이름으로 드러난다.
+func envOf(keys []string) []string {
+	out := make([]string, 0, len(keys))
+	for _, k := range keys {
+		if v, ok := os.LookupEnv(k); ok {
+			out = append(out, k+"="+v)
+		}
+	}
+	return out
+}
+
+func envKeys(kvs []string) []string {
+	out := make([]string, len(kvs))
+	for i, kv := range kvs {
+		out[i], _, _ = strings.Cut(kv, "=")
+	}
+	return out
+}
+
+// breadcrumbHas: 빵가루에 해당 단계 표식이 남았는지("HH:mm:ss.fff NN ..." 형식). 파일 부재·읽기
+// 실패는 미도달로 본다 — 이 실험에서 부재가 곧 판정이다.
+func breadcrumbHas(bc, step string) bool {
+	b, err := os.ReadFile(bc)
+	return err == nil && bytes.Contains(b, []byte(" "+step+" "))
+}
+
+// envProbe: 같은 격리 경로를 env만 바꿔 1회 돌리고, 프로바이더 쓰기가 돌아왔는지(빵가루 04)를
+// 반환한다. 아래 변종과 이분탐색의 판정은 이 한 값뿐이다 — 두 스트림이 빈 값으로 오는 실패라
+// 출력에 다시 의존할 수 없다.
+func envProbe(t *testing.T, s Spec, dir, name string, env []string) bool {
+	t.Helper()
+	bc := filepath.Join(dir, "probe-env-"+name+".bc")
+	p := s
+	p.Argv = probeArgv(s.Argv, treeKillScript(bc, filepath.Join(dir, "probe-env-"+name+".pid"), 2))
+	p.Env = env
+	p.Timeout = pathProbeBudget
+	start := time.Now()
+	r, err := Run(context.Background(), p)
+	ok := breadcrumbHas(bc, "04")
+	t.Logf("[diag] probe-env %s(격리 있음·%v, env %d개): provider-write-returned=%v 소요=%v err=%v TimedOut=%v ExitCode=%d stdout=%q stderr=%q",
+		name, pathProbeBudget, len(env), ok, time.Since(start), err, r.TimedOut, r.ExitCode, r.Stdout, r.Stderr)
+	logBreadcrumbs(t, bc)
+	return ok
+}
+
+// probeEnvVariants: 남은 단 하나의 후보 — "닫힌 표가 어느 변수를 넘기는가" — 를 세 갈래로
+// 가른다. 판정은 빵가루 04(Set-Content 반환) 하나이고, 셋 다 무조건 돌린다(하나가 풀려도 나머지
+// 답은 독립된 정보다). 읽는 법:
+//
+//	psmod-inherited 만 04 → PSModulePath 값이 원인. 단일 항목이 러너에서 부족하다.
+//	psmod-absent    도 04 → 명시 단일 항목이 문제이고 PowerShell의 재구성값은 충분하다.
+//	plus-omitted    만 04 → 원인은 PSModulePath 밖. 이어지는 이분탐색이 어느 변수인지 좁힌다.
+//	셋 다 정지            → 원인은 이 세 축 밖. 닫힌 표가 떨어뜨리는 나머지(logDroppedEnv 목록)
+//	                        중 표준 머신 변수가 아닌 항목이 다음 후보다.
+func probeEnvVariants(t *testing.T, s Spec, dir string) {
+	t.Helper()
+
+	// (1) 단일 항목 대신 부모의 상속 값. 이 브랜치 전의 자식이 보던 값이 바로 이것이다.
+	inherited := os.Getenv("PSModulePath")
+	t.Logf("[diag] 상속 PSModulePath: %d항목 %dB", len(strings.Split(inherited, ";")), len(inherited))
+	envProbe(t, s, dir, "psmod-inherited", envWith(s.Env, "PSModulePath="+inherited))
+
+	// (2) PSModulePath를 아예 넘기지 않는다 — PowerShell이 스스로 재구성한다. 표에서 뺀 직후
+	// (주입 전) 판본이 사실상 이 모양이었고 동일 정지였으므로, 같은 런 안에서 빵가루로 다시
+	// 확인하는 대조다. bare BaseEnv()는 여기서만 의도다 — 본 테스트를 이렇게 바꾸지 말 것.
+	envProbe(t, s, dir, "psmod-absent", BaseEnv())
+
+	// (3) 표가 떨어뜨린 표준 머신 변수 묶음을 한 번에 얹는다.
+	omitted := envOf(omittedWindowsKeys())
+	t.Logf("[diag] plus-omitted 묶음 %d/%d개: %v", len(omitted), len(omittedWindowsKeys()), envKeys(omitted))
+	if envProbe(t, s, dir, "plus-omitted", envWith(s.Env, omitted...)) {
+		bisectEnvGroup(t, s, dir, omitted)
+	}
+}
+
+// bisectEnvGroup: 묶음이 정지를 풀었을 때 최소 원인을 이분탐색으로 좁힌다(단일 원인 가정).
+// 반쪽 둘이 모두 멈추면 그 가정이 깨진 것이므로 단독 결론을 내지 않고 그 사실을 남기고 멈춘다 —
+// 틀린 단일 결론이 다음 CI 왕복을 낭비하는 것보다 낫다. 라운드당 최대 2회(≈7.5s)·최대 5라운드.
+func bisectEnvGroup(t *testing.T, s Spec, dir string, kvs []string) {
+	t.Helper()
+	for round := 1; len(kvs) > 1; round++ {
+		lo, hi := kvs[:len(kvs)/2], kvs[len(kvs)/2:]
+		if envProbe(t, s, dir, fmt.Sprintf("bisect%d-lo", round), envWith(s.Env, lo...)) {
+			kvs = lo
+			continue
+		}
+		if envProbe(t, s, dir, fmt.Sprintf("bisect%d-hi", round), envWith(s.Env, hi...)) {
+			kvs = hi
+			continue
+		}
+		t.Logf("[diag] 이분탐색 중단(라운드 %d): 반쪽 둘 다 정지 — 단일 원인이 아니다. 최소 집합은 %v의 조합",
+			round, envKeys(kvs))
+		return
+	}
+	// 슬라이스째로 찍는다 — 비었을 때도 panic 없이 그 사실이 그대로 남는다.
+	t.Logf("[diag] 이분탐색 결과: 단독으로 정지를 푸는 변수 = %v", kvs)
 }
 
 // logBreadcrumbs: 빵가루 파일과 판별 3단계가 만드는 동반 파일 둘을 조건 없이 남긴다. 없는
