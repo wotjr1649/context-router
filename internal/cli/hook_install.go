@@ -900,7 +900,9 @@ func countRegisteredHooks(path string) (int, error) {
 // "<unix초>\t<사유>"(구) 또는 5필드 "<unix초>\t<사유>\t<sid8>\t<hook_event>\t<tool>"(신, D43) —
 // ts가 1+ 숫자이고 사유(필드[1])가 비지 않는 그 두 필드 수의 줄만 사유로 센다. 그 외 필드 수·비숫자
 // ts·사유 없음은 "unparsed"(느슨 수용 금지, 설계 §5) — 진단은 절대 중단하지 않고, total은 빈 줄
-// 포함 모든 줄을 센다(줄 수 계약). 파일 부재·읽기 실패는 (0, nil) — countDropsLog와 동일 fail-soft.
+// 포함 모든 줄을 센다(줄 수 계약). 셋째 반환값 lastSeen은 사유별 ts 최댓값(D71) — isUnixTS를
+// 통과해도 int64 변환이 실패하면(자릿수 초과) 그 줄은 reasons에만 집계되고 lastSeen 키는 만들지
+// 않는다. 파일 부재·읽기 실패는 (0, nil, nil) — countDropsLog와 동일 fail-soft.
 func dropsByReason(path string) (int, map[string]int, map[string]int64) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -944,7 +946,9 @@ func isUnixTS(s string) bool {
 	return true
 }
 
-// formatDropCount — "N(사유=n,...)" 렌더(사유 알파벳순, 결정적). N==0이면 "0".
+// formatDropCount — "N(사유=n,...)" 렌더(사유 알파벳순, 결정적). N==0이면 "0". lastSeen[사유]가
+// 있으면 "사유=n@YYYY-MM-DD"(D71, UTC 날짜)로 마지막 발생 시각을 병기하고, 키가 없으면
+// (unparsed·ts 변환 실패) 기존처럼 건수만 낸다.
 func formatDropCount(total int, reasons map[string]int, lastSeen map[string]int64) string {
 	if total == 0 {
 		return "0"

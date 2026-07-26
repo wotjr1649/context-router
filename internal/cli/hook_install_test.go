@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/wotjr1649/context-router/internal/ident"
 	"github.com/wotjr1649/context-router/internal/store"
@@ -1094,6 +1095,15 @@ func TestRunHookInstallCodexCoupling(t *testing.T) {
 // 최댓값을 쓰고(로그가 시간순임을 가정하지 않는다), 정수 변환에 실패한 ts는 집계만 하고 병기를
 // 생략하며, unparsed에는 ts가 없으므로 병기하지 않는다.
 func TestDropsLastSeenUTC(t *testing.T) {
+	// F4(리뷰): CI 러너(GitHub Actions 등)는 이미 UTC라 time.Local이 UTC와 같으면 .UTC() 유무가
+	// 결과를 가르지 않아 이 감시선이 무력화된다. time.Local을 UTC가 아닌 고정 오프셋으로 강제
+	// 교체해 실행 머신의 실제 타임존과 무관하게 .UTC() 제거를 잡는다(t.Setenv("TZ", ...)는 이미
+	// 로드된 time.Local을 바꾸지 못해 효과가 없다). 패키지 전역 상태를 건드리므로 t.Parallel()과
+	// 병행 금지(이 패키지에 t.Parallel() 호출 없음을 grep으로 확인) — defer로 반드시 복원한다.
+	origLocal := time.Local
+	time.Local = time.FixedZone("UTC+9", 9*60*60)
+	defer func() { time.Local = origLocal }()
+
 	p := filepath.Join(t.TempDir(), "session.drops.log")
 	// a: 역순(둘째 줄이 더 과거) → 최댓값 1700000000 = 2023-11-14 UTC.
 	// b: 자릿수 초과로 int64 변환 실패 → 집계는 되고 병기는 없다(isUnixTS는 통과한다).
