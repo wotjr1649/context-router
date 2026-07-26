@@ -830,10 +830,10 @@ func TestNpmrcScratchConfigWins(t *testing.T) {
 	// 내장 기본으로 떨어지는지가 아니라 "호스트 사용자 구성 값이 아닌지"를 본다 — 머신 레벨
 	// npmrc가 registry를 정한 호스트에서도 판정이 흔들리지 않게(사용자 구성 상속만이 계약이다).
 	// 빈 출력은 통과가 아니다 — 값을 못 읽은 것과 격리된 것을 구분한다.
-	switch got := registry(jsEnv(t.TempDir())); {
-	case got == marker:
+	switch got := registry(jsEnv(t.TempDir())); got {
+	case marker:
 		t.Errorf("스크래치 npmrc가 호스트 사용자 구성에 지고 있다: %q", got)
-	case got == "":
+	case "":
 		t.Errorf("registry 값을 못 읽었다 — 격리 판정 불가")
 	}
 }
