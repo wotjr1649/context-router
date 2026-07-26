@@ -253,9 +253,9 @@ func shellRunner() runner {
 // 정상 반환한다. 상속 PSModulePath를 항목 단위로 이분탐색한 결과 정지를 푸는 항목은 단 하나 —
 // 호스트 **사용자** 모듈 경로(<USERPROFILE>\Documents\PowerShell\Modules)였다(그 항목이 있으면
 // exit 0·1.32s, 없으면 값이 더 넓어도 정지). 그 경로를 주입하는 교정은 D65가 금지하므로 "첫 항목에
-// 경로가 있어야 한다"는 요건만 스크래치의 빈 디렉터리로 만족시킨다. 이 가설의 판별은
-// internal/sandbox/run_windows_test.go의 probe-env psmod-shipped·psmod-scratch-* 세 변종이 같은
-// CI 런에서 낸다(읽는 법은 probeEnvVariants 주석).
+// 경로가 있어야 한다"는 요건만 스크래치의 빈 디렉터리로 만족시킨다. 이 교정으로 3-OS CI가 초록이
+// 됐고, 재발 판별 계측은 internal/sandbox/run_windows_test.go의 TestRunWindowsTimeoutKillsTree가
+// 실패 경로에서 낸다(읽는 법은 그 파일 probeEnvVariants 주석).
 //
 // ProgramFiles가 비면 그 항목을 빼고 준다 — 빈 값으로 조립한 상대 경로 항목은 자식의 cwd
 // (스크래치) 기준으로 해석되므로 넣지 않는다.

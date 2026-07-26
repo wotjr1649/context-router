@@ -125,8 +125,7 @@ func psModulePath(psExe, scratchMods string) string {
 
 // scratchModuleDir: 러너가 스크래치 하위에 만드는 빈 모듈 디렉터리의 대역(exec.shellRunner의
 // extra와 같은 배치·같은 이름). 실재하는 빈 디렉터리인 것이 주입 값의 전제이므로 생성까지 여기서
-// 하고, 실패하면 실험 자체가 성립하지 않으므로 즉시 멈춘다(러너 쪽은 경고만 남기고 계속한다 —
-// 그쪽 실패 경로는 probe-env psmod-scratch-noexist가 모형화한다).
+// 하고, 실패하면 전제가 깨지므로 즉시 멈춘다(러너 쪽은 경고만 남기고 계속한다 — exec.go extra).
 func scratchModuleDir(t *testing.T, scratch string) string {
 	t.Helper()
 	d := filepath.Join(scratch, "psmodules")
@@ -310,8 +309,8 @@ func treeKillScript(bcPath, pidPath string, pingCount int) string {
 	}, ";")
 }
 
-// dumpTreeKillDiag: 실패한 경우에만 부르는 진단 덤프. 조건 없이 전부 남긴다 — 어느 가설이
-// 맞는지 모르는 상태에서 "추측이 맞을 때만 찍는 로그"는 아무것도 가려내지 못한다.
+// dumpTreeKillDiag: 실패한 경우에만 부르는 진단 덤프. 조건 없이 전부 남긴다 — 두 스트림이 빈
+// 값으로 오는 실패라 "추측이 맞을 때만 찍는 로그"는 아무것도 가려내지 못한다.
 func dumpTreeKillDiag(t *testing.T, s Spec, dir, psExe, bcPath string, r Result, start time.Time) {
 	t.Helper()
 	t.Logf("[diag] 러너 신원: ImageOS=%q ImageVersion=%q RUNNER_OS=%q GOARCH=%s NumCPU=%d os.TempDir=%q",
