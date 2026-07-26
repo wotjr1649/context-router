@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"testing"
@@ -46,14 +47,14 @@ func TestRunWindowsEchoAndExit(t *testing.T) {
 // 실제로 소멸했는지까지 확인한다 — WaitDelay(5s)가 루트만 회수해도 통과하던 약한 검사를
 // 막는다.
 //
-// Env는 닫힌 표에 PSModulePath를 명시로 덧붙인다(exec.go shellRunner의 재지정과 같은 모양).
-// D65에서 이 키가 표에서 빠진 뒤로, 값이 없으면 PowerShell이 유효 모듈 경로를 호스트 상태
-// (HKLM/HKCU 환경값·셸 폴더)에서 스스로 재구성한다 — 개발기에서는 시스템 모듈 경로가 되살아나
-// 통과하지만 CI(windows-latest)에서는 루트가 손자 PID를 남기지 못했다(v0.11 3.07s 초록 →
-// v0.12 6.04s 실패, 이 패키지의 유일한 변경이 그 키의 제거였다). 즉 이 테스트는 호스트의
-// PSModulePath에 암묵적으로 기대고 있었고, 명시 주입이 자식의 유효 모듈 경로를 호스트와
-// 무관하게 고정한다. bare BaseEnv()로 "단순화"하지 말 것 — 표에 되돌려 넣는 것도 금지다
-// (그건 D65가 닫은 호스트 상속이다).
+// Env는 닫힌 표에 PSModulePath를 명시로 덧붙인다(exec.go shellRunner의 재지정과 같은 모양) —
+// 값이 없으면 PowerShell이 유효 모듈 경로를 호스트 상태(HKLM/HKCU 환경값·셸 폴더)에서 스스로
+// 재구성하므로, 명시 주입이 자식의 모듈 경로를 호스트와 무관하게 고정한다. bare BaseEnv()로
+// "단순화"하지 말 것 — 표에 되돌려 넣는 것도 금지다(그건 D65가 닫은 호스트 상속이다).
+//
+// 이 주입이 아래 CI 실패의 원인 교정은 아니다: 모듈 경로 가설은 CI 런 2회로 반증됐다(주입
+// 전·후 모두 6.04s에 동일 실패). 원인 미확정 상태이므로 이 테스트에는 임시 진단 계측이
+// 붙어 있다 — treeKillScript의 빵가루와 dumpTreeKillDiag. 원인이 확정되면 계측을 제거한다.
 func TestRunWindowsTimeoutKillsTree(t *testing.T) {
 	psExe, err := exec.LookPath("powershell.exe")
 	if err != nil {
@@ -61,20 +62,30 @@ func TestRunWindowsTimeoutKillsTree(t *testing.T) {
 	}
 	dir := t.TempDir()
 	pidFile := filepath.Join(dir, "gc.pid")
-	script := "$psi=New-Object System.Diagnostics.ProcessStartInfo;" +
-		"$psi.FileName='ping';$psi.Arguments='-n 60 127.0.0.1';$psi.UseShellExecute=$false;" +
-		"$p=[System.Diagnostics.Process]::Start($psi);" +
-		"Set-Content -LiteralPath '" + pidFile + "' -Value $p.Id;" +
-		"$p.WaitForExit()"
 	s := Spec{
-		Argv:      []string{psExe, "-NoProfile", "-NonInteractive", "-Command", script},
+		Argv: []string{
+			psExe, "-NoProfile", "-NonInteractive", "-Command",
+			treeKillScript(filepath.Join(dir, "root.bc"), pidFile, 60),
+		},
 		Dir:       dir,
 		Env:       append(BaseEnv(), "PSModulePath="+filepath.Join(filepath.Dir(psExe), "Modules")),
 		Timeout:   3 * time.Second,
 		StdoutCap: 32768, StderrCap: 8192,
 	}
-	start := time.Now()
-	r, err := Run(context.Background(), s)
+
+	// 진단 계측(임시): 실패한 경우에만 빵가루·env·러너 신원·통제 실행을 남긴다 — 통과 경로의
+	// 출력과 소요는 그대로다. Cleanup은 t.Fatalf로 끝난 실행에서도 돌고, t.TempDir의 삭제
+	// Cleanup보다 나중에 등록돼 LIFO로 그보다 먼저 돈다(스크래치가 아직 살아 있다).
+	var r Result
+	var start time.Time
+	t.Cleanup(func() {
+		if t.Failed() {
+			dumpTreeKillDiag(t, s, dir, psExe, r, start)
+		}
+	})
+
+	start = time.Now()
+	r, err = Run(context.Background(), s)
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -183,6 +194,172 @@ func assertJobLimits(t *testing.T, s Spec, wantMem uint64, wantProc uint32) {
 // 원격에서만 재현되는 회귀를 추적 불가로 만든다).
 func rootOutput(r Result) string {
 	return fmt.Sprintf(" (루트 stdout=%q stderr=%q)", r.Stdout, r.Stderr)
+}
+
+// ── 임시 진단 계측 ─────────────────────────────────────────────────────────────
+// TestRunWindowsTimeoutKillsTree가 CI(windows-latest)에서만 결정적으로 실패하고 개발기에서는
+// 재현되지 않는다. 실패 서명은 "TimedOut=true, 두 스트림 모두 빈 값, 손자 PID 파일 부재"이고
+// 두 가설(모듈 경로 제거·명시 주입)이 모두 반증됐다. 아래 계측은 다음 CI 런이 스스로 원인을
+// 설명하게 만드는 것이 목적이다 — 원인이 확정되면 treeKillScript의 빵가루 문장과
+// dumpTreeKillDiag/probe* 헬퍼를 함께 제거하고 스크립트를 원래 5문장으로 되돌린다.
+// (원인이 환경 쪽으로 판명되면 남을 수 있으므로 계측 자체는 정확해야 한다.)
+
+// treeKillScript: 손자를 스폰·기록하고 종료를 기다리는 루트 스크립트. 검증 경로
+// (New-Object → Process::Start → Set-Content → WaitForExit)는 v0.11과 동일하게 두고 그 사이에
+// 빵가루만 끼워 넣는다 — 실패 서명을 바꾸지 않기 위해서다. 규칙 둘:
+//   - 빵가루는 [IO.File]::AppendAllText만 쓴다. cmdlet·모듈 해석에 의존하지 않는 순수 .NET
+//     경로이고 호출마다 파일을 닫으므로, 명령 해석이 깨졌거나 잡이 트리를 끊어도 기록이 남는다
+//     (두 스트림이 빈 값으로 돌아오는 실패라 스트림에 다시 의존할 수 없다).
+//   - 큰따옴표를 쓰지 않는다 — Go EscapeArg → CreateProcess → powershell의 3중 인용을 피한다.
+func treeKillScript(bcPath, pidPath string, pingCount int) string {
+	return strings.Join([]string{
+		"$t0=[DateTime]::UtcNow",
+		"$b='" + bcPath + "'",
+		"$nl=[Environment]::NewLine",
+		"function bc($m){[IO.File]::AppendAllText($b,[DateTime]::UtcNow.ToString('HH:mm:ss.fff')+' '+$m+$nl)}",
+		// startup-ms = CreateProcess(created)부터 첫 문장까지. 잡 배정·재개 대기와 인터프리터
+		// 기동을 함께 담으므로, probe-noiso(격리 없음)·probe-long(격리 있음)의 같은 값과 나란히
+		// 놓으면 "3s 예산이 짧았나 / 격리 경로가 늦췄나"가 갈린다. 그래서 01이 첫 빵가루다 —
+		// 일찍 죽는 실행에서 가장 값진 한 줄이라 다른 무엇보다 앞에 온다.
+		"$sp=[System.Diagnostics.Process]::GetCurrentProcess().StartTime.ToUniversalTime()",
+		"bc('01 enter pid=' + $PID + ' created=' + $sp.ToString('HH:mm:ss.fff') + ' startup-ms=' + [int](($t0 - $sp).TotalMilliseconds) + ' ps=' + $PSVersionTable.PSVersion + ' clr=' + $PSVersionTable.CLRVersion + ' lang=' + $ExecutionContext.SessionState.LanguageMode + ' host=' + $Host.Name)",
+		// 02는 cmdlet·프로바이더 경로만 쓴다(.bc는 .NET 타입 경로만 쓴다). 두 파일의 유무가
+		// 갈라진다: .cmdlet만 있으면 .NET 타입 접근이 막힌 것, .bc만 있으면 cmdlet 해석이 깨진
+		// 것, 둘 다 없으면 스크립트가 아예 실행되지 않은 것이다.
+		"'02 cmdlet-ok lang=' + $ExecutionContext.SessionState.LanguageMode | Set-Content -LiteralPath '" + bcPath + ".cmdlet'",
+		"bc('03 cmdlet-marker-returned exists=' + [IO.File]::Exists('" + bcPath + ".cmdlet'))",
+		// 스트림 표식: 04가 남았는데 회수된 stdout/stderr에 표식이 없으면 킬 경로가 출력을
+		// 잃은 것이고, 있으면 회수 경로는 무죄다(빈 스트림이 정상인지 손실인지를 가른다).
+		"[Console]::Out.Write('STDOUT-MARK' + $nl)",
+		"[Console]::Out.Flush()",
+		"[Console]::Error.Write('STDERR-MARK' + $nl)",
+		"[Console]::Error.Flush()",
+		"bc('04 marks-flushed')",
+		"bc('05 PSModulePath=[' + $env:PSModulePath + ']')",
+		"bc('06 PATH=[' + $env:PATH + ']')",
+		"bc('07 PATHEXT=[' + $env:PATHEXT + '] TEMP=[' + $env:TEMP + '] SystemRoot=[' + $env:SystemRoot + '] windir=[' + $env:windir + ']')",
+		"bc('08 ProgramFiles=[' + $env:ProgramFiles + '] USERPROFILE=[' + $env:USERPROFILE + '] COMSPEC=[' + $env:COMSPEC + '] pwd=[' + $PWD.Path + ']')",
+		// ping 해석 가능성. CreateProcess는 System32를 PATH와 무관하게 뒤지므로 둘을 나눠 남긴다.
+		"$pd=''",
+		"foreach($d in ($env:PATH -split ';')){if($d -and [IO.File]::Exists($d + '\\ping.exe')){$pd=$pd + $d + '|'}}",
+		"bc('09 ping sys32=' + [IO.File]::Exists($env:SystemRoot + '\\System32\\ping.exe') + ' onpath=[' + $pd + ']')",
+		// Process::Start·Set-Content를 try로 감싼다 — 던진 예외가 빈 스트림이 아니라 파일에 남게.
+		"try{$psi=New-Object System.Diagnostics.ProcessStartInfo",
+		"$psi.FileName='ping'",
+		"$psi.Arguments='-n " + strconv.Itoa(pingCount) + " 127.0.0.1'",
+		"$psi.UseShellExecute=$false",
+		"bc('10 pre-start')",
+		"$p=[System.Diagnostics.Process]::Start($psi)",
+		"bc('11 started gc=' + $p.Id)",
+		"Set-Content -LiteralPath '" + pidPath + "' -Value $p.Id",
+		"bc('12 set-content-returned exists=' + [IO.File]::Exists('" + pidPath + "'))",
+		"$p.WaitForExit()",
+		"bc('13 gc-exited')",
+		"}catch{bc('90 threw ' + $_.Exception.GetType().FullName + ' :: ' + $_.Exception.Message)}",
+		// 비종료 오류(Set-Content 실패 등)는 catch에 걸리지 않으므로 $Error로 따로 건진다.
+		"bc('91 errors=' + $Error.Count + ' first=[' + $(if($Error.Count -gt 0){$Error[0].ToString()}else{''}) + ']')",
+	}, ";")
+}
+
+// dumpTreeKillDiag: 실패한 경우에만 부르는 진단 덤프. 조건 없이 전부 남긴다 — 어느 가설이
+// 맞는지 모르는 상태에서 "추측이 맞을 때만 찍는 로그"는 아무것도 가려내지 못한다.
+func dumpTreeKillDiag(t *testing.T, s Spec, dir, psExe string, r Result, start time.Time) {
+	t.Helper()
+	t.Logf("[diag] 러너 신원: ImageOS=%q ImageVersion=%q RUNNER_OS=%q GOARCH=%s NumCPU=%d os.TempDir=%q",
+		os.Getenv("ImageOS"), os.Getenv("ImageVersion"), os.Getenv("RUNNER_OS"),
+		runtime.GOARCH, runtime.NumCPU(), os.TempDir())
+	// Run 진입 시각(UTC). 빵가루의 created와 나란히 놓으면 Start()까지의 비용이 나온다.
+	t.Logf("[diag] Run 진입=%s (UTC)", start.UTC().Format("15:04:05.000"))
+	if fi, err := os.Stat(psExe); err == nil {
+		t.Logf("[diag] 인터프리터: %s size=%d mtime=%s", psExe, fi.Size(), fi.ModTime().UTC().Format(time.RFC3339))
+	} else {
+		t.Logf("[diag] 인터프리터 stat 실패: %s: %v", psExe, err)
+	}
+	t.Logf("[diag] Go가 자식에 넘긴 Spec.Env(%d개):", len(s.Env))
+	for _, kv := range s.Env {
+		t.Logf("[diag]   %s", kv)
+	}
+	t.Logf("[diag] Result: TimedOut=%v ExitCode=%d Duration=%v stdout(%dB,trunc=%v)=%q stderr(%dB,trunc=%v)=%q",
+		r.TimedOut, r.ExitCode, r.Duration,
+		len(r.Stdout), r.StdoutTrunc, r.Stdout, len(r.Stderr), r.StderrTrunc, r.Stderr)
+	dumpScratch(t, dir)
+	// 통제 실행 2종: 빵가루가 아예 없을 때 "격리 경로가 자식을 못 돌렸다 / 3s 예산이 이
+	// 러너에서 부족했다 / 인터프리터가 이 환경에서 아무것도 못 한다"를 갈라낸다. 손자 ping은
+	// 5회로 스스로 끝나 잔존 프로세스를 남기지 않는다.
+	probeNoIsolation(t, s, dir)
+	probeLongBudget(t, s, dir)
+}
+
+// dumpScratch: 스크래치의 모든 항목과 내용. 없는 빵가루는 있는 빵가루만큼의 정보다.
+func dumpScratch(t *testing.T, dir string) {
+	t.Helper()
+	ents, err := os.ReadDir(dir)
+	if err != nil {
+		t.Logf("[diag] 스크래치 읽기 실패 %s: %v", dir, err)
+		return
+	}
+	if len(ents) == 0 {
+		t.Logf("[diag] 스크래치 비어 있음(%s) — 자식이 파일을 하나도 만들지 못했다", dir)
+	}
+	for _, e := range ents {
+		logFileIfAny(t, filepath.Join(dir, e.Name()))
+	}
+}
+
+func logFileIfAny(t *testing.T, path string) {
+	t.Helper()
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Logf("[diag] %s 부재/읽기 실패: %v", filepath.Base(path), err)
+		return
+	}
+	t.Logf("[diag] --- %s (%dB) ---\n%s", filepath.Base(path), len(b), b)
+}
+
+// probeArgv: 같은 argv에서 스크립트(마지막 인자)만 바꾼 사본.
+func probeArgv(argv []string, script string) []string {
+	out := append([]string(nil), argv...)
+	out[len(out)-1] = script
+	return out
+}
+
+// probeNoIsolation: 잡·CREATE_SUSPENDED 없이 같은 argv·env·cwd로 같은 스크립트를 돌린다.
+// 빵가루가 빠르게 남으면 인터프리터와 자식 env는 정상이고 격리 경로가 원인이다. 여기서도
+// 아무것도 남지 않으면 인터프리터·환경 쪽이며, 이 실행은 킬 경로가 아니라 스트림으로 예외를
+// 볼 수 있다.
+func probeNoIsolation(t *testing.T, s Spec, dir string) {
+	t.Helper()
+	bc := filepath.Join(dir, "probe-noiso.bc")
+	argv := probeArgv(s.Argv, treeKillScript(bc, filepath.Join(dir, "probe-noiso.pid"), 5))
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
+	cmd.Dir, cmd.Env = s.Dir, s.Env
+	var out, errb bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &out, &errb
+	start := time.Now()
+	err := cmd.Run()
+	t.Logf("[diag] probe-noiso(격리 없음·20s): 소요=%v err=%v stdout=%q stderr=%q",
+		time.Since(start), err, out.String(), errb.String())
+	logFileIfAny(t, bc)
+}
+
+// probeLongBudget: 같은 격리 경로(잡·CREATE_SUSPENDED·재개)를 예산만 20s로 늘려 돌린다.
+// 손자가 기록되면 3s 예산이 이 러너에서 부족했다는 뜻이고, 여기서도 빵가루가 없으면 격리
+// 경로 자체가 자식을 돌리지 못한 것이다. ping 5회로 스스로 끝나므로 이 실행은 타임아웃이
+// 아닌 정상 종료 경로를 지나며, 그 stdout에 표식이 있는데 3s 실행에는 없다면 출력 손실이
+// 킬 경로 고유임을 뜻한다.
+func probeLongBudget(t *testing.T, s Spec, dir string) {
+	t.Helper()
+	bc := filepath.Join(dir, "probe-long.bc")
+	p := s
+	p.Argv = probeArgv(s.Argv, treeKillScript(bc, filepath.Join(dir, "probe-long.pid"), 5))
+	p.Timeout = 20 * time.Second
+	start := time.Now()
+	r, err := Run(context.Background(), p)
+	t.Logf("[diag] probe-long(격리 있음·20s): 소요=%v err=%v TimedOut=%v ExitCode=%d stdout=%q stderr=%q",
+		time.Since(start), err, r.TimedOut, r.ExitCode, r.Stdout, r.Stderr)
+	logFileIfAny(t, bc)
 }
 
 // readPidFile: 루트가 손자를 스폰·기록할 때까지 잠깐 폴링한 뒤 PID를 읽는다.
