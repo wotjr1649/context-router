@@ -2593,12 +2593,18 @@ func TestPurgeHookOnlyVacuumFailurePropagates(t *testing.T) {
 	}
 }
 
-// TestDoctorShowsPermissionLine: [19] 라인이 항상 나온다(충돌 유무와 무관).
+// TestDoctorShowsPermissionLine: [19] 라인이 항상 나오고, 규칙이 없는 환경에서는 세 갈래 중
+// "충돌 없음"이다. 라인 접두("[19] permissions:")만 단정하면 판정이 통째로 무력화돼도(예: ruleMatches가
+// 항상 false를 돌려주는 회귀) 통과하므로 문면까지 고정한다(G5). USER 스코프는 임시 홈으로 돌려
+// 실환경 설정이 판정에 섞이지 않게 한다 — 그러지 않으면 세 갈래 중 어느 것이 나올지 환경에 달린다.
 func TestDoctorShowsPermissionLine(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("USERPROFILE", home) // windows
+	t.Setenv("HOME", home)        // unix
 	var buf bytes.Buffer
 	_ = runDoctor(context.Background(), &buf, t.TempDir(), t.TempDir(), "0.12.0")
-	if !strings.Contains(buf.String(), "[19] permissions:") {
-		t.Fatalf("[19] 누락:\n%s", buf.String())
+	if !strings.Contains(buf.String(), "[19] permissions: ask/allow 충돌 없음") {
+		t.Fatalf("[19] 충돌 없음 라인 누락:\n%s", buf.String())
 	}
 }
 

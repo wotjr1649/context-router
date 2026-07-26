@@ -31,11 +31,11 @@ func TestMergeMCPServersIdempotent(t *testing.T) {
 		AlwaysLoad: true, Managed: hookMarker("0.12.0"),
 	}
 
-	first, err := mergeMCPServers(existing, ctrMCPServerName, entry, true, true)
+	first, _, err := mergeMCPServers(existing, ctrMCPServerName, entry, true, true)
 	if err != nil {
 		t.Fatalf("merge 1: %v", err)
 	}
-	second, err := mergeMCPServers(first, ctrMCPServerName, entry, true, true)
+	second, _, err := mergeMCPServers(first, ctrMCPServerName, entry, true, true)
 	if err != nil {
 		t.Fatalf("merge 2: %v", err)
 	}
@@ -64,7 +64,7 @@ func TestMergeMCPServersHealsStaleMarker(t *testing.T) {
 		`"args":["--enable","exec"],"alwaysLoad":true,"__ctrManaged":"context-router/0.11.0"}}}`)
 	entry := mcpServerEntry{Command: hookBinaryName, AlwaysLoad: true, Managed: hookMarker("0.12.0")}
 
-	out, err := mergeMCPServers(existing, ctrMCPServerName, entry, true, false) // setProfile=false
+	out, _, err := mergeMCPServers(existing, ctrMCPServerName, entry, true, false) // setProfile=false
 	if err != nil {
 		t.Fatalf("merge: %v", err)
 	}
@@ -86,7 +86,7 @@ func TestMergeMCPServersRetiresSuperseded(t *testing.T) {
 		`"ctr-global":{"command":"context-router","args":["--profile","global-search"]}}}`)
 	entry := mcpServerEntry{Command: hookBinaryName, Args: []string{}, AlwaysLoad: true, Managed: hookMarker("0.12.0")}
 
-	out, err := mergeMCPServers(existing, ctrMCPServerName, entry, true, true)
+	out, _, err := mergeMCPServers(existing, ctrMCPServerName, entry, true, true)
 	if err != nil {
 		t.Fatalf("merge: %v", err)
 	}
@@ -103,13 +103,97 @@ func TestMergeMCPServersRetiresSuperseded(t *testing.T) {
 
 	// 같은 이름이라도 남의 명령이면 건드리지 않는다.
 	foreign := []byte(`{"mcpServers":{"ctr":{"command":"someone-else","args":[]}}}`)
-	out2, err := mergeMCPServers(foreign, ctrMCPServerName, entry, true, true)
+	out2, _, err := mergeMCPServers(foreign, ctrMCPServerName, entry, true, true)
 	if err != nil {
 		t.Fatalf("merge foreign: %v", err)
 	}
 	if _, ok := mcpServersOf(t, out2)["ctr"]; !ok {
 		t.Errorf("남의 ctr 항목을 지웠다: %s", out2)
 	}
+}
+
+// TestMergeMCPServersCarriesSupersededProfile: 대체된 과거 등록(ctr)이 들고 있던 프로필은 우리
+// 이름에 기존 항목이 없을 때 이월한다 — 첫 등록에서는 그 항목이 사용자가 켜 둔 exec의 유일한
+// 근거이고, 이월 없이 지우면 재설치가 도구를 조용히 줄인 뒤 "병합 완료"만 보고한다(G9). 명시
+// 플래그(setProfile)가 있으면 플래그가 이기고, 우리 이름에 기존 항목이 있으면 그쪽이 근거다 —
+// mergeMCPServers:133의 프로필 유지 규칙과 같은 우선순위다.
+func TestMergeMCPServersCarriesSupersededProfile(t *testing.T) {
+	retired := `"ctr":{"command":"context-router","args":["--enable","exec"]}`
+	entry := mcpServerEntry{
+		Command: hookBinaryName, Args: mcpArgsForProfile(false),
+		AlwaysLoad: true, Managed: hookMarker("0.12.0"),
+	}
+
+	out, _, err := mergeMCPServers([]byte(`{"mcpServers":{`+retired+`}}`), ctrMCPServerName, entry, true, false)
+	if err != nil {
+		t.Fatalf("merge: %v", err)
+	}
+	if ours := mcpServersOf(t, out)[ctrMCPServerName]; !slices.Equal(ours.Args, []string{"--enable", "exec"}) {
+		t.Errorf("대체된 등록의 프로필이 이월되지 않았다: %v", ours.Args)
+	}
+	// 명시 플래그가 있으면 플래그가 이긴다 — 프로필을 끄는 정식 경로가 이월에 막히면 안 된다.
+	out2, _, err := mergeMCPServers([]byte(`{"mcpServers":{`+retired+`}}`), ctrMCPServerName, entry, true, true)
+	if err != nil {
+		t.Fatalf("merge(setProfile): %v", err)
+	}
+	if ours := mcpServersOf(t, out2)[ctrMCPServerName]; len(ours.Args) != 0 {
+		t.Errorf("명시 플래그를 이월이 덮었다: %v", ours.Args)
+	}
+	// 우리 이름에 기존 항목이 있으면 그쪽이 근거다(이월하지 않는다).
+	both := `{"mcpServers":{` + retired + `,"` + ctrMCPServerName + `":{"command":"context-router","args":[]}}}`
+	out3, _, err := mergeMCPServers([]byte(both), ctrMCPServerName, entry, true, false)
+	if err != nil {
+		t.Fatalf("merge(prev): %v", err)
+	}
+	if ours := mcpServersOf(t, out3)[ctrMCPServerName]; len(ours.Args) != 0 {
+		t.Errorf("우리 이름의 기존 항목보다 대체 항목을 우선했다: %v", ours.Args)
+	}
+}
+
+// TestMergeMCPServersKeepsExplicitAlwaysLoad: 항목에 명시된 alwaysLoad는 재설치가 덮지 않는다 —
+// 이 키는 서버가 연결될 때까지 세션 시작을 막으므로(호스트 5초 상한) 사용자가 false로 끌 이유가
+// 실재한다. alwaysLoad는 우리 소유 키라 keepUnownedEntryKeys가 되돌려 주지도 않는다(G11). 명시된
+// false는 값째로 남아야 한다 — 키가 사라지면 다음 재설치가 "명시 없음"으로 읽어 true로 되살려
+// 재설치마다 값이 진동한다. 키가 없으면 우리 기본값 true를 쓴다(첫 등록·마커 이전 등록).
+func TestMergeMCPServersKeepsExplicitAlwaysLoad(t *testing.T) {
+	existing := []byte(`{"mcpServers":{"` + ctrMCPServerName + `":{"command":"context-router",` +
+		`"args":[],"alwaysLoad":false,"__ctrManaged":"context-router/0.11.0"}}}`)
+	entry := mcpServerEntry{Command: hookBinaryName, Args: []string{}, AlwaysLoad: true, Managed: hookMarker("0.12.0")}
+
+	first, _, err := mergeMCPServers(existing, ctrMCPServerName, entry, true, false)
+	if err != nil {
+		t.Fatalf("merge 1: %v", err)
+	}
+	if raw := entryKeyOf(t, first, ctrMCPServerName, "alwaysLoad"); string(raw) != "false" {
+		t.Errorf("명시된 alwaysLoad가 보존되지 않았다: %q", raw)
+	}
+	second, _, err := mergeMCPServers(first, ctrMCPServerName, entry, true, false)
+	if err != nil {
+		t.Fatalf("merge 2: %v", err)
+	}
+	if !bytes.Equal(first, second) {
+		t.Errorf("재설치 멱등 위반:\n1: %s\n2: %s", first, second)
+	}
+	fresh, _, err := mergeMCPServers([]byte(`{}`), ctrMCPServerName, entry, true, false)
+	if err != nil {
+		t.Fatalf("merge fresh: %v", err)
+	}
+	if raw := entryKeyOf(t, fresh, ctrMCPServerName, "alwaysLoad"); string(raw) != "true" {
+		t.Errorf("기존 항목이 없을 때의 기본값이 true가 아니다: %q", raw)
+	}
+}
+
+// entryKeyOf — 결과 JSON에서 서버 항목의 키 원문을 뽑는다. 구조체 디코드로는 "키가 없다"와
+// "명시된 false"를 가릴 수 없어(둘 다 false로 읽힌다) 원문이 필요하다.
+func entryKeyOf(t *testing.T, b []byte, server, key string) json.RawMessage {
+	t.Helper()
+	var got struct {
+		Servers map[string]map[string]json.RawMessage `json:"mcpServers"`
+	}
+	if err := json.Unmarshal(b, &got); err != nil {
+		t.Fatalf("결과 파싱: %v (%s)", err, b)
+	}
+	return got.Servers[server][key]
 }
 
 // TestMergeMCPServersPreservesUserKeys: 사용자가 우리 항목에 직접 넣은 키("env"·"cwd"·"type")는
@@ -125,7 +209,7 @@ func TestMergeMCPServersPreservesUserKeys(t *testing.T) {
 		Command: hookBinaryName, Args: []string{}, AlwaysLoad: true, Managed: hookMarker("0.12.0"),
 	}
 
-	first, err := mergeMCPServers(existing, ctrMCPServerName, entry, true, true)
+	first, _, err := mergeMCPServers(existing, ctrMCPServerName, entry, true, true)
 	if err != nil {
 		t.Fatalf("merge 1: %v", err)
 	}
@@ -151,7 +235,7 @@ func TestMergeMCPServersPreservesUserKeys(t *testing.T) {
 		t.Errorf("우리 키가 갱신되지 않았다: %+v", ours)
 	}
 
-	second, err := mergeMCPServers(first, ctrMCPServerName, entry, true, true)
+	second, _, err := mergeMCPServers(first, ctrMCPServerName, entry, true, true)
 	if err != nil {
 		t.Fatalf("merge 2: %v", err)
 	}
@@ -163,7 +247,7 @@ func TestMergeMCPServersPreservesUserKeys(t *testing.T) {
 // TestMergeMCPServersUninstallKeepsOthers: install=false면 우리 항목만 지운다.
 func TestMergeMCPServersUninstallKeepsOthers(t *testing.T) {
 	existing := []byte(`{"mcpServers":{"other":{"command":"x"},"` + ctrMCPServerName + `":{"command":"context-router"}}}`)
-	out, err := mergeMCPServers(existing, ctrMCPServerName, mcpServerEntry{}, false, true)
+	out, _, err := mergeMCPServers(existing, ctrMCPServerName, mcpServerEntry{}, false, true)
 	if err != nil {
 		t.Fatalf("merge: %v", err)
 	}
@@ -188,14 +272,14 @@ func TestMergeMCPServersRejectsForeignSameName(t *testing.T) {
 	existing := []byte(`{"mcpServers":{"` + ctrMCPServerName + `":{"command":"someone-else","args":["--x"]}}}`)
 	entry := mcpServerEntry{Command: hookBinaryName, AlwaysLoad: true, Managed: hookMarker("0.12.0")}
 	for _, install := range []bool{true, false} {
-		out, err := mergeMCPServers(existing, ctrMCPServerName, entry, install, true)
+		out, _, err := mergeMCPServers(existing, ctrMCPServerName, entry, install, true)
 		if err == nil {
 			t.Errorf("install=%v: 남의 항목을 충돌 없이 처리했다: %s", install, out)
 		}
 	}
 	// 마커 없이 명령만 우리 것인 항목(마커 도입 전 등록)은 우리 것이라 계속 갱신·제거된다.
 	ours := []byte(`{"mcpServers":{"` + ctrMCPServerName + `":{"command":"context-router","args":["--x"]}}}`)
-	if _, err := mergeMCPServers(ours, ctrMCPServerName, entry, true, true); err != nil {
+	if _, _, err := mergeMCPServers(ours, ctrMCPServerName, entry, true, true); err != nil {
 		t.Errorf("마커 없는 우리 항목을 남의 것으로 봤다: %v", err)
 	}
 }
@@ -207,7 +291,7 @@ func TestMergeMCPServersRejectsForeignSameName(t *testing.T) {
 func TestMergeMCPServersEmptyOrNullTolerant(t *testing.T) {
 	entry := mcpServerEntry{Command: hookBinaryName, AlwaysLoad: true, Managed: hookMarker("0.12.0")}
 	for _, existing := range []string{" \n\t", "null", `{"mcpServers":null}`} {
-		out, err := mergeMCPServers([]byte(existing), ctrMCPServerName, entry, true, true)
+		out, _, err := mergeMCPServers([]byte(existing), ctrMCPServerName, entry, true, true)
 		if err != nil {
 			t.Fatalf("existing=%q merge err: %v", existing, err)
 		}
@@ -219,7 +303,7 @@ func TestMergeMCPServersEmptyOrNullTolerant(t *testing.T) {
 
 // TestMergeMCPServersRejectsMalformed: 깨진 JSON은 오류이며 메시지에 경로가 없다.
 func TestMergeMCPServersRejectsMalformed(t *testing.T) {
-	_, err := mergeMCPServers([]byte(`{"mcpServers":`), ctrMCPServerName, mcpServerEntry{Command: "x"}, true, true)
+	_, _, err := mergeMCPServers([]byte(`{"mcpServers":`), ctrMCPServerName, mcpServerEntry{Command: "x"}, true, true)
 	if err == nil {
 		t.Fatal("깨진 JSON에 오류가 없다")
 	}
@@ -279,6 +363,41 @@ func TestEnabledServersScopeNoneDefined(t *testing.T) {
 	}
 	if winner != "" || len(defined) != 0 {
 		t.Errorf("winner=%q defined=%v, 둘 다 비어야 한다", winner, defined)
+	}
+}
+
+// TestEnabledServersScopeReportsUnreadableScope: 확인하지 못한 스코프가 있으면 판정 불가로 올린다.
+// 미존재(os.ErrNotExist)만 "그 스코프에 정의 없음"으로 확인된 상태다 — 읽기·파싱 실패를 정의 없음으로
+// 세면 설치가 상위 스코프가 통째로 override 하는 자리에 승인 키를 쓰고 "기록했습니다"까지 찍는다(G6).
+// askShadowedAllows가 거짓 clean을 막으려 이미 채택한 규칙과 같다. 오류 문면에는 경로가 없다(§12).
+func TestEnabledServersScopeReportsUnreadableScope(t *testing.T) {
+	proj := t.TempDir()
+	for _, c := range []struct {
+		name string
+		read func(string) ([]byte, error)
+	}{
+		{"읽기 실패", func(p string) ([]byte, error) {
+			if scopeKeyForTest(proj, p) == "LOCAL" {
+				return nil, errors.New("읽기 거부") // 미존재가 아닌 오류
+			}
+			return nil, os.ErrNotExist
+		}},
+		{"파싱 실패", func(p string) ([]byte, error) {
+			if scopeKeyForTest(proj, p) == "LOCAL" {
+				return []byte(`{"enabledMcpjsonServers":`), nil
+			}
+			return nil, os.ErrNotExist
+		}},
+	} {
+		winner, defined, err := enabledServersScope(proj, c.read)
+		if err == nil {
+			t.Errorf("%s: 오류가 없다(winner=%q defined=%v) — 확인 못 한 스코프를 정의 없음으로 세면 안 된다",
+				c.name, winner, defined)
+			continue
+		}
+		if strings.Contains(err.Error(), proj) {
+			t.Errorf("%s: 오류 문면에 경로가 새어나온다", c.name)
+		}
 	}
 }
 
@@ -375,6 +494,33 @@ func TestAskShadowedAllowsServerWideAsk(t *testing.T) {
 	}
 	if len(got) != 1 || got[0] != "mcp__ctr-exec__ctr_execute" {
 		t.Errorf("got=%v, 서버 단위 ask가 덮는 그 서버 도구 1건만이어야 한다", got)
+	}
+}
+
+// TestAskShadowedAllowsWidenedAllowForms: 형태 확장(서버 단위·접미 glob)은 두 인자에 대칭으로
+// 적용된다 — 판정은 "두 규칙의 도구 집합이 겹치는가"이므로 allow가 넓은 형태여도 그 안의 도구를
+// 가리키는 ask는 여전히 프롬프트를 강제한다. 한쪽에만 확장을 적용하면 서버 단위 allow와 와일드카드
+// allow가 진단에서 거짓 clean으로 나온다(G5). 겹치지 않는 형태를 같은 픽스처에 넣어 접두 비교가
+// 리터럴끼리를 잡아먹지 않게(ctr_index vs ctr_indexer) 함께 고정한다 — 그래서 "2건"으로만 통과한다.
+func TestAskShadowedAllowsWidenedAllowForms(t *testing.T) {
+	proj := t.TempDir()
+	files := map[string]string{
+		"PROJECT": `{"permissions":{"ask":["mcp__ctr-exec__ctr_index"]}}`,
+		"LOCAL": `{"permissions":{"allow":["mcp__ctr-exec","mcp__ctr-exec__*",` +
+			`"mcp__ctr-exec2","mcp__ctr-exec__ctr_indexer","mcp__ctr-global__*"]}}`,
+	}
+	read := func(p string) ([]byte, error) {
+		if s, ok := files[scopeKeyForTest(proj, p)]; ok {
+			return []byte(s), nil
+		}
+		return nil, os.ErrNotExist
+	}
+	got, err := askShadowedAllows(proj, read)
+	if err != nil {
+		t.Fatalf("askShadowedAllows: %v", err)
+	}
+	if !slices.Equal(got, []string{"mcp__ctr-exec", "mcp__ctr-exec__*"}) {
+		t.Errorf("got=%v, 서버 단위·접미 glob allow 2건만이어야 한다(다른 서버·다른 도구는 제외)", got)
 	}
 }
 
@@ -603,6 +749,38 @@ func TestHookInstallReportsExistingApprovalScope(t *testing.T) {
 	}
 }
 
+// TestHookInstallSkipsApprovalKeyOnIndeterminateScope: 스코프 판정이 실패하면 승인 키를 쓰지 않고
+// 사유를 보고한다 — 깨진 settings.local.json은 "정의 없음"이 아니라 "확인 못 함"이고, 그 파일이
+// 실제로 이 키를 정의하고 있으면 우선순위가 낮은 project 스코프에 쓴 값은 조용히 무시된다(local >
+// project). 그 상태에서 "기록했습니다"를 찍으면 사용자는 승인이 끝났다고 읽는다(G6).
+func TestHookInstallSkipsApprovalKeyOnIndeterminateScope(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home) // Windows os.UserHomeDir 이음새
+	proj := t.TempDir()
+	local := filepath.Join(proj, ".claude", "settings.local.json")
+	if err := os.MkdirAll(filepath.Dir(local), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(local, []byte(`{"enabledMcpjsonServers":`), 0o600); err != nil { // 깨진 JSON
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	if err := runHookInstall(nil, t.TempDir(), "", false, proj, "0.12.0", &out); err != nil {
+		t.Fatalf("install: %v", err) // 훅·.mcp.json 설치 자체는 성공한다
+	}
+	settingsPath, err := hookSettingsPath(false, proj)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sb, _ := os.ReadFile(settingsPath); bytes.Contains(sb, []byte("enabledMcpjsonServers")) {
+		t.Errorf("판정 불가인데 승인 키를 썼다: %s", sb)
+	}
+	if !strings.Contains(out.String(), "승인 키 스코프를 판정하지 못해") {
+		t.Errorf("건너뛴 사유를 알리지 않았다:\n%s", out.String())
+	}
+}
+
 // TestHookInstallUserScopeSkipsApprovalKey: --user 설치는 승인 키를 어느 파일에도 쓰지 않고 사유를
 // 보고한다. 이 키는 프로젝트 .mcp.json 등록을 이름으로 승인하는 장치라, 사용자 스코프에 쓰면 이
 // 머신 모든 프로젝트의 동명 항목까지(소유 검증 없이) 승인하게 된다 — 사용자 스코프 서버는
@@ -728,15 +906,21 @@ func TestHostSnippetUsesCurrentServerPrefix(t *testing.T) {
 // TestMergeEnabledServersRemove: 제거는 우리 이름만 빼고, 우리가 배열을 비웠으면 키째로 지운다
 // (mergeHookSettings:167·177의 빈 컨테이너 제거 규칙과 같은 규칙). 우리 이름이 없으면 배열을
 // 손대지 않는다 — 사용자가 의도적으로 비워 둔 []를 지우면 그 스코프가 "정의됨"에서 "미정의"로
-// 바뀌어 하위 스코프를 덮으려던 의도가 사라진다.
+// 바뀌어 하위 스코프를 덮으려던 의도가 사라진다. keepEmpty는 같은 뒤집힘이 "우리가 비운 배열"에도
+// 성립하는 경우(하위 스코프가 그 키를 정의)를 위한 것이고, 그때는 빈 배열을 남긴다.
 func TestMergeEnabledServersRemove(t *testing.T) {
-	for _, c := range []struct{ name, existing, want string }{
-		{"단독 원소는 키째로 제거", `{"enabledMcpjsonServers":["` + ctrMCPServerName + `"]}`, `{}`},
-		{"다른 원소는 보존", `{"enabledMcpjsonServers":["other","` + ctrMCPServerName + `"]}`, `{"enabledMcpjsonServers":["other"]}`},
-		{"의도적 빈 배열은 보존", `{"enabledMcpjsonServers":[]}`, `{"enabledMcpjsonServers":[]}`},
-		{"키가 없으면 무변", `{"other":1}`, `{"other":1}`},
+	for _, c := range []struct {
+		name, existing, want string
+		keepEmpty            bool
+	}{
+		{"단독 원소는 키째로 제거", `{"enabledMcpjsonServers":["` + ctrMCPServerName + `"]}`, `{}`, false},
+		{"다른 원소는 보존", `{"enabledMcpjsonServers":["other","` + ctrMCPServerName + `"]}`, `{"enabledMcpjsonServers":["other"]}`, false},
+		{"의도적 빈 배열은 보존", `{"enabledMcpjsonServers":[]}`, `{"enabledMcpjsonServers":[]}`, false},
+		{"키가 없으면 무변", `{"other":1}`, `{"other":1}`, false},
+		{"하위 스코프가 정의하면 빈 배열을 남긴다", `{"enabledMcpjsonServers":["` + ctrMCPServerName + `"]}`, `{"enabledMcpjsonServers":[]}`, true},
+		{"남는 원소가 있으면 keepEmpty와 무관", `{"enabledMcpjsonServers":["other","` + ctrMCPServerName + `"]}`, `{"enabledMcpjsonServers":["other"]}`, true},
 	} {
-		got, err := mergeEnabledServers([]byte(c.existing), ctrMCPServerName, false)
+		got, err := mergeEnabledServers([]byte(c.existing), ctrMCPServerName, false, c.keepEmpty)
 		if err != nil {
 			t.Errorf("%s: %v", c.name, err)
 			continue
@@ -904,6 +1088,114 @@ func TestHookUninstallCleansMCPWhenSettingsUnparsable(t *testing.T) {
 	}
 	if b := mustReadFile(t, mcpConfigPath(proj)); bytes.Contains(b, []byte(ctrMCPServerName)) {
 		t.Errorf(".mcp.json 정리가 시도되지 않았다: %s", b)
+	}
+}
+
+// TestHookUninstallUserScopeKeepsApprovalKey: `uninstall --user`는 승인 키를 건드리지 않는다 —
+// `install --user`가 그 키를 쓰지 않으므로(hook_install.go의 --user 분기) 사용자 스코프 목록은
+// 사용자가 직접 넣은 것이다. 제거는 설치가 쓸 수 있었던 스코프만 되돌린다(G7). 훅 항목 제거는
+// 그대로 수행하므로 이 테스트는 "아무 일도 하지 않음"으로 통과할 수 없다.
+func TestHookUninstallUserScopeKeepsApprovalKey(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home) // Windows os.UserHomeDir 이음새
+	proj := t.TempDir()
+	userPath, err := hookSettingsPath(true, proj)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(userPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	// 사용자가 직접 넣은 목록 — 우리 이름이 들어 있어도 설치가 쓴 것이 아니다.
+	hand := `{"enabledMcpjsonServers":["` + ctrMCPServerName + `","other"]}`
+	if err := os.WriteFile(userPath, []byte(hand), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	if err := runHookUninstall([]string{"--user"}, proj, &out); err != nil {
+		t.Fatalf("uninstall --user: %v", err)
+	}
+	var doc struct {
+		Enabled []string `json:"enabledMcpjsonServers"`
+	}
+	if err := json.Unmarshal(mustReadFile(t, userPath), &doc); err != nil {
+		t.Fatalf("settings 파싱: %v", err)
+	}
+	if !slices.Contains(doc.Enabled, ctrMCPServerName) {
+		t.Errorf("사용자가 직접 넣은 승인 키 원소를 지웠다: %v", doc.Enabled)
+	}
+	if !strings.Contains(out.String(), "--user") {
+		t.Errorf("건너뛴 사유를 알리지 않았다:\n%s", out.String())
+	}
+}
+
+// TestHookUninstallKeepsEmptyApprovalListWhenLowerScopeDefines: 우리 이름이 마지막 원소여도, 더 낮은
+// 스코프(user)가 같은 키를 정의하면 키째로 지우지 않고 빈 배열을 남긴다 — 이 키는 스코프 간 병합되지
+// 않고 최상위 정의가 통째로 override 하므로, project 정의가 사라지는 순간 user 목록이 살아나 사용자가
+// 이 프로젝트에 넣지 않은 이름이 승인된다(G8). 아무도 정의하지 않은 흔한 경로에서는 기존 규칙대로
+// 키를 지운다(TestHookUninstallRemovesMCPConfigAndApprovalKey가 그쪽을 고정한다).
+func TestHookUninstallKeepsEmptyApprovalListWhenLowerScopeDefines(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	proj := t.TempDir()
+	var out bytes.Buffer
+	if err := runHookInstall(nil, t.TempDir(), "", false, proj, "0.12.0", &out); err != nil {
+		t.Fatalf("install: %v", err)
+	}
+	// 설치 뒤에 사용자가 user 스코프 목록을 만든 상태 — 설치 시점에는 아무도 정의하지 않았다.
+	userPath, err := hookSettingsPath(true, proj)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(userPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(userPath, []byte(`{"enabledMcpjsonServers":["other"]}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := runHookUninstall(nil, proj, &out); err != nil {
+		t.Fatalf("uninstall: %v", err)
+	}
+	projectPath, err := hookSettingsPath(false, proj)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sb := mustReadFile(t, projectPath)
+	var doc map[string]json.RawMessage
+	if err := json.Unmarshal(sb, &doc); err != nil {
+		t.Fatalf("settings 파싱: %v (%s)", err, sb)
+	}
+	raw, ok := doc["enabledMcpjsonServers"]
+	if !ok {
+		t.Fatalf("키가 사라져 하위 스코프 목록이 살아난다: %s", sb)
+	}
+	if string(raw) != "[]" {
+		t.Errorf("우리 이름을 뺀 빈 배열이 아니다: %s", raw)
+	}
+}
+
+// TestHookUninstallLeavesForeignOnlyMCPFileIntact: 우리 항목이 없는 .mcp.json은 바이트 그대로 두고
+// "제거 완료"를 찍지 않는다 — 무변경 재기록도 사용자 파일을 바꾼다(json.Marshal은 &를 유니코드
+// 이스케이프로 바꾸고 키를 정렬한다). 하지 않은 일을 했다고 말하는 문면은 사용자가 원인을 다른 데서
+// 찾게 만든다(G10). 형제 승인 키 문면은 이미 "없었으면 무변"으로 유보한다.
+func TestHookUninstallLeavesForeignOnlyMCPFileIntact(t *testing.T) {
+	proj := t.TempDir()
+	original := []byte("{\n  \"mcpServers\": {\n    \"other\": {\n      \"command\": \"x\",\n" +
+		"      \"args\": [\"a&b\"]\n    }\n  }\n}\n")
+	if err := os.WriteFile(mcpConfigPath(proj), original, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	if err := runHookUninstall(nil, proj, &out); err != nil {
+		t.Fatalf("uninstall: %v", err)
+	}
+	if after := mustReadFile(t, mcpConfigPath(proj)); !bytes.Equal(after, original) {
+		t.Errorf("우리 항목이 없는데 파일을 다시 썼다:\n원본: %s\n결과: %s", original, after)
+	}
+	if strings.Contains(out.String(), "mcp: .mcp.json 항목 제거 완료") {
+		t.Errorf("하지 않은 제거를 완료라고 알린다:\n%s", out.String())
 	}
 }
 

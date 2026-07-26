@@ -536,7 +536,8 @@ func runHookInstall(args []string, storeRoot, storeRootRaw string, storeRootExpl
 		}
 		// setProfile=*enableExec: 플래그가 없으면 기존 항목의 args를 보존한다(재설치가 이미 켠
 		// exec를 끄지 않는다). 마커는 setProfile과 무관하게 항상 갱신된다(self-heal).
-		mcpMerged, mergeErr := mergeMCPServers(existing, ctrMCPServerName, entry, true, *enableExec)
+		// changed는 install 경로에서 항상 true라 쓰지 않는다(마커 self-heal이 무변경을 배제한다).
+		mcpMerged, _, mergeErr := mergeMCPServers(existing, ctrMCPServerName, entry, true, *enableExec)
 		if mergeErr != nil {
 			// 실패 사유는 둘뿐이다 — 우리 이름 자리에 우리 소유가 아닌 항목이 있거나(소유 관문),
 			// 파일이 해석되지 않거나. 어느 쪽이든 사용자가 손댈 대상을 알려야 조치할 수 있다.
@@ -576,7 +577,7 @@ func runHookInstall(args []string, storeRoot, storeRootRaw string, storeRootExpl
 		prev, prevErr := os.ReadFile(path)
 		if prevErr != nil && !errors.Is(prevErr, os.ErrNotExist) {
 			fmt.Fprintln(stdout, "mcp: 기존 settings를 읽지 못해 승인 키 기록을 건너뜁니다")
-		} else if next, mergeErr := mergeEnabledServers(prev, ctrMCPServerName, true); mergeErr != nil {
+		} else if next, mergeErr := mergeEnabledServers(prev, ctrMCPServerName, true, false); mergeErr != nil {
 			fmt.Fprintln(stdout, "mcp: 승인 키 병합 실패 — 훅 설치는 완료되었습니다")
 		} else if writeErr := atomicWriteFile(path, next); writeErr != nil {
 			fmt.Fprintln(stdout, "mcp: 승인 키 기록 실패 — 훅 설치는 완료되었습니다")
@@ -693,8 +694,13 @@ func runHookUninstall(args []string, projectRoot string, stdout io.Writer) error
 	// 항목이 있으면 install과 똑같이 손대지 않고 사유만 보고한다. 파일은 지우지 않는다.
 	mcpPath := mcpConfigPath(projectRoot)
 	if existing, readErr := os.ReadFile(mcpPath); readErr == nil {
-		if mcpMerged, mergeErr := mergeMCPServers(existing, ctrMCPServerName, mcpServerEntry{}, false, true); mergeErr != nil {
+		if mcpMerged, changed, mergeErr := mergeMCPServers(existing, ctrMCPServerName, mcpServerEntry{}, false, true); mergeErr != nil {
 			fmt.Fprintf(stdout, "mcp: .mcp.json 항목 제거를 멈췄습니다 — %q 이름에 우리가 소유하지 않은 항목이 있거나 파일을 해석할 수 없습니다. 그 항목은 그대로 두었습니다\n", ctrMCPServerName)
+		} else if !changed {
+			// 우리 항목이 없으면 쓰지 않는다 — 재기록은 바이트 중립이 아니어서(키 정렬·유니코드
+			// 이스케이프) 남의 서버만 담긴 손으로 쓴 파일을 우리가 고쳐 놓게 된다. 문면도 하지 않은
+			// 일을 했다고 말하지 않는다(형제 승인 키 문면이 이미 "없었으면 무변"으로 유보한다).
+			fmt.Fprintf(stdout, "mcp: .mcp.json에 %q 항목이 없어 파일을 그대로 두었습니다\n", ctrMCPServerName)
 		} else if writeErr := atomicWriteFile(mcpPath, mcpMerged); writeErr != nil {
 			fmt.Fprintln(stdout, "mcp: .mcp.json 기록 실패 — 훅 항목 제거는 완료되었습니다")
 		} else {
@@ -707,8 +713,14 @@ func runHookUninstall(args []string, projectRoot string, stdout io.Writer) error
 	// 승인 키 — 우리가 쓴 스코프(이번 uninstall이 겨냥한 그 파일)에서만 우리 이름을 뺀다. 다른
 	// 스코프에는 애초에 쓰지 않았으므로 건드리지 않는다. 파일이 없으면 지울 것도 없다(만들지 않는다).
 	// 훅 쓰기가 끝난 뒤 다시 읽는다 — 순서가 뒤집히면 훅 쓰기가 이 편집을 덮는다.
-	if prev, prevErr := os.ReadFile(path); prevErr == nil {
-		if next, mergeErr := mergeEnabledServers(prev, ctrMCPServerName, false); mergeErr != nil {
+	// --user는 install이 이 키를 쓰지 않는 스코프다(위 --user 분기) — 그 파일의 목록은 사용자가 직접
+	// 넣은 것이므로 제거도 하지 않는다. "설치가 쓸 수 있었던 스코프만 되돌린다"의 대칭이다.
+	if *user {
+		fmt.Fprintln(stdout, "mcp: --user 제거는 승인 키를 건드리지 않았습니다 — --user 설치가 그 키를 쓰지 않으므로 사용자 스코프의 enabledMcpjsonServers는 직접 넣은 목록입니다")
+	} else if prev, prevErr := os.ReadFile(path); prevErr == nil {
+		// keepEmpty: 우리 이름을 빼서 배열이 비더라도 하위 스코프가 같은 키를 정의하면 키를 지우지
+		// 않는다 — 지우는 순간 그 목록이 살아나 이 프로젝트에 넣지 않은 이름이 승인된다.
+		if next, mergeErr := mergeEnabledServers(prev, ctrMCPServerName, false, lowerScopeDefinesEnabled(projectRoot, os.ReadFile)); mergeErr != nil {
 			fmt.Fprintln(stdout, "mcp: 승인 키 병합 실패 — 훅 항목 제거는 완료되었습니다")
 		} else if writeErr := atomicWriteFile(path, next); writeErr != nil {
 			fmt.Fprintln(stdout, "mcp: 승인 키 기록 실패 — 훅 항목 제거는 완료되었습니다")

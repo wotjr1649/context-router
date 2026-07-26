@@ -27,10 +27,13 @@ var supersededMCPServerNames = []string{"ctr"}
 // (hookMarker: "context-router/<version>")로, 소유 판정과 self-heal의 근거다.
 // 이 4필드가 install이 소유하는 전부다 — 사용자가 우리 항목에 직접 넣은 그 밖의 키는
 // ctrMCPEntryKeys 기준으로 왕복 보존한다(mergeMCPServers).
+// alwaysLoad에 omitempty를 달지 않는다 — 사용자가 명시한 false를 그대로 내보내야 한다.
+// 지우고 나면 다음 재설치가 "명시 없음"으로 읽어 기본값 true로 되살리므로 재설치마다 값이
+// 진동한다(mergeMCPServers의 alwaysLoad 유지 규칙과 한 쌍).
 type mcpServerEntry struct {
 	Command    string   `json:"command"`
 	Args       []string `json:"args"`
-	AlwaysLoad bool     `json:"alwaysLoad,omitempty"`
+	AlwaysLoad bool     `json:"alwaysLoad"`
 	Managed    string   `json:"__ctrManaged,omitempty"`
 }
 
@@ -89,11 +92,17 @@ func mcpArgsForProfile(enableExec bool) []string {
 // setProfile=false면 기존 우리 항목의 args를 그대로 유지한다 — 플래그 없이 실행한 재설치가
 // 이미 켜둔 exec 프로필을 끄지 않게 하는 지점이다(마커는 setProfile과 무관하게 항상 현재 값으로
 // 덮어쓴다 — self-heal). install은 대체된 과거 등록도 함께 정리한다(D63 ② 단일 서버).
-func mergeMCPServers(existing []byte, name string, entry mcpServerEntry, install, setProfile bool) ([]byte, error) {
+//
+// changed=false는 제거 경로에서 우리 항목이 애초에 없었다는 뜻이다 — 호출자가 쓰기와 "제거 완료"
+// 문면을 함께 건너뛰게 하는 신호다(uninstallCodexConfigBlock의 changed와 같은 역할). 무변경 재기록은
+// 바이트 중립이 아니다: 재마샬링이 키를 정렬하고 &를 유니코드 이스케이프로 바꾸므로, 우리 항목이
+// 없는 남의 파일을 손대지 않으려면 이 신호가 필요하다. install 경로는 항상 true다 — 마커 self-heal이
+// 있어 "무변경"이 성립하지 않는다.
+func mergeMCPServers(existing []byte, name string, entry mcpServerEntry, install, setProfile bool) ([]byte, bool, error) {
 	doc := map[string]json.RawMessage{}
 	if len(bytes.TrimSpace(existing)) > 0 { // 공백뿐인 파일은 빈 병합 기반(mergeHookSettings:125 형제)
 		if err := json.Unmarshal(existing, &doc); err != nil {
-			return nil, errors.New("mcp: 설정 파싱 실패") // 경로·원문 미포함
+			return nil, false, errors.New("mcp: 설정 파싱 실패") // 경로·원문 미포함
 		}
 		if doc == nil { // JSON `null` → Unmarshal이 맵을 nil로 설정(할당 시 패닉 — 최종 리뷰 C5 형제)
 			doc = map[string]json.RawMessage{}
@@ -102,7 +111,7 @@ func mergeMCPServers(existing []byte, name string, entry mcpServerEntry, install
 	servers := map[string]json.RawMessage{}
 	if raw, ok := doc["mcpServers"]; ok {
 		if err := json.Unmarshal(raw, &servers); err != nil {
-			return nil, errors.New("mcp: mcpServers 파싱 실패")
+			return nil, false, errors.New("mcp: mcpServers 파싱 실패")
 		}
 		if servers == nil { // `{"mcpServers":null}` 동일 경로
 			servers = map[string]json.RawMessage{}
@@ -118,19 +127,28 @@ func mergeMCPServers(existing []byte, name string, entry mcpServerEntry, install
 	var prevExists bool
 	if raw, ok := servers[name]; ok {
 		if err := json.Unmarshal(raw, &prev); err != nil {
-			return nil, errors.New("mcp: 기존 항목 파싱 실패")
+			return nil, false, errors.New("mcp: 기존 항목 파싱 실패")
 		}
 		if err := json.Unmarshal(raw, &prevRaw); err != nil {
-			return nil, errors.New("mcp: 기존 항목 파싱 실패")
+			return nil, false, errors.New("mcp: 기존 항목 파싱 실패")
 		}
 		if !strings.HasPrefix(prev.Managed, hookMarkerPrefix()) && prev.Command != hookBinaryName {
-			return nil, errors.New("mcp: 같은 이름의 다른 서버 항목이 있어 갱신을 멈춘다")
+			return nil, false, errors.New("mcp: 같은 이름의 다른 서버 항목이 있어 갱신을 멈춘다")
 		}
 		prevExists = true
 	}
+	changed := prevExists // 제거 경로의 신호 — install 경로는 아래에서 무조건 true로 올린다
 	if install {
+		changed = true
 		if prevExists && !setProfile {
 			entry.Args = prev.Args // 프로필 유지 — 명시 플래그 없이는 profile을 바꾸지 않는다
+		}
+		// 명시된 alwaysLoad도 args와 같은 규칙으로 유지한다 — 이 키는 서버가 연결될 때까지 세션
+		// 시작을 막으므로(호스트 5초 상한) 사용자가 false로 끌 이유가 실재하고, 우리 소유 키라
+		// keepUnownedEntryKeys가 되돌려 주지 않는다. 켜고 끄는 플래그가 없어 "명시돼 있으면 유지"가
+		// 전부다. 키가 없으면(첫 등록·마커 이전 등록) 우리 기본값 true를 쓴다 — self-heal이다.
+		if _, ok := prevRaw["alwaysLoad"]; ok {
+			entry.AlwaysLoad = prev.AlwaysLoad
 		}
 		if entry.Args == nil {
 			entry.Args = []string{} // "args": [] 고정 — nil은 null로 나가 멱등 비교가 흔들린다
@@ -144,17 +162,24 @@ func mergeMCPServers(existing []byte, name string, entry mcpServerEntry, install
 			if !ok {
 				continue
 			}
-			var prev mcpServerEntry
-			if err := json.Unmarshal(raw, &prev); err == nil && prev.Command == hookBinaryName {
+			var retired mcpServerEntry
+			if err := json.Unmarshal(raw, &retired); err == nil && retired.Command == hookBinaryName {
+				// 은퇴시키는 항목의 프로필은 우리 이름으로 이월한다 — 우리 이름에 기존 항목이 없으면
+				// 그 항목이 사용자가 켜 둔 프로필의 유일한 근거이고, 지우면서 이월하지 않으면 재설치가
+				// 도구를 조용히 줄인 뒤 "병합 완료"만 보고한다. 우선순위는 위 args 유지 규칙과 같다:
+				// 명시 플래그(setProfile) > 우리 이름의 기존 항목(prevExists) > 은퇴 항목.
+				if !prevExists && !setProfile && len(retired.Args) > 0 {
+					entry.Args = retired.Args
+				}
 				delete(servers, old)
 			}
 		}
 		b, err := json.Marshal(entry)
 		if err != nil {
-			return nil, errors.New("mcp: 항목 직렬화 실패")
+			return nil, false, errors.New("mcp: 항목 직렬화 실패")
 		}
 		if b, err = keepUnownedEntryKeys(prevRaw, b); err != nil {
-			return nil, err
+			return nil, false, err
 		}
 		servers[name] = b
 	} else {
@@ -169,15 +194,15 @@ func mergeMCPServers(existing []byte, name string, entry mcpServerEntry, install
 	} else {
 		sb, err := json.Marshal(servers)
 		if err != nil {
-			return nil, errors.New("mcp: mcpServers 직렬화 실패")
+			return nil, false, errors.New("mcp: mcpServers 직렬화 실패")
 		}
 		doc["mcpServers"] = sb
 	}
 	out, err := json.MarshalIndent(doc, "", "  ")
 	if err != nil {
-		return nil, errors.New("mcp: 설정 직렬화 실패")
+		return nil, false, errors.New("mcp: 설정 직렬화 실패")
 	}
-	return append(out, '\n'), nil
+	return append(out, '\n'), changed, nil
 }
 
 // enabledServersScope — enabledMcpjsonServers 키를 정의한 스코프를 우선순위 순으로 조사한다.
@@ -198,16 +223,23 @@ func enabledServersScope(projectRoot string, readFile func(string) ([]byte, erro
 	winner := ""
 	// 높은 우선순위부터 — local(가장 좁음) > project > user. 관리자 정책·CLI 인자 스코프는
 	// local보다 높지만 단일 사용자 로컬 도구의 판정 범위 밖이라 보지 않는다.
+	// 확인하지 못한 스코프는 "정의 없음"이 아니다 — 조용히 건너뛰면 설치가 상위 스코프가 통째로
+	// override 하는 자리에 승인 키를 쓰고 "기록했습니다"까지 찍는다. 미존재만 확인된 상태로 보고,
+	// 그 밖의 읽기·파싱 실패는 판정 불가로 올려 호출자가 쓰기를 건너뛰게 한다(askShadowedAllows가
+	// 거짓 clean을 막으려 이미 쓰는 규칙). 오류 문면에는 경로·원문을 담지 않는다(§12).
 	for _, p := range []string{localPath, projectPath, userPath} {
 		b, err := readFile(p)
 		if err != nil {
-			continue // 미존재·읽기 실패는 "정의 없음"으로 본다
+			if errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+			return "", nil, errors.New("mcp: settings 읽기 실패")
 		}
 		var doc struct {
 			Enabled []string `json:"enabledMcpjsonServers"`
 		}
 		if err := json.Unmarshal(b, &doc); err != nil {
-			continue // 깨진 파일은 이 판정에서 무시한다(설치기가 건드리지 않는다)
+			return "", nil, errors.New("mcp: settings 파싱 실패")
 		}
 		if doc.Enabled == nil {
 			continue
@@ -234,13 +266,32 @@ func enabledServersScopeLabel(projectRoot, path string) string {
 	return "user" // enabledServersScope가 조사하는 세 경로 중 남는 하나
 }
 
+// lowerScopeDefinesEnabled — 설치가 쓰는 project 스코프보다 **낮은** 스코프가 승인 키를 정의하는가.
+// uninstall이 우리 이름을 뺀 배열이 비었을 때 키를 지워도 되는지를 가르는 판정이다 — 이 키는 스코프
+// 간 병합되지 않고 최상위 정의가 통째로 override 하므로, 키를 지우면 그 아래 정의가 살아난다.
+// project 아래는 user뿐이다(local은 project보다 높아 project 키를 지워도 효력이 바뀌지 않는다).
+// 판정하지 못하면 "정의됨"을 유지하는 쪽(true)으로 기운다 — 뒤집는 쪽만 사용자가 이 프로젝트에 넣지
+// 않은 이름을 승인하는 결과를 만든다. 스코프 순회는 enabledServersScope 하나로 통일한다(같은 질문에
+// 두 번째 순회를 두지 않는다 — D13).
+func lowerScopeDefinesEnabled(projectRoot string, readFile func(string) ([]byte, error)) bool {
+	_, defined, err := enabledServersScope(projectRoot, readFile)
+	if err != nil {
+		return true
+	}
+	return slices.ContainsFunc(defined, func(p string) bool {
+		return enabledServersScopeLabel(projectRoot, p) == "user"
+	})
+}
+
 // mergeEnabledServers — settings 문서(existing, 빈 슬라이스 허용)의 enabledMcpjsonServers에
 // add면 name을 더하고 아니면 name을 뺀 JSON을 반환한다. 다른 키·다른 원소는 원문 그대로
 // 보존한다(json.RawMessage). 이미 있으면(제거 시엔 이미 없으면) 배열을 그대로 둔다 — 재실행이
 // 파일 바이트를 흔들지 않게 하는 멱등 조건이다.
 // 직렬화 형식(2-space MarshalIndent + 개행)은 mergeHookSettings와 같아야 한다 — 같은 파일을
 // 한 번의 설치에서 차례로 쓰므로 형식이 갈리면 재설치마다 바이트가 진동한다.
-func mergeEnabledServers(existing []byte, name string, add bool) ([]byte, error) {
+// keepEmpty는 제거 경로에서만 뜻이 있다(add 경로는 목록이 비지 않는다): 우리가 비운 배열을 키째로
+// 지우지 말고 빈 배열로 남기라는 지시다 — 판정은 호출자가 lowerScopeDefinesEnabled로 한다.
+func mergeEnabledServers(existing []byte, name string, add, keepEmpty bool) ([]byte, error) {
 	doc := map[string]json.RawMessage{}
 	if len(bytes.TrimSpace(existing)) > 0 { // 공백뿐인 파일은 빈 병합 기반(mergeMCPServers 형제)
 		if err := json.Unmarshal(existing, &doc); err != nil {
@@ -265,6 +316,12 @@ func mergeEnabledServers(existing []byte, name string, add bool) ([]byte, error)
 		list = slices.DeleteFunc(list, func(s string) bool { return s == name })
 	}
 	switch {
+	case len(list) == 0 && before > 0 && keepEmpty:
+		// 같은 "정의됨→미정의" 위험이 우리가 비운 배열에도 있다 — 하위 스코프가 이 키를 정의하면
+		// 키를 지우는 순간 그 목록이 살아나, 사용자가 이 프로젝트에 넣지 않은 이름이 승인된다.
+		// 그 경우에는 빈 배열을 남겨 스코프의 정의 상태를 그대로 둔다. 재실행은 before==0 경로로
+		// 들어가 이 []를 손대지 않으므로 바이트 멱등도 유지된다.
+		doc["enabledMcpjsonServers"] = json.RawMessage("[]")
 	case len(list) == 0 && before > 0:
 		// 우리가 비운 배열만 키째로 지운다 — mergeHookSettings(:167·:177)의 빈 컨테이너 제거 규칙과
 		// 같은 규칙이다(제거 뒤 흔적을 남기지 않는다). 원래 비어 있던 []는 손대지 않는다: 그것은
@@ -292,10 +349,13 @@ type permissionRules struct {
 	} `json:"permissions"`
 }
 
-// ruleMatches — ask 규칙 r이 allow 규칙 a가 가리키는 도구를 덮는가. 세 형태를 다룬다: 리터럴 완전
-// 일치, **서버 단위 규칙("mcp__server" — 그 서버의 전 도구를 덮는 문서화된 형태)**, 도구 위치 접미
-// glob("mcp__server__prefix_*"). 서버 세그먼트에는 glob이 오지 않는다. 서버 단위 형태를 빼면 그
-// 형태로 가려진 allow가 진단에서 거짓 clean으로 나온다(최종 리뷰 F5).
+// ruleMatches — ask 규칙 r과 allow 규칙 a가 가리키는 도구 집합이 겹치는가. 겹치면 그 교집합의
+// 도구에서 allow는 효력이 없다. 세 형태를 다룬다: 리터럴 완전 일치, **서버 단위 규칙("mcp__server" —
+// 그 서버의 전 도구를 덮는 문서화된 형태)**, 도구 위치 접미 glob("mcp__server__prefix_*"). 서버
+// 세그먼트에는 glob이 오지 않는다.
+// 형태 확장은 두 인자에 대칭으로 적용한다 — 한쪽(ask)에만 넓히면 서버 단위·와일드카드 **allow**가
+// 진단에서 거짓 clean으로 나온다. ask가 그 집합 안의 도구를 가리키면 프롬프트는 그대로 강제된다
+// (최종 리뷰 F5의 근거를 allow 쪽까지 적용한 것이다).
 // 판정은 mcp__ 접두 규칙에 한정한다: 매칭 규칙이 그 형태에만 정의돼 있고, 비-MCP 규칙(Read/Edit
 // 형태)은 인자에 절대경로를 담을 수 있어 진단 라인에 그대로 실리면 안 된다(리뷰 F5, §12).
 // 두 인자 모두를 걸러 여기 한 곳에서 비교 범위와 출력 범위가 함께 좁혀진다 — 아래 형태 확장은
@@ -304,15 +364,33 @@ func ruleMatches(r, a string) bool {
 	if !strings.HasPrefix(r, "mcp__") || !strings.HasPrefix(a, "mcp__") {
 		return false
 	}
-	// 서버 단위 규칙은 구분자까지 붙여 비교한다 — 구분자 없이 접두만 보면 이름이 r로 시작하는
-	// **다른** 서버(mcp__ctr-exec2__…)의 도구까지 덮는다고 오판한다.
-	if r == a || strings.HasPrefix(a, r+"__") {
-		return true
+	rp, rLiteral := ruleToolSet(r)
+	ap, aLiteral := ruleToolSet(a)
+	switch {
+	case rLiteral && aLiteral:
+		// 리터럴끼리는 완전 일치만이다 — 접두로 비교하면 ctr_index가 ctr_indexer를 덮는다고 오판한다.
+		return rp == ap
+	case rLiteral:
+		return strings.HasPrefix(rp, ap)
+	case aLiteral:
+		return strings.HasPrefix(ap, rp)
 	}
-	if !strings.HasSuffix(r, "*") {
-		return false
+	// 둘 다 집합이면 한쪽 접두가 다른 쪽 접두를 포함할 때만 겹친다(좁은 쪽이 곧 교집합).
+	return strings.HasPrefix(rp, ap) || strings.HasPrefix(ap, rp)
+}
+
+// ruleToolSet — 규칙 하나가 가리키는 도구 집합을 "접두 + 리터럴 여부"로 환원한다. 서버 단위 규칙은
+// 구분자까지 붙여 접두로 만든다 — 구분자 없이 이름 접두만 보면 이름이 그 규칙으로 시작하는 **다른**
+// 서버(mcp__ctr-exec2__…)의 도구까지 집합에 든다고 오판한다. 서버 단위 판정은 "mcp__" 뒤에 구분자가
+// 더 없는가로 한다(도구 자리가 비어 있다는 뜻).
+func ruleToolSet(rule string) (prefix string, literal bool) {
+	if strings.HasSuffix(rule, "*") {
+		return strings.TrimSuffix(rule, "*"), false
 	}
-	return strings.HasPrefix(a, strings.TrimSuffix(r, "*"))
+	if !strings.Contains(strings.TrimPrefix(rule, "mcp__"), "__") {
+		return rule + "__", false
+	}
+	return rule, true
 }
 
 // askShadowedAllows — 모든 스코프의 permissions를 모아, ask가 덮는 allow 항목을 보고한다.
