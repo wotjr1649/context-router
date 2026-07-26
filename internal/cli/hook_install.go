@@ -15,7 +15,9 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/wotjr1649/context-router/internal/hook"
 )
@@ -899,13 +901,13 @@ func countRegisteredHooks(path string) (int, error) {
 // ts가 1+ 숫자이고 사유(필드[1])가 비지 않는 그 두 필드 수의 줄만 사유로 센다. 그 외 필드 수·비숫자
 // ts·사유 없음은 "unparsed"(느슨 수용 금지, 설계 §5) — 진단은 절대 중단하지 않고, total은 빈 줄
 // 포함 모든 줄을 센다(줄 수 계약). 파일 부재·읽기 실패는 (0, nil) — countDropsLog와 동일 fail-soft.
-func dropsByReason(path string) (int, map[string]int) {
+func dropsByReason(path string) (int, map[string]int, map[string]int64) {
 	f, err := os.Open(path)
 	if err != nil {
-		return 0, nil
+		return 0, nil, nil
 	}
 	defer func() { _ = f.Close() }()
-	total, reasons := 0, map[string]int{}
+	total, reasons, lastSeen := 0, map[string]int{}, map[string]int64{}
 	sc := bufio.NewScanner(f)
 	sc.Buffer(make([]byte, 0, 64*1024), 1<<20) // 긴 줄에도 스캔 중단 방지(countDropsLog 관례 보존)
 	for sc.Scan() {
@@ -914,11 +916,18 @@ func dropsByReason(path string) (int, map[string]int) {
 		// D43: 정확 2필드(구) 또는 정확 5필드(신)만 수용 — 그 외 필드 수는 unparsed(느슨 수용 금지).
 		if (len(fields) == 2 || len(fields) == 5) && fields[1] != "" && isUnixTS(fields[0]) {
 			reasons[fields[1]]++
+			// D71: 사유별 ts 최댓값. isUnixTS는 자릿수 상한을 보지 않으므로 int64 변환이 따로
+			// 실패할 수 있다 — 그 줄은 집계에만 남기고 병기는 생략한다(키를 만들지 않는다).
+			if ts, convErr := strconv.ParseInt(fields[0], 10, 64); convErr == nil {
+				if prev, ok := lastSeen[fields[1]]; !ok || ts > prev {
+					lastSeen[fields[1]] = ts
+				}
+			}
 		} else {
 			reasons["unparsed"]++ // 빈 줄·비숫자 ts·필드 수 불일치·사유 없음 전부 unparsed
 		}
 	}
-	return total, reasons
+	return total, reasons, lastSeen
 }
 
 // isUnixTS — appendDrop이 쓰는 ts(time.Now().Unix()의 "%d")는 1+ ASCII 숫자다. 그 형식만 인정한다
@@ -936,7 +945,7 @@ func isUnixTS(s string) bool {
 }
 
 // formatDropCount — "N(사유=n,...)" 렌더(사유 알파벳순, 결정적). N==0이면 "0".
-func formatDropCount(total int, reasons map[string]int) string {
+func formatDropCount(total int, reasons map[string]int, lastSeen map[string]int64) string {
 	if total == 0 {
 		return "0"
 	}
@@ -947,6 +956,12 @@ func formatDropCount(total int, reasons map[string]int) string {
 	sort.Strings(keys)
 	parts := make([]string, 0, len(keys))
 	for _, k := range keys {
+		// D71: 마지막 발생 시각을 UTC 날짜로 병기한다 — 로컬 타임존이면 골든이 3-OS CI의
+		// 타임존에 따라 갈린다. ts가 없는 사유(unparsed·변환 실패)는 건수만 낸다.
+		if ts, ok := lastSeen[k]; ok {
+			parts = append(parts, fmt.Sprintf("%s=%d@%s", k, reasons[k], time.Unix(ts, 0).UTC().Format("2006-01-02")))
+			continue
+		}
 		parts = append(parts, fmt.Sprintf("%s=%d", k, reasons[k]))
 	}
 	return fmt.Sprintf("%d(%s)", total, strings.Join(parts, ","))

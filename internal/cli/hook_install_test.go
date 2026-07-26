@@ -519,7 +519,7 @@ func TestDoctor_HookItemsAndAscendingOrder(t *testing.T) {
 		if !strings.Contains(out, "[9] hooks: project=등록됨") {
 			t.Fatalf("out missing registered-hooks line:\n%s", out)
 		}
-		if !strings.Contains(out, "[12] drops: store-root=2(a=1,b=1) worktree=3(x=1,y=1,z=1) total=5") {
+		if !strings.Contains(out, "[12] drops: store-root=2(a=1@1970-01-01,b=1@1970-01-01) worktree=3(x=1@1970-01-01,y=1@1970-01-01,z=1@1970-01-01) total=5") {
 			t.Fatalf("out missing reason-rollup drops line:\n%s", out)
 		}
 		assertDoctorAscending(t, out)
@@ -536,7 +536,7 @@ func TestDropsByReason_StrictParsing(t *testing.T) {
 	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	total, reasons := dropsByReason(path)
+	total, reasons, _ := dropsByReason(path)
 	if total != 5 {
 		t.Fatalf("total=%d want 5(빈 줄 포함 모든 줄)", total)
 	}
@@ -561,7 +561,7 @@ func TestDropsByReasonFiveFields(t *testing.T) {
 	if err := os.WriteFile(p, []byte(data), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	_, got := dropsByReason(p) // 실제 시그니처: (total, reasons)
+	_, got, _ := dropsByReason(p) // 실제 시그니처: (total, reasons, lastSeen)
 	if got["unknown-session"] != 1 || got["shadow-oversize"] != 1 {
 		t.Fatalf("5필드 reason 집계 실패: %v", got)
 	}
@@ -1087,5 +1087,47 @@ func TestRunHookInstallCodexCoupling(t *testing.T) {
 	}
 	if !strings.Contains(buf2.String(), "보류") {
 		t.Fatalf("보류 안내 누락: %s", buf2.String())
+	}
+}
+
+// TestDropsLastSeenUTC — D71: 사유별 마지막 발생 시각을 UTC 날짜로 병기한다. 역순 ts가 섞여도
+// 최댓값을 쓰고(로그가 시간순임을 가정하지 않는다), 정수 변환에 실패한 ts는 집계만 하고 병기를
+// 생략하며, unparsed에는 ts가 없으므로 병기하지 않는다.
+func TestDropsLastSeenUTC(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "session.drops.log")
+	// a: 역순(둘째 줄이 더 과거) → 최댓값 1700000000 = 2023-11-14 UTC.
+	// b: 자릿수 초과로 int64 변환 실패 → 집계는 되고 병기는 없다(isUnixTS는 통과한다).
+	// 빈 줄 → unparsed.
+	data := "1700000000\ta\n1600000000\ta\n" +
+		"99999999999999999999\tb\n" +
+		"\n"
+	if err := os.WriteFile(p, []byte(data), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	total, reasons, last := dropsByReason(p)
+	if total != 4 {
+		t.Fatalf("total=%d want 4(빈 줄 포함 줄 수 계약)", total)
+	}
+	if reasons["a"] != 2 || reasons["b"] != 1 || reasons["unparsed"] != 1 {
+		t.Fatalf("reasons=%v want a=2,b=1,unparsed=1", reasons)
+	}
+	if last["a"] != 1700000000 {
+		t.Fatalf("last[a]=%d want 1700000000(최댓값 — 마지막 줄이 아니다)", last["a"])
+	}
+	if _, ok := last["b"]; ok {
+		t.Fatalf("last[b]는 없어야 한다(int64 변환 실패): %v", last)
+	}
+	if _, ok := last["unparsed"]; ok {
+		t.Fatalf("last[unparsed]는 없어야 한다: %v", last)
+	}
+	got := formatDropCount(total, reasons, last)
+	want := "4(a=2@2023-11-14,b=1,unparsed=1)"
+	if got != want {
+		t.Fatalf("formatDropCount=%q want %q", got, want)
+	}
+	// §2 D71 ②: 빈 로그(total==0)는 병기 없이 "0"이다 — 위 빈 줄은 total>0의 unparsed
+	// 케이스이므로 이 경로를 따로 단정한다.
+	if got := formatDropCount(0, nil, nil); got != "0" {
+		t.Fatalf("formatDropCount(0,nil,nil)=%q want \"0\"", got)
 	}
 }

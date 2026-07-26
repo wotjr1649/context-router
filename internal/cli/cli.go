@@ -1677,13 +1677,13 @@ func runDoctor(ctx context.Context, w io.Writer, storeRoot, projectRoot, version
 	// [12] drops 건수 — 두 위치 합산(T4 결정): <storeRoot>/드롭(식별 전) + <sessionDir>/드롭(worktree별).
 	// 각 위치를 사유별로 롤업해 "N(사유=n,...)"로 렌더한다(설계 v0.3 §5·D33a). total은 줄 수 합계
 	// (빈 줄·미파싱 줄 포함 — 기존 줄 수 계약 보존).
-	rootTotal, rootReasons := dropsByReason(filepath.Join(storeRoot, dropsFileName))
-	wtTotal, wtReasons := 0, map[string]int(nil)
+	rootTotal, rootReasons, rootLast := dropsByReason(filepath.Join(storeRoot, dropsFileName))
+	wtTotal, wtReasons, wtLast := 0, map[string]int(nil), map[string]int64(nil)
 	if canon.ProjectID != "" && canon.WorktreeID != "" {
-		wtTotal, wtReasons = dropsByReason(filepath.Join(storeRoot, "projects", canon.ProjectID, "worktrees", canon.WorktreeID, dropsFileName))
+		wtTotal, wtReasons, wtLast = dropsByReason(filepath.Join(storeRoot, "projects", canon.ProjectID, "worktrees", canon.WorktreeID, dropsFileName))
 	}
 	fmt.Fprintf(w, "[12] drops: store-root=%s worktree=%s total=%d\n",
-		formatDropCount(rootTotal, rootReasons), formatDropCount(wtTotal, wtReasons), rootTotal+wtTotal)
+		formatDropCount(rootTotal, rootReasons, rootLast), formatDropCount(wtTotal, wtReasons, wtLast), rootTotal+wtTotal)
 
 	// [13] 사이드카(drops.log) 기록 가능 여부 — worktree 세션 dir이 실재하면 그걸, 아니면
 	// store-root를 프로브한다(식별 전 drops는 store-root, 이후는 worktree dir, §2.3).
