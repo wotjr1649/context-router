@@ -252,7 +252,9 @@ func detectJS() (string, string, error) {
 // 1.3.14 실측). 그래서 키에 무관한 레버인 홈 포인터 자체를 스크래치로 돌린다(csEnv 선례).
 // 검증 한계를 밝혀 둔다: windows 1.3.14에서는 어떤 홈 포인터(HOME·XDG_CONFIG_HOME·USERPROFILE·
 // HOMEDRIVE+HOMEPATH)로도 전역 bunfig가 적용되지 않아(실측) 이 갈래가 닫는 것은 문서상 unix
-// 경로이며, CI에 bun이 없어 3-OS 실증 대상이 아니다. USERPROFILE은 돌리지 않는다 — windows에서
+// 경로다. CI는 이제 3-OS 전부에 bun 1.3.14를 설치하므로(ci.yml) 그 unix 경로에서 격리 단정 절반이
+// ubuntu·macos에서 처음 실행되고, windows는 픽스처 무효를 Skip 문면으로 남긴다
+// (TestRunJSScratchBunfigWins). USERPROFILE은 돌리지 않는다 — windows에서
 // 효과가 없고(실측) node/npm 쪽 부작용만 크다.
 func jsEnv(scratch string) []string {
 	rc := filepath.Join(scratch, "npmrc")
