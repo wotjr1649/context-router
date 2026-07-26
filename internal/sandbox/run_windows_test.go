@@ -6,7 +6,9 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -43,7 +45,20 @@ func TestRunWindowsEchoAndExit(t *testing.T) {
 // 잡 상속)하고 그 PID를 파일에 남긴다. Run 반환 후 "지연 < 임계"만이 아니라 손자 PID가
 // 실제로 소멸했는지까지 확인한다 — WaitDelay(5s)가 루트만 회수해도 통과하던 약한 검사를
 // 막는다.
+//
+// Env는 닫힌 표에 PSModulePath를 명시로 덧붙인다(exec.go shellRunner의 재지정과 같은 모양).
+// D65에서 이 키가 표에서 빠진 뒤로, 값이 없으면 PowerShell이 유효 모듈 경로를 호스트 상태
+// (HKLM/HKCU 환경값·셸 폴더)에서 스스로 재구성한다 — 개발기에서는 시스템 모듈 경로가 되살아나
+// 통과하지만 CI(windows-latest)에서는 루트가 손자 PID를 남기지 못했다(v0.11 3.07s 초록 →
+// v0.12 6.04s 실패, 이 패키지의 유일한 변경이 그 키의 제거였다). 즉 이 테스트는 호스트의
+// PSModulePath에 암묵적으로 기대고 있었고, 명시 주입이 자식의 유효 모듈 경로를 호스트와
+// 무관하게 고정한다. bare BaseEnv()로 "단순화"하지 말 것 — 표에 되돌려 넣는 것도 금지다
+// (그건 D65가 닫은 호스트 상속이다).
 func TestRunWindowsTimeoutKillsTree(t *testing.T) {
+	psExe, err := exec.LookPath("powershell.exe")
+	if err != nil {
+		t.Fatalf("powershell.exe 미해석 — 트리 종료 검증 불가: %v", err)
+	}
 	dir := t.TempDir()
 	pidFile := filepath.Join(dir, "gc.pid")
 	script := "$psi=New-Object System.Diagnostics.ProcessStartInfo;" +
@@ -52,9 +67,9 @@ func TestRunWindowsTimeoutKillsTree(t *testing.T) {
 		"Set-Content -LiteralPath '" + pidFile + "' -Value $p.Id;" +
 		"$p.WaitForExit()"
 	s := Spec{
-		Argv:      []string{"powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script},
+		Argv:      []string{psExe, "-NoProfile", "-NonInteractive", "-Command", script},
 		Dir:       dir,
-		Env:       BaseEnv(),
+		Env:       append(BaseEnv(), "PSModulePath="+filepath.Join(filepath.Dir(psExe), "Modules")),
 		Timeout:   3 * time.Second,
 		StdoutCap: 32768, StderrCap: 8192,
 	}
@@ -64,13 +79,13 @@ func TestRunWindowsTimeoutKillsTree(t *testing.T) {
 		t.Fatalf("Run: %v", err)
 	}
 	if !r.TimedOut {
-		t.Fatalf("TimedOut=false")
+		t.Fatalf("TimedOut=false%s", rootOutput(r))
 	}
 	if time.Since(start) > 10*time.Second {
-		t.Fatalf("트리 미종료 — 지연 %v", time.Since(start))
+		t.Fatalf("트리 미종료 — 지연 %v%s", time.Since(start), rootOutput(r))
 	}
 
-	gcPid := readPidFile(t, pidFile)
+	gcPid := readPidFile(t, pidFile, r)
 	deadline := time.Now().Add(5 * time.Second)
 	for processAlive(gcPid) {
 		if time.Now().After(deadline) {
@@ -163,8 +178,15 @@ func assertJobLimits(t *testing.T, s Spec, wantMem uint64, wantProc uint32) {
 	}
 }
 
+// rootOutput: 실패 메시지에 붙일 루트 출력. Run이 상한 버퍼로 이미 회수해 둔 것을 버리지
+// 않고 남긴다 — 루트가 왜 기록에 실패했는지가 CI 로그에서 바로 읽히게(진단 없는 실패는
+// 원격에서만 재현되는 회귀를 추적 불가로 만든다).
+func rootOutput(r Result) string {
+	return fmt.Sprintf(" (루트 stdout=%q stderr=%q)", r.Stdout, r.Stderr)
+}
+
 // readPidFile: 루트가 손자를 스폰·기록할 때까지 잠깐 폴링한 뒤 PID를 읽는다.
-func readPidFile(t *testing.T, path string) int {
+func readPidFile(t *testing.T, path string, r Result) int {
 	t.Helper()
 	var b []byte
 	deadline := time.Now().Add(3 * time.Second)
@@ -175,7 +197,7 @@ func readPidFile(t *testing.T, path string) int {
 			break
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("손자 PID 파일 미기록: %v", err)
+			t.Fatalf("손자 PID 파일 미기록: %v%s", err, rootOutput(r))
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
