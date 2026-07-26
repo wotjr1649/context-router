@@ -1047,12 +1047,27 @@ type HookPurgeReport struct {
 // 원본 상수를 그대로 쓰면 문장마다 다른 집합을 보게 되어 행이 어긋난다.
 // ORDER BY는 LIMIT을 결정적으로 만들기 위한 것이다(같은 tx 스냅샷에서 세 번 평가되므로 순서가
 // 고정돼야 같은 집합이 나온다). content_hash는 DISTINCT 결과 열이라 SQLite가 정렬을 허용한다.
-// created_at은 unix 초다(store.go:188).
+//
+// 나이 기준은 마지막 포착(sources.indexed_at)이다 — 첫 포착(artifacts.created_at)이 아니다.
+// shadow URI는 콘텐츠 주소이고(ingest.go: "shadow:"+title+":"+contentHash) Register의 found 분기는
+// sources만 upsert하므로, 바이트 동일한 출력을 다시 포착하면 옛 artifacts 행이 재사용되고 created_at은
+// 첫 포착 시각에 머문다. 첫 포착 기준으로 고르면 방금 다시 포착한 콘텐츠가 지워져, 몇 초 전 모델에
+// 넘긴 참조가 ctr_fetch에서 해소되지 않고 그 청크도 ctr_search에서 사라진다. indexed_at은 그 upsert가
+// 갱신하므로 이 창을 닫는다 — 형제 보존 경로 PurgeOlderThan(store.go:714)과 같은 기준이다.
+// 행 단위가 아니라 hash 단위 배제인 이유: Register의 조회 키가 (content_hash, media_type)이라 같은
+// 콘텐츠가 media_type마다 별개 artifacts 행을 가질 수 있는데, 삭제와 CAS 회수는 hash 단위다 —
+// 한 행만 최근이어도 공유 blob은 살려야 한다. hook이 raw_blob_hash로 참조하는 경우는 따로 볼 필요가
+// 없다: RawBlob은 web 소스만 설정하고(ingest.go 웹 경로) 비-hook raw_blob 참조는 위 두 번째
+// NOT EXISTS가 이미 hash 전체를 비귀속으로 떨어뜨린다.
+// created_at·indexed_at은 모두 unix 초다(store.go:188·193).
 func shadowOwnedFilter(cutoffUnix int64, maxHashes int) (string, []any) {
 	q := shadowOwnedHashQuery
 	var args []any
 	if cutoffUnix > 0 {
-		q += "\n  AND a.created_at < ?"
+		q += `
+  AND NOT EXISTS (
+    SELECT 1 FROM artifacts a4 JOIN sources s4 ON s4.artifact_id = a4.id
+    WHERE a4.content_hash = a.content_hash AND s4.indexed_at >= ?)`
 		args = append(args, cutoffUnix)
 	}
 	if maxHashes > 0 {
@@ -1068,8 +1083,8 @@ func (s *Store) PurgeHookOnly(ctx context.Context) (HookPurgeReport, error) {
 }
 
 // PurgeHookOnlyOlderThan — D41 §3 + D67: shadow 귀속(그 hash를 참조하는 소스가 전부 hook) 아티팩트
-// 중 created_at이 cutoffUnix보다 오래된 것을 최대 maxHashes개까지, 행을 단일 tx로 삭제한 뒤(술어를
-// tx 안에서 재실행해 외부 견적을 신뢰하지 않는다), 커밋 후 lockStore 하에 물리 CAS 파일을 rename
+// 중 마지막 포착(sources.indexed_at)이 cutoffUnix보다 오래된 것을 최대 maxHashes개까지, 행을 단일
+// tx로 삭제한 뒤(술어를 tx 안에서 재실행해 외부 견적을 신뢰하지 않는다), 커밋 후 lockStore 하에 물리 CAS 파일을 rename
 // 격리 프로토콜로 회수한다. 행 삭제와 파일 회수를 내부 두 단계(purgeHookRows·reclaimHookBlobs)로
 // 나눠, 커밋↔회수 사이의 재등록 경합(Register.writeBlob 교체)을 rename 격리로 폐쇄하고 테스트가 그
 // 창에 개입할 수 있게 한다(신규 공개 표면 아님). cutoffUnix<=0이면 나이 필터가, maxHashes<=0이면

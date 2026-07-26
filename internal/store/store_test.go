@@ -2099,8 +2099,8 @@ func TestPurgeHookOnlyPreservesReindexResidue(t *testing.T) {
 // explicit 소스는 나이와 무관하게 보존된다(--hook-only 계약 유지).
 //
 // 주의: 기존 TestPurgeHookOnlyAgeGateDefers(store_test.go:1927)의 age gate는 파일 unlink
-// 유예(mtime 1시간)이고, 이 태스크가 더하는 것은 artifacts.created_at 기준 대상 선택이다.
-// 서로 다른 축이므로 두 테스트가 함께 통과해야 한다.
+// 유예(mtime 1시간)이고, 이 태스크가 더하는 것은 마지막 포착(sources.indexed_at) 기준 대상
+// 선택이다. 서로 다른 축이므로 두 테스트가 함께 통과해야 한다.
 func TestPurgeHookOnlyOlderThan(t *testing.T) {
 	st := openAt(t, t.TempDir())
 	regSource(t, st, "old-shadow", "text/plain", "shadow:Bash:old", "hook")
@@ -2112,13 +2112,22 @@ func TestPurgeHookOnlyOlderThan(t *testing.T) {
 	// 모든 unlink가 Deferred로 끝나고 ReclaimedB가 0이라 행 수만 검증하게 된다.
 	ageBlobFile(t, st, oldHash, -2*gcOrphanMinAge)
 
-	// regSource는 created_at을 받지 않으므로 직접 내린다(쓰기 핸들은 패키지 사설 st.writer).
+	// regSource는 시각을 받지 않으므로 직접 내린다(쓰기 핸들은 패키지 사설 st.writer). 대상 선택을
+	// 좌우하는 값은 마지막 포착(sources.indexed_at)이므로 그것을 반드시 내려야 한다 — 여기서
+	// created_at만 내리면 이 테스트는 나이 필터를 전혀 검증하지 않는 공허 통과가 된다. created_at도
+	// 함께 내려 "오래 전 첫 포착 후 재포착 없음"이라는 실제 상태로 시드한다(소스가 아티팩트보다 먼저
+	// 색인된 불가능한 조합을 만들지 않는다).
 	cutoff := time.Now().Add(-72 * time.Hour).Unix()
 	oldTS := time.Now().Add(-96 * time.Hour).Unix()
 	if _, err := st.writer.Exec(
 		`UPDATE artifacts SET created_at=? WHERE content_hash=?`, oldTS, oldHash,
 	); err != nil {
-		t.Fatalf("나이 조정: %v", err)
+		t.Fatalf("첫 포착 나이 조정: %v", err)
+	}
+	if _, err := st.writer.Exec(
+		`UPDATE sources SET indexed_at=? WHERE uri='shadow:Bash:old'`, oldTS,
+	); err != nil {
+		t.Fatalf("마지막 포착 나이 조정: %v", err)
 	}
 	// regSource는 Registration.Chunks를 넘기지 않아 청크 행이 생기지 않는다(store.go:426 루프가
 	// 빈 슬라이스를 돈다). chunks DELETE 경로를 덮으려면 새 shadow에 청크를 직접 심어야 한다.
@@ -2179,6 +2188,73 @@ func TestPurgeHookOnlyOlderThan(t *testing.T) {
 	}
 	if freelist == 0 {
 		t.Errorf("freelist_count=0 — 회수가 free page를 남기지 않았다(VACUUM이 돌았다)")
+	}
+}
+
+// TestPurgeHookOnlyOlderThanKeepsRecapturedContent: 나이 기준이 마지막 포착(sources.indexed_at)이라는
+// 것을 고정한다. shadow URI는 콘텐츠 주소라(ingest.go: "shadow:"+title+":"+contentHash) 바이트 동일한
+// 출력을 다시 포착하면 같은 URI로 upsert되어 옛 artifacts 행을 재사용하고, Register의 found 분기는
+// sources만 갱신해 created_at은 첫 포착 시각에 머문다. 첫 포착 기준으로 고르면 방금 다시 포착한
+// 콘텐츠가 지워져, 몇 초 전 모델에 넘긴 참조가 ctr_fetch에서 해소되지 않고 그 청크도 ctr_search에서
+// 사라진다. 재포착되지 않은 대조군을 함께 두는 이유: 그것이 없으면 purge가 아무것도 고르지 않아도
+// "재포착분 잔존"이 공허하게 통과한다.
+func TestPurgeHookOnlyOlderThanKeepsRecapturedContent(t *testing.T) {
+	st := openAt(t, t.TempDir())
+	const fresh = "recaptured-shadow zzrecap"
+	freshHash := hashOf(fresh)
+	freshURI := "shadow:Bash:" + freshHash // 콘텐츠 주소 URI — 재포착이 같은 행을 upsert한다
+	reg := Registration{
+		StoredBytes: []byte(fresh), MediaType: "text/plain",
+		Source: SourceMeta{URI: freshURI, Kind: "hook", SrcHash: "sh-" + freshURI},
+		Chunks: []Chunk{{Ordinal: 0, Text: fresh}},
+	}
+	if _, err := st.Register(t.Context(), reg); err != nil {
+		t.Fatal(err)
+	}
+	regSource(t, st, "stale-shadow", "text/plain", "shadow:Bash:stale", "hook")
+	staleHash := hashOf("stale-shadow")
+
+	cutoff := time.Now().Add(-72 * time.Hour).Unix()
+	oldTS := time.Now().Add(-96 * time.Hour).Unix()
+	// 두 hash 모두 첫 포착을 창 밖으로 내린다(created_at·indexed_at 양쪽 — WHERE 없이 전량).
+	if _, err := st.writer.Exec(`UPDATE artifacts SET created_at=?`, oldTS); err != nil {
+		t.Fatalf("첫 포착 나이 조정: %v", err)
+	}
+	if _, err := st.writer.Exec(`UPDATE sources SET indexed_at=?`, oldTS); err != nil {
+		t.Fatalf("포착 시각 나이 조정: %v", err)
+	}
+	// 재포착: 바이트 동일 → 같은 content_hash·같은 URI. artifacts는 found 분기라 청크도 재삽입되지
+	// 않고 created_at도 그대로다. sources upsert만 indexed_at을 지금으로 올린다(store.go:451).
+	if _, err := st.Register(t.Context(), reg); err != nil {
+		t.Fatal(err)
+	}
+	// CAS 파일 나이는 재포착(writeBlob은 매번 재작성 — store.go:342 rename) 이후에 먹인다. 그러지
+	// 않으면 mtime 1시간 유예가 unlink를 막아 "blob 잔존" 단정이 공허 통과한다.
+	ageBlobFile(t, st, freshHash, -2*gcOrphanMinAge)
+	ageBlobFile(t, st, staleHash, -2*gcOrphanMinAge)
+
+	// 나이·건수 예산을 함께 넘긴다 — 기동 경로(main.go: cutoff, startupPurgeMaxHashes)와 같은 모양이다.
+	// 두 ? 의 위치 인자가 뒤바뀌면 `indexed_at >= 5`(전량 미배제) + 거대 LIMIT이 되어 아래 단정이
+	// 깨진다. 그 조합을 쓰는 테스트가 여기뿐이라 이 자리에서 함께 고정한다.
+	rep, err := st.PurgeHookOnlyOlderThan(t.Context(), cutoff, 5)
+	if err != nil {
+		t.Fatalf("PurgeHookOnlyOlderThan: %v", err)
+	}
+	if rep.Hashes != 1 {
+		t.Fatalf("rep.Hashes=%d want 1(대조군만 삭제 — 재포착분은 마지막 포착이 cutoff 이후라 보존)", rep.Hashes)
+	}
+	assertHashGone(t, st, staleHash)
+	assertHashIntact(t, st, freshHash) // artifacts 행 + CAS 파일
+	var srcN, chunkN int
+	if err := st.Reader().QueryRow(
+		`SELECT (SELECT COUNT(*) FROM sources WHERE uri=?),
+		        (SELECT COUNT(*) FROM chunks WHERE artifact_id IN
+		           (SELECT id FROM artifacts WHERE content_hash=?))`, freshURI, freshHash,
+	).Scan(&srcN, &chunkN); err != nil {
+		t.Fatalf("잔존 조회: %v", err)
+	}
+	if srcN != 1 || chunkN != 1 {
+		t.Errorf("재포착분 sources=%d chunks=%d want 1/1(ctr_fetch·ctr_search가 해소되어야 한다)", srcN, chunkN)
 	}
 }
 
