@@ -54,11 +54,11 @@ func TestRunWindowsEchoAndExit(t *testing.T) {
 // bare BaseEnv()로 "단순화"하지 말 것 — 표에 되돌려 넣는 것도 금지다(그건 D65가 닫은 호스트
 // 상속이다).
 //
-// 이 주입은 아래 CI 정지의 교정이 아니다. 정지한 실행의 유효 값은 이미 머신 전역 + <PSHOME>
-// 2항목이었다(인터프리터가 스스로 덧붙인다 — 빵가루 psmod-len=93). 명시 주입은 그 값을 고정할
-// 뿐이라 정지 여부를 바꾸지 않는다. 원인 미확정 상태이므로 임시 진단 계측(treeKillScript 빵가루·
-// dumpTreeKillDiag·probe-env psmod-shipped·bisectModulePath)을 유지한다 — 자세한 실측표는 아래
-// "임시 진단 계측" 주석. 원인이 확정되면 계측을 제거한다.
+// 이번 주입은 아래 CI 정지의 **교정 시도**다: 첫 항목(사용자 모듈 슬롯)이 스크래치의 빈 디렉터리다.
+// 이분탐색이 정지를 푸는 항목을 호스트 사용자 모듈 경로 하나로 좁혔고(아래 확정 6), 그 값을 주입하는
+// 것은 D65가 금지하므로 슬롯만 우리 것으로 채운다. 가설이 맞는지는 계측이 같은 런에서 판별하므로
+// (probe-env psmod-shipped·psmod-scratch-only·psmod-scratch-noexist) 계측을 이 사이클에도 유지한다 —
+// 초록이 되든 안 되든 다음 결정의 근거가 그 세 줄이다. 자세한 실측표는 아래 "임시 진단 계측" 주석.
 func TestRunWindowsTimeoutKillsTree(t *testing.T) {
 	psExe, err := exec.LookPath("powershell.exe")
 	if err != nil {
@@ -73,7 +73,7 @@ func TestRunWindowsTimeoutKillsTree(t *testing.T) {
 			treeKillScript(bcPath, pidFile, 60),
 		},
 		Dir:       dir,
-		Env:       append(BaseEnv(), "PSModulePath="+psModulePath(psExe)),
+		Env:       append(BaseEnv(), "PSModulePath="+psModulePath(psExe, scratchModuleDir(t, dir))),
 		Timeout:   3 * time.Second,
 		StdoutCap: 32768, StderrCap: 8192,
 	}
@@ -111,20 +111,32 @@ func TestRunWindowsTimeoutKillsTree(t *testing.T) {
 	}
 }
 
-// psModulePath: exec.shellRunner의 extra가 주입하는 PSModulePath와 같은 유도 — 머신 전역
-// <ProgramFiles>\WindowsPowerShell\Modules + <PSHOME>\Modules, 이 순서. 이 테스트는
-// powershell.exe(5.1)만 띄우므로 5.1 갈래만 조립한다(pwsh 7이면 PowerShell\Modules).
+// psModulePath: exec.shellRunner의 extra가 주입하는 PSModulePath와 같은 유도 — 스크래치 빈 모듈
+// 디렉터리 + <PSHOME>\Modules + 머신 전역 <ProgramFiles>\WindowsPowerShell\Modules, 이 순서. 이
+// 테스트는 powershell.exe(5.1)만 띄우므로 5.1 갈래만 조립한다(pwsh 7이면 PowerShell\Modules).
 //
-// 세 줄을 복제하는 이유: 이 파일은 인패키지 테스트(package sandbox)이고 internal/exec는
+// 몇 줄을 복제하는 이유: 이 파일은 인패키지 테스트(package sandbox)이고 internal/exec는
 // internal/sandbox를 임포트하므로, 러너의 헬퍼를 가져오면 임포트 순환이 된다. 러너 쪽 유도를
 // 바꾸면 여기도 같이 바꿀 것 — internal/exec/exec.go의 psModulePath.
-func psModulePath(psExe string) string {
-	home := filepath.Join(filepath.Dir(psExe), "Modules")
-	pf := os.Getenv("ProgramFiles")
-	if pf == "" {
-		return home
+func psModulePath(psExe, scratchMods string) string {
+	out := []string{scratchMods, filepath.Join(filepath.Dir(psExe), "Modules")}
+	if pf := os.Getenv("ProgramFiles"); pf != "" {
+		out = append(out, filepath.Join(pf, "WindowsPowerShell", "Modules"))
 	}
-	return filepath.Join(pf, "WindowsPowerShell", "Modules") + ";" + home
+	return strings.Join(out, ";")
+}
+
+// scratchModuleDir: 러너가 스크래치 하위에 만드는 빈 모듈 디렉터리의 대역(exec.shellRunner의
+// extra와 같은 배치·같은 이름). 실재하는 빈 디렉터리인 것이 주입 값의 전제이므로 생성까지 여기서
+// 하고, 실패하면 실험 자체가 성립하지 않으므로 즉시 멈춘다(러너 쪽은 경고만 남기고 계속한다 —
+// 그쪽 실패 경로는 probe-env psmod-scratch-noexist가 모형화한다).
+func scratchModuleDir(t *testing.T, scratch string) string {
+	t.Helper()
+	d := filepath.Join(scratch, "psmodules")
+	if err := os.MkdirAll(d, 0o700); err != nil {
+		t.Fatalf("스크래치 모듈 디렉터리 생성 실패: %v", err)
+	}
+	return d
 }
 
 func TestProbeWindows(t *testing.T) {
@@ -236,6 +248,10 @@ func rootOutput(r Result) string {
 //   - 원인은 PSModulePath의 **값**이다. 같은 런의 네 변종 중 상속 값(8항목 359B)만 04를 남기고
 //     exit 0으로 완주했고(1.33s), 단일 항목(유효 93B)·값 없음(유효 292B)·표준 머신 변수 추가는
 //     모두 정지했다. probe-noiso(부모 환경 전체 상속)도 완주한다.
+//   - 확정 6 — 항목 이분탐색이 상속 값의 8항목을 하나로 좁혔다: 단독으로 정지를 푸는 항목은
+//     C:\Users\runneradmin\Documents\PowerShell\Modules, 즉 호스트 **사용자** 모듈 경로다.
+//     그 항목이 있으면 프로바이더 쓰기가 반환하고 exit 0·1.32s로 완주하며, 없으면 값이 더 좁아도
+//     (93B) 더 넓어도(292B 상위집합) 정지한다.
 //
 // 반증 5 — "단일 항목이라 부족했다"는 읽기. 자식의 유효 값은 주입 값이 아니다: 인터프리터가
 // 머신 전역 모듈 경로를 스스로 앞에 덧붙인다(로컬 실측 — 5.1: 50B 주입 → 유효 93B =
@@ -244,12 +260,15 @@ func rootOutput(r Result) string {
 // 주입 값을 그 2항목으로 넓히는 것은 유효 값을 바꾸지 않는다 — psModulePath의 명시는 값을
 // 고정하는 것이고 이 정지의 교정이 아니다.
 //
-// 남은 질문은 "상속 값(359B)의 무엇이 정지를 푸는가"다. 값 없음(292B)이 2항목의 상위집합인데도
-// 정지했으므로 답은 항목 수·머신 전역이 아니라 상속 값에만 있는 항목 쪽에 있다. probeEnvVariants가
-// psmod-shipped(지금 주입하는 값)로 정지를 다시 못 박고, 상속 값이 풀고 주입 값이 못 풀면
-// bisectModulePath가 상속 값을 항목 단위로 갈라 최소 집합을 남긴다 — 그 항목이 무엇인지가
-// 다음 결정의 입력이다(호스트 값을 주입하는 교정은 D65가 금지하므로, 답에 따라 러너 쪽이 아닌
-// 테스트 쪽 교정이 될 수도 있다: 빵가루 03이 [IO.File]::WriteAllText는 모든 변종에서 돌아옴을 보인다).
+// 확정 6의 항목을 그대로 주입하는 교정은 D65가 금지한다(호스트 설치 모듈이 스니펫에서 자동 로드된다).
+// 그래서 이번 사이클의 교정 가설은 "PowerShell이 요구하는 것은 **그 슬롯에 있는 경로**이지 실제
+// 사용자의 경로가 아니다"이고, 러너는 첫 항목에 스크래치의 빈 모듈 디렉터리를 넣는다(exec.go
+// psModulePath). 호스트 사용자 경로가 아니라 우리가 만든 빈 디렉터리이므로 D65 계약은 그대로다.
+// 이 파일의 주입도 같은 유도로 맞춰 두었으므로 본 테스트가 초록이면 그 자체가 교정의 증거다.
+// 가설이 틀렸을 때 다음 결정에 필요한 값은 probeEnvVariants의 psmod-shipped·psmod-scratch-only·
+// psmod-scratch-noexist·psmod-inherited가 실패 경로에서 낸다 — 읽는 법은 그 함수 주석. 스크래치
+// 변종이 모두 정지하고 상속 값만 푼다면 요건은 실제 사용자 프로필 하위 경로 자체라는 뜻이고, 그때는
+// 값을 더 만들어 보는 것이 아니라 D65를 다시 결정해야 한다.
 // 원인이 확정되면 판별 3단계·빵가루 문장과 dumpTreeKillDiag/probe*/synthPath/logBreadcrumbs/
 // logDroppedEnv/bisect*를 함께 제거하고 스크립트를 원래 5문장으로 되돌린다.
 
@@ -273,8 +292,10 @@ func treeKillScript(bcPath, pidPath string, pingCount int) string {
 		"$sp=[System.Diagnostics.Process]::GetCurrentProcess().StartTime.ToUniversalTime()",
 		// 01에 자식이 실제로 본 PATH·PSModulePath의 크기를 함께 싣는다 — 지금까지 유일하게
 		// 남는 데 성공한 줄이고, 아래 PATH 변종(probePathVariants)이 실제로 자식에 도달했는지를
-		// 이 한 줄로 확인할 수 있다. 값 전체가 아니라 크기만 남긴다(로그 폭발 방지).
-		"bc('01 enter pid=' + $PID + ' created=' + $sp.ToString('HH:mm:ss.fff') + ' startup-ms=' + [int](($t0 - $sp).TotalMilliseconds) + ' ps=' + $PSVersionTable.PSVersion + ' clr=' + $PSVersionTable.CLRVersion + ' lang=' + $ExecutionContext.SessionState.LanguageMode + ' host=' + $Host.Name + ' path-n=' + ($env:PATH -split ';').Count + ' path-len=' + $env:PATH.Length + ' psmod-len=' + $env:PSModulePath.Length)",
+		// 이 한 줄로 확인할 수 있다. 값 전체가 아니라 항목 수·크기만 남긴다(로그 폭발 방지).
+		// psmod-n은 인터프리터가 주입 값에 항목을 덧붙였는지를 드러낸다 — 모듈 경로 변종의 판정을
+		// "주입 값"이 아니라 "자식이 실제로 본 값"으로 읽게 하는 단서다.
+		"bc('01 enter pid=' + $PID + ' created=' + $sp.ToString('HH:mm:ss.fff') + ' startup-ms=' + [int](($t0 - $sp).TotalMilliseconds) + ' ps=' + $PSVersionTable.PSVersion + ' clr=' + $PSVersionTable.CLRVersion + ' lang=' + $ExecutionContext.SessionState.LanguageMode + ' host=' + $Host.Name + ' path-n=' + ($env:PATH -split ';').Count + ' path-len=' + $env:PATH.Length + ' psmod-n=' + ($env:PSModulePath -split ';').Count + ' psmod-len=' + $env:PSModulePath.Length)",
 		// ── 판별 3단계 ────────────────────────────────────────────────────────────
 		// 01 이후를 "계측"에서 "판별"로 바꾼다. 앞선 CI 런에서 01([IO.File]::AppendAllText)은
 		// 남았고 그 다음이 예외·오류 레코드·stdout·stderr 전부 없이 멈췄다. 예외 없는 정지는
@@ -386,6 +407,14 @@ func dumpScratch(t *testing.T, dir string) {
 
 func logFileIfAny(t *testing.T, path string) {
 	t.Helper()
+	// 스크래치에는 파일 아닌 항목도 있다(주입 값의 첫 항목인 psmodules 디렉터리). ReadFile로
+	// 읽으면 "부재/읽기 실패"로 찍혀 부재가 결론인 이 실험의 판독을 흐린다 — 항목 수로 남긴다.
+	// 그 수가 0인 것 자체가 D65 계약(우리 슬롯은 비어 있다)의 확인이다.
+	if fi, err := os.Stat(path); err == nil && fi.IsDir() {
+		ents, rerr := os.ReadDir(path)
+		t.Logf("[diag] --- %s\\ (디렉터리, 항목 %d개, err=%v) ---", filepath.Base(path), len(ents), rerr)
+		return
+	}
 	b, err := os.ReadFile(path)
 	if err != nil {
 		t.Logf("[diag] %s 부재/읽기 실패: %v", filepath.Base(path), err)
@@ -580,28 +609,47 @@ func envProbe(t *testing.T, s Spec, dir, name string, env []string) bool {
 	return ok
 }
 
-// probeEnvVariants: 남은 단 하나의 후보 — "닫힌 표가 어느 변수를 넘기는가" — 를 네 갈래로
-// 가른다. 판정은 빵가루 04(Set-Content 반환) 하나이고, 넷 다 무조건 돌린다(하나가 풀려도 나머지
-// 답은 독립된 정보다). 읽는 법:
+// probeEnvVariants: 교정 가설("사용자 모듈 슬롯에 우리 빈 디렉터리를 넣으면 충분하다")을 판별하고,
+// 틀렸을 때 다음 결정의 입력까지 같은 런에서 남긴다. 판정은 빵가루 04(Set-Content 반환) 하나이고,
+// 변종은 무조건 다 돌린다(하나가 풀려도 나머지 답은 독립된 정보다). 읽는 법:
 //
-//	psmod-shipped   04 없음 → 예상대로다(유효 값이 정지 실행과 같은 2항목이므로). 정지가 킬 경로가
-//	                        아니라 모듈 경로 쪽임을 자기완결 실행으로 다시 못 박는다.
-//	psmod-shipped   04 있음 → 놀라운 결과. 유효 항목 집합이 같으므로 남는 차이는 **항목 순서**뿐이다
-//	                        (명시 주입은 머신 전역·PSHOME 순서를 고정한다). 그때는 순서가 신호다.
-//	psmod-inherited 만 04 → PSModulePath 값이 원인. 이어서 bisectModulePath가 항목까지 좁힌다.
-//	psmod-absent    도 04 → 명시 주입이 문제이고 PowerShell의 재구성값은 충분하다.
-//	plus-omitted    만 04 → 원인은 PSModulePath 밖. 이어지는 이분탐색이 어느 변수인지 좁힌다.
-//	넷 다 정지            → 원인은 이 축들 밖. 닫힌 표가 떨어뜨리는 나머지(logDroppedEnv 목록)
-//	                        중 표준 머신 변수가 아닌 항목이 다음 후보다.
+//	psmod-shipped        04 있음 → 교정 확정. 스크래치 빈 디렉터리가 그 슬롯을 채우면 충분하고
+//	                             D65 계약은 그대로 유지된다(본 테스트도 초록이어야 한다).
+//	shipped 정지 + only 04    → 슬롯 자체는 스크래치로 충분한데 뒤 두 항목(PSHOME·머신 전역)이
+//	                             방해한다. 다음 교정은 항목 구성·순서 쪽이다.
+//	shipped 04 + noexist 정지 → 디렉터리 **실재**가 시행점이다. 러너의 MkdirAll 실패는 격리가
+//	                             아니라 정지로 이어지므로, 그 실패는 경고로 끝낼 수 없다.
+//	shipped·noexist 둘 다 04  → 실재는 무관하고 문자열이 있으면 된다. 생성 실패 경로도 안전하다.
+//	스크래치 변종 전부 정지 + psmod-inherited 04 → 요건은 실제 사용자 프로필 하위 경로 자체다.
+//	                             값을 더 만들지 말고 D65를 다시 결정해야 한다(bisectModulePath가
+//	                             확정 6을 한 번 더 못 박는다).
+//	psmod-absent         도 04 → 명시 주입이 문제이고 PowerShell의 재구성값은 충분하다.
+//	plus-omitted         만 04 → 원인은 PSModulePath 밖. 이어지는 이분탐색이 어느 변수인지 좁힌다.
+//	전부 정지                  → 원인은 이 축들 밖. 닫힌 표가 떨어뜨리는 나머지(logDroppedEnv 목록)
+//	                             중 표준 머신 변수가 아닌 항목이 다음 후보다.
 func probeEnvVariants(t *testing.T, s Spec, dir string) {
 	t.Helper()
+	psExe := s.Argv[0] // 이 테스트가 해석한 powershell.exe
+	mods := scratchModuleDir(t, dir)
 
 	// (0) 지금 러너가 주입하는 값 그대로(s.Env = 닫힌 표 + psModulePath) 자기 완결 실행. 본
 	// 테스트는 타임아웃·킬 경로를 지나므로 실패가 "모듈 경로 정지"인지 "킬 경로"인지 갈리지
 	// 않는다 — 이 프로브는 손자 ping 2회로 스스로 끝나므로 그 둘을 나눈다.
-	shipped := psModulePath(s.Argv[0]) // s.Argv[0] = 이 테스트가 해석한 powershell.exe
+	shipped := psModulePath(psExe, mods)
 	t.Logf("[diag] 주입 PSModulePath: %d항목 %dB", len(strings.Split(shipped, ";")), len(shipped))
 	shippedOK := envProbe(t, s, dir, "psmod-shipped", s.Env)
+
+	// (0a) 스크래치 모듈 디렉터리 단독 — "그 슬롯에 경로가 있으면 되는가"와 "이 3항목 조합이어야
+	// 하는가"를 가른다. 머신 전역이 값에 없으면 인터프리터가 스스로 덧붙이므로(반증 5) 자식의 유효
+	// 값은 이보다 넓다 — 빵가루 01의 psmod-n·psmod-len으로 실제 값의 모양이 읽힌다(3항목 주입은
+	// 로컬 실측에서 유효 값이 주입 값과 바이트 단위로 같다 — 5.1 150B, pwsh 7 130B, 덧붙임 없음).
+	envProbe(t, s, dir, "psmod-scratch-only", envWith(s.Env, "PSModulePath="+mods))
+
+	// (0b) shipped와 같은 3항목인데 첫 항목만 실재하지 않는 경로 — 러너에서 MkdirAll이 실패한
+	// 경로의 모형이다(그쪽은 경고만 남기고 계속한다). 디렉터리 실재가 시행점인지를 가른다.
+	noexist := filepath.Join(dir, "psmodules-noexist")
+	envProbe(t, s, dir, "psmod-scratch-noexist",
+		envWith(s.Env, "PSModulePath="+psModulePath(psExe, noexist)))
 
 	// (1) 주입 값 대신 부모의 상속 값. 이 브랜치 전의 자식이 보던 값이 바로 이것이다.
 	inherited := os.Getenv("PSModulePath")
@@ -628,9 +676,10 @@ func probeEnvVariants(t *testing.T, s Spec, dir string) {
 // 항목이 필요한가"를 항목 단위 이분탐색으로 좁힌다. 판정은 빵가루 04 하나이고, 반쪽 둘이 모두
 // 멈추면 단일 항목 가정이 깨진 것이므로 단독 결론을 내지 않고 그 사실만 남긴다.
 //
-// 남는 항목이 무엇인지가 다음 결정의 입력이다: 사용자 경로면 D65 계약과 정면으로 부딪히고,
-// 러너 이미지 고유 경로(C:\Modules\... 류)면 러너 쪽 교정이 아니라 테스트 쪽 교정이 답이다.
-// 어느 쪽이든 호스트 값을 그대로 주입하는 교정은 D65가 닫았으므로 이 결과를 사람이 읽고 정한다.
+// 앞선 런이 이미 답을 냈다(확정 6 — 호스트 사용자 모듈 경로 하나). 이 사이클에 남겨 두는 이유는
+// 재확인이다: 스크래치 교정이 실패한 런에서 "그 항목이 여전히·단독으로 푸는가"까지 같은 로그에
+// 있어야 D65 재결정의 근거가 한 런으로 완결된다. 호스트 값을 그대로 주입하는 교정은 D65가 닫았으므로
+// 결정 자체는 사람이 한다.
 func bisectModulePath(t *testing.T, s Spec, dir string, entries []string) {
 	t.Helper()
 	for round := 1; len(entries) > 1; round++ {
