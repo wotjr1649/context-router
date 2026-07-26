@@ -183,16 +183,16 @@ func snippetContent(fileName, code string) []byte {
 
 func shellRunner() runner {
 	if runtime.GOOS == "windows" {
-		var psHome string // detect가 채우고 extra가 읽는다(Run: detect 102행 → extra 118행)
+		var psMods string // detect가 채우고 extra가 읽는다(Run: detect 102행 → extra 118행)
 		return runner{
 			file: "snippet.ps1",
 			detect: func() (string, string, error) {
 				if p, err := exec.LookPath("pwsh"); err == nil {
-					psHome = filepath.Dir(p)
+					psMods = psModulePath(filepath.Dir(p), "PowerShell")
 					return p, "7", nil
 				}
 				if p, err := exec.LookPath("powershell"); err == nil {
-					psHome = filepath.Dir(p)
+					psMods = psModulePath(filepath.Dir(p), "WindowsPowerShell")
 					return p, "5.1", nil // runner 필드로 5.1 가시화 (D60)
 				}
 				return "", "", ErrToolchainMissing
@@ -200,17 +200,19 @@ func shellRunner() runner {
 			argv: func(bin, file string) []string {
 				return []string{bin, "-NoProfile", "-NonInteractive", "-File", file}
 			},
-			// D65: 모듈 경로를 인터프리터 설치본으로 고정한다. PSModulePath만 주면 pwsh가 그 앞에
-			// USERPROFILE 유도 사용자 경로를 덧붙이므로 USERPROFILE도 스크래치로 돌린다. extra는
-			// BaseEnv 뒤에 붙어 마지막 값이 이기므로(exec.go:116-119) 이 재지정은 shell 러너에만
-			// 적용된다 — csharp의 USERPROFILE(D60)은 그대로다.
-			// psHome 공유는 안전하다: table()이 호출마다 새 클로저 쌍을 만들어(exec.go:86) 동시
+			// D65: 모듈 경로를 머신 전역 + 인터프리터 설치본으로 고정한다(값은 psModulePath).
+			// PSModulePath를 명시해도 pwsh는 사용자 모듈 디렉터리가 실재하면 USERPROFILE 유도 경로를
+			// 앞에 덧붙이므로 USERPROFILE도 스크래치로 돌린다 — 호스트 사용자 모듈을 실제로 떼어내는
+			// 레버는 이쪽이다(실측: TestRunShellScratchModulePathWins의 격리 없는 절반이 그 경로로 로드).
+			// extra는 BaseEnv 뒤에 붙어 마지막 값이 이기므로(exec.go:116-119) 이 재지정은 shell
+			// 러너에만 적용된다 — csharp의 USERPROFILE(D60)은 그대로다.
+			// psMods 공유는 안전하다: table()이 호출마다 새 클로저 쌍을 만들어(exec.go:86) 동시
 			// Run끼리 변수를 공유하지 않고, extra를 부르는 유일한 경로인 Run이 detect 성공 뒤에만
 			// 도달한다(detect 오류는 104행에서 조기 반환). 표에서 직접 extra를 부르는 코드는
 			// detect를 먼저 불러야 한다.
 			extra: func(scratch string) []string {
 				return []string{
-					"PSModulePath=" + filepath.Join(psHome, "Modules"),
+					"PSModulePath=" + psMods,
 					"USERPROFILE=" + scratch,
 				}
 			},
@@ -227,6 +229,32 @@ func shellRunner() runner {
 		},
 		argv: func(bin, file string) []string { return []string{bin, file} },
 	}
+}
+
+// psModulePath: shell 러너가 주입할 PSModulePath 값 — 머신 전역 모듈 디렉터리
+// (<ProgramFiles>\<pfDir>\Modules, pfDir은 인터프리터 버전별로 PowerShell(7) /
+// WindowsPowerShell(5.1))와 <PSHOME>\Modules 둘뿐이다. 호스트 PSModulePath는 읽지 않는다.
+//
+// 두 항목·이 순서는 인터프리터가 단일 항목 주입에 대해 스스로 만드는 유효 값과 바이트 단위로
+// 같다(실측 — pwsh 7: 37B 주입 → 73B 2항목, 5.1: 50B 주입 → 93B 2항목, 둘 다 머신 전역이 앞).
+// 즉 이 명시는 **동작 변경이 아니라 값의 고정**이다: 머신 전역 덧붙임은 문서화되지 않은 인터프리터
+// 내부 동작이라, 명시하지 않으면 향후 판본에서 조용히 좁아지거나 넓어진다.
+//
+// D65 계약은 그대로다 — 머신 전역은 사용자 구성이 아니므로 닫은 대상
+// (<USERPROFILE>\Documents\...\Modules)이 아니고, 그 차단은 USERPROFILE 재지정이 맡는다.
+// CI(windows-latest) 5.1의 프로바이더 cmdlet 정지는 이 값으로 교정되지 않는다: 그 정지가 난
+// 실행의 유효 값이 이미 93B 2항목이었다(빵가루 psmod-len=93). 원인은 열린 상태다 —
+// internal/sandbox/run_windows_test.go 상단 계측 주석이 실측표를 들고 있다.
+//
+// ProgramFiles가 비면 <PSHOME>\Modules만 준다 — 빈 값으로 조립한 상대 경로 항목은 자식의 cwd
+// (스크래치) 기준으로 해석되므로 넣지 않는다.
+func psModulePath(psHome, pfDir string) string {
+	home := filepath.Join(psHome, "Modules")
+	pf := os.Getenv("ProgramFiles")
+	if pf == "" {
+		return home
+	}
+	return filepath.Join(pf, pfDir, "Modules") + ";" + home
 }
 
 func detectJS() (string, string, error) {
