@@ -153,26 +153,13 @@ func mergeMCPServers(existing []byte, name string, entry mcpServerEntry, install
 		if entry.Args == nil {
 			entry.Args = []string{} // "args": [] 고정 — nil은 null로 나가 멱등 비교가 흔들린다
 		}
-		// 대체된 과거 등록 정리 — 우리 명령을 가리키는 것만 지운다(같은 이름의 남의 서버 보호).
-		for _, old := range supersededMCPServerNames {
-			if old == name {
-				continue
-			}
-			raw, ok := servers[old]
-			if !ok {
-				continue
-			}
-			var retired mcpServerEntry
-			if err := json.Unmarshal(raw, &retired); err == nil && retired.Command == hookBinaryName {
-				// 은퇴시키는 항목의 프로필은 우리 이름으로 이월한다 — 우리 이름에 기존 항목이 없으면
-				// 그 항목이 사용자가 켜 둔 프로필의 유일한 근거이고, 지우면서 이월하지 않으면 재설치가
-				// 도구를 조용히 줄인 뒤 "병합 완료"만 보고한다. 우선순위는 위 args 유지 규칙과 같다:
-				// 명시 플래그(setProfile) > 우리 이름의 기존 항목(prevExists) > 은퇴 항목.
-				if !prevExists && !setProfile && len(retired.Args) > 0 {
-					entry.Args = retired.Args
-				}
-				delete(servers, old)
-			}
+		retiredArgs, _ := retireSupersededMCPServers(servers, name)
+		// 은퇴시키는 항목의 프로필은 우리 이름으로 이월한다 — 우리 이름에 기존 항목이 없으면
+		// 그 항목이 사용자가 켜 둔 프로필의 유일한 근거이고, 지우면서 이월하지 않으면 재설치가
+		// 도구를 조용히 줄인 뒤 "병합 완료"만 보고한다. 우선순위는 위 args 유지 규칙과 같다:
+		// 명시 플래그(setProfile) > 우리 이름의 기존 항목(prevExists) > 은퇴 항목.
+		if !prevExists && !setProfile && len(retiredArgs) > 0 {
+			entry.Args = retiredArgs
 		}
 		b, err := json.Marshal(entry)
 		if err != nil {
@@ -184,6 +171,13 @@ func mergeMCPServers(existing []byte, name string, entry mcpServerEntry, install
 		servers[name] = b
 	} else {
 		delete(servers, name)
+		// 제거도 install의 대칭이다 — 은퇴 이름을 install만 정리하면 uninstall 뒤에 우리 명령을 가리키는
+		// 옛 항목이 남아 호스트가 그 이름으로 우리를 계속 띄운다. 우리 이름이 애초에 없었어도 은퇴 항목을
+		// 지웠으면 changed는 참이어야 한다 — 거짓이면 호출자가 쓰기와 문면을 함께 건너뛰어 그 항목이
+		// 영구 잔존한다. 반대로 아무것도 지우지 않은 경우의 거짓은 그대로다(남의 파일 재기록 금지).
+		if _, retired := retireSupersededMCPServers(servers, name); retired {
+			changed = true
+		}
 	}
 	if len(servers) == 0 {
 		// 빈 컨테이너는 키째로 지운다 — mergeHookSettings(:167·:177)와 같은 무조건 형태다(T2 리뷰 F3).
@@ -203,6 +197,34 @@ func mergeMCPServers(existing []byte, name string, entry mcpServerEntry, install
 		return nil, false, errors.New("mcp: 설정 직렬화 실패")
 	}
 	return append(out, '\n'), changed, nil
+}
+
+// retireSupersededMCPServers — 대체된 과거 등록 이름(D63 ② 단일 서버)을 servers에서 지운다. 우리
+// 명령을 가리키는 항목만 지운다 — 같은 이름의 남의 서버는 보호한다(우리 이름 자리의 소유 관문과 같은
+// 기준이고, 마커 없는 옛 항목도 우리 것이라 명령 일치 하나로 판정한다). install과 uninstall이 같은
+// 함수를 쓴다: 정리가 install에만 있으면 제거는 install의 대칭이 아니게 되고, uninstall 뒤에도 우리
+// 바이너리를 가리키는 옛 항목이 남아 호스트가 그 이름으로 우리를 계속 띄운다.
+// 반환값은 지운 항목이 들고 있던 args(프로필 이월 후보 — install만 쓴다)와 실제로 지웠는지 여부다.
+func retireSupersededMCPServers(servers map[string]json.RawMessage, name string) (args []string, removed bool) {
+	for _, old := range supersededMCPServerNames {
+		if old == name {
+			continue
+		}
+		raw, ok := servers[old]
+		if !ok {
+			continue
+		}
+		var retired mcpServerEntry
+		if err := json.Unmarshal(raw, &retired); err != nil || retired.Command != hookBinaryName {
+			continue
+		}
+		if len(retired.Args) > 0 {
+			args = retired.Args
+		}
+		delete(servers, old)
+		removed = true
+	}
+	return args, removed
 }
 
 // enabledServersScope — enabledMcpjsonServers 키를 정의한 스코프를 우선순위 순으로 조사한다.
@@ -393,8 +415,9 @@ func ruleToolSet(rule string) (prefix string, literal bool) {
 	return rule, true
 }
 
-// askShadowedAllows — 모든 스코프의 permissions를 모아, ask가 덮는 allow 항목을 보고한다.
-// 규칙 평가가 deny→ask→allow 순이라 이 조합에서 allow는 효력이 없다(설계 v0.12 D64).
+// askShadowedAllows — 모든 스코프의 permissions를 모아, ask와 도구가 겹치는 allow 항목을 보고한다.
+// 규칙 평가가 deny→ask→allow 순이라 그 교집합의 도구에서 allow는 효력이 없다(설계 v0.12 D64).
+// 교집합이 allow의 전부가 아닐 수 있으므로(부분 겹침) 보고 문면은 "덮는다"가 아니라 "겹친다"다.
 // permission 규칙은 스코프 간 concat+dedup으로 병합되므로 전 스코프를 합쳐 판정한다 —
 // enabledServersScope와 달리 덮어쓰기가 아니라 합집합이라 순회 순서가 결과를 바꾸지 않는다.
 func askShadowedAllows(projectRoot string, readFile func(string) ([]byte, error)) ([]string, error) {

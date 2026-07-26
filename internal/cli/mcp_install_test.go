@@ -110,6 +110,30 @@ func TestMergeMCPServersRetiresSuperseded(t *testing.T) {
 	if _, ok := mcpServersOf(t, out2)["ctr"]; !ok {
 		t.Errorf("남의 ctr 항목을 지웠다: %s", out2)
 	}
+
+	// 제거 경로도 같은 기준으로 은퇴시킨다(R2) — 우리 현재 이름이 애초에 없어도 은퇴 항목을 지웠으면
+	// changed는 참이어야 한다. 거짓이면 호출자가 쓰기와 문면을 함께 건너뛰어 그 항목이 영구 잔존한다.
+	out3, changed, err := mergeMCPServers(existing, ctrMCPServerName, mcpServerEntry{}, false, true)
+	if err != nil {
+		t.Fatalf("merge remove: %v", err)
+	}
+	if _, ok := mcpServersOf(t, out3)["ctr"]; ok {
+		t.Errorf("제거 경로가 대체된 ctr 항목을 남겼다: %s", out3)
+	}
+	if !changed {
+		t.Errorf("은퇴 항목을 지웠는데 changed가 거짓이다 — 호출자가 쓰기를 건너뛴다: %s", out3)
+	}
+	// 남의 명령이면 제거 경로에서도 두고, 지운 것이 없으므로 changed도 거짓이다.
+	out4, changed4, err := mergeMCPServers(foreign, ctrMCPServerName, mcpServerEntry{}, false, true)
+	if err != nil {
+		t.Fatalf("merge remove foreign: %v", err)
+	}
+	if _, ok := mcpServersOf(t, out4)["ctr"]; !ok {
+		t.Errorf("제거 경로가 남의 ctr 항목을 지웠다: %s", out4)
+	}
+	if changed4 {
+		t.Errorf("아무것도 지우지 않았는데 changed가 참이다 — 남의 파일을 다시 쓰게 된다: %s", out4)
+	}
 }
 
 // TestMergeMCPServersCarriesSupersededProfile: 대체된 과거 등록(ctr)이 들고 있던 프로필은 우리
@@ -1196,6 +1220,99 @@ func TestHookUninstallLeavesForeignOnlyMCPFileIntact(t *testing.T) {
 	}
 	if strings.Contains(out.String(), "mcp: .mcp.json 항목 제거 완료") {
 		t.Errorf("하지 않은 제거를 완료라고 알린다:\n%s", out.String())
+	}
+}
+
+// TestHookInstallRestoresApprovalNameAfterReinstall: uninstall이 하위 스코프 보호를 위해 남긴 빈
+// 승인 배열도 "정의됨"으로 세어지지만, 그 정의를 가진 최상위 스코프가 이번 설치가 쓰는 바로 그
+// 파일이면 보고가 아니라 병합이다 — 설계 D64 스코프 규칙의 "사용 중인 최고 우선순위 스코프에 쓴다"가
+// 그 경우를 이미 지시한다. 보고로 넘기면 같은 프로젝트의 재설치가 .mcp.json 등록만 되돌려 놓고 승인
+// 이름은 빼놓은 상태로 끝나, 사용자는 "설치 완료"를 읽고도 그 서버가 자동 승인되지 않는다(R1).
+// 실사용 순서를 그대로 걷는다: 설치 → 사용자가 user 스코프에 다른 이름 추가 → uninstall(빈 배열
+// 잔존) → 재설치. 같은 상태는 판정 실패 편향(lowerScopeDefinesEnabled의 오류→true)으로도 만들어지므로
+// 하위 스코프 정의가 없는 환경에서도 도달한다.
+func TestHookInstallRestoresApprovalNameAfterReinstall(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home) // Windows os.UserHomeDir 이음새
+	proj := t.TempDir()
+	var out bytes.Buffer
+	if err := runHookInstall(nil, t.TempDir(), "", false, proj, "0.12.0", &out); err != nil {
+		t.Fatalf("install: %v", err)
+	}
+	userPath, err := hookSettingsPath(true, proj)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(userPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(userPath, []byte(`{"enabledMcpjsonServers":["other"]}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := runHookUninstall(nil, proj, &out); err != nil {
+		t.Fatalf("uninstall: %v", err)
+	}
+	projectPath, err := hookSettingsPath(false, proj)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var afterUninstall map[string]json.RawMessage
+	if err := json.Unmarshal(mustReadFile(t, projectPath), &afterUninstall); err != nil {
+		t.Fatalf("settings 파싱: %v", err)
+	}
+	if raw := string(afterUninstall["enabledMcpjsonServers"]); raw != "[]" {
+		t.Fatalf("전제 불성립 — uninstall이 빈 배열을 남기지 않았다: %q", raw)
+	}
+	out.Reset()
+	if err := runHookInstall(nil, t.TempDir(), "", false, proj, "0.12.0", &out); err != nil {
+		t.Fatalf("reinstall: %v", err)
+	}
+	var reinstalled struct {
+		Enabled []string `json:"enabledMcpjsonServers"`
+	}
+	if err := json.Unmarshal(mustReadFile(t, projectPath), &reinstalled); err != nil {
+		t.Fatalf("settings 파싱: %v", err)
+	}
+	if !slices.Contains(reinstalled.Enabled, ctrMCPServerName) {
+		t.Errorf("재설치가 승인 이름을 되돌리지 않았다 — 등록만 되고 자동 승인은 안 된 상태로 남는다: %v\n%s",
+			reinstalled.Enabled, out.String())
+	}
+	// 하위 스코프(user) 목록은 손대지 않는다 — 우리 project 정의가 그 목록을 덮는 것은 이 프로젝트에
+	// 한정된 효과이고, 그 파일 자체를 고칠 권한은 설치기에 없다(--user 분기와 같은 규율).
+	if ub := mustReadFile(t, userPath); !bytes.Contains(ub, []byte(`"other"`)) {
+		t.Errorf("user 스코프 목록을 손댔다: %s", ub)
+	}
+}
+
+// TestHookUninstallRetiresSupersededEntry: 대체된 과거 등록 이름(D63 ②)도 제거 대상이다 — 정리가
+// install 분기 안에만 있으면 uninstall 뒤에 우리 바이너리를 가리키는 옛 항목이 남아 호스트가 그
+// 이름으로 우리를 계속 띄우고, "install의 대칭"(D64) 주장이 깨진다(R2). 소유 기준은 install과 같다
+// (command가 우리 바이너리). 우리 현재 이름이 없어도 지운 것이 있으면 파일을 쓰고, "그대로 두었습니다"
+// 문면은 아무것도 지우지 않았을 때만 나온다.
+func TestHookUninstallRetiresSupersededEntry(t *testing.T) {
+	proj := t.TempDir()
+	old := supersededMCPServerNames[0]
+	existing := []byte(`{"mcpServers":{` +
+		`"` + old + `":{"command":"` + hookBinaryName + `","args":[]},` +
+		`"other":{"command":"x","args":[]}}}`)
+	if err := os.WriteFile(mcpConfigPath(proj), existing, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	if err := runHookUninstall(nil, proj, &out); err != nil {
+		t.Fatalf("uninstall: %v", err)
+	}
+	servers := mcpServersOf(t, mustReadFile(t, mcpConfigPath(proj)))
+	if _, ok := servers[old]; ok {
+		t.Errorf("대체된 과거 등록 %q가 남았다 — 우리 바이너리를 가리키는 항목이 잔존한다: %s",
+			old, mustReadFile(t, mcpConfigPath(proj)))
+	}
+	if _, ok := servers["other"]; !ok {
+		t.Errorf("남의 서버 항목이 사라졌다: %s", mustReadFile(t, mcpConfigPath(proj)))
+	}
+	if strings.Contains(out.String(), "그대로 두었습니다") {
+		t.Errorf("지운 것이 있는데 무변경이라고 알린다:\n%s", out.String())
 	}
 }
 

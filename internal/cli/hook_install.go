@@ -550,9 +550,10 @@ func runHookInstall(args []string, storeRoot, storeRootRaw string, storeRootExpl
 		}
 	}
 
-	// 승인 키 — 아무도 정의하지 않았으면 이번 설치 스코프에 쓰고, 이미 정의가 있으면 보고만 한다.
-	// 이 키는 스코프 간 병합되지 않고 최상위 정의가 통째로 override 하므로, 정의가 있는 상태에서
-	// 다른 스코프에 쓰면 조용히 무시될 값을 남기는 셈이다(설계 D64 스코프 규칙).
+	// 승인 키 — 아무도 정의하지 않았거나 최상위 정의가 이번 설치 스코프 자신이면 그 파일에 쓰고,
+	// 다른 스코프가 이기고 있으면 보고만 한다.
+	// 이 키는 스코프 간 병합되지 않고 최상위 정의가 통째로 override 하므로, 남의 스코프가 이기는 상태에서
+	// 우리 스코프에 쓰면 조용히 무시될 값을 남기는 셈이다(설계 D64 스코프 규칙).
 	// 등록이 확정되지 않은 상태에서는 승인 키도 건드리지 않는다 — 이 키는 이름으로 .mcp.json 항목을
 	// 미리 승인하므로, 우리 이름 자리에 남의 항목이 남아 있는 채로 이름을 넣으면 그 남의 항목을
 	// 대신 자동 승인해 주는 셈이 된다(소유 관문의 연장).
@@ -565,15 +566,25 @@ func runHookInstall(args []string, storeRoot, storeRootRaw string, storeRootExpl
 		fmt.Fprintln(stdout, "mcp: --user 설치는 승인 키를 쓰지 않았습니다 — enabledMcpjsonServers는 프로젝트 .mcp.json 등록에만 적용됩니다. 모든 프로젝트에서 쓰려면 doctor 안내의 사용자 스코프 등록을 쓰세요(승인 키가 필요 없습니다)")
 	} else if winner, defined, scopeErr := enabledServersScope(projectRoot, os.ReadFile); scopeErr != nil {
 		fmt.Fprintln(stdout, "mcp: 승인 키 스코프를 판정하지 못해 건너뜁니다")
-	} else if len(defined) > 0 {
+	} else if len(defined) > 0 && winner != path {
 		// 실제로 적용되는 스코프를 라벨로 알린다 — 파일명은 project와 user가 같아 구분되지 않고,
-		// 절대경로는 싣지 않는다(§12 canary 규율). "추가하세요"가 아니라 "있는지 확인하세요"인 이유:
-		// 직전 설치가 쓴 파일이 그대로 winner인 재설치에서는 이름이 이미 들어 있어 거짓 경보가 된다.
+		// 절대경로는 싣지 않는다(§12 canary 규율). 여기 오는 것은 이기는 정의가 이번 설치가 쓰는
+		// 파일이 아닌 경우뿐이다: 더 좁은 스코프(local)는 사용자가 그 스코프로 관리하기로 정한 것이고,
+		// 더 넓은 스코프(user)만 정의한 경우에는 project에 쓰는 순간 그 목록을 통째로 덮는다 — 어느
+		// 쪽도 우리가 대신 고칠 자리가 아니라 보고가 맞다. "추가하세요"가 아니라 "있는지 확인하세요"인
+		// 이유는 그 파일의 목록에 사용자가 이미 이름을 넣어 뒀을 수 있어서다(그러면 거짓 경보가 된다).
 		fmt.Fprintf(stdout, "mcp: enabledMcpjsonServers는 이미 %d개 스코프에 정의돼 있어 이번 설치가 쓰지 않았습니다(적용되는 것은 최상위 %s 스코프 1개) — 자동 승인이 안 되면 그 파일의 목록에 %q가 있는지 확인하세요\n",
 			len(defined), enabledServersScopeLabel(projectRoot, winner), ctrMCPServerName)
 	} else {
+		// 아무도 정의하지 않았거나(흔한 첫 설치) 이기는 정의가 곧 이 파일이다. 후자는 uninstall이
+		// 하위 스코프 보호를 위해 남긴 빈 배열([])로 만들어지는 흔한 상태다 — 그 상태를 "이미 정의됨"으로
+		// 보고로 넘기면 같은 프로젝트의 재설치가 .mcp.json 등록만 되돌려 놓고 승인 이름은 빼놓아, 등록된
+		// 서버가 자동 승인되지 않은 채 "설치 완료"만 남는다. 설계 D64 스코프 규칙의 "사용 중인 최고
+		// 우선순위 스코프에 쓴다"가 이 경우를 지시한다(무시될 값을 쓰는 것이 아니다 — 이기는 파일이다).
 		// path는 위쪽 훅 병합이 이미 쓴 파일이다 — 그 쓰기가 끝난 뒤 다시 읽어 병합해야 한다.
 		// 순서가 뒤집히면 훅 쓰기가 승인 키를 덮는다(둘 다 성공하고 결과만 조용히 사라진다).
+		// mergeEnabledServers는 이미 든 이름을 다시 넣지 않으므로, 이름이 있는 목록에는 같은 바이트가
+		// 나온다 — 이 분기가 재설치마다 도는 것이 파일을 흔들지 않는 근거다.
 		prev, prevErr := os.ReadFile(path)
 		if prevErr != nil && !errors.Is(prevErr, os.ErrNotExist) {
 			fmt.Fprintln(stdout, "mcp: 기존 settings를 읽지 못해 승인 키 기록을 건너뜁니다")
@@ -692,19 +703,25 @@ func runHookUninstall(args []string, projectRoot string, stdout io.Writer) error
 
 	// .mcp.json 항목 제거 — install의 대칭(D64). 소유 관문은 양방향이라 우리 이름 자리에 남의
 	// 항목이 있으면 install과 똑같이 손대지 않고 사유만 보고한다. 파일은 지우지 않는다.
+	// 대체된 과거 등록 이름(D63 ②)도 install과 같은 소유 기준으로 함께 지운다 — 그쪽 정리가 install
+	// 분기에만 있으면 대칭이 아니고, 우리 명령을 가리키는 옛 항목이 제거 뒤에도 영구 잔존한다.
 	mcpPath := mcpConfigPath(projectRoot)
 	if existing, readErr := os.ReadFile(mcpPath); readErr == nil {
 		if mcpMerged, changed, mergeErr := mergeMCPServers(existing, ctrMCPServerName, mcpServerEntry{}, false, true); mergeErr != nil {
 			fmt.Fprintf(stdout, "mcp: .mcp.json 항목 제거를 멈췄습니다 — %q 이름에 우리가 소유하지 않은 항목이 있거나 파일을 해석할 수 없습니다. 그 항목은 그대로 두었습니다\n", ctrMCPServerName)
 		} else if !changed {
-			// 우리 항목이 없으면 쓰지 않는다 — 재기록은 바이트 중립이 아니어서(키 정렬·유니코드
+			// 우리 항목이 하나도 없으면 쓰지 않는다 — 재기록은 바이트 중립이 아니어서(키 정렬·유니코드
 			// 이스케이프) 남의 서버만 담긴 손으로 쓴 파일을 우리가 고쳐 놓게 된다. 문면도 하지 않은
 			// 일을 했다고 말하지 않는다(형제 승인 키 문면이 이미 "없었으면 무변"으로 유보한다).
-			fmt.Fprintf(stdout, "mcp: .mcp.json에 %q 항목이 없어 파일을 그대로 두었습니다\n", ctrMCPServerName)
+			// "하나도"인 이유: changed는 현재 이름과 대체된 과거 등록 이름 중 어느 것을 지워도 참이라,
+			// 이 분기는 둘 다 없었을 때만 온다.
+			fmt.Fprintf(stdout, "mcp: .mcp.json에 우리 항목(%q·대체된 과거 등록 이름)이 없어 파일을 그대로 두었습니다\n", ctrMCPServerName)
 		} else if writeErr := atomicWriteFile(mcpPath, mcpMerged); writeErr != nil {
 			fmt.Fprintln(stdout, "mcp: .mcp.json 기록 실패 — 훅 항목 제거는 완료되었습니다")
 		} else {
-			fmt.Fprintf(stdout, "mcp: .mcp.json 항목 제거 완료(서버 %s)\n", ctrMCPServerName)
+			// 지운 것이 현재 이름일 수도, 대체된 과거 등록 이름일 수도 있다 — 둘 다 changed를 올리므로
+			// 없던 이름까지 지웠다고 말하지 않는다(위 "없었으면 무변"과 같은 유보다).
+			fmt.Fprintf(stdout, "mcp: .mcp.json 항목 제거 완료 — %q와 대체된 과거 등록 이름 중 있던 것만 지웠습니다\n", ctrMCPServerName)
 		}
 	} else if !errors.Is(readErr, os.ErrNotExist) {
 		fmt.Fprintln(stdout, "mcp: 기존 설정을 읽지 못해 .mcp.json 정리를 건너뜁니다")

@@ -2608,8 +2608,11 @@ func TestDoctorShowsPermissionLine(t *testing.T) {
 	}
 }
 
-// TestDoctorReportsAskShadowedAllow: 프로젝트 settings의 ask가 allow를 덮으면 doctor가 그 도구
-// 이름을 [19]로 보고한다 — 디스크의 실제 파일에서 doctor 라인까지의 배선을 잇는 테스트다.
+// TestDoctorReportsAskShadowedAllow: 프로젝트 settings의 ask와 도구가 겹치는 allow가 있으면 doctor가
+// 그 규칙 이름을 [19]로 보고한다 — 디스크의 실제 파일에서 doctor 라인까지의 배선을 잇는 테스트다.
+// 두 번째 allow(서버 단위)는 ask와 일부만 겹친다 — 겹치는 도구에서만 무력화되고 나머지 도구에서는
+// 그대로 유효하므로, 문면이 "덮는다"가 아니라 "겹친다"여야 한다(R4). 판정이 교집합으로 바뀐 뒤에도
+// "덮는다"로 남으면 진단이 사용자에게 그 allow 전체가 죽었다고 잘못 읽힌다.
 // USER 스코프는 임시 홈으로 돌려 실환경 설정이 건수에 섞이지 않게 한다(판정은 전 스코프 합집합).
 func TestDoctorReportsAskShadowedAllow(t *testing.T) {
 	home := t.TempDir()
@@ -2619,13 +2622,14 @@ func TestDoctorReportsAskShadowedAllow(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(projectRoot, ".claude"), 0o755); err != nil {
 		t.Fatalf("mkdir: %v", err)
 	}
-	rules := `{"permissions":{"ask":["mcp__ctr-exec__ctr_execute"],"allow":["mcp__ctr-exec__ctr_execute"]}}`
+	rules := `{"permissions":{"ask":["mcp__ctr-exec__ctr_execute"],` +
+		`"allow":["mcp__ctr-exec__ctr_execute","mcp__ctr-exec"]}}`
 	if err := os.WriteFile(filepath.Join(projectRoot, ".claude", "settings.json"), []byte(rules), 0o600); err != nil {
 		t.Fatalf("write settings: %v", err)
 	}
 	var buf bytes.Buffer
 	_ = runDoctor(context.Background(), &buf, t.TempDir(), projectRoot, "0.12.0")
-	if !strings.Contains(buf.String(), "[19] permissions: ask가 allow를 덮는 항목 1건 — mcp__ctr-exec__ctr_execute") {
+	if !strings.Contains(buf.String(), "[19] permissions: ask와 겹치는 allow 항목 2건 — mcp__ctr-exec__ctr_execute, mcp__ctr-exec") {
 		t.Fatalf("[19] 충돌 보고 누락:\n%s", buf.String())
 	}
 }
