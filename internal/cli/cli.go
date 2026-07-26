@@ -1435,8 +1435,8 @@ permissions (.claude/settings.json 예시 — ingest/net/global은 기본 ask):
 # 2종이 allow 1종을 무력화). ask 규칙을 넣으면 두 경우 모두 프롬프트가 강제된다: 무프롬프트
 # 모드에서도 ask는 프롬프트를 띄우고, 평가 순서(deny→ask→allow) 때문에 더 구체적인 allow도
 # ask를 이기지 못한다.
-# 이중 동의는 유지된다: ① --enable exec 서버 프로필(기동 시) ② 호스트 권한 모델(모드에 따름 —
-# 무프롬프트 모드에서는 이 층이 프롬프트를 만들지 않는다).
+# 이중 동의는 유지된다: ① --enable exec 서버 프로필(기동 시) ② 호스트 권한 모델(모드와 규칙에
+# 따름 — 무프롬프트 모드이거나 덮는 allow 규칙이 있으면 이 층은 프롬프트를 만들지 않는다).
 
 ## Codex (~/.codex/config.toml)
 [mcp_servers.ctr]
