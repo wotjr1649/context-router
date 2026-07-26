@@ -68,6 +68,16 @@ func TestMain(m *testing.M) {
 
 func selfExe(t *testing.T) string { return testSelfExe(t) }
 
+// mustEnv: extra류(격리 준비) 함수의 (env, error)를 호출부 잡음 없이 펼친다. 준비 실패는
+// 테스트 픽스처가 깨진 것이므로 즉시 끊는다 — t를 받는 헬퍼로는 f(g()) 형태로 다중값을
+// 전달할 수 없어(Go 호출 규칙) panic으로 끊는다. panic도 해당 테스트만 실패시킨다.
+func mustEnv(kv []string, err error) []string {
+	if err != nil {
+		panic("격리 준비 실패: " + err.Error())
+	}
+	return kv
+}
+
 func TestRunShellEcho(t *testing.T) {
 	if _, err := exec.LookPath(shellName()); err != nil {
 		t.Skip("shell 미설치")
@@ -397,7 +407,7 @@ func TestRunGo(t *testing.T) {
 func TestGoEnvIsolatesGOENV(t *testing.T) {
 	scratch := t.TempDir()
 	m := map[string]string{}
-	for _, kv := range goEnv(scratch) {
+	for _, kv := range mustEnv(goEnv(scratch)) {
 		k, v, _ := strings.Cut(kv, "=")
 		m[k] = v
 	}
@@ -480,7 +490,7 @@ func TestRunGoScratchGoEnvWins(t *testing.T) {
 		t.Fatalf("스니펫 기록 실패: %v", err)
 	}
 	env := sandbox.BaseEnv() // 닫힌 표 그대로 — 개발자 셸의 GOFLAGS/GOPROXY가 실험을 흐리지 않게
-	for _, kv := range goEnv(scratch) {
+	for _, kv := range mustEnv(goEnv(scratch)) {
 		if !strings.HasPrefix(kv, "GOENV=") {
 			env = append(env, kv)
 		}
@@ -518,7 +528,7 @@ func TestRunPython(t *testing.T) {
 func TestPyEnvIsolatesUserSite(t *testing.T) {
 	scratch := t.TempDir()
 	m := map[string]string{}
-	for _, kv := range pyEnv(scratch) {
+	for _, kv := range mustEnv(pyEnv(scratch)) {
 		k, v, _ := strings.Cut(kv, "=")
 		m[k] = v
 	}
@@ -606,7 +616,7 @@ func TestRunPyScratchUserSiteWins(t *testing.T) {
 		t.Fatalf("스니펫 기록 실패: %v", err)
 	}
 	env := sandbox.BaseEnv()
-	for _, kv := range pyEnv(scratch) {
+	for _, kv := range mustEnv(pyEnv(scratch)) {
 		if !strings.HasPrefix(kv, "PYTHONNOUSERSITE=") {
 			env = append(env, kv)
 		}
@@ -656,7 +666,7 @@ func TestJSEnvIsolatesUserConfig(t *testing.T) {
 	}
 	scratch := t.TempDir()
 	m := map[string]string{}
-	for _, kv := range jsEnv(scratch) {
+	for _, kv := range mustEnv(jsEnv(scratch)) {
 		k, v, _ := strings.Cut(kv, "=")
 		m[k] = v
 	}
@@ -684,7 +694,7 @@ func TestJSEnvIsolatesUserConfig(t *testing.T) {
 		}
 		sub := t.TempDir()
 		sm := map[string]string{}
-		for _, kv := range r.extra(sub) {
+		for _, kv := range mustEnv(r.extra(sub)) {
 			k, v, _ := strings.Cut(kv, "=")
 			sm[k] = v
 		}
@@ -759,7 +769,7 @@ func TestRunJSScratchBunfigWins(t *testing.T) {
 		t.Fatalf("스니펫 기록 실패: %v", err)
 	}
 	env := sandbox.BaseEnv()
-	for _, kv := range jsEnv(scratch) {
+	for _, kv := range mustEnv(jsEnv(scratch)) {
 		if !strings.HasPrefix(kv, "HOME=") && !strings.HasPrefix(kv, "XDG_CONFIG_HOME=") {
 			env = append(env, kv)
 		}
@@ -830,7 +840,7 @@ func TestNpmrcScratchConfigWins(t *testing.T) {
 	// 내장 기본으로 떨어지는지가 아니라 "호스트 사용자 구성 값이 아닌지"를 본다 — 머신 레벨
 	// npmrc가 registry를 정한 호스트에서도 판정이 흔들리지 않게(사용자 구성 상속만이 계약이다).
 	// 빈 출력은 통과가 아니다 — 값을 못 읽은 것과 격리된 것을 구분한다.
-	switch got := registry(jsEnv(t.TempDir())); got {
+	switch got := registry(mustEnv(jsEnv(t.TempDir()))); got {
 	case marker:
 		t.Errorf("스크래치 npmrc가 호스트 사용자 구성에 지고 있다: %q", got)
 	case "":
@@ -917,7 +927,7 @@ func TestRunShellScratchModulePathWins(t *testing.T) {
 		t.Fatalf("스니펫 기록 실패: %v", err)
 	}
 	env := sandbox.BaseEnv() // 닫힌 표 그대로 — PSModulePath는 이미 표 밖이다
-	for _, kv := range r.extra(scratch) {
+	for _, kv := range mustEnv(r.extra(scratch)) {
 		if !strings.HasPrefix(kv, "USERPROFILE=") {
 			env = append(env, kv)
 		}
@@ -1027,7 +1037,7 @@ func TestRunShellPS51ProviderWriteReturns(t *testing.T) {
 func TestCSEnvInjection(t *testing.T) {
 	scratch := t.TempDir()
 	m := map[string]string{}
-	for _, kv := range csEnv(scratch) {
+	for _, kv := range mustEnv(csEnv(scratch)) {
 		k, v, _ := strings.Cut(kv, "=")
 		m[k] = v
 	}
@@ -1104,6 +1114,81 @@ func TestRunCS(t *testing.T) {
 }
 
 // TestRunnerStatus: doctor용 — 6언어 모두 항목이 나오고 현재 환경의 러너들이 OK다.
+// TestExtraSetupFailureIsErrSetup: 격리 시행점의 준비 실패는 러너 오류(sandbox.ErrSetup)로
+// 오르고 env는 비어서 돌아온다 — 경고만 남기고 계속하면 실재하지 않는 경로를 가리키는 env로
+// 실행되고, pip·NuGet은 그 상태에서 호스트 사용자 구성을 다시 로드한다(exec.go runner.extra
+// 주석의 분류 기준).
+//
+// 픽스처는 프로덕션에 훅을 심지 않고 실제 OS 오류를 만든다: 파일이 놓일 자리에 디렉터리를 미리
+// 만들면 os.WriteFile이(unix EISDIR / windows 액세스 거부), 디렉터리가 놓일 자리에 파일을 미리
+// 만들면 os.MkdirAll이(ENOTDIR) 실패한다. 각 케이스는 같은 함수가 블로커 없는 스크래치에서
+// 정상 반환하는 것까지 확인해 블로커가 실패의 원인임을 고정한다.
+func TestExtraSetupFailureIsErrSetup(t *testing.T) {
+	cases := []struct {
+		name    string                         // 시행점
+		blocker string                         // 스크래치 하위에 미리 만들 상대 경로
+		asDir   bool                           // true=디렉터리로 만든다(파일 기록을 막음), false=파일(디렉터리 생성을 막음)
+		env     func(string) ([]string, error) // 대상 extra
+	}{
+		{"pip.conf", "pip.conf", true, pyEnv},
+		{"nuget.config", "nuget.config", true, csEnv},
+		{"nuget-migrations-sentinel", filepath.Join("xdg", "NuGet", "Migrations", "1"), true, csEnv},
+		{"dotnet-cli-home", "dotnet", false, csEnv},
+		{"gotmpdir", "go-tmp", false, goEnv},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			scratch := t.TempDir()
+			blocker := filepath.Join(scratch, tc.blocker)
+			if tc.asDir {
+				if err := os.MkdirAll(blocker, 0o700); err != nil {
+					t.Fatalf("블로커 디렉터리 생성 실패: %v", err)
+				}
+			} else if err := os.WriteFile(blocker, nil, 0o600); err != nil {
+				t.Fatalf("블로커 파일 기록 실패: %v", err)
+			}
+			kv, err := tc.env(scratch)
+			if !errors.Is(err, sandbox.ErrSetup) {
+				t.Fatalf("격리 준비 실패가 ErrSetup으로 오르지 않았다: err=%v", err)
+			}
+			if kv != nil {
+				t.Errorf("실패 시 env를 돌려주면 격리가 빠진 채로 실행된다: %v", kv)
+			}
+			// 블로커가 없으면 같은 함수가 정상 반환한다(해피 패스 대조).
+			if kv, err := tc.env(t.TempDir()); err != nil || len(kv) == 0 {
+				t.Fatalf("깨끗한 스크래치에서 준비 실패: kv=%v err=%v", kv, err)
+			}
+		})
+	}
+}
+
+// TestShellExtraModuleDirFailureIsErrSetup: windows shell 러너의 psmodules 생성 실패도 시행점이다.
+// PSModulePath 첫 항목이 실재해야 5.1 프로바이더 cmdlet 영구 정지를 피한다(psModulePath 주석의
+// 실측) — 부재 경로를 첫 항목으로 주고 실행하면 그 정지가 타임아웃까지 매달린다.
+func TestShellExtraModuleDirFailureIsErrSetup(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("windows 전용 시행점 — 다른 OS의 shell 러너는 extra가 없다")
+	}
+	r := table()["shell"]
+	if _, _, err := r.detect(); err != nil { // extra가 읽는 psHome을 detect가 채운다(Run과 같은 순서)
+		t.Skipf("pwsh/powershell 미설치: %v", err)
+	}
+	scratch := t.TempDir()
+	if err := os.WriteFile(filepath.Join(scratch, "psmodules"), nil, 0o600); err != nil {
+		t.Fatalf("블로커 파일 기록 실패: %v", err)
+	}
+	kv, err := r.extra(scratch)
+	if !errors.Is(err, sandbox.ErrSetup) {
+		t.Fatalf("모듈 디렉터리 생성 실패가 ErrSetup으로 오르지 않았다: err=%v", err)
+	}
+	if kv != nil {
+		t.Errorf("실패 시 env를 돌려주면 부재 경로가 첫 항목인 PSModulePath로 실행된다: %v", kv)
+	}
+	if kv, err := r.extra(t.TempDir()); err != nil || len(kv) == 0 {
+		t.Fatalf("깨끗한 스크래치에서 준비 실패: kv=%v err=%v", kv, err)
+	}
+}
+
 func TestRunnerStatus(t *testing.T) {
 	st := RunnerStatus()
 	if len(st) != 6 {

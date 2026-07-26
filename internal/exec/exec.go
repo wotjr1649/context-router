@@ -63,7 +63,20 @@ type runner struct {
 	file   string // 스니펫 파일명
 	detect func() (bin, version string, err error)
 	argv   func(bin, file string) []string
-	extra  func(scratch string) []string // 러너별 재지정/강제 env (nil 가능)
+	// extra: 러너별 재지정/강제 env(nil 가능). env 값이 가리키는 스크래치 하위 준비(파일
+	// 기록·디렉터리 생성)를 함께 하므로 오류를 반환한다 — 격리 준비 실패는 fail-closed다
+	// (설계 정정: 이전의 "전부 best-effort" 서술을 대체한다. 경고만 남기고 계속하면 실재하지
+	// 않는 경로를 가리키는 env로 실행되고, 그 상태가 변수를 주지 않은 것보다 나쁜 지점이
+	// 있다 — pip은 PIP_CONFIG_FILE이 실재할 때만 사용자 구성을 빼기 때문이다).
+	//
+	// 지점별 분류 기준은 하나다: **부재가 호스트 무관 기본으로 안전하게 퇴화하는가.**
+	//   · 시행점 — 부재가 호스트 사용자 구성을 다시 들이거나(pip.conf·nuget.config), 소비자가
+	//     실재를 요구해 실행이 깨진다(psmodules·GOTMPDIR·Application Support·NuGet sentinel).
+	//     실패 시 sandbox.ErrSetup을 감아 반환하고 env는 nil로 둔다 — 격리가 빠진 env를
+	//     호출부에 넘기지 않는다.
+	//   · 이중 안전장치 — 부재가 도구 내장 기본으로 퇴화한다(npmrc·스크래치 홈·pycache·
+	//     go-env). 경고만 남기고 계속하며, 왜 benign인지 각 지점에 적어 둔다.
+	extra func(scratch string) ([]string, error)
 }
 
 func shellName() string {
@@ -115,7 +128,11 @@ func Run(ctx context.Context, scratchParent, selfExe string, req Request) (Respo
 
 	env := append(sandbox.BaseEnv(), tmpEnv(scratch)...) // 공통 temp 재지정(중복 키는 마지막 값 승리)
 	if r.extra != nil {
-		env = append(env, r.extra(scratch)...)
+		ex, err := r.extra(scratch)
+		if err != nil {
+			return Response{}, err // ErrSetup — 격리 시행점 준비 실패는 실행 없이 반환(fail-closed)
+		}
+		env = append(env, ex...)
 	}
 	// execute_file: 파일 경로를 CTR_FILE로 노출(스니펫이 읽음)
 	if req.FilePath != "" {
@@ -183,7 +200,7 @@ func snippetContent(fileName, code string) []byte {
 
 func shellRunner() runner {
 	if runtime.GOOS == "windows" {
-		var psHome, pfDir string // detect가 채우고 extra가 읽는다(Run: detect 102행 → extra 118행)
+		var psHome, pfDir string // detect가 채우고 extra가 읽는다(Run: detect 115행 → extra 131행)
 		return runner{
 			file: "snippet.ps1",
 			detect: func() (string, string, error) {
@@ -205,23 +222,26 @@ func shellRunner() runner {
 			// PSModulePath를 명시해도 pwsh는 사용자 모듈 디렉터리가 실재하면 USERPROFILE 유도 경로를
 			// 앞에 덧붙이므로 USERPROFILE도 스크래치로 돌린다 — 호스트 사용자 모듈을 실제로 떼어내는
 			// 레버는 이쪽이다(실측: TestRunShellScratchModulePathWins의 격리 없는 절반이 그 경로로 로드).
-			// extra는 BaseEnv 뒤에 붙어 마지막 값이 이기므로(exec.go:116-119) 이 재지정은 shell
+			// extra는 BaseEnv 뒤에 붙어 마지막 값이 이기므로(exec.go:129-136) 이 재지정은 shell
 			// 러너에만 적용된다 — csharp의 USERPROFILE(D60)은 그대로다.
-			// psHome·pfDir 공유는 안전하다: table()이 호출마다 새 클로저 쌍을 만들어(exec.go:86) 동시
+			// psHome·pfDir 공유는 안전하다: table()이 호출마다 새 클로저 쌍을 만들어(exec.go:99) 동시
 			// Run끼리 변수를 공유하지 않고, extra를 부르는 유일한 경로인 Run이 detect 성공 뒤에만
-			// 도달한다(detect 오류는 104행에서 조기 반환). 표에서 직접 extra를 부르는 코드는
+			// 도달한다(detect 오류는 117행에서 조기 반환). 표에서 직접 extra를 부르는 코드는
 			// detect를 먼저 불러야 한다.
-			extra: func(scratch string) []string {
+			extra: func(scratch string) ([]string, error) {
 				mods := filepath.Join(scratch, "psmodules")
+				// 시행점: 첫 항목이 **실재**해야 5.1 프로바이더 cmdlet 영구 정지를 피한다(아래
+				// psModulePath 주석의 실측 — 정지를 푸는 조건이 "첫 항목에 실재하는 경로"였다).
+				// 부재 경로를 첫 항목으로 주면 그 정지가 그대로 돌아오고, 정지는 오류도 아니라
+				// 타임아웃까지 매달린다 — 준비가 깨졌으면 실행하지 않는 쪽이 계약이다.
 				if err := os.MkdirAll(mods, 0o700); err != nil {
-					// 격리는 유지된다(호스트 사용자 모듈 경로를 주지 않는 것이 계약이고, 이 값은
-					// 그대로 부재 경로를 가리킨다). 잃는 것은 아래 정지 회피뿐이라 관측만 남긴다.
-					slog.Warn("exec: 스크래치 모듈 디렉터리 생성 실패 — 사용자 모듈 슬롯이 부재 경로가 된다", "error", err)
+					slog.Error("exec: 스크래치 모듈 디렉터리 생성 실패", "error", err) // 경로는 로그에만
+					return nil, fmt.Errorf("%w: 모듈 디렉터리 생성 실패", sandbox.ErrSetup)
 				}
 				return []string{
 					"PSModulePath=" + psModulePath(mods, psHome, pfDir),
 					"USERPROFILE=" + scratch,
-				}
+				}, nil
 			},
 		}
 	}
@@ -294,19 +314,28 @@ func detectJS() (string, string, error) {
 // ubuntu·macos에서 처음 실행되고, windows는 픽스처 무효를 Skip 문면으로 남긴다
 // (TestRunJSScratchBunfigWins). USERPROFILE은 돌리지 않는다 — windows에서
 // 효과가 없고(실측) node/npm 쪽 부작용만 크다.
-func jsEnv(scratch string) []string {
+func jsEnv(scratch string) ([]string, error) {
 	rc := filepath.Join(scratch, "npmrc")
+	// benign(이중 안전장치): 레버는 NPM_CONFIG_USERCONFIG 값 자체다 — 경로가 부재해도 npm은
+	// 호스트 사용자 파일로 되돌아가지 않고 내장 기본으로 간다(위 ① 실측). 부재가 호스트 무관
+	// 기본으로 퇴화하므로 시행점이 아니다.
 	if err := os.WriteFile(rc, nil, 0o600); err != nil {
 		slog.Warn("exec: npmrc 기록 실패 — 격리는 유지(호스트 사용자 구성 미적용), npm 내장 기본으로 실행", "error", err)
 	}
 	home := filepath.Join(scratch, "home")
 	xdg := filepath.Join(home, ".config") // XDG 기본 배치 — MkdirAll이 home까지 만든다
-	_ = os.MkdirAll(xdg, 0o700)
+	// benign(이중 안전장치): bunfig 차단의 레버도 홈 포인터 **값**이다(위 ②) — 디렉터리가 없으면
+	// 자식이 찾을 사용자 bunfig가 없는 것이고, 호스트 홈으로 되돌아가지도 않는다(부재가 곧
+	// 격리된 결과다). 인터프리터 실행 자체는 이 디렉터리를 요구하지 않고, install 계열이 쓸 때는
+	// 자신이 만든다.
+	if err := os.MkdirAll(xdg, 0o700); err != nil {
+		slog.Warn("exec: 스크래치 홈 생성 실패 — 격리는 유지(홈 포인터가 호스트 사용자 구성 밖을 가리킨다)", "error", err)
+	}
 	return []string{
 		"NPM_CONFIG_USERCONFIG=" + rc,
 		"HOME=" + home,
 		"XDG_CONFIG_HOME=" + xdg,
-	}
+	}, nil
 }
 
 func tsRunner() runner {
@@ -428,18 +457,26 @@ func detectPy() (string, string, error) {
 // iter_config_files의 os.path.exists 조건 — 부재 경로면 호스트 사용자 구성이 그대로 로드되는
 // 것을 실측). 머신 전역 구성(/etc/pip.conf · %ProgramData%\pip\pip.ini)은 이 레버 밖이며,
 // 여기서 끊는 것은 사용자 구성 상속이다.
-func pyEnv(scratch string) []string {
+func pyEnv(scratch string) ([]string, error) {
 	cache := filepath.Join(scratch, "pycache")
-	_ = os.MkdirAll(cache, 0o700)
+	// benign(캐시 재지정, 격리 레버 아님): CPython이 .pyc를 쓰는 시점에 상위 디렉터리를 스스로
+	// 만들고 그마저 실패하면 바이트코드 기록만 조용히 건너뛴다 — 부재가 호스트 경로로 새지 않는다.
+	if err := os.MkdirAll(cache, 0o700); err != nil {
+		slog.Warn("exec: 바이트코드 캐시 디렉터리 생성 실패 — 바이트코드 기록만 생략된다", "error", err)
+	}
 	conf := filepath.Join(scratch, "pip.conf")
+	// 시행점: pip은 PIP_CONFIG_FILE 경로가 **실재**할 때만 사용자 구성을 로드 목록에서 뺀다(위
+	// 주석의 실측). 조용히 넘기면 호스트 pip 사용자 구성이 그대로 로드된 채 실행되므로, 변수를
+	// 주지 않은 것보다 나쁜 상태다 — 실행하지 않는다.
 	if err := os.WriteFile(conf, nil, 0o600); err != nil {
-		slog.Warn("exec: pip 구성 기록 실패 — 호스트 pip 사용자 구성이 그대로 로드된다(파일 실재가 시행점)", "error", err)
+		slog.Error("exec: pip 구성 기록 실패", "error", err) // 경로는 로그에만
+		return nil, fmt.Errorf("%w: pip 구성 기록 실패", sandbox.ErrSetup)
 	}
 	return []string{
 		"PYTHONPYCACHEPREFIX=" + cache,
 		"PYTHONNOUSERSITE=1",
 		"PIP_CONFIG_FILE=" + conf,
-	}
+	}, nil
 }
 
 func detectGo() (string, string, error) {
@@ -461,17 +498,25 @@ func detectGo() (string, string, error) {
 // stdlib 실행이라 이 값들로 정상 동작한다(GOPATH가 스크래치라 어차피 모듈 캐시가 비어 있다).
 const goEnvFile = "GOFLAGS=\nGOTOOLCHAIN=local\nGOPROXY=off\n"
 
-func goEnv(scratch string) []string {
+func goEnv(scratch string) ([]string, error) {
 	build := filepath.Join(scratch, "go-build")
 	gopath := filepath.Join(scratch, "go")
 	gotmp := filepath.Join(scratch, "go-tmp")
+	// 시행점(gotmp): go는 GOTMPDIR를 스스로 만들지 않아 부재면 `go run`이 work dir 생성에서
+	// 죽는다(위 주석의 사전 생성 필수 근거) — 사용자 코드 오류로 오분류될 실패다. build·gopath는
+	// go가 없으면 스스로 만드는 쪽이지만 같은 루프에서 함께 fail-closed로 둔다: 스크래치 하위
+	// 생성이 막힌 상황이면 go의 자체 생성도 같은 이유로 실패하므로 나눠서 얻는 것이 없다.
 	for _, d := range []string{build, gopath, gotmp} {
-		_ = os.MkdirAll(d, 0o700)
+		if err := os.MkdirAll(d, 0o700); err != nil {
+			slog.Error("exec: go 캐시·임시 디렉터리 생성 실패", "error", err) // 경로는 로그에만
+			return nil, fmt.Errorf("%w: go 디렉터리 생성 실패", sandbox.ErrSetup)
+		}
 	}
 	goenv := filepath.Join(scratch, "go-env")
+	// benign(이중 안전장치): 호스트 go env 파일을 끊는 레버는 GOENV 값 자체다 — 부재 파일이면
+	// go는 호스트 파일로 되돌아가지 않고 내장 기본으로 간다. 잃는 것은 의도한 값(GOPROXY=off·
+	// GOTOOLCHAIN=local)뿐이며 그 기본도 호스트 구성이 아니므로 시행점이 아니다.
 	if err := os.WriteFile(goenv, []byte(goEnvFile), 0o600); err != nil {
-		// 기록 실패 시 GOENV는 부재 파일을 가리킨다 — go는 그 경우 호스트 파일로 되돌아가지
-		// 않고(격리는 유지) 내장 기본으로 동작한다. 잃는 것은 의도한 값이다.
 		slog.Warn("exec: go env 파일 기록 실패 — go 내장 기본(공개 모듈 프록시·툴체인 자동 다운로드)으로 실행", "error", err)
 	}
 	return []string{
@@ -479,7 +524,7 @@ func goEnv(scratch string) []string {
 		"GOPATH=" + gopath,
 		"GOTMPDIR=" + gotmp,
 		"GOENV=" + goenv,
-	}
+	}, nil
 }
 
 // detectCS: dotnet + SDK ≥10 게이트.
@@ -557,7 +602,7 @@ const nugetConfig = `<?xml version="1.0" encoding="utf-8"?>
 // NUGET_PACKAGES는 global-packages만 재지정하므로 http/plugins 캐시도 스크래치 하위로 옮긴다
 // (I5 — 안 하면 HOME/LOCALAPPDATA로 이탈해 landlock write-deny로 실패하거나 D61 잔존물이 남음).
 // cold DOTNET_CLI_HOME는 매 실행 first-run이라 배너/텔레메트리가 stdout을 오염시킨다 — 끈다(I4).
-func csEnv(scratch string) []string {
+func csEnv(scratch string) ([]string, error) {
 	home := filepath.Join(scratch, "dotnet")
 	nuget := filepath.Join(scratch, "nuget")
 	nugetHTTP := filepath.Join(scratch, "nuget-http")
@@ -575,14 +620,26 @@ func csEnv(scratch string) []string {
 	// Support)에서 결정되는데 NSSearchPath는 경로를 만들지 않아, 미존재 시 빈 문자열→temp 경로 결정 실패로
 	// 죽는다 — env에 할당·파생한 경로는 전부 사전 생성한다(goEnv GOTMPDIR 규칙). SBPL scratch subpath 안.
 	appSupport := filepath.Join(userHome, "Library", "Application Support")
+	// 시행점: migrations·appSupport는 부재 자체가 실행을 깨는 쪽이고(위 두 주석의 근거 —
+	// landlock RO /tmp EACCES · NSSearchPath 빈 문자열로 temp 경로 결정 실패), 나머지 넷도
+	// env가 가리키는 경로라 만들 수 없는 상황에서는 dotnet/NuGet의 자체 생성도 같은 이유로
+	// 실패한다. 한 루프이므로 함께 fail-closed로 둔다.
 	for _, d := range []string{home, nuget, nugetHTTP, nugetPlugins, migrations, appSupport} {
-		_ = os.MkdirAll(d, 0o700)
+		if err := os.MkdirAll(d, 0o700); err != nil {
+			slog.Error("exec: dotnet·NuGet 스크래치 디렉터리 생성 실패", "error", err) // 경로는 로그에만
+			return nil, fmt.Errorf("%w: dotnet 디렉터리 생성 실패", sandbox.ErrSetup)
+		}
 	}
-	_ = os.WriteFile(filepath.Join(migrations, "1"), nil, 0o600)
-	// 이 파일이 호스트 구성 차단의 유일한 시행점이라 조용한 실패는 격리 없이 실행되는 것과
-	// 같다 — 러너 오류로 올리지는 않되(다른 재지정과 동일한 best-effort 계약) 관측은 남긴다.
+	// 시행점: sentinel이 없으면 MigrationRunner가 돌아 위 주석의 EACCES 실패 경로로 들어간다.
+	if err := os.WriteFile(filepath.Join(migrations, "1"), nil, 0o600); err != nil {
+		slog.Error("exec: NuGet 마이그레이션 sentinel 기록 실패", "error", err) // 경로는 로그에만
+		return nil, fmt.Errorf("%w: NuGet sentinel 기록 실패", sandbox.ErrSetup)
+	}
+	// 시행점: 이 파일이 호스트 구성 차단의 유일한 시행점이라 조용한 실패는 격리 없이 실행되는
+	// 것과 같다 — 그래서 러너 오류로 올린다(설계 정정: 이전의 best-effort 계약을 대체한다).
 	if err := os.WriteFile(filepath.Join(scratch, "nuget.config"), []byte(nugetConfig), 0o600); err != nil {
-		slog.Warn("exec: NuGet 구성 기록 실패 — 호스트 구성이 병합된 채로 실행", "error", err)
+		slog.Error("exec: NuGet 구성 기록 실패", "error", err) // 경로는 로그에만
+		return nil, fmt.Errorf("%w: NuGet 구성 기록 실패", sandbox.ErrSetup)
 	}
 	return []string{
 		"DOTNET_CLI_HOME=" + home,
@@ -599,7 +656,7 @@ func csEnv(scratch string) []string {
 		"DOTNET_CLI_DO_NOT_USE_MSBUILD_SERVER=1",
 		"MSBUILDDISABLENODEREUSE=1",
 		"UseSharedCompilation=false",
-	}
+	}, nil
 }
 
 // tmpEnv: 공통 temp 재지정 — Unix는 TMPDIR, Windows는 TEMP·TMP를 스크래치 하위 tmp로
