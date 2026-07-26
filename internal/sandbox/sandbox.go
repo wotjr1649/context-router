@@ -119,8 +119,9 @@ func baseKeys() []string {
 	if runtime.GOOS == "windows" {
 		// PSModulePath는 D65에서 제외했다 — 호스트 설치 모듈이 스니펫에서 자동 로드되는 경로였다.
 		// 값을 지우기만 하면 pwsh가 기본값을 재구성하며 USERPROFILE 유도 사용자 경로를 되살리므로,
-		// shell 러너의 extra가 <PSHOME>\Modules와 스크래치 USERPROFILE을 함께 주입한다(exec.go).
-		// 이 표에 다시 넣으면 그 재지정이 무의미해진다 — "단순화"로 되돌리지 말 것.
+		// shell 러너의 extra가 호스트와 무관한 값을 명시 주입한다 — 그 값과 유도는 여기서
+		// 되풀이하지 않는다(internal/exec/exec.go psModulePath). 이 표에 다시 넣으면 그 재지정이
+		// 무의미해진다 — "단순화"로 되돌리지 말 것.
 		return []string{
 			"PATH", "PATHEXT", "COMSPEC", "SystemRoot", "SystemDrive",
 			"TEMP", "TMP", "USERPROFILE", "HOMEDRIVE", "HOMEPATH",

@@ -325,7 +325,7 @@ func dumpTreeKillDiag(t *testing.T, s Spec, dir, psExe, bcPath string, r Result,
 	}
 	t.Logf("[diag] Go가 자식에 넘긴 Spec.Env(%d개):", len(s.Env))
 	for _, kv := range s.Env {
-		t.Logf("[diag]   %s", kv)
+		t.Logf("[diag]   %s", envLogLine(kv))
 	}
 	t.Logf("[diag] Result: TimedOut=%v ExitCode=%d Duration=%v stdout(%dB,trunc=%v)=%q stderr(%dB,trunc=%v)=%q",
 		r.TimedOut, r.ExitCode, r.Duration,
@@ -337,6 +337,19 @@ func dumpTreeKillDiag(t *testing.T, s Spec, dir, psExe, bcPath string, r Result,
 	// 판별 프로브: 이 실패가 알려진 모듈 경로 정지인지를 같은 런에서 가른다(읽는 법은 그 함수
 	// 주석). 손자 ping은 스스로 끝나 잔존 프로세스를 남기지 않는다.
 	probeEnvVariants(t, s, dir)
+}
+
+// envLogLine: env 한 줄을 로그 형태로 줄인다. 경로가 든 값은 빵가루 01과 같은 형태(항목 수·바이트
+// 수)로만 남긴다 — 이 덤프는 CI 빌드 로그로 나가고, 닫힌 표가 통과시키는 값 다수가 호스트 계정명이
+// 박힌 절대 경로다. 재발 판별에 필요한 것은 원문이 아니라 "그 키가 자식에 도달했는지·크기가 얼마인지"
+// 이므로(01이 자식 쪽에서 같은 두 수를 남겨 대조가 된다) 이 축약으로 판독이 좁아지지 않는다. 경로가
+// 없는 키(PATHEXT·SystemDrive 등)는 원문 자체가 진단 정보라 그대로 남긴다.
+func envLogLine(kv string) string {
+	k, v, _ := strings.Cut(kv, "=")
+	if !strings.ContainsAny(v, `\/`) {
+		return kv
+	}
+	return fmt.Sprintf("%s=<%d항목 %dB>", k, len(strings.Split(v, ";")), len(v))
 }
 
 // dumpScratch: 스크래치의 모든 항목과 내용. 없는 빵가루는 있는 빵가루만큼의 정보다.
@@ -400,9 +413,9 @@ func breadcrumbHas(bc, step string) bool {
 }
 
 // envProbe: 같은 격리 경로를 env만 바꿔 1회 돌리고, 프로바이더 쓰기가 돌아왔는지(빵가루 04)를
-// 반환한다. 아래 두 변종의 판정은 이 한 값뿐이다 — 두 스트림이 빈 값으로 오는 실패라 출력에
-// 다시 의존할 수 없다.
-func envProbe(t *testing.T, s Spec, dir, name string, env []string) bool {
+// 자기 로그 줄에 남긴다. 아래 두 변종의 판정은 이 한 값뿐이다 — 두 스트림이 빈 값으로 오는
+// 실패라 출력에 다시 의존할 수 없다.
+func envProbe(t *testing.T, s Spec, dir, name string, env []string) {
 	t.Helper()
 	bc := filepath.Join(dir, "probe-env-"+name+".bc")
 	p := s
@@ -415,12 +428,13 @@ func envProbe(t *testing.T, s Spec, dir, name string, env []string) bool {
 	t.Logf("[diag] probe-env %s(격리 있음·%v, env %d개): provider-write-returned=%v 소요=%v err=%v TimedOut=%v ExitCode=%d stdout=%q stderr=%q",
 		name, probeBudget, len(env), ok, time.Since(start), err, r.TimedOut, r.ExitCode, r.Stdout, r.Stderr)
 	logBreadcrumbs(t, bc)
-	return ok
 }
 
 // probeEnvVariants: 이 실패가 알려진 모듈 경로 정지인지를 판별한다. 판정은 빵가루 04(Set-Content
 // 반환) 하나이고, 두 변종은 무조건 다 돌린다 — 출하 값과 알려진 양성 통제(부모 상속 값)의 대비가
-// 곧 판정이다. 읽는 법(다시 유도하지 말 것):
+// 곧 판정이다. 합산 줄은 없다: 두 probe-env 줄의 provider-write-returned=를 나란히 놓고 아래
+// 표로 읽는다(변종마다 빵가루·동반 파일이 따로 찍히므로 한 줄로 합치면 그 대응이 흐려진다).
+// 읽는 법(다시 유도하지 말 것):
 //
 //	shipped 04 있음      → 이 정지는 재발하지 않았다. 실패 원인은 모듈 경로 밖이고, 빵가루의
 //	                      마지막 단계가 다음 신호다(treeKillScript의 판별 3단계 주석).

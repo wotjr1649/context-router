@@ -946,6 +946,81 @@ func TestRunShellScratchModulePathWins(t *testing.T) {
 	}
 }
 
+// TestRunShellPS51ProviderWriteReturns: 출하 유도(psModulePath)로 조립한 값이 **5.1**
+// 인터프리터에서 프로바이더 cmdlet 쓰기를 돌아오게 하는지 본다. shellRunner의 detect는 pwsh 7이
+// 있으면 그것을 먼저 고르므로 Run 경유로는 5.1 갈래가 CI에서 한 번도 실행되지 않는데, 측정된
+// 정지는 그 갈래에서만 났다(CI windows-latest + Windows PowerShell 5.1, 2026-07-25). 그래서
+// detect만 5.1로 대체하고 값 유도·env 조립·격리 경로는 출하와 같게 둔다 — 프로덕션에 토글을
+// 심지 않기 위해 이 테스트가 argv를 직접 조립한다(위 TestRunShellScratchModulePathWins와 같은
+// 방식). 5.1만 있는 호스트에서 ctr_execute{language:"shell"}가 실제로 받는 구성이 이것이다.
+//
+// 판정 둘이다.
+//
+//	① 구조 요건 — 주입 값의 첫 항목이 인자로 준(=우리가 만든) 실재 디렉터리다. 이분탐색이
+//	   지목한 유일한 해제 조건이라 유도가 이 성질을 잃으면 정지 조건이 돌아온다. 첫 항목의
+//	   신원까지 보는 이유: <PSHOME>\Modules로 "단순화"해도 그 경로는 실재하므로 존재 검사만으로는
+//	   그 회귀가 통과한다.
+//	② 동작 요건 — 같은 값으로 띄운 5.1에서 Set-Content가 돌아온다. 정지가 재발하면 여기서 잡힌다.
+//
+// 예산 10s로 묶는다: 5.1 기동은 실측 170~194ms이고 이 스니펫은 손자를 스폰하지 않으므로 건강한
+// 실행은 1s 안쪽이다. 예산이 만료되면 sandbox.Run이 잡을 종료하므로(+WaitDelay 5s) 정지가
+// 재발해도 패키지가 매달리지 않는다. 재발 시 판별 계측은 internal/sandbox/run_windows_test.go
+// TestRunWindowsTimeoutKillsTree의 실패 경로에 있다.
+func TestRunShellPS51ProviderWriteReturns(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("PowerShell 5.1 갈래는 Windows 전용")
+	}
+	psExe, err := exec.LookPath("powershell")
+	if err != nil {
+		t.Skipf("powershell.exe(5.1) 미해석 — 5.1 갈래 검증 불가: %v", err)
+	}
+
+	scratch := t.TempDir()
+	mods := filepath.Join(scratch, "psmodules") // shellRunner의 extra와 같은 배치·같은 이름
+	if err := os.MkdirAll(mods, 0o700); err != nil {
+		t.Fatalf("스크래치 모듈 디렉터리 생성 실패 — 주입 값의 전제가 깨진다: %v", err)
+	}
+	psmod := psModulePath(mods, filepath.Dir(psExe), "WindowsPowerShell")
+
+	first, _, _ := strings.Cut(psmod, ";")
+	fi, statErr := os.Stat(first)
+	if first != mods || statErr != nil || !fi.IsDir() {
+		t.Fatalf("주입 값의 첫 항목이 우리가 만든 실재 디렉터리가 아니다 — CI 5.1 프로바이더 "+
+			"cmdlet 정지의 유일한 해제 조건이다(D65): first=%q want=%q stat=%v", first, mods, statErr)
+	}
+
+	// 표식은 Set-Content **뒤에** 찍는다 — 파일 존재만 보면 "쓰기는 됐는데 호출이 돌아오지
+	// 않았다"를 구분하지 못하고, 정지의 서명이 정확히 그 자리다.
+	const marker = "PROVIDER-WRITE-RETURNED"
+	out := filepath.Join(scratch, "provider.out")
+	code := "'x' | Set-Content -LiteralPath '" + out + "'\nWrite-Output '" + marker + "'\n"
+	file := filepath.Join(scratch, "snippet.ps1")
+	if err := os.WriteFile(file, snippetContent("snippet.ps1", code), 0o600); err != nil {
+		t.Fatalf("스니펫 기록 실패: %v", err)
+	}
+	env := append(sandbox.BaseEnv(), tmpEnv(scratch)...)
+	env = append(env, "PSModulePath="+psmod, "USERPROFILE="+scratch) // extra가 주입하는 그대로
+	res, err := sandbox.Run(context.Background(), sandbox.Spec{
+		Argv: []string{psExe, "-NoProfile", "-NonInteractive", "-File", file},
+		Dir:  scratch, Env: env, Timeout: 10 * time.Second,
+		StdoutCap: stdoutCap, StderrCap: stderrCap,
+	})
+	if err != nil {
+		t.Fatalf("sandbox.Run: %v", err)
+	}
+	if res.TimedOut {
+		t.Fatalf("5.1에서 프로바이더 cmdlet이 돌아오지 않았다(정지 재발): stdout=%q stderr=%q",
+			res.Stdout, res.Stderr)
+	}
+	if res.ExitCode != 0 || !strings.Contains(string(res.Stdout), marker) {
+		t.Fatalf("exit=%d stdout=%q stderr=%q — 표식 부재는 Set-Content 뒤가 실행되지 않았다는 뜻",
+			res.ExitCode, res.Stdout, res.Stderr)
+	}
+	if b, err := os.ReadFile(out); err != nil || string(bytes.TrimSpace(b)) != "x" {
+		t.Fatalf("프로바이더 쓰기 결과가 없다: %q err=%v", b, err)
+	}
+}
+
 // TestCSEnvInjection: C# env 재지정이 스크래치 하위 경로·강제 플래그로 주입되고 재지정
 // 디렉터리가 생성됨을 결정적으로 검증한다(dotnet 실행/복원 불필요 — 배선 자체 확인).
 // 런타임 왕복은 TestRunCS(CI)가 겸한다.
