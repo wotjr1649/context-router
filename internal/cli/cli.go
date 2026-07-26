@@ -1422,12 +1422,18 @@ const hostSnippet = `--- host adapter snippets (설계 §9) ---
 # 그대로 받는 claude mcp add-json 형태를 쓴다(--scope user 동일 적용).
 # global-search는 별개 프로필이라 필요할 때만 따로 등록한다(설치기가 만들지 않는다):
 #   "ctr-global": { "command": "context-router", "args": ["--profile", "global-search", "--projects", "<path-or-id,...>"] }
-permissions (.claude/settings.json 예시 — ingest/net/global은 기본 ask):
+permissions (.claude/settings.json 예시 — ingest/net/global 도구에 ask를 건다):
 {
   "permissions": {
     "ask": ["mcp__ctr-exec__ctr_index", "mcp__ctr-exec__ctr_fetch_and_index", "mcp__ctr-global__*"]
   }
 }
+# 이 두 도구 규칙은 그 프로필을 켠 등록에서만 대상이 있다 — ctr_index는 --enable ingest,
+# ctr_fetch_and_index는 --enable net에서만 등록되므로, 위의 exec만 켠 등록에는 두 도구 자체가 없고
+# 규칙은 아무것도 매치하지 않는다(게이트한 것처럼 보이지만 게이트할 도구가 없다). 두 프로필까지
+# 쓰려면 위 등록의 args를 ["--enable", "exec,ingest,net"]으로 바꾼다 — 플래그 없는 재설치는 그 args를
+# 보존하고 "hook install --enable-exec"은 exec만으로 되돌린다. mcp__ctr-global__*도 위의 ctr-global
+# 등록을 따로 만든 경우에만 대상이 있다.
 # exec 2종(ctr_execute·ctr_execute_file)은 ask에 넣지 않는다 — 승인 강도는 호스트 권한 모드가
 # 정한다. default 모드에서는 MCP 기본 프롬프트가 그대로 작동하고, 무프롬프트 모드이거나 그
 # 도구를 덮는 allow 규칙(프롬프트의 '다시 묻지 않기'·--allowedTools가 남기는 항목)이 있으면
