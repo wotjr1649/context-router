@@ -52,16 +52,24 @@ jobs:
         with:
           python-version: '3.14'
 
+      # 아래 두 실행의 -count=1: setup-go의 기본 캐시는 빌드 산출물만이 아니라 테스트 결과까지
+      # 복원한다. 없으면 초록 체크가 "실행됐다"가 아니라 "지난 런에서 캐시됐다"를 뜻할 수 있다 —
+      # v0.11 이후 main의 windows 런은 internal/sandbox를 매번 ok (cached)로 찍었고, 타임아웃이
+      # 프로세스 트리를 죽이는지 지키는 windows 전용 테스트는 그 초록들 동안 한 번도 실행되지
+      # 않았다. 그 안의 회귀는 이 브랜치에서 소스 변경이 캐시 키를 깨뜨린 뒤에야 드러났다.
+      # 개발기에서 돌 수 없는 OS별 코드(landlock/SBPL, 러너별 격리)의 유일한 검증 경로가 이
+      # 런이라 캐시 재사용은 검증의 부재와 같다 — 중복으로 보여도 지우지 말 것.
+
       # 메모리 캡 규율(CLAUDE.md): 전체 스위트는 -p 1 필수.
       # store 2-프로세스 경합, transform worker RLIMIT_AS/트리킬 서브프로세스 테스트를 포함해
       # 3-OS에서 처음 실행된다 — ubuntu/macos 로그가 unix RLIMIT_AS self-apply 실측(게이트 8)이다.
-      - name: go test -p 1
-        run: go test -p 1 ./...
+      - name: go test -p 1 -count=1
+        run: go test -p 1 -count=1 ./...
 
       # CGO 가용 러너에서만 -race 추가 실행(게이트 7 동시성 심층).
-      - name: go test -p 1 -race (ubuntu only)
+      - name: go test -p 1 -count=1 -race (ubuntu only)
         if: runner.os == 'Linux'
-        run: go test -p 1 -race ./...
+        run: go test -p 1 -count=1 -race ./...
 
   lint:
     runs-on: ubuntu-latest
