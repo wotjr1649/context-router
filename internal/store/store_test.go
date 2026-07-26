@@ -2128,6 +2128,15 @@ func TestPurgeHookOnlyOlderThan(t *testing.T) {
 	); err != nil {
 		t.Fatalf("청크 시드: %v", err)
 	}
+	// 오래된 shadow에는 페이지 여러 장을 차지할 만큼 큰 청크를 심는다 — 아래 freelist 단정이 회수로
+	// 실제로 비워진 페이지를 보게 하는 전제다(작은 행만 지우면 free page가 0장일 수 있다).
+	if _, err := st.writer.Exec(
+		`INSERT INTO chunks(artifact_id, ordinal, text)
+		 SELECT artifact_id, 0, ? FROM sources WHERE uri='shadow:Bash:old'`,
+		strings.Repeat("old-chunk ", 40000), // 약 400KB
+	); err != nil {
+		t.Fatalf("청크 시드(old): %v", err)
+	}
 
 	rep, err := st.PurgeHookOnlyOlderThan(t.Context(), cutoff, 0)
 	if err != nil {
@@ -2159,6 +2168,17 @@ func TestPurgeHookOnlyOlderThan(t *testing.T) {
 	}
 	if chunks == 0 {
 		t.Errorf("cutoff 이후 shadow의 청크가 지워졌다 — 나이 조건이 세 문장 전부에 걸리지 않았다")
+	}
+	// 설계 §2 D67의 "VACUUM 미수행"을 고정한다: 회수 뒤 free page가 남아 있다는 것이 그 증거다.
+	// 이 경로에 VACUUM이 끼어들면 freelist가 0으로 회수되는데, 그것은 상시 로드(alwaysLoad) 서버의
+	// 기동 지연 보장을 깨는 변경이므로 조용히 green으로 통과하면 안 된다. TestVacuum은 반대로 명시
+	// 호출 VACUUM이 동작함을 고정한다 — 자동 회수 경로와 명시 축소는 서로 다른 계약이다.
+	var freelist int
+	if err := st.Reader().QueryRow(`PRAGMA freelist_count`).Scan(&freelist); err != nil {
+		t.Fatalf("freelist 조회: %v", err)
+	}
+	if freelist == 0 {
+		t.Errorf("freelist_count=0 — 회수가 free page를 남기지 않았다(VACUUM이 돌았다)")
 	}
 }
 
