@@ -25,11 +25,44 @@ var supersededMCPServerNames = []string{"ctr"}
 // mcpServerEntry — .mcp.json의 stdio 서버 항목. alwaysLoad는 호스트가 도구를 세션
 // 시작 시 상주시키게 한다(지연 로드 면제). Managed는 훅 설정과 같은 버전 마커
 // (hookMarker: "context-router/<version>")로, 소유 판정과 self-heal의 근거다.
+// 이 4필드가 install이 소유하는 전부다 — 사용자가 우리 항목에 직접 넣은 그 밖의 키는
+// ctrMCPEntryKeys 기준으로 왕복 보존한다(mergeMCPServers).
 type mcpServerEntry struct {
 	Command    string   `json:"command"`
 	Args       []string `json:"args"`
 	AlwaysLoad bool     `json:"alwaysLoad,omitempty"`
 	Managed    string   `json:"__ctrManaged,omitempty"`
+}
+
+// ctrMCPEntryKeys — install이 소유하는(재설치마다 현재 값으로 덮어쓰는) 항목 키. mcpServerEntry의
+// json 태그와 1:1이다. 여기 없는 키는 사용자 것이라 원문 그대로 되돌린다 — 4필드 구조체로 재마샬링만
+// 하던 이전 형태는 "env"(CTR_SHADOW_RETENTION·CTR_STORE_ROOT처럼 현실적인 설정)·"cwd"·"type"을 매
+// hook install마다 조용히 버렸다(최종 리뷰 F4).
+var ctrMCPEntryKeys = []string{"command", "args", "alwaysLoad", "__ctrManaged"}
+
+// keepUnownedEntryKeys — 새 항목(ours)에 기존 항목 원문(prev)의 우리 소유가 아닌 키를 되돌린다.
+// 되돌릴 키가 없으면 ours를 그대로 준다 — 흔한 경로의 출력 형태(구조체 필드 순서)를 바꾸지 않는다.
+// 되돌릴 키가 있으면 map 마샬링이라 키가 정렬되는데, 그 형태도 같은 입력에 같은 출력이므로 재실행
+// 바이트 동일성(TestMergeMCPServersIdempotent)은 두 경로 모두에서 성립한다.
+func keepUnownedEntryKeys(prev map[string]json.RawMessage, ours []byte) ([]byte, error) {
+	merged := map[string]json.RawMessage{}
+	for k, v := range prev {
+		if !slices.Contains(ctrMCPEntryKeys, k) {
+			merged[k] = v
+		}
+	}
+	if len(merged) == 0 {
+		return ours, nil
+	}
+	// 우리 4키를 사용자 키 위에 올린다 — Unmarshal은 비어 있지 않은 맵의 기존 항목을 보존한다.
+	if err := json.Unmarshal(ours, &merged); err != nil {
+		return nil, errors.New("mcp: 항목 직렬화 실패")
+	}
+	b, err := json.Marshal(merged)
+	if err != nil {
+		return nil, errors.New("mcp: 항목 직렬화 실패")
+	}
+	return b, nil
 }
 
 // mcpConfigPath — 프로젝트 루트의 .mcp.json 경로.
@@ -48,7 +81,8 @@ func mcpArgsForProfile(enableExec bool) []string {
 }
 
 // mergeMCPServers — existing(빈 슬라이스 허용)에 name 항목을 install 여부에 따라
-// 반영한 JSON을 반환한다. 다른 서버 항목은 원문 그대로 보존한다(json.RawMessage).
+// 반영한 JSON을 반환한다. 다른 서버 항목은 원문 그대로 보존하고(json.RawMessage), 우리 항목
+// 안에서도 우리가 소유하지 않은 키는 왕복 보존한다(ctrMCPEntryKeys·keepUnownedEntryKeys).
 // 키 순서가 결정적이도록 map을 그대로 마샬링한다(encoding/json이 키를 정렬한다) —
 // 멱등 비교가 바이트 단위로 성립하는 근거다.
 //
@@ -80,9 +114,13 @@ func mergeMCPServers(existing []byte, name string, entry mcpServerEntry, install
 	// 보존" 철학 — 파손 금지 > 멱등 완전성). 훅과 달리 AND가 아니라 OR인 이유는 마커 이전 버전이
 	// 남긴 우리 항목(마커 없음·명령 일치)도 우리 것이라 대칭 제거 대상이기 때문이다.
 	var prev mcpServerEntry
+	var prevRaw map[string]json.RawMessage // 우리 소유가 아닌 키의 왕복 보존용 원문
 	var prevExists bool
 	if raw, ok := servers[name]; ok {
 		if err := json.Unmarshal(raw, &prev); err != nil {
+			return nil, errors.New("mcp: 기존 항목 파싱 실패")
+		}
+		if err := json.Unmarshal(raw, &prevRaw); err != nil {
 			return nil, errors.New("mcp: 기존 항목 파싱 실패")
 		}
 		if !strings.HasPrefix(prev.Managed, hookMarkerPrefix()) && prev.Command != hookBinaryName {
@@ -114,6 +152,9 @@ func mergeMCPServers(existing []byte, name string, entry mcpServerEntry, install
 		b, err := json.Marshal(entry)
 		if err != nil {
 			return nil, errors.New("mcp: 항목 직렬화 실패")
+		}
+		if b, err = keepUnownedEntryKeys(prevRaw, b); err != nil {
+			return nil, err
 		}
 		servers[name] = b
 	} else {
@@ -251,16 +292,21 @@ type permissionRules struct {
 	} `json:"permissions"`
 }
 
-// ruleMatches — ask 규칙 r이 allow 규칙 a가 가리키는 도구를 덮는가. 리터럴 완전 일치와
-// 도구 위치 접미 glob("mcp__server__prefix_*")만 다룬다. 서버 세그먼트에는 glob이 오지 않는다.
+// ruleMatches — ask 규칙 r이 allow 규칙 a가 가리키는 도구를 덮는가. 세 형태를 다룬다: 리터럴 완전
+// 일치, **서버 단위 규칙("mcp__server" — 그 서버의 전 도구를 덮는 문서화된 형태)**, 도구 위치 접미
+// glob("mcp__server__prefix_*"). 서버 세그먼트에는 glob이 오지 않는다. 서버 단위 형태를 빼면 그
+// 형태로 가려진 allow가 진단에서 거짓 clean으로 나온다(최종 리뷰 F5).
 // 판정은 mcp__ 접두 규칙에 한정한다: 매칭 규칙이 그 형태에만 정의돼 있고, 비-MCP 규칙(Read/Edit
 // 형태)은 인자에 절대경로를 담을 수 있어 진단 라인에 그대로 실리면 안 된다(리뷰 F5, §12).
-// 두 인자 모두를 걸러 여기 한 곳에서 비교 범위와 출력 범위가 함께 좁혀진다.
+// 두 인자 모두를 걸러 여기 한 곳에서 비교 범위와 출력 범위가 함께 좁혀진다 — 아래 형태 확장은
+// 모두 이 관문 뒤에 있다.
 func ruleMatches(r, a string) bool {
 	if !strings.HasPrefix(r, "mcp__") || !strings.HasPrefix(a, "mcp__") {
 		return false
 	}
-	if r == a {
+	// 서버 단위 규칙은 구분자까지 붙여 비교한다 — 구분자 없이 접두만 보면 이름이 r로 시작하는
+	// **다른** 서버(mcp__ctr-exec2__…)의 도구까지 덮는다고 오판한다.
+	if r == a || strings.HasPrefix(a, r+"__") {
 		return true
 	}
 	if !strings.HasSuffix(r, "*") {

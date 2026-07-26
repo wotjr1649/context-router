@@ -112,6 +112,54 @@ func TestMergeMCPServersRetiresSuperseded(t *testing.T) {
 	}
 }
 
+// TestMergeMCPServersPreservesUserKeys: 사용자가 우리 항목에 직접 넣은 키("env"·"cwd"·"type")는
+// 재설치에서 왕복 보존되고, 우리 소유 4키는 현재 값으로 갱신된다. 4필드 구조체로 재마샬링만 하던
+// 이전 형태는 그 키들을 매 hook install마다 조용히 버렸다 — hook install은 이제 모두에게 재실행을
+// 권하는 경로라 그 유실이 멱등성 주장 자체를 침식한다(최종 리뷰 F4). 보존 경로에서도 두 번 병합한
+// 바이트가 같아야 한다(키 정렬이 결정적이라는 근거).
+func TestMergeMCPServersPreservesUserKeys(t *testing.T) {
+	existing := []byte(`{"mcpServers":{"` + ctrMCPServerName + `":{"command":"context-router",` +
+		`"args":["--enable","exec"],"alwaysLoad":true,"__ctrManaged":"context-router/0.11.0",` +
+		`"env":{"CTR_SHADOW_RETENTION":"24h"},"cwd":"w","type":"stdio"}}}`)
+	entry := mcpServerEntry{
+		Command: hookBinaryName, Args: []string{}, AlwaysLoad: true, Managed: hookMarker("0.12.0"),
+	}
+
+	first, err := mergeMCPServers(existing, ctrMCPServerName, entry, true, true)
+	if err != nil {
+		t.Fatalf("merge 1: %v", err)
+	}
+	var got struct {
+		Servers map[string]struct {
+			Command string            `json:"command"`
+			Args    []string          `json:"args"`
+			Managed string            `json:"__ctrManaged"`
+			Env     map[string]string `json:"env"`
+			Cwd     string            `json:"cwd"`
+			Type    string            `json:"type"`
+		} `json:"mcpServers"`
+	}
+	if err := json.Unmarshal(first, &got); err != nil {
+		t.Fatalf("결과 파싱: %v (%s)", err, first)
+	}
+	ours := got.Servers[ctrMCPServerName]
+	if ours.Env["CTR_SHADOW_RETENTION"] != "24h" || ours.Cwd != "w" || ours.Type != "stdio" {
+		t.Errorf("사용자 키가 유실됐다: env=%v cwd=%q type=%q", ours.Env, ours.Cwd, ours.Type)
+	}
+	// 우리 소유 키는 새 값이 이긴다 — setProfile=true라 args가 교체되고 마커는 self-heal 한다.
+	if ours.Managed != hookMarker("0.12.0") || len(ours.Args) != 0 || ours.Command != hookBinaryName {
+		t.Errorf("우리 키가 갱신되지 않았다: %+v", ours)
+	}
+
+	second, err := mergeMCPServers(first, ctrMCPServerName, entry, true, true)
+	if err != nil {
+		t.Fatalf("merge 2: %v", err)
+	}
+	if !bytes.Equal(first, second) {
+		t.Errorf("보존 경로 멱등 위반:\n1: %s\n2: %s", first, second)
+	}
+}
+
 // TestMergeMCPServersUninstallKeepsOthers: install=false면 우리 항목만 지운다.
 func TestMergeMCPServersUninstallKeepsOthers(t *testing.T) {
 	existing := []byte(`{"mcpServers":{"other":{"command":"x"},"` + ctrMCPServerName + `":{"command":"context-router"}}}`)
@@ -303,6 +351,33 @@ func TestAskShadowedAllowsGlob(t *testing.T) {
 	}
 }
 
+// TestAskShadowedAllowsServerWideAsk: 서버 단위 ask 규칙("mcp__ctr-exec" — 그 서버의 전 도구를 덮는
+// 문서화된 형태)이 그 서버 도구의 allow를 가리는 조합도 잡는다. 이 형태를 놓치면 doctor [19]가
+// "충돌 없음"이라는 거짓 clean을 낸다(최종 리뷰 F5). 이름이 접두로 겹치는 **다른** 서버(ctr-exec2)와
+// 무관한 서버(ctr-global)의 allow는 보고 대상이 아니다 — 구분자 "__" 없이 접두만 보면 전자를
+// 덮는다고 오판하므로 그 케이스를 함께 넣는다. 그래서 이 테스트는 "1건"으로만 통과한다.
+func TestAskShadowedAllowsServerWideAsk(t *testing.T) {
+	proj := t.TempDir()
+	files := map[string]string{
+		"PROJECT": `{"permissions":{"ask":["mcp__ctr-exec"]}}`,
+		"LOCAL": `{"permissions":{"allow":["mcp__ctr-exec__ctr_execute",` +
+			`"mcp__ctr-exec2__ctr_execute","mcp__ctr-global__ctr_search"]}}`,
+	}
+	read := func(p string) ([]byte, error) {
+		if s, ok := files[scopeKeyForTest(proj, p)]; ok {
+			return []byte(s), nil
+		}
+		return nil, os.ErrNotExist
+	}
+	got, err := askShadowedAllows(proj, read)
+	if err != nil {
+		t.Fatalf("askShadowedAllows: %v", err)
+	}
+	if len(got) != 1 || got[0] != "mcp__ctr-exec__ctr_execute" {
+		t.Errorf("got=%v, 서버 단위 ask가 덮는 그 서버 도구 1건만이어야 한다", got)
+	}
+}
+
 // TestAskShadowedAllowsClean: 겹치지 않으면 빈 목록이다.
 func TestAskShadowedAllowsClean(t *testing.T) {
 	proj := t.TempDir()
@@ -436,6 +511,38 @@ func TestHookInstallWritesMCPConfig(t *testing.T) {
 	sb2, _ := os.ReadFile(settingsPath)
 	if !bytes.Equal(sb, sb2) {
 		t.Errorf("settings 멱등 위반:\n1: %s\n2: %s", sb, sb2)
+	}
+}
+
+// TestHookInstallWritesNoAskRule: 설치 결과 settings에 permissions.ask 항목이 생기지 않는다
+// (설계 §2 D64 승인 정책 — 승인 강도는 호스트 권한 모드가 정하고, ask는 무프롬프트 모드에서도
+// 프롬프트를 강제하며 더 구체적인 allow도 이긴다). 기존 가드는 doctor 안내 문면만 검사해
+// (TestHostSnippetNoExecAskRule) 설치 결과 자체는 무단정이었다 — 설계가 테스트보다 강하게
+// 주장하던 지점을 여기서 닫는다(최종 리뷰 F7).
+func TestHookInstallWritesNoAskRule(t *testing.T) {
+	proj := t.TempDir()
+	var out bytes.Buffer
+	if err := runHookInstall(nil, t.TempDir(), "", false, proj, "0.12.0", &out); err != nil {
+		t.Fatalf("install: %v", err)
+	}
+	settingsPath, err := hookSettingsPath(false, proj)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sb, err := os.ReadFile(settingsPath)
+	if err != nil {
+		t.Fatalf("settings 미생성: %v", err)
+	}
+	// 설치가 이 파일을 실제로 썼는지 먼저 확인한다 — 빈 파일로 조용히 통과하면 아래 단정이 무의미하다.
+	if !bytes.Contains(sb, []byte("hooks")) {
+		t.Fatalf("설치가 settings에 훅을 쓰지 않았다: %s", sb)
+	}
+	var doc permissionRules
+	if err := json.Unmarshal(sb, &doc); err != nil {
+		t.Fatalf("settings 파싱: %v (%s)", err, sb)
+	}
+	if len(doc.Permissions.Ask) != 0 {
+		t.Errorf("설치가 permissions.ask를 만들었다: %v", doc.Permissions.Ask)
 	}
 }
 
