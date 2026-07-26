@@ -407,6 +407,13 @@ const startupPurgeBudget = 60 * time.Second
 // 더 내리지 않는 이유: 정상상태 유입이 세션당 shadow 약 67해시라 그보다 낮으면 회수가 유입을 못
 // 따라간다. 더 올리지 않는 이유: 보유 시간이 훅 예산을 잠식하고, 행 삭제가 단일 tx라 배치가 클수록
 // 롤백 시 잃는 진행분도 커진다(예산을 넘긴 배치는 통째 롤백 — 부분 진행이 없다).
+//
+// **이 상한이 묶지 못하는 것**(2026-07-26 머지 전 코드리뷰): `LIMIT`은 반환 행만 묶고 shadow 술어
+// 평가는 묶지 않는다. 스키마에 `CREATE INDEX`가 한 줄도 없어(암묵 인덱스는 UNIQUE 둘뿐) 술어의
+// `sources.raw_blob_hash`·`s2.artifact_id` 조회는 후보 행마다 `sources`를 훑는다. 그래서 위 보유
+// 시간은 **측정한 저장 크기(아티팩트 1254개·210MiB)에서의 값**이고, 배치 크기를 고정해도 shadow
+// 아티팩트가 늘면 함께 자란다 — 위 문장을 "저장 크기와 무관한 상한"으로 읽지 말 것. 정량 곡선과
+// 색인 추가는 스키마 변경이라 별도로 한다(설계 §4).
 const startupPurgeMaxHashes = 100
 
 func run(ctx context.Context, args []string, stderr io.Writer) error {
