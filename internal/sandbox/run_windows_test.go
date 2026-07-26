@@ -61,11 +61,12 @@ func TestRunWindowsTimeoutKillsTree(t *testing.T) {
 		t.Fatalf("powershell.exe 미해석 — 트리 종료 검증 불가: %v", err)
 	}
 	dir := t.TempDir()
+	bcPath := filepath.Join(dir, "root.bc")
 	pidFile := filepath.Join(dir, "gc.pid")
 	s := Spec{
 		Argv: []string{
 			psExe, "-NoProfile", "-NonInteractive", "-Command",
-			treeKillScript(filepath.Join(dir, "root.bc"), pidFile, 60),
+			treeKillScript(bcPath, pidFile, 60),
 		},
 		Dir:       dir,
 		Env:       append(BaseEnv(), "PSModulePath="+filepath.Join(filepath.Dir(psExe), "Modules")),
@@ -80,7 +81,7 @@ func TestRunWindowsTimeoutKillsTree(t *testing.T) {
 	var start time.Time
 	t.Cleanup(func() {
 		if t.Failed() {
-			dumpTreeKillDiag(t, s, dir, psExe, r, start)
+			dumpTreeKillDiag(t, s, dir, psExe, bcPath, r, start)
 		}
 	})
 
@@ -198,15 +199,26 @@ func rootOutput(r Result) string {
 
 // ── 임시 진단 계측 ─────────────────────────────────────────────────────────────
 // TestRunWindowsTimeoutKillsTree가 CI(windows-latest)에서만 결정적으로 실패하고 개발기에서는
-// 재현되지 않는다. 실패 서명은 "TimedOut=true, 두 스트림 모두 빈 값, 손자 PID 파일 부재"이고
-// 두 가설(모듈 경로 제거·명시 주입)이 모두 반증됐다. 아래 계측은 다음 CI 런이 스스로 원인을
-// 설명하게 만드는 것이 목적이다 — 원인이 확정되면 treeKillScript의 빵가루 문장과
-// dumpTreeKillDiag/probe* 헬퍼를 함께 제거하고 스크립트를 원래 5문장으로 되돌린다.
-// (원인이 환경 쪽으로 판명되면 남을 수 있으므로 계측 자체는 정확해야 한다.)
+// 재현되지 않는다. 실패 서명은 "TimedOut=true, 두 스트림 모두 빈 값, 손자 PID 파일 부재"다.
+//
+// 반증된 가설 — 되살리지 말 것:
+//  1. PSModulePath 제거로 Set-Content 미해석: 5.1 기본 세션 상태에서 해석되고, 경로를 다시
+//     주입한 런도 동일 실패였다.
+//  2. 3s 예산 부족: 20s 프로브도 같은 지점에서 멈춘다.
+//  3. "probe-noiso가 env 격리 없이 돈다"는 근거로 닫힌 표를 배제한 결론: 그 판본은 cmd.Env를
+//     s.Env로 고정하고 있었으므로 env를 갈라낸 적이 없다. 닫힌 표는 여전히 후보다.
+//
+// 확정된 사실: 인터프리터는 정상 기동하고(170~194ms, FullLanguage, ConsoleHost) 빵가루 01을
+// [IO.File]::AppendAllText로 남기는 데 성공한 뒤, 예외·오류 레코드·출력 없이 그 다음에서 멈춘다.
+// 남기지 못하는 PID 파일은 Set-Content로 쓴다 — .NET 직접 쓰기는 되고 cmdlet 경로는 안 되는
+// 이 비대칭이 지금 가진 가장 날카로운 단서이므로, treeKillScript의 판별 3단계가 그 비대칭을
+// 정면으로 가른다(02 파이프라인 / 03 .NET 쓰기 / 04 프로바이더 쓰기).
+// 원인이 확정되면 판별 3단계·빵가루 문장과 dumpTreeKillDiag/probe*/synthPath/logBreadcrumbs를
+// 함께 제거하고 스크립트를 원래 5문장으로 되돌린다.
 
 // treeKillScript: 손자를 스폰·기록하고 종료를 기다리는 루트 스크립트. 검증 경로
-// (New-Object → Process::Start → Set-Content → WaitForExit)는 v0.11과 동일하게 두고 그 사이에
-// 빵가루만 끼워 넣는다 — 실패 서명을 바꾸지 않기 위해서다. 규칙 둘:
+// (New-Object → Process::Start → Set-Content → WaitForExit)는 v0.11과 동일하게 두고 그 앞에
+// 빵가루와 판별 3단계만 끼워 넣는다 — 실패 서명을 바꾸지 않기 위해서다. 규칙 둘:
 //   - 빵가루는 [IO.File]::AppendAllText만 쓴다. cmdlet·모듈 해석에 의존하지 않는 순수 .NET
 //     경로이고 호출마다 파일을 닫으므로, 명령 해석이 깨졌거나 잡이 트리를 끊어도 기록이 남는다
 //     (두 스트림이 빈 값으로 돌아오는 실패라 스트림에 다시 의존할 수 없다).
@@ -222,27 +234,28 @@ func treeKillScript(bcPath, pidPath string, pingCount int) string {
 		// 놓으면 "3s 예산이 짧았나 / 격리 경로가 늦췄나"가 갈린다. 그래서 01이 첫 빵가루다 —
 		// 일찍 죽는 실행에서 가장 값진 한 줄이라 다른 무엇보다 앞에 온다.
 		"$sp=[System.Diagnostics.Process]::GetCurrentProcess().StartTime.ToUniversalTime()",
-		"bc('01 enter pid=' + $PID + ' created=' + $sp.ToString('HH:mm:ss.fff') + ' startup-ms=' + [int](($t0 - $sp).TotalMilliseconds) + ' ps=' + $PSVersionTable.PSVersion + ' clr=' + $PSVersionTable.CLRVersion + ' lang=' + $ExecutionContext.SessionState.LanguageMode + ' host=' + $Host.Name)",
-		// 02는 cmdlet·프로바이더 경로만 쓴다(.bc는 .NET 타입 경로만 쓴다). 두 파일의 유무가
-		// 갈라진다: .cmdlet만 있으면 .NET 타입 접근이 막힌 것, .bc만 있으면 cmdlet 해석이 깨진
-		// 것, 둘 다 없으면 스크립트가 아예 실행되지 않은 것이다.
-		"'02 cmdlet-ok lang=' + $ExecutionContext.SessionState.LanguageMode | Set-Content -LiteralPath '" + bcPath + ".cmdlet'",
-		"bc('03 cmdlet-marker-returned exists=' + [IO.File]::Exists('" + bcPath + ".cmdlet'))",
-		// 스트림 표식: 04가 남았는데 회수된 stdout/stderr에 표식이 없으면 킬 경로가 출력을
-		// 잃은 것이고, 있으면 회수 경로는 무죄다(빈 스트림이 정상인지 손실인지를 가른다).
-		"[Console]::Out.Write('STDOUT-MARK' + $nl)",
-		"[Console]::Out.Flush()",
-		"[Console]::Error.Write('STDERR-MARK' + $nl)",
-		"[Console]::Error.Flush()",
-		"bc('04 marks-flushed')",
-		"bc('05 PSModulePath=[' + $env:PSModulePath + ']')",
-		"bc('06 PATH=[' + $env:PATH + ']')",
-		"bc('07 PATHEXT=[' + $env:PATHEXT + '] TEMP=[' + $env:TEMP + '] SystemRoot=[' + $env:SystemRoot + '] windir=[' + $env:windir + ']')",
-		"bc('08 ProgramFiles=[' + $env:ProgramFiles + '] USERPROFILE=[' + $env:USERPROFILE + '] COMSPEC=[' + $env:COMSPEC + '] pwd=[' + $PWD.Path + ']')",
-		// ping 해석 가능성. CreateProcess는 System32를 PATH와 무관하게 뒤지므로 둘을 나눠 남긴다.
-		"$pd=''",
-		"foreach($d in ($env:PATH -split ';')){if($d -and [IO.File]::Exists($d + '\\ping.exe')){$pd=$pd + $d + '|'}}",
-		"bc('09 ping sys32=' + [IO.File]::Exists($env:SystemRoot + '\\System32\\ping.exe') + ' onpath=[' + $pd + ']')",
+		// 01에 자식이 실제로 본 PATH·PSModulePath의 크기를 함께 싣는다 — 지금까지 유일하게
+		// 남는 데 성공한 줄이고, 아래 PATH 변종(probePathVariants)이 실제로 자식에 도달했는지를
+		// 이 한 줄로 확인할 수 있다. 값 전체가 아니라 크기만 남긴다(로그 폭발 방지).
+		"bc('01 enter pid=' + $PID + ' created=' + $sp.ToString('HH:mm:ss.fff') + ' startup-ms=' + [int](($t0 - $sp).TotalMilliseconds) + ' ps=' + $PSVersionTable.PSVersion + ' clr=' + $PSVersionTable.CLRVersion + ' lang=' + $ExecutionContext.SessionState.LanguageMode + ' host=' + $Host.Name + ' path-n=' + ($env:PATH -split ';').Count + ' path-len=' + $env:PATH.Length + ' psmod-len=' + $env:PSModulePath.Length)",
+		// ── 판별 3단계 ────────────────────────────────────────────────────────────
+		// 01 이후를 "계측"에서 "판별"로 바꾼다. 앞선 CI 런에서 01([IO.File]::AppendAllText)은
+		// 남았고 그 다음이 예외·오류 레코드·stdout·stderr 전부 없이 멈췄다. 예외 없는 정지는
+		// "OS 호출이 돌아오지 않았다"는 뜻이므로, 돌아오지 않는 호출을 세 갈래로 나눠 가둔다:
+		// 순수 파이프라인 → .NET 직접 파일 쓰기 → 프로바이더 경유 파일 쓰기.
+		//
+		// 다음 CI 로그를 읽는 법(다시 유도하지 말 것):
+		//   02 있음·03 없음 → 파이프라인은 되고 직접 파일 열기가 멈춘다. 파일시스템 필터 가설 강화.
+		//   03 있음·04 없음 → 일반 스캔 적체 가설은 약하고 Set-Content 프로바이더 경로가 문제다.
+		//   01만 있음       → 파일 쓰기 가설 반증. 정지는 첫 cmdlet·파이프라인 활성화 안에 있다.
+		//   04까지 있고 12 없음 → 같은 프로바이더 호출이 한 번은 돌아왔으므로 결정적 차단이 아니다.
+		//     그 경우 10~13 중 어디가 마지막인지가 다음 신호다.
+		"1 | Out-Null",
+		"bc('02 pipeline-returned')",
+		"[IO.File]::WriteAllText($b + '.dotnet.cmdlet', 'x')",
+		"bc('03 dotnet-write-returned')",
+		"'x' | Set-Content -LiteralPath ($b + '.provider.cmdlet')",
+		"bc('04 set-content-returned')",
 		// Process::Start·Set-Content를 try로 감싼다 — 던진 예외가 빈 스트림이 아니라 파일에 남게.
 		"try{$psi=New-Object System.Diagnostics.ProcessStartInfo",
 		"$psi.FileName='ping'",
@@ -263,7 +276,7 @@ func treeKillScript(bcPath, pidPath string, pingCount int) string {
 
 // dumpTreeKillDiag: 실패한 경우에만 부르는 진단 덤프. 조건 없이 전부 남긴다 — 어느 가설이
 // 맞는지 모르는 상태에서 "추측이 맞을 때만 찍는 로그"는 아무것도 가려내지 못한다.
-func dumpTreeKillDiag(t *testing.T, s Spec, dir, psExe string, r Result, start time.Time) {
+func dumpTreeKillDiag(t *testing.T, s Spec, dir, psExe, bcPath string, r Result, start time.Time) {
 	t.Helper()
 	t.Logf("[diag] 러너 신원: ImageOS=%q ImageVersion=%q RUNNER_OS=%q GOARCH=%s NumCPU=%d os.TempDir=%q",
 		os.Getenv("ImageOS"), os.Getenv("ImageVersion"), os.Getenv("RUNNER_OS"),
@@ -282,12 +295,16 @@ func dumpTreeKillDiag(t *testing.T, s Spec, dir, psExe string, r Result, start t
 	t.Logf("[diag] Result: TimedOut=%v ExitCode=%d Duration=%v stdout(%dB,trunc=%v)=%q stderr(%dB,trunc=%v)=%q",
 		r.TimedOut, r.ExitCode, r.Duration,
 		len(r.Stdout), r.StdoutTrunc, r.Stdout, len(r.Stderr), r.StderrTrunc, r.Stderr)
+	// 루트 빵가루 3종을 이름으로 못 박아 먼저 남긴다 — 열거(dumpScratch)만으로는 "없는 파일"이
+	// 눈에 띄지 않고, 이 실험에서 부재가 곧 결론이다.
+	logBreadcrumbs(t, bcPath)
 	dumpScratch(t, dir)
-	// 통제 실행 2종: 빵가루가 아예 없을 때 "격리 경로가 자식을 못 돌렸다 / 3s 예산이 이
-	// 러너에서 부족했다 / 인터프리터가 이 환경에서 아무것도 못 한다"를 갈라낸다. 손자 ping은
-	// 5회로 스스로 끝나 잔존 프로세스를 남기지 않는다.
+	// 통제 실행: 빵가루가 아예 없을 때 "격리 경로가 자식을 못 돌렸다 / 3s 예산이 이 러너에서
+	// 부족했다 / 인터프리터가 이 환경에서 아무것도 못 한다"를 갈라내고(2종), 닫힌 표의 PATH가
+	// 원인인지를 3변종으로 다시 나눈다. 손자 ping은 스스로 끝나 잔존 프로세스를 남기지 않는다.
 	probeNoIsolation(t, s, dir)
 	probeLongBudget(t, s, dir)
+	probePathVariants(t, s, psExe, dir)
 }
 
 // dumpScratch: 스크래치의 모든 항목과 내용. 없는 빵가루는 있는 빵가루만큼의 정보다.
@@ -323,10 +340,14 @@ func probeArgv(argv []string, script string) []string {
 	return out
 }
 
-// probeNoIsolation: 잡·CREATE_SUSPENDED 없이 같은 argv·env·cwd로 같은 스크립트를 돌린다.
-// 빵가루가 빠르게 남으면 인터프리터와 자식 env는 정상이고 격리 경로가 원인이다. 여기서도
-// 아무것도 남지 않으면 인터프리터·환경 쪽이며, 이 실행은 킬 경로가 아니라 스트림으로 예외를
-// 볼 수 있다.
+// probeNoIsolation: 잡·CREATE_SUSPENDED 없이, 그리고 닫힌 env 표 없이(부모 환경 상속) 같은
+// argv·cwd로 같은 스크립트를 돌린다 — 이름이 주장하는 "격리 없음"이 실제로 성립하는 유일한
+// 실행이다. cmd.Env=s.Env로 표를 고정했던 앞선 판본은 env 격리를 하나도 갈라내지 못했고, 그
+// 판본을 근거로 닫힌 표를 후보에서 뺀 결론은 틀렸다. cmd.Env를 비워 두면 exec.Cmd가 부모
+// 환경 전체를 물려준다(BaseEnv 주석의 "nil Env = 전체 상속"과 같은 성질을 여기서는 의도로 쓴다).
+// 빵가루가 여기서 남고 격리 실행에서 안 남으면 원인은 잡·재개 경로 또는 닫힌 표 중 하나이고,
+// PATH 변종(probe-path-*)이 그 둘을 다시 나눈다. 여기서도 안 남으면 인터프리터·러너 쪽이며,
+// 이 실행은 킬 경로가 아니라 스트림으로 예외를 볼 수 있다.
 func probeNoIsolation(t *testing.T, s Spec, dir string) {
 	t.Helper()
 	bc := filepath.Join(dir, "probe-noiso.bc")
@@ -334,14 +355,14 @@ func probeNoIsolation(t *testing.T, s Spec, dir string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
-	cmd.Dir, cmd.Env = s.Dir, s.Env
+	cmd.Dir = s.Dir // cmd.Env 미설정 = 부모 환경 상속. 여기에 s.Env를 되돌려 넣지 말 것.
 	var out, errb bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &out, &errb
 	start := time.Now()
 	err := cmd.Run()
-	t.Logf("[diag] probe-noiso(격리 없음·20s): 소요=%v err=%v stdout=%q stderr=%q",
+	t.Logf("[diag] probe-noiso(격리 없음·env 상속·20s): 소요=%v err=%v stdout=%q stderr=%q",
 		time.Since(start), err, out.String(), errb.String())
-	logFileIfAny(t, bc)
+	logBreadcrumbs(t, bc)
 }
 
 // probeLongBudget: 같은 격리 경로(잡·CREATE_SUSPENDED·재개)를 예산만 20s로 늘려 돌린다.
@@ -359,7 +380,86 @@ func probeLongBudget(t *testing.T, s Spec, dir string) {
 	r, err := Run(context.Background(), p)
 	t.Logf("[diag] probe-long(격리 있음·20s): 소요=%v err=%v TimedOut=%v ExitCode=%d stdout=%q stderr=%q",
 		time.Since(start), err, r.TimedOut, r.ExitCode, r.Stdout, r.Stderr)
-	logFileIfAny(t, bc)
+	logBreadcrumbs(t, bc)
+}
+
+// pathProbeBudget: PATH 변종 1회 예산. 손자 ping 2회(≈1s)+인터프리터 기동(≈0.2s)이면 건강한
+// 실행은 ≈1.5s에 끝나므로 6s는 넉넉하고, 셋이 모두 멈춰도 18s로 끝난다 — 계측 전체(실패 시)를
+// 러너에서 ≈64s에 묶어 job의 timeout-minutes: 20 안쪽에 크게 남긴다.
+const pathProbeBudget = 6 * time.Second
+
+// probePathVariants: 같은 격리 실행을 PATH만 바꿔 3번 돌린다. 닫힌 env 표가 다시 후보로 돌아왔고
+// (probe-noiso의 env 고정이 잘못된 배제를 낳았다) PATH는 표에서 호스트 상태를 가장 크게 실어
+// 나르는 항목이다. 읽는 법:
+//   - (c)만 멈춘다      → 상속 PATH의 특정 항목이 원인
+//   - (b)도 함께 멈춘다 → 특정 항목이 아니라 길이·항목 수가 원인
+//   - 셋 다 멈춘다      → PATH 가설 반증(원인은 PATH 밖)
+//
+// 세 변종의 항목 수·바이트 수를 로그에 함께 남기므로 "비슷한 길이였나"는 로그에서 직접 읽힌다.
+func probePathVariants(t *testing.T, s Spec, psExe, dir string) {
+	t.Helper()
+	inherited := os.Getenv("PATH")
+	sys32 := filepath.Join(os.Getenv("SystemRoot"), "System32")
+	for _, v := range []struct{ name, path string }{
+		{"a-minimal", sys32 + ";" + filepath.Dir(psExe)},
+		{"b-synthetic", synthPath(t, inherited)},
+		{"c-inherited", inherited},
+	} {
+		bc := filepath.Join(dir, "probe-path-"+v.name+".bc")
+		p := s
+		p.Argv = probeArgv(s.Argv, treeKillScript(bc, filepath.Join(dir, "probe-path-"+v.name+".pid"), 2))
+		// 닫힌 표를 복제한 뒤 PATH만 덧붙인다. exec.Cmd는 중복 키에서 마지막 값을 쓰므로
+		// (os/exec Cmd.Env 계약) 이 한 줄이 표의 PATH를 대체한다. s.Env를 직접 append하면
+		// 백업 배열을 공유해 변종끼리 서로를 덮으므로 반드시 복제한다.
+		p.Env = append(append([]string(nil), s.Env...), "PATH="+v.path)
+		p.Timeout = pathProbeBudget
+		start := time.Now()
+		r, err := Run(context.Background(), p)
+		t.Logf("[diag] probe-path %s(격리 있음·%v, %d항목 %dB): 소요=%v err=%v TimedOut=%v ExitCode=%d stdout=%q stderr=%q",
+			v.name, pathProbeBudget, len(strings.Split(v.path, ";")), len(v.path),
+			time.Since(start), err, r.TimedOut, r.ExitCode, r.Stdout, r.Stderr)
+		logBreadcrumbs(t, bc)
+	}
+}
+
+// synthPath: 상속 PATH와 항목 수가 같고, 확실히 존재하는 로컬 디렉터리만으로 이뤄진 대조 PATH.
+// %SystemRoot%\System32(모자라면 %SystemRoot%)의 실제 하위 디렉터리를 열거해 쓴다 — 열거했으므로
+// 존재가 확실하고, 시스템 드라이브라 네트워크·마운트 경유가 아니며, 항목이 서로 달라 "같은 경로
+// 반복"으로 항목 수 대조가 무의미해지는 일도 없다. 항목 수는 정확히 맞추고 길이는 근사한다
+// (개발기 테스트 프로세스 실측: 상속 66항목 2700B ↔ 대조 66항목 1944B). 대조가 상속보다 짧게
+// 나오는 쪽이라, (b)가 멈추면 "길이·항목 수" 해석은 더 짧은 PATH로도 재현됐다는 뜻이 된다.
+func synthPath(t *testing.T, inherited string) string {
+	t.Helper()
+	want := len(strings.Split(inherited, ";"))
+	root := os.Getenv("SystemRoot")
+	out := make([]string, 0, want)
+	for _, base := range []string{filepath.Join(root, "System32"), root} {
+		ents, err := os.ReadDir(base)
+		if err != nil {
+			t.Logf("[diag] synth PATH 열거 실패 %s: %v", base, err)
+			continue
+		}
+		for _, e := range ents {
+			if len(out) == want {
+				return strings.Join(out, ";")
+			}
+			if e.IsDir() {
+				out = append(out, filepath.Join(base, e.Name()))
+			}
+		}
+	}
+	// 하위 디렉터리가 상속 항목 수보다 적으면 있는 만큼으로 간다 — 로그의 항목 수가 그 사실을
+	// 그대로 드러내므로 조용히 왜곡되지 않는다.
+	return strings.Join(out, ";")
+}
+
+// logBreadcrumbs: 빵가루 파일과 판별 3단계가 만드는 동반 파일 둘을 조건 없이 남긴다. 없는
+// 파일이 이 실험의 신호이므로 부재도 한 줄로 찍혀야 한다(logFileIfAny가 부재를 남긴다).
+func logBreadcrumbs(t *testing.T, bc string) {
+	t.Helper()
+	for _, p := range []string{bc, bc + ".dotnet.cmdlet", bc + ".provider.cmdlet"} {
+		logFileIfAny(t, p)
+	}
 }
 
 // readPidFile: 루트가 손자를 스폰·기록할 때까지 잠깐 폴링한 뒤 PID를 읽는다.
