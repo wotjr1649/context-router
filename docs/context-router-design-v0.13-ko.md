@@ -456,4 +456,22 @@ artifact당 sources 5개는 고정값이고, 실 저장소에서 그 비율이 �
 - **doctor `[12]` 로그 로테이션** — 보존 정책 결정이 선행된다(§1.2).
 - **`ctr_batch_execute` 재도입**(D58 이월) · **Windows AppContainer FS
   제한**(D59 이월) · **타인 배포 채널·MCP 설치 표준** — v0.12 §4에서 이월.
+- **windows shell 갈래의 cold `USERPROFILE`** — D65(`827fe15`)가 `PSModulePath`·
+  `USERPROFILE`을 스크래치로 재지정했지만 dotnet first-run 억제(`dotnetFirstRunEnv`)는
+  얹지 않았다. D75는 unix 갈래에만 그 억제를 공유했다(`internal/exec/exec.go`의
+  `shellEnv`) — `.ps1` 스니펫이 dotnet을 부르면 첫 실행 배너·텔레메트리 문구가 stdout을
+  오염시킬 수 있다(D75 리뷰에서 `git log -S`·`git merge-base --is-ancestor`로 확인됨).
+- **색인 DDL의 non-context `Exec`과 잠금 경합** — `internal/store/store.go`의
+  `ensureIndexes`는 `writer.Exec`를 쓰므로 다른 프로세스가 쓰기 락을 쥔 동안
+  `busy_timeout` 대기가 `OpenContext`의 데드라인을 넘길 수 있다(§3 미측정 (a)).
+  `migrate`/`applySchemaV1`도 같은 성질(`tx.Exec`, non-context)이라 한쪽만 고치면
+  비대칭이 된다 — 둘을 함께 결정한다.
+- **`PurgeHookOnlyOlderThan`의 실 잠금 보유 시간 재측정** — §3 ⑧은 술어 `SELECT`만
+  격리해 쟀다. 행 삭제·파일 회수를 포함한 실 보유 시간(632·633ms, `cmd/context-router/main.go`)은
+  D73 색인 도입 이후 다시 재지 않았다(§3 미측정 (b)). 벤치 픽스처의 artifact당 sources
+  5개 고정 비율도 균일 가정이지 실 저장소 분포가 아니다(§3 미측정 (c)).
+- **D76 사이드파일 마커의 위조 가능성** — `ctr-exit-code:`는 배포 바이너리에 박힌 고정
+  리터럴이라 `.ps1` 스니펫이 예약 경로에 직접 써서 tail을 건너뛰고 임의 값의 보강 줄을
+  만들 수 있다. 스니펫은 이미 자신의 `stderr`를 제어해 같은 줄을 직접 낼 수 있으므로 새
+  권한은 아니고 `exit_code`도 영향받지 않는다 — 경계 문제가 아니라 정보 정확성 문제다.
 - **이월 Minor** — 로컬 원장 `progress.md`의 잔여분.
