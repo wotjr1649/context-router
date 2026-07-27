@@ -2619,6 +2619,9 @@ func TestShadowPredicateUsesIndexes(t *testing.T) {
 		}
 		plan = append(plan, detail)
 	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
 	joined := strings.Join(plan, "\n")
 	// 판정 ①: 세 색인이 계획에 각각 나타난다.
 	for _, name := range shadowIndexNames {
@@ -2673,8 +2676,10 @@ func TestEnsureIndexesFailureDoesNotBlockOpen(t *testing.T) {
 	if warnLines < 1 || warnLines > len(shadowIndexNames) {
 		t.Fatalf("경고 줄 수=%d want 1..%d\n%s", warnLines, len(shadowIndexNames), logBuf.String())
 	}
-	if got := countShadowIndexes(t, s2.Reader()); got >= len(shadowIndexNames) {
-		t.Fatalf("indexes=%d — 실패를 유도했는데 전부 생겼다", got)
+	// 정확히 실패한 색인 1개만 없어야 한다(= len-1). ">= len"만 보면 첫 실패에서 멈추는
+	// 회귀(나머지 2개도 안 생겨 got=0)와 계속 진행(got=2)을 구분하지 못한다 — 리뷰 F1.
+	if got := countShadowIndexes(t, s2.Reader()); got != len(shadowIndexNames)-1 {
+		t.Fatalf("indexes=%d want %d(실패 1개 제외 나머지) — 첫 실패에서 멈추면 나머지도 안 생긴다", got, len(shadowIndexNames)-1)
 	}
 	if got := shadowOwnedHashesT(t, s2); !reflect.DeepEqual(got, want) {
 		t.Fatalf("색인 부분 적용이 술어 결과를 바꿨다: got=%v want=%v", got, want)
