@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -172,14 +173,16 @@ func (s *Store) migrate() error {
 		if err := s.applySchemaV1(); err != nil {
 			return fmt.Errorf("store migrate: %w", err)
 		}
-		return nil
 	case v == SchemaVersion:
-		return nil
 	case v > SchemaVersion:
 		return fmt.Errorf("store migrate: db user_version=%d > 지원 %d — 비파괴 거부: %w", v, SchemaVersion, ErrUnavailable)
 	default:
 		return fmt.Errorf("store migrate: 알 수 없는 하위 버전 %d: %w", v, ErrUnavailable)
 	}
+	// D73: 색인은 버전 스위치 **밖**에서 적용한다 — 신규(v==0→v1)와 기존(v==1)이 같은 한 번의
+	// Open에서 색인까지 도달해야 하고, 버전을 올리지 않아 구 바이너리도 이 DB를 계속 연다.
+	s.ensureIndexes()
+	return nil
 }
 
 const schemaV1 = `
@@ -228,6 +231,35 @@ func (s *Store) applySchemaV1() error {
 		return err
 	}
 	return tx.Commit()
+}
+
+// shadowIndexDDL — D73: shadow 보존 술어(shadowOwnedHashQuery + shadowOwnedFilter의 나이 절)가
+// 쓰는 진입 컬럼을 선두로 둔 복합 색인. 술어 지점과의 대응:
+//
+//	· hook JOIN·첫 NOT EXISTS의 s2 — artifact_id → source_kind
+//	· 둘째 NOT EXISTS의 s3        — raw_blob_hash → source_kind
+//	· 나이 절의 s4                — artifact_id → indexed_at
+//
+// a2·a4·ORDER BY의 content_hash는 기존 UNIQUE(content_hash, media_type)의 선두 컬럼이 커버하므로
+// 추가하지 않는다. indexed_at 단독 색인은 형제 경로 PurgeOlderThan용이며 이 결정의 범위 밖이다.
+var shadowIndexDDL = []struct{ name, ddl string }{
+	{"idx_sources_artifact_kind", `CREATE INDEX IF NOT EXISTS idx_sources_artifact_kind ON sources(artifact_id, source_kind)`},
+	{"idx_sources_blobhash_kind", `CREATE INDEX IF NOT EXISTS idx_sources_blobhash_kind ON sources(raw_blob_hash, source_kind)`},
+	{"idx_sources_artifact_indexed", `CREATE INDEX IF NOT EXISTS idx_sources_artifact_indexed ON sources(artifact_id, indexed_at)`},
+}
+
+// ensureIndexes — D73: 버전 스위치 **밖**에서 색인을 적용한다. SchemaVersion을 올리면
+// case v > SchemaVersion이 구 바이너리의 writable Open을 영구 거부하고, 스위치 안에 두면
+// case v == SchemaVersion이 DDL 앞에서 반환해 기존 DB가 색인을 받지 못한다. 색인 부재는
+// 느리지만 정확한 상태로 퇴화하므로(D65 분류의 이중 안전장치) 실패가 Open을 막지 않는다 —
+// 색인마다 개별로 내고 첫 실패에서 나머지를 중단하지 않으며, 실패한 색인마다 경고 한 줄을
+// 남긴다(따라서 최대 3줄). 실제 적용 상태는 doctor [3]의 indexes 병기가 관측한다.
+func (s *Store) ensureIndexes() {
+	for _, ix := range shadowIndexDDL {
+		if _, err := s.writer.Exec(ix.ddl); err != nil {
+			slog.Warn("store: 색인 생성 실패 — 술어는 정확하나 스캔 경계가 넓어진다", "index", ix.name, "error", err)
+		}
+	}
 }
 
 func (s *Store) Reader() *sql.DB { return s.reader }

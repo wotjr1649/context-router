@@ -2665,3 +2665,24 @@ func TestDoctorPermissionLineOnCheckFailure(t *testing.T) {
 		t.Fatalf("판정 실패인데 판정 불가 라인이 없다:\n%s", buf.String())
 	}
 }
+
+// TestDoctorIndexesRender — D73: 병기가 quick_check 뒤에 오고 기존 부분문자열 단정이 그대로
+// 통과한다(골든 갱신 없이 정보만 더한다).
+func TestDoctorIndexesRender(t *testing.T) {
+	// 전용 doctor 실행 헬퍼는 없다 — 기존 셋업 두 개로 조립해 runDoctor(cli.go:1471)를 직접 부른다.
+	storeRoot, projectRoot, projDir := doctorShadowProjDir(t) // cli_test.go:545
+	seedShadowContentDB(t, projDir)                           // cli_test.go:411 — writable Open이라 여기서 색인이 생긴다
+	var buf bytes.Buffer
+	// doctor는 실패 항목이 있으면 오류를 낼 수 있다 — 이 테스트는 [3] 렌더만 보므로 출력으로 판정하고
+	// 오류는 로그로 남긴다.
+	if err := runDoctor(context.Background(), &buf, storeRoot, projectRoot, "0.0.1-dev"); err != nil {
+		t.Logf("runDoctor: %v", err)
+	}
+	out := buf.String()
+	if !strings.Contains(out, "user_version=1 quick_check=ok") {
+		t.Fatalf("기존 부분문자열 단정이 깨졌다:\n%s", out)
+	}
+	if !strings.Contains(out, "quick_check=ok indexes=3/3") {
+		t.Fatalf("indexes 병기가 quick_check 뒤에 없다:\n%s", out)
+	}
+}

@@ -1397,6 +1397,26 @@ func probeFTS5(ctx context.Context, reader *sql.DB) error {
 	return nil
 }
 
+// shadowIndexNames — D73 대상 색인 이름. store의 DDL과 같은 집합을 doctor가 센다. 이름을 여기에
+// 복사해 두는 것은 store 내부 변수를 진단이 읽지 않기 위한 것이다(패키지 경계 유지).
+var shadowIndexNames = []string{
+	"idx_sources_artifact_kind",
+	"idx_sources_blobhash_kind",
+	"idx_sources_artifact_indexed",
+}
+
+// countShadowIndexes — read-only 프로브. 조회 실패는 0으로 센다(진단은 fail-soft).
+func countShadowIndexes(ctx context.Context, db *sql.DB) int {
+	n := 0
+	for _, name := range shadowIndexNames {
+		var got string
+		if err := db.QueryRowContext(ctx, `SELECT name FROM sqlite_master WHERE type='index' AND name=?`, name).Scan(&got); err == nil {
+			n++
+		}
+	}
+	return n
+}
+
 // hostSnippet: doctor 마지막에 출력하는 호스트 등록 안내(설계 §9) — Claude Code(.mcp.json +
 // ingest/net/global ask 규칙)와 Codex(config.toml 기본 6-도구 프로필). exec는 기본 OFF·프로필
 // opt-in(--enable exec, D58)이라 활성 예시와 enabled_tools 확장을 병기하되, 승인 강도는 호스트
@@ -1537,7 +1557,12 @@ func runDoctor(ctx context.Context, w io.Writer, storeRoot, projectRoot, version
 					fmt.Fprintf(w, "[3] content.db: quick_check 실패 (user_version=%d quick_check=%q)\n", userVersion, quickCheck)
 					failed = append(failed, "content.db")
 				} else {
-					fmt.Fprintf(w, "[3] content.db: user_version=%d quick_check=ok\n", userVersion)
+					// D73: 색인 유무를 버전이 아니라 진단으로 관측한다. 병기는 quick_check **뒤**에
+					// 둔다 — 기존 테스트가 "user_version=%d quick_check=ok"를 부분문자열로 단정하므로
+					// 뒤에 붙이면 골든을 갱신하지 않고 정보만 더한다. 분자는 대상 색인 3개 중 실재
+					// 수다(sources 전체 색인 수를 세면 uri PK의 autoindex가 섞인다).
+					fmt.Fprintf(w, "[3] content.db: user_version=%d quick_check=ok indexes=%d/%d\n",
+						userVersion, countShadowIndexes(ctx, st.Reader()), len(shadowIndexNames))
 					reader = st.Reader()
 				}
 			}

@@ -8,10 +8,13 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -2452,5 +2455,228 @@ func TestReclaimHookBlobsHonorsLockWaitCancel(t *testing.T) {
 	}
 	if elapsed > 2*time.Second {
 		t.Fatalf("ctx 미관측 의심 — %v 소요(5초 하드 대기로 lockStore 회귀 가능성, F3)", elapsed)
+	}
+}
+
+// --- D73: shadow 술어 색인(버전 스위치 밖) ---
+
+// shadowIndexNames — D73 대상 색인. 진단의 분자와 같은 집합이다.
+var shadowIndexNames = []string{
+	"idx_sources_artifact_kind",
+	"idx_sources_blobhash_kind",
+	"idx_sources_artifact_indexed",
+}
+
+// countShadowIndexes — sqlite_master에서 대상 색인의 실재 수를 센다. sources 전체 색인 수를
+// 세면 uri TEXT PRIMARY KEY의 autoindex가 포함돼 "색인 없음"이 0으로 관측되지 않는다.
+func countShadowIndexes(t *testing.T, db *sql.DB) int {
+	t.Helper()
+	n := 0
+	for _, name := range shadowIndexNames {
+		var got string
+		err := db.QueryRow(`SELECT name FROM sqlite_master WHERE type='index' AND name=?`, name).Scan(&got)
+		if err == nil {
+			n++
+			continue
+		}
+		if !errors.Is(err, sql.ErrNoRows) {
+			t.Fatalf("index 조회(%s): %v", name, err)
+		}
+	}
+	return n
+}
+
+// TestEnsureIndexesOnFreshDB — D73: 신규 생성 DB가 **첫 Open**에서 색인까지 도달하고
+// user_version은 1로 남는다(구 바이너리 호환 회귀 방지).
+func TestEnsureIndexesOnFreshDB(t *testing.T) {
+	dir := t.TempDir()
+	s := openAt(t, dir)
+	if got := countShadowIndexes(t, s.Reader()); got != len(shadowIndexNames) {
+		t.Fatalf("indexes=%d want %d", got, len(shadowIndexNames))
+	}
+	var v int
+	if err := s.Reader().QueryRow("PRAGMA user_version").Scan(&v); err != nil {
+		t.Fatal(err)
+	}
+	if v != SchemaVersion {
+		t.Fatalf("user_version=%d want %d — 이 결정은 버전을 올리지 않는다", v, SchemaVersion)
+	}
+}
+
+// TestEnsureIndexesOnExistingV1 — D73: 색인 없는 기존 v1 DB가 Open 후 색인을 얻는다.
+// 버전 스위치 안에 두면 case v == SchemaVersion이 DDL 앞에서 반환해 이 테스트가 실패한다.
+func TestEnsureIndexesOnExistingV1(t *testing.T) {
+	dir := t.TempDir()
+	s := openAt(t, dir)
+	for _, name := range shadowIndexNames { // v0.12 상태(색인 없음)를 만든다
+		if _, err := s.writer.Exec("DROP INDEX IF EXISTS " + name); err != nil {
+			t.Fatal(err)
+		}
+	}
+	_ = s.Close() // 전용 종료 헬퍼는 없다 — openAt의 cleanup이 두 번째 Close 오류를 버린다
+	s2 := openAt(t, dir)
+	if got := countShadowIndexes(t, s2.Reader()); got != len(shadowIndexNames) {
+		t.Fatalf("재Open 후 indexes=%d want %d", got, len(shadowIndexNames))
+	}
+}
+
+// TestShadowPredicateResultUnchangedByIndexes — D73: 색인은 성능 변경이며 의미 변경이 아니다.
+// 같은 데이터에서 색인 유/무의 술어 결과 집합이 같아야 한다.
+func TestShadowPredicateResultUnchangedByIndexes(t *testing.T) {
+	dir := t.TempDir()
+	s := openAt(t, dir)
+	seedShadowMixed(t, s) // 아래에서 새로 만드는 픽스처(기존 seed*는 uri 재사용으로 조합 불가)
+	withIdx := shadowOwnedHashesT(t, s)
+	if len(withIdx) == 0 {
+		t.Fatal("픽스처가 귀속 hash를 만들지 못했다 — 빈 결과끼리의 비교는 무의미하다")
+	}
+	for _, name := range shadowIndexNames {
+		if _, err := s.writer.Exec("DROP INDEX IF EXISTS " + name); err != nil {
+			t.Fatal(err)
+		}
+	}
+	withoutIdx := shadowOwnedHashesT(t, s)
+	if !reflect.DeepEqual(withIdx, withoutIdx) {
+		t.Fatalf("색인이 결과를 바꿨다: with=%v without=%v", withIdx, withoutIdx)
+	}
+}
+
+// shadowOwnedHashesT — shadowOwnedFilter(0, 0)의 질의를 실행해 hash 슬라이스를 정렬 반환한다.
+func shadowOwnedHashesT(t *testing.T, s *Store) []string {
+	t.Helper()
+	q, args := shadowOwnedFilter(0, 0)
+	rows, err := s.Reader().Query(q, args...)
+	if err != nil {
+		t.Fatalf("shadow 술어: %v", err)
+	}
+	defer func() { _ = rows.Close() }()
+	var out []string
+	for rows.Next() {
+		var h string
+		if err := rows.Scan(&h); err != nil {
+			t.Fatal(err)
+		}
+		out = append(out, h)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// seedShadowMixed — 귀속 hash 1개(hook 단독)와 비귀속 hash 1개(hook + file이 같은 콘텐츠를
+// 공유)를 서로 다른 콘텐츠·uri로 등록한다. 기존 seed*(store_test.go:1716-1765)는 전부 같은
+// 콘텐츠와 uri "shadow:Bash:1"을 재사용하므로 조합하면 upsert로 덮인다 — regSource로 직접 만든다.
+func seedShadowMixed(t *testing.T, st *Store) {
+	t.Helper()
+	regSource(t, st, "owned-by-hook-only", "text/plain", "shadow:Bash:owned", "hook")
+	regSource(t, st, "shared-with-file", "text/plain", "shadow:Bash:shared", "hook")
+	regSource(t, st, "shared-with-file", "text/plain", "file:///tmp/shared.txt", "file")
+}
+
+// TestEnsureIndexesReopenIsNoop — D73 §2 ③: 색인이 이미 셋 다 있는 DB를 다시 Open해도 오류가
+// 없고 3/3이 유지된다. DDL은 IF NOT EXISTS라 멱등이므로 호출 횟수 자체는 계약이 아니다 —
+// 계약은 ① 정상 경로마다 도달 ② 재개시 결과 불변 ③ 기동 예산 내(Task 2b)다.
+func TestEnsureIndexesReopenIsNoop(t *testing.T) {
+	dir := t.TempDir()
+	s := openAt(t, dir)
+	if got := countShadowIndexes(t, s.Reader()); got != len(shadowIndexNames) {
+		t.Fatalf("첫 Open indexes=%d want %d", got, len(shadowIndexNames))
+	}
+	_ = s.Close()
+	s2 := openAt(t, dir)
+	if got := countShadowIndexes(t, s2.Reader()); got != len(shadowIndexNames) {
+		t.Fatalf("재Open indexes=%d want %d", got, len(shadowIndexNames))
+	}
+	var v int
+	if err := s2.Reader().QueryRow("PRAGMA user_version").Scan(&v); err != nil {
+		t.Fatal(err)
+	}
+	if v != SchemaVersion {
+		t.Fatalf("user_version=%d want %d", v, SchemaVersion)
+	}
+}
+
+// TestShadowPredicateUsesIndexes — D73: 수치 기록만으로는 색인이 질의 계획에 반영되지 않아도
+// 통과하므로, 계획에 sources 전체 스캔이 없음을 단정한다.
+func TestShadowPredicateUsesIndexes(t *testing.T) {
+	dir := t.TempDir()
+	s := openAt(t, dir)
+	seedShadowMixed(t, s)
+	q, args := shadowOwnedFilter(time.Now().Unix(), 100)
+	rows, err := s.Reader().Query("EXPLAIN QUERY PLAN "+q, args...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = rows.Close() }()
+	var plan []string
+	for rows.Next() {
+		var id, parent, notUsed int
+		var detail string
+		if err := rows.Scan(&id, &parent, &notUsed, &detail); err != nil {
+			t.Fatal(err)
+		}
+		plan = append(plan, detail)
+	}
+	joined := strings.Join(plan, "\n")
+	// 판정 ①: 세 색인이 계획에 각각 나타난다.
+	for _, name := range shadowIndexNames {
+		if !strings.Contains(joined, name) {
+			t.Fatalf("계획에 %s가 없다:\n%s", name, joined)
+		}
+	}
+	// 판정 ②: "USING"이 없는 맨 SCAN이 없다. **별칭 SCAN 자체를 금지하면 안 된다** — 색인이
+	// 전부 있어도 구동 테이블은 "SCAN sh USING COVERING INDEX idx_sources_artifact_kind"로
+	// 남는다(실측). 그리고 술어의 sources 참조는 전부 별칭(sh·s2·s3·s4)이라 "SCAN sources"를
+	// 찾는 형태는 색인이 없어도 항상 통과한다.
+	for _, d := range plan {
+		if strings.HasPrefix(strings.TrimSpace(d), "SCAN ") && !strings.Contains(d, "USING") {
+			t.Fatalf("색인 없는 맨 SCAN이 남아 있다: %q\n전체 계획:\n%s", d, joined)
+		}
+	}
+}
+
+// TestEnsureIndexesFailureDoesNotBlockOpen — D73: 색인 DDL 실패는 Open을 막지 않고 경고로
+// 남으며, 그 상태에서도 술어가 정확하고 진단의 실재 수가 3보다 작게 관측된다.
+func TestEnsureIndexesFailureDoesNotBlockOpen(t *testing.T) {
+	dir := t.TempDir()
+	s := openAt(t, dir)
+	seedShadowMixed(t, s)
+	want := shadowOwnedHashesT(t, s)
+	// 대상 이름 하나를 다른 객체가 선점하게 만들어 CREATE INDEX를 실패시킨다.
+	for _, name := range shadowIndexNames {
+		if _, err := s.writer.Exec("DROP INDEX IF EXISTS " + name); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := s.writer.Exec(`CREATE TABLE idx_sources_artifact_kind(x)`); err != nil {
+		t.Fatal(err)
+	}
+	_ = s.Close()
+	// §2 ⑩: 실패가 slog.Warn으로 관측되는지 본다 — 기본 로거를 갈아 캡처하고 되돌린다.
+	var logBuf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logBuf, nil)))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+	s2 := openAt(t, dir) // Open이 실패하지 않아야 한다
+	warnLines := 0
+	for _, ln := range strings.Split(strings.TrimSpace(logBuf.String()), "\n") {
+		if !strings.Contains(ln, "색인 생성 실패") {
+			continue
+		}
+		warnLines++
+		if !strings.Contains(ln, "idx_sources_artifact_kind") {
+			t.Fatalf("경고에 실패한 색인 이름이 없다: %q", ln)
+		}
+	}
+	if warnLines < 1 || warnLines > len(shadowIndexNames) {
+		t.Fatalf("경고 줄 수=%d want 1..%d\n%s", warnLines, len(shadowIndexNames), logBuf.String())
+	}
+	if got := countShadowIndexes(t, s2.Reader()); got >= len(shadowIndexNames) {
+		t.Fatalf("indexes=%d — 실패를 유도했는데 전부 생겼다", got)
+	}
+	if got := shadowOwnedHashesT(t, s2); !reflect.DeepEqual(got, want) {
+		t.Fatalf("색인 부분 적용이 술어 결과를 바꿨다: got=%v want=%v", got, want)
 	}
 }
