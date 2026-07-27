@@ -2387,6 +2387,11 @@ func TestErrPredicates(t *testing.T) {
 // 취소된 ctx를 PurgeHookOnlyOlderThan에 처음부터 넘기는 형태로는 이 회귀를 잡을 수 없다 —
 // 그 경로는 행 삭제 tx에서 먼저 실패해 빈 리포트를 반환하므로 deferred가 원래 0이다. 그래서
 // 회수 단계를 직접 부른다.
+//
+// 이 테스트는 루프 선두 체크만 잡는다(F3) — 락이 무경합이라 lockStoreCtx(ctx, s.dir)가 즉시
+// 성공해 그 내부 select{ctx.Done(), time.After}는 절대 안 탄다. lockStoreCtx를 lockStore로
+// 되돌려도 이 테스트는 그대로 통과한다. 잠금 대기 자체의 취소 관측은
+// TestReclaimHookBlobsHonorsLockWaitCancel(아래)이 락을 선점해 강제로 검증한다.
 func TestReclaimHookBlobsHonorsCancel(t *testing.T) {
 	dir := t.TempDir()
 	s := openAt(t, dir) // store_test.go:1693 — dir 지정 Open, t.Cleanup에 `_ = s.Close()` 등록
@@ -2416,5 +2421,36 @@ func TestReclaimHookBlobsHonorsCancel(t *testing.T) {
 		if _, statErr := os.Stat(filepath.Join(dir, "artifacts", h[:2], h)); statErr != nil {
 			t.Fatalf("blob %s 가 사라졌다: %v", h[:8], statErr)
 		}
+	}
+}
+
+// TestReclaimHookBlobsHonorsLockWaitCancel — D74 F3/F4: reclaimHookBlobs의 lockStoreCtx 대기
+// 자체가 ctx를 관측한다. content.db.rebuild.lock을 외부에서 배타 선점해(TestOpenContextLockDeadline과
+// 동형 — store_test.go:1627) lockStoreCtx가 select{ctx.Done(), time.After}로 실제 진입하게
+// 만든다. lockStoreCtx를 lockStore로 되돌리면(F3 회귀) ctx.Done()이 절대 발화하지 않아 내부
+// 5초 하드 타임아웃까지 블록한다 — elapsed 상한이 그 회귀를 잡는다. 동시에 반환 오류가
+// context.DeadlineExceeded 그대로인지도 검증한다(F4 — lockStoreCtx가 감싸는 ErrUnavailable이
+// 아니라).
+func TestReclaimHookBlobsHonorsLockWaitCancel(t *testing.T) {
+	dir := t.TempDir()
+	s := openAt(t, dir)
+	release, err := AcquireLock(filepath.Join(dir, lockFileName), false)
+	if err != nil {
+		t.Fatalf("선점 잠금: %v", err)
+	}
+	defer release()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	hashes := []string{strings.Repeat("c", 64)} // 락 획득 전에 반환되므로 실재 blob 불필요
+	var rep HookPurgeReport
+	start := time.Now()
+	err = s.reclaimHookBlobs(ctx, hashes, &rep)
+	elapsed := time.Since(start)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("err=%v want context.DeadlineExceeded(F4 계약)", err)
+	}
+	if elapsed > 2*time.Second {
+		t.Fatalf("ctx 미관측 의심 — %v 소요(5초 하드 대기로 lockStore 회귀 가능성, F3)", elapsed)
 	}
 }

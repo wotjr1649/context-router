@@ -1177,15 +1177,21 @@ func (s *Store) purgeHookRows(ctx context.Context, cutoffUnix int64, maxHashes i
 // mtime이 gcOrphanMinAge(1h) 이내(교체 감지 겸 age gate) 또는 DB 재확인에서 참조 존재 → 원 경로로
 // 롤백 + Deferred++ ③ 아니면 os.Remove + ReclaimedB += size(Remove 실패는 롤백 + Failed++). rename
 // 이후 도착한 Register.writeBlob은 원 경로에 새 파일을 만들 뿐 무충돌, rename 이전 교체분은 격리본의
-// fresh mtime이 ②에서 걸려 롤백 — Stat↔unlink 오삭제 창을 폐쇄한다. lockStoreCtx 실패(취소 포함)는
-// 오류로 반환하되 행 삭제는 이미 유효하다(남은 파일은 --gc 후속). 루프 선두 ctx.Err() 체크(D74)로
-// 취소 시 종료가 배치 크기만큼 지연되던 것과 deferred 부풀림을 함께 없앤다.
+// fresh mtime이 ②에서 걸려 롤백 — Stat↔unlink 오삭제 창을 폐쇄한다. lockStoreCtx 실패는 오류로
+// 반환하되 행 삭제는 이미 유효하다(남은 파일은 --gc 후속) — 그 실패가 ctx 취소/데드라인이면
+// ctx.Err()를 그대로 반환해(F4) 잠금 대기 구간과 루프 구간이 같은 계약을 지킨다: 그 외(다른
+// 프로세스의 5초 하드 타임아웃 등 ctx와 무관한 사유)는 기존대로 wrapped ErrUnavailable이다.
+// 루프 선두 ctx.Err() 체크(D74)로 취소 시 종료가 배치 크기만큼 지연되던 것과 deferred 부풀림을
+// 함께 없앤다.
 func (s *Store) reclaimHookBlobs(ctx context.Context, hashes []string, rep *HookPurgeReport) error {
 	if len(hashes) == 0 {
 		return nil
 	}
 	release, err := lockStoreCtx(ctx, s.dir)
 	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil { // F4: 취소/데드라인이 원인이면 그 사유를 그대로 노출
+			return ctxErr
+		}
 		return fmt.Errorf("store PurgeHookOnly: %w", err)
 	}
 	defer release()

@@ -391,10 +391,11 @@ func shadowCutoff(now time.Time, d time.Duration) int64 {
 // 예산을 넘긴 배치는 단일 tx라 통째 롤백돼 회수가 전혀 진행되지 않았다).
 //
 // 강제되는 범위(하드 바운드가 아니다): 행 삭제 tx는 드라이버가 ctx 취소를 sqlite3_interrupt로
-// 전달해 촘촘히 끊긴다(실측 5/50/150ms 예산 → 소요 5.5/50.2/154ms). 파일 회수 루프는 hash 사이에서
-// ctx를 보지 않아 예산이 소진돼도 목록 끝까지 돌고 오류도 만들지 않으므로(store.reclaimHookBlobs)
-// 그 구간의 한도는 시간이 아니라 startupPurgeMaxHashes다. 또 SQLite busy handler는 interrupt
-// 플래그를 보지 않아 다른 프로세스가 쥔 락을 기다리는 busy_timeout(5s)은 이 예산을 넘길 수 있다.
+// 전달해 촘촘히 끊긴다(실측 5/50/150ms 예산 → 소요 5.5/50.2/154ms). 파일 회수 루프도 D74부터
+// 매 hash 선두에서 ctx.Err()를 관측해 예산 소진 시 조기 반환한다(store.reclaimHookBlobs) — 그래도
+// 취소 없이 정상 완주할 때의 상한은 시간이 아니라 startupPurgeMaxHashes다. 또 SQLite busy handler는
+// interrupt 플래그를 보지 않아 다른 프로세스가 쥔 락을 기다리는 busy_timeout(5s)은 이 예산을 넘길
+// 수 있다(잠금 대기 자체는 D74의 lockStoreCtx가 ctx도 함께 관측한다 — store.go:66).
 const startupPurgeBudget = 60 * time.Second
 
 // startupPurgeMaxHashes — 1회 회수 배치 상한. 이 값이 묶는 것은 기동당 작업량이 아니라 **잠금 보유
@@ -547,9 +548,12 @@ func run(ctx context.Context, args []string, stderr io.Writer) error {
 		rep, purgeErr := st.PurgeHookOnlyOlderThan(purgeCtx, cutoff, startupPurgeMaxHashes)
 		// 결과 분류를 오류 모양이 아니라 ctx의 종료 사유로 하는 이유: 예산 소진의 관측된 모양은
 		// context.DeadlineExceeded였지만 드라이버가 문장 중간 취소를 sqlite3_interrupt로 처리하므로
-		// SQLITE_INTERRUPT로 올라올 수도 있고, 파일 회수 단계는 예산을 넘겨도 오류를 만들지 않는다.
-		// 한 번만 읽어 세 분기가 같은 값을 보게 한다 — ctx.Err()는 최초 종료 사유로 latch되므로 취소가
-		// deadline을 덮어쓰지 못하고, 취소는 종료 경로만 의미한다(시그널 또는 아래 defer의 cancelPurge).
+		// SQLITE_INTERRUPT로 올라올 수도 있고, D74부터 파일 회수 단계도 자체적으로 오류를 반환한다
+		// (store.reclaimHookBlobs, 루프 선두 ctx.Err()). 그래서 이 오류 하나만으로는 행 삭제 tx가
+		// 커밋됐는지 알 수 없다 — rep.Hashes(store.purgeHookRows는 실패 시 항상 빈 리포트를 반환하므로
+		// >0이면 커밋이 확정)로 아래에서 그 둘을 구분한다. 한 번만 읽어 모든 분기가 같은 값을 보게
+		// 한다 — ctx.Err()는 최초 종료 사유로 latch되므로 취소가 deadline을 덮어쓰지 못하고, 취소는
+		// 종료 경로만 의미한다(시그널 또는 아래 defer의 cancelPurge).
 		purgeCtxErr := purgeCtx.Err()
 		budgetSpent := errors.Is(purgeCtxErr, context.DeadlineExceeded)
 		switch {
@@ -557,16 +561,26 @@ func run(ctx context.Context, args []string, stderr io.Writer) error {
 			// 종료로 중단된 것은 실패가 아니다 — 남은 배치는 다음 기동이 그대로 다시 집는다. stdio
 			// 서버는 호스트가 stdin을 닫으면 mcp.Serve가 반환하므로(시그널 없이도) 이 경로를 탄다.
 			slog.Debug("기동 shadow 회수 중단 — 서버 종료", "error", purgeErr)
+		case purgeErr != nil && budgetSpent && rep.Hashes > 0:
+			// F1: D74부터 예산 소진이 파일 회수 단계(행 삭제는 이미 커밋)에서도 걸릴 수 있다 — rep는
+			// purgeHookRows가 채운 실제 카운트이지 zero-value가 아니다(아래 case는 그 전제가 유효한
+			// rep.Hashes==0 사례만 남는다). 행이 이미 삭제돼 다음 기동 술어에 다시 안 잡히므로 남은
+			// 파일의 유일한 회수 경로는 purge --gc다. D67 튜닝 입력이 소실되지 않도록 카운트를 그대로
+			// 싣는다(위 case와 동일한 필드 — capped·budget_spent 대신 이 분기 자체가 budget_spent다).
+			slog.Warn("기동 shadow 회수 예산 소진 — 행 삭제 완료, 파일 회수 잔여분은 purge --gc",
+				"hashes", rep.Hashes, "bytes", rep.ReclaimedB, "deferred", rep.DeferredFiles,
+				"capped", rep.Hashes == startupPurgeMaxHashes)
 		case purgeErr != nil && budgetSpent:
 			// 예산은 폭주 가드이므로 소진은 정상 경로가 아니다 — 경고로 올린다. 건수는 싣지 않는다:
-			// 이 분기의 오류는 행 삭제 tx에서만 나오고 그 단계는 실패 시 빈 리포트를 반환한다
-			// (store.purgeHookRows). 남은 파일은 참조 재확인이 실패하면 보수적으로 유예되므로
-			// (stillReferenced가 오류를 "참조 있음"으로 취급) 오삭제는 없다.
+			// 위 case가 커밋된 사례를 먼저 가져가므로 이 분기는 rep.Hashes==0(행 삭제 tx 자체가
+			// 예산에 걸려 커밋 전 롤백, store.purgeHookRows)만 남는다. 남은 파일은 참조 재확인이
+			// 실패하면 보수적으로 유예되므로(stillReferenced가 오류를 "참조 있음"으로 취급) 오삭제는
+			// 없다.
 			slog.Warn("기동 shadow 회수 예산 소진 — 행 삭제 미완료, 다음 기동에서 재시도")
 		case purgeErr != nil:
 			// 두 실패가 이 분기로 온다: 행 삭제 실패(다음 기동이 같은 배치를 다시 집는다)와 커밋 뒤
-			// 파일 회수 실패(lockStore 실패 등 — 행이 이미 없어 다음 기동 술어에 안 잡히므로 purge --gc가
-			// 회수 경로다). 어느 쪽인지 로그에서 구분할 수 없으므로 두 경로를 함께 적는다.
+			// 파일 회수 실패(lockStoreCtx 실패 등 — 행이 이미 없어 다음 기동 술어에 안 잡히므로
+			// purge --gc가 회수 경로다). 어느 쪽인지 로그에서 구분할 수 없으므로 두 경로를 함께 적는다.
 			slog.Warn("기동 shadow 회수 실패 — 행 삭제분은 다음 기동에서 재시도, 파일 회수분은 purge --gc", "error", purgeErr)
 		case rep.Hashes > 0:
 			// capped·budget_spent: 어느 예산이 이번 배치를 끊었는지 관측용(D67 임계값 재설정 입력).
@@ -577,8 +591,10 @@ func run(ctx context.Context, args []string, stderr io.Writer) error {
 	}()
 	// 회수를 st.Close()·sessDB.Close()보다 먼저 끝낸다(defer LIFO — 이 defer가 그 둘보다 나중에
 	// 등록되어 먼저 돈다): 닫힌 DB 접근과 rename 격리 중간 상태(*.purging)로 프로세스가 끝나는 것을
-	// 막는다. 취소 뒤 남는 대기는 파일 회수 루프의 잔여 hash(≤startupPurgeMaxHashes)와 진입 전
-	// lockStore 대기(≤5s)뿐이다 — 고루틴이 프로세스보다 오래 살지 않는다.
+	// 막는다. D74부터 루프가 매 hash 선두에서 ctx.Err()를 관측하고 lockStoreCtx도 잠금 대기 중
+	// ctx를 함께 관측하므로(store.go:66), 취소 뒤 남는 대기는 이미 진행 중인 단일 hash 처리분뿐이다
+	// — 더 이상 잔여 배치 전체(≤startupPurgeMaxHashes)나 잠금 대기 최대 5초를 기다리지 않는다.
+	// 고루틴이 프로세스보다 오래 살지 않는다.
 	defer func() { cancelPurge(); <-purgeDone }()
 	return mcp.Serve(ctx, mcp.Config{
 		Canon: canon, Store: st, SelfExe: selfExe, ScratchRoot: scratchRoot,
