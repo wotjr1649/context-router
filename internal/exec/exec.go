@@ -74,8 +74,10 @@ type runner struct {
 	//     실재를 요구해 실행이 깨진다(psmodules·GOTMPDIR·Application Support·NuGet sentinel).
 	//     실패 시 sandbox.ErrSetup을 감아 반환하고 env는 nil로 둔다 — 격리가 빠진 env를
 	//     호출부에 넘기지 않는다.
-	//   · 이중 안전장치 — 부재가 도구 내장 기본으로 퇴화한다(npmrc·스크래치 홈·pycache·
-	//     go-env). 경고만 남기고 계속하며, 왜 benign인지 각 지점에 적어 둔다.
+	//   · 이중 안전장치 — 부재가 도구 내장 기본으로 퇴화한다(npmrc·jsEnv 러너 고유
+	//     XDG_CONFIG_HOME·pycache·go-env). 경고만 남기고 계속하며, 왜 benign인지 각 지점에
+	//     적어 둔다. **홈 유도 격리 자체(HOME·CFFIXED_USER_HOME·XDG_DATA_HOME)는 D75부터
+	//     homeIsolationEnv가 소유하는 시행점**이다 — 위 시행점 목록 참조.
 	extra func(scratch string) ([]string, error)
 }
 
@@ -255,6 +257,10 @@ func shellRunner() runner {
 			return p, "", nil
 		},
 		argv: func(bin, file string) []string { return []string{bin, file} },
+		// D75: sh 스니펫은 어떤 툴체인이든 부를 수 있어 재지정 대상이 열린 집합이다 — 공유
+		// 지점(홈 유도 격리)을 그대로 쓴다. windows 갈래는 자기 PSModulePath·USERPROFILE
+		// 재지정을 유지하며 이 헬퍼를 부르지 않는다.
+		extra: homeIsolationEnv,
 	}
 }
 
@@ -285,6 +291,45 @@ func psModulePath(scratchMods, psHome, pfDir string) string {
 		out = append(out, filepath.Join(pf, pfDir, "Modules"))
 	}
 	return strings.Join(out, ";")
+}
+
+// homeIsolationEnv — D75: 홈 유도 사용자 구성의 **공유 지점**. unix 툴체인의 사용자 구성은 거의
+// 전부 $HOME 유도이고(XDG_CONFIG_HOME은 sandbox 허용 표 밖이라 이미 차단되며 그 기본값도
+// $HOME/.config다), jsEnv·csEnv가 이미 각자 HOME을 돌리고 있었다 — shell에 여섯 번째 사본을
+// 만들지 않고 한 지점으로 모은다(D13). sandbox의 닫힌 표(BaseEnv)로 올리지 않는 이유는 그러면
+// python·go 갈래까지 범위가 늘어나는데 그 두 러너는 다른 축으로 격리하기 때문이다.
+//
+// 부재가 안전하게 퇴화하지 않으므로 **시행점(fail-closed)**이다: 빈 스크래치 홈은 XDG 기본
+// 경로의 NuGet Migrations sentinel을 없애 sh 스니펫의 dotnet 호출을 하드코딩 /tmp 뮤텍스 실패
+// 경로로 보내고(dotnet/runtime#49822), macOS의 file-based dotnet run은 Application Support가
+// 없으면 temp 경로 결정에서 죽는다. 플랫폼 분기를 두지 않는 것은 기존 csharp 갈래가 이미 그
+// 형태이기 때문이다 — 분기를 두면 비darwin에서 값이 사라져 동작이 갈린다.
+//
+// js도 이 시행점을 함께 진다: 세 앵커는 통째로 주거나 말거나이고 부분 채택은 하지 않는다
+// (설계 D75 §2⑤ — js가 XDG_DATA_HOME·CFFIXED_USER_HOME을 새로 얻는 것은 의도된 변경이다).
+// js 자신은 NuGet sentinel을 쓰지 않지만, 앵커별로 갈라 주면 그 분기 자체가 D75가 없애려던
+// 네 번째 변형이 된다 — 같은 스크래치 하위 생성이라 home만 성공하고 나머지만 실패할 가능성도
+// 낮다(csEnv가 이미 이 여섯 경로를 한 루프로 묶어 온 전례와 같다).
+func homeIsolationEnv(scratch string) ([]string, error) {
+	home := filepath.Join(scratch, "home")
+	xdg := filepath.Join(scratch, "xdg")
+	appSupport := filepath.Join(home, "Library", "Application Support")
+	migrations := filepath.Join(xdg, "NuGet", "Migrations")
+	for _, d := range []string{home, appSupport, migrations} {
+		if err := os.MkdirAll(d, 0o700); err != nil {
+			slog.Error("exec: 홈 격리 디렉터리 생성 실패", "error", err) // 경로는 로그에만
+			return nil, fmt.Errorf("%w: 홈 격리 디렉터리 생성 실패", sandbox.ErrSetup)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(migrations, "1"), nil, 0o600); err != nil {
+		slog.Error("exec: NuGet 마이그레이션 sentinel 기록 실패", "error", err)
+		return nil, fmt.Errorf("%w: NuGet sentinel 기록 실패", sandbox.ErrSetup)
+	}
+	return []string{
+		"HOME=" + home,
+		"CFFIXED_USER_HOME=" + home,
+		"XDG_DATA_HOME=" + xdg,
+	}, nil
 }
 
 func detectJS() (string, string, error) {
@@ -322,20 +367,21 @@ func jsEnv(scratch string) ([]string, error) {
 	if err := os.WriteFile(rc, nil, 0o600); err != nil {
 		slog.Warn("exec: npmrc 기록 실패 — 격리는 유지(호스트 사용자 구성 미적용), npm 내장 기본으로 실행", "error", err)
 	}
-	home := filepath.Join(scratch, "home")
-	xdg := filepath.Join(home, ".config") // XDG 기본 배치 — MkdirAll이 home까지 만든다
-	// benign(이중 안전장치): bunfig 차단의 레버도 홈 포인터 **값**이다(위 ②) — 디렉터리가 없으면
-	// 자식이 찾을 사용자 bunfig가 없는 것이고, 호스트 홈으로 되돌아가지도 않는다(부재가 곧
-	// 격리된 결과다). 인터프리터 실행 자체는 이 디렉터리를 요구하지 않고, install 계열이 쓸 때는
-	// 자신이 만든다.
-	if err := os.MkdirAll(xdg, 0o700); err != nil {
-		slog.Warn("exec: 스크래치 홈 생성 실패 — 격리는 유지(홈 포인터가 호스트 사용자 구성 밖을 가리킨다)", "error", err)
+	shared, err := homeIsolationEnv(scratch)
+	if err != nil {
+		return nil, err // D75: 홈 준비 실패는 이제 시행점이다(이전에는 경고 후 계속 실행했다)
 	}
-	return []string{
-		"NPM_CONFIG_USERCONFIG=" + rc,
-		"HOME=" + home,
-		"XDG_CONFIG_HOME=" + xdg,
-	}, nil
+	// XDG_CONFIG_HOME은 러너 고유다 — bunfig 차단의 레버이고 헬퍼의 XDG_DATA_HOME과 용도·경로가
+	// 다르다. 헬퍼가 만든 홈 아래 XDG 기본 배치를 그대로 쓴다.
+	xdgConfig := filepath.Join(scratch, "home", ".config")
+	if err := os.MkdirAll(xdgConfig, 0o700); err != nil {
+		slog.Warn("exec: 스크래치 XDG_CONFIG_HOME 생성 실패 — 격리는 유지(홈 포인터가 호스트 밖을 가리킨다)", "error", err)
+	}
+	return append(
+		shared,
+		"NPM_CONFIG_USERCONFIG="+rc,
+		"XDG_CONFIG_HOME="+xdgConfig,
+	), nil
 }
 
 func tsRunner() runner {
@@ -607,33 +653,15 @@ func csEnv(scratch string) ([]string, error) {
 	nuget := filepath.Join(scratch, "nuget")
 	nugetHTTP := filepath.Join(scratch, "nuget-http")
 	nugetPlugins := filepath.Join(scratch, "nuget-plugins")
-	// XDG_DATA_HOME 밑 NuGet/Migrations/1 sentinel을 미리 만들어 MigrationRunner를 단락시킨다 —
-	// 없으면 NuGet-Migrations named mutex가 /tmp/.dotnet(TMPDIR 무시 하드코딩, dotnet/runtime#49822)에
-	// shared-memory를 열다 landlock RO /tmp에서 EACCES로 실패한다.
-	xdg := filepath.Join(scratch, "xdg")
-	migrations := filepath.Join(xdg, "NuGet", "Migrations")
-	// macOS는 ~/Library/Application Support/dotnet(Cocoa NSApplicationSupportDirectory)를 쓰는데
-	// DOTNET_CLI_HOME으로 못 옮긴다 — Foundation이 존중하는 CFFIXED_USER_HOME(+HOME)을 scratch
-	// 하위로 돌려 SBPL subpath 안에 넣고, first-run 워크로드 무결성 검사(네트워크)를 스킵한다.
-	userHome := filepath.Join(scratch, "home")
-	// file-based dotnet run의 artifacts temp는 LocalApplicationData(macOS=<home>/Library/Application
-	// Support)에서 결정되는데 NSSearchPath는 경로를 만들지 않아, 미존재 시 빈 문자열→temp 경로 결정 실패로
-	// 죽는다 — env에 할당·파생한 경로는 전부 사전 생성한다(goEnv GOTMPDIR 규칙). SBPL scratch subpath 안.
-	appSupport := filepath.Join(userHome, "Library", "Application Support")
-	// 시행점: migrations·appSupport는 부재 자체가 실행을 깨는 쪽이고(위 두 주석의 근거 —
-	// landlock RO /tmp EACCES · NSSearchPath 빈 문자열로 temp 경로 결정 실패), 나머지 넷도
-	// env가 가리키는 경로라 만들 수 없는 상황에서는 dotnet/NuGet의 자체 생성도 같은 이유로
-	// 실패한다. 한 루프이므로 함께 fail-closed로 둔다.
-	for _, d := range []string{home, nuget, nugetHTTP, nugetPlugins, migrations, appSupport} {
+	// 시행점: 이 넷은 env가 가리키는 경로라 만들 수 없는 상황에서는 dotnet/NuGet의 자체 생성도
+	// 같은 이유로 실패한다 — 한 루프로 함께 fail-closed로 둔다. 홈 유도 앵커(HOME·
+	// CFFIXED_USER_HOME·XDG_DATA_HOME과 그 NuGet Migrations sentinel)는 D75부터 homeIsolationEnv가
+	// 소유한다(js·unix shell과 공유) — 아래에서 위임한다.
+	for _, d := range []string{home, nuget, nugetHTTP, nugetPlugins} {
 		if err := os.MkdirAll(d, 0o700); err != nil {
 			slog.Error("exec: dotnet·NuGet 스크래치 디렉터리 생성 실패", "error", err) // 경로는 로그에만
 			return nil, fmt.Errorf("%w: dotnet 디렉터리 생성 실패", sandbox.ErrSetup)
 		}
-	}
-	// 시행점: sentinel이 없으면 MigrationRunner가 돌아 위 주석의 EACCES 실패 경로로 들어간다.
-	if err := os.WriteFile(filepath.Join(migrations, "1"), nil, 0o600); err != nil {
-		slog.Error("exec: NuGet 마이그레이션 sentinel 기록 실패", "error", err) // 경로는 로그에만
-		return nil, fmt.Errorf("%w: NuGet sentinel 기록 실패", sandbox.ErrSetup)
 	}
 	// 시행점: 이 파일이 호스트 구성 차단의 유일한 시행점이라 조용한 실패는 격리 없이 실행되는
 	// 것과 같다 — 그래서 러너 오류로 올린다(설계 정정: 이전의 best-effort 계약을 대체한다).
@@ -641,14 +669,16 @@ func csEnv(scratch string) ([]string, error) {
 		slog.Error("exec: NuGet 구성 기록 실패", "error", err) // 경로는 로그에만
 		return nil, fmt.Errorf("%w: NuGet 구성 기록 실패", sandbox.ErrSetup)
 	}
-	return []string{
-		"DOTNET_CLI_HOME=" + home,
-		"NUGET_PACKAGES=" + nuget,
-		"NUGET_HTTP_CACHE_PATH=" + nugetHTTP,
-		"NUGET_PLUGINS_CACHE_PATH=" + nugetPlugins,
-		"XDG_DATA_HOME=" + xdg,
-		"HOME=" + userHome,
-		"CFFIXED_USER_HOME=" + userHome,
+	shared, err := homeIsolationEnv(scratch)
+	if err != nil {
+		return nil, err
+	}
+	return append(
+		shared,
+		"DOTNET_CLI_HOME="+home,
+		"NUGET_PACKAGES="+nuget,
+		"NUGET_HTTP_CACHE_PATH="+nugetHTTP,
+		"NUGET_PLUGINS_CACHE_PATH="+nugetPlugins,
 		"DOTNET_SKIP_WORKLOAD_INTEGRITY_CHECK=1",
 		"DOTNET_GENERATE_ASPNET_CERTIFICATE=false", // macOS first-run dev-cert가 SBPL 밖 로그인 키체인 접근 예방
 		"DOTNET_NOLOGO=1",
@@ -656,7 +686,7 @@ func csEnv(scratch string) ([]string, error) {
 		"DOTNET_CLI_DO_NOT_USE_MSBUILD_SERVER=1",
 		"MSBUILDDISABLENODEREUSE=1",
 		"UseSharedCompilation=false",
-	}, nil
+	), nil
 }
 
 // tmpEnv: 공통 temp 재지정 — Unix는 TMPDIR, Windows는 TEMP·TMP를 스크래치 하위 tmp로

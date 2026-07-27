@@ -4,10 +4,12 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -1135,9 +1137,23 @@ func TestExtraSetupFailureIsErrSetup(t *testing.T) {
 		{"nuget-migrations-sentinel", filepath.Join("xdg", "NuGet", "Migrations", "1"), true, csEnv},
 		{"dotnet-cli-home", "dotnet", false, csEnv},
 		{"gotmpdir", "go-tmp", false, goEnv},
+		{"js-home", "home", false, jsEnv},
+		{"cs-home", "home", false, csEnv},
+		// unix 갈래만 헬퍼를 부른다 — windows 갈래는 PSModulePath·USERPROFILE을 유지한다.
+		{"shell-home", "home", false, func(scratch string) ([]string, error) {
+			if runtime.GOOS == "windows" {
+				return nil, fmt.Errorf("%w: windows 갈래는 이 축의 대상이 아니다", sandbox.ErrSetup)
+			}
+			return table()["shell"].extra(scratch)
+		}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
+			// shell-home은 unix 갈래만 대상이다 — windows 갈래는 이 축의 대상이 아니므로(위 표
+			// 행의 windows 분기) 해피 패스 대조까지 포함해 이 서브테스트 전체를 건너뛴다.
+			if tc.name == "shell-home" && runtime.GOOS == "windows" {
+				t.Skip("windows 갈래는 홈 격리 축의 대상이 아니다 — PSModulePath·USERPROFILE을 유지한다")
+			}
 			scratch := t.TempDir()
 			blocker := filepath.Join(scratch, tc.blocker)
 			if tc.asDir {
@@ -1167,7 +1183,7 @@ func TestExtraSetupFailureIsErrSetup(t *testing.T) {
 // 실측) — 부재 경로를 첫 항목으로 주고 실행하면 그 정지가 타임아웃까지 매달린다.
 func TestShellExtraModuleDirFailureIsErrSetup(t *testing.T) {
 	if runtime.GOOS != "windows" {
-		t.Skip("windows 전용 시행점 — 다른 OS의 shell 러너는 extra가 없다")
+		t.Skip("windows 갈래의 psmodules 시행점 전용 — unix 갈래는 홈 격리 축을 shell-home 행이 덮는다")
 	}
 	r := table()["shell"]
 	if _, _, err := r.detect(); err != nil { // extra가 읽는 psHome을 detect가 채운다(Run과 같은 순서)
@@ -1234,5 +1250,186 @@ func TestRunnerLabelNodeLeg(t *testing.T) {
 				t.Fatalf("runner=%q base=%q want node", resp.Runner, base)
 			}
 		})
+	}
+}
+
+// TestHomeIsolationEnvAnchors — D75: 헬퍼가 세 앵커와 준비물을 소유한다. 플랫폼 분기가 없다.
+func TestHomeIsolationEnvAnchors(t *testing.T) {
+	scratch := t.TempDir()
+	env, err := homeIsolationEnv(scratch)
+	if err != nil {
+		t.Fatalf("homeIsolationEnv: %v", err)
+	}
+	home := filepath.Join(scratch, "home")
+	xdg := filepath.Join(scratch, "xdg")
+	for _, want := range []string{"HOME=" + home, "CFFIXED_USER_HOME=" + home, "XDG_DATA_HOME=" + xdg} {
+		if !slices.Contains(env, want) {
+			t.Fatalf("env에 %q 없음: %v", want, env)
+		}
+	}
+	for _, p := range []string{home, filepath.Join(home, "Library", "Application Support"), filepath.Join(xdg, "NuGet", "Migrations")} {
+		if fi, statErr := os.Stat(p); statErr != nil || !fi.IsDir() {
+			t.Fatalf("준비물 디렉터리 부재: %s (%v)", p, statErr)
+		}
+	}
+	if _, statErr := os.Stat(filepath.Join(xdg, "NuGet", "Migrations", "1")); statErr != nil {
+		t.Fatalf("NuGet sentinel 부재: %v", statErr)
+	}
+}
+
+// TestHomeIsolationEnvFailClosed — D75: 준비물 생성이 실패하면 실행을 거부한다. 홈이 없으면
+// 재지정이 성립하지 않고 그 상태로 실행하면 호스트 홈으로 되돌아갈 수 있다.
+func TestHomeIsolationEnvFailClosed(t *testing.T) {
+	scratch := t.TempDir()
+	// 파일 자리에 디렉터리를 만들 수 없게 해 실제 OS 오류를 낸다(v0.12의 extra fail-closed
+	// 픽스처와 같은 방식).
+	if err := os.WriteFile(filepath.Join(scratch, "home"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	env, err := homeIsolationEnv(scratch)
+	if !errors.Is(err, sandbox.ErrSetup) {
+		t.Fatalf("err=%v want sandbox.ErrSetup", err)
+	}
+	if env != nil {
+		t.Fatalf("env=%v want nil — 격리가 빠진 env를 호출부에 넘기지 않는다", env)
+	}
+}
+
+// TestRunnerIsolationKeySets — D75: 통합 후 각 러너의 유효 격리 키 집합을 고정한다. js·shell이
+// 얻는 키가 늘어나는 것은 의도된 변경이므로 "기존과 동일"을 요구하지 않는다 — 변화 없음을
+// 단정하는 대상은 csharp(이미 세 앵커를 전부 준다)과 windows shell(헬퍼를 부르지 않는다)이다.
+func TestRunnerIsolationKeySets(t *testing.T) {
+	scratch := t.TempDir()
+	anchors := []string{"HOME", "CFFIXED_USER_HOME", "XDG_DATA_HOME"}
+	tbl := table()
+	for _, lang := range []string{"javascript", "typescript", "csharp"} {
+		env, err := tbl[lang].extra(scratch)
+		if err != nil {
+			t.Fatalf("%s extra: %v", lang, err)
+		}
+		for _, k := range anchors {
+			if !hasEnvKeyT(env, k) {
+				t.Fatalf("%s에 앵커 %s 없음", lang, k)
+			}
+		}
+	}
+	shell := tbl["shell"]
+	if runtime.GOOS == "windows" {
+		// windows 갈래의 extra는 detect가 채우는 psHome·pfDir를 읽는다(exec.go:227-230의 계약) —
+		// detect를 먼저 부르지 않으면 값이 빈 채로 조립된다. 미설치면 Skip한다
+		// (TestShellExtraModuleDirFailureIsErrSetup:1172-1175 선례).
+		if _, _, err := shell.detect(); err != nil {
+			t.Skipf("windows shell 미설치: %v", err)
+		}
+		env, err := shell.extra(scratch)
+		if err != nil {
+			t.Fatalf("windows shell extra: %v", err)
+		}
+		if !hasEnvKeyT(env, "PSModulePath") || !hasEnvKeyT(env, "USERPROFILE") {
+			t.Fatalf("windows shell 기존 2키가 유지되지 않았다: %v", env)
+		}
+		// 키 존재만 보면 detect 누락이 드러나지 않는다 — 값까지 단정한다.
+		if got := envValueT(env, "PSModulePath"); !strings.HasPrefix(got, filepath.Join(scratch, "psmodules")) {
+			t.Fatalf("PSModulePath 첫 항목이 스크래치가 아니다: %q", got)
+		}
+		if got := envValueT(env, "USERPROFILE"); got != scratch {
+			t.Fatalf("USERPROFILE=%q want %q", got, scratch)
+		}
+		for _, k := range anchors {
+			if hasEnvKeyT(env, k) {
+				t.Fatalf("windows shell이 헬퍼 앵커 %s를 얻었다 — 호출 지점 규정 위반", k)
+			}
+		}
+		return
+	}
+	env, err := shell.extra(scratch)
+	if err != nil {
+		t.Fatalf("unix shell extra: %v", err)
+	}
+	for _, k := range anchors {
+		if !hasEnvKeyT(env, k) {
+			t.Fatalf("unix shell에 앵커 %s 없음", k)
+		}
+	}
+}
+
+func hasEnvKeyT(env []string, key string) bool {
+	return envValueT(env, key) != ""
+}
+
+// envValueT — 마지막 값이 이긴다(Run이 BaseEnv 뒤에 extra를 붙이는 규칙과 같다). 부재는 "".
+func envValueT(env []string, key string) string {
+	out := ""
+	for _, e := range env {
+		if v, ok := strings.CutPrefix(e, key+"="); ok {
+			out = v
+		}
+	}
+	return out
+}
+
+// TestRunShellHomeToolchainStillWorks — D75: 홈 재지정이 sh 스니펫의 홈 유도 툴체인 호출을
+// 깨뜨리지 않는다. sentinel 준비가 빠지면 실패하는 경로를 덮는다.
+func TestRunShellHomeToolchainStillWorks(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("unix shell 갈래 전용")
+	}
+	if _, err := exec.LookPath("dotnet"); err != nil { // 이 파일에서 exec는 os/exec다(별칭 없음)
+		t.Skip("dotnet 없음")
+	}
+	// run(t, req)(exec_test.go:151)은 Run(ctx, t.TempDir(), selfExe(t), req)를 부른다 — selfExe에
+	// 빈 문자열을 넘기면 linux의 sandbox.Run이 ErrSetup으로 즉시 반환한다(run_unix.go:34).
+	resp := run(t, Request{Language: "shell", Code: "set -e\ndotnet --version\n"})
+	if resp.ExitCode == nil || *resp.ExitCode != 0 {
+		t.Fatalf("dotnet --version 실패: exit=%v stderr=%q", resp.ExitCode, resp.Stderr)
+	}
+}
+
+// TestRunShellScratchHomeWins — D75 §2 ①: 격리 없는 절반은 호스트 홈 유도 구성을 읽고, 격리된
+// 절반은 읽지 않는다. windows의 같은 축(USERPROFILE·PSModulePath)은
+// TestRunShellScratchModulePathWins(exec_test.go:890)가 이미 덮으므로 그 A/B 구성 방식을
+// unix HOME 축으로 복제한다 — **그 테스트를 먼저 읽고 절반을 만드는 형태를 그대로 따른다**
+// (격리 없는 절반을 어떻게 조립하는지가 거기에 있다).
+func TestRunShellScratchHomeWins(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("unix shell 갈래 전용 — windows 축은 exec_test.go:890이 덮는다")
+	}
+	requireLang(t, "shell")
+	fakeHome := t.TempDir()
+	if err := os.WriteFile(filepath.Join(fakeHome, "ctr-marker"), []byte("host"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HOME", fakeHome) // BaseEnv의 허용 표가 이 값을 복사한다(sandbox.go:131)
+
+	const code = "test -f \"$HOME/ctr-marker\" && echo SEEN || echo ABSENT\n"
+
+	// 격리된 절반: 실제 러너 경로 — extra가 홈을 스크래치로 돌린다.
+	got := run(t, Request{Language: "shell", Code: code})
+	if !strings.Contains(got.Stdout, "ABSENT") {
+		t.Fatalf("격리된 절반이 호스트 홈 마커를 봤다: stdout=%q stderr=%q", got.Stdout, got.Stderr)
+	}
+
+	// 격리 없는 절반: extra를 적용하지 않고 같은 스니펫을 직접 돌려 SEEN을 본다(:890과 같은
+	// 방식 — 프로덕션에 토글을 심지 않기 위해 이 절반만 테스트가 환경을 조립한다). 이 대조가
+	// 없으면 위 단정은 마커 생성이 실패해도 통과한다(거짓 clean).
+	r := table()["shell"]
+	bin, _, err := r.detect()
+	if err != nil {
+		t.Fatalf("detect: %v", err)
+	}
+	scratch := t.TempDir()
+	file := filepath.Join(scratch, "snippet.sh")
+	if err := os.WriteFile(file, []byte(code), 0o600); err != nil {
+		t.Fatalf("스니펫 기록 실패: %v", err)
+	}
+	env := sandbox.BaseEnv() // 닫힌 표가 HOME=fakeHome을 그대로 복사한다 — extra 미적용
+	cmd := exec.Command(bin, file)
+	cmd.Dir, cmd.Env = scratch, env
+	raw, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("격리 없는 절반이 실행 자체에 실패했다: %v: %s", err, raw)
+	}
+	if !strings.Contains(string(raw), "SEEN") {
+		t.Fatalf("픽스처 무효 — 격리 없이도 호스트 홈 마커가 보이지 않았다: %s", raw)
 	}
 }
