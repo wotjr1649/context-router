@@ -473,6 +473,27 @@ func TestShellNativeExitAugmentation(t *testing.T) {
 		}
 	})
 
+	t.Run("사이드파일이_상한을_넘으면_보강하지_않는다", func(t *testing.T) {
+		// G1(최종 게이트 리뷰): os.ReadFile은 마커 검사 이전에 파일 전체를 서버 프로세스에
+		// 할당했다 — 스크래치가 스니펫의 작업 디렉터리이기도 해 스니펫이 이 값을 직접 고를 수
+		// 있었다. 마커 뒤에 상한(maxNativeExitSideFileBytes)을 정확히 1바이트 넘기는 자릿수의
+		// 숫자를 쓴다 — 그 자릿수는 int64 오버플로 없이 strconv.Atoi가 그대로 파싱할 크기다.
+		// 상한이 없다면(또는 한 바이트라도 새면) 이 값은 파싱에 성공해 보강 줄을 냈을 것이므로,
+		// 이 케이스가 실패하면 상한이 아니라 다른 이유(파싱 실패 등)로 막혔다는 혼동이 없다.
+		digits := maxNativeExitSideFileBytes - len(ctrNativeExitMarker) + 1
+		overLimit := ctrNativeExitMarker + strings.Repeat("1", digits)
+		resp := run(t, Request{
+			Language: "shell",
+			Code:     "[System.IO.File]::WriteAllText('ctr-native-exit', '" + overLimit + "')\nreturn\n",
+		})
+		if resp.ExitCode == nil || *resp.ExitCode != 0 {
+			t.Fatalf("exit_code=%v want 0", resp.ExitCode)
+		}
+		if resp.Stderr != "" {
+			t.Fatalf("상한을 넘는 사이드 파일이 보강을 만들었다: %q", resp.Stderr)
+		}
+	})
+
 	t.Run("ConstrainedLanguage에서_tail이_안전하다", func(t *testing.T) {
 		// F2 리뷰(회귀 방지) — 이 dev host에서 실측: 스니펫이 자신을 ConstrainedLanguage로
 		// 낮추면(자기 자신에 대한 강등은 FullLanguage에서 허용된다) 그 뒤에 실행되는 tail의
@@ -1382,7 +1403,7 @@ func TestRunnerLabelNodeLeg(t *testing.T) {
 			// (run_unix.go:34) 이 잡(ubuntu)에서 Run을 직접 부르면 안 된다.
 			resp := run(t, Request{Language: lang, Code: "console.log(1)"})
 			// runnerLabel은 filepath.Base(bin) + (version이 있으면) " " + version이다
-			// (internal/exec/exec.go:215-221) — 첫 토큰을 떼고 확장자를 제거해 비교한다.
+			// (internal/exec/exec.go:237-243) — 첫 토큰을 떼고 확장자를 제거해 비교한다.
 			first := strings.Fields(resp.Runner)[0]
 			base := strings.TrimSuffix(first, filepath.Ext(first))
 			if base != "node" {
@@ -1469,7 +1490,7 @@ func TestRunnerIsolationKeySets(t *testing.T) {
 	}
 	shell := tbl["shell"]
 	if runtime.GOOS == "windows" {
-		// windows 갈래의 extra는 detect가 채우는 psHome·pfDir를 읽는다(exec.go:313-316의 계약) —
+		// windows 갈래의 extra는 detect가 채우는 psHome·pfDir를 읽는다(exec.go:335-338의 계약) —
 		// detect를 먼저 부르지 않으면 값이 빈 채로 조립된다. 미설치면 Skip한다
 		// (TestShellExtraModuleDirFailureIsErrSetup:1189-1191 선례).
 		if _, _, err := shell.detect(); err != nil {
@@ -1552,12 +1573,12 @@ func TestRunShellHomeToolchainStillWorks(t *testing.T) {
 
 // TestRunShellScratchHomeWins — D75 §2 ①: 격리 없는 절반은 호스트 홈 유도 구성을 읽고, 격리된
 // 절반은 읽지 않는다. windows의 같은 축(USERPROFILE·PSModulePath)은
-// TestRunShellScratchModulePathWins(exec_test.go:1031)가 이미 덮으므로 그 A/B 구성 방식을
+// TestRunShellScratchModulePathWins(exec_test.go:1052)가 이미 덮으므로 그 A/B 구성 방식을
 // unix HOME 축으로 복제한다 — **그 테스트를 먼저 읽고 절반을 만드는 형태를 그대로 따른다**
 // (격리 없는 절반을 어떻게 조립하는지가 거기에 있다).
 func TestRunShellScratchHomeWins(t *testing.T) {
 	if runtime.GOOS == "windows" {
-		t.Skip("unix shell 갈래 전용 — windows 축은 exec_test.go:1031이 덮는다")
+		t.Skip("unix shell 갈래 전용 — windows 축은 exec_test.go:1052가 덮는다")
 	}
 	requireLang(t, "shell")
 	// 픽스처를 심기 전에 sync.Once 빌드를 끝낸다 — 심은 뒤면 그 go build가 HOME 유도 GOPATH/

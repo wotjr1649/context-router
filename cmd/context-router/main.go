@@ -562,19 +562,27 @@ func run(ctx context.Context, args []string, stderr io.Writer) error {
 		purgeCtxErr := purgeCtx.Err()
 		budgetSpent := errors.Is(purgeCtxErr, context.DeadlineExceeded)
 		switch {
-		case purgeErr != nil && errors.Is(purgeCtxErr, context.Canceled):
-			// 종료로 중단된 것은 실패가 아니다 — 남은 배치는 다음 기동이 그대로 다시 집는다. stdio
-			// 서버는 호스트가 stdin을 닫으면 mcp.Serve가 반환하므로(시그널 없이도) 이 경로를 탄다.
-			slog.Debug("기동 shadow 회수 중단 — 서버 종료", "error", purgeErr)
-		case purgeErr != nil && budgetSpent && rep.Hashes > 0:
-			// F1: D74부터 예산 소진이 파일 회수 단계(행 삭제는 이미 커밋)에서도 걸릴 수 있다 — rep는
-			// purgeHookRows가 채운 실제 카운트이지 zero-value가 아니다(아래 case는 그 전제가 유효한
-			// rep.Hashes==0 사례만 남는다). 행이 이미 삭제돼 다음 기동 술어에 다시 안 잡히므로 남은
-			// 파일의 유일한 회수 경로는 purge --gc다. D67 튜닝 입력이 소실되지 않도록 카운트를 그대로
-			// 싣는다(위 case와 동일한 필드 — capped·budget_spent 대신 이 분기 자체가 budget_spent다).
-			slog.Warn("기동 shadow 회수 예산 소진 — 행 삭제 완료, 파일 회수 잔여분은 purge --gc",
+		case purgeErr != nil && rep.Hashes > 0:
+			// F1 확장(G2 — 최종 게이트 리뷰): rep.Hashes>0이면 행 삭제 tx는 이미 커밋되었고
+			// (store.purgeHookRows는 실패 시 항상 빈 리포트를 반환하므로 이 값 자체가 커밋의
+			// 증거다) 이후 파일 회수 단계에서 실패했다는 뜻이다 — 원인은 예산 소진·서버 종료
+			// 취소·lockStoreCtx 실패 등 무엇이든 상관없다. 행이 이미 삭제돼 다음 기동 술어에
+			// 다시 안 잡히므로 남은 파일의 유일한 회수 경로는 purge --gc다 — 이 case를 아래
+			// 종료-취소 case보다 먼저 두는 이유가 그것이다: 순서가 뒤집히면 종료 취소로 중단된
+			// 커밋-후 실패까지 "남은 배치는 다음 기동이 다시 집는다"(행이 이미 없어 거짓인
+			// 안내)로 흡수된다. D67 튜닝 입력이 소실되지 않도록 카운트를 그대로 싣고,
+			// budget_spent로 예산 소진과 종료 취소를 구분한다(ctx.Err()는 단일 값이라 둘은
+			// 배타적이다).
+			slog.Warn("기동 shadow 회수 중단 — 행 삭제 완료, 파일 회수 잔여분은 purge --gc",
 				"hashes", rep.Hashes, "bytes", rep.ReclaimedB, "deferred", rep.DeferredFiles,
-				"capped", rep.Hashes == startupPurgeMaxHashes)
+				"capped", rep.Hashes == startupPurgeMaxHashes, "budget_spent", budgetSpent)
+		case purgeErr != nil && errors.Is(purgeCtxErr, context.Canceled):
+			// 종료로 중단된 것은 실패가 아니다 — 위 case가 커밋된 사례(rep.Hashes>0)를 먼저
+			// 가져가므로 이 분기는 행 삭제 tx 자체가 커밋 전에 취소된 rep.Hashes==0 사례만
+			// 남는다(그래서 "남은 배치는 다음 기동이 그대로 다시 집는다"가 참이다). stdio
+			// 서버는 호스트가 stdin을 닫으면 mcp.Serve가 반환하므로(시그널 없이도) 이 경로를
+			// 탄다.
+			slog.Debug("기동 shadow 회수 중단 — 서버 종료", "error", purgeErr)
 		case purgeErr != nil && budgetSpent:
 			// 예산은 폭주 가드이므로 소진은 정상 경로가 아니다 — 경고로 올린다. 건수는 싣지 않는다:
 			// 위 case가 커밋된 사례를 먼저 가져가므로 이 분기는 rep.Hashes==0(행 삭제 tx 자체가
@@ -583,10 +591,10 @@ func run(ctx context.Context, args []string, stderr io.Writer) error {
 			// 없다.
 			slog.Warn("기동 shadow 회수 예산 소진 — 행 삭제 미완료, 다음 기동에서 재시도")
 		case purgeErr != nil:
-			// 두 실패가 이 분기로 온다: 행 삭제 실패(다음 기동이 같은 배치를 다시 집는다)와 커밋 뒤
-			// 파일 회수 실패(lockStoreCtx 실패 등 — 행이 이미 없어 다음 기동 술어에 안 잡히므로
-			// purge --gc가 회수 경로다). 어느 쪽인지 로그에서 구분할 수 없으므로 두 경로를 함께 적는다.
-			slog.Warn("기동 shadow 회수 실패 — 행 삭제분은 다음 기동에서 재시도, 파일 회수분은 purge --gc", "error", purgeErr)
+			// rep.Hashes==0인 행 삭제 자체의 실패만 이 분기로 온다 — 커밋 뒤 실패(파일 회수
+			// 실패 포함, 원인 무관)는 맨 위 case가 전부 먼저 가져간다. 다음 기동이 같은 배치를
+			// 다시 집는다.
+			slog.Warn("기동 shadow 회수 실패 — 다음 기동에서 재시도", "error", purgeErr)
 		case rep.Hashes > 0:
 			// capped·budget_spent: 어느 예산이 이번 배치를 끊었는지 관측용(D67 임계값 재설정 입력).
 			slog.Info("기동 shadow 회수", "hashes", rep.Hashes, "bytes", rep.ReclaimedB,

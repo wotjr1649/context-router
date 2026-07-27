@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"os/exec"
@@ -193,13 +194,34 @@ func Run(ctx context.Context, scratchParent, selfExe string, req Request) (Respo
 	return resp, nil
 }
 
+// maxNativeExitSideFileBytes — 사이드 파일 상한. tail이 쓰는 값은 ctrNativeExitMarker
+// 다음에 $LASTEXITCODE의 [string] 변환뿐인데 $LASTEXITCODE는 PowerShell Int32라 그 변환은
+// 최대 11자("-2147483648")를 넘지 않는다 — 그 위에 여유를 얹는다. 스크래치가 스니펫의 작업
+// 디렉터리이기도 해 스니펫이 이 경로에 임의 크기 파일을 직접 쓸 수 있는데, os.ReadFile은 마커
+// 검사 이전에 그 전체를 서버 프로세스에 할당했다 — 이 상한이 그 할당을 막는다(최종 게이트
+// 리뷰 G1). 여유를 20자 이내로 좁게 두는 이유는 exec_test.go의 상한 회귀 테스트가 "상한+1"
+// 크기에서도 strconv.Atoi가 파싱 가능한(int64 오버플로 없는) 자릿수를 골라야 하기 때문이다 —
+// 여유가 지금보다 훨씬 크면(예: 64비트 최장 20자) 그 테스트가 상한이 아니라 Atoi 오버플로로
+// 막히는 값만 만들 수 있어 상한 자체를 더 이상 검증하지 못한다.
+const maxNativeExitSideFileBytes = len(ctrNativeExitMarker) + 16
+
 // readNativeExitCode — D76 사이드 파일 읽기. 파일 부재(tail 미실행)·마커 부재(스크래치가
 // 스니펫의 작업 디렉터리이기도 해 스니펫이 같은 이름에 직접 쓴 파일일 수 있다 — F3 리뷰)·
-// 빈 값($LASTEXITCODE 미설정, 즉 외부 명령이 없었음)·파싱 실패는 모두 "보강하지 않음"이다.
+// 빈 값($LASTEXITCODE 미설정, 즉 외부 명령이 없었음)·파싱 실패·상한 초과·비일반 파일(파이프
+// 등)은 모두 "보강하지 않음"이다(G1). 읽기는 상한+1로 제한한다 — netfetch.readBody·hook.Run과
+// 같은 관용구(초과 여부만 판별하면 되므로 상한을 넘는 파일 전체를 할당하지 않는다).
 func readNativeExitCode(path string) (int, bool) {
-	b, err := os.ReadFile(path)
+	f, err := os.Open(path)
 	if err != nil {
 		return 0, false
+	}
+	defer f.Close()
+	if fi, err := f.Stat(); err != nil || !fi.Mode().IsRegular() {
+		return 0, false // stat 실패·비일반 파일(파이프 등)도 "보강하지 않음"(G1)
+	}
+	b, err := io.ReadAll(io.LimitReader(f, int64(maxNativeExitSideFileBytes+1)))
+	if err != nil || len(b) > maxNativeExitSideFileBytes {
+		return 0, false // 상한 초과 — tail이 쓴 값일 수 없다(위 상수 주석)
 	}
 	s, ok := strings.CutPrefix(strings.TrimSpace(string(b)), ctrNativeExitMarker)
 	if !ok || s == "" {
