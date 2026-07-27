@@ -8,6 +8,22 @@
 [Semantic Versioning](https://semver.org/lang/ko/)을 따른다. 각 항목의 D 번호는
 그 결정의 근거가 있는 설계 문서 절을 가리킨다.
 
+## [0.12.1] — 2026-07-27
+
+### Changed
+
+- **doctor `[12]` drops 진단에 사유별 마지막 발생 시각이 병기된다** (D71).
+  형태는 `<사유>=<건수>@<YYYY-MM-DD>`(UTC)다. 누적 집계만 보이던 이전 출력은 이미 해결된
+  문제를 현재 발생 중인 것처럼 읽히게 했다 — 시각이 있으면 그 구분이 한눈에 보인다.
+  정수 변환에 실패하는 타임스탬프와 `unparsed`에는 병기하지 않는다(집계는 유지된다).
+
+### Internal
+
+- CI 액션 참조를 커밋 SHA로 고정하고 워크플로 토큰 권한을 `contents: read`로 좁혔다 (D68).
+- `GOOS=windows` lint 스텝을 추가해 windows 전용 파일의 미검출 정적 오류를 닫았다 (D69).
+- bun을 설치하지 않는 잡을 추가해 node 인터프리터 레그를 CI에서 실행한다 (D70).
+- `buildinfo` 주석을 실제 릴리스 절차에 맞췄다 (D72).
+
 ## [0.12.0] — 2026-07-26
 
 ### Changed — 사용자 관측 가능한 동작 변경
@@ -64,4 +80,5 @@
 - **doctor 호스트 스니펫이 권한 모드를 기준으로 안내한다** (D64). 승인 강도가
   호스트 권한 모드와 규칙 평가 순서에 따라 달라지는 점을 문면에 반영했다.
 
+[0.12.1]: https://github.com/wotjr1649/context-router/compare/v0.12.0...v0.12.1
 [0.12.0]: https://github.com/wotjr1649/context-router/compare/v0.11.1...v0.12.0
