@@ -1302,6 +1302,7 @@ func TestRunnerIsolationKeySets(t *testing.T) {
 	scratch := t.TempDir()
 	anchors := []string{"HOME", "CFFIXED_USER_HOME", "XDG_DATA_HOME"}
 	tbl := table()
+	var csharpEnv []string
 	for _, lang := range []string{"javascript", "typescript", "csharp"} {
 		env, err := tbl[lang].extra(scratch)
 		if err != nil {
@@ -1312,12 +1313,26 @@ func TestRunnerIsolationKeySets(t *testing.T) {
 				t.Fatalf("%s에 앵커 %s 없음", lang, k)
 			}
 		}
+		if lang == "csharp" {
+			csharpEnv = env
+		}
+	}
+	// csharp은 §2⑤가 "변화 없음"을 요구하는 대상이다 — 키 존재만으로는 값이 바뀌어도(예: 헬퍼가
+	// 다른 하위 경로를 쓰게 되어도) 통과하므로 값까지 고정한다. csEnv는 D75 이전에도 이미 이
+	// 경로였다(homeIsolationEnv와 같은 산식) — 여기서 값이 달라지면 D75가 csharp에 대해 "무변화"를
+	// 지키지 못했다는 뜻이다.
+	wantHome, wantXDG := filepath.Join(scratch, "home"), filepath.Join(scratch, "xdg")
+	wantVals := map[string]string{"HOME": wantHome, "CFFIXED_USER_HOME": wantHome, "XDG_DATA_HOME": wantXDG}
+	for _, k := range anchors {
+		if got := envValueT(csharpEnv, k); got != wantVals[k] {
+			t.Fatalf("csharp %s=%q want %q", k, got, wantVals[k])
+		}
 	}
 	shell := tbl["shell"]
 	if runtime.GOOS == "windows" {
 		// windows 갈래의 extra는 detect가 채우는 psHome·pfDir를 읽는다(exec.go:227-230의 계약) —
 		// detect를 먼저 부르지 않으면 값이 빈 채로 조립된다. 미설치면 Skip한다
-		// (TestShellExtraModuleDirFailureIsErrSetup:1172-1175 선례).
+		// (TestShellExtraModuleDirFailureIsErrSetup:1189-1191 선례).
 		if _, _, err := shell.detect(); err != nil {
 			t.Skipf("windows shell 미설치: %v", err)
 		}
@@ -1369,7 +1384,10 @@ func envValueT(env []string, key string) string {
 }
 
 // TestRunShellHomeToolchainStillWorks — D75: 홈 재지정이 sh 스니펫의 홈 유도 툴체인 호출을
-// 깨뜨리지 않는다. sentinel 준비가 빠지면 실패하는 경로를 덮는다.
+// 깨뜨리지 않는다. sentinel 준비가 빠지면 실패하는 경로를 덮는다. 리뷰 F1: exit code만으로는
+// 냉각된 홈의 first-run 배너가 stdout에 섞여도 통과하므로 stdout 형태까지 본다 — 단, 이
+// 단정은 이 Windows 호스트에서 실행되지 않는다(위 Skip). dotnet을 설치한 CI ubuntu·macos가
+// 실행 지점이며, 로컬에서 검증되었다고 적지 않는다.
 func TestRunShellHomeToolchainStillWorks(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("unix shell 갈래 전용")
@@ -1382,6 +1400,14 @@ func TestRunShellHomeToolchainStillWorks(t *testing.T) {
 	resp := run(t, Request{Language: "shell", Code: "set -e\ndotnet --version\n"})
 	if resp.ExitCode == nil || *resp.ExitCode != 0 {
 		t.Fatalf("dotnet --version 실패: exit=%v stderr=%q", resp.ExitCode, resp.Stderr)
+	}
+	// 리뷰 F1: dotnetFirstRunEnv(shellEnv 경유)가 빠지면 냉각된 HOME이 first-run으로 보여 배너·
+	// 텔레메트리 안내가 stdout에 섞인다. 정확한 배너 문구는 SDK 버전마다 달라 문자열 매칭 대신
+	// 형태로 본다 — 정상 출력은 버전 번호 한 줄뿐이므로, 트레일링 개행을 뗀 뒤 그 안에 개행이
+	// 더 있으면(또는 아예 비어 있으면) 배너 유입 의심으로 실패시킨다.
+	got := strings.TrimRight(resp.Stdout, "\n")
+	if got == "" || strings.Contains(got, "\n") {
+		t.Fatalf("dotnet --version stdout이 버전 한 줄이 아니다(first-run 배너 유입 의심): %q", resp.Stdout)
 	}
 }
 

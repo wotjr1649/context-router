@@ -258,9 +258,11 @@ func shellRunner() runner {
 		},
 		argv: func(bin, file string) []string { return []string{bin, file} },
 		// D75: sh 스니펫은 어떤 툴체인이든 부를 수 있어 재지정 대상이 열린 집합이다 — 공유
-		// 지점(홈 유도 격리)을 그대로 쓴다. windows 갈래는 자기 PSModulePath·USERPROFILE
-		// 재지정을 유지하며 이 헬퍼를 부르지 않는다.
-		extra: homeIsolationEnv,
+		// 지점(홈 유도 격리)을 쓴다. shellEnv는 homeIsolationEnv에 dotnet first-run 억제를 얹은
+		// 것이다(리뷰 F1) — 순수 헬퍼만 쓰면 sh가 부르는 dotnet이 냉각된 HOME을 first-run으로
+		// 봐 배너가 stdout을 오염시킨다. windows 갈래는 자기 PSModulePath·USERPROFILE 재지정을
+		// 유지하며 이 헬퍼를 부르지 않는다.
+		extra: shellEnv,
 	}
 }
 
@@ -306,7 +308,10 @@ func psModulePath(scratchMods, psHome, pfDir string) string {
 // 형태이기 때문이다 — 분기를 두면 비darwin에서 값이 사라져 동작이 갈린다.
 //
 // js도 이 시행점을 함께 진다: 세 앵커는 통째로 주거나 말거나이고 부분 채택은 하지 않는다
-// (설계 D75 §2⑤ — js가 XDG_DATA_HOME·CFFIXED_USER_HOME을 새로 얻는 것은 의도된 변경이다).
+// (설계 D75 §0 결정 본문의 앵커 표·"통합의 결과로 각 러너의 격리 키 집합이 달라진다" 열거 —
+// js가 XDG_DATA_HOME·CFFIXED_USER_HOME을 새로 얻는 것은 의도된 변경이다. §2⑤는 그 결정에 따른
+// 검증 요건일 뿐이다 — "기존과 동일"을 js·shell에 요구하지 않는다는 테스트 지침이지 결정의
+// 출처가 아니다).
 // js 자신은 NuGet sentinel을 쓰지 않지만, 앵커별로 갈라 주면 그 분기 자체가 D75가 없애려던
 // 네 번째 변형이 된다 — 같은 스크래치 하위 생성이라 home만 성공하고 나머지만 실패할 가능성도
 // 낮다(csEnv가 이미 이 여섯 경로를 한 루프로 묶어 온 전례와 같다).
@@ -338,6 +343,10 @@ func detectJS() (string, string, error) {
 }
 
 // jsEnv: node/bun의 사용자 레벨 구성을 스크래치로 가둔다(D65). 두 갈래다.
+//
+// 홈 포인터(HOME·CFFIXED_USER_HOME·XDG_DATA_HOME) 자체는 D75부터 homeIsolationEnv가 소유한다 —
+// 그 준비 실패는 시행점이라 jsEnv도 실행을 거부한다(과거엔 경고 후 계속 실행했다). 아래 ①·②는
+// 그 위에 얹는 jsEnv 고유 레버(NPM_CONFIG_USERCONFIG·XDG_CONFIG_HOME)만 다룬다.
 //
 // ① npmrc — 인터프리터 자체는 npmrc를 읽지 않으므로(`node file.js`·`bun file.js`) 스니펫 실행
 // 에는 반영 지점이 없지만, 스니펫이 npm·bun install을 호출하면 호스트 사용자 구성의 레지스트리·
@@ -643,11 +652,24 @@ const nugetConfig = `<?xml version="1.0" encoding="utf-8"?>
 </configuration>
 `
 
+// dotnetFirstRunEnv: dotnet first-run 억제 4종 — csEnv와 shellEnv가 공유한다(D13: 나열을
+// 갈라 두면 갈래마다 드리프트한다). 대상은 "DOTNET_CLI_HOME 또는 그 대체(HOME)가 매 실행 새
+// 스크래치로 냉각되는 모든 갈래"다: 냉각된 홈은 dotnet에 first-run으로 보여 배너·텔레메트리
+// 안내가 stdout을 오염시키고(csharp에서 관측·I4), macOS는 인증서 생성·워크로드 무결성 점검이
+// 샌드박스 허용 경로 밖(로그인 키체인·네트워크)을 건드리려 한다.
+var dotnetFirstRunEnv = []string{
+	"DOTNET_SKIP_WORKLOAD_INTEGRITY_CHECK=1",
+	"DOTNET_GENERATE_ASPNET_CERTIFICATE=false", // macOS first-run dev-cert가 SBPL 밖 로그인 키체인 접근 예방
+	"DOTNET_NOLOGO=1",
+	"DOTNET_CLI_TELEMETRY_OPTOUT=1",
+}
+
 // csEnv: dotnet CLI/NuGet 홈을 스크래치 하위로 재지정(그 디렉터리 생성)하고, in-job 실행에
 // 맞춰 MSBuild 서버/노드 재사용·공유 컴파일을 끈다(스크래치 수명 밖 프로세스 잔존 방지).
 // NUGET_PACKAGES는 global-packages만 재지정하므로 http/plugins 캐시도 스크래치 하위로 옮긴다
 // (I5 — 안 하면 HOME/LOCALAPPDATA로 이탈해 landlock write-deny로 실패하거나 D61 잔존물이 남음).
-// cold DOTNET_CLI_HOME는 매 실행 first-run이라 배너/텔레메트리가 stdout을 오염시킨다 — 끈다(I4).
+// cold DOTNET_CLI_HOME는 매 실행 first-run이라 배너/텔레메트리가 stdout을 오염시킨다 —
+// dotnetFirstRunEnv로 끈다(I4).
 func csEnv(scratch string) ([]string, error) {
 	home := filepath.Join(scratch, "dotnet")
 	nuget := filepath.Join(scratch, "nuget")
@@ -673,20 +695,34 @@ func csEnv(scratch string) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	return append(
+	env := append(
 		shared,
 		"DOTNET_CLI_HOME="+home,
 		"NUGET_PACKAGES="+nuget,
 		"NUGET_HTTP_CACHE_PATH="+nugetHTTP,
 		"NUGET_PLUGINS_CACHE_PATH="+nugetPlugins,
-		"DOTNET_SKIP_WORKLOAD_INTEGRITY_CHECK=1",
-		"DOTNET_GENERATE_ASPNET_CERTIFICATE=false", // macOS first-run dev-cert가 SBPL 밖 로그인 키체인 접근 예방
-		"DOTNET_NOLOGO=1",
-		"DOTNET_CLI_TELEMETRY_OPTOUT=1",
+	)
+	env = append(env, dotnetFirstRunEnv...)
+	return append(
+		env,
 		"DOTNET_CLI_DO_NOT_USE_MSBUILD_SERVER=1",
 		"MSBUILDDISABLENODEREUSE=1",
 		"UseSharedCompilation=false",
 	), nil
+}
+
+// shellEnv — D75 F1(리뷰): unix shell의 extra. sh 스니펫은 어떤 툴체인이든 부를 수 있어(shellRunner
+// 주석) dotnet도 그 대상이다 — homeIsolationEnv가 HOME을 매 실행 새 스크래치로 냉각시키는데,
+// dotnet은 DOTNET_CLI_HOME이 없으면 HOME으로 cli-home을 대신 산정하므로 csEnv와 같은 냉각 문제를
+// 그대로 물려받는다. 그래서 homeIsolationEnv의 세 앵커에 dotnetFirstRunEnv를 얹는다.
+// homeIsolationEnv 자체에는 넣지 않는다(D75 설계 — 헬퍼는 세 앵커만 소유) — js도 그 헬퍼를 쓰는데
+// js는 dotnet과 무관하므로, 헬퍼를 넓히면 js가 쓰지 않을 dotnet 설정까지 얻는다.
+func shellEnv(scratch string) ([]string, error) {
+	shared, err := homeIsolationEnv(scratch)
+	if err != nil {
+		return nil, err
+	}
+	return append(shared, dotnetFirstRunEnv...), nil
 }
 
 // tmpEnv: 공통 temp 재지정 — Unix는 TMPDIR, Windows는 TEMP·TMP를 스크래치 하위 tmp로
