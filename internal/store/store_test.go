@@ -2382,3 +2382,39 @@ func TestErrPredicates(t *testing.T) {
 		t.Fatal("IsDiskErr 비-sqlite 오류에 true")
 	}
 }
+
+// TestReclaimHookBlobsHonorsCancel — D74: 행 삭제 커밋 이후 파일 회수 루프가 취소를 관측한다.
+// 취소된 ctx를 PurgeHookOnlyOlderThan에 처음부터 넘기는 형태로는 이 회귀를 잡을 수 없다 —
+// 그 경로는 행 삭제 tx에서 먼저 실패해 빈 리포트를 반환하므로 deferred가 원래 0이다. 그래서
+// 회수 단계를 직접 부른다.
+func TestReclaimHookBlobsHonorsCancel(t *testing.T) {
+	dir := t.TempDir()
+	s := openAt(t, dir) // store_test.go:1693 — dir 지정 Open, t.Cleanup에 `_ = s.Close()` 등록
+	// 회수 대상 blob 두 개를 CAS 배치대로 만든다: <dir>/artifacts/<h[:2]>/<h>
+	hashes := []string{strings.Repeat("a", 64), strings.Repeat("b", 64)}
+	for _, h := range hashes {
+		p := filepath.Join(dir, "artifacts", h[:2], h)
+		if err := os.MkdirAll(filepath.Dir(p), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // 회수 시작 전에 취소된 상태
+	var rep HookPurgeReport
+	err := s.reclaimHookBlobs(ctx, hashes, &rep)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("err=%v want context.Canceled", err)
+	}
+	if rep.DeferredFiles != 0 {
+		t.Fatalf("deferred=%d want 0 — 취소 경로가 deferred를 부풀리면 D67 임계값 입력이 오염된다", rep.DeferredFiles)
+	}
+	// 취소로 중단됐으므로 파일은 그대로 남는다(후속 --gc가 회수한다).
+	for _, h := range hashes {
+		if _, statErr := os.Stat(filepath.Join(dir, "artifacts", h[:2], h)); statErr != nil {
+			t.Fatalf("blob %s 가 사라졌다: %v", h[:8], statErr)
+		}
+	}
+}

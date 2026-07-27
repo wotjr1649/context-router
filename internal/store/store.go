@@ -1084,7 +1084,7 @@ func (s *Store) PurgeHookOnly(ctx context.Context) (HookPurgeReport, error) {
 
 // PurgeHookOnlyOlderThan — D41 §3 + D67: shadow 귀속(그 hash를 참조하는 소스가 전부 hook) 아티팩트
 // 중 마지막 포착(sources.indexed_at)이 cutoffUnix보다 오래된 것을 최대 maxHashes개까지, 행을 단일
-// tx로 삭제한 뒤(술어를 tx 안에서 재실행해 외부 견적을 신뢰하지 않는다), 커밋 후 lockStore 하에 물리 CAS 파일을 rename
+// tx로 삭제한 뒤(술어를 tx 안에서 재실행해 외부 견적을 신뢰하지 않는다), 커밋 후 lockStoreCtx 하에 물리 CAS 파일을 rename
 // 격리 프로토콜로 회수한다. 행 삭제와 파일 회수를 내부 두 단계(purgeHookRows·reclaimHookBlobs)로
 // 나눠, 커밋↔회수 사이의 재등록 경합(Register.writeBlob 교체)을 rename 격리로 폐쇄하고 테스트가 그
 // 창에 개입할 수 있게 한다(신규 공개 표면 아님). cutoffUnix<=0이면 나이 필터가, maxHashes<=0이면
@@ -1172,23 +1172,31 @@ func (s *Store) purgeHookRows(ctx context.Context, cutoffUnix int64, maxHashes i
 	return hashes, rep, nil
 }
 
-// reclaimHookBlobs: purgeHookRows 커밋 후 호출 — lockStore(s.dir) 하에 hash별 물리 CAS 파일을 rename
+// reclaimHookBlobs: purgeHookRows 커밋 후 호출 — lockStoreCtx(ctx, s.dir) 하에 hash별 물리 CAS 파일을 rename
 // 격리 프로토콜로 회수한다. ① os.Rename(p, p+".purging") — 원자, 실패는 부재만 무음 skip·그 외(공유 위반 등)는 Failed++ ② 격리본 re-Stat:
 // mtime이 gcOrphanMinAge(1h) 이내(교체 감지 겸 age gate) 또는 DB 재확인에서 참조 존재 → 원 경로로
 // 롤백 + Deferred++ ③ 아니면 os.Remove + ReclaimedB += size(Remove 실패는 롤백 + Failed++). rename
 // 이후 도착한 Register.writeBlob은 원 경로에 새 파일을 만들 뿐 무충돌, rename 이전 교체분은 격리본의
-// fresh mtime이 ②에서 걸려 롤백 — Stat↔unlink 오삭제 창을 폐쇄한다. lockStore 실패는 오류로 반환하되
-// 행 삭제는 이미 유효하다(남은 파일은 --gc 후속).
+// fresh mtime이 ②에서 걸려 롤백 — Stat↔unlink 오삭제 창을 폐쇄한다. lockStoreCtx 실패(취소 포함)는
+// 오류로 반환하되 행 삭제는 이미 유효하다(남은 파일은 --gc 후속). 루프 선두 ctx.Err() 체크(D74)로
+// 취소 시 종료가 배치 크기만큼 지연되던 것과 deferred 부풀림을 함께 없앤다.
 func (s *Store) reclaimHookBlobs(ctx context.Context, hashes []string, rep *HookPurgeReport) error {
 	if len(hashes) == 0 {
 		return nil
 	}
-	release, err := lockStore(s.dir)
+	release, err := lockStoreCtx(ctx, s.dir)
 	if err != nil {
 		return fmt.Errorf("store PurgeHookOnly: %w", err)
 	}
 	defer release()
 	for _, h := range hashes {
+		// D74: 회수 루프는 기동 경로에서 도는데 종료 신호를 보지 않으면 종료가 배치 크기만큼
+		// 지연되고, 남은 hash가 deferred로 세어져 D67 임계값 튜닝의 입력을 부풀린다. 여기서
+		// 반환하면 호출부(PurgeHookOnlyOlderThan)가 "행 삭제는 커밋되어 유효, 남은 파일은
+		// --gc 후속 회수"라는 기존 계약대로 처리한다.
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		p := filepath.Join(s.dir, "artifacts", h[:2], h) // blobPath 헬퍼 부재 — 인라인 관례
 		q := p + ".purging"
 		if err := os.Rename(p, q); err != nil {
