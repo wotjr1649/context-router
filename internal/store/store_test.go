@@ -2712,26 +2712,38 @@ func dropShadowIndexesOn(tb testing.TB, s *Store) {
 	}
 }
 
-// seedSourcesTB — artifacts 1행 + sources n행을 한 트랜잭션에 직접 넣는다. regSource를 n번 부르지
-// 않는 이유는 그것이 blob·chunk·FTS까지 만들어 2만 행에서 측정 대상보다 픽스처 생성이 더
-// 오래 걸리기 때문이다 — 술어가 훑는 것은 sources이므로 그 규모만 맞추면 된다.
+// seedSourcesTB — sources n행을 artifacts 여러 행에 groupSize개씩 나눠 한 트랜잭션에 직접
+// 넣는다. regSource를 n번 부르지 않는 이유는 그것이 blob·chunk·FTS까지 만들어 2만 행에서 측정
+// 대상보다 픽스처 생성이 더 오래 걸리기 때문이다 — 술어가 훑는 것은 sources이므로 그 규모만
+// 맞추면 된다. artifact_id를 하나로 몰지 않는 이유(리뷰 F1): 복합 색인 3개의 선두 컬럼은
+// artifact_id·raw_blob_hash이고 D73이 명명한 비용 축은 "총 shadow 아티팩트 수"다 — 전부
+// artifact_id=1이면 그 선두 컬럼의 선택도가 0이 되어 색인 유/무 비교가 대상 효과를 드러낼 수
+// 없다(리뷰가 지적한 문제 — 이전 버전은 이 함수가 artifact_id=1로 전부 몰았다). groupSize는
+// "적은 수"를 나타내는 임의 고정값이며 결과를 보고 고른 값이 아니다.
 func seedSourcesTB(tb testing.TB, s *Store, n int) {
 	tb.Helper()
-	if _, err := s.writer.Exec(
-		`INSERT INTO artifacts(content_hash, media_type, byte_length, created_at) VALUES('h0','text/plain',1,0)`,
-	); err != nil {
-		tb.Fatalf("artifacts 삽입: %v", err)
-	}
+	const groupSize = 5
 	tx, err := s.writer.Begin()
 	if err != nil {
 		tb.Fatal(err)
 	}
-	stmt, err := tx.Prepare(`INSERT INTO sources(uri, artifact_id, source_kind, indexed_at) VALUES(?, 1, 'hook', 0)`)
+	insArt, err := tx.Prepare(`INSERT INTO artifacts(id, content_hash, media_type, byte_length, created_at) VALUES(?, ?, 'text/plain', 1, 0)`)
 	if err != nil {
 		tb.Fatal(err)
 	}
+	insSrc, err := tx.Prepare(`INSERT INTO sources(uri, artifact_id, source_kind, indexed_at) VALUES(?, ?, 'hook', 0)`)
+	if err != nil {
+		tb.Fatal(err)
+	}
+	var artifactID int64
 	for i := 0; i < n; i++ {
-		if _, err := stmt.Exec(fmt.Sprintf("shadow:Bash:%d", i)); err != nil {
+		if i%groupSize == 0 {
+			artifactID++
+			if _, err := insArt.Exec(artifactID, fmt.Sprintf("h%d", artifactID)); err != nil {
+				tb.Fatalf("artifacts 삽입 %d: %v", artifactID, err)
+			}
+		}
+		if _, err := insSrc.Exec(fmt.Sprintf("shadow:Bash:%d", i), artifactID); err != nil {
 			tb.Fatalf("sources 삽입 %d: %v", i, err)
 		}
 	}
@@ -2779,6 +2791,16 @@ func BenchmarkShadowPredicate(b *testing.B) {
 				seedSourcesTB(b, s, rows)
 				if !withIndex {
 					dropShadowIndexesOn(b, s)
+				}
+				// 리뷰 F2: 이름이 주장하는 색인 상태를 실제로 확인한다 — ensureIndexes는 실패를
+				// 경고로만 남기고 반환하지 않는 fail-soft이고, dropShadowIndexesOn은 DROP INDEX
+				// IF EXISTS라 두 팔이 조용히 같은 상태로 남아도 아무 것도 실패하지 않는다.
+				wantIdx := 0
+				if withIndex {
+					wantIdx = len(shadowIndexNames)
+				}
+				if got := countShadowIndexes(b, s.Reader()); got != wantIdx {
+					b.Fatalf("indexes=%d want %d(index=%v) — 이 팔이 이름이 주장하는 색인 상태가 아니다", got, wantIdx, withIndex)
 				}
 				q, args := shadowOwnedFilter(time.Now().Unix(), 100)
 				b.ResetTimer()
