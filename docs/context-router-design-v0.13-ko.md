@@ -394,8 +394,52 @@
 
 ## 3. 관측 실측 기록
 
-(D73의 벤치·예산 측정 수치가 나오면 여기에 기록한다. 현재 비어 있는 것은 측정 전이기
-때문이며, 기대값을 미리 적지 않는다.)
+측정 조건: Windows 11 Home, 13th Gen Intel Core i7-13700HX(24 논리 코어)·RAM
+31.7GiB, `go1.26.5 windows/amd64`. **전부 단일 프로세스 실행** — 다른 프로세스와의
+락 경합은 포함하지 않는다(아래 "미측정" 참조). 재현 시 이 조건과 함께 비교한다.
+
+**D73 §2 ⑦ 기동 예산** — `go test -p 1 ./internal/store/ -run
+TestOpenBudgetWithIndexDDL -v`. 색인 없는 v1 픽스처를 닫고 다시 Open해 색인
+3개가 만들어지는 구간(Open이 DDL을 실행하는 구간)을 잰다. 예산은 5s(D63,
+호스트 `alwaysLoad` 타임아웃)이고 `elapsed >= budget`이면 `Fatalf`로 실패하는
+단정이다(수동 판독이 아니다).
+
+| sources 행 수 | Open+색인 생성 경과 |
+| --- | --- |
+| 2,000 | 7.21ms(1차) / 8.08ms(재현) |
+| 20,000 | 29.54ms(1차) / 29.70ms(재현) |
+
+예산의 1% 미만 — **PASS**.
+
+**D73 §2 ⑧ 술어 전후 벤치** — `go test -p 1 ./internal/store/ -run '^$' -bench
+BenchmarkShadowPredicate -benchtime 10x`(1회 실행, 총 573.486s, 칸마다 `b.N=10`).
+`seedSourcesTB`(브리프 지정 그대로)는 artifacts 1행에 sources N행 전부를
+`artifact_id=1`로 채운다 — 색인 선두 컬럼 `artifact_id`의 선택도가 0인 최악
+사례 픽스처다.
+
+| sources 행 수 | index 없음 | index 있음 | 있음/없음 |
+| --- | --- | --- | --- |
+| 2,000 | 189,042,060 ns/op(≈189.0ms) | 337,106,060 ns/op(≈337.1ms) | ×1.78 |
+| 20,000 | 22,634,172,470 ns/op(≈22.63s) | 28,846,797,060 ns/op(≈28.85s) | ×1.27 |
+
+**색인이 있는 쪽이 두 규모 모두에서 더 느리게 나왔다** — "색인이 항상
+빠르다"의 반증이 아니라 이 픽스처의 특성이다. sources 전부가 artifact_id
+하나를 공유해 `idx_sources_artifact_kind` 등 복합 색인의 선두 컬럼이 아무
+것도 걸러내지 못한다. 비커밋 진단으로 `EXPLAIN QUERY PLAN`을 직접 확인했다
+(이 표에는 포함하지 않음, 재현 시 별도로 확인 필요): index=false에서는
+SQLite가 스스로 `artifact_id` 위에 임시 색인(`AUTOMATIC PARTIAL COVERING
+INDEX`)과 `BLOOM FILTER`를 붙여 "없음" 판정을 더 빨리 내리고, index=true에서는
+선언한 색인을 `SEARCH ... USING COVERING INDEX`로 타면서도 선택도가 없어
+비슷한 규모를 훑는다(관측). 이 계획 차이가 위 시간차의 원인이라는 것은
+추론이다 — 반복 측정이나 격리된 A/B 마이크로벤치로 확증하지 않았다. 두
+경우 모두 행 수 10배(2천→2만)에 소요가 index 없음 ×119.7·index 있음
+×85.6로 자란다 — 실 스토어처럼 artifact_id가 여러 값으로 갈리는 분포에서는
+이 결과가 재현되지 않을 수 있다(그 분포에서의 재측정은 이 태스크 범위 밖).
+
+**미측정**: 이 실측은 전부 단일 프로세스다. `ensureIndexes`의 색인 DDL은
+`writer.Exec`(non-context)라 다른 프로세스가 같은 DB를 잠그고 있으면
+`busy_timeout` 대기가 걸릴 수 있는데(F2, 파킹), 그 **잠금 경합 축은 이 실측이
+다루지 않는다** — ⑦은 색인 생성 자체의 비용만 재고 PASS했다.
 
 ## 4. 의도적 미결 (v0.14+ 후보)
 

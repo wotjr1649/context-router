@@ -2469,8 +2469,10 @@ var shadowIndexNames = []string{
 
 // countShadowIndexes — sqlite_master에서 대상 색인의 실재 수를 센다. sources 전체 색인 수를
 // 세면 uri TEXT PRIMARY KEY의 autoindex가 포함돼 "색인 없음"이 0으로 관측되지 않는다.
-func countShadowIndexes(t *testing.T, db *sql.DB) int {
-	t.Helper()
+// testing.TB로 잡은 이유: BenchmarkShadowPredicate(D73 §2 ⑧)가 *testing.B로도 이 함수를
+// 불러야 해서 — 두 번째 병렬 카운터를 만들지 않고 시그니처만 넓힌다.
+func countShadowIndexes(tb testing.TB, db *sql.DB) int {
+	tb.Helper()
 	n := 0
 	for _, name := range shadowIndexNames {
 		var got string
@@ -2480,7 +2482,7 @@ func countShadowIndexes(t *testing.T, db *sql.DB) int {
 			continue
 		}
 		if !errors.Is(err, sql.ErrNoRows) {
-			t.Fatalf("index 조회(%s): %v", name, err)
+			tb.Fatalf("index 조회(%s): %v", name, err)
 		}
 	}
 	return n
@@ -2683,5 +2685,116 @@ func TestEnsureIndexesFailureDoesNotBlockOpen(t *testing.T) {
 	}
 	if got := shadowOwnedHashesT(t, s2); !reflect.DeepEqual(got, want) {
 		t.Fatalf("색인 부분 적용이 술어 결과를 바꿨다: got=%v want=%v", got, want)
+	}
+}
+
+// --- D73 §2 ⑦⑧: 기동 예산 판정 + 술어 전후 벤치 ---
+
+// openTB — openAt(store_test.go:1693)의 testing.TB 대응. 벤치에서도 써야 해서 *testing.T 고정을
+// 푼 것뿐이고 cleanup 등록은 같다.
+func openTB(tb testing.TB, dir string) *Store {
+	tb.Helper()
+	s, err := Open(dir, false)
+	if err != nil {
+		tb.Fatalf("Open(%s): %v", dir, err)
+	}
+	tb.Cleanup(func() { _ = s.Close() })
+	return s
+}
+
+// dropShadowIndexesOn — 열린 Store에서 대상 색인 셋을 지운다(색인 없는 상태 재현).
+func dropShadowIndexesOn(tb testing.TB, s *Store) {
+	tb.Helper()
+	for _, name := range shadowIndexNames {
+		if _, err := s.writer.Exec("DROP INDEX IF EXISTS " + name); err != nil {
+			tb.Fatalf("DROP INDEX %s: %v", name, err)
+		}
+	}
+}
+
+// seedSourcesTB — artifacts 1행 + sources n행을 한 트랜잭션에 직접 넣는다. regSource를 n번 부르지
+// 않는 이유는 그것이 blob·chunk·FTS까지 만들어 2만 행에서 측정 대상보다 픽스처 생성이 더
+// 오래 걸리기 때문이다 — 술어가 훑는 것은 sources이므로 그 규모만 맞추면 된다.
+func seedSourcesTB(tb testing.TB, s *Store, n int) {
+	tb.Helper()
+	if _, err := s.writer.Exec(
+		`INSERT INTO artifacts(content_hash, media_type, byte_length, created_at) VALUES('h0','text/plain',1,0)`,
+	); err != nil {
+		tb.Fatalf("artifacts 삽입: %v", err)
+	}
+	tx, err := s.writer.Begin()
+	if err != nil {
+		tb.Fatal(err)
+	}
+	stmt, err := tx.Prepare(`INSERT INTO sources(uri, artifact_id, source_kind, indexed_at) VALUES(?, 1, 'hook', 0)`)
+	if err != nil {
+		tb.Fatal(err)
+	}
+	for i := 0; i < n; i++ {
+		if _, err := stmt.Exec(fmt.Sprintf("shadow:Bash:%d", i)); err != nil {
+			tb.Fatalf("sources 삽입 %d: %v", i, err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		tb.Fatal(err)
+	}
+}
+
+// TestOpenBudgetWithIndexDDL — D73 §2 ⑦: 색인 생성이 기동 예산 안이다. alwaysLoad는 서버가
+// 연결될 때까지 세션 시작을 막고 호스트 5초 타임아웃이 상한이므로(D63) 초과를 실패로 단정한다.
+// 픽스처는 색인 없는 상태로 닫고, 다시 Open하는 구간을 잰다 — 그 구간이 DDL을 실행한다.
+func TestOpenBudgetWithIndexDDL(t *testing.T) {
+	const budget = 5 * time.Second
+	for _, rows := range []int{2000, 20000} {
+		t.Run(fmt.Sprintf("sources=%d", rows), func(t *testing.T) {
+			dir := t.TempDir()
+			seed := openTB(t, dir)
+			seedSourcesTB(t, seed, rows)
+			dropShadowIndexesOn(t, seed)
+			_ = seed.Close()
+
+			start := time.Now()
+			s := openTB(t, dir)
+			elapsed := time.Since(start)
+
+			if got := countShadowIndexes(t, s.Reader()); got != len(shadowIndexNames) {
+				t.Fatalf("indexes=%d want %d — Open이 색인을 만들지 않았다", got, len(shadowIndexNames))
+			}
+			t.Logf("rows=%d Open+색인 생성 %v", rows, elapsed)
+			if elapsed >= budget {
+				t.Fatalf("Open이 기동 예산을 넘었다: %v >= %v (rows=%d)", elapsed, budget, rows)
+			}
+		})
+	}
+}
+
+// BenchmarkShadowPredicate — D73 §2 ⑧: 술어 실행 시간을 색인 유/무로 비교한다. 결과는 설계 §3에
+// 실측으로 기록한다(기대값을 미리 적지 않는다).
+func BenchmarkShadowPredicate(b *testing.B) {
+	for _, rows := range []int{2000, 20000} {
+		for _, withIndex := range []bool{false, true} {
+			b.Run(fmt.Sprintf("sources=%d/index=%v", rows, withIndex), func(b *testing.B) {
+				dir := b.TempDir()
+				s := openTB(b, dir)
+				seedSourcesTB(b, s, rows)
+				if !withIndex {
+					dropShadowIndexesOn(b, s)
+				}
+				q, args := shadowOwnedFilter(time.Now().Unix(), 100)
+				b.ResetTimer()
+				for i := 0; i < b.N; i++ {
+					rs, err := s.Reader().Query(q, args...)
+					if err != nil {
+						b.Fatal(err)
+					}
+					for rs.Next() {
+					}
+					if err := rs.Err(); err != nil {
+						b.Fatal(err)
+					}
+					_ = rs.Close()
+				}
+			})
+		}
 	}
 }
