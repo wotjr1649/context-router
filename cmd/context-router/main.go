@@ -395,7 +395,7 @@ func shadowCutoff(now time.Time, d time.Duration) int64 {
 // 매 hash 선두에서 ctx.Err()를 관측해 예산 소진 시 조기 반환한다(store.reclaimHookBlobs) — 그래도
 // 취소 없이 정상 완주할 때의 상한은 시간이 아니라 startupPurgeMaxHashes다. 또 SQLite busy handler는
 // interrupt 플래그를 보지 않아 다른 프로세스가 쥔 락을 기다리는 busy_timeout(5s)은 이 예산을 넘길
-// 수 있다(잠금 대기 자체는 D74의 lockStoreCtx가 ctx도 함께 관측한다 — store.go:66).
+// 수 있다(잠금 대기 자체는 D74의 lockStoreCtx가 ctx도 함께 관측한다 — store.go:67).
 const startupPurgeBudget = 60 * time.Second
 
 // startupPurgeMaxHashes — 1회 회수 배치 상한. 이 값이 묶는 것은 기동당 작업량이 아니라 **잠금 보유
@@ -597,7 +597,7 @@ func run(ctx context.Context, args []string, stderr io.Writer) error {
 	// 회수를 st.Close()·sessDB.Close()보다 먼저 끝낸다(defer LIFO — 이 defer가 그 둘보다 나중에
 	// 등록되어 먼저 돈다): 닫힌 DB 접근과 rename 격리 중간 상태(*.purging)로 프로세스가 끝나는 것을
 	// 막는다. D74부터 루프가 매 hash 선두에서 ctx.Err()를 관측하고 lockStoreCtx도 잠금 대기 중
-	// ctx를 함께 관측하므로(store.go:66), 취소 뒤 남는 대기는 이미 진행 중인 단일 hash 처리분뿐이다
+	// ctx를 함께 관측하므로(store.go:67), 취소 뒤 남는 대기는 이미 진행 중인 단일 hash 처리분뿐이다
 	// — 더 이상 잔여 배치 전체(≤startupPurgeMaxHashes)나 잠금 대기 최대 5초를 기다리지 않는다.
 	// 고루틴이 프로세스보다 오래 살지 않는다.
 	defer func() { cancelPurge(); <-purgeDone }()

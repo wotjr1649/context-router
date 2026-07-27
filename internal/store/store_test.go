@@ -2101,7 +2101,7 @@ func TestPurgeHookOnlyPreservesReindexResidue(t *testing.T) {
 // TestPurgeHookOnlyOlderThan: cutoff보다 새 shadow 아티팩트는 남고 오래된 것만 지워진다.
 // explicit 소스는 나이와 무관하게 보존된다(--hook-only 계약 유지).
 //
-// 주의: 기존 TestPurgeHookOnlyAgeGateDefers(store_test.go:1927)의 age gate는 파일 unlink
+// 주의: 기존 TestPurgeHookOnlyAgeGateDefers(store_test.go:1930)의 age gate는 파일 unlink
 // 유예(mtime 1시간)이고, 이 태스크가 더하는 것은 마지막 포착(sources.indexed_at) 기준 대상
 // 선택이다. 서로 다른 축이므로 두 테스트가 함께 통과해야 한다.
 func TestPurgeHookOnlyOlderThan(t *testing.T) {
@@ -2132,7 +2132,7 @@ func TestPurgeHookOnlyOlderThan(t *testing.T) {
 	); err != nil {
 		t.Fatalf("마지막 포착 나이 조정: %v", err)
 	}
-	// regSource는 Registration.Chunks를 넘기지 않아 청크 행이 생기지 않는다(store.go:426 루프가
+	// regSource는 Registration.Chunks를 넘기지 않아 청크 행이 생기지 않는다(store.go:459 루프가
 	// 빈 슬라이스를 돈다). chunks DELETE 경로를 덮으려면 새 shadow에 청크를 직접 심어야 한다.
 	if _, err := st.writer.Exec(
 		`INSERT INTO chunks(artifact_id, ordinal, text)
@@ -2227,11 +2227,11 @@ func TestPurgeHookOnlyOlderThanKeepsRecapturedContent(t *testing.T) {
 		t.Fatalf("포착 시각 나이 조정: %v", err)
 	}
 	// 재포착: 바이트 동일 → 같은 content_hash·같은 URI. artifacts는 found 분기라 청크도 재삽입되지
-	// 않고 created_at도 그대로다. sources upsert만 indexed_at을 지금으로 올린다(store.go:451).
+	// 않고 created_at도 그대로다. sources upsert만 indexed_at을 지금으로 올린다(store.go:483).
 	if _, err := st.Register(t.Context(), reg); err != nil {
 		t.Fatal(err)
 	}
-	// CAS 파일 나이는 재포착(writeBlob은 매번 재작성 — store.go:342 rename) 이후에 먹인다. 그러지
+	// CAS 파일 나이는 재포착(writeBlob은 매번 재작성 — store.go:374 rename) 이후에 먹인다. 그러지
 	// 않으면 mtime 1시간 유예가 unlink를 막아 "blob 잔존" 단정이 공허 통과한다.
 	ageBlobFile(t, st, freshHash, -2*gcOrphanMinAge)
 	ageBlobFile(t, st, staleHash, -2*gcOrphanMinAge)
@@ -2397,7 +2397,7 @@ func TestErrPredicates(t *testing.T) {
 // TestReclaimHookBlobsHonorsLockWaitCancel(아래)이 락을 선점해 강제로 검증한다.
 func TestReclaimHookBlobsHonorsCancel(t *testing.T) {
 	dir := t.TempDir()
-	s := openAt(t, dir) // store_test.go:1693 — dir 지정 Open, t.Cleanup에 `_ = s.Close()` 등록
+	s := openAt(t, dir) // store_test.go:1696 — dir 지정 Open, t.Cleanup에 `_ = s.Close()` 등록
 	// 회수 대상 blob 두 개를 CAS 배치대로 만든다: <dir>/artifacts/<h[:2]>/<h>
 	hashes := []string{strings.Repeat("a", 64), strings.Repeat("b", 64)}
 	for _, h := range hashes {
@@ -2429,7 +2429,7 @@ func TestReclaimHookBlobsHonorsCancel(t *testing.T) {
 
 // TestReclaimHookBlobsHonorsLockWaitCancel — D74 F3/F4: reclaimHookBlobs의 lockStoreCtx 대기
 // 자체가 ctx를 관측한다. content.db.rebuild.lock을 외부에서 배타 선점해(TestOpenContextLockDeadline과
-// 동형 — store_test.go:1627) lockStoreCtx가 select{ctx.Done(), time.After}로 실제 진입하게
+// 동형 — store_test.go:1633) lockStoreCtx가 select{ctx.Done(), time.After}로 실제 진입하게
 // 만든다. lockStoreCtx를 lockStore로 되돌리면(F3 회귀) ctx.Done()이 절대 발화하지 않아 내부
 // 5초 하드 타임아웃까지 블록한다 — elapsed 상한이 그 회귀를 잡는다. 동시에 반환 오류가
 // context.DeadlineExceeded 그대로인지도 검증한다(F4 — lockStoreCtx가 감싸는 ErrUnavailable이
@@ -2568,7 +2568,7 @@ func shadowOwnedHashesT(t *testing.T, s *Store) []string {
 }
 
 // seedShadowMixed — 귀속 hash 1개(hook 단독)와 비귀속 hash 1개(hook + file이 같은 콘텐츠를
-// 공유)를 서로 다른 콘텐츠·uri로 등록한다. 기존 seed*(store_test.go:1716-1765)는 전부 같은
+// 공유)를 서로 다른 콘텐츠·uri로 등록한다. 기존 seed*(store_test.go:1719-1768)는 전부 같은
 // 콘텐츠와 uri "shadow:Bash:1"을 재사용하므로 조합하면 upsert로 덮인다 — regSource로 직접 만든다.
 func seedShadowMixed(t *testing.T, st *Store) {
 	t.Helper()
@@ -2690,7 +2690,7 @@ func TestEnsureIndexesFailureDoesNotBlockOpen(t *testing.T) {
 
 // --- D73 §2 ⑦⑧: 기동 예산 판정 + 술어 전후 벤치 ---
 
-// openTB — openAt(store_test.go:1693)의 testing.TB 대응. 벤치에서도 써야 해서 *testing.T 고정을
+// openTB — openAt(store_test.go:1696)의 testing.TB 대응. 벤치에서도 써야 해서 *testing.T 고정을
 // 푼 것뿐이고 cleanup 등록은 같다.
 func openTB(tb testing.TB, dir string) *Store {
 	tb.Helper()

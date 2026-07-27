@@ -186,7 +186,7 @@ func Run(ctx context.Context, scratchParent, selfExe string, req Request) (Respo
 	if strings.HasSuffix(r.file, ".ps1") && resp.ExitCode != nil && *resp.ExitCode == 0 && resp.Stderr == "" {
 		if n, ok := readNativeExitCode(sidePath); ok && n != 0 {
 			resp.Stderr = fmt.Sprintf(
-				"context-router: 마지막 외부 명령이 종료 코드 %d으로 끝났습니다(exit_code는 스니펫의 종료 상태입니다).\n", n,
+				"context-router: 마지막 외부 명령이 종료 코드 %d번으로 끝났습니다(exit_code는 스니펫의 종료 상태입니다).\n", n,
 			)
 		}
 	}
@@ -272,7 +272,7 @@ func snippetContent(fileName, code, sidePath string) []byte {
 
 func shellRunner() runner {
 	if runtime.GOOS == "windows" {
-		var psHome, pfDir string // detect가 채우고 extra가 읽는다(Run: detect 115행 → extra 131행)
+		var psHome, pfDir string // detect가 채우고 extra가 읽는다(Run: detect 117행 → extra 133행)
 		return runner{
 			file: "snippet.ps1",
 			detect: func() (string, string, error) {
@@ -294,11 +294,11 @@ func shellRunner() runner {
 			// PSModulePath를 명시해도 pwsh는 사용자 모듈 디렉터리가 실재하면 USERPROFILE 유도 경로를
 			// 앞에 덧붙이므로 USERPROFILE도 스크래치로 돌린다 — 호스트 사용자 모듈을 실제로 떼어내는
 			// 레버는 이쪽이다(실측: TestRunShellScratchModulePathWins의 격리 없는 절반이 그 경로로 로드).
-			// extra는 BaseEnv 뒤에 붙어 마지막 값이 이기므로(exec.go:129-136) 이 재지정은 shell
+			// extra는 BaseEnv 뒤에 붙어 마지막 값이 이기므로(exec.go:131-138) 이 재지정은 shell
 			// 러너에만 적용된다 — csharp의 USERPROFILE(D60)은 그대로다.
-			// psHome·pfDir 공유는 안전하다: table()이 호출마다 새 클로저 쌍을 만들어(exec.go:99) 동시
+			// psHome·pfDir 공유는 안전하다: table()이 호출마다 새 클로저 쌍을 만들어(exec.go:102) 동시
 			// Run끼리 변수를 공유하지 않고, extra를 부르는 유일한 경로인 Run이 detect 성공 뒤에만
-			// 도달한다(detect 오류는 117행에서 조기 반환). 표에서 직접 extra를 부르는 코드는
+			// 도달한다(detect 오류는 119행에서 조기 반환). 표에서 직접 extra를 부르는 코드는
 			// detect를 먼저 불러야 한다.
 			extra: func(scratch string) ([]string, error) {
 				mods := filepath.Join(scratch, "psmodules")

@@ -630,7 +630,7 @@ func TestDoctorShadowOwnedMultiWorktree(t *testing.T) {
 }
 
 // TestDoctorShadowOwnedNoSessionDecomp — D40 §2: content.db는 있으나 worktrees 세션이 하나도
-// 없으면(usable=0) [15]는 버킷 분해 없이 '세션 분해 없음' 폴백으로 렌더한다(cli.go:1484 경로).
+// 없으면(usable=0) [15]는 버킷 분해 없이 '세션 분해 없음' 폴백으로 렌더한다(cli.go:1830 경로).
 func TestDoctorShadowOwnedNoSessionDecomp(t *testing.T) {
 	storeRoot, projectRoot, projDir := doctorShadowProjDir(t)
 	seedShadowContentDB(t, projDir) // worktrees 디렉터리 미생성 → usable=0
@@ -2669,7 +2669,7 @@ func TestDoctorPermissionLineOnCheckFailure(t *testing.T) {
 // TestDoctorIndexesRender — D73: 병기가 quick_check 뒤에 오고 기존 부분문자열 단정이 그대로
 // 통과한다(골든 갱신 없이 정보만 더한다).
 func TestDoctorIndexesRender(t *testing.T) {
-	// 전용 doctor 실행 헬퍼는 없다 — 기존 셋업 두 개로 조립해 runDoctor(cli.go:1471)를 직접 부른다.
+	// 전용 doctor 실행 헬퍼는 없다 — 기존 셋업 두 개로 조립해 runDoctor(cli.go:1491)를 직접 부른다.
 	storeRoot, projectRoot, projDir := doctorShadowProjDir(t) // cli_test.go:545
 	seedShadowContentDB(t, projDir)                           // cli_test.go:411 — writable Open이라 여기서 색인이 생긴다
 	var buf bytes.Buffer

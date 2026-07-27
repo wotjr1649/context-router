@@ -1085,13 +1085,13 @@ type HookPurgeReport struct {
 // sources만 upsert하므로, 바이트 동일한 출력을 다시 포착하면 옛 artifacts 행이 재사용되고 created_at은
 // 첫 포착 시각에 머문다. 첫 포착 기준으로 고르면 방금 다시 포착한 콘텐츠가 지워져, 몇 초 전 모델에
 // 넘긴 참조가 ctr_fetch에서 해소되지 않고 그 청크도 ctr_search에서 사라진다. indexed_at은 그 upsert가
-// 갱신하므로 이 창을 닫는다 — 형제 보존 경로 PurgeOlderThan(store.go:714)과 같은 기준이다.
+// 갱신하므로 이 창을 닫는다 — 형제 보존 경로 PurgeOlderThan(store.go:744)과 같은 기준이다.
 // 행 단위가 아니라 hash 단위 배제인 이유: Register의 조회 키가 (content_hash, media_type)이라 같은
 // 콘텐츠가 media_type마다 별개 artifacts 행을 가질 수 있는데, 삭제와 CAS 회수는 hash 단위다 —
 // 한 행만 최근이어도 공유 blob은 살려야 한다. hook이 raw_blob_hash로 참조하는 경우는 따로 볼 필요가
 // 없다: RawBlob은 web 소스만 설정하고(ingest.go 웹 경로) 비-hook raw_blob 참조는 위 두 번째
 // NOT EXISTS가 이미 hash 전체를 비귀속으로 떨어뜨린다.
-// created_at·indexed_at은 모두 unix 초다(store.go:188·193).
+// created_at·indexed_at은 모두 unix 초다(store.go:191·196).
 func shadowOwnedFilter(cutoffUnix int64, maxHashes int) (string, []any) {
 	q := shadowOwnedHashQuery
 	var args []any

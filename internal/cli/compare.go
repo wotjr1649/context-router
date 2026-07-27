@@ -54,7 +54,7 @@ func defaultRolloutRoot() string {
 
 // loadCCSynthetic — D51(v0.9): source="first-event" 합성 등록 cc: 세션 집합(--compare 전용
 // 기본 제외 — 구성상 불완전 표본). loadCCSessions 본문을 복제하되 SQL만 교체한다(재사용 금지 —
-// loadCCSessions는 무플래그 본표(cli.go:456)와 공유하는 byte-for-byte 게이트). 실패는 빈 집합
+// loadCCSessions는 무플래그 본표(cli.go:367)와 공유하는 byte-for-byte 게이트). 실패는 빈 집합
 // (fail-soft, loadCCSessions와 동형). read-only라 대상 DB를 오염시키지 않는다.
 func loadCCSynthetic(ctx context.Context, storeRoot, projectRoot string) map[string]bool {
 	canon, err := ident.Canonicalize(projectRoot)

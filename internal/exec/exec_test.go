@@ -363,7 +363,7 @@ func TestShellNativeExitNotPropagated(t *testing.T) {
 	// D76: 이 자리는 이제 비어 있지 않다 — 마지막 외부 명령(cmd /c exit 5)의 종료 상황을 알리는
 	// 보강 줄 정확히 하나가 들어간다. 문면 한 글자, 줄 수 어느 쪽이 바뀌어도 여기서 깨져야 한다 —
 	// 부분일치로 완화하면 이 감시선이 다시 무력해진다(D76 이전엔 stderr가 비어야 통과했다).
-	const wantStderr = "context-router: 마지막 외부 명령이 종료 코드 5으로 끝났습니다(exit_code는 스니펫의 종료 상태입니다).\n"
+	const wantStderr = "context-router: 마지막 외부 명령이 종료 코드 5번으로 끝났습니다(exit_code는 스니펫의 종료 상태입니다).\n"
 	if resp.Stderr != wantStderr {
 		t.Fatalf("stderr가 보강 줄과 정확히 일치해야 한다: got=%q want=%q", resp.Stderr, wantStderr)
 	}
@@ -1376,13 +1376,13 @@ func TestRunnerLabelNodeLeg(t *testing.T) {
 	}
 	for _, lang := range []string{"javascript", "typescript"} {
 		t.Run(lang, func(t *testing.T) {
-			requireLang(t, lang) // exec_test.go:144 — 미설치 호스트는 Skip(Fatal 금지, 저장소 관례)
-			// run(t, req)(exec_test.go:151)은 Run(ctx, t.TempDir(), selfExe(t), req)를 부른다.
+			requireLang(t, lang) // exec_test.go:157 — 미설치 호스트는 Skip(Fatal 금지, 저장소 관례)
+			// run(t, req)(exec_test.go:164)은 Run(ctx, t.TempDir(), selfExe(t), req)를 부른다.
 			// selfExe를 빈 문자열로 넘기면 linux의 sandbox.Run이 ErrSetup으로 즉시 반환하므로
 			// (run_unix.go:34) 이 잡(ubuntu)에서 Run을 직접 부르면 안 된다.
 			resp := run(t, Request{Language: lang, Code: "console.log(1)"})
 			// runnerLabel은 filepath.Base(bin) + (version이 있으면) " " + version이다
-			// (internal/exec/exec.go:179-185) — 첫 토큰을 떼고 확장자를 제거해 비교한다.
+			// (internal/exec/exec.go:215-221) — 첫 토큰을 떼고 확장자를 제거해 비교한다.
 			first := strings.Fields(resp.Runner)[0]
 			base := strings.TrimSuffix(first, filepath.Ext(first))
 			if base != "node" {
@@ -1469,7 +1469,7 @@ func TestRunnerIsolationKeySets(t *testing.T) {
 	}
 	shell := tbl["shell"]
 	if runtime.GOOS == "windows" {
-		// windows 갈래의 extra는 detect가 채우는 psHome·pfDir를 읽는다(exec.go:227-230의 계약) —
+		// windows 갈래의 extra는 detect가 채우는 psHome·pfDir를 읽는다(exec.go:313-316의 계약) —
 		// detect를 먼저 부르지 않으면 값이 빈 채로 조립된다. 미설치면 Skip한다
 		// (TestShellExtraModuleDirFailureIsErrSetup:1189-1191 선례).
 		if _, _, err := shell.detect(); err != nil {
@@ -1534,7 +1534,7 @@ func TestRunShellHomeToolchainStillWorks(t *testing.T) {
 	if _, err := exec.LookPath("dotnet"); err != nil { // 이 파일에서 exec는 os/exec다(별칭 없음)
 		t.Skip("dotnet 없음")
 	}
-	// run(t, req)(exec_test.go:151)은 Run(ctx, t.TempDir(), selfExe(t), req)를 부른다 — selfExe에
+	// run(t, req)(exec_test.go:164)은 Run(ctx, t.TempDir(), selfExe(t), req)를 부른다 — selfExe에
 	// 빈 문자열을 넘기면 linux의 sandbox.Run이 ErrSetup으로 즉시 반환한다(run_unix.go:34).
 	resp := run(t, Request{Language: "shell", Code: "set -e\ndotnet --version\n"})
 	if resp.ExitCode == nil || *resp.ExitCode != 0 {
@@ -1552,12 +1552,12 @@ func TestRunShellHomeToolchainStillWorks(t *testing.T) {
 
 // TestRunShellScratchHomeWins — D75 §2 ①: 격리 없는 절반은 호스트 홈 유도 구성을 읽고, 격리된
 // 절반은 읽지 않는다. windows의 같은 축(USERPROFILE·PSModulePath)은
-// TestRunShellScratchModulePathWins(exec_test.go:890)가 이미 덮으므로 그 A/B 구성 방식을
+// TestRunShellScratchModulePathWins(exec_test.go:1031)가 이미 덮으므로 그 A/B 구성 방식을
 // unix HOME 축으로 복제한다 — **그 테스트를 먼저 읽고 절반을 만드는 형태를 그대로 따른다**
 // (격리 없는 절반을 어떻게 조립하는지가 거기에 있다).
 func TestRunShellScratchHomeWins(t *testing.T) {
 	if runtime.GOOS == "windows" {
-		t.Skip("unix shell 갈래 전용 — windows 축은 exec_test.go:890이 덮는다")
+		t.Skip("unix shell 갈래 전용 — windows 축은 exec_test.go:1031이 덮는다")
 	}
 	requireLang(t, "shell")
 	// 픽스처를 심기 전에 sync.Once 빌드를 끝낸다 — 심은 뒤면 그 go build가 HOME 유도 GOPATH/
