@@ -146,7 +146,8 @@ func Run(ctx context.Context, scratchParent, selfExe string, req Request) (Respo
 	env = append(env, "CTR_SCRATCH="+scratch)
 
 	file := filepath.Join(scratch, r.file)
-	if err := os.WriteFile(file, snippetContent(r.file, req.Code), 0o600); err != nil {
+	sidePath := filepath.Join(scratch, ctrNativeExitFile)
+	if err := os.WriteFile(file, snippetContent(r.file, req.Code, sidePath), 0o600); err != nil {
 		return Response{}, fmt.Errorf("%w: 스니펫 기록 실패", sandbox.ErrSetup)
 	}
 	spec := sandbox.Spec{
@@ -175,7 +176,37 @@ func Run(ctx context.Context, scratchParent, selfExe string, req Request) (Respo
 		ec := res.ExitCode
 		resp.ExitCode = &ec
 	}
+	// D76: exit_code가 0이고 stderr가 빈 상황에서만 네이티브 종료 상황을 한 줄 남긴다 — 원래
+	// 비어 있던 자리에만 들어가므로 사용자 출력과 섞이지 않고, 응답 스키마도 바뀌지 않는다
+	// (필드를 더하면 outputSchema가 tools/list 표면을 넘긴다). tail이 읽는 $LASTEXITCODE는
+	// "마지막 외부 명령"(네이티브 프로그램 또는 호출된 스크립트)의 값이므로 문면도 그 한정을
+	// 그대로 적는다.
+	if resp.ExitCode != nil && *resp.ExitCode == 0 && resp.Stderr == "" {
+		if n, ok := readNativeExitCode(sidePath); ok && n != 0 {
+			resp.Stderr = fmt.Sprintf(
+				"context-router: 마지막 외부 명령이 종료 코드 %d으로 끝났습니다(exit_code는 스니펫의 종료 상태입니다).\n", n,
+			)
+		}
+	}
 	return resp, nil
+}
+
+// readNativeExitCode — D76 사이드 파일 읽기. 파일 부재(tail 미실행)·빈 값($LASTEXITCODE 미설정,
+// 즉 외부 명령이 없었음)·파싱 실패는 모두 "보강하지 않음"이다.
+func readNativeExitCode(path string) (int, bool) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return 0, false
+	}
+	s := strings.TrimSpace(string(b))
+	if s == "" {
+		return 0, false
+	}
+	n, err := strconv.Atoi(s)
+	if err != nil {
+		return 0, false
+	}
+	return n, true
 }
 
 func runnerLabel(lang, bin, version string) string {
@@ -190,14 +221,31 @@ func fileArgv(bin, file string) []string { return []string{bin, file} }
 func goArgv(bin, file string) []string   { return []string{bin, "run", file} }
 func csArgv(bin, file string) []string   { return []string{bin, "run", file} }
 
-// snippetContent: 스니펫 파일에 기록할 바이트. .ps1은 UTF-8 BOM을 선두에 붙인다(I2) —
-// powershell.exe 5.1이 BOM 없는 .ps1을 시스템 ANSI 코드페이지로 디코딩해 비ASCII를 손상시키기
-// 때문(한국어 Windows에서 관측). pwsh 7은 BOM을 허용하므로 fallback 양쪽 모두 안전하다.
-func snippetContent(fileName, code string) []byte {
-	if strings.HasSuffix(fileName, ".ps1") {
-		return append([]byte{0xEF, 0xBB, 0xBF}, code...)
+// ctrNativeExitFile — D76 사이드 파일 이름. 런별 스크래치 절대 경로로 고정한다(스니펫이 작업
+// 디렉터리를 바꾸거나 같은 상대 경로에 써도 값에 개입하지 않게).
+const ctrNativeExitFile = "ctr-native-exit"
+
+// snippetContent — .ps1에는 UTF-8 BOM(기존 계약, I2 — powershell.exe 5.1이 BOM 없는 .ps1을
+// 시스템 ANSI 코드페이지로 디코딩해 비ASCII를 손상시키는 것을 막는다)과 D76 tail을 붙인다.
+//
+// tail 제약 셋: ① 스니펫의 마지막 개행이 보장되지 않으므로 개행을 **선행**시킨다.
+// ② 기록에 프로바이더 cmdlet(Set-Content·Out-File)을 쓰지 않는다 — 5.1의 무반환 정지 경로가
+// 실측됐다. ③ 변수명을 스니펫과 충돌하지 않게 고유하게 둔다.
+// 스니펫이 exit으로 끝나면 tail은 실행되지 않는다 — 코드를 명시한 exit이면 exit_code가 그
+// 값이고, 인수 없는 exit은 0을 반환해 네이티브 실패가 가려지지만 이 보강이 덮지 못하는 알려진
+// 공백이다(설계 v0.13 §1.2).
+func snippetContent(fileName, code, sidePath string) []byte {
+	if !strings.HasSuffix(fileName, ".ps1") {
+		return []byte(code)
 	}
-	return []byte(code)
+	// $LASTEXITCODE를 직접 참조하면 스니펫이 strict mode를 켜고 외부 명령 없이 끝났을 때
+	// 미초기화 변수 오류가 스니펫 stderr로 나가고(pwsh·5.1 양쪽 실측, 내부 스크립트 경로 포함)
+	// 사이드 파일도 안 써진다 — 무신호를 없애려던 것이 새 잡음을 만든다. Get-Variable로 읽으면
+	// 미설정이 오류가 아니라 빈 값이 된다.
+	tail := "\n$ctrNativeExitCode = Get-Variable -Name LASTEXITCODE -ValueOnly -ErrorAction SilentlyContinue\n" +
+		"[System.IO.File]::WriteAllText('" + strings.ReplaceAll(sidePath, "'", "''") + "', [string]$ctrNativeExitCode)\n"
+	out := append([]byte{0xEF, 0xBB, 0xBF}, code...)
+	return append(out, tail...)
 }
 
 func shellRunner() runner {

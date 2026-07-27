@@ -103,16 +103,27 @@ func TestRunShellEcho(t *testing.T) {
 // TestSnippetPS1BOM: I2 — .ps1 스니펫은 선두에 UTF-8 BOM(EF BB BF)이 붙어야 powershell.exe
 // 5.1이 비ASCII를 ANSI 코드페이지로 오독하지 않는다. 다른 확장자는 BOM이 붙지 않는다.
 func TestSnippetPS1BOM(t *testing.T) {
-	got := snippetContent("snippet.ps1", "Write-Output '한글'")
+	side := filepath.Join(t.TempDir(), "side")
+	got := snippetContent("snippet.ps1", "Write-Output '한글'", side)
 	if !bytes.HasPrefix(got, []byte{0xEF, 0xBB, 0xBF}) {
 		t.Fatalf(".ps1 UTF-8 BOM 미기록: 선두=%x", got[:min(3, len(got))])
 	}
-	if !bytes.HasSuffix(got, []byte("Write-Output '한글'")) {
-		t.Fatalf("BOM 뒤 코드 원문 손상")
+	// tail이 코드 뒤에 붙으므로 접미가 아니라 포함으로 본다(D76).
+	if !bytes.Contains(got, []byte("Write-Output '한글'")) {
+		t.Fatalf("코드 본문이 없다: %q", got)
+	}
+	// BOM 직후가 코드 시작임은 그대로 단정한다.
+	if !bytes.HasPrefix(got[3:], []byte("Write-Output '한글'")) {
+		t.Fatalf("BOM 직후가 코드 시작이 아니다: %q", got)
 	}
 	for _, f := range []string{"snippet.sh", "snippet.js", "snippet.py", "snippet.go", "snippet.cs"} {
-		if bytes.HasPrefix(snippetContent(f, "x"), []byte{0xEF, 0xBB, 0xBF}) {
+		out := snippetContent(f, "x", side)
+		if bytes.HasPrefix(out, []byte{0xEF, 0xBB, 0xBF}) {
 			t.Errorf("%s에 BOM 오부착", f)
+		}
+		// D76: tail은 .ps1 전용이다 — 다른 확장자는 원문 그대로 나와야 한다(tail 미부착).
+		if string(out) != "x" {
+			t.Errorf("%s에 tail이 붙었다: %q", f, out)
 		}
 	}
 }
@@ -319,12 +330,15 @@ func TestShellExitCodeIsLastCommand(t *testing.T) {
 
 // TestShellNativeExitNotPropagated: 계약의 안전망(exit_code + stderr를 함께 보기)이 잡지
 // 못하는 부류를 고정한다 — windows 인터프리터는 -File 실행에서 exit이나 종결 오류가 없으면 0을
-// 돌려주므로, 마지막 줄이 비 0으로 죽은 네이티브 명령이어도 exit_code 0이고 stderr까지 비어
-// 실패가 두 채널 어디에도 남지 않는다($ErrorActionPreference = 'Stop'도 이 부류는 멈추지
-// 못한다 — pwsh 7.6.0·powershell 5.1 실측). 안내가 PowerShell에 exit $LASTEXITCODE 전파를
-// 지시하는 근거이고, 러너가 언젠가 네이티브 종료를 전파하기 시작하면 안내 문면을 고쳐야
-// 하므로 이 테스트가 먼저 깨져 알린다. sh는 반대로 마지막 명령의 상태를 문자 그대로
-// 전파하며(안내의 sh 문면 근거) 두 절반이 그 대비를 함께 고정한다(설계 v0.12 D66).
+// 돌려주므로, 마지막 줄이 비 0으로 죽은 네이티브 명령이어도 exit_code는 0이다
+// ($ErrorActionPreference = 'Stop'도 이 부류는 멈추지 못한다 — pwsh 7.6.0·powershell 5.1
+// 실측). 안내가 PowerShell에 exit $LASTEXITCODE 전파를 지시하는 근거이고, 러너가 언젠가
+// 네이티브 종료를 exit_code로 전파하기 시작하면 안내 문면을 고쳐야 하므로 이 테스트가 먼저
+// 깨져 알린다. D76부터 stderr는 더 이상 비어 있지 않다 — 원래 무신호였던 이 자리를 채우는
+// 보강 줄 정확히 하나를 문면 그대로 고정한다(아래 wantStderr) — 부분일치로 완화하면 문면이
+// 바뀌거나 엉뚱한 케이스로 새는 것을 이 테스트가 놓친다. sh는 반대로 마지막 명령의 상태를
+// 문자 그대로 전파하며(안내의 sh 문면 근거) 두 절반이 그 대비를 함께 고정한다(설계 v0.12
+// D66 · v0.13 D76).
 func TestShellNativeExitNotPropagated(t *testing.T) {
 	requireLang(t, "shell")
 	if runtime.GOOS != "windows" {
@@ -346,9 +360,90 @@ func TestShellNativeExitNotPropagated(t *testing.T) {
 		t.Fatalf("exit=%d want 0 — 네이티브 종료가 전파되기 시작했다면 안내 문면을 고친다. stderr=%q",
 			*resp.ExitCode, resp.Stderr)
 	}
-	if s := strings.TrimSpace(resp.Stderr); s != "" {
-		t.Errorf("stderr가 비어 있지 않다 — 실패가 관측 가능해졌다면 안내 문면을 고친다: %q", s)
+	// D76: 이 자리는 이제 비어 있지 않다 — 마지막 외부 명령(cmd /c exit 5)의 종료 상황을 알리는
+	// 보강 줄 정확히 하나가 들어간다. 문면 한 글자, 줄 수 어느 쪽이 바뀌어도 여기서 깨져야 한다 —
+	// 부분일치로 완화하면 이 감시선이 다시 무력해진다(D76 이전엔 stderr가 비어야 통과했다).
+	const wantStderr = "context-router: 마지막 외부 명령이 종료 코드 5으로 끝났습니다(exit_code는 스니펫의 종료 상태입니다).\n"
+	if resp.Stderr != wantStderr {
+		t.Fatalf("stderr가 보강 줄과 정확히 일치해야 한다: got=%q want=%q", resp.Stderr, wantStderr)
 	}
+}
+
+// TestShellNativeExitAugmentation — D76: exit_code 0에 stderr가 빈 상황에서만 마지막 외부
+// 명령의 종료 상황을 stderr 한 줄로 낸다. exit_code의 의미는 바뀌지 않는다.
+func TestShellNativeExitAugmentation(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("windows shell 갈래 전용(PowerShell -File 계약)")
+	}
+	requireLang(t, "shell")
+	const marker = "마지막 외부 명령이 종료 코드"
+
+	t.Run("마지막_줄이_비0_네이티브", func(t *testing.T) {
+		resp := run(t, Request{Language: "shell", Code: "cmd /c exit 5\n"})
+		if resp.ExitCode == nil || *resp.ExitCode != 0 {
+			t.Fatalf("exit_code=%v want 0(계약 불변)", resp.ExitCode)
+		}
+		if !strings.Contains(resp.Stderr, marker) {
+			t.Fatalf("보강 줄 없음: stderr=%q", resp.Stderr)
+		}
+	})
+
+	t.Run("성공한_cmdlet_뒤_거짓실패_금지", func(t *testing.T) {
+		resp := run(t, Request{Language: "shell", Code: "cmd /c exit 5\nWrite-Output 'ok'\n"})
+		if resp.ExitCode == nil || *resp.ExitCode != 0 {
+			t.Fatalf("exit_code=%v want 0 — 거짓 실패를 만들지 않는다", resp.ExitCode)
+		}
+		// 잠긴 값이므로 이 케이스에도 보강 줄이 나온다(의미는 마지막 외부 명령 한정이다).
+		if !strings.Contains(resp.Stderr, marker) {
+			t.Fatalf("보강 줄 없음: stderr=%q", resp.Stderr)
+		}
+	})
+
+	t.Run("인수없는_exit은_보강되지_않는다", func(t *testing.T) {
+		resp := run(t, Request{Language: "shell", Code: "cmd /c exit 5\nexit\n"})
+		if strings.Contains(resp.Stderr, marker) {
+			t.Fatalf("tail이 실행되지 않아야 하는데 보강 줄이 있다: %q", resp.Stderr)
+		}
+		// 대조: 마지막 exit만 제거하면 보강 줄이 나온다 — 이 대조가 없으면 위 단정은 tail이
+		// 전혀 동작하지 않아도 통과한다.
+		ctrl := run(t, Request{Language: "shell", Code: "cmd /c exit 5\n"})
+		if !strings.Contains(ctrl.Stderr, marker) {
+			t.Fatalf("대조 케이스에 보강 줄이 없다: %q", ctrl.Stderr)
+		}
+	})
+
+	t.Run("코드를_명시한_exit", func(t *testing.T) {
+		resp := run(t, Request{Language: "shell", Code: "cmd /c exit 5\nexit 3\n"})
+		if resp.ExitCode == nil || *resp.ExitCode != 3 {
+			t.Fatalf("exit_code=%v want 3 — 스니펫이 명시한 코드를 그대로 낸다", resp.ExitCode)
+		}
+	})
+
+	t.Run("stderr가_비어있지_않으면_넣지_않는다", func(t *testing.T) {
+		resp := run(t, Request{Language: "shell", Code: "cmd /c exit 5\n[Console]::Error.WriteLine('boom')\n"})
+		if strings.Count(resp.Stderr, marker) != 0 {
+			t.Fatalf("stderr가 이미 비어 있지 않은데 보강했다: %q", resp.Stderr)
+		}
+	})
+
+	t.Run("strict_mode에_네이티브_명령_없음", func(t *testing.T) {
+		// tail이 $LASTEXITCODE를 직접 참조하면 여기서 미초기화 변수 오류가 stderr로 나간다.
+		resp := run(t, Request{Language: "shell", Code: "Set-StrictMode -Version Latest\nWrite-Output 'ok'\n"})
+		if resp.Stderr != "" {
+			t.Fatalf("stderr가 비어야 한다 — tail이 오류를 내면 안 된다: %q", resp.Stderr)
+		}
+	})
+
+	t.Run("여러줄_문자열로_끝나는_스니펫", func(t *testing.T) {
+		// here-string으로 끝나고 마지막 개행이 없는 형태 — tail이 구문을 깨지 않아야 한다.
+		resp := run(t, Request{Language: "shell", Code: "cmd /c exit 5\n$x = @'\nline\n'@"})
+		if resp.ExitCode == nil || *resp.ExitCode != 0 {
+			t.Fatalf("tail이 구문을 깼다: exit=%v stderr=%q", resp.ExitCode, resp.Stderr)
+		}
+		if !strings.Contains(resp.Stderr, marker) {
+			t.Fatalf("보강 줄 없음: stderr=%q", resp.Stderr)
+		}
+	})
 }
 
 // TestTruncation: stdout이 상한(32768)을 넘으면 잘리고 StdoutTrunc가 선다.
@@ -925,7 +1020,7 @@ func TestRunShellScratchModulePathWins(t *testing.T) {
 	}
 	scratch := t.TempDir()
 	file := filepath.Join(scratch, "snippet.ps1")
-	if err := os.WriteFile(file, snippetContent("snippet.ps1", code), 0o600); err != nil {
+	if err := os.WriteFile(file, snippetContent("snippet.ps1", code, filepath.Join(scratch, ctrNativeExitFile)), 0o600); err != nil {
 		t.Fatalf("스니펫 기록 실패: %v", err)
 	}
 	env := sandbox.BaseEnv() // 닫힌 표 그대로 — PSModulePath는 이미 표 밖이다
@@ -1007,7 +1102,7 @@ func TestRunShellPS51ProviderWriteReturns(t *testing.T) {
 	out := filepath.Join(scratch, "provider.out")
 	code := "'x' | Set-Content -LiteralPath '" + out + "'\nWrite-Output '" + marker + "'\n"
 	file := filepath.Join(scratch, "snippet.ps1")
-	if err := os.WriteFile(file, snippetContent("snippet.ps1", code), 0o600); err != nil {
+	if err := os.WriteFile(file, snippetContent("snippet.ps1", code, filepath.Join(scratch, ctrNativeExitFile)), 0o600); err != nil {
 		t.Fatalf("스니펫 기록 실패: %v", err)
 	}
 	env := append(sandbox.BaseEnv(), tmpEnv(scratch)...)
