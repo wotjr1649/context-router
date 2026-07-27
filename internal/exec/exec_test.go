@@ -1210,3 +1210,29 @@ func TestRunnerStatus(t *testing.T) {
 		}
 	}
 }
+
+// TestRunnerLabelNodeLeg — D70: bun이 없는 환경에서 javascript·typescript가 node 레그를 탄다.
+// 라벨은 실행 파일 basename이라 windows에서 ".exe"가 붙으므로 확장자를 제거하고 비교한다.
+// bun이 설치된 환경에서는 detectJS가 bun을 고르므로 이 단정이 성립하지 않는다 — SKIP한다
+// (거짓 실패를 만들지 않는다). CI의 bun 없는 잡이 이 테스트의 실행 지점이다.
+func TestRunnerLabelNodeLeg(t *testing.T) {
+	if _, err := exec.LookPath("bun"); err == nil {
+		t.Skip("bun 설치됨 — detectJS가 bun을 고르므로 node 레그가 아니다")
+	}
+	for _, lang := range []string{"javascript", "typescript"} {
+		t.Run(lang, func(t *testing.T) {
+			requireLang(t, lang) // exec_test.go:144 — 미설치 호스트는 Skip(Fatal 금지, 저장소 관례)
+			// run(t, req)(exec_test.go:151)은 Run(ctx, t.TempDir(), selfExe(t), req)를 부른다.
+			// selfExe를 빈 문자열로 넘기면 linux의 sandbox.Run이 ErrSetup으로 즉시 반환하므로
+			// (run_unix.go:34) 이 잡(ubuntu)에서 Run을 직접 부르면 안 된다.
+			resp := run(t, Request{Language: lang, Code: "console.log(1)"})
+			// runnerLabel은 filepath.Base(bin) + (version이 있으면) " " + version이다
+			// (internal/exec/exec.go:179-185) — 첫 토큰을 떼고 확장자를 제거해 비교한다.
+			first := strings.Fields(resp.Runner)[0]
+			base := strings.TrimSuffix(first, filepath.Ext(first))
+			if base != "node" {
+				t.Fatalf("runner=%q base=%q want node", resp.Runner, base)
+			}
+		})
+	}
+}

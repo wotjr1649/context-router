@@ -134,6 +134,27 @@ jobs:
       - name: golangci-lint (GOOS=windows)
         run: GOOS=windows "$(go env GOPATH)/bin/golangci-lint" run --max-same-issues=0 --max-issues-per-linter=0 ./...
 
+  # D70: test 잡은 bun을 설치하므로 detectJS가 항상 bun을 고른다 — node 레그가 CI에서 한 번도
+  # 실행되지 않았다. bun을 설치하지 않는 잡에서 js·ts 러너를 돌린다. 판정은 통과 여부가 아니라
+  # 응답의 runner 라벨이며(TestRunnerLabelNodeLeg), 그 단정이 없으면 bun 잡을 한 번 더 돌린
+  # 것과 구분되지 않는다.
+  test-node-leg:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      # test 잡과 같은 라인 — TS 게이트 ≥22.7을 충족한다. bun은 설치하지 않는다(이 잡의 존재 이유).
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+
+      - name: go test (js·ts 러너 — node 레그)
+        run: go test -p 1 -count=1 ./internal/exec/ -run 'TestRunTS|TestRunJSIsolatesUserConfig|TestRunnerLabelNodeLeg' -v
+
   crossbuild:
     runs-on: ubuntu-latest
     timeout-minutes: 10
