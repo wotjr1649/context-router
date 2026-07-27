@@ -81,7 +81,7 @@ jobs:
 
   lint:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6
       - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16  # v6
@@ -103,7 +103,7 @@ jobs:
       - name: "golangci-lint (v2, default: standard + misspell)"
         uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a  # v9
         with:
-          version: v2.12
+          version: v2.12.2
 
       # D69: 기본 lint는 한 GOOS의 파일 집합만 본다 — windows 전용 파일 4개(ident/realpath_windows.go,
       # transform/worker_windows.go, store/store_lock_windows.go, sandbox/run_windows.go)가 ubuntu
@@ -181,6 +181,10 @@ jobs:
           major="${ver%%.*}"
           minor="${ver#*.}"
           minor="${minor%%.*}"
+          # fail-closed 파싱 가드(Go의 nodeAtLeast와 방향 일치) — 아래 [ -lt ] 비교가
+          # 비숫자에서 내는 오류는 if 조건 안에서 삼켜져 게이트가 조용히 통과(exit 0)할
+          # 수 있다. 비교 전에 먼저 걸러 그 경로를 막는다.
+          case "$major$minor" in ''|*[!0-9]*) echo "unparseable node version: $node_version" >&2; exit 1;; esac
           if [ "$major" -lt 22 ] || { [ "$major" -eq 22 ] && [ "$minor" -lt 7 ]; }; then
             echo "node $node_version does not meet the TypeScript gate (>=22.7 required by detectTS) — TestRunTS/TestRunnerLabelNodeLeg's typescript subtest would silently Skip via requireLang instead of failing; fix setup-node's node-version input" >&2
             exit 1
