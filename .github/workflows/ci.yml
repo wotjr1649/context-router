@@ -113,18 +113,26 @@ jobs:
         run: |
           set -euo pipefail
           for pkg in ./internal/ident ./internal/transform ./internal/store ./internal/sandbox; do
-            # 파이프로 바로 grep하지 않는다 — pipefail 아래에서 grep 조기 종료가 go list에
-            # SIGPIPE를 주면 파이프라인이 실패해 포함 확인이 거짓 실패가 될 수 있다.
+            # herestring으로 grep에 직접 먹인다 — "$files"를 echo로 파이프하면 pipefail 아래에서
+            # grep 조기 종료가 echo에 SIGPIPE를 줘 파이프라인이 비영이 되고 매칭 성공이 실패로
+            # 뒤집힐 수 있다(64KiB 넘는 payload로 재현). herestring은 파이프 자체가 없어 이
+            # 경합이 구조적으로 없다.
             files="$(GOOS=windows go list -f '{{join .GoFiles "\n"}}' "$pkg")"
-            if ! echo "$files" | grep -q '_windows\.go$'; then
+            if ! grep -q '_windows\.go$' <<<"$files"; then
               echo "no windows-only file in lint scope for $pkg"
               exit 1
             fi
           done
 
       # 판정 2단계: 포함이 확인된 뒤의 결과를 받는다.
+      # golangci-lint를 이름으로만 부르면 앞선 golangci-lint-action이 PATH 앞에 자체 바이너리를
+      # 얹었을 때 그쪽이 우선될 수 있어 위 "정확 패치로 고정" 의도가 실행 시점에 성립하지 않을
+      # 수 있다 — go install이 심은 경로를 직접 가리켜 실행 바이너리를 확정한다.
+      # 기본 상한(--max-same-issues=3)은 동일 메시지를 3건까지만 출력한다 — 이 절삭이 앞선 두
+      # 세션에서 같은 lint 결과를 4건·13건으로 서로 다르게 기록하게 만든 원인이었다. 상한을
+      # 풀어 CI 로그가 전체 목록을 보이게 한다(exit code 판정 자체는 절삭과 무관하게 정확했다).
       - name: golangci-lint (GOOS=windows)
-        run: GOOS=windows golangci-lint run ./...
+        run: GOOS=windows "$(go env GOPATH)/bin/golangci-lint" run --max-same-issues=0 --max-issues-per-linter=0 ./...
 
   crossbuild:
     runs-on: ubuntu-latest
