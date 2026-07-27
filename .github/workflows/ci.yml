@@ -97,6 +97,35 @@ jobs:
         with:
           version: v2.12
 
+      # D69: 기본 lint는 한 GOOS의 파일 집합만 본다 — windows 전용 파일 4개(ident/realpath_windows.go,
+      # transform/worker_windows.go, store/store_lock_windows.go, sandbox/run_windows.go)가 ubuntu
+      # 런에서 대상 밖이었다. 액션과 같은 버전을 직접 설치해 GOOS=windows로 한 번 더 돈다.
+      # 취득 방식 근거: 이 잡이 이미 gofumpt를 go install로 받으므로(ci.yml:84) 관례와 같다.
+      # 액션을 SHA 핀해 한 번 더 쓰고 그 스텝에만 env: GOOS를 주는 대안이 D68의 공급망 고정과
+      # 더 일관되지만, 한 잡에서 액션 두 번 실행의 캐시 동작과 env 전달이 미검증이다 — 그쪽으로
+      # 옮기는 것은 그 두 가지를 확인한 뒤로 미룬다. 버전은 부동 prefix가 아닌 정확 패치로 고정한다.
+      - name: install golangci-lint (action과 동일 계열, 정확 패치)
+        run: go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.12.2
+
+      # 판정 1단계: 대상 파일이 실제로 범위에 있는지 먼저 확인한다. 이 확인 없이 통과만 보면
+      # 스텝이 그 파일을 못 봐도 초록이다(설계 v0.13 D69).
+      - name: verify windows-only files are in lint scope
+        run: |
+          set -euo pipefail
+          for pkg in ./internal/ident ./internal/transform ./internal/store ./internal/sandbox; do
+            # 파이프로 바로 grep하지 않는다 — pipefail 아래에서 grep 조기 종료가 go list에
+            # SIGPIPE를 주면 파이프라인이 실패해 포함 확인이 거짓 실패가 될 수 있다.
+            files="$(GOOS=windows go list -f '{{join .GoFiles "\n"}}' "$pkg")"
+            if ! echo "$files" | grep -q '_windows\.go$'; then
+              echo "no windows-only file in lint scope for $pkg"
+              exit 1
+            fi
+          done
+
+      # 판정 2단계: 포함이 확인된 뒤의 결과를 받는다.
+      - name: golangci-lint (GOOS=windows)
+        run: GOOS=windows golangci-lint run ./...
+
   crossbuild:
     runs-on: ubuntu-latest
     timeout-minutes: 10

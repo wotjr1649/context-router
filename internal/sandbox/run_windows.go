@@ -54,7 +54,7 @@ func newJob(s Spec) (windows.Handle, error) {
 		h, windows.JobObjectExtendedLimitInformation,
 		uintptr(unsafe.Pointer(&info)), uint32(unsafe.Sizeof(info)),
 	); err != nil {
-		windows.CloseHandle(h)
+		_ = windows.CloseHandle(h)
 		return 0, err
 	}
 	return h, nil
@@ -66,7 +66,7 @@ func Probe(context.Context) error {
 	if err != nil {
 		return fmt.Errorf("%w: Job Object 준비 불가: %v", ErrSetup, err)
 	}
-	windows.CloseHandle(h)
+	_ = windows.CloseHandle(h)
 	return nil
 }
 
@@ -81,7 +81,7 @@ func assignToJob(job windows.Handle, pid int) error {
 		return err
 	}
 	err = windows.AssignProcessToJobObject(job, ph)
-	windows.CloseHandle(ph)
+	_ = windows.CloseHandle(ph)
 	return err
 }
 
@@ -93,7 +93,7 @@ func resumeMainThread(pid int) error {
 	if err != nil {
 		return err
 	}
-	defer windows.CloseHandle(snap)
+	defer func() { _ = windows.CloseHandle(snap) }()
 
 	var te windows.ThreadEntry32
 	te.Size = uint32(unsafe.Sizeof(te))
@@ -107,7 +107,7 @@ func resumeMainThread(pid int) error {
 				return err
 			}
 			_, err = windows.ResumeThread(th)
-			windows.CloseHandle(th)
+			_ = windows.CloseHandle(th)
 			return err
 		}
 		if err := windows.Thread32Next(snap, &te); err != nil {
@@ -137,7 +137,7 @@ func Run(ctx context.Context, s Spec) (Result, error) {
 		})
 		return e
 	}
-	defer terminateJob()
+	defer func() { _ = terminateJob() }()
 
 	timeoutCtx, cancel := context.WithTimeout(ctx, s.Timeout)
 	defer cancel()

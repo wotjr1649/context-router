@@ -47,26 +47,26 @@ func applyMemLimit(cmd *exec.Cmd, bytes int64) (func(), error) {
 		job, windows.JobObjectExtendedLimitInformation,
 		uintptr(unsafe.Pointer(&info)), uint32(unsafe.Sizeof(info)),
 	); err != nil {
-		windows.CloseHandle(job)
+		_ = windows.CloseHandle(job)
 		return nil, err
 	}
 
 	if err := cmd.Start(); err != nil {
-		windows.CloseHandle(job)
+		_ = windows.CloseHandle(job)
 		return nil, err
 	}
 
 	procHandle, err := windows.OpenProcess(windows.PROCESS_SET_QUOTA|windows.PROCESS_TERMINATE, false, uint32(cmd.Process.Pid))
 	if err != nil {
 		killOrphan(cmd)
-		windows.CloseHandle(job)
+		_ = windows.CloseHandle(job)
 		return nil, err
 	}
 	assignErr := windows.AssignProcessToJobObject(job, procHandle)
-	windows.CloseHandle(procHandle)
+	_ = windows.CloseHandle(procHandle)
 	if assignErr != nil {
 		killOrphan(cmd)
-		windows.CloseHandle(job)
+		_ = windows.CloseHandle(job)
 		return nil, assignErr
 	}
 
@@ -74,7 +74,7 @@ func applyMemLimit(cmd *exec.Cmd, bytes int64) (func(), error) {
 	// closeJob: 마지막 Job 핸들 close 시 KILL_ON_JOB_CLOSE가 배정된 프로세스(트리)를 종료한다.
 	// Spawn의 defer cleanup()(정상/타임아웃 후 공통 경로)에서만 호출된다 — cmd.Cancel에는
 	// 더 이상 배선하지 않는다(위 주석, 리뷰 B3). 재호출돼도 sync.Once로 안전.
-	closeJob := func() { once.Do(func() { windows.CloseHandle(job) }) }
+	closeJob := func() { once.Do(func() { _ = windows.CloseHandle(job) }) }
 	return closeJob, nil
 }
 

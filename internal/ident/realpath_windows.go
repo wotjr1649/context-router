@@ -29,7 +29,7 @@ func RealPath(p string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("realpath: open: %w", err)
 	}
-	defer windows.CloseHandle(h)
+	defer func() { _ = windows.CloseHandle(h) }()
 
 	buf := make([]uint16, 260)
 	for {
