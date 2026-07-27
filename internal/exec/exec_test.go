@@ -1395,6 +1395,11 @@ func TestRunShellScratchHomeWins(t *testing.T) {
 		t.Skip("unix shell 갈래 전용 — windows 축은 exec_test.go:890이 덮는다")
 	}
 	requireLang(t, "shell")
+	// 픽스처를 심기 전에 sync.Once 빌드를 끝낸다 — 심은 뒤면 그 go build가 HOME 유도 GOPATH/
+	// GOCACHE 기본값을 잃고 깨지며 실패가 testExeErr에 캐시돼 패키지 전체가 오염된다(다른 HOME·
+	// USERPROFILE 픽스처 테스트와 같은 선례 — exec_test.go의 selfExe(t) 선호출 관례).
+	selfExe(t)
+
 	fakeHome := t.TempDir()
 	if err := os.WriteFile(filepath.Join(fakeHome, "ctr-marker"), []byte("host"), 0o600); err != nil {
 		t.Fatal(err)
