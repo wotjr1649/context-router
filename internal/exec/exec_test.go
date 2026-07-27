@@ -444,6 +444,50 @@ func TestShellNativeExitAugmentation(t *testing.T) {
 			t.Fatalf("보강 줄 없음: stderr=%q", resp.Stderr)
 		}
 	})
+
+	t.Run("Get-Variable_재정의가_tail을_깨지_않는다", func(t *testing.T) {
+		// F2 리뷰(회귀 방지): 스니펫이 Get-Variable을 같은 이름의 함수로 가리면(PowerShell
+		// 명령 해석에서 함수가 cmdlet보다 우선한다) tail의 호출이 그 함수로 해석된다. 함수가
+		// throw하면 try/catch 없이는 그 오류가 스니펫의 stderr로 새고 $ErrorActionPreference에
+		// 따라 exit_code까지 흔들릴 수 있다 — 양쪽 다 조용히 흡수돼야 한다.
+		resp := run(t, Request{Language: "shell", Code: "function Get-Variable { throw 'boom' }\ncmd /c exit 5\n"})
+		if resp.ExitCode == nil || *resp.ExitCode != 0 {
+			t.Fatalf("exit_code=%v want 0 — tail의 오류가 스니펫 실행에 영향을 주면 안 된다", resp.ExitCode)
+		}
+		if resp.Stderr != "" {
+			t.Fatalf("tail의 오류가 stderr로 샜다: %q", resp.Stderr)
+		}
+	})
+
+	t.Run("스니펫이_사이드파일_이름에_직접_써도_오인되지_않는다", func(t *testing.T) {
+		// F3 리뷰(회귀 방지): 스크래치가 스니펫의 작업 디렉터리이기도 해 상대 경로
+		// "ctr-native-exit"가 tail의 사이드 파일과 같은 절대 경로로 닿는다. 마커 없이 직접
+		// 쓴 값(9)을 tail이 건너뛴 채로(top-level return) 남기면, 그 값이 외부 명령 종료
+		// 코드로 오인되면 안 된다.
+		resp := run(t, Request{Language: "shell", Code: "[System.IO.File]::WriteAllText('ctr-native-exit', '9')\nreturn\n"})
+		if resp.ExitCode == nil || *resp.ExitCode != 0 {
+			t.Fatalf("exit_code=%v want 0", resp.ExitCode)
+		}
+		if resp.Stderr != "" {
+			t.Fatalf("스니펫이 직접 쓴 값이 외부 명령 종료 코드로 오인됐다: %q", resp.Stderr)
+		}
+	})
+
+	t.Run("ConstrainedLanguage에서_tail이_안전하다", func(t *testing.T) {
+		// F2 리뷰(회귀 방지) — 이 dev host에서 실측: 스니펫이 자신을 ConstrainedLanguage로
+		// 낮추면(자기 자신에 대한 강등은 FullLanguage에서 허용된다) 그 뒤에 실행되는 tail의
+		// WriteAllText(.NET 정적 메서드 직접 호출)가 막힌다 — pwsh·5.1 양쪽에서 "Cannot invoke
+		// method. Method invocation is supported only on core types in this language mode."로
+		// 재현했다. try/catch 없이는 그 오류가 스니펫의 stderr로 새고 exit_code까지 흔들릴 수
+		// 있다. 네이티브 명령(cmd) 호출 자체는 언어 모드 제약을 받지 않는다.
+		resp := run(t, Request{Language: "shell", Code: "$ExecutionContext.SessionState.LanguageMode = 'ConstrainedLanguage'\ncmd /c exit 5\n"})
+		if resp.ExitCode == nil || *resp.ExitCode != 0 {
+			t.Fatalf("exit_code=%v want 0 — tail의 오류가 스니펫 실행에 영향을 주면 안 된다", resp.ExitCode)
+		}
+		if resp.Stderr != "" {
+			t.Fatalf("tail의 오류가 stderr로 샜다: %q", resp.Stderr)
+		}
+	})
 }
 
 // TestTruncation: stdout이 상한(32768)을 넘으면 잘리고 StdoutTrunc가 선다.

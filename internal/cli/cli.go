@@ -1475,9 +1475,9 @@ enabled_tools = ["ctr_search", "ctr_fetch", "ctr_transform", "ctr_record_event",
 ## exec 결과 읽기(호스트 공통)
 # shell 러너: exit_code는 스니펫의 종료 상태다(중간 비종결 오류는 반영되지 않는다).
 # "마지막 명령의 상태"가 문자 그대로인 것은 sh뿐이다 — PowerShell -File은 exit이나 종결
-# 오류가 없으면 0이라, 마지막 줄이 비 0으로 죽은 네이티브 명령이면 exit_code 0에 stderr까지
-# 비어 실패가 두 채널 어디에도 남지 않는다($ErrorActionPreference = 'Stop'도 이 부류는
-# 멈추지 못한다 — pwsh 7.6.0·powershell 5.1 실측).
+# 오류가 없으면 0이라, 마지막 줄이 비 0으로 죽은 네이티브 명령이면 exit_code는 0이다. 이
+# 경우 stderr에 그 상황을 알리는 안내 줄이 한 줄 남는다(exit_code는 바뀌지 않는다 —
+# $ErrorActionPreference = 'Stop'도 이 부류는 멈추지 못한다 — pwsh 7.6.0·powershell 5.1 실측).
 # 판정은 exit_code와 stderr를 함께 보고, 엄격 동작은 스니펫에 직접 적는다:
 #   PowerShell: 첫 줄 $ErrorActionPreference = 'Stop'(cmdlet 오류) + 네이티브 명령은
 #               $LASTEXITCODE 확인, 마지막 줄 exit $LASTEXITCODE로 전파.

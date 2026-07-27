@@ -180,8 +180,10 @@ func Run(ctx context.Context, scratchParent, selfExe string, req Request) (Respo
 	// 비어 있던 자리에만 들어가므로 사용자 출력과 섞이지 않고, 응답 스키마도 바뀌지 않는다
 	// (필드를 더하면 outputSchema가 tools/list 표면을 넘긴다). tail이 읽는 $LASTEXITCODE는
 	// "마지막 외부 명령"(네이티브 프로그램 또는 호출된 스크립트)의 값이므로 문면도 그 한정을
-	// 그대로 적는다.
-	if resp.ExitCode != nil && *resp.ExitCode == 0 && resp.Stderr == "" {
+	// 그대로 적는다. .ps1 러너로 한정한다(F3 리뷰) — 그 밖의 언어는 tail을 쓴 적이 없어 사이드
+	// 파일이 있을 수 없고, 있다면 스크래치가 스니펫의 작업 디렉터리이기도 해 스니펫이 같은
+	// 이름에 직접 쓴 것일 뿐이므로 읽을 이유가 없다(마커 요건은 readNativeExitCode가 추가로 막는다).
+	if strings.HasSuffix(r.file, ".ps1") && resp.ExitCode != nil && *resp.ExitCode == 0 && resp.Stderr == "" {
 		if n, ok := readNativeExitCode(sidePath); ok && n != 0 {
 			resp.Stderr = fmt.Sprintf(
 				"context-router: 마지막 외부 명령이 종료 코드 %d으로 끝났습니다(exit_code는 스니펫의 종료 상태입니다).\n", n,
@@ -191,15 +193,16 @@ func Run(ctx context.Context, scratchParent, selfExe string, req Request) (Respo
 	return resp, nil
 }
 
-// readNativeExitCode — D76 사이드 파일 읽기. 파일 부재(tail 미실행)·빈 값($LASTEXITCODE 미설정,
-// 즉 외부 명령이 없었음)·파싱 실패는 모두 "보강하지 않음"이다.
+// readNativeExitCode — D76 사이드 파일 읽기. 파일 부재(tail 미실행)·마커 부재(스크래치가
+// 스니펫의 작업 디렉터리이기도 해 스니펫이 같은 이름에 직접 쓴 파일일 수 있다 — F3 리뷰)·
+// 빈 값($LASTEXITCODE 미설정, 즉 외부 명령이 없었음)·파싱 실패는 모두 "보강하지 않음"이다.
 func readNativeExitCode(path string) (int, bool) {
 	b, err := os.ReadFile(path)
 	if err != nil {
 		return 0, false
 	}
-	s := strings.TrimSpace(string(b))
-	if s == "" {
+	s, ok := strings.CutPrefix(strings.TrimSpace(string(b)), ctrNativeExitMarker)
+	if !ok || s == "" {
 		return 0, false
 	}
 	n, err := strconv.Atoi(s)
@@ -221,16 +224,32 @@ func fileArgv(bin, file string) []string { return []string{bin, file} }
 func goArgv(bin, file string) []string   { return []string{bin, "run", file} }
 func csArgv(bin, file string) []string   { return []string{bin, "run", file} }
 
-// ctrNativeExitFile — D76 사이드 파일 이름. 런별 스크래치 절대 경로로 고정한다(스니펫이 작업
-// 디렉터리를 바꾸거나 같은 상대 경로에 써도 값에 개입하지 않게).
+// ctrNativeExitFile — D76 사이드 파일 이름. 런별 스크래치 절대 경로로 고정해 스니펫이 작업
+// 디렉터리를 바꾼 뒤에도 tail이 쓰는 파일은 항상 같은 곳을 가리키게 한다. 스크래치가 스니펫의
+// 작업 디렉터리이기도 하므로 스니펫이 같은 이름의 **상대** 경로로 이 파일에 직접 쓰는 경로까지는
+// 이 상수(절대 경로 고정)만으로 막히지 않는다 — 그건 ctrNativeExitMarker가 막는다(F3 리뷰).
 const ctrNativeExitFile = "ctr-native-exit"
+
+// ctrNativeExitMarker — F3 리뷰: 스니펫이 ctrNativeExitFile과 같은 이름에 직접 쓴 내용을
+// tail이 남긴 값으로 오인하지 않기 위한 판별 접두어. tail만 이 접두어를 붙여 쓰고,
+// readNativeExitCode는 이 접두어가 없는 파일 내용을 전부 "보강하지 않음"으로 취급한다.
+const ctrNativeExitMarker = "ctr-exit-code:"
 
 // snippetContent — .ps1에는 UTF-8 BOM(기존 계약, I2 — powershell.exe 5.1이 BOM 없는 .ps1을
 // 시스템 ANSI 코드페이지로 디코딩해 비ASCII를 손상시키는 것을 막는다)과 D76 tail을 붙인다.
 //
-// tail 제약 셋: ① 스니펫의 마지막 개행이 보장되지 않으므로 개행을 **선행**시킨다.
+// tail 제약 넷: ① 스니펫의 마지막 개행이 보장되지 않으므로 개행을 **선행**시킨다.
 // ② 기록에 프로바이더 cmdlet(Set-Content·Out-File)을 쓰지 않는다 — 5.1의 무반환 정지 경로가
-// 실측됐다. ③ 변수명을 스니펫과 충돌하지 않게 고유하게 둔다.
+// 실측됐다. ③ 변수명을 스니펫과 충돌하지 않게 고유하게 둔다. ④ 두 statement를 try/catch로
+// 감싼다(F2 리뷰) — ConstrainedLanguage는 WriteAllText 같은 .NET 메서드 직접 호출을 막고,
+// 스니펫이 Get-Variable을 같은 이름의 함수로 정의하면 PowerShell 명령 해석에서 함수가
+// cmdlet보다 우선해 그 함수가 대신 호출된다. 두 경우 모두 함수가 throw하거나 호출이 막히면
+// 그 오류가 스니펫의 stderr로 새고 $ErrorActionPreference='Stop'에서는 종료 코드까지 흔들린다
+// (pwsh 7·powershell 5.1 양쪽 실측). catch는 비워 둔다 — 실패하면 사이드 파일이 그냥 안
+// 써질 뿐이고, 그건 readNativeExitCode가 이미 "보강하지 않음"으로 처리하는 경로다.
+// 기록값은 ctrNativeExitMarker를 접두어로 붙인다 — 스크래치가 스니펫의 작업 디렉터리이기도
+// 해서 스니펫이 같은 상대 경로("ctr-native-exit")에 직접 쓸 수 있는데, 마커가 없으면 그
+// 내용이 외부 명령 종료 코드로 오인된다(F3 리뷰).
 // 스니펫이 exit으로 끝나면 tail은 실행되지 않는다 — 코드를 명시한 exit이면 exit_code가 그
 // 값이고, 인수 없는 exit은 0을 반환해 네이티브 실패가 가려지지만 이 보강이 덮지 못하는 알려진
 // 공백이다(설계 v0.13 §1.2).
@@ -242,8 +261,11 @@ func snippetContent(fileName, code, sidePath string) []byte {
 	// 미초기화 변수 오류가 스니펫 stderr로 나가고(pwsh·5.1 양쪽 실측, 내부 스크립트 경로 포함)
 	// 사이드 파일도 안 써진다 — 무신호를 없애려던 것이 새 잡음을 만든다. Get-Variable로 읽으면
 	// 미설정이 오류가 아니라 빈 값이 된다.
-	tail := "\n$ctrNativeExitCode = Get-Variable -Name LASTEXITCODE -ValueOnly -ErrorAction SilentlyContinue\n" +
-		"[System.IO.File]::WriteAllText('" + strings.ReplaceAll(sidePath, "'", "''") + "', [string]$ctrNativeExitCode)\n"
+	tail := "\ntry {\n" +
+		"$ctrNativeExitCode = Get-Variable -Name LASTEXITCODE -ValueOnly -ErrorAction SilentlyContinue\n" +
+		"[System.IO.File]::WriteAllText('" + strings.ReplaceAll(sidePath, "'", "''") + "', '" +
+		ctrNativeExitMarker + "' + [string]$ctrNativeExitCode)\n" +
+		"} catch {}\n"
 	out := append([]byte{0xEF, 0xBB, 0xBF}, code...)
 	return append(out, tail...)
 }
