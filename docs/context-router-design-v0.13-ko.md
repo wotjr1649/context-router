@@ -413,7 +413,7 @@ TestOpenBudgetWithIndexDDL -v`. 색인 없는 v1 픽스처를 닫고 다시 Open
 
 각 칸은 **단일 wall-clock 샘플**이다(반복·평균 없음) — 독립 재실행 값이
 1.6~1.8배 높게 나온 것은 실측 간에 이 정도 편차가 흔하다는 뜻으로 읽는다.
-예산 5s 대비로는 재실행 값도 1% 미만 — **PASS**.
+예산 5s 대비로는 이 실측이 0.14~0.59%, 재실행이 0.26~1.04%다 — **PASS**.
 
 **D73 §2 ⑧ 술어 전후 벤치** — `go test -p 1 ./internal/store/ -run '^$' -bench
 BenchmarkShadowPredicate -benchtime 10x`(1회 실행, 총 281.945s, 칸마다 `b.N=10`).
