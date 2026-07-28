@@ -1921,7 +1921,7 @@ func TestD78SignalOnExit(t *testing.T) {
 		{"explicit-exit", "cmd /c exit 71\nexit 3", ctrNativeExitMarker + "71"},
 		{"bare-exit", "cmd /c exit 76\nexit", ctrNativeExitMarker + "76"},
 		// exit 0은 인수 없는 exit과 별개 사례로 남긴다 — 보강의 트리거는 "인수 없는
-		// exit"이 아니라 exit_code == 0(exec.go:188)이라, 사용자에게 실제로 새 줄이
+		// exit"이 아니라 exit_code == 0(exec.go:189)이라, 사용자에게 실제로 새 줄이
 		// 붙는 자리가 이 둘 **모두**다(CHANGELOG 0.14.0). 인수 없는 exit만 태우면
 		// 릴리스 문면이 약속한 절반에 감시선이 없다(최종 리뷰).
 		{"exit-zero", "cmd /c exit 71\nexit 0", ctrNativeExitMarker + "71"},
