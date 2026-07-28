@@ -325,8 +325,9 @@ D78의 단정은 보강 줄이 아니라 **사이드파일 값**을 본다 — �
    테스트에 고정한다. 픽스처 규모(행 수·artifact 수·해시 수)를 로그에 남긴다.
    · **실행 위치**: 이 게이트는 `go test ./...`에 포함되므로 CI에서 3-OS와
    `-race`로 **네 번** 돈다. 그 전제로 규모를 잡는다(`-race`에서 skip하지 않는다).
-   · **진단**: `Fatalf` 문면에 `rep.Hashes`·`rep.ReclaimedB`·`rep.DeferredFiles`와
-   개발기 기준값을 함께 찍어 "회귀인가 러너 편차인가"를 가를 수 있게 한다.
+   · **진단**: `Fatalf` 문면에 `rep.Hashes`·`rep.ReclaimedB`·`rep.DeferredFiles`·
+   `rep.FailedFiles`와 개발기 기준값을 함께 찍어 "회귀인가 러너 편차인가"를 가를
+   수 있게 한다.
    · **유도 FAIL**: 임계를 일시적으로 낮춰 게이트가 실제로 실패하는 것을 한 번
    캡처하고 원복한다.
 2. **D78 종료 코드 동일성** — 승격 대상 네 케이스(`exit N`·정상·`throw`·인수 없는
@@ -519,9 +520,9 @@ DeferredFiles=20 FailedFiles=0`. 나이 게이트가 단락되면 `stillReferenc
 `os.Remove`도 실행되지 않아 유예 경로만 재는 종이 게이트가 된다는 §0 D77의 근거가
 실측으로 확인된다(그 상태의 소요 0.04s는 PASS 경로 0.05~0.06s보다 **짧다** — 경로
 단정이 없으면 "더 빨라진" 종이 게이트가 조용히 초록이 된다). ② `budget`을 1ms로
-낮추면 `잠금 보유가 예산을 넘었다: 18.56ms >= 1ms (hashes=20 reclaimed=370B
-deferred=0)`. `Fatalf` 문면이 보고서 값을 함께 실어 "회귀인가 러너 편차인가"를
-가를 수 있다는 것을 같은 출력이 함께 보인다. ③ **`FailedFiles` 항의 유도** — 한
+낮추면 `잠금 보유가 예산을 넘었다: 16.3535ms >= 1ms (hashes=20 reclaimed=370B
+deferred=0 failed=0)`. `Fatalf` 문면이 보고서 값 넷을 함께 실어 "회귀인가 러너
+편차인가"를 가를 수 있다는 것을 같은 출력이 함께 보인다. ③ **`FailedFiles` 항의 유도** — 한
 해시의 rename 목적지(`<hash>.purging`)를 디렉터리로 선점해 `os.Rename`을 실패시키면
 `회수 경로를 타지 않았다: ReclaimedB=352 DeferredFiles=0 FailedFiles=1`이다.
 **`ReclaimedB>0`·`DeferredFiles==0`이 그대로 성립**하므로 `FailedFiles` 항이 없던
