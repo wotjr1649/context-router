@@ -1698,7 +1698,11 @@ func TestPromotesNativeExitSignal(t *testing.T) {
 		{"strictmode-first", "Set-StrictMode -Version Latest\n\"hello\""},
 		{"variable-first", "$x = 1\ncmd /c exit 77"},
 		{"param-inside-function", "function f { param($y) }\nf\ncmd /c exit 70"},
-		{"paramx-identifier", "$paramX = 1\ncmd /c exit 70"},
+		// 선두에 `$`를 두지 않는 것이 이 케이스의 전부다 — `$`로 시작하면 토큰 스캔이
+		// j=0에서 끝나 **빈 토큰**을 판정하므로, `strings.HasPrefix(s, "param")` 같은
+		// 접두어 구현도 똑같이 승격시켜 "전체 토큰 일치"와 "접두어 일치"가 구분되지
+		// 않는다(최종 리뷰 M3). 식별자 그대로 두면 접두어 구현에서만 폴백으로 뒤집힌다.
+		{"paramx-identifier", "paramX 1\ncmd /c exit 70"},
 		{"unterminated-block-comment", "<# never closed\ncmd /c exit 70"},
 		{"empty", ""},
 	}
@@ -1906,6 +1910,11 @@ func TestD78SignalOnExit(t *testing.T) {
 	}{
 		{"explicit-exit", "cmd /c exit 71\nexit 3", ctrNativeExitMarker + "71"},
 		{"bare-exit", "cmd /c exit 76\nexit", ctrNativeExitMarker + "76"},
+		// exit 0은 인수 없는 exit과 별개 사례로 남긴다 — 보강의 트리거는 "인수 없는
+		// exit"이 아니라 exit_code == 0(exec.go:188)이라, 사용자에게 실제로 새 줄이
+		// 붙는 자리가 이 둘 **모두**다(CHANGELOG 0.14.0). 인수 없는 exit만 태우면
+		// 릴리스 문면이 약속한 절반에 감시선이 없다(최종 리뷰).
+		{"exit-zero", "cmd /c exit 71\nexit 0", ctrNativeExitMarker + "71"},
 		{"throw", "cmd /c exit 73\nthrow 'boom'", ctrNativeExitMarker + "73"},
 		{"normal", "cmd /c exit 72", ctrNativeExitMarker + "72"},
 	}
@@ -1915,18 +1924,19 @@ func TestD78SignalOnExit(t *testing.T) {
 	// -SupportEvent·핸들러 실행 시점이라 셸 버전에 민감한 표면이다. 부재 셸은 psBin이
 	// Skip한다(TestRunShellPS51ProviderWriteReturns 선례).
 	//
-	// 5.1 갈래가 네 사례 **모두** side=""로 실패하면 그것은 D78이 아니라 호스트의
+	// 5.1 갈래가 다섯 사례 **모두** side=""로 실패하면 그것은 D78이 아니라 호스트의
 	// ExecutionPolicy다 — 스니펫을 파싱하기도 전에 load-time UnauthorizedAccess로 끝나고,
 	// 그 사유는 stderr에만 있다(아래 Fatalf가 함께 낸다). 5.1은 pwsh와 정책 레지스트리 키가
 	// 별개이며, 미설정 시 기본값은 **SKU에 따라 다르다**: 클라이언트 SKU는 Restricted라
 	// 이 차단이 나고, CI windows 러너가 쓰는 서버 SKU는 LocalMachine 기본값이 RemoteSigned라
 	// 서명 없는 로컬 .ps1이 그대로 돈다 — 개발기가 빨간불이어도 CI는 이 갈래를 실제로 밟는다.
 	//
-	// D78 부재는 그 서명을 내지 않는다: 폴백 tail이 그대로 도니 normal은 통과하고 exit로
-	// 끝나는 셋만 실패한다(Task 3 유도 FAIL 실측). 정책 차단을 Skip으로 바꾸는 감시선은 넣지
-	// 않는다 — Get-ExecutionPolicy는 5.1에서 Microsoft.PowerShell.Security 자동 로드에 실패할
-	// 수 있어(실측: CouldNotAutoloadMatchingModule) 정책과 무관하게 이 갈래를 통째로 건너뛰게
-	// 만든다. 5.1 갈래의 실검증 권위는 CI windows 잡이다.
+	// D78 부재는 그 서명을 내지 않는다: 폴백 tail이 그대로 도니 normal은 통과하고
+	// exit·throw로 끝나는 넷만 실패한다(Task 3 · 최종 리뷰 유도 FAIL 실측). 정책 차단을
+	// Skip으로 바꾸는 감시선은 넣지 않는다 — Get-ExecutionPolicy는 5.1에서
+	// Microsoft.PowerShell.Security 자동 로드에 실패할 수 있어(실측:
+	// CouldNotAutoloadMatchingModule) 정책과 무관하게 이 갈래를 통째로 건너뛰게 만든다.
+	// 5.1 갈래의 실검증 권위는 CI windows 잡이다.
 	for _, shell := range []string{"pwsh", "powershell"} {
 		t.Run(shell, func(t *testing.T) {
 			for _, tc := range cases {
@@ -1983,6 +1993,15 @@ func TestD78StderrNoDrift(t *testing.T) {
 	dir := t.TempDir()
 	_, _, baseErr, _ := runPS1Shell(t, "", dir, code, false)
 	_, _, gotErr, _ := runPS1Shell(t, "", dir, code, true)
+	// 픽스처 유효성 먼저 — 대조군 stderr가 비면 비교할 오류가 아예 없어 아래 단정이
+	// "둘 다 빈 값"으로 공허하게 통과한다(최종 리뷰 M1). TestD78RequiresStillApplies의
+	// `base == 0` 검사와 같은 관용구다. 이 가드가 닫는 것은 **빈 stderr**뿐이다 —
+	// 셸이 스크립트를 로드조차 못 하는 호스트(5.1 정책 차단 등)는 양쪽 다리가 같은
+	// 비어 있지 않은 문면을 내므로 여기서 걸리지 않는다. 그 갈래의 권위는 CI windows
+	// 잡이다(runPS1Shell 주석).
+	if baseErr == "" {
+		t.Fatal("대조군 stderr가 비었다 — 픽스처가 무효다(2행 오류를 내는 스니펫이어야 한다)")
+	}
 	if gotErr != baseErr {
 		t.Fatalf("stderr가 달라졌다 — 등록 문을 앞 줄에 두면 여기서 줄 번호 +1 드리프트가 "+
 			"잡힌다\n승격: %q\n대조: %q", gotErr, baseErr)
@@ -2098,17 +2117,26 @@ func TestD78FallbackMatchesBaseline(t *testing.T) {
 
 // TestD78Limits — 설계 §2.9. 경로마다 결과가 다르므로 따로 단정한다.
 func TestD78Limits(t *testing.T) {
+	// 아래 두 케이스는 종료 코드를 함께 단정한다 — side == ""는 "본문이 여기까지 갔지만
+	// 신호가 남지 않았다"뿐 아니라 "스크립트가 파싱조차 안 됐다"·"인터프리터가 뜨지
+	// 않았다"에서도 성립해, side만 보면 아무것도 돌지 않아도 통과한다(최종 리뷰 M2).
 	t.Run("environment-exit-no-signal", func(t *testing.T) {
-		_, _, _, side := runPS1(t, "cmd /c exit 75\n[Environment]::Exit(5)", true)
+		exitCode, _, _, side := runPS1(t, "cmd /c exit 75\n[Environment]::Exit(5)", true)
 		if side != "" {
 			t.Fatalf("side=%q want 없음 — [Environment]::Exit은 이벤트를 발화시키지 않는다", side)
+		}
+		if exitCode != 5 {
+			t.Fatalf("exit=%d want 5 — [Environment]::Exit(5)가 실행되지 않았다(본문 미실행)", exitCode)
 		}
 	})
 	t.Run("fallback-throw-no-signal", func(t *testing.T) {
 		// 폴백 경로는 D76 tail이라 처리되지 않은 종료 오류에서 tail이 실행되지 않는다.
-		_, _, _, side := runPS1(t, "param($x)\ncmd /c exit 73\nthrow 'x'", true)
+		exitCode, _, _, side := runPS1(t, "param($x)\ncmd /c exit 73\nthrow 'x'", true)
 		if side != "" {
 			t.Fatalf("side=%q want 없음 — 폴백 경로의 알려진 공백이다", side)
+		}
+		if exitCode != 1 {
+			t.Fatalf("exit=%d want 1 — throw가 실행되지 않았다(본문 미실행)", exitCode)
 		}
 	})
 	t.Run("fallback-normal-records", func(t *testing.T) {
