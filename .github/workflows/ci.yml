@@ -142,6 +142,62 @@ jobs:
       - name: golangci-lint (GOOS=windows)
         run: GOOS=windows "$(go env GOPATH)/bin/golangci-lint" run --max-same-issues=0 --max-issues-per-linter=0 ./...
 
+      # D79(v0.14): darwin·netbsd·perf 축을 더해 미검출 집합을 비운다. D69가 GOOS=windows
+      # 축을 세우고 남긴 잔여는 정확히 세 파일이었다 — internal/sandbox/launcher_darwin.go,
+      # internal/sandbox/launcher_other.go, internal/search/perf_test.go.
+      #
+      # 판정은 **세 단계**다. D69의 두 단계 앞에 빌드 확인이 붙는다: 그 GOOS에서 전
+      # 패키지가 빌드되지 않으면 golangci-lint는 typechecking error와 함께 "0 issues."를
+      # 내며 종료 코드만 실패한다 — 스코프 확인(2단계)은 초록인데 lint가 **다른 패키지**에서
+      # 죽는 형태다. freebsd가 정확히 그랬다(worker_unix.go의 syscall.Rlimit이 그 GOOS에서
+      # int64라 !windows 갈래가 통째로 컴파일되지 않는다). netbsd는 소스 변경 0으로
+      # 성립하고 같은 !windows && !linux && !darwin 갈래라 미검출 집합을 동일하게 닫는다.
+      # openbsd는 syscall.RLIMIT_AS 미정의로 불가하다.
+      - name: verify darwin/netbsd/perf axes build and are in lint scope
+        run: |
+          set -euo pipefail
+          for goos in darwin netbsd; do
+            if ! GOOS=$goos go build ./...; then
+              echo "GOOS=$goos build failed — this lint axis does not hold (see design v0.14 D79)"
+              exit 1
+            fi
+          done
+          if ! go build -tags perf ./...; then
+            echo "-tags perf build failed — this lint axis does not hold"
+            exit 1
+          fi
+          # perf 축의 스코프 확인은 형태가 다르다 — .GoFiles는 _test.go를 포함하지 않아
+          # perf_test.go를 볼 수 없다. .TestGoFiles/.XTestGoFiles를 본다.
+          files="$(GOOS=darwin go list -f '{{join .GoFiles "\n"}}' ./internal/sandbox)"
+          if ! grep -q 'launcher_darwin\.go$' <<<"$files"; then
+            echo "launcher_darwin.go not in darwin lint scope"
+            exit 1
+          fi
+          files="$(GOOS=netbsd go list -f '{{join .GoFiles "\n"}}' ./internal/sandbox)"
+          if ! grep -q 'launcher_other\.go$' <<<"$files"; then
+            echo "launcher_other.go not in netbsd lint scope"
+            exit 1
+          fi
+          files="$(go list -tags perf -f '{{join .TestGoFiles "\n"}}{{join .XTestGoFiles "\n"}}' ./internal/search)"
+          if ! grep -q 'perf_test\.go$' <<<"$files"; then
+            echo "perf_test.go not in perf lint scope"
+            exit 1
+          fi
+
+      - name: golangci-lint (GOOS=darwin)
+        run: GOOS=darwin "$(go env GOPATH)/bin/golangci-lint" run --max-same-issues=0 --max-issues-per-linter=0 ./...
+
+      - name: golangci-lint (GOOS=netbsd)
+        run: GOOS=netbsd "$(go env GOPATH)/bin/golangci-lint" run --max-same-issues=0 --max-issues-per-linter=0 ./...
+
+      # `run:` 값이 큰따옴표로 시작하면 YAML이 그것을 이중따옴표 스칼라로 파싱하고 닫는
+      # 따옴표 뒤를 처리하지 못한다 → **ci.yml 전체가 파싱 오류**가 되어 lint 잡뿐 아니라
+      # 워크플로의 모든 잡이 로드되지 않는다(검수 실측). 기존 D69 스텝과 위 두 축은 값이
+      # `GOOS=…`로 시작해 평문 스칼라라 무사하고, perf 스텝만 앞에 붙는 것이 없어 따옴표가
+      # 선두로 온다 — `env`를 앞세워 평문 스칼라로 만든다.
+      - name: golangci-lint (--build-tags perf)
+        run: env "$(go env GOPATH)/bin/golangci-lint" run --build-tags perf --max-same-issues=0 --max-issues-per-linter=0 ./...
+
   # D70: test 잡은 bun을 설치하므로 detectJS가 항상 bun을 고른다 — node 레그가 CI에서 한 번도
   # 실행되지 않았다. bun을 설치하지 않는 잡에서 js·ts 러너를 돌린다. 판정은 통과 여부가 아니라
   # 응답의 runner 라벨이며(TestRunnerLabelNodeLeg), 그 단정이 없으면 bun 잡을 한 번 더 돌린

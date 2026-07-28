@@ -7,9 +7,10 @@ linters:
   default: standard
   enable:
     - misspell
-  # D69 결합: ci.yml의 "verify windows-only files are in lint scope" 스텝은 go list
+  # D69·D79 결합: ci.yml의 "verify windows-only files are in lint scope"와
+  # "verify darwin/netbsd/perf axes build and are in lint scope" 두 스텝은 go list
   # 스코프만 증명한다(golangci-lint 자체의 스코프가 아니다) — 지금은 여기 경로 기반
-  # 제외가 없어 둘이 일치하지만, 나중에 exclusions.paths를 추가하면 그 스텝은 계속
+  # 제외가 없어 둘이 일치하지만, 나중에 exclusions.paths를 추가하면 그 스텝들은 계속
   # 초록인데 golangci-lint는 그 경로를 건너뛸 수 있어 게이트가 거짓 초록이 된다.
   exclusions:
     presets:
