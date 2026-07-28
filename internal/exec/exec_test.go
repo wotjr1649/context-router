@@ -1793,3 +1793,212 @@ func TestSnippetContentNonPS1Unchanged(t *testing.T) {
 		t.Fatalf("got %q want %q", got, code)
 	}
 }
+
+// psBin — 셸을 고른다. name이 빈 문자열이면 러너와 같은 순서(pwsh → powershell)로
+// 고른다(shellRunner의 detect 순서와 일치 — exec.go:401-411). name을 주면 그 셸만 쓰고
+// 부재 시 Skip한다 — 5.1 레그를 명시적으로 밟는 관용구는 위
+// TestRunShellPS51ProviderWriteReturns가 선례다.
+func psBin(t *testing.T, name string) string {
+	t.Helper()
+	if name != "" {
+		p, err := exec.LookPath(name)
+		if err != nil {
+			t.Skipf("%s 미해석: %v", name, err)
+		}
+		return p
+	}
+	if p, err := exec.LookPath("pwsh"); err == nil {
+		return p
+	}
+	p, err := exec.LookPath("powershell")
+	if err != nil {
+		t.Skipf("pwsh/powershell 미설치: %v", err)
+	}
+	return p
+}
+
+// runPS1Shell — .ps1 스니펫을 러너와 같은 형태로 돌리고 (종료 코드, stdout, stderr,
+// 사이드파일)을 준다.
+//
+// dir을 인자로 받는 이유: PowerShell 오류 메시지에는 스크립트의 절대 경로가 박힌다.
+// 승격본과 대조군을 서로 다른 t.TempDir()에서 돌리면 stderr가 경로에서 갈려 §2.6의
+// 바이트 비교가 승격 여부와 무관하게 **항상** 실패한다(검수 실측: 같은 dir이면 바이트
+// 동일, 다른 dir이면 항상 불일치).
+//
+// promote=false면 등록 문 없이 D76 tail만 붙인 대조군을 만든다 — 승격 대상은 트리 안에
+// 등록 문 없는 경로가 없으므로 대조군은 테스트가 직접 조립해야 한다(§2.6).
+//
+// 타임아웃: -SupportEvent 회귀가 나면 `Get-Job | Wait-Job`이 끝나지 않는다(설계 §3 표6).
+// 그 감시선이 물리는 순간 무한 대기가 되고 go test 기본 10분 패닉으로만 끝난다. 그래서
+// probeVersion(exec.go:639-646)의 CommandContext + WaitDelay 관용구를 그대로 쓰고,
+// 타임아웃을 일반 실패와 구분해 진단 가능하게 만든다. 예산 근거: 5.1 기동 실측
+// 170~194ms, 건강한 실행은 1s 안쪽이다(TestRunShellPS51ProviderWriteReturns 선례).
+func runPS1Shell(t *testing.T, shell, dir, code string, promote bool) (exitCode int, stdout, stderr, side string) {
+	t.Helper()
+	if runtime.GOOS != "windows" {
+		t.Skip("windows shell 갈래 전용(PowerShell -File 계약)")
+	}
+	bin := psBin(t, shell)
+	sidePath := filepath.Join(dir, ctrNativeExitFile)
+	_ = os.Remove(sidePath) // 같은 dir을 재사용하는 호출(§2.6 대조)에서 이전 값이 남지 않게 한다
+	var content []byte
+	if promote {
+		content = snippetContent("snippet.ps1", code, sidePath)
+	} else {
+		buf := append([]byte{0xEF, 0xBB, 0xBF}, code...)
+		content = append(buf, nativeExitTail(sidePath)...)
+	}
+	file := filepath.Join(dir, "snippet.ps1")
+	if err := os.WriteFile(file, content, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, bin, "-NoProfile", "-NonInteractive", "-File", file)
+	cmd.Dir = dir
+	cmd.WaitDelay = time.Second
+	var so, se bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &so, &se
+	err := cmd.Run()
+	if ctx.Err() != nil {
+		t.Fatalf("스니펫이 10s 예산 안에 끝나지 않았다 — -SupportEvent 회귀 의심"+
+			"(Get-Job | Wait-Job이 이벤트 작업을 기다린다): %v", ctx.Err())
+	}
+	if err != nil && cmd.ProcessState == nil {
+		t.Fatalf("인터프리터를 시작하지 못했다: %v", err) // 비영 종료는 정상 경로이므로 err 자체는 무시한다
+	}
+	if b, rerr := os.ReadFile(sidePath); rerr == nil {
+		side = string(b)
+	}
+	return cmd.ProcessState.ExitCode(), so.String(), se.String(), side
+}
+
+// runPS1 — 대부분의 케이스용 래퍼. 셸은 러너 순서로 고르고 스크래치는 새로 만든다.
+// stderr를 대조하는 테스트는 이 래퍼를 쓰지 말고 runPS1Shell에 같은 dir을 넘긴다.
+func runPS1(t *testing.T, code string, promote bool) (int, string, string, string) {
+	t.Helper()
+	return runPS1Shell(t, "", t.TempDir(), code, promote)
+}
+
+// TestD78SignalOnExit — D78이 닫는 공백 ①②. exit로 끝나는 스니펫에서도 사이드파일이
+// 생기고 마지막 외부 명령의 코드가 담긴다.
+func TestD78SignalOnExit(t *testing.T) {
+	cases := []struct {
+		name, code, want string
+	}{
+		{"explicit-exit", "cmd /c exit 71\nexit 3", ctrNativeExitMarker + "71"},
+		{"bare-exit", "cmd /c exit 76\nexit", ctrNativeExitMarker + "76"},
+		{"throw", "cmd /c exit 73\nthrow 'boom'", ctrNativeExitMarker + "73"},
+		{"normal", "cmd /c exit 72", ctrNativeExitMarker + "72"},
+	}
+	// 양쪽 셸을 명시적으로 돈다. runPS1은 pwsh를 먼저 잡으므로 그것만 쓰면 pwsh와 5.1이
+	// 모두 있는 GitHub windows 러너에서 제품의 5.1 폴백 갈래(shellRunner detect, runner
+	// 라벨 `5.1`)를 새 테스트가 한 번도 밟지 않는다 — D78이 바꾸는 것이 이벤트 서브시스템·
+	// -SupportEvent·핸들러 실행 시점이라 셸 버전에 민감한 표면이다. 부재 셸은 psBin이
+	// Skip한다(TestRunShellPS51ProviderWriteReturns 선례).
+	//
+	// 5.1 갈래가 네 사례 **모두** side=""로 실패하면 그것은 D78이 아니라 호스트의
+	// ExecutionPolicy다 — 스니펫을 파싱하기도 전에 load-time UnauthorizedAccess로 끝난다
+	// (5.1은 pwsh와 정책 키가 별개라 unset이면 Restricted). D78 부재는 그 서명을 내지
+	// 않는다: 폴백 tail이 그대로 도니 normal은 통과하고 exit로 끝나는 셋만 실패한다
+	// (Task 3 유도 FAIL 실측). 정책 차단을 Skip으로 바꾸는 감시선은 넣지 않는다 —
+	// Get-ExecutionPolicy는 5.1에서 Microsoft.PowerShell.Security 자동 로드에 실패할 수
+	// 있어(실측: CouldNotAutoloadMatchingModule) 정책과 무관하게 이 갈래를 통째로
+	// 건너뛰게 만든다. 5.1 갈래의 실검증 권위는 CI windows 잡이다.
+	for _, shell := range []string{"pwsh", "powershell"} {
+		t.Run(shell, func(t *testing.T) {
+			for _, tc := range cases {
+				t.Run(tc.name, func(t *testing.T) {
+					_, _, _, side := runPS1Shell(t, shell, t.TempDir(), tc.code, true)
+					if side != tc.want {
+						t.Fatalf("side=%q want %q", side, tc.want)
+					}
+				})
+			}
+		})
+	}
+}
+
+// TestD78ExitCodeUnchanged — 승격 대상에서 종료 코드는 바뀌지 않는다(설계 §2.2).
+func TestD78ExitCodeUnchanged(t *testing.T) {
+	for _, tc := range []struct{ name, code string }{
+		{"explicit-exit", "cmd /c exit 71\nexit 3"},
+		{"normal", "cmd /c exit 72"},
+		{"throw", "cmd /c exit 73\nthrow 'boom'"},
+		{"bare-exit", "cmd /c exit 76\nexit"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			base, _, _, _ := runPS1(t, tc.code, false)
+			got, _, _, _ := runPS1(t, tc.code, true)
+			if got != base {
+				t.Fatalf("종료 코드가 바뀌었다: 승격 %d vs 대조군 %d", got, base)
+			}
+		})
+	}
+}
+
+// TestD78BodyRunsToCompletion — 설계 §2.3. 문 종료 오류가 있어도 마지막 문장이 실행된다.
+// 종료 코드는 양쪽 0이라 §2.2 단정으로는 검출되지 않는다 — 이 단정이 try/finally 회귀를
+// 막는 감시선이다(래핑하면 사이드파일이 41이 된다).
+func TestD78BodyRunsToCompletion(t *testing.T) {
+	const code = "cmd /c exit 41\nNotACmd999\ncmd /c exit 69"
+	_, _, _, side := runPS1(t, code, true)
+	if want := ctrNativeExitMarker + "69"; side != want {
+		t.Fatalf("side=%q want %q — 오류 뒤 마지막 문장이 실행되지 않았다(try/finally 회귀)", side, want)
+	}
+}
+
+// TestD78StderrNoDrift — 설계 §2.6. 오류가 2행 이상인 스니펫에서 stderr가 대조군과
+// 바이트 동일해야 한다. 등록 문을 앞 줄에 두면 여기서 줄 번호 +1 드리프트가 잡힌다.
+// param을 사례로 쓰지 않는다 — 승격해도 stderr가 0B라 비교할 오류가 없다.
+func TestD78StderrNoDrift(t *testing.T) {
+	const code = "cmd /c exit 41\nthrow 'boom'" // 오류가 2행에서 난다(검수 실측 확인)
+	// 같은 스크래치를 재사용한다 — 다른 TempDir이면 stderr에 박히는 스크립트 절대 경로가
+	// 달라 승격 여부와 무관하게 항상 불일치하고, 이 감시선이 무조건 FAIL한다.
+	dir := t.TempDir()
+	_, _, baseErr, _ := runPS1Shell(t, "", dir, code, false)
+	_, _, gotErr, _ := runPS1Shell(t, "", dir, code, true)
+	if gotErr != baseErr {
+		t.Fatalf("stderr가 달라졌다 — 등록 문을 앞 줄에 두면 여기서 줄 번호 +1 드리프트가 "+
+			"잡힌다\n승격: %q\n대조: %q", gotErr, baseErr)
+	}
+}
+
+// TestD78QuotedSidePathRuns — 설계 §2.7의 나머지 절반. 생성 바이트에서 작은따옴표가
+// 이중화되는 것은 TestSnippetContent…가 단정한다. 여기서는 그 스크립트가 실제로 파싱되어
+// 사이드파일이 기록되는지를 본다 — 따옴표 짝이 어긋나거나 `"; "`가 빠지는 회귀는 바이트
+// 단정을 통과하지만 이 단정은 통과하지 못한다.
+func TestD78QuotedSidePathRuns(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "o'brien") // 작은따옴표는 Windows 파일명에 허용된다
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	_, _, _, side := runPS1Shell(t, "", dir, "cmd /c exit 62", true)
+	if want := ctrNativeExitMarker + "62"; side != want {
+		t.Fatalf("side=%q want %q — 경로의 작은따옴표가 이중화되지 않으면 스크립트가 "+
+			"파싱되지 않는다", side, want)
+	}
+}
+
+// TestD78FirstLineErrorKeepsLineNumber — 설계 §2.6. 1행 오류는 줄 번호만 단정하고
+// 열 번호·소스 줄 에코 차이는 허용한다(§1.2의 알려진 한계).
+func TestD78FirstLineErrorKeepsLineNumber(t *testing.T) {
+	const code = "throw 'boom'"
+	_, _, gotErr, _ := runPS1(t, code, true)
+	if !strings.Contains(gotErr, "snippet.ps1:1") && !strings.Contains(gotErr, "snippet.ps1: 1") {
+		t.Fatalf("1행 오류의 줄 번호가 1이 아니다: %q", gotErr)
+	}
+}
+
+// TestD78RequiresStillApplies — 설계 §2.6. 승격돼도 #requires 지시자가 그대로 작동한다.
+func TestD78RequiresStillApplies(t *testing.T) {
+	const code = "#requires -Version 99\ncmd /c exit 61"
+	base, _, _, _ := runPS1(t, code, false)
+	got, _, _, _ := runPS1(t, code, true)
+	if base == 0 {
+		t.Fatalf("대조군이 이미 통과했다 — 픽스처가 무효다(요구 버전을 올려라)")
+	}
+	if got != base {
+		t.Fatalf("승격 시 #requires가 무력화됐다: %d vs 대조군 %d", got, base)
+	}
+}
