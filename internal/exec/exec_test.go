@@ -2027,3 +2027,164 @@ func TestD78RequiresStillApplies(t *testing.T) {
 		t.Fatalf("승격 시 #requires가 무력화됐다: %d vs 대조군 %d", got, base)
 	}
 }
+
+// TestD78NoObservableSideEffects — 설계 §2.4. -SupportEvent 회귀 감시선.
+// 빠지면 Get-Job이 1이 되고 Wait-Job이 끝나지 않으며 작업 표가 stdout에 찍힌다.
+func TestD78NoObservableSideEffects(t *testing.T) {
+	// TestD78SignalOnExit과 같은 이유로 양쪽 셸을 돈다 — 작업표·구독표는 셸 버전에
+	// 민감한 표면이고, 이 테스트가 -SupportEvent 회귀의 1차 감시선이다.
+	for _, shell := range []string{"pwsh", "powershell"} {
+		t.Run(shell, func(t *testing.T) {
+			t.Run("job-and-subscriber-tables-clean", func(t *testing.T) {
+				const code = `Write-Output ("jobs=" + (Get-Job).Count + " subs=" + (Get-EventSubscriber).Count)`
+				_, out, _, _ := runPS1Shell(t, shell, t.TempDir(), code, true)
+				if got := strings.TrimSpace(out); got != "jobs=0 subs=0" {
+					t.Fatalf("stdout=%q want \"jobs=0 subs=0\" — -SupportEvent가 빠지면 1/1이 되고 작업 표가 stdout에도 찍힌다", got)
+				}
+			})
+			t.Run("wait-job-terminates", func(t *testing.T) {
+				const code = "cmd /c exit 71\nGet-Job | Wait-Job | Out-Null"
+				_, _, _, side := runPS1Shell(t, shell, t.TempDir(), code, true)
+				if want := ctrNativeExitMarker + "71"; side != want {
+					t.Fatalf("side=%q want %q — Wait-Job이 이벤트 작업을 기다리다 멈췄을 수 있다", side, want)
+				}
+			})
+			t.Run("remove-job-keeps-sidefile", func(t *testing.T) {
+				const code = "cmd /c exit 71\nGet-Job | Remove-Job -Force"
+				_, _, _, side := runPS1Shell(t, shell, t.TempDir(), code, true)
+				if want := ctrNativeExitMarker + "71"; side != want {
+					t.Fatalf("side=%q want %q — 통상적인 정리 관용구가 신호를 지웠다", side, want)
+				}
+			})
+		})
+	}
+}
+
+// TestD78FallbackMatchesBaseline — 설계 §2.5. 폴백 대상은 대조군과 완전히 같아야 한다.
+// 폴백이 만드는 스크립트는 D76 형태와 바이트 동일하므로 이 대조는 구성상 성립한다.
+// 명명 블록은 토큰마다 따로 단정한다 — dynamicparam이 3라운드에서, clean이 5라운드에서
+// 빠졌던 자리다(clean은 7.x에서만 명명 블록이라 5.1에서는 과잉 폴백으로 무해하다).
+func TestD78FallbackMatchesBaseline(t *testing.T) {
+	for _, tc := range []struct{ name, code string }{
+		{"param", "param($x = \"dflt\")\nWrite-Output \"x=$x\"\ncmd /c exit 80"},
+		{"block-comment-then-param", "<# doc #> param($x)\ncmd /c exit 74"},
+		{"multiline-block-comment-then-param", "<#\n doc\n line2\n#>\nparam($x)\ncmd /c exit 74"},
+		{"attribute-then-param", "[CmdletBinding()] param($x)\ncmd /c exit 74"},
+		{"using", "using namespace System.Text\nWrite-Output 'ok'\ncmd /c exit 78"},
+		{"backtick-then-using", "`\nusing namespace System.Text\nWrite-Output 'ok'\ncmd /c exit 78"},
+		{"bom-then-param", "\uFEFFparam($x)\ncmd /c exit 74"},
+		// 명명 블록은 **토큰마다 따로** 태운다 — begin/process/end를 한 스니펫에 합치면
+		// begin 토큰만 판정을 거친다. dynamicparam이 3라운드에서, clean이 5라운드에서
+		// 빠졌던 자리가 정확히 이 자리다.
+		{"dynamicparam", "dynamicparam { }\nend { cmd /c exit 79 }"},
+		{"begin", "begin { }\nend { cmd /c exit 79 }"},
+		{"process", "process { }\nend { cmd /c exit 79 }"},
+		{"end", "end { cmd /c exit 79 }"},
+		{"clean", "clean { }\nend { cmd /c exit 79 }"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if promotesNativeExitSignal(tc.code) {
+				t.Fatalf("승격 대상으로 판정됐다 — 폴백해야 한다")
+			}
+			bc, bo, _, bs := runPS1(t, tc.code, false)
+			gc, go_, _, gs := runPS1(t, tc.code, true)
+			if gc != bc || go_ != bo || gs != bs {
+				t.Fatalf("폴백이 대조군과 다르다\n승격: exit=%d out=%q side=%q\n대조: exit=%d out=%q side=%q",
+					gc, go_, gs, bc, bo, bs)
+			}
+		})
+	}
+}
+
+// TestD78Limits — 설계 §2.9. 경로마다 결과가 다르므로 따로 단정한다.
+func TestD78Limits(t *testing.T) {
+	t.Run("environment-exit-no-signal", func(t *testing.T) {
+		_, _, _, side := runPS1(t, "cmd /c exit 75\n[Environment]::Exit(5)", true)
+		if side != "" {
+			t.Fatalf("side=%q want 없음 — [Environment]::Exit은 이벤트를 발화시키지 않는다", side)
+		}
+	})
+	t.Run("fallback-throw-no-signal", func(t *testing.T) {
+		// 폴백 경로는 D76 tail이라 처리되지 않은 종료 오류에서 tail이 실행되지 않는다.
+		_, _, _, side := runPS1(t, "param($x)\ncmd /c exit 73\nthrow 'x'", true)
+		if side != "" {
+			t.Fatalf("side=%q want 없음 — 폴백 경로의 알려진 공백이다", side)
+		}
+	})
+	t.Run("fallback-normal-records", func(t *testing.T) {
+		_, _, _, side := runPS1(t, "param($x)\ncmd /c exit 74", true)
+		if want := ctrNativeExitMarker + "74"; side != want {
+			t.Fatalf("side=%q want %q — 폴백 경로도 정상 종료에서는 기록한다", side, want)
+		}
+	})
+	// 아래 두 케이스의 첫 줄이 `$ctrProbe = Join-Path …`인 것은 필수다(계획 초안에서 정정).
+	// 초안은 `[System.IO.File]::WriteAllText($PSScriptRoot + …)`로 시작했는데 선두 `[`는
+	// promotesFirstToken이 최상단 속성 선언으로 보고 과잉 폴백시키는 문자다(기존 fallback
+	// 케이스 type-cast-overfallback과 같은 자리). 그러면 등록 문이 아예 붙지 않아 두 단정이
+	// 승격 경로를 밟지 못한다 — 실측 4형태 비교:
+	//   폴백형 -Force / -Force 없음 → 둘 다 side=":8888"
+	//   승격형 -Force → ":8888",  승격형 -Force 없음 → ":45"
+	// 즉 초안 형태에서는 without-force가 통과 불가능하고, force-wins는 무엇을 지우든 통과하는
+	// 거짓 초록이 된다. 그 재발을 막으려고 두 케이스 모두 승격 판정을 먼저 단정한다.
+	t.Run("unregister-force-wins", func(t *testing.T) {
+		code := "$ctrProbe = Join-Path $PSScriptRoot '" + ctrNativeExitFile + "'\n" +
+			"[System.IO.File]::WriteAllText($ctrProbe, '" + ctrNativeExitMarker + "8888')\n" +
+			"Unregister-Event -SourceIdentifier PowerShell.Exiting -Force -ErrorAction SilentlyContinue\n" +
+			"cmd /c exit 45\nexit"
+		if !promotesNativeExitSignal(code) {
+			t.Fatal("픽스처가 폴백으로 판정됐다 — 등록 문이 없으면 이 단정은 아무것도 보지 못한다")
+		}
+		_, _, _, side := runPS1(t, code, true)
+		if want := ctrNativeExitMarker + "8888"; side != want {
+			t.Fatalf("side=%q want %q — -Force로는 조작이 통한다(알려진 한계)", side, want)
+		}
+	})
+	t.Run("unregister-without-force-fails", func(t *testing.T) {
+		// -SupportEvent 구독은 숨김이라 -Force 없는 Unregister-Event는 찾지 못하고 실패한다.
+		// 이 대비가 깨지면 -SupportEvent가 사라진 것이다.
+		code := "$ctrProbe = Join-Path $PSScriptRoot '" + ctrNativeExitFile + "'\n" +
+			"[System.IO.File]::WriteAllText($ctrProbe, '" + ctrNativeExitMarker + "8888')\n" +
+			"Unregister-Event -SourceIdentifier PowerShell.Exiting -ErrorAction SilentlyContinue\n" +
+			"cmd /c exit 45\nexit"
+		if !promotesNativeExitSignal(code) {
+			t.Fatal("픽스처가 폴백으로 판정됐다 — 등록 문이 없으면 이 단정은 아무것도 보지 못한다")
+		}
+		_, _, _, side := runPS1(t, code, true)
+		if want := ctrNativeExitMarker + "45"; side != want {
+			t.Fatalf("side=%q want %q — -Force 없는 해제가 성공했다면 -SupportEvent가 빠진 것이다", side, want)
+		}
+	})
+	// Task 2 리뷰가 지목한 구분. 승격 경로의 등록 문은 $LASTEXITCODE를 **직접** 읽는데,
+	// nativeExitTail의 주석이 그 직접 참조가 strict mode 스코프 안에서는 미초기화 변수
+	// 오류를 낸다고 문서화하고 있다. 기존 서브테스트 `strict_mode에_네이티브_명령_없음`은
+	// stderr == ""만 단정하므로 "핸들러가 빈 값을 기록했다"와 "핸들러가 throw했고 내부
+	// catch가 삼켰다"를 구분하지 못한다 — 둘 다 통과한다. 사이드파일 값이 그 둘을 가른다:
+	// 기록에 성공하면 마커만 남은 빈 값이고, 핸들러가 throw했다면 파일 자체가 없다.
+	// 설계 §3 표4가 이 조합의 관측값을 "빈 값"으로 기록하고 있다.
+	t.Run("strict-mode-no-native-command", func(t *testing.T) {
+		_, _, _, side := runPS1(t, "Set-StrictMode -Version Latest\nWrite-Output 'ok'", true)
+		if want := ctrNativeExitMarker; side != want {
+			t.Fatalf("side=%q want %q — 빈 문자열이면 핸들러가 throw하고 내부 catch가 삼킨 것이다", side, want)
+		}
+	})
+	t.Run("lastexitcode-assign", func(t *testing.T) {
+		// 설계 §3 표5: 스크립트 최상단 대입만으로 값이 바뀐다(global: 한정자 불필요).
+		_, _, _, side := runPS1(t, "cmd /c exit 5\n$LASTEXITCODE = 7777\nexit", true)
+		if want := ctrNativeExitMarker + "7777"; side != want {
+			t.Fatalf("side=%q want %q", side, want)
+		}
+	})
+	t.Run("own-handler-wins", func(t *testing.T) {
+		// 설계 §3 표5: 같은 소스 식별자로 두 번 등록해도 충돌 오류 없이 공존하고
+		// 스니펫 쪽 기록이 이긴다. 핸들러는 별도 스코프에서 돌므로 경로를 env로 넘긴다
+		// (프로세스 전역이라 핸들러에서 보인다 — 러너의 등록 문도 같은 방식으로 읽는다).
+		code := "$env:CTR_PROBE = Join-Path $PSScriptRoot '" + ctrNativeExitFile + "'\n" +
+			"Register-EngineEvent -SourceIdentifier PowerShell.Exiting -SupportEvent -Action { " +
+			"[System.IO.File]::WriteAllText($env:CTR_PROBE, '" + ctrNativeExitMarker + "9999') }\n" +
+			"cmd /c exit 5\nexit"
+		_, _, _, side := runPS1(t, code, true)
+		if want := ctrNativeExitMarker + "9999"; side != want {
+			t.Fatalf("side=%q want %q — 스니펫 자신의 핸들러가 이기는 것이 관측된 동작이다(위조 무력화를 주장하지 않는 근거)", side, want)
+		}
+	})
+}
