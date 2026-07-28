@@ -2828,7 +2828,11 @@ func BenchmarkShadowPredicate(b *testing.B) {
 // 픽스처는 두 조건을 함께 만족해야 한다(설계 v0.14 §2.1):
 //   - 경로 조건: 블롭 mtime을 gcOrphanMinAge 이전으로 소급시킨다. 그러지 않으면
 //     reclaimHookBlobs의 나이 게이트가 단락되어 stillReferenced 쿼리도 os.Remove도
-//     실행되지 않고, 유예 경로만 재는 종이 게이트가 된다.
+//     실행되지 않고, 유예 경로만 재는 종이 게이트가 된다. 단정은 Hashes·Deferred·
+//     Failed를 함께 본다(TestPurgeHookOnly, :1917과 같은 관용구) — Failed를 빼면
+//     rename/unlink 실패(store.go:1242·:1254, Windows 공유 위반)로 일부 해시만
+//     회수돼도 ReclaimedB>0·Deferred==0이 성립해 측정량이 줄어든 것을 감춘 채
+//     넉넉한 여유를 보고한다.
 //   - 규모 조건: 개발기 실측이 budget의 1/5 이하가 되는 해시 수를 쓴다. 이 게이트는
 //     CI에서 3-OS와 -race로 네 번 도는데, 원 실측(100해시 632ms) 대비 여유 1.58배로는
 //     러너 편차 한 번이 BLOCKED가 된다.
@@ -2856,14 +2860,14 @@ func TestPurgeHookOnlyLockHoldBudget(t *testing.T) {
 	if rep.Hashes != hashes {
 		t.Fatalf("rep.Hashes=%d want %d — 픽스처가 의도한 규모로 처리되지 않았다", rep.Hashes, hashes)
 	}
-	if rep.ReclaimedB <= 0 || rep.DeferredFiles != 0 {
-		t.Fatalf("회수 경로를 타지 않았다: ReclaimedB=%d DeferredFiles=%d — 나이 게이트가 단락되면 이 게이트는 유예 경로만 재는 종이 게이트가 된다",
-			rep.ReclaimedB, rep.DeferredFiles)
+	if rep.ReclaimedB <= 0 || rep.DeferredFiles != 0 || rep.FailedFiles != 0 {
+		t.Fatalf("회수 경로를 타지 않았다: ReclaimedB=%d DeferredFiles=%d FailedFiles=%d — 나이 게이트가 단락되면 유예 경로만 재는 종이 게이트가 되고, rename/unlink가 실패하면 줄어든 배치를 재고도 통과한다",
+			rep.ReclaimedB, rep.DeferredFiles, rep.FailedFiles)
 	}
-	t.Logf("hashes=%d reclaimed=%dB deferred=%d 보유 %v (budget %v, 여유 %.1f배)",
-		rep.Hashes, rep.ReclaimedB, rep.DeferredFiles, elapsed, budget, float64(budget)/float64(elapsed))
+	t.Logf("hashes=%d reclaimed=%dB deferred=%d failed=%d 보유 %v (budget %v, 여유 %.1f배)",
+		rep.Hashes, rep.ReclaimedB, rep.DeferredFiles, rep.FailedFiles, elapsed, budget, float64(budget)/float64(elapsed))
 	if elapsed >= budget {
-		t.Fatalf("잠금 보유가 예산을 넘었다: %v >= %v (hashes=%d reclaimed=%dB deferred=%d) — 개발기 기준값은 이 절반 이하였다",
-			elapsed, budget, rep.Hashes, rep.ReclaimedB, rep.DeferredFiles)
+		t.Fatalf("잠금 보유가 예산을 넘었다: %v >= %v (hashes=%d reclaimed=%dB deferred=%d failed=%d) — 개발기 기준값은 이 절반 이하였다",
+			elapsed, budget, rep.Hashes, rep.ReclaimedB, rep.DeferredFiles, rep.FailedFiles)
 	}
 }

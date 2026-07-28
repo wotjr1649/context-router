@@ -422,9 +422,9 @@ const startupPurgeBudget = 60 * time.Second
 // D77(v0.14): 색인 도입 이후 합성 픽스처로 재측정했다 — 20해시 19.8ms(해시당 약 1.0ms,
 // -count 5 재실행 대역 13.0~23.7ms), 회수 경로 확인(ReclaimedB>0·DeferredFiles=0).
 // 자동 게이트는 store_test.go의 TestPurgeHookOnlyLockHoldBudget이며 임계는 훅 예산
-// 2000ms의 50%인 1000ms다. 위 632·633ms는 실 도그푸딩 저장소(아티팩트 1254개·210MiB)의
-// 값이라 합성 픽스처와 분포가 달라 절대값 비교는 성립하지 않는다 — 게이트가 잡는 것은
-// 해시당 비용의 회귀다.
+// 2000ms의 50%인 1000ms다. 위 632·633ms는 **D73 색인 도입 이전**의 실 도그푸딩
+// 저장소(색인 없음, 아티팩트 1254개·210MiB) 값이라 색인 유무도 분포도 달라 절대값
+// 비교는 성립하지 않는다 — 게이트가 잡는 것은 해시당 비용의 회귀다.
 const startupPurgeMaxHashes = 100
 
 func run(ctx context.Context, args []string, stderr io.Writer) error {
