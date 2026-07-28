@@ -329,39 +329,68 @@ func promotesFirstToken(s string) bool {
 	return true
 }
 
-// snippetContent — .ps1에는 UTF-8 BOM(기존 계약, I2 — powershell.exe 5.1이 BOM 없는 .ps1을
-// 시스템 ANSI 코드페이지로 디코딩해 비ASCII를 손상시키는 것을 막는다)과 D76 tail을 붙인다.
+// nativeExitRegistration — D78 승격 경로. `PowerShell.Exiting` 이벤트에 기록 동작을
+// 걸고 스니펫과 **같은 줄**로 잇는다("; "로 끝나는 이유가 그것이다).
 //
-// tail 제약 넷: ① 스니펫의 마지막 개행이 보장되지 않으므로 개행을 **선행**시킨다.
-// ② 기록에 프로바이더 cmdlet(Set-Content·Out-File)을 쓰지 않는다 — 5.1의 무반환 정지 경로가
-// 실측됐다. ③ 변수명을 스니펫과 충돌하지 않게 고유하게 둔다. ④ 두 statement를 try/catch로
-// 감싼다(F2 리뷰) — ConstrainedLanguage는 WriteAllText 같은 .NET 메서드 직접 호출을 막고,
-// 스니펫이 Get-Variable을 같은 이름의 함수로 정의하면 PowerShell 명령 해석에서 함수가
-// cmdlet보다 우선해 그 함수가 대신 호출된다. 두 경우 모두 함수가 throw하거나 호출이 막히면
-// 그 오류가 스니펫의 stderr로 새고 $ErrorActionPreference='Stop'에서는 종료 코드까지 흔들린다
-// (pwsh 7·powershell 5.1 양쪽 실측). catch는 비워 둔다 — 실패하면 사이드 파일이 그냥 안
-// 써질 뿐이고, 그건 readNativeExitCode가 이미 "보강하지 않음"으로 처리하는 경로다.
-// 기록값은 ctrNativeExitMarker를 접두어로 붙인다 — 스크래치가 스니펫의 작업 디렉터리이기도
-// 해서 스니펫이 같은 상대 경로("ctr-native-exit")에 직접 쓸 수 있는데, 마커가 없으면 그
-// 내용이 외부 명령 종료 코드로 오인된다(F3 리뷰).
-// 스니펫이 exit으로 끝나면 tail은 실행되지 않는다 — 코드를 명시한 exit이면 exit_code가 그
-// 값이고, 인수 없는 exit은 0을 반환해 네이티브 실패가 가려지지만 이 보강이 덮지 못하는 알려진
-// 공백이다(설계 v0.13 §1.2).
-func snippetContent(fileName, code, sidePath string) []byte {
-	if !strings.HasSuffix(fileName, ".ps1") {
-		return []byte(code)
-	}
+// 세 가지가 각각 하나의 실측된 문제를 막는다(설계 v0.14 D78):
+//   - 스니펫을 감싸지 않는 것 — try/finally는 문 종료 오류의 제어 흐름을 바꿔,
+//     오류 뒤의 나머지 스니펫이 실행되지 않는다(종료 코드가 같아 검출되지 않는다).
+//   - -SupportEvent — 없으면 세션 작업표에 PSEventJob이 남아 `Get-Job | Wait-Job`이
+//     끝나지 않고 `Get-Job | Remove-Job -Force`가 사이드 파일을 지우며, 작업 표가
+//     stdout에도 찍힌다.
+//   - 인라인 결합 — 앞 줄에 두면 모든 오류 메시지의 줄 번호가 +1 밀린다. 인라인은
+//     2행 이상 오류에서 stderr를 바이트 단위로 보존한다(1행 오류는 열 번호와 소스 줄
+//     에코가 밀린다 — 설계 §1.2의 알려진 한계).
+//
+// $LASTEXITCODE는 global 한정자 없이 읽는다(핸들러 스코프에서 그대로 보인다).
+// sidePath의 작은따옴표는 반드시 이중화한다 — 빠지면 스크립트가 파싱되지 않는다.
+func nativeExitRegistration(sidePath string) string {
+	return "Register-EngineEvent -SourceIdentifier PowerShell.Exiting -SupportEvent -Action { try { " +
+		"[System.IO.File]::WriteAllText('" + strings.ReplaceAll(sidePath, "'", "''") + "', '" +
+		ctrNativeExitMarker + "' + [string]$LASTEXITCODE) } catch {} }; "
+}
+
+// nativeExitTail — D76 폴백 경로. 최상단 전용 구문으로 시작하는 스니펫은 승격하지
+// 않으므로 이 형태를 그대로 유지한다(그 경로의 알려진 공백도 함께 유지된다:
+// 스니펫이 exit 또는 처리되지 않은 종료 오류로 끝나면 tail이 실행되지 않는다).
+//
+// tail 제약 넷은 D76 그대로다: ① 개행을 선행시킨다 ② 프로바이더 cmdlet을 쓰지 않는다
+// ③ 변수명을 고유하게 둔다 ④ try/catch로 감싼다(ConstrainedLanguage·Get-Variable 재정의).
+func nativeExitTail(sidePath string) string {
 	// $LASTEXITCODE를 직접 참조하면 스니펫이 strict mode를 켜고 외부 명령 없이 끝났을 때
 	// 미초기화 변수 오류가 스니펫 stderr로 나가고(pwsh·5.1 양쪽 실측, 내부 스크립트 경로 포함)
 	// 사이드 파일도 안 써진다 — 무신호를 없애려던 것이 새 잡음을 만든다. Get-Variable로 읽으면
-	// 미설정이 오류가 아니라 빈 값이 된다.
-	tail := "\ntry {\n" +
+	// 미설정이 오류가 아니라 빈 값이 된다. 승격 경로가 직접 참조로 읽어도 되는 것은 그쪽
+	// 핸들러가 스니펫의 strict mode 스코프 밖에서 돌기 때문이다(실측: Set-StrictMode -Version
+	// Latest 스니펫에서도 핸들러가 기록에 성공해 빈 값을 남긴다). 이 줄을 그쪽에 맞춰
+	// "정리"하면 위 실측이 그대로 돌아온다.
+	return "\ntry {\n" +
 		"$ctrNativeExitCode = Get-Variable -Name LASTEXITCODE -ValueOnly -ErrorAction SilentlyContinue\n" +
 		"[System.IO.File]::WriteAllText('" + strings.ReplaceAll(sidePath, "'", "''") + "', '" +
 		ctrNativeExitMarker + "' + [string]$ctrNativeExitCode)\n" +
 		"} catch {}\n"
-	out := append([]byte{0xEF, 0xBB, 0xBF}, code...)
-	return append(out, tail...)
+}
+
+// snippetContent — .ps1에는 UTF-8 BOM(기존 계약, I2 — powershell.exe 5.1이 BOM 없는
+// .ps1을 시스템 ANSI 코드페이지로 디코딩해 비ASCII를 손상시키는 것을 막는다)과 D78
+// 종료 신호를 붙인다. 승격 대상이면 등록 문을 선두에 잇고, 최상단 전용 구문으로
+// 시작하면 D76 tail 형태로 폴백한다(promotesNativeExitSignal).
+//
+// 기록값에 ctrNativeExitMarker를 접두어로 붙이는 이유는 D76 그대로다 — 스크래치가
+// 스니펫의 작업 디렉터리이기도 해서 스니펫이 같은 상대 경로에 직접 쓸 수 있고,
+// 마커가 없으면 그 내용이 외부 명령 종료 코드로 오인된다.
+func snippetContent(fileName, code, sidePath string) []byte {
+	if !strings.HasSuffix(fileName, ".ps1") {
+		return []byte(code)
+	}
+	buf := make([]byte, 0, 3+len(code)+320)
+	buf = append(buf, 0xEF, 0xBB, 0xBF)
+	if promotesNativeExitSignal(code) {
+		buf = append(buf, nativeExitRegistration(sidePath)...)
+		return append(buf, code...)
+	}
+	buf = append(buf, code...)
+	return append(buf, nativeExitTail(sidePath)...)
 }
 
 func shellRunner() runner {

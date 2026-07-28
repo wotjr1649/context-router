@@ -108,13 +108,16 @@ func TestSnippetPS1BOM(t *testing.T) {
 	if !bytes.HasPrefix(got, []byte{0xEF, 0xBB, 0xBF}) {
 		t.Fatalf(".ps1 UTF-8 BOM 미기록: 선두=%x", got[:min(3, len(got))])
 	}
-	// tail이 코드 뒤에 붙으므로 접미가 아니라 포함으로 본다(D76).
+	// 신호(D76 tail 또는 D78 등록 문)가 붙으므로 접두·접미가 아니라 포함으로 본다.
 	if !bytes.Contains(got, []byte("Write-Output '한글'")) {
 		t.Fatalf("코드 본문이 없다: %q", got)
 	}
-	// BOM 직후가 코드 시작임은 그대로 단정한다.
-	if !bytes.HasPrefix(got[3:], []byte("Write-Output '한글'")) {
-		t.Fatalf("BOM 직후가 코드 시작이 아니다: %q", got)
+	// D78: 이 스니펫은 승격 대상이라 BOM 직후는 등록 문이고 코드는 그 뒤에 **같은 줄로**
+	// 이어진다(구조 단정 본체는 TestSnippetContentRegistration). 선두 BOM이라는 I2 계약은
+	// 위 단정이 지킨다 — 여기서는 그 사이에 들어간 것이 등록 문뿐이고 코드가 손상 없이
+	// 끝까지 남는지만 본다.
+	if !bytes.HasSuffix(got, []byte("; Write-Output '한글'")) {
+		t.Fatalf("BOM 다음 등록 문 뒤로 코드가 그대로 이어지지 않는다: %q", got)
 	}
 	for _, f := range []string{"snippet.sh", "snippet.js", "snippet.py", "snippet.go", "snippet.cs"} {
 		out := snippetContent(f, "x", side)
@@ -371,12 +374,20 @@ func TestShellNativeExitNotPropagated(t *testing.T) {
 
 // TestShellNativeExitAugmentation — D76: exit_code 0에 stderr가 빈 상황에서만 마지막 외부
 // 명령의 종료 상황을 stderr 한 줄로 낸다. exit_code의 의미는 바뀌지 않는다.
+//
+// D78이 신호 생성 형태를 tail에서 등록 문으로 바꾼 뒤에도 이 보강 조건은 그대로다 —
+// 바뀐 것은 어떤 스니펫에서 신호가 살아남느냐이고, 아래 세 케이스(인수 없는 exit ·
+// Get-Variable 재정의 · ConstrainedLanguage)가 그 변화의 결과를 잠근다.
 func TestShellNativeExitAugmentation(t *testing.T) {
 	if runtime.GOOS != "windows" {
 		t.Skip("windows shell 갈래 전용(PowerShell -File 계약)")
 	}
 	requireLang(t, "shell")
 	const marker = "마지막 외부 명령이 종료 코드"
+	// 사이드 파일에 진짜 값(ctr-exit-code:5)이 남았을 때 나가는 보강 줄 전문. 정확히
+	// 일치를 요구하는 것은 값이 5라는 것과 **스니펫 자신의 stderr가 비어 있었다**는 것을
+	// 한 번에 잠그기 때문이다 — 보강은 stderr가 빈 경우에만 들어간다(exec.go의 D76 조건).
+	const wantStderr5 = "context-router: 마지막 외부 명령이 종료 코드 5번으로 끝났습니다(exit_code는 스니펫의 종료 상태입니다).\n"
 
 	t.Run("마지막_줄이_비0_네이티브", func(t *testing.T) {
 		resp := run(t, Request{Language: "shell", Code: "cmd /c exit 5\n"})
@@ -399,16 +410,17 @@ func TestShellNativeExitAugmentation(t *testing.T) {
 		}
 	})
 
-	t.Run("인수없는_exit은_보강되지_않는다", func(t *testing.T) {
+	t.Run("인수없는_exit도_보강된다", func(t *testing.T) {
+		// v0.13 §1.2의 공백 ②를 D78이 닫았다. 인수 없는 exit은 0을 반환해 그 앞의 네이티브
+		// 실패(5)를 가렸고, D76 tail은 exit 뒤에 실행되지 않아 신호까지 사라졌다 — 단정이
+		// 그 공백을 "보강되지 않는다"로 굳혀 놓았던 자리다. 등록 문은 엔진 종료 시점에
+		// 실행되므로 그 5가 남는다. 단정을 뒤집는 것이 D78의 계약이다.
 		resp := run(t, Request{Language: "shell", Code: "cmd /c exit 5\nexit\n"})
-		if strings.Contains(resp.Stderr, marker) {
-			t.Fatalf("tail이 실행되지 않아야 하는데 보강 줄이 있다: %q", resp.Stderr)
+		if resp.ExitCode == nil || *resp.ExitCode != 0 {
+			t.Fatalf("exit_code=%v want 0 — 인수 없는 exit의 계약은 바뀌지 않았다", resp.ExitCode)
 		}
-		// 대조: 마지막 exit만 제거하면 보강 줄이 나온다 — 이 대조가 없으면 위 단정은 tail이
-		// 전혀 동작하지 않아도 통과한다.
-		ctrl := run(t, Request{Language: "shell", Code: "cmd /c exit 5\n"})
-		if !strings.Contains(ctrl.Stderr, marker) {
-			t.Fatalf("대조 케이스에 보강 줄이 없다: %q", ctrl.Stderr)
+		if resp.Stderr != wantStderr5 {
+			t.Fatalf("보강 줄이 정확히 하나 나와야 한다: got=%q want=%q", resp.Stderr, wantStderr5)
 		}
 	})
 
@@ -445,17 +457,20 @@ func TestShellNativeExitAugmentation(t *testing.T) {
 		}
 	})
 
-	t.Run("Get-Variable_재정의가_tail을_깨지_않는다", func(t *testing.T) {
-		// F2 리뷰(회귀 방지): 스니펫이 Get-Variable을 같은 이름의 함수로 가리면(PowerShell
-		// 명령 해석에서 함수가 cmdlet보다 우선한다) tail의 호출이 그 함수로 해석된다. 함수가
-		// throw하면 try/catch 없이는 그 오류가 스니펫의 stderr로 새고 $ErrorActionPreference에
-		// 따라 exit_code까지 흔들릴 수 있다 — 양쪽 다 조용히 흡수돼야 한다.
+	t.Run("Get-Variable_재정의에도_신호가_살아남는다", func(t *testing.T) {
+		// F2 리뷰가 막던 회귀(스니펫이 Get-Variable을 같은 이름의 함수로 가리면 tail의 호출이
+		// 그 함수로 해석돼 throw가 stderr로 새는 것)는 **대상 자체와 함께 사라졌다** — D78
+		// 등록 문은 Get-Variable을 쓰지 않고 $LASTEXITCODE를 직접 읽는다. 그래서 이 스니펫은
+		// 신호가 소실되던 케이스에서 살아남는 케이스로 바뀐다(설계 v0.14 §3 표5의 긍정 결과).
+		// 정확히 일치 단정이 원래의 보호 의도도 함께 유지한다 — 오류가 샜다면 stderr가 비지
+		// 않아 보강 자체가 들어가지 않았을 것이다.
 		resp := run(t, Request{Language: "shell", Code: "function Get-Variable { throw 'boom' }\ncmd /c exit 5\n"})
 		if resp.ExitCode == nil || *resp.ExitCode != 0 {
-			t.Fatalf("exit_code=%v want 0 — tail의 오류가 스니펫 실행에 영향을 주면 안 된다", resp.ExitCode)
+			t.Fatalf("exit_code=%v want 0 — 종료 신호가 스니펫 실행에 영향을 주면 안 된다", resp.ExitCode)
 		}
-		if resp.Stderr != "" {
-			t.Fatalf("tail의 오류가 stderr로 샜다: %q", resp.Stderr)
+		if resp.Stderr != wantStderr5 {
+			t.Fatalf("사이드 파일의 진짜 값(5)이 보강 줄 하나로 나와야 한다: got=%q want=%q",
+				resp.Stderr, wantStderr5)
 		}
 	})
 
@@ -494,19 +509,24 @@ func TestShellNativeExitAugmentation(t *testing.T) {
 		}
 	})
 
-	t.Run("ConstrainedLanguage에서_tail이_안전하다", func(t *testing.T) {
-		// F2 리뷰(회귀 방지) — 이 dev host에서 실측: 스니펫이 자신을 ConstrainedLanguage로
-		// 낮추면(자기 자신에 대한 강등은 FullLanguage에서 허용된다) 그 뒤에 실행되는 tail의
-		// WriteAllText(.NET 정적 메서드 직접 호출)가 막힌다 — pwsh·5.1 양쪽에서 "Cannot invoke
-		// method. Method invocation is supported only on core types in this language mode."로
-		// 재현했다. try/catch 없이는 그 오류가 스니펫의 stderr로 새고 exit_code까지 흔들릴 수
-		// 있다. 네이티브 명령(cmd) 호출 자체는 언어 모드 제약을 받지 않는다.
+	t.Run("ConstrainedLanguage에서도_신호가_살아남는다", func(t *testing.T) {
+		// 스니펫이 자신을 ConstrainedLanguage로 낮추면(자기 자신에 대한 강등은 FullLanguage에서
+		// 허용된다) 그 뒤에 실행되는 D76 tail의 WriteAllText(.NET 정적 메서드 직접 호출)가
+		// 막혔다 — "Cannot invoke method. Method invocation is supported only on core types in
+		// this language mode."(pwsh 7·powershell 5.1 양쪽 실측). try/catch가 오류를 삼켜
+		// 안전하기는 했지만 신호는 사라졌다.
+		//
+		// D78에서는 등록 문이 스니펫보다 **먼저** 실행되므로 핸들러 스크립트블록이
+		// FullLanguage에서 생성되고, 강등 뒤에 열리는 종료 시점에도 기록에 성공한다(이 dev
+		// host 실측: 사이드 파일 ctr-exit-code:5). 네이티브 명령(cmd) 호출 자체는 언어 모드
+		// 제약을 받지 않는다는 전제는 그대로다.
 		resp := run(t, Request{Language: "shell", Code: "$ExecutionContext.SessionState.LanguageMode = 'ConstrainedLanguage'\ncmd /c exit 5\n"})
 		if resp.ExitCode == nil || *resp.ExitCode != 0 {
-			t.Fatalf("exit_code=%v want 0 — tail의 오류가 스니펫 실행에 영향을 주면 안 된다", resp.ExitCode)
+			t.Fatalf("exit_code=%v want 0 — 종료 신호가 스니펫 실행에 영향을 주면 안 된다", resp.ExitCode)
 		}
-		if resp.Stderr != "" {
-			t.Fatalf("tail의 오류가 stderr로 샜다: %q", resp.Stderr)
+		if resp.Stderr != wantStderr5 {
+			t.Fatalf("사이드 파일의 진짜 값(5)이 보강 줄 하나로 나와야 한다: got=%q want=%q",
+				resp.Stderr, wantStderr5)
 		}
 	})
 }
@@ -1688,5 +1708,81 @@ func TestPromotesNativeExitSignal(t *testing.T) {
 				t.Fatalf("폴백됐다 — 승격 대상이다\ncode=%q", tc.code)
 			}
 		})
+	}
+}
+
+// TestSnippetContentRegistration — D78: 승격 대상은 BOM 다음에 등록 문이 오고 그 뒤에
+// 스니펫이 **같은 줄로** 이어진다. 앞 줄에 두면 모든 오류의 줄 번호가 +1 밀린다.
+func TestSnippetContentRegistration(t *testing.T) {
+	const side = `C:\tmp\ctr-native-exit`
+	got := string(snippetContent("snippet.ps1", "cmd /c exit 71\nexit 3", side))
+
+	if !strings.HasPrefix(got, "\xEF\xBB\xBF") {
+		t.Fatal("BOM이 없다 — powershell 5.1이 비ASCII를 손상시킨다(I2 계약)")
+	}
+	body := strings.TrimPrefix(got, "\xEF\xBB\xBF")
+	if !strings.HasPrefix(body, "Register-EngineEvent ") {
+		t.Fatalf("등록 문이 선두가 아니다: %.80q", body)
+	}
+	if !strings.Contains(body, "-SupportEvent") {
+		t.Fatal("-SupportEvent가 없다 — 세션 작업표에 PSEventJob이 남아 Get-Job | Wait-Job이 끝나지 않는다")
+	}
+	if !strings.Contains(body, "$LASTEXITCODE") {
+		t.Fatal("$LASTEXITCODE를 읽지 않는다")
+	}
+	// 인라인 결합: 등록 문과 스니펫 첫 줄 사이에 개행이 없어야 한다.
+	head, _, ok := strings.Cut(body, "\n")
+	if !ok {
+		t.Fatal("개행이 없다")
+	}
+	if !strings.Contains(head, "; cmd /c exit 71") {
+		t.Fatalf("스니펫 첫 줄이 등록 문과 같은 줄에 있지 않다: %.200q", head)
+	}
+}
+
+// TestSnippetContentEscapesSidePath — D78: sidePath의 작은따옴표는 이중화한다. 빠지면
+// 사용자명에 '가 있는 호스트에서 스크립트 자체가 파싱되지 않아 모든 shell 스니펫이
+// 실패한다(D76 tail이 nativeExitTail에서 하는 처리와 같다).
+func TestSnippetContentEscapesSidePath(t *testing.T) {
+	const side = `C:\Users\o'brien\tmp\ctr-native-exit`
+	got := string(snippetContent("snippet.ps1", "cmd /c exit 71", side))
+	if !strings.Contains(got, `o''brien`) {
+		t.Fatalf("작은따옴표가 이중화되지 않았다: %.240q", got)
+	}
+	if strings.Contains(got, `'C:\Users\o'brien`) {
+		t.Fatal("원본 작은따옴표가 그대로 남아 문자열 리터럴이 조기 종료된다")
+	}
+}
+
+// TestSnippetContentFallbackKeepsD76Form — D78: 폴백 대상은 현재 D76 형태와 **바이트
+// 동일**해야 한다. §2.5·§2.6의 대조 논거 전체가 이 동일성에 걸려 있다 — runPS1의
+// promote=false 대조군이 "현재 형태"라는 전제가 여기서 무너지면 이후 모든 대조가
+// 조용히 무의미해진다. 그래서 부분 문자열이 아니라 골든 리터럴로 잠근다(선행 개행
+// 하나, 줄 순서 하나가 달라져도 잡힌다).
+func TestSnippetContentFallbackKeepsD76Form(t *testing.T) {
+	const side = `C:\tmp\ctr-native-exit`
+	const code = "param($x)\ncmd /c exit 74"
+	// D76 tail 골든(216B). 마커를 상수 대신 리터럴로 적는 것은 의도적이다 —
+	// ctrNativeExitMarker가 바뀌면 이 테스트가 먼저 깨져 D76 무회귀를 알린다.
+	const wantTail = "\ntry {\n" +
+		"$ctrNativeExitCode = Get-Variable -Name LASTEXITCODE -ValueOnly -ErrorAction SilentlyContinue\n" +
+		"[System.IO.File]::WriteAllText('" + `C:\tmp\ctr-native-exit` + "', '" +
+		"ctr-exit-code:" + "' + [string]$ctrNativeExitCode)\n" +
+		"} catch {}\n"
+
+	got := string(snippetContent("snippet.ps1", code, side))
+	if strings.Contains(got, "Register-EngineEvent") {
+		t.Fatal("폴백 대상에 등록 문이 붙었다")
+	}
+	if want := "\xEF\xBB\xBF" + code + wantTail; got != want {
+		t.Fatalf("폴백 산출물이 D76 형태와 바이트 동일하지 않다\ngot  %q\nwant %q", got, want)
+	}
+}
+
+// TestSnippetContentNonPS1Unchanged — .ps1이 아니면 원본 그대로다(기존 계약).
+func TestSnippetContentNonPS1Unchanged(t *testing.T) {
+	const code = "echo hi"
+	if got := string(snippetContent("snippet.sh", code, "/tmp/x")); got != code {
+		t.Fatalf("got %q want %q", got, code)
 	}
 }
