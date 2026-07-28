@@ -1624,3 +1624,69 @@ func TestRunShellScratchHomeWins(t *testing.T) {
 		t.Fatalf("픽스처 무효 — 격리 없이도 호스트 홈 마커가 보이지 않았다: %s", raw)
 	}
 }
+
+// TestPromotesNativeExitSignal — D78 미니 파서. 최상단 전용 구문으로 시작하는 스니펫은
+// 승격하지 않는다(설계 v0.14 D78의 4단계 절차). 미탐만이 회귀이고 과잉 폴백은 기존 동작
+// 유지이므로, 판정을 넓게 잡는 쪽이 안전 방향이다.
+func TestPromotesNativeExitSignal(t *testing.T) {
+	fallback := []struct{ name, code string }{
+		{"param", "param($x)\ncmd /c exit 74"},
+		{"param-with-default", "param($x = \"dflt\")\nWrite-Output $x"},
+		{"param-uppercase", "PARAM ($x)\ncmd /c exit 74"},
+		{"block-comment-then-param", "<# doc #> param($x)\ncmd /c exit 74"},
+		{"multiline-block-comment-then-param", "<#\n doc\n line2\n#>\nparam($x)\ncmd /c exit 74"},
+		{"attribute-then-param", "[CmdletBinding()] param($x)\ncmd /c exit 74"},
+		{"using", "using namespace System.Text\ncmd /c exit 78"},
+		{"bom-then-param", "\uFEFFparam($x)\ncmd /c exit 74"},
+		{"backtick-continuation-then-using", "`\nusing namespace System.Text\ncmd /c exit 78"},
+		{"dynamicparam", "dynamicparam { }\nend { cmd /c exit 79 }"},
+		{"begin", "begin { }\nprocess { }\nend { cmd /c exit 79 }"},
+		{"process", "process { }\nend { cmd /c exit 79 }"},
+		{"end", "end { cmd /c exit 79 }"},
+		{"clean", "clean { }\nend { cmd /c exit 79 }"},
+		{"type-cast-overfallback", "[int]$x = 5\ncmd /c exit 70"},
+		// PowerShell은 이 줄 전체를 라인 주석으로 처리하므로 다음 줄의 param이 살아 있다.
+		// 좌→우 우선순위(현재 위치 첫 문자로만 판정)를 따르면 라인 주석을 소비한 뒤
+		// param을 만나 폴백한다. `<#`를 먼저 찾는 구현은 짝 없는 `#>`를 찾아 남은 입력을
+		// 전부 삼키고 미탐을 낸다 — 그것을 막는 것이 이 케이스다.
+		{"line-comment-containing-block-open", "# see <# note\nparam($x)\ncmd /c exit 74"},
+		// PowerShell 언어 사양의 공백은 " \t\r\n" 넷보다 넓다 — form feed·vertical tab·
+		// Unicode Zs(NBSP)도 공백이다. 검수 실측(pwsh 7·powershell 5.1 양쪽): 아래 셋은
+		// 현재 형태에서 정상 실행(exit 0 · side :78 · stdout USING-OK)인데 승격하면
+		// ParserError로 exit 1 · 사이드파일 없음 · stdout 빈 값이 된다.
+		// nbsp 케이스의 선두 문자는 U+00A0이라 **화면에 보이지 않는다** — 복사·편집에서
+		// 일반 공백(U+0020)으로 바뀌면 그 케이스가 무효가 되므로 바이트로 확인할 것.
+		{"formfeed-then-using", "\x0Cusing namespace System.Text\nWrite-Output 'ok'\ncmd /c exit 78"},
+		{"verttab-then-using", "\x0Busing namespace System.Text\nWrite-Output 'ok'\ncmd /c exit 78"},
+		{"nbsp-then-using", " using namespace System.Text\nWrite-Output 'ok'\ncmd /c exit 78"},
+		// PowerShell은 **단독 CR도 줄 종료**로 처리한다(실측 확인). LF만 찾는 구현은
+		// 주석이 다음 LF까지 이어진다고 보고 using을 지나쳐 승격한다 — 같은 ParserError.
+		{"cr-line-comment-then-using", "# note\rusing namespace System.Text\nWrite-Output 'ok'\ncmd /c exit 78"},
+	}
+	for _, tc := range fallback {
+		t.Run("fallback/"+tc.name, func(t *testing.T) {
+			if promotesNativeExitSignal(tc.code) {
+				t.Fatalf("승격됐다 — 최상단 전용 구문이므로 폴백해야 한다\ncode=%q", tc.code)
+			}
+		})
+	}
+
+	promote := []struct{ name, code string }{
+		{"plain", "cmd /c exit 71\nexit 3"},
+		{"line-comment-first", "# just a comment\ncmd /c exit 82"},
+		{"requires-first", "#requires -Version 5\ncmd /c exit 81"},
+		{"strictmode-first", "Set-StrictMode -Version Latest\n\"hello\""},
+		{"variable-first", "$x = 1\ncmd /c exit 77"},
+		{"param-inside-function", "function f { param($y) }\nf\ncmd /c exit 70"},
+		{"paramx-identifier", "$paramX = 1\ncmd /c exit 70"},
+		{"unterminated-block-comment", "<# never closed\ncmd /c exit 70"},
+		{"empty", ""},
+	}
+	for _, tc := range promote {
+		t.Run("promote/"+tc.name, func(t *testing.T) {
+			if !promotesNativeExitSignal(tc.code) {
+				t.Fatalf("폴백됐다 — 승격 대상이다\ncode=%q", tc.code)
+			}
+		})
+	}
+}

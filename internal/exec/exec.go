@@ -16,6 +16,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	"github.com/wotjr1649/context-router/internal/sandbox"
 )
@@ -256,6 +257,77 @@ const ctrNativeExitFile = "ctr-native-exit"
 // tail이 남긴 값으로 오인하지 않기 위한 판별 접두어. tail만 이 접두어를 붙여 쓰고,
 // readNativeExitCode는 이 접두어가 없는 파일 내용을 전부 "보강하지 않음"으로 취급한다.
 const ctrNativeExitMarker = "ctr-exit-code:"
+
+// promotesNativeExitSignal — D78: 스니펫이 PowerShell 최상단 전용 구문으로 시작하면
+// 등록 문을 붙이지 않는다(승격하지 않는다). 등록 문은 스니펫 앞의 한 문장이라 그런
+// 구문의 자리를 빼앗고, 그러면 본문이 실행되지 않거나 종료 코드가 뒤집힌다.
+// 적용 대상은 BOM을 붙이기 **전**의 원본 코드다 — 선두 U+FEFF를 먼저 떼지 않으면
+// 공백 판정이 거기서 멈춰 모든 감지가 실패한다(설계 v0.14 D78 1단계).
+//
+// 과잉 폴백은 허용한다(기존 동작 유지). 미탐만이 회귀이며, 이 비대칭이 판정을 넓게
+// 잡는 이유다 — `[`로 시작하는 타입 캐스트나 `end`를 명령명으로 쓰는 문장이 함께
+// 걸리는 것은 무해하다.
+func promotesNativeExitSignal(code string) bool {
+	s := strings.TrimPrefix(code, "\uFEFF")
+	// 2단계: 공백과 주석을 소비한다. 판정은 **현재 위치의 첫 문자로만** 한다 —
+	// `<#`를 먼저 찾는 구현은 `# ... <#` 형태에서 짝 없는 `#>`를 찾아 남은 입력을
+	// 전부 삼키고 미탐을 낸다.
+	for {
+		// PowerShell의 공백은 " \t\r\n" 넷보다 넓다 — form feed(U+000C) · vertical tab
+		// (U+000B) · Unicode Zs(NBSP U+00A0 포함)도 공백이다. unicode.IsSpace가
+		// White_Space 속성을 보므로 그 전부를 덮는다. 과잉 폴백 방향이라 "미탐만이
+		// 회귀"라는 설계 §0의 비대칭 규칙에 부합한다.
+		s = strings.TrimLeftFunc(s, unicode.IsSpace)
+		switch {
+		case strings.HasPrefix(s, "<#"):
+			j := strings.Index(s[2:], "#>")
+			if j < 0 {
+				return true // 닫히지 않은 블록 주석 — EOF까지 소비. 어느 형태로도 ParserError라 결과가 같다.
+			}
+			s = s[2+j+2:]
+		case strings.HasPrefix(s, "#"):
+			// PowerShell은 **단독 CR도 줄 종료**로 처리한다(검수 실측). LF만 찾으면
+			// `# note\rusing namespace …`에서 주석이 다음 LF까지 이어진다고 보고
+			// using을 지나쳐 승격한다 — 그 스니펫은 ParserError로 통째로 사라진다.
+			// CRLF에서 남는 \n은 다음 루프의 TrimLeftFunc가 소비한다.
+			j := strings.IndexAny(s, "\r\n")
+			if j < 0 {
+				return true // 주석만 있는 스니펫
+			}
+			s = s[j+1:]
+		default:
+			return promotesFirstToken(s)
+		}
+	}
+}
+
+// promotesFirstToken — 주석·공백을 걷어낸 뒤의 첫 실질 토큰으로 판정한다(설계 3단계).
+func promotesFirstToken(s string) bool {
+	if s == "" {
+		return true
+	}
+	// `[`는 속성 선언 시작, 백틱은 줄 연속 문자다. 백틱을 소비하지 않으면 그 뒤의
+	// 최상단 전용 구문이 그대로 승격되어 스니펫이 통째로 사라진다(설계 §관측 5라운드 18).
+	if s[0] == '[' || s[0] == '`' {
+		return false
+	}
+	j := 0
+	for j < len(s) {
+		c := s[j]
+		alpha := c == '_' || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z')
+		digit := c >= '0' && c <= '9'
+		if alpha || (j > 0 && digit) {
+			j++
+			continue
+		}
+		break
+	}
+	switch strings.ToLower(s[:j]) {
+	case "param", "using", "dynamicparam", "begin", "process", "end", "clean":
+		return false
+	}
+	return true
+}
 
 // snippetContent — .ps1에는 UTF-8 BOM(기존 계약, I2 — powershell.exe 5.1이 BOM 없는 .ps1을
 // 시스템 ANSI 코드페이지로 디코딩해 비ASCII를 손상시키는 것을 막는다)과 D76 tail을 붙인다.
