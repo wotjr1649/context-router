@@ -1839,6 +1839,23 @@ func runPS1Shell(t *testing.T, shell, dir, code string, promote bool) (exitCode 
 		t.Skip("windows shell 갈래 전용(PowerShell -File 계약)")
 	}
 	bin := psBin(t, shell)
+	// 환경도 러너가 만드는 것을 그대로 재현한다(exec.go:133 + shellRunner의 extra). cmd.Env를
+	// nil로 두면 호스트 환경 **전체**가 상속되어(sandbox.go:134-136이 경고하는 그 경로) D65가
+	// 일부러 떼어낸 호스트 PSModulePath가 스니펫에 닿고, 5.1의 실행 정책이 테스트를 띄운
+	// 세션의 상속 값에 따라 갈린다. 조립을 손으로 하는 것은 detect가 pwsh를 먼저 고르기
+	// 때문이다 — 5.1을 명시하는 레그는 직접 조립해야 한다(TestRunShellPS51ProviderWriteReturns
+	// 와 같은 방식).
+	pfDir := "WindowsPowerShell" // detect: pwsh → PowerShell, powershell → WindowsPowerShell
+	if strings.HasPrefix(strings.ToLower(filepath.Base(bin)), "pwsh") {
+		pfDir = "PowerShell"
+	}
+	mods := filepath.Join(dir, "psmodules") // extra와 같은 배치·같은 이름
+	if err := os.MkdirAll(mods, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	env := append(sandbox.BaseEnv(), tmpEnv(dir)...)
+	env = append(env, "PSModulePath="+psModulePath(mods, filepath.Dir(bin), pfDir), "USERPROFILE="+dir)
+
 	sidePath := filepath.Join(dir, ctrNativeExitFile)
 	_ = os.Remove(sidePath) // 같은 dir을 재사용하는 호출(§2.6 대조)에서 이전 값이 남지 않게 한다
 	var content []byte
@@ -1856,6 +1873,7 @@ func runPS1Shell(t *testing.T, shell, dir, code string, promote bool) (exitCode 
 	defer cancel()
 	cmd := exec.CommandContext(ctx, bin, "-NoProfile", "-NonInteractive", "-File", file)
 	cmd.Dir = dir
+	cmd.Env = env
 	cmd.WaitDelay = time.Second
 	var so, se bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &so, &se
@@ -1898,20 +1916,27 @@ func TestD78SignalOnExit(t *testing.T) {
 	// Skip한다(TestRunShellPS51ProviderWriteReturns 선례).
 	//
 	// 5.1 갈래가 네 사례 **모두** side=""로 실패하면 그것은 D78이 아니라 호스트의
-	// ExecutionPolicy다 — 스니펫을 파싱하기도 전에 load-time UnauthorizedAccess로 끝난다
-	// (5.1은 pwsh와 정책 키가 별개라 unset이면 Restricted). D78 부재는 그 서명을 내지
-	// 않는다: 폴백 tail이 그대로 도니 normal은 통과하고 exit로 끝나는 셋만 실패한다
-	// (Task 3 유도 FAIL 실측). 정책 차단을 Skip으로 바꾸는 감시선은 넣지 않는다 —
-	// Get-ExecutionPolicy는 5.1에서 Microsoft.PowerShell.Security 자동 로드에 실패할 수
-	// 있어(실측: CouldNotAutoloadMatchingModule) 정책과 무관하게 이 갈래를 통째로
-	// 건너뛰게 만든다. 5.1 갈래의 실검증 권위는 CI windows 잡이다.
+	// ExecutionPolicy다 — 스니펫을 파싱하기도 전에 load-time UnauthorizedAccess로 끝나고,
+	// 그 사유는 stderr에만 있다(아래 Fatalf가 함께 낸다). 5.1은 pwsh와 정책 레지스트리 키가
+	// 별개이며, 미설정 시 기본값은 **SKU에 따라 다르다**: 클라이언트 SKU는 Restricted라
+	// 이 차단이 나고, CI windows 러너가 쓰는 서버 SKU는 LocalMachine 기본값이 RemoteSigned라
+	// 서명 없는 로컬 .ps1이 그대로 돈다 — 개발기가 빨간불이어도 CI는 이 갈래를 실제로 밟는다.
+	//
+	// D78 부재는 그 서명을 내지 않는다: 폴백 tail이 그대로 도니 normal은 통과하고 exit로
+	// 끝나는 셋만 실패한다(Task 3 유도 FAIL 실측). 정책 차단을 Skip으로 바꾸는 감시선은 넣지
+	// 않는다 — Get-ExecutionPolicy는 5.1에서 Microsoft.PowerShell.Security 자동 로드에 실패할
+	// 수 있어(실측: CouldNotAutoloadMatchingModule) 정책과 무관하게 이 갈래를 통째로 건너뛰게
+	// 만든다. 5.1 갈래의 실검증 권위는 CI windows 잡이다.
 	for _, shell := range []string{"pwsh", "powershell"} {
 		t.Run(shell, func(t *testing.T) {
 			for _, tc := range cases {
 				t.Run(tc.name, func(t *testing.T) {
-					_, _, _, side := runPS1Shell(t, shell, t.TempDir(), tc.code, true)
+					_, _, errOut, side := runPS1Shell(t, shell, t.TempDir(), tc.code, true)
 					if side != tc.want {
-						t.Fatalf("side=%q want %q", side, tc.want)
+						// stderr를 함께 낸다 — 이 갈래의 흔한 실패 원인(로드 단계 정책 차단)은
+						// 사이드파일 값만으로는 보이지 않고 거기에만 적혀 있다.
+						t.Fatalf("side=%q want %q — stderr=%q", side, tc.want,
+							errOut[:min(len(errOut), 400)])
 					}
 				})
 			}
