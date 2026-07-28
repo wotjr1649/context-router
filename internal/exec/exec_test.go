@@ -1752,6 +1752,13 @@ func TestSnippetContentEscapesSidePath(t *testing.T) {
 	if strings.Contains(got, `'C:\Users\o'brien`) {
 		t.Fatal("원본 작은따옴표가 그대로 남아 문자열 리터럴이 조기 종료된다")
 	}
+	// 폴백 경로(nativeExitTail)도 같은 요건이다. 위 스니펫은 승격 대상이라 tail이 없으므로
+	// 이 단정 없이는 tail 쪽 이스케이프를 보는 곳이 하나도 남지 않는다 —
+	// TestSnippetContentFallbackKeepsD76Form의 골든은 작은따옴표가 없는 sidePath를 쓴다.
+	fb := string(snippetContent("snippet.ps1", "param($x)\ncmd /c exit 71", side))
+	if !strings.Contains(fb, `o''brien`) || strings.Contains(fb, `'C:\Users\o'brien`) {
+		t.Fatalf("폴백 경로의 작은따옴표가 이중화되지 않았다: %.240q", fb)
+	}
 }
 
 // TestSnippetContentFallbackKeepsD76Form — D78: 폴백 대상은 현재 D76 형태와 **바이트
