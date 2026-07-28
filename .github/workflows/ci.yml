@@ -162,12 +162,23 @@ jobs:
               exit 1
             fi
           done
-          if ! go build -tags perf ./...; then
-            echo "-tags perf build failed — this lint axis does not hold"
+          # perf 축만 go build가 아니다 — go build는 _test.go를 컴파일하지 않고 이 저장소에서
+          # perf 태그가 거는 파일은 internal/search/perf_test.go 하나뿐이라, go build -tags perf는
+          # 태그 없는 빌드와 같은 집합을 컴파일해 이 축에 대해 항상 통과한다(리뷰 실측).
+          # -run '^$'는 테스트 본문을 하나도 실행하지 않고 테스트 바이너리까지 링크하므로 실패가
+          # 곧 컴파일 실패다. go vet도 태그 붙은 테스트 파일을 보지만 golangci-lint의 기본 linter에
+          # govet이 이미 들어 있어 그 실패 출력은 3단계의 lint 소견과 구분되지 않는다 — 1단계가
+          # 존재하는 이유가 바로 그 신호 분리다. -p 1은 test 잡과 같은 메모리 캡 규율이고,
+          # 본문이 하나도 실행되지 않아 비용은 사실상 없다.
+          if ! go test -tags perf -run '^$' -p 1 ./...; then
+            echo "-tags perf test compile failed — this lint axis does not hold"
             exit 1
           fi
           # perf 축의 스코프 확인은 형태가 다르다 — .GoFiles는 _test.go를 포함하지 않아
-          # perf_test.go를 볼 수 없다. .TestGoFiles/.XTestGoFiles를 본다.
+          # perf_test.go를 볼 수 없다. .TestGoFiles/.XTestGoFiles를 본다. 두 join 사이의
+          # {{"\n"}}은 필수다 — 없으면 외부 테스트 파일이 생겼을 때 .TestGoFiles의 마지막
+          # 항목과 .XTestGoFiles의 첫 항목이 한 줄로 붙어 줄 끝 앵커($) 매칭이 어긋난다
+          # (stdlib strings로 실측: export_test.gobuilder_test.go).
           files="$(GOOS=darwin go list -f '{{join .GoFiles "\n"}}' ./internal/sandbox)"
           if ! grep -q 'launcher_darwin\.go$' <<<"$files"; then
             echo "launcher_darwin.go not in darwin lint scope"
@@ -178,7 +189,7 @@ jobs:
             echo "launcher_other.go not in netbsd lint scope"
             exit 1
           fi
-          files="$(go list -tags perf -f '{{join .TestGoFiles "\n"}}{{join .XTestGoFiles "\n"}}' ./internal/search)"
+          files="$(go list -tags perf -f '{{join .TestGoFiles "\n"}}{{"\n"}}{{join .XTestGoFiles "\n"}}' ./internal/search)"
           if ! grep -q 'perf_test\.go$' <<<"$files"; then
             echo "perf_test.go not in perf lint scope"
             exit 1
