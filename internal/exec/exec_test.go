@@ -439,7 +439,12 @@ func TestShellNativeExitAugmentation(t *testing.T) {
 	})
 
 	t.Run("strict_mode에_네이티브_명령_없음", func(t *testing.T) {
-		// tail이 $LASTEXITCODE를 직접 참조하면 여기서 미초기화 변수 오류가 stderr로 나간다.
+		// 이 스니펫은 최상단 전용 구문으로 시작하지 않아 **승격**된다(promote/strictmode-first).
+		// 그래서 여기서 $LASTEXITCODE를 직접 참조하는 것은 등록 문의 핸들러이고, 그런데도
+		// 미초기화 변수 오류가 stderr로 나가지 않아야 한다 — 핸들러가 스니펫의 strict mode
+		// 스코프 밖에서 돌기 때문이다(근거 실측은 exec.go의 nativeExitTail 주석). D76에서는
+		// 같은 자리를 tail의 Get-Variable 경유가 지켰다 — 아래 Fatalf 문면의 "tail"은 그때
+		// 표현이 남은 것이다.
 		resp := run(t, Request{Language: "shell", Code: "Set-StrictMode -Version Latest\nWrite-Output 'ok'\n"})
 		if resp.Stderr != "" {
 			t.Fatalf("stderr가 비어야 한다 — tail이 오류를 내면 안 된다: %q", resp.Stderr)
@@ -447,7 +452,12 @@ func TestShellNativeExitAugmentation(t *testing.T) {
 	})
 
 	t.Run("여러줄_문자열로_끝나는_스니펫", func(t *testing.T) {
-		// here-string으로 끝나고 마지막 개행이 없는 형태 — tail이 구문을 깨지 않아야 한다.
+		// here-string으로 끝나고 마지막 개행이 없는 형태. 이 스니펫은 `cmd`로 시작해 **승격**되므로
+		// tail이 붙지 않는다 — 등록 문이 첫 줄 **앞에** 인라인으로 들어갈 뿐 끝에는 아무것도
+		// 덧붙지 않는다. 그래서 여기서 보는 것은 "끝에 붙이기"가 아니라 "앞에 붙이기"가 구문을
+		// 깨지 않는다는 것이다(아래 Fatalf 문면의 "tail"은 D76 시절 표현이 남은 것이다).
+		// 폴백 tail의 선행 개행 계약은 TestSnippetContentFallbackKeepsD76Form의 골든 리터럴이
+		// 바이트 단위로 잠근다.
 		resp := run(t, Request{Language: "shell", Code: "cmd /c exit 5\n$x = @'\nline\n'@"})
 		if resp.ExitCode == nil || *resp.ExitCode != 0 {
 			t.Fatalf("tail이 구문을 깼다: exit=%v stderr=%q", resp.ExitCode, resp.Stderr)

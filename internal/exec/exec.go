@@ -180,9 +180,10 @@ func Run(ctx context.Context, scratchParent, selfExe string, req Request) (Respo
 	}
 	// D76: exit_code가 0이고 stderr가 빈 상황에서만 네이티브 종료 상황을 한 줄 남긴다 — 원래
 	// 비어 있던 자리에만 들어가므로 사용자 출력과 섞이지 않고, 응답 스키마도 바뀌지 않는다
-	// (필드를 더하면 outputSchema가 tools/list 표면을 넘긴다). tail이 읽는 $LASTEXITCODE는
-	// "마지막 외부 명령"(네이티브 프로그램 또는 호출된 스크립트)의 값이므로 문면도 그 한정을
-	// 그대로 적는다. .ps1 러너로 한정한다(F3 리뷰) — 그 밖의 언어는 tail을 쓴 적이 없어 사이드
+	// (필드를 더하면 outputSchema가 tools/list 표면을 넘긴다). 기록 경로 — D78 승격의 등록 문
+	// (nativeExitRegistration) 또는 폴백의 tail(nativeExitTail) — 이 읽는 $LASTEXITCODE는 "마지막
+	// 외부 명령"(네이티브 프로그램 또는 호출된 스크립트)의 값이므로 문면도 그 한정을 그대로 적는다.
+	// .ps1 러너로 한정한다(F3 리뷰) — 그 밖의 언어는 두 기록 경로 어느 쪽도 붙인 적이 없어 사이드
 	// 파일이 있을 수 없고, 있다면 스크래치가 스니펫의 작업 디렉터리이기도 해 스니펫이 같은
 	// 이름에 직접 쓴 것일 뿐이므로 읽을 이유가 없다(마커 요건은 readNativeExitCode가 추가로 막는다).
 	if strings.HasSuffix(r.file, ".ps1") && resp.ExitCode != nil && *resp.ExitCode == 0 && resp.Stderr == "" {
@@ -195,7 +196,7 @@ func Run(ctx context.Context, scratchParent, selfExe string, req Request) (Respo
 	return resp, nil
 }
 
-// maxNativeExitSideFileBytes — 사이드 파일 상한. tail이 쓰는 값은 ctrNativeExitMarker
+// maxNativeExitSideFileBytes — 사이드 파일 상한. 기록 경로(등록 문·tail)가 쓰는 값은 ctrNativeExitMarker
 // 다음에 $LASTEXITCODE의 [string] 변환뿐인데 $LASTEXITCODE는 PowerShell Int32라 그 변환은
 // 최대 11자("-2147483648")를 넘지 않는다 — 그 위에 여유를 얹는다. 스크래치가 스니펫의 작업
 // 디렉터리이기도 해 스니펫이 이 경로에 임의 크기 파일을 직접 쓸 수 있는데, os.ReadFile은 마커
@@ -206,8 +207,9 @@ func Run(ctx context.Context, scratchParent, selfExe string, req Request) (Respo
 // 막히는 값만 만들 수 있어 상한 자체를 더 이상 검증하지 못한다.
 const maxNativeExitSideFileBytes = len(ctrNativeExitMarker) + 16
 
-// readNativeExitCode — D76 사이드 파일 읽기. 파일 부재(tail 미실행)·마커 부재(스크래치가
-// 스니펫의 작업 디렉터리이기도 해 스니펫이 같은 이름에 직접 쓴 파일일 수 있다 — F3 리뷰)·
+// readNativeExitCode — D76 사이드 파일 읽기. 파일 부재(기록 경로 미실행 — 등록 문의 핸들러도
+// 폴백 tail도 값을 남기지 못한 경우)·마커 부재(스크래치가 스니펫의 작업 디렉터리이기도 해
+// 스니펫이 같은 이름에 직접 쓴 파일일 수 있다 — F3 리뷰)·
 // 빈 값($LASTEXITCODE 미설정, 즉 외부 명령이 없었음)·파싱 실패·상한 초과·비일반 파일(파이프
 // 등)은 모두 "보강하지 않음"이다(G1). 읽기는 상한+1로 제한한다 — netfetch.readBody·hook.Run과
 // 같은 관용구(초과 여부만 판별하면 되므로 상한을 넘는 파일 전체를 할당하지 않는다).
@@ -222,7 +224,7 @@ func readNativeExitCode(path string) (int, bool) {
 	}
 	b, err := io.ReadAll(io.LimitReader(f, int64(maxNativeExitSideFileBytes+1)))
 	if err != nil || len(b) > maxNativeExitSideFileBytes {
-		return 0, false // 상한 초과 — tail이 쓴 값일 수 없다(위 상수 주석)
+		return 0, false // 상한 초과 — 두 기록 경로 어느 쪽이 쓴 값도 아니다(위 상수 주석)
 	}
 	s, ok := strings.CutPrefix(strings.TrimSpace(string(b)), ctrNativeExitMarker)
 	if !ok || s == "" {
@@ -248,13 +250,15 @@ func goArgv(bin, file string) []string   { return []string{bin, "run", file} }
 func csArgv(bin, file string) []string   { return []string{bin, "run", file} }
 
 // ctrNativeExitFile — D76 사이드 파일 이름. 런별 스크래치 절대 경로로 고정해 스니펫이 작업
-// 디렉터리를 바꾼 뒤에도 tail이 쓰는 파일은 항상 같은 곳을 가리키게 한다. 스크래치가 스니펫의
-// 작업 디렉터리이기도 하므로 스니펫이 같은 이름의 **상대** 경로로 이 파일에 직접 쓰는 경로까지는
-// 이 상수(절대 경로 고정)만으로 막히지 않는다 — 그건 ctrNativeExitMarker가 막는다(F3 리뷰).
+// 디렉터리를 바꾼 뒤에도 기록 경로(등록 문·tail)가 쓰는 파일은 항상 같은 곳을 가리키게 한다.
+// 스크래치가 스니펫의 작업 디렉터리이기도 하므로 스니펫이 같은 이름의 **상대** 경로로 이 파일에
+// 직접 쓰는 경로까지는 이 상수(절대 경로 고정)만으로 막히지 않는다 — 그건 ctrNativeExitMarker가
+// 막는다(F3 리뷰).
 const ctrNativeExitFile = "ctr-native-exit"
 
 // ctrNativeExitMarker — F3 리뷰: 스니펫이 ctrNativeExitFile과 같은 이름에 직접 쓴 내용을
-// tail이 남긴 값으로 오인하지 않기 위한 판별 접두어. tail만 이 접두어를 붙여 쓰고,
+// 기록 경로가 남긴 값으로 오인하지 않기 위한 판별 접두어. 이 접두어를 붙여 쓰는 것은 D78
+// 승격의 등록 문(nativeExitRegistration)과 폴백의 tail(nativeExitTail) 둘뿐이고,
 // readNativeExitCode는 이 접두어가 없는 파일 내용을 전부 "보강하지 않음"으로 취급한다.
 const ctrNativeExitMarker = "ctr-exit-code:"
 
