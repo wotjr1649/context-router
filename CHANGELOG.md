@@ -143,6 +143,7 @@
 - **doctor 호스트 스니펫이 권한 모드를 기준으로 안내한다** (D64). 승인 강도가
   호스트 권한 모드와 규칙 평가 순서에 따라 달라지는 점을 문면에 반영했다.
 
+[0.14.0]: https://github.com/wotjr1649/context-router/compare/v0.13.0...v0.14.0
 [0.13.0]: https://github.com/wotjr1649/context-router/compare/v0.12.1...v0.13.0
 [0.12.1]: https://github.com/wotjr1649/context-router/compare/v0.12.0...v0.12.1
 [0.12.0]: https://github.com/wotjr1649/context-router/compare/v0.11.1...v0.12.0
