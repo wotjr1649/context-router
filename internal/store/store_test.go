@@ -2820,3 +2820,50 @@ func BenchmarkShadowPredicate(b *testing.B) {
 		}
 	}
 }
+
+// TestPurgeHookOnlyLockHoldBudget — D77: 기동 purge의 실 잠금 보유 시간이 훅 예산의
+// 절반을 넘지 않는다. 형태는 D73 §2⑦(TestOpenBudgetWithIndexDDL)을 따른다 —
+// elapsed >= budget이면 Fatalf이며 수동 판독이 아니다.
+//
+// 픽스처는 두 조건을 함께 만족해야 한다(설계 v0.14 §2.1):
+//   - 경로 조건: 블롭 mtime을 gcOrphanMinAge 이전으로 소급시킨다. 그러지 않으면
+//     reclaimHookBlobs의 나이 게이트가 단락되어 stillReferenced 쿼리도 os.Remove도
+//     실행되지 않고, 유예 경로만 재는 종이 게이트가 된다.
+//   - 규모 조건: 개발기 실측이 budget의 1/5 이하가 되는 해시 수를 쓴다. 이 게이트는
+//     CI에서 3-OS와 -race로 네 번 도는데, 원 실측(100해시 632ms) 대비 여유 1.58배로는
+//     러너 편차 한 번이 BLOCKED가 된다.
+//
+// 그래서 이 게이트가 잡는 것은 **해시당 비용의 회귀**다. startupPurgeMaxHashes(100해시)
+// 배치의 절대 보유 시간은 합성 픽스처로 검증할 수 없다(실 저장소와 분포가 다르다).
+func TestPurgeHookOnlyLockHoldBudget(t *testing.T) {
+	const (
+		budget = 1000 * time.Millisecond // 훅 총예산 2000ms의 50%(설계 v0.14 D77)
+		hashes = 20                      // 규모 조건: 개발기 실측이 budget/5 이하가 되도록 고른 값
+	)
+	st := openAt(t, t.TempDir())
+	for i := 0; i < hashes; i++ {
+		c := fmt.Sprintf("lock-hold-budget-%d", i)
+		regSource(t, st, c, "text/plain", fmt.Sprintf("shadow:Bash:%d", i), "hook")
+		ageBlobFile(t, st, hashOf(c), -2*gcOrphanMinAge) // 경로 조건
+	}
+
+	start := time.Now()
+	rep, err := st.PurgeHookOnlyOlderThan(t.Context(), 0, hashes)
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("PurgeHookOnlyOlderThan: %v", err)
+	}
+	if rep.Hashes != hashes {
+		t.Fatalf("rep.Hashes=%d want %d — 픽스처가 의도한 규모로 처리되지 않았다", rep.Hashes, hashes)
+	}
+	if rep.ReclaimedB <= 0 || rep.DeferredFiles != 0 {
+		t.Fatalf("회수 경로를 타지 않았다: ReclaimedB=%d DeferredFiles=%d — 나이 게이트가 단락되면 이 게이트는 유예 경로만 재는 종이 게이트가 된다",
+			rep.ReclaimedB, rep.DeferredFiles)
+	}
+	t.Logf("hashes=%d reclaimed=%dB deferred=%d 보유 %v (budget %v, 여유 %.1f배)",
+		rep.Hashes, rep.ReclaimedB, rep.DeferredFiles, elapsed, budget, float64(budget)/float64(elapsed))
+	if elapsed >= budget {
+		t.Fatalf("잠금 보유가 예산을 넘었다: %v >= %v (hashes=%d reclaimed=%dB deferred=%d) — 개발기 기준값은 이 절반 이하였다",
+			elapsed, budget, rep.Hashes, rep.ReclaimedB, rep.DeferredFiles)
+	}
+}
