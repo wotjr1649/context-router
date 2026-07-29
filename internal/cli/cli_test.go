@@ -165,7 +165,7 @@ func TestRunDoctor_Smoke(t *testing.T) {
 	}
 
 	var buf bytes.Buffer
-	if err := runDoctor(context.Background(), &buf, storeRoot, projectRoot, "0.0.1-dev"); err != nil {
+	if err := runDoctor(context.Background(), &buf, storeRoot, projectRoot, "0.0.1-dev", false); err != nil {
 		t.Fatalf("runDoctor err=%v out=%s", err, buf.String())
 	}
 	out := buf.String()
@@ -213,7 +213,7 @@ func TestRunDoctor_InitializedStore(t *testing.T) {
 	}
 
 	var buf bytes.Buffer
-	if err := runDoctor(context.Background(), &buf, storeRoot, projectRoot, "0.0.1-dev"); err != nil {
+	if err := runDoctor(context.Background(), &buf, storeRoot, projectRoot, "0.0.1-dev", false); err != nil {
 		t.Fatalf("runDoctor err=%v out=%s", err, buf.String())
 	}
 	out := buf.String()
@@ -259,7 +259,7 @@ func TestRunDoctor_ContentDBSize(t *testing.T) {
 	}
 
 	var buf bytes.Buffer
-	if err := runDoctor(context.Background(), &buf, storeRoot, projectRoot, "0.0.1-dev"); err != nil {
+	if err := runDoctor(context.Background(), &buf, storeRoot, projectRoot, "0.0.1-dev", false); err != nil {
 		t.Fatalf("runDoctor err=%v out=%s", err, buf.String())
 	}
 	if !strings.Contains(buf.String(), "[14] content.db: sources=2 artifacts=2 blob=45B") {
@@ -332,7 +332,7 @@ func TestRunDoctor_StoreSizeWarn(t *testing.T) {
 	storeRoot, projectRoot := doctorSizeWarnSetup(t)
 	t.Setenv("CTR_STORE_WARN_BYTES", "5") // blob 10B > 5B → 발화
 	var buf bytes.Buffer
-	if err := runDoctor(context.Background(), &buf, storeRoot, projectRoot, "0.0.1-dev"); err != nil {
+	if err := runDoctor(context.Background(), &buf, storeRoot, projectRoot, "0.0.1-dev", false); err != nil {
 		t.Fatalf("runDoctor err=%v out=%s", err, buf.String())
 	}
 	for _, want := range []string{"[14] warning:", "purge", "--hook-only"} {
@@ -345,7 +345,7 @@ func TestRunDoctor_StoreSizeWarn(t *testing.T) {
 func TestRunDoctor_StoreSizeWarnSilentUnderThreshold(t *testing.T) {
 	storeRoot, projectRoot := doctorSizeWarnSetup(t) // 임계 미설정 — 기본 100MiB
 	var buf bytes.Buffer
-	if err := runDoctor(context.Background(), &buf, storeRoot, projectRoot, "0.0.1-dev"); err != nil {
+	if err := runDoctor(context.Background(), &buf, storeRoot, projectRoot, "0.0.1-dev", false); err != nil {
 		t.Fatalf("runDoctor err=%v out=%s", err, buf.String())
 	}
 	if !strings.Contains(buf.String(), "[14] content.db: sources=1 artifacts=1 blob=10B") {
@@ -363,7 +363,7 @@ func TestRunDoctor_ContentFileWarn(t *testing.T) {
 	storeRoot, projectRoot := doctorSizeWarnSetup(t)
 	t.Setenv("CTR_CONTENT_FILE_WARN_BYTES", "1")
 	var buf bytes.Buffer
-	if err := runDoctor(context.Background(), &buf, storeRoot, projectRoot, "0.0.1-dev"); err != nil {
+	if err := runDoctor(context.Background(), &buf, storeRoot, projectRoot, "0.0.1-dev", false); err != nil {
 		t.Fatalf("runDoctor err=%v out=%s", err, buf.String())
 	}
 	out := buf.String()
@@ -381,7 +381,7 @@ func TestRunDoctor_ContentFileWarnAxisIndependent(t *testing.T) {
 	storeRoot, projectRoot := doctorSizeWarnSetup(t)
 	t.Setenv("CTR_STORE_WARN_BYTES", "1")
 	var buf bytes.Buffer
-	if err := runDoctor(context.Background(), &buf, storeRoot, projectRoot, "0.0.1-dev"); err != nil {
+	if err := runDoctor(context.Background(), &buf, storeRoot, projectRoot, "0.0.1-dev", false); err != nil {
 		t.Fatalf("runDoctor err=%v out=%s", err, buf.String())
 	}
 	out := buf.String()
@@ -485,7 +485,7 @@ func TestDoctorShadowOwnedLine(t *testing.T) {
 	})
 
 	var buf bytes.Buffer
-	if err := runDoctor(context.Background(), &buf, storeRoot, projectRoot, "0.0.1-dev"); err != nil {
+	if err := runDoctor(context.Background(), &buf, storeRoot, projectRoot, "0.0.1-dev", false); err != nil {
 		t.Fatalf("runDoctor err=%v out=%s", err, buf.String())
 	}
 	out := buf.String()
@@ -529,7 +529,7 @@ func TestDoctorShadowOwnedIncomplete(t *testing.T) {
 	}
 
 	var buf bytes.Buffer
-	if err := runDoctor(context.Background(), &buf, storeRoot, projectRoot, "0.0.1-dev"); err != nil {
+	if err := runDoctor(context.Background(), &buf, storeRoot, projectRoot, "0.0.1-dev", false); err != nil {
 		t.Fatalf("runDoctor err=%v ([15] 실패가 전역 failed로 새면 안 됨) out=%s", err, buf.String())
 	}
 	out := buf.String()
@@ -567,7 +567,7 @@ func TestDoctorShadowOwnedShared(t *testing.T) {
 	seedShadowWorktree(t, wt, cxSid, []string{"artifact://" + cxSid + "/sha256-" + ownedHash})
 
 	var buf bytes.Buffer
-	if err := runDoctor(context.Background(), &buf, storeRoot, projectRoot, "0.0.1-dev"); err != nil {
+	if err := runDoctor(context.Background(), &buf, storeRoot, projectRoot, "0.0.1-dev", false); err != nil {
 		t.Fatalf("runDoctor err=%v out=%s", err, buf.String())
 	}
 	out := buf.String()
@@ -592,7 +592,7 @@ func TestDoctorShadowOwnedUnattributed(t *testing.T) {
 	seedShadowWorktree(t, wt, sid, []string{"artifact://" + sid + "/sha256-" + strings.Repeat("d", 64)}) // 비귀속 hash
 
 	var buf bytes.Buffer
-	if err := runDoctor(context.Background(), &buf, storeRoot, projectRoot, "0.0.1-dev"); err != nil {
+	if err := runDoctor(context.Background(), &buf, storeRoot, projectRoot, "0.0.1-dev", false); err != nil {
 		t.Fatalf("runDoctor err=%v out=%s", err, buf.String())
 	}
 	out := buf.String()
@@ -617,7 +617,7 @@ func TestDoctorShadowOwnedMultiWorktree(t *testing.T) {
 	seedShadowWorktree(t, filepath.Join(projDir, "worktrees", "wt2"), cxSid, []string{"artifact://" + cxSid + "/sha256-" + ownedHash})
 
 	var buf bytes.Buffer
-	if err := runDoctor(context.Background(), &buf, storeRoot, projectRoot, "0.0.1-dev"); err != nil {
+	if err := runDoctor(context.Background(), &buf, storeRoot, projectRoot, "0.0.1-dev", false); err != nil {
 		t.Fatalf("runDoctor err=%v out=%s", err, buf.String())
 	}
 	out := buf.String()
@@ -636,7 +636,7 @@ func TestDoctorShadowOwnedNoSessionDecomp(t *testing.T) {
 	seedShadowContentDB(t, projDir) // worktrees 디렉터리 미생성 → usable=0
 
 	var buf bytes.Buffer
-	if err := runDoctor(context.Background(), &buf, storeRoot, projectRoot, "0.0.1-dev"); err != nil {
+	if err := runDoctor(context.Background(), &buf, storeRoot, projectRoot, "0.0.1-dev", false); err != nil {
 		t.Fatalf("runDoctor err=%v out=%s", err, buf.String())
 	}
 	out := buf.String()
@@ -1736,7 +1736,7 @@ func TestRunDoctor_StoreRootDeepMissingParents_Writable(t *testing.T) {
 	projectRoot := t.TempDir()
 
 	var buf bytes.Buffer
-	if err := runDoctor(context.Background(), &buf, storeRoot, projectRoot, "0.0.1-dev"); err != nil {
+	if err := runDoctor(context.Background(), &buf, storeRoot, projectRoot, "0.0.1-dev", false); err != nil {
 		t.Fatalf("runDoctor err=%v out=%s", err, buf.String())
 	}
 	if !strings.Contains(buf.String(), "[1] store-root: exists=false writable=true") {
@@ -1764,7 +1764,7 @@ func TestRunDoctor_StoreRootAncestorIsFile_Rejected(t *testing.T) {
 	projectRoot := t.TempDir()
 
 	var buf bytes.Buffer
-	err := runDoctor(context.Background(), &buf, storeRoot, projectRoot, "0.0.1-dev")
+	err := runDoctor(context.Background(), &buf, storeRoot, projectRoot, "0.0.1-dev", false)
 	if err == nil {
 		t.Fatal("want error — store-root의 중간 조상이 비디렉터리 파일")
 	}
@@ -1785,7 +1785,7 @@ func TestRunDoctor_StoreRootIsFile_Rejected(t *testing.T) {
 	projectRoot := t.TempDir()
 
 	var buf bytes.Buffer
-	err := runDoctor(context.Background(), &buf, storeRoot, projectRoot, "0.0.1-dev")
+	err := runDoctor(context.Background(), &buf, storeRoot, projectRoot, "0.0.1-dev", false)
 	if err == nil {
 		t.Fatal("want error — store-root path is an existing non-directory file")
 	}
@@ -1921,7 +1921,7 @@ func TestRunDoctor_SessionItems(t *testing.T) {
 		storeRoot := t.TempDir()
 		projectRoot := t.TempDir()
 		var buf bytes.Buffer
-		if err := runDoctor(context.Background(), &buf, storeRoot, projectRoot, "0.0.1-dev"); err != nil {
+		if err := runDoctor(context.Background(), &buf, storeRoot, projectRoot, "0.0.1-dev", false); err != nil {
 			t.Fatalf("runDoctor err=%v out=%s", err, buf.String())
 		}
 		out := buf.String()
@@ -1953,7 +1953,7 @@ func TestRunDoctor_SessionItems(t *testing.T) {
 		}
 
 		var buf bytes.Buffer
-		if err := runDoctor(context.Background(), &buf, storeRoot, projectRoot, "0.0.1-dev"); err != nil {
+		if err := runDoctor(context.Background(), &buf, storeRoot, projectRoot, "0.0.1-dev", false); err != nil {
 			t.Fatalf("runDoctor err=%v out=%s", err, buf.String())
 		}
 		out := buf.String()
@@ -1989,7 +1989,7 @@ func TestRunDoctor_SessionItems(t *testing.T) {
 		}
 
 		var buf bytes.Buffer
-		err = runDoctor(context.Background(), &buf, storeRoot, projectRoot, "0.0.1-dev")
+		err = runDoctor(context.Background(), &buf, storeRoot, projectRoot, "0.0.1-dev", false)
 		if err == nil {
 			t.Fatalf("want error(진단 실패 항목 존재), got nil: %s", buf.String())
 		}
@@ -2032,7 +2032,7 @@ func TestDoctorEmptyExcludesSubagentLifecycle(t *testing.T) {
 	}
 
 	var buf bytes.Buffer
-	if err := runDoctor(context.Background(), &buf, storeRoot, projectRoot, "0.0.1-dev"); err != nil {
+	if err := runDoctor(context.Background(), &buf, storeRoot, projectRoot, "0.0.1-dev", false); err != nil {
 		t.Fatalf("runDoctor err=%v out=%s", err, buf.String())
 	}
 	if !strings.Contains(buf.String(), "sessions=2 (empty=1)") {
@@ -2335,17 +2335,20 @@ func TestPurgeHookOnlyComboRejected(t *testing.T) {
 // TestDoctorCodexMCPLine — D52 doctor [16] 5분기(v0.9 §0). CODEX_HOME 격리 하에 각 분기 출력을
 // 단정한다. 버전은 runDoctor에 넘긴 ver로 스레딩하고 픽스처 marker도 같은 ver로 조립해([9]식
 // marker≠version 불일치 문구 회피) 0.9.0 하드코딩 없이 범프 후에도 유효하게 유지한다.
+// write — 픽스처 파일 기록 테스트 헬퍼. 원래 TestDoctorCodexMCPLine의 지역 클로저였고,
+// D83의 [20]·--fix 테스트가 같은 것을 필요로 해 파일 수준으로 올렸다.
+func write(t *testing.T, path string, data []byte) {
+	t.Helper()
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatalf("write %s: %v", filepath.Base(path), err)
+	}
+}
+
 func TestDoctorCodexMCPLine(t *testing.T) {
 	const ver = "9.9.9-test" // 바이너리 기본 version과 무관한 합성값 — doctor가 인자 version을 쓰는지 검증
 	selfHooks, err := mergeCodexHooks(nil, buildCodexHookCommand(false, "", false), hookMarker(ver), true, true)
 	if err != nil {
 		t.Fatalf("selfHooks 조립: %v", err)
-	}
-	write := func(t *testing.T, path string, data []byte) {
-		t.Helper()
-		if err := os.WriteFile(path, data, 0o600); err != nil {
-			t.Fatalf("write %s: %v", filepath.Base(path), err)
-		}
 	}
 	cases := []struct {
 		name        string
@@ -2401,7 +2404,7 @@ func TestDoctorCodexMCPLine(t *testing.T) {
 			projectRoot := t.TempDir()
 			c.setup(t, codexHome, projectRoot)
 			var buf bytes.Buffer
-			if err := runDoctor(context.Background(), &buf, storeRoot, projectRoot, ver); err != nil {
+			if err := runDoctor(context.Background(), &buf, storeRoot, projectRoot, ver, false); err != nil {
 				t.Fatalf("runDoctor err=%v out=%s", err, buf.String())
 			}
 			out := buf.String()
@@ -2422,11 +2425,227 @@ func TestDoctorCodexMCPLine(t *testing.T) {
 	}
 }
 
+// TestDoctorMCPMarkerLine — D83 신설 검사(§2-13). 감지원이 **먼저** 물려야 --fix가 고칠
+// 대상을 안다: [9]는 .claude/settings.json의 훅 그룹만 읽고, [16]의 버전 비교는 hooks.json에서
+// 뽑은 값이며, config.toml은 존재·부재·이상만 읽는다. .mcp.json을 읽는 doctor 항목은 없었다.
+// D82가 버전을 MCP 등록물로 옮겼으므로 이 검사가 없으면 --fix에 감지원이 하나도 남지 않는다.
+func TestDoctorMCPMarkerLine(t *testing.T) {
+	cases := []struct {
+		name        string
+		setup       func(t *testing.T, codexHome, projectRoot string)
+		wantContain []string
+		wantAbsent  []string
+	}{
+		{
+			name:        "① 두 등록물 모두 부재",
+			setup:       func(t *testing.T, codexHome, projectRoot string) {},
+			wantContain: []string{"[20] mcp markers: .mcp.json=없음 codex=없음"},
+			wantAbsent:  []string{"[20] warning:"},
+		},
+		{
+			name: "② 두 등록물 모두 현재 버전 — 경고 없음",
+			setup: func(t *testing.T, codexHome, projectRoot string) {
+				var out bytes.Buffer
+				if err := runHookInstall(nil, t.TempDir(), "", false, projectRoot, "0.15.0", &out); err != nil {
+					t.Fatal(err)
+				}
+				if err := runHookInstall([]string{"--codex", "--user"}, "", "", false, projectRoot, "0.15.0", &out); err != nil {
+					t.Fatal(err)
+				}
+			},
+			wantContain: []string{"[20] mcp markers: .mcp.json=marker 0.15.0 codex=marker 0.15.0"},
+			wantAbsent:  []string{"[20] warning:"},
+		},
+		{
+			name: "③ 구 버전 표식 — 드리프트 경고",
+			setup: func(t *testing.T, codexHome, projectRoot string) {
+				var out bytes.Buffer
+				if err := runHookInstall(nil, t.TempDir(), "", false, projectRoot, "0.14.0", &out); err != nil {
+					t.Fatal(err)
+				}
+			},
+			wantContain: []string{"marker 0.14.0", "≠0.15.0", "[20] warning:", "doctor --fix"},
+		},
+		{
+			name: "④ 무버전 표식 — 버전 미상도 드리프트다(hostSnippet 붙여넣기 경로)",
+			setup: func(t *testing.T, codexHome, projectRoot string) {
+				write(t, filepath.Join(codexHome, "config.toml"),
+					[]byte("[mcp_servers.ctr]\ncommand = \"context-router\"\n[mcp_servers.ctr.env]\nCTR_MANAGED = \"context-router\"\n"))
+			},
+			wantContain: []string{"codex=marker 버전미상", "[20] warning:"},
+		},
+		{
+			name: "⑤ 우리 표식이 아니면 고칠 대상이 아니다",
+			setup: func(t *testing.T, codexHome, projectRoot string) {
+				write(t, filepath.Join(codexHome, "config.toml"),
+					[]byte("[mcp_servers.ctr]\ncommand = \"other\"\n[mcp_servers.ctr.env]\nCTR_MANAGED = \"other-tool/1.0\"\n"))
+			},
+			wantContain: []string{"codex=미등록"},
+			wantAbsent:  []string{"[20] warning:"},
+		},
+		{
+			// 표식은 없지만 command가 우리 것인 테이블은 D80의 **인수 대상**이라 install도
+			// --fix도 표식을 채운다. 그것을 "미등록"으로 보고하면 감지와 고침이 어긋난다 —
+			// 검사가 고칠 것이 없다고 말한 자리에서 --fix가 파일을 바꾸게 된다.
+			name: "⑥ 표식 없는 우리 테이블 — 인수 대상이므로 드리프트다",
+			setup: func(t *testing.T, codexHome, projectRoot string) {
+				write(t, filepath.Join(codexHome, "config.toml"),
+					[]byte("[mcp_servers.ctr]\ncommand = \"context-router\"\nargs = []\n"))
+			},
+			wantContain: []string{"codex=표식없음", "[20] warning:", "doctor --fix"},
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			codexHome := t.TempDir()
+			t.Setenv("CODEX_HOME", codexHome)
+			projectRoot := t.TempDir()
+			c.setup(t, codexHome, projectRoot)
+			var buf bytes.Buffer
+			if err := runDoctor(context.Background(), &buf, t.TempDir(), projectRoot, "0.15.0", false); err != nil {
+				t.Fatalf("runDoctor err=%v out=%s", err, buf.String())
+			}
+			out := buf.String()
+			for _, want := range c.wantContain {
+				if !strings.Contains(out, want) {
+					t.Errorf("출력에 %q 없음:\n%s", want, out)
+				}
+			}
+			for _, absent := range c.wantAbsent {
+				if strings.Contains(out, absent) {
+					t.Errorf("출력에 %q 있으면 안 됨:\n%s", absent, out)
+				}
+			}
+			// 항목 번호는 [20]이다 — 기존 번호를 밀지 않는다([16]·[17] 문면에 묶인 테스트가 있다).
+			if !strings.Contains(out, "[19] permissions:") || !strings.Contains(out, "[20] mcp markers:") {
+				t.Errorf("[19] 뒤에 [20]이 오지 않는다:\n%s", out)
+			}
+		})
+	}
+}
+
+// TestDoctorFix — D83 --fix(§2-13). 드리프트를 해소하고, 드리프트 없는 픽스처에서는 무변경이며,
+// 파일이 없으면 만들지 않고 안내만 낸다(doctor no-create). **파일이 있어도 우리 소유로 확인된
+// 등록물이 없으면 만들지 않는다** — no-create의 범위가 파일이 아니라 등록물이라는 것이 D83이고,
+// 그래야 [20]이 "미등록"으로 보고하는 상태와 --fix의 대상이 일치한다. 종료코드 계약도 바뀌지
+// 않는다 — 마커 드리프트와 그 고침은 실패 항목 수 계산에 들어가지 않는다([16] 경고와 같은 취급).
+func TestDoctorFix(t *testing.T) {
+	codexHome := t.TempDir()
+	t.Setenv("CODEX_HOME", codexHome)
+	projectRoot := t.TempDir()
+	var iout bytes.Buffer
+	if err := runHookInstall(nil, t.TempDir(), "", false, projectRoot, "0.14.0", &iout); err != nil {
+		t.Fatal(err)
+	}
+	if err := runHookInstall([]string{"--codex", "--user"}, "", "", false, projectRoot, "0.14.0", &iout); err != nil {
+		t.Fatal(err)
+	}
+	mcpPath := mcpConfigPath(projectRoot)
+	cfgPath := filepath.Join(codexHome, "config.toml")
+
+	var buf bytes.Buffer
+	if err := runDoctor(context.Background(), &buf, t.TempDir(), projectRoot, "0.15.0", true); err != nil {
+		t.Fatalf("runDoctor --fix err=%v out=%s", err, buf.String())
+	}
+	mb, _ := os.ReadFile(mcpPath)
+	if !strings.Contains(string(mb), `"__ctrManaged": "context-router/0.15.0"`) {
+		t.Errorf(".mcp.json 표식이 고쳐지지 않았다:\n%s", mb)
+	}
+	cb, _ := os.ReadFile(cfgPath)
+	if !strings.Contains(string(cb), `CTR_MANAGED = "context-router/0.15.0"`) {
+		t.Errorf("config.toml 표식이 고쳐지지 않았다:\n%s", cb)
+	}
+	if _, err := os.Stat(cfgPath + ".bak"); err != nil {
+		t.Errorf("--fix가 백업을 남기지 않았다: %v", err)
+	}
+
+	// 드리프트 없는 상태의 재실행은 무변경이다.
+	mb2Before, _ := os.ReadFile(mcpPath)
+	cb2Before, _ := os.ReadFile(cfgPath)
+	var buf2 bytes.Buffer
+	if err := runDoctor(context.Background(), &buf2, t.TempDir(), projectRoot, "0.15.0", true); err != nil {
+		t.Fatalf("runDoctor --fix 2: %v", err)
+	}
+	mb2After, _ := os.ReadFile(mcpPath)
+	cb2After, _ := os.ReadFile(cfgPath)
+	if !bytes.Equal(mb2Before, mb2After) || !bytes.Equal(cb2Before, cb2After) {
+		t.Errorf("드리프트 없는 --fix가 파일을 바꿨다")
+	}
+
+	// no-create: 파일이 없으면 만들지 않고 안내만 낸다.
+	emptyHome := t.TempDir()
+	t.Setenv("CODEX_HOME", emptyHome)
+	emptyProj := t.TempDir()
+	var buf3 bytes.Buffer
+	if err := runDoctor(context.Background(), &buf3, t.TempDir(), emptyProj, "0.15.0", true); err != nil {
+		t.Fatalf("runDoctor --fix(no file): %v", err)
+	}
+	if _, err := os.Stat(mcpConfigPath(emptyProj)); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("--fix가 없던 .mcp.json을 만들었다")
+	}
+	if _, err := os.Stat(filepath.Join(emptyHome, "config.toml")); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("--fix가 없던 config.toml을 만들었다")
+	}
+	if !strings.Contains(buf3.String(), "[20] fix: 대상 파일이 없어") {
+		t.Errorf("no-create 안내가 없다:\n%s", buf3.String())
+	}
+
+	// no-create의 범위는 파일이 아니라 **등록물**이다(D83): 파일은 있어도 우리 소유로
+	// 확인된 등록물이 없으면 만들지 않고 hook install을 안내한다. 이 상태를 [20]은
+	// "미등록"으로 보고하므로 감지와 고침의 대상이 정확히 일치한다.
+	otherHome := t.TempDir()
+	t.Setenv("CODEX_HOME", otherHome)
+	otherProj := t.TempDir()
+	otherCfg := filepath.Join(otherHome, "config.toml")
+	write(t, otherCfg, []byte("[model]\nname = \"gpt\"\n"))
+	otherMCP := mcpConfigPath(otherProj)
+	write(t, otherMCP, []byte("{\n  \"mcpServers\": {}\n}\n"))
+	var buf4 bytes.Buffer
+	if err := runDoctor(context.Background(), &buf4, t.TempDir(), otherProj, "0.15.0", true); err != nil {
+		t.Fatalf("runDoctor --fix(미등록): %v", err)
+	}
+	if cb4, _ := os.ReadFile(otherCfg); strings.Contains(string(cb4), "[mcp_servers.ctr]") {
+		t.Errorf("--fix가 없던 관리 테이블을 만들었다:\n%s", cb4)
+	}
+	if mb4, _ := os.ReadFile(otherMCP); strings.Contains(string(mb4), ctrMCPServerName) {
+		t.Errorf("--fix가 없던 .mcp.json 항목을 만들었다:\n%s", mb4)
+	}
+	if !strings.Contains(buf4.String(), "hook install") {
+		t.Errorf("미등록 안내가 없다:\n%s", buf4.String())
+	}
+}
+
+// TestRunDoctorFixFlag — D83 구현 이음새 ①. doctor 분기에 --fix 하나만 받는 자체 flagset을
+// 열고 그 밖의 인자는 종전대로 거부한다. 오류 문면은 사용자 입력을 에코하지 않는다(규약 §6).
+func TestRunDoctorFixFlag(t *testing.T) {
+	t.Setenv("CODEX_HOME", t.TempDir())
+	var out, errOut bytes.Buffer
+	if err := Run(context.Background(), "doctor", []string{"--fix"}, t.TempDir(), t.TempDir(), "0.15.0", false, "", &out, &errOut); err != nil {
+		t.Fatalf("doctor --fix: %v out=%s", err, out.String())
+	}
+	if !strings.Contains(out.String(), "[20] ") {
+		t.Errorf("--fix 실행에 [20]이 없다:\n%s", out.String())
+	}
+	for _, args := range [][]string{{"--bogus"}, {"extra"}, {"--fix", "extra"}} {
+		var o, e bytes.Buffer
+		err := Run(context.Background(), "doctor", args, t.TempDir(), t.TempDir(), "0.15.0", false, "", &o, &e)
+		if err == nil {
+			t.Errorf("%v: 인자를 거부하지 않았다", args)
+			continue
+		}
+		for _, tok := range args {
+			if strings.Contains(err.Error(), strings.TrimLeft(tok, "-")) && tok != "--fix" {
+				t.Errorf("%v: 오류가 사용자 입력을 에코했다: %v", args, err)
+			}
+		}
+	}
+}
+
 // TestDoctorShowsRunnerLine — [18] exec 러너 감지 라인(D58). 감지 결과는 환경 의존이라 접두만
 // 검증한다(exec는 opt-in 프로필이라 미검출이어도 실패 게이트가 아님 — err 무시).
 func TestDoctorShowsRunnerLine(t *testing.T) {
 	var buf bytes.Buffer
-	_ = runDoctor(context.Background(), &buf, t.TempDir(), t.TempDir(), "0.11.0")
+	_ = runDoctor(context.Background(), &buf, t.TempDir(), t.TempDir(), "0.11.0", false)
 	if !strings.Contains(buf.String(), "[18] exec runners:") {
 		t.Fatalf("[18] 누락:\n%s", buf.String())
 	}
@@ -2438,7 +2657,7 @@ func TestDoctorWarnMentionsHookOnly(t *testing.T) {
 	storeRoot, projectRoot := doctorSizeWarnSetup(t)
 	t.Setenv("CTR_STORE_WARN_BYTES", "5") // blob 10B > 5B → 발화
 	var buf bytes.Buffer
-	if err := runDoctor(context.Background(), &buf, storeRoot, projectRoot, "0.0.1-dev"); err != nil {
+	if err := runDoctor(context.Background(), &buf, storeRoot, projectRoot, "0.0.1-dev", false); err != nil {
 		t.Fatalf("runDoctor err=%v out=%s", err, buf.String())
 	}
 	out := buf.String()
@@ -2644,7 +2863,7 @@ func TestDoctorShowsPermissionLine(t *testing.T) {
 	t.Setenv("USERPROFILE", home) // windows
 	t.Setenv("HOME", home)        // unix
 	var buf bytes.Buffer
-	_ = runDoctor(context.Background(), &buf, t.TempDir(), t.TempDir(), "0.12.0")
+	_ = runDoctor(context.Background(), &buf, t.TempDir(), t.TempDir(), "0.12.0", false)
 	if !strings.Contains(buf.String(), "[19] permissions: ask/allow 충돌 없음") {
 		t.Fatalf("[19] 충돌 없음 라인 누락:\n%s", buf.String())
 	}
@@ -2670,7 +2889,7 @@ func TestDoctorReportsAskShadowedAllow(t *testing.T) {
 		t.Fatalf("write settings: %v", err)
 	}
 	var buf bytes.Buffer
-	_ = runDoctor(context.Background(), &buf, t.TempDir(), projectRoot, "0.12.0")
+	_ = runDoctor(context.Background(), &buf, t.TempDir(), projectRoot, "0.12.0", false)
 	if !strings.Contains(buf.String(), "[19] permissions: ask와 겹치는 allow 항목 2건 — mcp__ctr-exec__ctr_execute, mcp__ctr-exec") {
 		t.Fatalf("[19] 충돌 보고 누락:\n%s", buf.String())
 	}
@@ -2688,7 +2907,7 @@ func TestDoctorIndeterminateOnUnreadableScope(t *testing.T) {
 		t.Fatalf("mkdir: %v", err)
 	}
 	var buf bytes.Buffer
-	_ = runDoctor(context.Background(), &buf, t.TempDir(), projectRoot, "0.12.0")
+	_ = runDoctor(context.Background(), &buf, t.TempDir(), projectRoot, "0.12.0", false)
 	if !strings.Contains(buf.String(), "[19] permissions: ask/allow 판정 불가") {
 		t.Fatalf("읽을 수 없는 스코프인데 판정 불가가 아니다:\n%s", buf.String())
 	}
@@ -2702,7 +2921,7 @@ func TestDoctorPermissionLineOnCheckFailure(t *testing.T) {
 	t.Setenv("USERPROFILE", "") // windows
 	t.Setenv("HOME", "")        // unix
 	var buf bytes.Buffer
-	_ = runDoctor(context.Background(), &buf, t.TempDir(), t.TempDir(), "0.12.0")
+	_ = runDoctor(context.Background(), &buf, t.TempDir(), t.TempDir(), "0.12.0", false)
 	if !strings.Contains(buf.String(), "[19] permissions: ask/allow 판정 불가") {
 		t.Fatalf("판정 실패인데 판정 불가 라인이 없다:\n%s", buf.String())
 	}
@@ -2717,7 +2936,7 @@ func TestDoctorIndexesRender(t *testing.T) {
 	var buf bytes.Buffer
 	// doctor는 실패 항목이 있으면 오류를 낼 수 있다 — 이 테스트는 [3] 렌더만 보므로 출력으로 판정하고
 	// 오류는 로그로 남긴다.
-	if err := runDoctor(context.Background(), &buf, storeRoot, projectRoot, "0.0.1-dev"); err != nil {
+	if err := runDoctor(context.Background(), &buf, storeRoot, projectRoot, "0.0.1-dev", false); err != nil {
 		t.Logf("runDoctor: %v", err)
 	}
 	out := buf.String()

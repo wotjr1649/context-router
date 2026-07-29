@@ -88,6 +88,22 @@ func markerVersion(marker string) string {
 	return ""
 }
 
+// markerDrift — MCP 등록물 표식이 현재 버전과 어긋나는가(D83). 우리 표식이 아니면 고칠 대상이
+// 아니다. **무버전 표식(context-router)은 "표식 있음·버전 미상"이라 드리프트로 본다** —
+// hostSnippet이 인쇄하는 값이 그 형태이고, --fix가 현재 버전 값으로 채운다(D80).
+func markerDrift(marker, version string) bool {
+	return isOurMarkerValue(marker) && markerVersion(marker) != version
+}
+
+// ownedRegistration — 등록물이 우리 소유인가(D83 --fix의 대상 조건). 표식 값이 소유 기준을
+// 만족하거나 command가 hookBinaryName이면 참이다 — D80의 인수 절과 같은 기준이다.
+// 거짓이면 --fix는 병합하지 않고 hook install만 안내한다: 부재 파일뿐 아니라 **부재 등록물도
+// 만들지 않는 것**이 no-create 원칙의 범위이고, 등록 생성은 hook install의 일이다.
+// [20]의 "미등록" 표시가 이 술어의 거짓과 같은 조건이라 감지와 고침의 대상이 일치한다.
+func ownedRegistration(marker, command string, found bool) bool {
+	return found && (isOurMarkerValue(marker) || command == hookBinaryName)
+}
+
 // buildHookCommand — 등록할 훅 명령 문자열을 조립한다(설계 §7). --store-root는 명시된 경우에만
 // 원시값을 주입한다(기본 절대경로의 불필요한 영구 기입 방지 — 미명시 시 훅은 실행 시점에
 // CTR_STORE_ROOT>OS 기본으로 해석). --no-shadow는 러닝 훅이 CTR_SHADOW_OFF로 반영한다(settings

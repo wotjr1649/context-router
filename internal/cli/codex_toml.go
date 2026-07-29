@@ -634,6 +634,20 @@ func codexConfigPath() (string, error) {
 	return filepath.Join(home, ".codex", "config.toml"), nil
 }
 
+// codexConfigMarker — config.toml 관리 테이블의 소유 표식과 command를 읽는다(D83 감지원).
+// probe는 존재·부재·이상만 보므로 버전 비교에 쓸 수 없어 별도 판독기가 필요하다.
+// found는 **관리 테이블이 중복 없이 하나 있다**는 뜻이고, 표식이 없으면 marker는 ""다.
+func codexConfigMarker(existing []byte) (marker, command string, found bool) {
+	lines := splitLinesKeepEnds(existing)
+	sp := codexManagedSpans(lines)
+	if sp.dup || !sp.table.found {
+		return "", "", false
+	}
+	view := codexReadTable(lines, sp.table)
+	m, _ := codexMarkerValue(lines, sp, view)
+	return m, view.command, true
+}
+
 // codexTableView — 관리 테이블 구간을 소유 키와 보존 라인으로 가른 결과.
 type codexTableView struct {
 	command string   // command 키의 문자열 값(부재면 "")

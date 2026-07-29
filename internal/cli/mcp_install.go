@@ -82,6 +82,27 @@ func mcpConfigPath(projectRoot string) string {
 	return filepath.Join(projectRoot, ".mcp.json")
 }
 
+// mcpManagedMarker — .mcp.json에서 우리 항목의 __ctrManaged와 command를 읽는다(D83 감지원).
+// 파싱 실패·우리 항목 부재는 found=false다 — 파일 존재 여부는 호출자가 따로 본다(--fix의
+// no-create). command까지 돌려주는 이유: 표식이 없어도 command가 우리 것이면 D80의 인수
+// 대상이라 install도 --fix도 표식을 채운다. 그 상태를 "미등록"으로 접으면 감지와 고침이 어긋난다.
+func mcpManagedMarker(data []byte) (marker, command string, found bool) {
+	var doc struct {
+		Servers map[string]struct {
+			Managed string `json:"__ctrManaged"`
+			Command string `json:"command"`
+		} `json:"mcpServers"`
+	}
+	if json.Unmarshal(data, &doc) != nil {
+		return "", "", false
+	}
+	e, ok := doc.Servers[ctrMCPServerName]
+	if !ok {
+		return "", "", false
+	}
+	return e.Managed, e.Command, true
+}
+
 // mcpProfileNames — 설치기가 아는 프로필 이름(D81). 이 순서가 args의 쉼표 목록과
 // enabled_tools의 추가 순서를 함께 정한다 — 두 값이 같은 입력에서 같은 순서로 도출되므로
 // 골든이 입력 순서에 흔들리지 않는다. 서버 쪽 NewServer의 Enable 분기는 손대지 않는다.

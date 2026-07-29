@@ -77,12 +77,19 @@ func Run(ctx context.Context, sub string, args []string, storeRoot, projectRoot,
 		fmt.Fprintln(stdout, version)
 		return nil
 	case "doctor":
-		if len(args) > 0 {
-			// 사용자 입력(원시 args)을 오류 문구에 에코하지 않는다 — 개수만(규약 §6, 리뷰
-			// Fix Round 3, item 5).
-			return fmt.Errorf("cli: doctor: 예상치 않은 인자 %d개", len(args))
+		// D83 이음새 ① — --fix 하나만 받는 자체 flagset. 그 밖의 인자는 종전대로 거부하고,
+		// 오류 문면에는 사용자 입력(원시 args)을 에코하지 않는다(규약 §6) — flag 패키지의
+		// 오류는 플래그 이름을 담으므로 %w로 감싸지 않는다.
+		fs := flag.NewFlagSet("doctor", flag.ContinueOnError)
+		fs.SetOutput(io.Discard)
+		fix := fs.Bool("fix", false, "MCP 등록물의 버전 표식 드리프트를 현재 버전으로 다시 기입한다(기존 파일만)")
+		if err := fs.Parse(args); err != nil {
+			return errors.New("cli: doctor: 인식할 수 없는 플래그(사용 가능: --fix)")
 		}
-		return runDoctor(ctx, stdout, storeRoot, projectRoot, version)
+		if rest := fs.Args(); len(rest) > 0 {
+			return fmt.Errorf("cli: doctor: 예상치 않은 인자 %d개", len(rest))
+		}
+		return runDoctor(ctx, stdout, storeRoot, projectRoot, version, *fix)
 	case "upgrade":
 		if len(args) > 0 {
 			return fmt.Errorf("cli: upgrade: 예상치 않은 인자 %d개", len(args))
@@ -1500,7 +1507,7 @@ CTR_MANAGED = "context-router"
 // 스니펫을 w에 출력한다. store를 생성하지 않는다(store.Open(dir, true)만 사용, 설계 §7).
 // 실패 항목이 있으면 error를 반환한다(main이 exit 1) — 반환 오류 메시지에는 절대경로를
 // 담지 않는다(§12 canary), 대신 상세는 w의 진단 본문에 있다.
-func runDoctor(ctx context.Context, w io.Writer, storeRoot, projectRoot, version string) error {
+func runDoctor(ctx context.Context, w io.Writer, storeRoot, projectRoot, version string, fix bool) error {
 	var failed []string
 	fmt.Fprintln(w, "context-router doctor")
 	fmt.Fprintln(w)
@@ -1955,6 +1962,52 @@ func runDoctor(ctx context.Context, w io.Writer, storeRoot, projectRoot, version
 		fmt.Fprintln(w, "[19] permissions: ask/allow 충돌 없음")
 	}
 
+	// [20] MCP 등록물의 버전 표식(D83) — .mcp.json의 __ctrManaged와 config.toml의
+	// env.CTR_MANAGED. D82가 버전을 이 두 곳으로 옮겼으므로 이것이 --fix의 유일한 감지원이다.
+	// [9]는 훅 그룹만 읽고 [16]의 버전 비교는 hooks.json 값이며 config.toml은 존재·부재·이상만
+	// 읽는다. 경고는 [16]과 같이 failed에 계상하지 않는다(종료코드 계약 무변경).
+	// 항목 번호가 [20]인 이유: 현재 마지막이 [19]이고 기존 번호는 밀지 않는다([16]·[17] 문면에
+	// 묶인 테스트가 있다).
+	markerState := func(data []byte, readErr error, read func([]byte) (string, string, bool)) (string, bool) {
+		switch {
+		case errors.Is(readErr, os.ErrNotExist):
+			return "없음", false
+		case readErr != nil:
+			return "읽기실패", false
+		}
+		marker, command, found := read(data)
+		if !ownedRegistration(marker, command, found) {
+			return "미등록", false // 우리 소유가 아니면 고칠 대상이 아니다
+		}
+		if !isOurMarkerValue(marker) {
+			// 표식은 없지만 command가 우리 것 — D80의 인수 대상이라 --fix가 표식을 채운다.
+			// 이것을 "미등록"으로 접으면 [20]은 고칠 것이 없다고 말하는데 --fix는 파일을 바꾼다.
+			return "표식없음", true
+		}
+		v := markerVersion(marker)
+		if !markerDrift(marker, version) {
+			return "marker " + v, false
+		}
+		if v == "" { // 무버전 표식 — "표식 있음·버전 미상"(hostSnippet 붙여넣기 경로)
+			return "marker 버전미상≠" + version, true
+		}
+		return "marker " + v + "≠" + version, true
+	}
+	mcpData, mcpReadErr := os.ReadFile(mcpConfigPath(projectRoot))
+	mcpLabel, mcpDrift := markerState(mcpData, mcpReadErr, mcpManagedMarker)
+	codexLabel, codexDrift := "확인불가", false
+	if cfgP, cfgErr := codexConfigPath(); cfgErr == nil {
+		cfgData, cfgReadErr := os.ReadFile(cfgP)
+		codexLabel, codexDrift = markerState(cfgData, cfgReadErr, codexConfigMarker)
+	}
+	fmt.Fprintf(w, "[20] mcp markers: .mcp.json=%s codex=%s\n", mcpLabel, codexLabel)
+	if mcpDrift || codexDrift {
+		fmt.Fprintln(w, "[20] warning: MCP 등록물의 버전 표식이 현재 버전과 다릅니다 — doctor --fix로 다시 기입하세요(기존 파일만 고치며 백업을 남깁니다)")
+	}
+	if fix {
+		doctorFixRegistrations(w, projectRoot, version)
+	}
+
 	fmt.Fprintln(w)
 	fmt.Fprint(w, hostSnippet)
 
@@ -1962,6 +2015,82 @@ func runDoctor(ctx context.Context, w io.Writer, storeRoot, projectRoot, version
 		return fmt.Errorf("doctor: 진단 실패 항목 %d개", len(failed))
 	}
 	return nil
+}
+
+// doctorFixRegistrations — doctor --fix(D83). MCP 등록물의 표식을 현재 버전으로 다시 기입하고,
+// D80 형식으로의 마이그레이션이 남은 config.toml을 함께 변환한다. **소유가 확인된 등록물만
+// 고친다** — 부재하는 파일도, 부재하는 등록물도 만들지 않고 안내만 낸다(doctor no-create
+// 원칙의 범위는 파일이 아니라 등록물이다). 그 조건이 ownedRegistration이며 [20]이 "미등록"으로
+// 보고하는 상태와 같은 술어라 감지와 고침의 대상이 어긋나지 않는다. 기입은 새 경로를 만들지
+// 않고 install이 쓰는 경로를 그대로 쓴다: Codex는 installCodexConfigBlock, .mcp.json은
+// mergeMCPServers. D84의 백업과 무변경 판정도 그 경로에 있는 것을 그대로 쓴다.
+// 자동이 아니라 명시적 행위인 이유는 §0에 있다 — 기동 시 자동 재기입은 제품이 사용자 설정
+// 파일을 예고 없이 고치는 동작이 되고, 마커 교체 직후가 그 경로의 검증이 가장 얕은 시점이다.
+func doctorFixRegistrations(w io.Writer, projectRoot, version string) {
+	missing := 0
+	mcpPath := mcpConfigPath(projectRoot)
+	switch data, err := os.ReadFile(mcpPath); {
+	case errors.Is(err, os.ErrNotExist):
+		missing++
+	case err != nil:
+		fmt.Fprintln(w, "[20] fix: .mcp.json을 읽지 못해 건너뜁니다")
+	case !ownedRegistration(mcpManagedMarker(data)):
+		fmt.Fprintln(w, "[20] fix: .mcp.json에 우리 소유로 확인된 등록물이 없습니다 — 만들지 않습니다. hook install로 먼저 등록하세요")
+	default:
+		entry := mcpServerEntry{Command: hookBinaryName, AlwaysLoad: true, Managed: hookMarker(version)}
+		// setProfile=false — 표식만 고치고 프로필은 기존 항목의 것을 그대로 둔다.
+		if merged, _, mErr := mergeMCPServers(data, ctrMCPServerName, entry, true, false); mErr != nil {
+			fmt.Fprintf(w, "[20] fix: %q 이름에 우리가 소유하지 않은 항목이 있어 .mcp.json을 그대로 두었습니다\n", ctrMCPServerName)
+		} else if bytes.Equal(data, merged) {
+			fmt.Fprintln(w, "[20] fix: .mcp.json은 이미 현재 버전입니다 — 무변경")
+		} else if wErr := atomicWriteFile(mcpPath, merged); wErr != nil {
+			fmt.Fprintln(w, "[20] fix: .mcp.json 기록 실패")
+		} else {
+			fmt.Fprintf(w, "[20] fix: .mcp.json 표식을 %s로 다시 기입했습니다\n", version)
+		}
+	}
+	cfgPath, cfgErr := codexConfigPath()
+	switch data, err := readIfPathOK(cfgPath, cfgErr); {
+	case cfgErr != nil:
+		fmt.Fprintln(w, "[20] fix: config.toml 경로 확인불가")
+	case errors.Is(err, os.ErrNotExist):
+		missing++
+	case err != nil:
+		fmt.Fprintln(w, "[20] fix: config.toml을 읽지 못해 건너뜁니다")
+	default:
+		res := installCodexConfigBlock(data, codexInstallRequest{Marker: hookMarker(version)})
+		_, _, hasTable := codexConfigMarker(data)
+		switch {
+		case res.State != mcpWritten:
+			// 중복 정의·구간 밖 충돌·사용자 소유 테이블이 여기로 온다.
+			fmt.Fprintln(w, "[20] fix: config.toml이 기입 가능한 상태가 아닙니다 — [16] 안내를 먼저 따르세요")
+		case !hasTable:
+			// 관리 테이블 자체가 없다 — mcpWritten은 "append하면 된다"는 뜻이지만 --fix는
+			// 등록을 만들지 않는다. 이 상태를 [20]도 "미등록"으로 보고한다.
+			fmt.Fprintln(w, "[20] fix: config.toml에 우리 관리 테이블이 없습니다 — 만들지 않습니다. hook install --codex로 먼저 등록하세요")
+		case !res.Changed:
+			fmt.Fprintln(w, "[20] fix: config.toml은 이미 현재 형식·버전입니다 — 무변경")
+		default:
+			if bErr := backupCodexConfig(cfgPath, data); bErr != nil {
+				fmt.Fprintln(w, "[20] fix: config.toml 백업 실패 — 기입하지 않았습니다")
+			} else if wErr := atomicWriteFile(cfgPath, res.Out); wErr != nil {
+				fmt.Fprintln(w, "[20] fix: config.toml 기록 실패")
+			} else {
+				fmt.Fprintln(w, "[20] fix: config.toml 관리 테이블을 다시 기입했습니다(백업 config.toml.bak)")
+			}
+		}
+	}
+	if missing > 0 {
+		fmt.Fprintf(w, "[20] fix: 대상 파일이 없어 %d건을 건너뛰었습니다 — 만들지 않습니다. hook install로 먼저 등록하세요\n", missing)
+	}
+}
+
+// readIfPathOK — 경로 해석이 실패했으면 읽지 않는다(doctorFixRegistrations의 switch 초기화용).
+func readIfPathOK(path string, pathErr error) ([]byte, error) {
+	if pathErr != nil {
+		return nil, pathErr
+	}
+	return os.ReadFile(path)
 }
 
 // formatBuildLine — doctor [17] build 라인 순수 포매터(D56 — 테스트 주입점, 검수 반영). bi가

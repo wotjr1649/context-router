@@ -471,7 +471,7 @@ func TestDoctor_HookItemsAndAscendingOrder(t *testing.T) {
 		storeRoot := t.TempDir()
 		projectRoot := t.TempDir()
 		var buf bytes.Buffer
-		if err := runDoctor(context.Background(), &buf, storeRoot, projectRoot, "0.1.0"); err != nil {
+		if err := runDoctor(context.Background(), &buf, storeRoot, projectRoot, "0.1.0", false); err != nil {
 			t.Fatalf("runDoctor err=%v out=%s", err, buf.String())
 		}
 		out := buf.String()
@@ -514,7 +514,7 @@ func TestDoctor_HookItemsAndAscendingOrder(t *testing.T) {
 		}
 
 		var buf bytes.Buffer
-		if err := runDoctor(context.Background(), &buf, storeRoot, projectRoot, "0.1.0"); err != nil {
+		if err := runDoctor(context.Background(), &buf, storeRoot, projectRoot, "0.1.0", false); err != nil {
 			t.Fatalf("runDoctor err=%v out=%s", err, buf.String())
 		}
 		out := buf.String()
@@ -591,7 +591,7 @@ func TestDoctor_UserScopeHookRegistration(t *testing.T) {
 	}
 
 	var buf bytes.Buffer
-	if err := runDoctor(context.Background(), &buf, storeRoot, projectRoot, "0.1.0"); err != nil {
+	if err := runDoctor(context.Background(), &buf, storeRoot, projectRoot, "0.1.0", false); err != nil {
 		t.Fatalf("runDoctor err=%v out=%s", err, buf.String())
 	}
 	out := buf.String()
@@ -619,7 +619,7 @@ func TestDoctorVersionlessHookMarker(t *testing.T) {
 	}
 	// 설치 버전과 다른 버전으로 doctor를 돌려도 훅 스코프는 흔들리지 않는다.
 	var buf bytes.Buffer
-	if err := runDoctor(context.Background(), &buf, storeRoot, projectRoot, "0.16.0"); err != nil {
+	if err := runDoctor(context.Background(), &buf, storeRoot, projectRoot, "0.16.0", false); err != nil {
 		t.Fatalf("runDoctor err=%v out=%s", err, buf.String())
 	}
 	out := buf.String()
