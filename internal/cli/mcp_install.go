@@ -113,6 +113,27 @@ var mcpProfileNames = []string{"ingest", "net", "exec"}
 // 원인이 이 기본값이었다. exec는 --enable-exec 명시 opt-in을 유지한다(D58·D59·D64).
 var defaultMCPProfiles = []string{"ingest", "net"}
 
+// emptyProfileRegistration — 우리 이름의 기존 등록물이 프로필 없이 남아 있는가. v0.14 이전
+// 등록물은 --enable이 없어 전부 이 상태이고, 무플래그 재설치는 보존 규칙이 이겨 기본 프로필로
+// 넓히지 않는다(설계 D81이 축자로 정한 동작) — 그래서 D81의 동기였던 ctr_index·
+// ctr_fetch_and_index 미등록이 기존 사용자에게 그대로 남는다. 조용히 넓히면 쓰기·네트워크
+// 도구를 동의 없이 노출하므로 동작이 아니라 안내로 닫는다(리뷰 P4).
+// 해석 실패·항목 부재·미소유·되읽기 실패는 false다 — 거짓 경보를 내지 않는다.
+func emptyProfileRegistration(existing []byte, name string) bool {
+	var doc struct {
+		Servers map[string]mcpServerEntry `json:"mcpServers"`
+	}
+	if json.Unmarshal(existing, &doc) != nil {
+		return false
+	}
+	prev, ok := doc.Servers[name]
+	if !ok || (!isOurMarkerValue(prev.Managed) && prev.Command != hookBinaryName) {
+		return false
+	}
+	profiles, readOK := profilesFromArgs(prev.Args)
+	return readOK && len(profiles) == 0
+}
+
 // canonicalProfiles — 아는 이름만 mcpProfileNames 순서로 중복 없이 남긴다(정규화 단일 지점).
 func canonicalProfiles(profiles []string) []string {
 	var out []string

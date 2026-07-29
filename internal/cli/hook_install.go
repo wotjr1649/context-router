@@ -626,6 +626,11 @@ func runHookInstall(args []string, storeRoot, storeRootRaw string, storeRootExpl
 		} else {
 			mcpRegistered = true
 			fmt.Fprintf(stdout, "mcp: .mcp.json 병합 완료(서버 %s)\n", ctrMCPServerName)
+			// 빈 프로필로 남은 기존 등록물은 보존 규칙이 이겨 기본 프로필을 얻지 못한다(D81) —
+			// 명시 경로를 알려야 사용자가 D81의 동기였던 두 도구를 켤 수 있다(리뷰 P4).
+			if !setProfile && emptyProfileRegistration(existing, ctrMCPServerName) {
+				fmt.Fprintln(stdout, "mcp: 기존 등록물에 프로필이 없어 그대로 유지했습니다 — ctr_index·ctr_fetch_and_index가 필요하면 hook install --enable ingest,net으로 명시하세요(빈 프로필은 기본값으로 넓히지 않습니다)")
+			}
 		}
 	}
 

@@ -814,6 +814,40 @@ func TestHookInstallEnableFlag(t *testing.T) {
 		t.Errorf("공백뿐인 --enable이 기존 프로필을 덮었다: args=%v want [--enable exec]", ours.Args)
 	}
 
+	// P4(PR 상세 리뷰) — v0.14 이전 등록물은 --enable이 없어 빈 프로필이고, 무플래그 재설치는
+	// 보존 규칙이 이겨 기본 프로필로 넓히지 않는다(설계 D81 축자). 그러면 릴리스 동기였던
+	// ctr_index·ctr_fetch_and_index 미등록이 그대로 남으므로 명시 경로를 안내한다.
+	oldProj := t.TempDir()
+	seed := []byte(`{"mcpServers":{"ctr-exec":{"command":"context-router","args":[],"alwaysLoad":true}}}`)
+	if err := os.WriteFile(mcpConfigPath(oldProj), seed, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var oldOut bytes.Buffer
+	if err := runHookInstall(nil, t.TempDir(), "", false, oldProj, "0.15.0", &oldOut); err != nil {
+		t.Fatalf("v0.14 형태 재설치: %v", err)
+	}
+	if !strings.Contains(oldOut.String(), "--enable ingest,net") {
+		t.Errorf("빈 프로필 등록물에 명시 경로 안내가 없다:\n%s", oldOut.String())
+	}
+	// 안내는 내지만 보존 규칙은 그대로다 — 조용히 프로필을 넓히면 쓰기·네트워크 도구가
+	// 사용자 동의 없이 노출된다.
+	oldBytes, _ := os.ReadFile(mcpConfigPath(oldProj))
+	if ours := mcpServersOf(t, oldBytes)[ctrMCPServerName]; len(ours.Args) != 0 {
+		t.Errorf("안내 대신 프로필을 넓혔다: args=%v", ours.Args)
+	}
+	// 프로필이 있는 등록물에는 거짓 경보를 내지 않는다.
+	newProj := t.TempDir()
+	var mk, again bytes.Buffer
+	if err := runHookInstall([]string{"--enable", "ingest"}, t.TempDir(), "", false, newProj, "0.15.0", &mk); err != nil {
+		t.Fatalf("1차 install: %v", err)
+	}
+	if err := runHookInstall(nil, t.TempDir(), "", false, newProj, "0.15.0", &again); err != nil {
+		t.Fatalf("무플래그 재설치: %v", err)
+	}
+	if strings.Contains(again.String(), "--enable ingest,net") {
+		t.Errorf("프로필이 있는 등록물에 거짓 안내를 냈다:\n%s", again.String())
+	}
+
 	var out bytes.Buffer
 	err := runHookInstall([]string{"--enable", "bogus"}, t.TempDir(), "", false, t.TempDir(), "0.15.0", &out)
 	if err == nil {
