@@ -306,6 +306,14 @@ func TestMergeMCPServersRejectsForeignSameName(t *testing.T) {
 	if _, _, err := mergeMCPServers(ours, ctrMCPServerName, entry, true, true); err != nil {
 		t.Errorf("마커 없는 우리 항목을 남의 것으로 봤다: %v", err)
 	}
+	// T3-F5: 무버전 정확 일치 마커("context-router", D82 이후 형태)만으로도 우리 것으로 인정돼
+	// 갱신이 거부되지 않는다 — isOurMarkerValue가 옛 strings.HasPrefix(prev.Managed,
+	// hookMarkerPrefix())보다 넓힌 지점의 감시선. command는 일부러 남의 것으로 둬 마커 단독으로
+	// 소유가 인정되는지를 가른다.
+	versionless := []byte(`{"mcpServers":{"` + ctrMCPServerName + `":{"command":"someone-else","args":["--x"],"__ctrManaged":"context-router"}}}`)
+	if _, _, err := mergeMCPServers(versionless, ctrMCPServerName, entry, true, true); err != nil {
+		t.Errorf("무버전 정확 일치 마커를 남의 것으로 봤다: %v", err)
+	}
 }
 
 // TestMergeMCPServersEmptyOrNullTolerant: 공백뿐인 파일과 JSON `null`·`{"mcpServers":null}`

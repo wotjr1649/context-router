@@ -269,12 +269,26 @@ func codexEntries(lines [][]byte, sp codexSpan) [][2]int {
 	return out
 }
 
-// codexKeyName — 정규화 라인에서 대입 키 이름을 뽑는다(따옴표 키도 벗긴다). '='가 없거나
-// 앞부분이 비면 ""(키 줄이 아니다). 주석 줄은 '#'로 시작하므로 우리 키 이름과 절대 같아지지
-// 않는다 — 주석은 언제나 보존 라인으로 간다.
+// codexKeyName — 정규화 라인에서 대입 키 이름을 뽑는다(따옴표 키도 벗긴다). 따옴표로 시작하는
+// 키는 첫 '='가 아니라 **닫는 따옴표 뒤**에서 '='를 찾는다(T3-F1) — 첫 '=' 무조건 분리로는
+// 따옴표 키 안의 '='가 이름을 조기 절단해 사용자 키 `"args=x" = "y"`가 예약어 "args"로
+// 오분류되고, codexReadTable의 continue 세 곳과 codexEnvBody의 표식 건너뛰기가 그 줄을 보존
+// 목록에서 빼 재기입 때 조용히 지운다. basicStringLen·literalStringLen로 닫는 따옴표를 찾는다 —
+// tomlKeyLen과 같은 이스케이프 인지 기준을 공유한다. '='가 없거나 앞부분이 비면 ""(키 줄이
+// 아니다). 주석 줄은 '#'로 시작하므로 우리 키 이름과 절대 같아지지 않는다 — 주석은 언제나
+// 보존 라인으로 간다.
 func codexKeyName(s string) string {
+	if s == "" {
+		return ""
+	}
 	i := strings.Index(s, "=")
-	if i <= 0 {
+	switch s[0] {
+	case '"':
+		i = basicStringLen(s)
+	case '\'':
+		i = literalStringLen(s)
+	}
+	if i <= 0 || i >= len(s) || s[i] != '=' {
 		return ""
 	}
 	return strings.Trim(s[:i], `"'`)
@@ -580,7 +594,11 @@ func tomlKeyLen(s, key string) int {
 
 // tomlInlineValue — 인라인 테이블 대입 줄(정규화)에서 key의 문자열 값을 뽑는다. 키 경계는
 // '{' 또는 ',' 직후로 한정한다 — 부분 문자열로 찾으면 다른 키의 값 안에 든 같은 이름까지 잡는다.
-// found는 키가 텍스트로 있는가이고, 값이 문자열이 아니면 ("", true)다.
+// 값은 '=' 바로 다음(정규화라 공백 없음)이 큰따옴표일 때만 읽는다 — inlineMarkerSpan과 같은
+// 기준이다(T3-F2). '=' 뒤 나머지 전체를 tomlStringList에 넘기면 값이 문자열이 아닐 때 스캔이
+// 다음 키의 문자열 값까지 집어삼켜 소유를 오판한다(예: `CTR_MANAGED = 0, X = "context-router/…"`
+// 를 CTR_MANAGED의 값으로 오독). found는 키가 텍스트로 있는가이고, 값이 문자열이 아니면
+// ("", true)다.
 func tomlInlineValue(s, key string) (value string, found bool) {
 	for i := 0; i < len(s); i++ {
 		if s[i] != '{' && s[i] != ',' {
@@ -590,10 +608,11 @@ func tomlInlineValue(s, key string) (value string, found bool) {
 		if n < 0 || i+1+n >= len(s) || s[i+1+n] != '=' {
 			continue
 		}
-		if v := tomlStringList(s[i+2+n:]); len(v) > 0 {
-			return v[0], true
+		v := i + 2 + n
+		if v >= len(s) || s[v] != '"' {
+			return "", true
 		}
-		return "", true
+		return s[v+1 : v+basicStringLen(s[v:])-1], true
 	}
 	return "", false
 }
@@ -723,8 +742,15 @@ func setInlineEnvMarker(line []byte, old string, oldFound bool, marker, eol stri
 	if open < 0 || last < open {
 		return line // 여러 줄 인라인 등 우리가 다루지 않는 형태 — 원문 보존
 	}
+	// 빈 여부는 여는 중괄호 뒤 첫 비공백 토큰으로 판정한다(T3-F3) — LastIndex(s, "}")를 경계로
+	// 쓰면 후행 주석 안의 '}'(예: `env = {} # }`)를 닫는 중괄호로 오인해, 실제로는 빈 테이블인데
+	// 내용이 있다고 보고 쉼표를 붙인다 — `{ CTR_MANAGED = "…",}`는 TOML이 금지하는 후행 쉼표다.
 	sep := ","
-	if strings.TrimSpace(s[open+1:last]) == "" {
+	j := open + 1
+	for j < len(s) && (s[j] == ' ' || s[j] == '\t') {
+		j++
+	}
+	if j < len(s) && s[j] == '}' {
 		sep = ""
 	}
 	return []byte(s[:open+1] + " " + codexMarkerKey + ` = "` + marker + `"` + sep + s[open+1:] + eol)

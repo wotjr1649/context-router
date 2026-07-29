@@ -252,6 +252,9 @@ func TestCodexTableOwnershipAndAdoption(t *testing.T) {
 		{"③ 표식 값이 남의 것", "[mcp_servers.ctr]\ncommand = \"other\"\n[mcp_servers.ctr.env]\nCTR_MANAGED = \"other-tool/1.0\"\n", false},
 		{"③ 표식도 없고 command도 다르다", "[mcp_servers.ctr]\ncommand = \"other\"\n", false},
 		{"③ 키만 있고 값이 비었다", "[mcp_servers.ctr]\ncommand = \"other\"\n[mcp_servers.ctr.env]\nCTR_MANAGED = \"\"\n", false},
+		// T3-F2: 인라인 표식 값이 문자열이 아니면(0) 뒤 키의 문자열 값("context-router/…")까지
+		// 스캔이 집어삼켜 소유로 오판했다 — tomlInlineValue가 '=' 바로 다음 토큰만 보게 고쳤다.
+		{"③ 인라인 표식 값이 문자열 아님(뒤 키로 오염 배제)", "[mcp_servers.ctr]\ncommand = \"other\"\nenv = { CTR_MANAGED = 0, X = \"context-router/0.15.0\" }\n", false},
 	}
 	for _, c := range cases {
 		lines, sp, view := codexLinesOf(t, c.src)
@@ -361,5 +364,31 @@ func TestCodexTableBodyPreservesUnownedKeys(t *testing.T) {
 	kbody := string(codexTableBody(klines, ksp.table, kview, defaultMCPProfiles, true, "context-router/0.15.0", "\n"))
 	if !strings.Contains(kbody, "args = [\"--profile\", \"global-search\"]\n") || strings.Contains(kbody, "ctr_index") {
 		t.Errorf("되읽지 못한 args·enabled_tools를 손댔다:\n%s", kbody)
+	}
+	// T3-F1: 따옴표 키 안의 '='가 첫 '=' 기준 분리로 조기 절단되면 사용자 키 "args=x"가 예약어
+	// "args"로 오분류돼 codexReadTable의 continue가 그 줄을 보존 목록에서 빼 재기입 때 지운다 —
+	// codexKeyName이 닫는 따옴표 뒤에서 '='를 찾아야 막힌다.
+	fsrc := "[mcp_servers.ctr]\ncommand = \"context-router\"\n\"args=x\" = \"y\"\nreal_user_key = 1\n"
+	flines, fsp, fview := codexLinesOf(t, fsrc)
+	fbody := string(codexTableBody(flines, fsp.table, fview, nil, false, "context-router/0.15.0", "\n"))
+	if !strings.Contains(fbody, "\"args=x\" = \"y\"\n") {
+		t.Errorf("따옴표 키 안의 '='가 조기 절단돼 사용자 줄이 사라졌다:\n%s", fbody)
+	}
+	// 같은 오분류가 codexEnvBody의 표식 건너뛰기에도 있었다(T3-F1의 넷째 손실 경로) —
+	// "CTR_MANAGED=x"가 표식 키로 오인되면 그 줄이 건너뛰어져 사라진다.
+	fesrc := "[mcp_servers.ctr.env]\n\"CTR_MANAGED=x\" = \"y\"\nCTR_MANAGED = \"context-router/0.14.0\"\n"
+	felines := splitLinesKeepEnds([]byte(fesrc))
+	fesp := codexManagedSpans(felines)
+	febody := string(codexEnvBody(felines, fesp.env, "context-router/0.15.0", "\n"))
+	if !strings.Contains(febody, "\"CTR_MANAGED=x\" = \"y\"\n") {
+		t.Errorf("codexEnvBody에서 따옴표 키 오분류로 사용자 줄이 사라졌다:\n%s", febody)
+	}
+	// T3-F3: 빈 인라인 env 뒤에 '}'를 담은 주석이 있으면(예: "env = {} # }") LastIndex 기반 빈
+	// 판정이 그 주석의 '}'를 진짜 닫는 중괄호로 오인해 후행 쉼표(TOML 금지)를 만든다.
+	csrc := "[mcp_servers.ctr]\ncommand = \"context-router\"\nenv = {} # }\n"
+	clines, csp, cview := codexLinesOf(t, csrc)
+	cbody := string(codexTableBody(clines, csp.table, cview, nil, false, "context-router/0.15.0", "\n"))
+	if !strings.Contains(cbody, codexMarkerKey+` = "context-router/0.15.0"} # }`) {
+		t.Errorf("빈 인라인 env + 후행 주석 처리가 후행 쉼표를 만들었다(TOML 금지):\n%s", cbody)
 	}
 }
