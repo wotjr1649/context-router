@@ -2473,6 +2473,48 @@ func TestHostSnippetNoExecAskRule(t *testing.T) {
 	}
 }
 
+// TestHostSnippetCodexTable — D80 §2-17. 스니펫이 인쇄하는 Codex 블록은 env.CTR_MANAGED를
+// 담아야 한다 — reportCodexMCPState의 안내가 "이 스니펫으로 수동 등록한 뒤 재실행"을 가리키므로,
+// 담지 않으면 그것을 붙여 넣은 사용자가 표식 없는 테이블을 갖는다(command를 그대로 붙여 넣으면
+// D80 인수 절이 받지만, 경로를 고쳐 쓰면 받지 못한다). 값은 **무버전 context-router**다 —
+// hostSnippet은 상수라 버전을 담으면 상수가 아니게 되고, 그 값은 D82의 정확 일치 절을 만족해
+// 소유 판정에 그대로 걸리며 D83의 검사는 "표식 있음·버전 미상"으로 읽어 --fix가 채운다.
+// 같은 테스트가 붙여넣기 대상에 승인 모드 **키**가 없는지도 본다(D81 — 권장 안내 문면 자체는
+// 주석 줄로 남을 수 있다).
+func TestHostSnippetCodexTable(t *testing.T) {
+	for _, want := range []string{
+		"[mcp_servers.ctr]",
+		"[mcp_servers.ctr.env]",
+		codexMarkerKey + ` = "context-router"`,
+		`"ctr_index"`,
+		`"ctr_fetch_and_index"`,
+	} {
+		if !strings.Contains(hostSnippet, want) {
+			t.Errorf("Codex 스니펫에 %q 없음:\n%s", want, hostSnippet)
+		}
+	}
+	// 버전이 박힌 표식을 인쇄하면 안 된다(상수가 릴리스마다 바뀌게 된다).
+	if strings.Contains(hostSnippet, codexMarkerKey+` = "context-router/`) {
+		t.Errorf("스니펫이 버전 있는 표식을 인쇄한다:\n%s", hostSnippet)
+	}
+	// 승인 모드 키는 **대입 줄**로 나오면 안 된다. 주석(#로 시작)은 안내라 허용한다.
+	for _, line := range strings.Split(hostSnippet, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "#") {
+			continue
+		}
+		if strings.Contains(trimmed, "approval_mode") {
+			t.Errorf("붙여넣기 대상에 승인 모드 키가 있다: %s", line)
+		}
+	}
+	// D81 — .mcp.json 예시도 설치기 **기본 프로필**을 인쇄한다. exec만 켠 옛 예시를 붙여 넣은
+	// 사용자는 ctr_index·ctr_fetch_and_index가 없는 등록을 갖고, 바로 아래 ask 규칙이
+	// 매치할 도구가 없는 상태가 된다(TestHostSnippetUsesCurrentServerPrefix가 지키는 두 규칙).
+	if !strings.Contains(hostSnippet, `"args": ["--enable", "ingest,net"]`) {
+		t.Errorf(".mcp.json 예시가 기본 프로필을 인쇄하지 않는다:\n%s", hostSnippet)
+	}
+}
+
 // TestPurgeHookOnlySinglePrompt — TTY 경로에서 확인 프롬프트가 정확히 1회만 출력된다(전역
 // confirmPurge와의 중복 방지 회귀 — 조기 분기가 전역 confirm 앞에 있어야 함). 견적 슬러그를
 // 정확히 재구성해 입력하면 통과하고 실회수 보고까지 진행된다.

@@ -1426,17 +1426,17 @@ const hostSnippet = `--- host adapter snippets (설계 §9) ---
 ## Claude Code (.mcp.json — 단일 서버가 표준이다, D63 ②)
 {
   "mcpServers": {
-    "ctr-exec": { "command": "context-router", "args": ["--enable", "exec"], "alwaysLoad": true }
+    "ctr-exec": { "command": "context-router", "args": ["--enable", "ingest,net"], "alwaysLoad": true }
   }
 }
-# 이 블록은 "context-router hook install"이 자동으로 병합한다(exec 프로필은 --enable-exec opt-in).
+# 이 블록은 "context-router hook install"이 자동으로 병합한다(기본 프로필 ingest,net · exec는 --enable-exec opt-in).
 # alwaysLoad는 Claude Code v2.1.121 이상에서만 동작한다 — 그 이전 호스트는 이 필드를 조용히 무시한다.
 # 과거의 "ctr" 등록은 이 항목의 도구 집합에 완전히 포함된다 — 함께 두면 6개 도구가 중복
 # 노출되므로 "context-router hook install"이 자동으로 제거한다.
 # 모든 프로젝트에서 쓰려면 프로젝트 .mcp.json이 아니라 사용자 스코프로 등록한다 — 사용자 스코프
 # 서버는 ~/.claude.json에 저장돼 프로젝트를 가로질러 쓰이고, enabledMcpjsonServers 승인이 필요 없다
 # (그 키는 저장소가 제공하는 프로젝트 .mcp.json 서버를 승인하는 장치다):
-#   claude mcp add --scope user ctr-exec -- context-router --enable exec
+#   claude mcp add --scope user ctr-exec -- context-router --enable ingest,net
 # -- 는 claude 자신의 플래그와 서버 명령을 가른다(없으면 --enable을 claude가 자기 옵션으로 읽는다).
 # 이 플래그 형태로 alwaysLoad를 설정하는 수단은 문서에 없다 — 임의 필드가 필요하면 서버 설정 스키마를
 # 그대로 받는 claude mcp add-json 형태를 쓴다(--scope user 동일 적용).
@@ -1449,10 +1449,10 @@ permissions (.claude/settings.json 예시 — ingest/net/global 도구에 ask를
   }
 }
 # 이 두 도구 규칙은 그 프로필을 켠 등록에서만 대상이 있다 — ctr_index는 --enable ingest,
-# ctr_fetch_and_index는 --enable net에서만 등록되므로, 위의 exec만 켠 등록에는 두 도구 자체가 없고
-# 규칙은 아무것도 매치하지 않는다(게이트한 것처럼 보이지만 게이트할 도구가 없다). 두 프로필까지
-# 쓰려면 위 등록의 args를 ["--enable", "exec,ingest,net"]으로 바꾼다 — 플래그 없는 재설치는 그 args를
-# 보존하고 "hook install --enable-exec"은 exec만으로 되돌린다. mcp__ctr-global__*도 위의 ctr-global
+# ctr_fetch_and_index는 --enable net에서만 등록된다. 위 등록은 설치기 기본 프로필(ingest,net)이라
+# 두 도구가 모두 있고 규칙이 그대로 매치한다. exec까지 함께 쓰려면 위 등록의 args를
+# ["--enable", "ingest,net,exec"]으로 바꾼다 — 플래그 없는 재설치는 그 args를 보존하고
+# "hook install --enable-exec"은 exec만으로 되돌린다. mcp__ctr-global__*도 위의 ctr-global
 # 등록을 따로 만든 경우에만 대상이 있다.
 # exec 2종(ctr_execute·ctr_execute_file)은 ask에 넣지 않는다 — 승인 강도는 호스트 권한 모드가
 # 정한다. default 모드에서는 MCP 기본 프롬프트가 그대로 작동하고, 무프롬프트 모드이거나 그
@@ -1467,10 +1467,22 @@ permissions (.claude/settings.json 예시 — ingest/net/global 도구에 ask를
 ## Codex (~/.codex/config.toml)
 [mcp_servers.ctr]
 command = "context-router"
-args = []
-enabled_tools = ["ctr_search", "ctr_fetch", "ctr_transform", "ctr_record_event", "ctr_session_summary", "ctr_export_events"]
-# ingest/net 활성화 시 권장: default_tools_approval_mode = "prompt"
-# exec 프로필(--enable exec) 활성 시 enabled_tools에 "ctr_execute","ctr_execute_file" 추가 — 승인 강도는 Codex 승인 모드가 정한다.
+args = ["--enable", "ingest,net"]
+enabled_tools = ["ctr_search", "ctr_fetch", "ctr_transform", "ctr_record_event", "ctr_session_summary", "ctr_export_events", "ctr_index", "ctr_fetch_and_index"]
+
+[mcp_servers.ctr.env]
+CTR_MANAGED = "context-router"
+# 이 두 테이블은 "context-router hook install --codex"가 자동으로 병합한다. 관리 단위는 테이블
+# 경계이며 주석 마커가 아니다 — Codex는 다른 서버를 추가하는 것만으로 파일 전체를 재직렬화하며
+# 주석을 지우기 때문이다. CTR_MANAGED는 소유 표식일 뿐이고 서버는 이 환경변수를 읽지 않는다.
+# 위 값은 무버전이다 — doctor가 "표식 있음·버전 미상"으로 읽고 doctor --fix가 현재 버전으로 채운다.
+# 승인 프롬프트가 필요하면 [mcp_servers.ctr]에 default_tools_approval_mode = "prompt"를 직접
+# 넣는다. 설치기는 그 키를 쓰지 않고(D64와 같은 사유 — 무프롬프트 모드에서도 프롬프트를 강제해
+# 사용자가 끌 수 없게 된다), 넣어 둔 키는 재설치가 원문 그대로 보존한다.
+# exec 프로필은 "hook install --codex --enable-exec"으로 켠다 — args가 ["--enable", "exec"]가
+# 되고 enabled_tools에 "ctr_execute","ctr_execute_file"이 함께 붙는다(ingest·net까지 함께 쓰려면
+# "--enable ingest,net,exec"으로 지정한다 — 두 플래그는 합집합이다). 승인 강도는 Codex 승인 모드가 정한다.
+# [mcp_servers.ctr-exec]는 설치기가 읽지도 쓰지도 않는다 — 그 이름의 테이블을 직접 만들었다면 그대로 둔다.
 
 ## exec 결과 읽기(호스트 공통)
 # shell 러너: exit_code는 스니펫의 종료 상태다(중간 비종결 오류는 반영되지 않는다).
