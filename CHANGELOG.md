@@ -8,6 +8,61 @@
 [Semantic Versioning](https://semver.org/lang/ko/)을 따른다. 각 항목의 D 번호는
 그 결정의 근거가 있는 설계 문서 절을 가리킨다.
 
+## [0.15.0] — 2026-07-29
+
+### Changed — 사용자 관측 가능한 동작 변경
+
+- **Codex `config.toml`의 관리 단위가 주석 마커에서 TOML 테이블 경계로 바뀌었다** (D80).
+  `# BEGIN/END context-router`를 더 쓰지 않는다 — Codex는 다른 서버를 추가하는 것만으로
+  파일 전체를 재직렬화하며 주석을 지우므로, 마커로는 관리 단위를 유지할 수 없다. 관리 범위는
+  `[mcp_servers.ctr]`와 `[mcp_servers.ctr.env]` **두 독립 구간**이고, 소유 표식은 재직렬화를
+  견디는 `env.CTR_MANAGED`로 옮겼다(서버는 이 환경변수를 읽지 않는다 — 표식일 뿐이다).
+  - **재설치가 우리 테이블 안의 사용자 키를 더 이상 버리지 않는다.** install이 소유하는 키는
+    `command`·`args`·`enabled_tools`·`env.CTR_MANAGED` 넷이고, 그 밖의 키(예: 직접 넣은
+    `default_tools_approval_mode`)와 `env`의 다른 환경변수는 원문 그대로 왕복 보존된다.
+  - **구 형식 파일은 1회 변환된다.** 마커 두 줄만 지우고 테이블은 그대로 둔다. 마커가 이미
+    소멸한 파일도 `command`가 우리 것이면 인수해 표식을 다시 기입한다(self-heal).
+  - `hook uninstall --codex`는 우리 두 테이블만 지운다 — 마커가 밀려 그 사이에 사용자 테이블이
+    들어간 파일에서도 그 테이블이 살아남는다.
+  - **`[mcp_servers.ctr-exec]`는 읽지도 쓰지도 않는다.** 그 이름은 `.mcp.json` 등록의 제품
+    표준 이름이지만 `config.toml`에서 같은 이름의 테이블은 사용자가 만든 별도 등록이다.
+  - 내용을 바꾸기 직전 `config.toml.bak` 단일 슬롯 백업을 남긴다(누적하지 않는다). 기입 바이트가
+    기존과 같으면 쓰기와 백업을 모두 생략한다.
+- **설치기 기본 프로필이 `ingest,net`이 됐다** (D81). 플래그 없는 **첫** 설치가
+  `ctr_index`·`ctr_fetch_and_index`를 등록물에 싣는다 — 그 둘의 미등록이 세 세션 이월된 원인이
+  기본값이었다. 이미 설치된 항목이 있으면 그 프로필을 그대로 유지한다(재설치가 켜 둔 프로필을
+  끄지 않는다). **exec는 `--enable-exec` 명시 opt-in 그대로다.**
+  - **`hook install --enable <프로필 목록>`**(쉼표 구분)을 새로 받는다. `--enable-exec`과 함께
+    지정하면 결과는 합집합이고 지정 순서가 결과를 바꾸지 않는다. 모르는 이름은 오류다.
+  - **`--codex`와 `--enable-exec`을 함께 쓸 수 있다.** 프로필이 Codex 관리 테이블에도 실리고
+    `enabled_tools`가 `args`와 **함께** 조립되므로, 그 조합을 막던 두 사유가 모두 사라졌다.
+  - 설치기는 승인 모드 키(`default_tools_approval_mode`·`tools.<도구>.approval_mode`)를
+    **기입하지 않는다.** 관리 블록의 권장 주석은 재직렬화가 지우므로 같은 안내를 stdout으로 낸다.
+- **훅 등록물에서 버전이 사라졌다** (D82). `.claude/settings.json` 훅 그룹의 `__ctrManaged`와
+  Codex `hooks.json`의 `statusMessage`가 무버전 `context-router`가 된다. 버전은 MCP 등록물
+  (`.mcp.json`의 `__ctrManaged`, `config.toml`의 `env.CTR_MANAGED`)에만 남는다. 훅 정의가 릴리스
+  간 바이트 동일해지므로 **같은 설치 옵션·같은 MCP 상태에서는 버전만 이유로 Codex 재신뢰가
+  강요되지 않는다**(`trusted_hash`가 무엇을 덮는지는 Codex 내부라 미검증이며, 이 주장은
+  필요조건까지다). 구 버전 마커(`context-router/0.14.0`)도 계속 소유로 인정되고 대칭 제거된다.
+  `doctor`의 훅 스코프는 무버전 마커에 버전 불일치 경고를 내지 않는다.
+- **`doctor`에 `[20] mcp markers`와 `doctor --fix`가 생겼다** (D83). 두 MCP 등록물의 버전 표식을
+  읽어 드리프트를 알리고, `--fix`가 현재 버전으로 다시 기입한다. **기존 파일만 고치고 없는
+  파일은 만들지 않으며**, 종료코드 계약도 바뀌지 않는다(드리프트와 그 고침은 실패 항목 수에
+  들지 않는다). 기입은 install이 쓰는 경로를 그대로 재사용하고 D84의 백업을 남긴다.
+- `doctor`의 호스트 등록 안내(Codex 절)가 새 형식을 인쇄한다 — `[mcp_servers.ctr.env]`와
+  무버전 `CTR_MANAGED`를 담으므로 붙여 넣은 등록도 소유 판정에 걸린다.
+
+### Internal
+
+- 게이트 11(`TestSchemaTokenBudget`)의 측정 대상을 **설치기가 만들 수 있는 최대 프로필**
+  (`ingest`·`net`·`exec` 10도구)로 옮기고 상한을 실측 + 최소 여유로 재기준화했다. 이전 형태는
+  exec만 켠 8도구를 재서 D81이 여는 표면이 옛 상한을 넘겨도 통과했다 — 물리지 않는 검사였다.
+- 설계 문서와 `internal/exec` 주석이 `exec.go`를 줄 번호로 가리키던 인용을 심볼 인용으로
+  바꿨다. v0.14 한 릴리스에 인용이 두 번 밀린 부류가 구조적으로 사라진다.
+- `TestD78Limits`의 `fallback-throw-no-signal`이 파싱 실패를 가르게 됐다 — PowerShell은 미처리
+  `throw`와 ParserError에 모두 exit 1을 내므로, 본문이 실제로 실행됐음을 stdout 표지로 함께
+  단정한다.
+
 ## [0.14.0] — 2026-07-29
 
 ### Changed — 사용자 관측 가능한 동작 변경

@@ -8,7 +8,7 @@ package buildinfo
 // 절차를 처방하는 주석이 부정확한 쪽이다: 설계 v0.13 D72). marker 등호 비교 보호와 태그 일치
 // 검증은 스펙 v0.10 D56·§1.3. var(const 아님) — 향후 -ldflags -X 주입 전환 여지
 // (unexported + accessor = 외부 변경 차단).
-var productVersion = "0.14.0"
+var productVersion = "0.15.0"
 
 // ProductVersion — 전 소비처(CLI 배너·hook Producer·marker·doctor·MCP serverInfo·version
 // 서브커맨드)의 유일 입구.
