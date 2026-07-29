@@ -1096,6 +1096,106 @@ func TestRunHookInstallCodexCoupling(t *testing.T) {
 	}
 }
 
+// TestRunHookInstallCodexBackupAndIdempotent — D84 백업과 멱등(§2-12). 내용 변경이 있을 때만
+// .bak이 생기고, 무변경 멱등 실행에서는 생기지 않는다. 멱등 픽스처는 **호스트 재직렬화 형태**로
+// 만든다(주석 없음 · **빈 args 포함** — §3 표4의 현재 사용자 파일이 그 상태이고, 부재와 []를
+// 동치로 보는 D80 규칙이 걸리는 자리다 · §1.3-1 ②가 관측한 키 순서·인용·env 표기) — 우리
+// 산출물을 그대로 입력으로 쓰면 실사용의 흔들림을 재현하지 못한다. .bak은 단일 슬롯이라
+// 누적하지 않는다. t.Setenv 사용 → t.Parallel 금지.
+func TestRunHookInstallCodexBackupAndIdempotent(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("CODEX_HOME", home)
+	cfg := filepath.Join(home, "config.toml")
+	bak := cfg + ".bak"
+	// 프로필이 빈 재설치(§3 표4의 현재 사용자 파일 상태) — args 키를 쓰지 않아야 한다.
+	// **Task 1 게이트 ②의 관측 형태를 여기에 반영한다**: 관측한 키 순서·인용 방식·공백·env
+	// 표기가 아래와 다르면 seed를 그 형태로 고친 뒤 같은 단정을 그대로 건다(스펙 §2-12).
+	// 관측이 우리 기입과 같았으면 아래 그대로 둔다.
+	seed := "model = \"gpt\"\n\n[mcp_servers.ctr]\ncommand = \"context-router\"\nargs = []\nenabled_tools = [\"ctr_search\"]\n"
+	if err := os.WriteFile(cfg, []byte(seed), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	if err := runHookInstall([]string{"--codex", "--user"}, "", "", false, t.TempDir(), "0.15.0", &out); err != nil {
+		t.Fatalf("install 1: %v", err)
+	}
+	first, err := os.ReadFile(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, statErr := os.Stat(bak); statErr != nil {
+		t.Fatalf("내용이 바뀌었는데 .bak이 없다: %v", statErr)
+	}
+	if b, _ := os.ReadFile(bak); string(b) != seed {
+		t.Errorf(".bak이 변경 직전 내용이 아니다: %q", b)
+	}
+	// 빈 프로필을 이월했으므로 args 키를 쓰지 않는다(부재와 []를 동치로 본다, D80).
+	if strings.Contains(string(first), "args = ") {
+		t.Errorf("빈 프로필인데 args 줄을 썼다:\n%s", first)
+	}
+	// 무변경 멱등 실행: 바이트가 그대로이고 .bak의 mtime도 움직이지 않는다.
+	bakInfo, err := os.Stat(bak)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := runHookInstall([]string{"--codex", "--user"}, "", "", false, t.TempDir(), "0.15.0", &out); err != nil {
+		t.Fatalf("install 2: %v", err)
+	}
+	second, _ := os.ReadFile(cfg)
+	if !bytes.Equal(first, second) {
+		t.Errorf("무변경 재실행이 바이트를 바꿨다:\n1: %s\n2: %s", first, second)
+	}
+	if again, _ := os.Stat(bak); !again.ModTime().Equal(bakInfo.ModTime()) {
+		t.Errorf("무변경 재실행이 .bak을 다시 썼다 — 단일 슬롯 계약이 무의미해진다")
+	}
+}
+
+// TestRunHookInstallCodexNotices — D81 설치기 안내(§2-7 exec opt-in 안내 · Codex 되읽기).
+// 승인 모드 안내는 파일에 남지 않으므로(재직렬화가 주석을 지운다) stdout으로 내고, exec opt-in은
+// 별도 [mcp_servers.ctr-exec]에 걸린 승인 게이트를 거치지 않는 두 번째 경로가 생긴다는 사실을
+// 함께 알린다. 어느 안내도 config.toml에 키를 남기지 않는다.
+func TestRunHookInstallCodexNotices(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("CODEX_HOME", home)
+	var out bytes.Buffer
+	if err := runHookInstall([]string{"--codex", "--user", "--enable-exec"}, "", "", false, t.TempDir(), "0.15.0", &out); err != nil {
+		t.Fatalf("install: %v", err)
+	}
+	s := out.String()
+	for _, want := range []string{"default_tools_approval_mode", "exec"} {
+		if !strings.Contains(s, want) {
+			t.Errorf("stdout 안내에 %q 없음: %q", want, s)
+		}
+	}
+	cfg, _ := os.ReadFile(filepath.Join(home, "config.toml"))
+	if strings.Contains(string(cfg), "approval_mode") {
+		t.Errorf("설치기가 승인 모드 키를 기입했다:\n%s", cfg)
+	}
+	if !strings.Contains(string(cfg), "\"ctr_execute_file\"") {
+		t.Errorf("--enable-exec이 enabled_tools에 반영되지 않았다:\n%s", cfg)
+	}
+
+	// 되읽지 못하는 args — 두 키를 손대지 않고 그 사실을 stdout으로 알린다.
+	home2 := t.TempDir()
+	t.Setenv("CODEX_HOME", home2)
+	odd := "[mcp_servers.ctr]\ncommand = \"context-router\"\nargs = [\"--profile\", \"global-search\"]\nenabled_tools = [\"custom\"]\n"
+	if err := os.WriteFile(filepath.Join(home2, "config.toml"), []byte(odd), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var out2 bytes.Buffer
+	if err := runHookInstall([]string{"--codex", "--user"}, "", "", false, t.TempDir(), "0.15.0", &out2); err != nil {
+		t.Fatalf("install(odd): %v", err)
+	}
+	if !strings.Contains(out2.String(), "해석하지 못") {
+		t.Errorf("되읽기 실패 안내가 없다: %q", out2.String())
+	}
+	cfg2, _ := os.ReadFile(filepath.Join(home2, "config.toml"))
+	if !strings.Contains(string(cfg2), "args = [\"--profile\", \"global-search\"]") ||
+		!strings.Contains(string(cfg2), "enabled_tools = [\"custom\"]") {
+		t.Errorf("해석하지 못한 값을 덮어썼다:\n%s", cfg2)
+	}
+}
+
 // TestDropsLastSeenUTC — D71: 사유별 마지막 발생 시각을 UTC 날짜로 병기한다. 역순 ts가 섞여도
 // 최댓값을 쓰고(로그가 시간순임을 가정하지 않는다), 정수 변환에 실패한 ts는 집계만 하고 병기를
 // 생략하며, unparsed에는 ts가 없으므로 병기하지 않는다.

@@ -14,6 +14,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -500,13 +501,11 @@ func runHookInstall(args []string, storeRoot, storeRootRaw string, storeRootExpl
 	if *enableExec {
 		installProfiles = []string{"exec"}
 	}
-	// --codex는 config.toml/hooks.json 경로라 .mcp.json을 만들지 않고, 관리 블록의 도구 목록도
-	// 고정이라 exec 프로필이 반영될 자리가 없다. 조용히 무시하면 사용자는 exec가 켜졌다고 오인한다.
-	if *codex && *enableExec {
-		return errors.New("hook install: --enable-exec은 --codex와 함께 쓸 수 없습니다(.mcp.json은 Claude Code 전용)")
-	}
+	// D81 — --codex × --enable-exec 상호 배제를 제거한다. 그 검사의 사유 둘이 모두 해소됐다:
+	// ① --codex가 .mcp.json을 만들지 않는다 → 프로필이 Codex 관리 테이블에도 실리므로 반영될
+	// 자리가 생겼다. ② 관리 블록의 도구 목록이 고정이다 → enabled_tools가 args와 함께 조립된다.
 	if *codex {
-		return runHookInstallCodex(*user, *noShadow, storeRootExplicit, storeRootRaw, projectRoot, version, stdout)
+		return runHookInstallCodex(*user, *noShadow, storeRootExplicit, storeRootRaw, projectRoot, version, installProfiles, *enableExec, stdout)
 	}
 	path, err := hookSettingsPath(*user, projectRoot)
 	if err != nil {
@@ -606,10 +605,22 @@ func runHookInstall(args []string, storeRoot, storeRootRaw string, storeRootExpl
 	return nil
 }
 
+// backupCodexConfig — 내용을 바꾸기 직전 단일 슬롯 백업(D84). config.toml.bak을 **매번
+// 덮어쓰며 누적하지 않는다**. 호출자는 기입 바이트가 기존과 다를 때만 부른다 — 무변경
+// 재실행마다 .bak이 생기면 단일 슬롯 계약이 무의미해진다. 재직렬화는 호스트가 일으키므로
+// 우리 설계가 막을 수 없고, 이 백업은 **우리 쪽 판정이 틀렸을 때의 복구 수단**이다.
+// 새로 만드는 파일(existing 없음)에는 되돌릴 내용이 없어 백업하지 않는다.
+func backupCodexConfig(path string, existing []byte) error {
+	if len(existing) == 0 {
+		return nil
+	}
+	return atomicWriteFile(path+".bak", existing)
+}
+
 // runHookInstallCodex — --codex 설치 결합(스펙 v0.7 §3, D47+D48). config.toml 관리 블록 병합을
 // 먼저 시도해 MCP 확정 여부를 판정하고(가드 등록의 전제), hooks.json에는 MCP 확정 시에만
 // PreToolUse(Bash) 가드 그룹을 포함한다 — "거부 표면 존재 + 안내 도구 부재"(D32)를 구조적으로 봉쇄.
-func runHookInstallCodex(user, noShadow, storeRootExplicit bool, storeRootRaw, projectRoot, version string, stdout io.Writer) error {
+func runHookInstallCodex(user, noShadow, storeRootExplicit bool, storeRootRaw, projectRoot, version string, profiles []string, setProfile bool, stdout io.Writer) error {
 	cfgPath, err := codexConfigPath()
 	if err != nil {
 		return err
@@ -618,14 +629,18 @@ func runHookInstallCodex(user, noShadow, storeRootExplicit bool, storeRootRaw, p
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return errors.New("hook: config.toml 읽기 실패")
 	}
-	res := installCodexConfigBlock(cfgExisting, codexInstallRequest{Marker: hookMarker(version)})
-	cfgOut, mcpState := res.Out, res.State
-	if mcpState == mcpWritten && res.Changed {
-		if err := atomicWriteFile(cfgPath, cfgOut); err != nil {
+	res := installCodexConfigBlock(cfgExisting, codexInstallRequest{
+		Profiles: profiles, SetProfile: setProfile, Marker: hookMarker(version),
+	})
+	if res.State == mcpWritten && res.Changed {
+		if bErr := backupCodexConfig(cfgPath, cfgExisting); bErr != nil {
+			return errors.New("hook install: config.toml 백업 실패")
+		}
+		if wErr := atomicWriteFile(cfgPath, res.Out); wErr != nil {
 			return errors.New("hook install: config.toml 쓰기 실패")
 		}
 	}
-	mcpConfirmed := mcpState == mcpWritten || mcpState == mcpExistingHeader
+	mcpConfirmed := res.State == mcpWritten || res.State == mcpExistingHeader
 	path, err := codexHooksPath(user, projectRoot)
 	if err != nil {
 		return err
@@ -647,7 +662,22 @@ func runHookInstallCodex(user, noShadow, storeRootExplicit bool, storeRootRaw, p
 	if err := atomicWriteFile(path, merged); err != nil {
 		return errors.New("hook install: 설정 쓰기 실패")
 	}
-	reportCodexMCPState(stdout, mcpState)
+	reportCodexMCPState(stdout, res.State)
+	if res.State == mcpWritten {
+		// D81 — 승인 모드 키는 기입하지 않는다. 예전에는 관리 블록의 주석 한 줄로 권했으나
+		// 재직렬화가 주석을 지우므로(§3 표1) 파일에 남지 않는 안내는 안내가 아니다. 기입이
+		// 확정된 경우에만 낸다.
+		fmt.Fprintln(stdout, "hook install (codex): 승인 프롬프트가 필요하면 [mcp_servers.ctr]에 default_tools_approval_mode = \"prompt\"를 직접 넣으세요 — 설치기는 그 키를 쓰지 않고, 넣어 둔 키는 재설치가 보존합니다")
+		if slices.Contains(res.Profiles, "exec") {
+			// D81 — exec opt-in이 여는 경로 하나를 명시한다. 승인 모드 키는 서버 테이블 단위라
+			// 별도 [mcp_servers.ctr-exec]에 걸어 둔 게이트가 관리 테이블 쪽 exec에는 걸리지 않는다.
+			// 우리는 그 테이블을 고치지 않는다 — D80이 관리 대상 밖으로 두었다.
+			fmt.Fprintln(stdout, "hook install (codex): exec 프로필을 [mcp_servers.ctr]에 켰습니다 — 별도 [mcp_servers.ctr-exec]에 승인 모드를 걸어 두었다면 그 키는 서버 테이블 단위라 이 경로에는 걸리지 않습니다(같은 두 도구에 게이트 없는 두 번째 경로가 생깁니다)")
+		}
+		if res.ArgsKept {
+			fmt.Fprintln(stdout, "hook install (codex): 기존 args를 프로필로 해석하지 못해 args·enabled_tools를 그대로 두었습니다(command와 소유 표식만 갱신) — 프로필을 바꾸려면 --enable로 명시하세요")
+		}
+	}
 	n := len(codexRegistrations)
 	if mcpConfirmed {
 		n++

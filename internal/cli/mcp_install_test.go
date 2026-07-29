@@ -885,18 +885,29 @@ func TestHookInstallSkipsApprovalKeyOnMCPConflict(t *testing.T) {
 	}
 }
 
-// TestHookInstallRejectsExecWithCodex: --codex는 config.toml 경로라 .mcp.json을 만들지 않고,
-// 관리 블록의 도구 목록도 고정이라 --enable-exec이 반영될 자리가 없다. 조용히 무시하면 사용자가
-// exec가 켜졌다고 오인하므로 조합 자체를 거부한다.
-func TestHookInstallRejectsExecWithCodex(t *testing.T) {
+// TestHookInstallAcceptsExecWithCodex — 계약 반전(§2-15). v0.14의
+// TestHookInstallRejectsExecWithCodex가 있던 자리다: 그때는 --codex + --enable-exec이 오류를
+// 내야 통과했는데, D81이 프로필을 Codex 관리 테이블에도 실으므로 그 상호 배제가 사라졌다.
+// 지우기만 하면 그 조합이 무검사 구간이 되므로 "오류 없이 exec 프로필이 관리 테이블의
+// args·enabled_tools에 반영된다"를 단정한다. t.Setenv 사용 → t.Parallel 금지.
+func TestHookInstallAcceptsExecWithCodex(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("CODEX_HOME", home)
 	var out bytes.Buffer
-	err := runHookInstall([]string{"--codex", "--enable-exec"}, "", "", false, t.TempDir(), "0.12.0", &out)
-	if err == nil {
-		t.Fatalf("--codex와 --enable-exec 조합을 거부하지 않았다: %s", out.String())
+	if err := runHookInstall([]string{"--codex", "--user", "--enable-exec"}, "", "", false, t.TempDir(), "0.15.0", &out); err != nil {
+		t.Fatalf("--codex + --enable-exec을 거부했다: %v", err)
 	}
-	// 플래그가 아예 없어서 나는 파싱 오류로는 통과하지 못한다 — 조합 판정이 실제로 존재해야 한다.
-	if strings.Contains(err.Error(), "플래그 파싱") {
-		t.Errorf("조합 판정이 아니라 파싱 오류다: %v", err)
+	cfg, err := os.ReadFile(filepath.Join(home, "config.toml"))
+	if err != nil {
+		t.Fatalf("config.toml 미생성: %v", err)
+	}
+	if !strings.Contains(string(cfg), "args = [\"--enable\", \"exec\"]") {
+		t.Errorf("exec 프로필이 args에 반영되지 않았다:\n%s", cfg)
+	}
+	for _, tool := range []string{"ctr_execute", "ctr_execute_file"} {
+		if !strings.Contains(string(cfg), "\""+tool+"\"") {
+			t.Errorf("%s가 enabled_tools에 없다 — args와 함께 조립되지 않았다:\n%s", tool, cfg)
+		}
 	}
 }
 
