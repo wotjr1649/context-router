@@ -2168,7 +2168,16 @@ func TestD78Limits(t *testing.T) {
 	})
 	t.Run("fallback-throw-no-signal", func(t *testing.T) {
 		// 폴백 경로는 D76 tail이라 처리되지 않은 종료 오류에서 tail이 실행되지 않는다.
-		exitCode, _, _, side := runPS1(t, "param($x)\ncmd /c exit 73\nthrow 'x'", true)
+		// **exit 1만 보면 파싱 실패를 가르지 못한다** — PowerShell은 미처리 throw와
+		// ParserError·로드 실패에 모두 1을 낸다(v0.14 유도 FAIL이 파싱 불가 픽스처에서
+		// exit=1을 실측했다). 그래서 본문이 throw 앞까지 실제로 갔음을 stdout 표지로 함께
+		// 단정한다(v0.15 §1.1 값싼 정리 ②).
+		const reached = "ctr-fallback-throw-reached"
+		exitCode, stdout, _, side := runPS1(t,
+			"param($x)\ncmd /c exit 73\nWrite-Output '"+reached+"'\nthrow 'x'", true)
+		if !strings.Contains(stdout, reached) {
+			t.Fatalf("stdout=%q에 표지가 없다 — 본문이 실행되지 않았다(파싱 실패·로드 실패도 exit 1을 낸다)", stdout)
+		}
 		if side != "" {
 			t.Fatalf("side=%q want 없음 — 폴백 경로의 알려진 공백이다", side)
 		}
