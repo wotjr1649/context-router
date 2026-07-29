@@ -233,28 +233,31 @@ func TestNewServerProfileGating(t *testing.T) {
 	}
 }
 
-// maxToolSchemaBytes: 게이트 11(스키마 토큰 예산, 설계 §2.3·§3.5) — D62 재기준화로 측정 표면이
-// session.db 정상 open된 6-도구(ctr_search/ctr_fetch/ctr_transform + ctr_record_event/
-// ctr_session_summary/ctr_export_events) + exec 프로필 2종(ctr_execute/ctr_execute_file) =
-// 8-도구가 됐다(exec가 회수 경로의 1급 도구로 편입 + ctr_search/ctr_fetch 회수-유도 문구 보강분
-// 포함). tools/list 결과 JSON 직렬화 바이트 상한 — 설명 문구 비대화 회귀 조기 감지용이다. D62부터는
-// 이전 1.2× 완충 대신 실측 + 최소 여유로 재기준화한다(과대 상향 금지 — 완충이 크면 문구 비대화가
-// 상한 아래로 숨어 감지력이 떨어진다). 실측 12914B(v0.11 12864B + v0.11.1 shell 방언 표기)에 최소
-// 여유를 더해 13000 유지. 이 값은 exec 프로필 **단일 서버**의 tools/list 표면이다 — 클라이언트가
-// ctr·ctr-exec를 함께 등록하면 상주 총량은 두 서버 합집합이라 이 값과 다르다(폐기된 이전
-// 값: 6-도구 10024B×1.2=12029, 태스크7 1차 3-도구 5139B×1.2=6167, v0.0.1 3-도구 4359B×1.2=5231).
+// maxToolSchemaBytes: 게이트 11(스키마 토큰 예산, 설계 §2.3·§3.5) — v0.15 재기준화로 측정
+// 표면이 **설치기가 만들 수 있는 최대 프로필**이 됐다: 세션 정상 open의 6-도구
+// (ctr_search/ctr_fetch/ctr_transform + ctr_record_event/ctr_session_summary/ctr_export_events)에
+// 설치기 기본 프로필 ingest,net의 2종(ctr_index·ctr_fetch_and_index)과 --enable-exec 형태의
+// 2종(ctr_execute·ctr_execute_file)을 더한 10-도구다(D81). 이전 형태는 exec 프로필만 켠
+// 8-도구(12914B)를 재서, D81이 여는 10-도구 표면이 옛 상한 13000을 1853B 넘겨도 통과했다 —
+// 물리지 않는 검사였다. tools/list 결과 JSON 직렬화 바이트 상한이며 설명 문구 비대화 회귀의
+// 조기 감지용이다. D62부터의 규칙 그대로 **실측 + 최소 여유**로 잡는다(과대 상향 금지 —
+// 여유가 100B 이상이면 "설명에 100바이트를 덧붙이면 넘긴다"는 감시선이 죽는다).
+// 실측 14853B(10-도구)를 100의 배수로 올려 14900(여유 47B). 이 값은 **단일 서버**의 tools/list
+// 표면이다 — 클라이언트가 ctr·ctr-exec를 함께 등록하면 상주 총량은 두 서버 합집합이라 다르다
+// (폐기된 이전 값: exec 8-도구 12914→13000, 6-도구 10024×1.2=12029).
 // 실측값·근거는 docs/gates-v0.0.1-ko.md 게이트 11 항목 참조(정식 갱신은 게이트 문서 마일스톤에서).
-const maxToolSchemaBytes = 13000
+const maxToolSchemaBytes = 14900
 
 // TestSchemaTokenBudget: tools/list 결과(ListToolsResult 전체 — 실제 클라이언트가 받는
 // JSON 그대로) 직렬화 바이트가 maxToolSchemaBytes를 넘지 않는지 확인한다(게이트 11). 근사
 // 토큰 수 = bytes/4는 로그로만 남긴다 — Claude 정확 tokenizer는 비공개라 근사치일 뿐이고,
 // 실질 게이트는 바이트 상한 쪽이다.
 func TestSchemaTokenBudget(t *testing.T) {
-	// newRecordEventTestServer(t, "exec"): Session 6-도구 + exec 프로필 2종(ctr_execute·
-	// ctr_execute_file) = 8-도구 표면(D62 재기준화 — exec가 회수 경로의 1급 도구로 편입됨).
-	// exec 프로브가 실패하는 환경이면 6-도구로 줄지만 상한은 상계이므로 여전히 통과한다.
-	cs, _, _, _ := newRecordEventTestServer(t, "exec")
+	// newRecordEventTestServer(t, "ingest", "net", "exec"): 세션 6-도구 + ingest 1 + net 1 +
+	// exec 2 = **설치기가 만들 수 있는 최대 프로필**의 10-도구 표면이다(D81 — 기본 ingest,net에
+	// --enable-exec을 더한 형태). 프로브가 실패하는 환경이면 도구가 줄지만 상한은 상계이므로
+	// 여전히 통과한다.
+	cs, _, _, _ := newRecordEventTestServer(t, "ingest", "net", "exec")
 	lt, err := cs.ListTools(context.Background(), nil)
 	if err != nil {
 		t.Fatalf("list tools: %v", err)
