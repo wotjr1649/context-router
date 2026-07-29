@@ -68,6 +68,15 @@ func keepUnownedEntryKeys(prev map[string]json.RawMessage, ours []byte) ([]byte,
 	return b, nil
 }
 
+// isOurMarkerValue — 소유 표식 값의 기준(D82·D84). **정확 일치 `context-router`**(무버전 —
+// D82 이후 훅 등록물과 hostSnippet이 쓰는 값)이거나 **`context-router/` 접두**(버전 있는 값)일
+// 때만 소유다. 키의 존재만으로는 소유가 아니다. 정확 일치 절은 과도기 장치가 아니라 영구
+// 본절이며 D84의 v1.0 제거 대상에서 제외한다 — 지우면 v0.15 이후 설치본이 소유 판정에서
+// 탈락해 대칭 제거가 깨진다.
+func isOurMarkerValue(v string) bool {
+	return v == hookBinaryName || strings.HasPrefix(v, hookMarkerPrefix())
+}
+
 // mcpConfigPath — 프로젝트 루트의 .mcp.json 경로.
 func mcpConfigPath(projectRoot string) string {
 	return filepath.Join(projectRoot, ".mcp.json")
@@ -199,7 +208,7 @@ func mergeMCPServers(existing []byte, name string, entry mcpServerEntry, install
 		if err := json.Unmarshal(raw, &prevRaw); err != nil {
 			return nil, false, errors.New("mcp: 기존 항목 파싱 실패")
 		}
-		if !strings.HasPrefix(prev.Managed, hookMarkerPrefix()) && prev.Command != hookBinaryName {
+		if !isOurMarkerValue(prev.Managed) && prev.Command != hookBinaryName {
 			return nil, false, errors.New("mcp: 같은 이름의 다른 서버 항목이 있어 갱신을 멈춘다")
 		}
 		prevExists = true

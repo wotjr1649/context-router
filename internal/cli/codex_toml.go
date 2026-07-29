@@ -12,6 +12,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 )
 
@@ -502,4 +503,292 @@ func codexConfigPath() (string, error) {
 		return "", errors.New("codex: 홈 디렉터리 해석 실패")
 	}
 	return filepath.Join(home, ".codex", "config.toml"), nil
+}
+
+// codexTableView — 관리 테이블 구간을 소유 키와 보존 라인으로 가른 결과.
+type codexTableView struct {
+	command string   // command 키의 문자열 값(부재면 "")
+	args    []string // args 배열의 문자열 값. **부재와 [] 모두 nil**이다 — D80이 둘을 동치로 본다
+	tools   []string // enabled_tools 배열의 문자열 값
+	// inlineEnv — 인라인 env 대입 줄 인덱스(-1이면 없음). 이 줄이 있으면 [mcp_servers.ctr.env]
+	// 헤더를 새로 붙이지 않는다(중복 정의 금지) — 표식은 그 줄 안에서 갈아 끼운다.
+	inlineEnv int
+	// keep — 우리 소유가 아닌 라인. 원문 그대로 되돌린다.
+	// argsLines·toolsLines — 되읽기 실패 시 keep에 합류해 args·enabled_tools도 원문으로 돌아간다.
+	keep, argsLines, toolsLines []int
+}
+
+// codexReadTable — 관리 테이블 구간을 훑어 소유 키 값과 보존 라인을 가른다.
+func codexReadTable(lines [][]byte, sp codexSpan) codexTableView {
+	view := codexTableView{inlineEnv: -1}
+	if !sp.found {
+		return view
+	}
+	for _, e := range codexEntries(lines, sp) {
+		joined := ""
+		for i := e[0]; i <= e[1]; i++ {
+			joined += stripLine(lines[i])
+		}
+		values := []string(nil)
+		if eq := strings.Index(joined, "="); eq >= 0 {
+			values = tomlStringList(joined[eq+1:])
+		}
+		switch codexKeyName(joined) {
+		case "command":
+			if len(values) > 0 {
+				view.command = values[0]
+			}
+			continue
+		case "args":
+			view.args = values
+			for i := e[0]; i <= e[1]; i++ {
+				view.argsLines = append(view.argsLines, i)
+			}
+			continue
+		case "enabled_tools":
+			view.tools = values
+			for i := e[0]; i <= e[1]; i++ {
+				view.toolsLines = append(view.toolsLines, i)
+			}
+			continue
+		case "env":
+			// 인라인 env 대입은 보존 라인으로 두고 표식만 갈아 끼운다 — 이 줄이 있는데
+			// [mcp_servers.ctr.env] 헤더를 새로 붙이면 중복 정의로 사용자 Codex가 깨진다.
+			view.inlineEnv = e[0]
+		}
+		for i := e[0]; i <= e[1]; i++ {
+			view.keep = append(view.keep, i)
+		}
+	}
+	return view
+}
+
+// tomlKeyLen — s의 맨 앞이 key인가. TOML은 `CTR_MANAGED`와 `"CTR_MANAGED"`·`'CTR_MANAGED'`를
+// **같은 키**로 읽으므로 세 표기를 모두 그 키로 본다 — 맨 키만 보면 따옴표 표기를 부재로 읽고
+// 표식을 한 번 더 넣어 같은 인라인 테이블에 중복 키가 생긴다(D80이 막으려는 파스 에러 방향).
+// 맞으면 그 키 표기의 길이(따옴표 포함), 아니면 -1이다. 서브테이블 경로의 codexKeyName이
+// 따옴표를 벗기는 것과 **같은 기준**이며, 두 경로가 다른 기준을 쓰면 같은 파일을 두 방식으로
+// 읽는 셈이다.
+func tomlKeyLen(s, key string) int {
+	for _, q := range []string{"", `"`, "'"} {
+		if strings.HasPrefix(s, q+key+q) {
+			return 2*len(q) + len(key)
+		}
+	}
+	return -1
+}
+
+// tomlInlineValue — 인라인 테이블 대입 줄(정규화)에서 key의 문자열 값을 뽑는다. 키 경계는
+// '{' 또는 ',' 직후로 한정한다 — 부분 문자열로 찾으면 다른 키의 값 안에 든 같은 이름까지 잡는다.
+// found는 키가 텍스트로 있는가이고, 값이 문자열이 아니면 ("", true)다.
+func tomlInlineValue(s, key string) (value string, found bool) {
+	for i := 0; i < len(s); i++ {
+		if s[i] != '{' && s[i] != ',' {
+			continue
+		}
+		n := tomlKeyLen(s[i+1:], key)
+		if n < 0 || i+1+n >= len(s) || s[i+1+n] != '=' {
+			continue
+		}
+		if v := tomlStringList(s[i+2+n:]); len(v) > 0 {
+			return v[0], true
+		}
+		return "", true
+	}
+	return "", false
+}
+
+// codexMarkerValue — 소유 표식 값을 읽는다. [mcp_servers.ctr.env] 서브테이블과 관리 테이블
+// 안의 인라인 env 대입 **두 형태를 모두** 인식한다(D80). found는 키가 있는가이고, 소유
+// 판정은 값 기준(isOurMarkerValue)이라 키만 있고 값이 비면 소유가 아니다.
+func codexMarkerValue(lines [][]byte, sp codexSpans, view codexTableView) (string, bool) {
+	if sp.env.found {
+		for _, e := range codexEntries(lines, sp.env) {
+			joined := ""
+			for i := e[0]; i <= e[1]; i++ {
+				joined += stripLine(lines[i])
+			}
+			if codexKeyName(joined) != codexMarkerKey {
+				continue
+			}
+			if v := tomlStringList(joined[strings.Index(joined, "=")+1:]); len(v) > 0 {
+				return v[0], true
+			}
+			return "", true
+		}
+	}
+	if view.inlineEnv >= 0 {
+		return tomlInlineValue(stripLine(lines[view.inlineEnv]), codexMarkerKey)
+	}
+	return "", false
+}
+
+// codexOwnership — 관리 테이블의 소유 판정. D84가 **한 절로 격리**한 형태다:
+//
+//	소유 = env.CTR_MANAGED 값이 소유 기준을 만족(D82)
+//	     || command가 hookBinaryName (D80 인수 절 — 재직렬화가 표식을 지운 파일의 복귀 경로)
+//	     || 구 BEGIN/END 블록 안에 있는 우리 테이블 (D84 — v1.0에서 **이 절만** 지운다)
+//
+// 셋 다 **테이블 한정**이다: 테이블 한정 없는 위치 술어를 쓰면 밀림 파일에서 블록 안에 들어온
+// 사용자 테이블까지 소유가 되고, 이름 한정 없는 명령 술어를 쓰면 [mcp_servers.ctr-exec]까지
+// 소유가 된다. 앞의 두 절은 제거 대상이 아니다 — 첫 절의 정확 일치는 D82의 영구 본절이고,
+// 둘째 절은 호스트 재직렬화가 표식을 다시 지울 때의 복귀 경로다.
+func codexOwnership(marker string, markerFound bool, command string, inOldBlock bool) bool {
+	if markerFound && isOurMarkerValue(marker) {
+		return true
+	}
+	if command == hookBinaryName {
+		return true
+	}
+	return inOldBlock
+}
+
+// tomlStringArray — 문자열 슬라이스를 TOML 배열 리터럴로 쓴다(우리가 기입하는 유일한 형태).
+func tomlStringArray(v []string) string {
+	q := make([]string, len(v))
+	for i, s := range v {
+		q[i] = `"` + s + `"`
+	}
+	return "[" + strings.Join(q, ", ") + "]"
+}
+
+// ensureEOL — 바이트가 개행으로 끝나지 않으면 지배 개행을 붙인다(구간 뒤에 다른 테이블을
+// 이어 붙일 때 두 줄이 붙는 것을 막는다).
+func ensureEOL(b []byte, eol string) []byte {
+	if len(b) > 0 && b[len(b)-1] != '\n' {
+		return append(b, eol...)
+	}
+	return b
+}
+
+// inlineMarkerSpan — 인라인 env 대입 줄(**원문**)에서 key의 문자열 값 구간 [start,end)를
+// 찾는다. 키 경계는 '{' 또는 ',' 다음의 첫 비공백 토큰으로 한정하고 따옴표 표기도 같은 키로
+// 본다(tomlKeyLen) — 읽기(tomlInlineValue)와 되쓰기가 같은 키 기준을 써야 "부재로 읽고 다시
+// 넣는" 중복 키가 생기지 않는다. 부분 문자열로 찾으면 다른 키의 값 안에 든 같은 이름까지
+// 잡는다. 없거나 값이 문자열이 아니면 (-1,-1)이다. tomlInlineValue와 달리 정규화 문자열이
+// 아니라 원문을 받는다 — 되쓰기는 원문 바이트를 보존해야 하므로 stripLine이 지운 공백 위치를
+// 쓸 수 없다.
+func inlineMarkerSpan(s, key string) (start, end int) {
+	skipSpace := func(i int) int {
+		for i < len(s) && (s[i] == ' ' || s[i] == '\t') {
+			i++
+		}
+		return i
+	}
+	for i := 0; i < len(s); i++ {
+		if s[i] != '{' && s[i] != ',' {
+			continue
+		}
+		j := skipSpace(i + 1)
+		n := tomlKeyLen(s[j:], key)
+		if n < 0 {
+			continue
+		}
+		j = skipSpace(j + n)
+		if j >= len(s) || s[j] != '=' {
+			continue
+		}
+		j = skipSpace(j + 1)
+		if j >= len(s) || s[j] != '"' {
+			return -1, -1 // 키는 있으나 문자열 값이 아니다 — 우리가 다루지 않는 형태
+		}
+		return j, j + basicStringLen(s[j:])
+	}
+	return -1, -1
+}
+
+// setInlineEnvMarker — 인라인 env 대입 줄에 소유 표식을 심는다. 이미 있으면 **그 키의 값
+// 구간만** 바꾸고, 없으면 여는 중괄호 뒤에 더한다(내부가 비면 쉼표를 붙이지 않는다 — TOML은
+// 인라인 테이블의 후행 쉼표를 허용하지 않는다). 그 밖의 키는 원문 그대로 남는다. 키는 있는데
+// 값이 문자열이 아니면 우리가 다루지 않는 형태이므로 원문을 그대로 둔다(중복 키 생성 금지) —
+// 그 판정은 inlineMarkerSpan이 돌려주는 (-1,-1)이 내린다. **빈 문자열 값은 그 부류가 아니다**:
+// 값 구간이 있으므로 제자리에서 현재 값으로 갱신한다 — 갱신하지 않으면 표식이 영영 현재 값이
+// 되지 못하고, 그 상태가 D84 무변경 판정을 매번 어긋나게 한다.
+// 값으로 첫 일치를 치환하지 않는 이유: 표식과 **값이 같은** 사용자 키가 앞서 있으면 그 값이
+// 바뀌고 CTR_MANAGED는 옛 값으로 남는다 — 사용자 환경변수를 조용히 고치는 경로다.
+func setInlineEnvMarker(line []byte, old string, oldFound bool, marker, eol string) []byte {
+	s := trimEOL(line)
+	if oldFound {
+		if old == marker {
+			return line
+		}
+		start, end := inlineMarkerSpan(s, codexMarkerKey)
+		if start < 0 {
+			return line
+		}
+		return []byte(s[:start] + `"` + marker + `"` + s[end:] + eol)
+	}
+	open := strings.Index(s, "{")
+	last := strings.LastIndex(s, "}")
+	if open < 0 || last < open {
+		return line // 여러 줄 인라인 등 우리가 다루지 않는 형태 — 원문 보존
+	}
+	sep := ","
+	if strings.TrimSpace(s[open+1:last]) == "" {
+		sep = ""
+	}
+	return []byte(s[:open+1] + " " + codexMarkerKey + ` = "` + marker + `"` + sep + s[open+1:] + eol)
+}
+
+// codexTableBody — 관리 테이블 구간의 새 내용(소유 키 + 보존 라인). 기존 테이블이면 헤더
+// 라인을 원문 그대로 옮긴다 — 호스트가 헤더 공백을 바꿔 놓아도 그것만으로 재기입이 나지
+// 않게 하는 지점이다. keepArgs면 args·enabled_tools를 보존 라인으로 되돌린다(D81 되읽기 실패).
+func codexTableBody(lines [][]byte, sp codexSpan, view codexTableView, profiles []string, keepArgs bool, marker, eol string) []byte {
+	var b []byte
+	if sp.found {
+		b = append(b, lines[sp.start]...)
+		b = ensureEOL(b, eol)
+	} else {
+		b = append(b, "["+codexManagedTable+"]"+eol...)
+	}
+	b = append(b, `command = "`+hookBinaryName+`"`+eol...)
+	if !keepArgs {
+		if a := mcpArgsForProfiles(profiles); len(a) > 0 {
+			b = append(b, "args = "+tomlStringArray(a)+eol...)
+		}
+		b = append(b, "enabled_tools = "+tomlStringArray(enabledToolsForProfiles(profiles))+eol...)
+	}
+	keep := view.keep
+	if keepArgs {
+		keep = append(append(append([]int{}, keep...), view.argsLines...), view.toolsLines...)
+		slices.Sort(keep)
+	}
+	for _, i := range keep {
+		if i == view.inlineEnv {
+			old, found := tomlInlineValue(stripLine(lines[i]), codexMarkerKey)
+			b = append(b, setInlineEnvMarker(lines[i], old, found, marker, eol)...)
+			continue
+		}
+		b = append(b, lines[i]...)
+	}
+	return b
+}
+
+// codexEnvBody — [mcp_servers.ctr.env] 구간의 새 내용. CTR_MANAGED만 우리 것이고 나머지
+// 환경변수는 보존한다(D80).
+func codexEnvBody(lines [][]byte, sp codexSpan, marker, eol string) []byte {
+	var b []byte
+	if sp.found {
+		b = append(b, lines[sp.start]...)
+		b = ensureEOL(b, eol)
+	} else {
+		b = append(b, "["+codexManagedEnv+"]"+eol...)
+	}
+	b = append(b, codexMarkerKey+` = "`+marker+`"`+eol...)
+	if !sp.found {
+		return b
+	}
+	for _, e := range codexEntries(lines, sp) {
+		joined := ""
+		for i := e[0]; i <= e[1]; i++ {
+			joined += stripLine(lines[i])
+		}
+		if codexKeyName(joined) == codexMarkerKey {
+			continue
+		}
+		for i := e[0]; i <= e[1]; i++ {
+			b = append(b, lines[i]...)
+		}
+	}
+	return b
 }

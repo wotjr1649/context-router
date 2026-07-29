@@ -223,3 +223,143 @@ func TestCodexManagedSpans(t *testing.T) {
 		t.Errorf("tomlStringList=%v want [a b]", v)
 	}
 }
+
+// codexLinesOf — 픽스처 문자열을 라인 목록과 구간으로 함께 푸는 테스트 헬퍼.
+func codexLinesOf(t *testing.T, src string) ([][]byte, codexSpans, codexTableView) {
+	t.Helper()
+	lines := splitLinesKeepEnds([]byte(src))
+	sp := codexManagedSpans(lines)
+	return lines, sp, codexReadTable(lines, sp.table)
+}
+
+// TestCodexTableOwnershipAndAdoption — D80 소유 판정과 인수(§2-3). 세 갈래를 한 표로 본다.
+// ① 표식 있고 값이 소유 기준을 만족 → 소유 ② 표식 없고 command가 hookBinaryName → **인수**
+// ③ 표식 값이 기준을 벗어나거나 표식도 없고 command도 다른 값 → 사용자 소유.
+// 표식은 서브테이블과 인라인 대입 두 형태를 모두 인식한다(D80 — 호스트가 어느 형태로
+// 되쓰는지는 미검증이라 스캔이 둘 다 본다). 인라인 대입의 키는 맨 키와 따옴표 키가 TOML에서
+// 같은 키이므로 둘 다 인식한다 — 따옴표 키를 부재로 읽으면 소유를 놓치고 표식을 다시 넣는다.
+func TestCodexTableOwnershipAndAdoption(t *testing.T) {
+	cases := []struct {
+		name      string
+		src       string
+		wantOwned bool
+	}{
+		{"① 표식 버전 있음", "[mcp_servers.ctr]\ncommand = \"other\"\n[mcp_servers.ctr.env]\nCTR_MANAGED = \"context-router/0.14.0\"\n", true},
+		{"① 표식 무버전(D82 정확 일치)", "[mcp_servers.ctr]\ncommand = \"other\"\n[mcp_servers.ctr.env]\nCTR_MANAGED = \"context-router\"\n", true},
+		{"① 인라인 env 표식", "[mcp_servers.ctr]\ncommand = \"other\"\nenv = { CTR_MANAGED = \"context-router/0.15.0\" }\n", true},
+		{"① 인라인 env 표식(따옴표 키)", "[mcp_servers.ctr]\ncommand = \"other\"\nenv = { \"CTR_MANAGED\" = \"context-router/0.15.0\" }\n", true},
+		{"② 인수 — 표식 없고 command 일치", "[mcp_servers.ctr]\ncommand = \"context-router\"\nargs = []\n", true},
+		{"③ 표식 값이 남의 것", "[mcp_servers.ctr]\ncommand = \"other\"\n[mcp_servers.ctr.env]\nCTR_MANAGED = \"other-tool/1.0\"\n", false},
+		{"③ 표식도 없고 command도 다르다", "[mcp_servers.ctr]\ncommand = \"other\"\n", false},
+		{"③ 키만 있고 값이 비었다", "[mcp_servers.ctr]\ncommand = \"other\"\n[mcp_servers.ctr.env]\nCTR_MANAGED = \"\"\n", false},
+	}
+	for _, c := range cases {
+		lines, sp, view := codexLinesOf(t, c.src)
+		marker, found := codexMarkerValue(lines, sp, view)
+		if got := codexOwnership(marker, found, view.command, false); got != c.wantOwned {
+			t.Errorf("%s: owned=%v want %v (marker=%q found=%v command=%q)", c.name, got, c.wantOwned, marker, found, view.command)
+		}
+	}
+	// 인수 범위는 관리 테이블 이름 하나다 — ctr-exec은 command가 같아도 관리 대상이 아니다.
+	_, sp, _ := codexLinesOf(t, "[mcp_servers.ctr-exec]\ncommand = \"context-router\"\n")
+	if sp.table.found {
+		t.Errorf("ctr-exec이 관리 테이블로 잡혔다")
+	}
+	// D84 마지막 절: 구 블록 안이면 표식도 command도 없어도 소유다(v1.0에서 이 절만 지운다).
+	if !codexOwnership("", false, "/abs/path/context-router", true) {
+		t.Errorf("구 BEGIN/END 블록 안의 우리 테이블이 소유로 인정되지 않았다")
+	}
+}
+
+// TestCodexTableBodyPreservesUnownedKeys — D80 왕복 보존(§2-1 키 보존). 관리 테이블 안에서
+// install이 소유하는 키는 command·args·enabled_tools 셋(+ env.CTR_MANAGED)이고, 그 밖의 키는
+// 사용자 것이라 **원문 그대로** 되돌린다. [mcp_servers.ctr.env]에서도 CTR_MANAGED만 우리
+// 것이다. D81이 승인 모드 키를 기입하지 않기로 했고 사용자가 그 키를 놓을 자리는 이 테이블
+// 안뿐이라, 이 보존은 그 결정의 전제다.
+// 같은 테스트가 **인라인 env 표기 파일의 기입 규칙**(D80)도 본다 — 서브테이블 헤더를 붙이지
+// 않고 그 줄 안에서 표식만 갈아 끼우며, 값이 같은 앞선 사용자 키를 대신 바꾸지 않는다.
+func TestCodexTableBodyPreservesUnownedKeys(t *testing.T) {
+	src := "[mcp_servers.ctr]\n" +
+		"command = \"context-router\"\n" +
+		"args = []\n" +
+		"enabled_tools = [\"ctr_search\"]\n" +
+		"default_tools_approval_mode = \"prompt\"\n" +
+		"startup_timeout_sec = 30\n"
+	lines, sp, view := codexLinesOf(t, src)
+	got := string(codexTableBody(lines, sp.table, view, []string{"ingest", "net"}, false, "context-router/0.15.0", "\n"))
+	for _, want := range []string{
+		"[mcp_servers.ctr]\n",
+		"command = \"context-router\"\n",
+		"args = [\"--enable\", \"ingest,net\"]\n",
+		"\"ctr_index\"",
+		"\"ctr_fetch_and_index\"",
+		"default_tools_approval_mode = \"prompt\"\n",
+		"startup_timeout_sec = 30\n",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("본문에 %q 없음:\n%s", want, got)
+		}
+	}
+	// 프로필이 비면 args 키 자체를 쓰지 않는다(재직렬화가 args = []를 지운다, D80).
+	empty := string(codexTableBody(lines, sp.table, view, nil, false, "context-router/0.15.0", "\n"))
+	if strings.Contains(empty, "args = ") {
+		t.Errorf("빈 프로필인데 args 줄을 썼다:\n%s", empty)
+	}
+	// env 서브테이블: CTR_MANAGED만 우리 것이고 나머지 환경변수는 보존한다.
+	esrc := "[mcp_servers.ctr.env]\nCTR_MANAGED = \"context-router/0.14.0\"\nCTR_STORE_ROOT = \"D:/ctr\"\n"
+	elines := splitLinesKeepEnds([]byte(esrc))
+	esp := codexManagedSpans(elines)
+	ebody := string(codexEnvBody(elines, esp.env, "context-router/0.15.0", "\n"))
+	if !strings.Contains(ebody, "CTR_MANAGED = \"context-router/0.15.0\"\n") {
+		t.Errorf("표식이 현재 값으로 갱신되지 않았다:\n%s", ebody)
+	}
+	if !strings.Contains(ebody, "CTR_STORE_ROOT = \"D:/ctr\"\n") {
+		t.Errorf("사용자 환경변수가 사라졌다:\n%s", ebody)
+	}
+	if strings.Count(ebody, "CTR_MANAGED") != 1 {
+		t.Errorf("표식이 중복 기입됐다:\n%s", ebody)
+	}
+	// 인라인 env 표기(D80 기입 규칙): 서브테이블 헤더를 붙이지 않고 그 줄 안에서 표식만
+	// 갈아 끼운다. 표식과 **값이 같은** 사용자 키를 앞에 둬, 첫 일치 치환이 그 키를 대신
+	// 바꾸는 구현을 배제한다 — 그러면 사용자 환경변수가 조용히 바뀌고 표식은 옛 값으로 남는다.
+	isrc := "[mcp_servers.ctr]\n" +
+		"command = \"context-router\"\n" +
+		"env = { CTR_STORE_ROOT = \"context-router/0.14.0\", CTR_MANAGED = \"context-router/0.14.0\" }\n"
+	ilines, isp, iview := codexLinesOf(t, isrc)
+	ibody := string(codexTableBody(ilines, isp.table, iview, nil, false, "context-router/0.15.0", "\n"))
+	if !strings.Contains(ibody, "CTR_MANAGED = \"context-router/0.15.0\"") {
+		t.Errorf("인라인 표식이 갱신되지 않았다:\n%s", ibody)
+	}
+	if !strings.Contains(ibody, "CTR_STORE_ROOT = \"context-router/0.14.0\"") {
+		t.Errorf("값이 같은 앞선 사용자 키가 대신 바뀌었다:\n%s", ibody)
+	}
+	if strings.Contains(ibody, "["+codexManagedEnv+"]") {
+		t.Errorf("인라인 표기 파일에 env 서브테이블 헤더를 붙였다 — 중복 정의다:\n%s", ibody)
+	}
+	// 표식 키가 없는 인라인 대입에는 여는 중괄호 뒤에 더한다(그 밖의 키는 그대로).
+	nsrc := "[mcp_servers.ctr]\ncommand = \"context-router\"\nenv = { CTR_STORE_ROOT = \"D:/ctr\" }\n"
+	nlines, nsp, nview := codexLinesOf(t, nsrc)
+	nbody := string(codexTableBody(nlines, nsp.table, nview, nil, false, "context-router/0.15.0", "\n"))
+	if !strings.Contains(nbody, codexMarkerKey+" = \"context-router/0.15.0\"") ||
+		!strings.Contains(nbody, "CTR_STORE_ROOT = \"D:/ctr\"") {
+		t.Errorf("인라인 대입에 표식을 더하면서 기존 키를 보존하지 못했다:\n%s", nbody)
+	}
+	// 따옴표 키 인라인 표식: TOML이 같은 키로 읽으므로 값 구간만 갈아 끼우고 키를 다시 더하지
+	// 않는다 — 더하면 같은 인라인 테이블에 중복 키가 생겨 사용자 Codex 전체가 깨진다.
+	qsrc := "[mcp_servers.ctr]\ncommand = \"context-router\"\nenv = { \"CTR_MANAGED\" = \"context-router/0.14.0\" }\n"
+	qlines, qsp, qview := codexLinesOf(t, qsrc)
+	qbody := string(codexTableBody(qlines, qsp.table, qview, nil, false, "context-router/0.15.0", "\n"))
+	if !strings.Contains(qbody, "\"CTR_MANAGED\" = \"context-router/0.15.0\"") {
+		t.Errorf("따옴표 키 인라인 표식이 제자리에서 갱신되지 않았다:\n%s", qbody)
+	}
+	if strings.Count(qbody, codexMarkerKey) != 1 {
+		t.Errorf("따옴표 키를 부재로 읽고 표식을 다시 더했다 — 중복 키다:\n%s", qbody)
+	}
+	// keepArgs=true면 args·enabled_tools를 손대지 않고 원문으로 되돌린다(D81 되읽기 실패).
+	ksrc := "[mcp_servers.ctr]\ncommand = \"context-router\"\nargs = [\"--profile\", \"global-search\"]\nenabled_tools = [\"ctr_search\"]\n"
+	klines, ksp, kview := codexLinesOf(t, ksrc)
+	kbody := string(codexTableBody(klines, ksp.table, kview, defaultMCPProfiles, true, "context-router/0.15.0", "\n"))
+	if !strings.Contains(kbody, "args = [\"--profile\", \"global-search\"]\n") || strings.Contains(kbody, "ctr_index") {
+		t.Errorf("되읽지 못한 args·enabled_tools를 손댔다:\n%s", kbody)
+	}
+}
