@@ -131,23 +131,28 @@ func TestCodexConfigBlockRoundTrip(t *testing.T) {
 // 된다. [[배열 테이블]]은 경계이지만 이름 있는 헤더는 아니다.
 // **배열 안 원소는 대괄호로 시작하는 형태로 둔다** — 따옴표로 시작하는 원소는 stripLine
 // 결과가 '"'로 시작해 상태 추적이 있든 없든 경계가 아니므로 depth 추적에 물리는 단정이
-// 되지 못한다. 한 줄 문자열·주석 줄(line 10)은 어느 구현에서도 경계가 아니라 감시선이
+// 되지 못한다. 한 줄 문자열·주석 줄(line 11)은 어느 구현에서도 경계가 아니라 감시선이
 // 아니지만, '['를 포함하기만 하면 경계로 보는 구현을 배제하는 자리로 남긴다.
+// **line 2는 이스케이프 인지 감시선이다(리뷰 F3)**: 여러 줄 기본 문자열 본문에 \""" 를 넣는다 —
+// 첫 따옴표만 백슬래시로 이스케이프되고 나머지 둘은 평범한 문자라 실제로는 닫지 않는다.
+// strings.Index 기반으로 닫기를 찾으면 이 세 따옴표를 닫기로 오인해 그 뒤로 열림 상태가
+// 뒤집히고, 그 오염이 line 12·13의 경계 판정까지 전파된다 — 두 줄의 단정이 이 감시선의 게이트다.
 func TestTOMLLineScannerHeaderBoundary(t *testing.T) {
 	src := "" +
 		"[a]\n" + // 0 경계 a
 		"k = \"\"\"\n" + // 1
-		"[mcp_servers.x]\n" + // 2 여러 줄 기본 문자열 안 — 경계 아님
-		"\"\"\"\n" + // 3
-		"m = '''\n" + // 4
-		"[mcp_servers.y]\n" + // 5 여러 줄 리터럴 안 — 경계 아님
-		"'''\n" + // 6
-		"arr = [\n" + // 7
-		"  [1, 2],\n" + // 8 여러 줄 배열 안의 중첩 배열 — 경계 아님(depth 추적의 감시선)
-		"]\n" + // 9
-		"s = \"[not.a.header]\"  # [also.not]\n" + // 10 한 줄 문자열·주석 — 경계 아님
-		"[[b]]\n" + // 11 배열 테이블 — 경계이나 이름 없음
-		"[c] # trailing\n" // 12 경계 c
+		"\\\"\"\"\n" + // 2 이스케이프된 \""" — 닫기 오인 감시선(F3), 실제로는 닫지 않는다
+		"[mcp_servers.x]\n" + // 3 여러 줄 기본 문자열 안 — 경계 아님
+		"\"\"\"\n" + // 4
+		"m = '''\n" + // 5
+		"[mcp_servers.y]\n" + // 6 여러 줄 리터럴 안 — 경계 아님
+		"'''\n" + // 7
+		"arr = [\n" + // 8
+		"  [1, 2],\n" + // 9 여러 줄 배열 안의 중첩 배열 — 경계 아님(depth 추적의 감시선)
+		"]\n" + // 10
+		"s = \"[not.a.header]\"  # [also.not]\n" + // 11 한 줄 문자열·주석 — 경계 아님
+		"[[b]]\n" + // 12 배열 테이블 — 경계이나 이름 없음(F3 감시선 게이트 1)
+		"[c] # trailing\n" // 13 경계 c(F3 감시선 게이트 2)
 	lines := splitLinesKeepEnds([]byte(src))
 	var sc tomlLineScanner
 	type got struct {
@@ -155,8 +160,8 @@ func TestTOMLLineScannerHeaderBoundary(t *testing.T) {
 		name     string
 	}
 	want := map[int]got{
-		0: {true, "a"}, 2: {false, ""}, 5: {false, ""}, 8: {false, ""},
-		10: {false, ""}, 11: {true, ""}, 12: {true, "c"},
+		0: {true, "a"}, 3: {false, ""}, 6: {false, ""}, 9: {false, ""},
+		11: {false, ""}, 12: {true, ""}, 13: {true, "c"},
 	}
 	for i, ln := range lines {
 		b, n := sc.step(ln)
@@ -177,7 +182,7 @@ func TestCodexManagedSpans(t *testing.T) {
 		"[mcp_servers.between]\n" + // 3  table.end
 		"x = 1\n" + // 4
 		"[mcp_servers.ctr.env]\n" + // 5  env.start
-		"CTR_MANAGED = \"context-router/0.15.0\"\n" + // 6
+		codexMarkerKey + " = \"context-router/0.15.0\"\n" + // 6
 		"[after]\n" + // 7  env.end
 		"y = 2\n" // 8
 	sp := codexManagedSpans(splitLinesKeepEnds([]byte(src)))
