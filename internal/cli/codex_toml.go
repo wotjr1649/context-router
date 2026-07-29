@@ -1,8 +1,11 @@
 package cli
 
-// D48 — config.toml 관리 블록 병합(스펙 v0.7 §0 D48·§3). TOML 파서 비의존(신규 의존 금지):
-// 마커 정확 라인 매치 + 본문 검증(소유) + 키-경계 보수 스캔(충돌)이 파스 에러 방향
-// (중복 정의로 사용자 Codex 전체 파손)을 구조 봉쇄한다. 순수 바이트 변환 — IO는 호출자.
+// D48→D80 — config.toml 관리 단위를 주석 마커 블록에서 **TOML 테이블 경계**로 옮긴다(스펙
+// v0.15 §0 D80·D84). 주석은 TOML 데이터가 아니라 호스트 재직렬화가 지우므로(§3 표1) 마커로는
+// 관리 단위를 유지할 수 없다. TOML 파서 비의존(신규 의존 금지): 라인 스캐너가 여러 줄
+// 문자열·배열의 열림 상태를 추적해 테이블 헤더만 경계로 잡고, 그 경계 안에서만 바이트를
+// 바꾼다 — TOML 문법상 헤더와 다음 헤더 사이에는 그 테이블의 키만 올 수 있으므로 blast
+// radius가 우리 테이블 안으로 구조적으로 묶인다. 순수 바이트 변환 — IO는 호출자.
 
 import (
 	"bytes"
@@ -69,6 +72,237 @@ func trimEOL(line []byte) string {
 // stripLine — 소유·충돌 판정용 정규화: 종결자 포함 공백 전부 제거.
 func stripLine(line []byte) string {
 	return strings.Join(strings.Fields(string(line)), "")
+}
+
+const (
+	// codexManagedTable — Codex 관리 테이블 이름. .mcp.json의 ctrMCPServerName(ctr-exec)과
+	// 다르다(D80·§1.2) — 사용자 파일의 [mcp_servers.ctr-exec]는 exec 2종만 노출하고 승인
+	// 모드가 걸린 **별도 등록**이라 install도 uninstall도 읽지도 쓰지도 않는다.
+	codexManagedTable = "mcp_servers.ctr"
+	// codexManagedEnv — 소유 표식을 싣는 서브테이블. 관리 테이블과 **독립 구간**이다.
+	codexManagedEnv = "mcp_servers.ctr.env"
+	// codexMarkerKey — 소유 표식 키. 재직렬화를 견디면서 사용자 의미를 갖지 않는 유일한
+	// 보존 필드다. 우리 바이너리는 이 환경변수를 읽지 않는다 — 표식일 뿐이며, 읽지
+	// 않는다는 사실 자체가 계약이다(D80).
+	codexMarkerKey = "CTR_MANAGED"
+)
+
+// tomlLineScanner — 라인 기반 테이블 헤더 판정기(D80 헤더 판정 규칙). TOML 파서가 아니다 —
+// 여러 줄 문자열(삼중 큰따옴표·삼중 홑따옴표)과 여러 줄 배열의 열림 상태만 추적해 그 안의 [ … ] 모양 줄을
+// 헤더로 보지 않는다. 상태 추적을 빼면 범위가 그 줄에서 잘려 우리 테이블의 잔여 키가 남거나
+// 사용자 값 안의 한 줄이 경계가 되고, 그러면 D80의 blast radius 논거가 함께 무너진다.
+type tomlLineScanner struct {
+	inBasic   bool // """ 열림
+	inLiteral bool // ''' 열림
+	depth     int  // 여러 줄 배열 [ ] 균형
+}
+
+// open — 이 줄이 앞 줄에서 시작한 여러 줄 값 안인가(헤더·키 판정을 하면 안 되는 상태).
+func (s *tomlLineScanner) open() bool { return s.inBasic || s.inLiteral || s.depth > 0 }
+
+// step — 라인 하나를 소비한다. boundary는 이 줄이 테이블 경계인지, name은 단일 대괄호
+// 헤더일 때의 정규화된 이름이다([[배열 테이블]]도 경계이지만 이름은 비운다 — 우리 이름이
+// 될 수 없고, 경계로는 세야 앞 테이블의 구간이 거기서 끝난다).
+func (s *tomlLineScanner) step(line []byte) (boundary bool, name string) {
+	if !s.open() {
+		t := stripLine(line)
+		if strings.HasPrefix(t, "[") {
+			boundary = true
+			if !strings.HasPrefix(t, "[[") {
+				if i := strings.Index(t, "]"); i > 1 {
+					name = t[1:i]
+				}
+			}
+		}
+	}
+	s.advance(string(line), boundary)
+	return boundary, name
+}
+
+// advance — 라인 내용을 훑어 여러 줄 상태를 갱신한다. 헤더 줄은 자기완결이라 배열 균형을
+// 세지 않는다 — 헤더의 대괄호가 배열 열림으로 잡히면 그 뒤 파일 전체가 값 안으로 들어간다.
+func (s *tomlLineScanner) advance(line string, header bool) {
+	for i := 0; i < len(line); {
+		switch {
+		case s.inBasic:
+			// 닫기 탐색은 basicStringLen과 **같은 기준**으로 이스케이프를 인지한다 —
+			// strings.Index로 찾으면 \""" 를 닫기로 오인해 그 뒤 파일 전체의 열림 상태가
+			// 뒤집힌다. 두 자리가 다른 기준을 쓰면 같은 파일을 두 방식으로 읽는 셈이다.
+			j := i
+			for j < len(line) {
+				if line[j] == '\\' {
+					j += 2
+					continue
+				}
+				if strings.HasPrefix(line[j:], `"""`) {
+					break
+				}
+				j++
+			}
+			if j >= len(line) {
+				return
+			}
+			s.inBasic, i = false, j+3
+		case s.inLiteral:
+			j := strings.Index(line[i:], "'''")
+			if j < 0 {
+				return
+			}
+			s.inLiteral, i = false, i+j+3
+		case strings.HasPrefix(line[i:], `"""`):
+			s.inBasic, i = true, i+3
+		case strings.HasPrefix(line[i:], "'''"):
+			s.inLiteral, i = true, i+3
+		case line[i] == '#':
+			return // 문자열 밖 주석 — 줄의 나머지는 값이 아니다
+		case line[i] == '"':
+			i += basicStringLen(line[i:])
+		case line[i] == '\'':
+			i += literalStringLen(line[i:])
+		case line[i] == '[' && !header:
+			s.depth++
+			i++
+		case line[i] == ']' && !header:
+			if s.depth > 0 {
+				s.depth--
+			}
+			i++
+		default:
+			i++
+		}
+	}
+}
+
+// basicStringLen — s[0]이 여는 큰따옴표일 때 닫는 따옴표까지의 길이(백슬래시 이스케이프
+// 반영). 닫히지 않으면 줄 끝까지다 — TOML은 한 줄 기본 문자열의 줄바꿈을 허용하지 않으므로
+// 미닫힘은 문법 오류이고, 우리는 그 줄에서 멈추면 된다.
+func basicStringLen(s string) int {
+	for i := 1; i < len(s); i++ {
+		switch s[i] {
+		case '\\':
+			i++
+		case '"':
+			return i + 1
+		}
+	}
+	return len(s)
+}
+
+// literalStringLen — 홑따옴표 문자열에는 이스케이프가 없다.
+func literalStringLen(s string) int {
+	if j := strings.Index(s[1:], "'"); j >= 0 {
+		return j + 2
+	}
+	return len(s)
+}
+
+// codexSpan — 관리 테이블 한 구간의 라인 범위 [start, end) — 헤더 라인부터 다음 테이블 헤더
+// 직전 또는 EOF까지.
+type codexSpan struct {
+	start, end int
+	found      bool
+}
+
+// codexSpans — 두 관리 테이블의 구간. **서로 독립 구간**이다(D80): 인접해 있지 않아도 되고,
+// 사이에 사용자 테이블이 오면 그 테이블은 어느 구간에도 들지 않는다 — 두 테이블을 하나의
+// 연속 구간으로 다루면 그 사이 테이블이 삭제 범위에 든다.
+// dup은 같은 이름의 헤더가 둘 이상이라는 뜻이며, 그 자체가 TOML 중복 정의라 무변경으로 뺀다.
+type codexSpans struct {
+	table codexSpan
+	env   codexSpan
+	dup   bool
+}
+
+// codexManagedSpans — 라인 목록에서 두 관리 테이블의 구간을 잡는다.
+func codexManagedSpans(lines [][]byte) codexSpans {
+	var out codexSpans
+	var sc tomlLineScanner
+	cur := -1 // 0=table, 1=env, -1=없음
+	for i, ln := range lines {
+		boundary, name := sc.step(ln)
+		if !boundary {
+			continue
+		}
+		switch cur {
+		case 0:
+			out.table.end = i
+		case 1:
+			out.env.end = i
+		}
+		cur = -1
+		switch name {
+		case codexManagedTable:
+			if out.table.found {
+				out.dup = true
+			}
+			out.table, cur = codexSpan{start: i, end: len(lines), found: true}, 0
+		case codexManagedEnv:
+			if out.env.found {
+				out.dup = true
+			}
+			out.env, cur = codexSpan{start: i, end: len(lines), found: true}, 1
+		}
+	}
+	return out
+}
+
+// codexEntries — 구간 안의 논리 엔트리를 (첫 줄, 마지막 줄) 인덱스 쌍으로 나눈다. 여러 줄
+// 값은 한 엔트리다 — 소유 키의 한 줄만 지우면 남은 줄이 보존 라인으로 되살아나 문법이 깨진다.
+func codexEntries(lines [][]byte, sp codexSpan) [][2]int {
+	var out [][2]int
+	var sc tomlLineScanner
+	start := -1
+	for i := sp.start + 1; i < sp.end; i++ {
+		if start < 0 {
+			start = i
+		}
+		sc.step(lines[i])
+		if !sc.open() {
+			out = append(out, [2]int{start, i})
+			start = -1
+		}
+	}
+	if start >= 0 {
+		out = append(out, [2]int{start, sp.end - 1})
+	}
+	return out
+}
+
+// codexKeyName — 정규화 라인에서 대입 키 이름을 뽑는다(따옴표 키도 벗긴다). '='가 없거나
+// 앞부분이 비면 ""(키 줄이 아니다). 주석 줄은 '#'로 시작하므로 우리 키 이름과 절대 같아지지
+// 않는다 — 주석은 언제나 보존 라인으로 간다.
+func codexKeyName(s string) string {
+	i := strings.Index(s, "=")
+	if i <= 0 {
+		return ""
+	}
+	return strings.Trim(s[:i], `"'`)
+}
+
+// tomlStringList — 정규화 문자열에서 따옴표 안 값을 순서대로 뽑는다. 배열의 줄바꿈·공백·
+// 후행 쉼표가 달라도 값 동치를 판정할 수 있게 하는 최소 정규화이며 **비교 전용**이다 —
+// stripLine이 값 안의 공백까지 지우므로 되쓰기에는 쓰지 않는다.
+func tomlStringList(s string) []string {
+	var out []string
+	for i := 0; i < len(s); {
+		var n int
+		switch s[i] {
+		case '"':
+			n = basicStringLen(s[i:])
+		case '\'':
+			n = literalStringLen(s[i:])
+		default:
+			i++
+			continue
+		}
+		if n < 2 {
+			i++
+			continue
+		}
+		out = append(out, s[i+1:i+n-1])
+		i += n
+	}
+	return out
 }
 
 // isBlankLine — 종결자 제외 내용이 공백뿐이면 빈 줄(uninstall 직전-빈줄 판정).

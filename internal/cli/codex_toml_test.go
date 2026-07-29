@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"slices"
 	"strings"
 	"testing"
 )
@@ -121,5 +122,99 @@ func TestCodexConfigBlockRoundTrip(t *testing.T) {
 		if string(back) != want {
 			t.Fatalf("왕복(%q): got=%q want=%q", orig, back, want)
 		}
+	}
+}
+
+// TestTOMLLineScannerHeaderBoundary — D80 헤더 판정 규칙(§2-2). 여러 줄 문자열(삼중 큰따옴표·삼중 홑따옴표)과
+// 여러 줄 배열 안에 있는 [ … ] 모양 줄은 테이블 경계가 아니다. 상태 추적 없이 라인 모양만
+// 보면 범위가 그 줄에서 잘려 우리 테이블의 잔여 키가 남거나 사용자 값 안의 한 줄이 경계가
+// 된다. [[배열 테이블]]은 경계이지만 이름 있는 헤더는 아니다.
+// **배열 안 원소는 대괄호로 시작하는 형태로 둔다** — 따옴표로 시작하는 원소는 stripLine
+// 결과가 '"'로 시작해 상태 추적이 있든 없든 경계가 아니므로 depth 추적에 물리는 단정이
+// 되지 못한다. 한 줄 문자열·주석 줄(line 10)은 어느 구현에서도 경계가 아니라 감시선이
+// 아니지만, '['를 포함하기만 하면 경계로 보는 구현을 배제하는 자리로 남긴다.
+func TestTOMLLineScannerHeaderBoundary(t *testing.T) {
+	src := "" +
+		"[a]\n" + // 0 경계 a
+		"k = \"\"\"\n" + // 1
+		"[mcp_servers.x]\n" + // 2 여러 줄 기본 문자열 안 — 경계 아님
+		"\"\"\"\n" + // 3
+		"m = '''\n" + // 4
+		"[mcp_servers.y]\n" + // 5 여러 줄 리터럴 안 — 경계 아님
+		"'''\n" + // 6
+		"arr = [\n" + // 7
+		"  [1, 2],\n" + // 8 여러 줄 배열 안의 중첩 배열 — 경계 아님(depth 추적의 감시선)
+		"]\n" + // 9
+		"s = \"[not.a.header]\"  # [also.not]\n" + // 10 한 줄 문자열·주석 — 경계 아님
+		"[[b]]\n" + // 11 배열 테이블 — 경계이나 이름 없음
+		"[c] # trailing\n" // 12 경계 c
+	lines := splitLinesKeepEnds([]byte(src))
+	var sc tomlLineScanner
+	type got struct {
+		boundary bool
+		name     string
+	}
+	want := map[int]got{
+		0: {true, "a"}, 2: {false, ""}, 5: {false, ""}, 8: {false, ""},
+		10: {false, ""}, 11: {true, ""}, 12: {true, "c"},
+	}
+	for i, ln := range lines {
+		b, n := sc.step(ln)
+		if w, ok := want[i]; ok && (b != w.boundary || n != w.name) {
+			t.Errorf("line %d: boundary=%v name=%q want %v/%q", i, b, n, w.boundary, w.name)
+		}
+	}
+}
+
+// TestCodexManagedSpans — D80 관리 범위. 각 테이블의 구간은 헤더 라인부터 **다음 테이블 헤더
+// 직전 또는 EOF**까지이고 **두 테이블은 서로 독립 구간**이다 — 사이에 사용자 테이블이 와도
+// 그 테이블은 어느 구간에도 들지 않는다. 같은 이름의 헤더가 둘이면 TOML 중복 정의라 dup이다.
+func TestCodexManagedSpans(t *testing.T) {
+	src := "" +
+		"model = \"gpt\"\n" + // 0
+		"[mcp_servers.ctr]\n" + // 1  table.start
+		"command = \"context-router\"\n" + // 2
+		"[mcp_servers.between]\n" + // 3  table.end
+		"x = 1\n" + // 4
+		"[mcp_servers.ctr.env]\n" + // 5  env.start
+		"CTR_MANAGED = \"context-router/0.15.0\"\n" + // 6
+		"[after]\n" + // 7  env.end
+		"y = 2\n" // 8
+	sp := codexManagedSpans(splitLinesKeepEnds([]byte(src)))
+	if !sp.table.found || sp.table.start != 1 || sp.table.end != 3 {
+		t.Errorf("table=%+v want {1 3 true}", sp.table)
+	}
+	if !sp.env.found || sp.env.start != 5 || sp.env.end != 7 {
+		t.Errorf("env=%+v want {5 7 true}", sp.env)
+	}
+	if sp.dup {
+		t.Errorf("dup=true인데 중복 헤더가 없다")
+	}
+	// EOF 종료
+	sp2 := codexManagedSpans(splitLinesKeepEnds([]byte("[mcp_servers.ctr]\na = 1\nb = 2\n")))
+	if sp2.table.end != 3 {
+		t.Errorf("EOF 종료 end=%d want 3", sp2.table.end)
+	}
+	// 중복 정의
+	sp3 := codexManagedSpans(splitLinesKeepEnds([]byte("[mcp_servers.ctr]\n[x]\n[mcp_servers.ctr]\n")))
+	if !sp3.dup {
+		t.Errorf("같은 이름 헤더 둘인데 dup=false")
+	}
+	// [mcp_servers.ctr-exec]는 관리 대상이 아니다(D80 — 사용자가 만든 별도 등록)
+	sp4 := codexManagedSpans(splitLinesKeepEnds([]byte("[mcp_servers.ctr-exec]\ncommand = \"context-router\"\n")))
+	if sp4.table.found || sp4.env.found {
+		t.Errorf("ctr-exec을 관리 테이블로 잡았다: %+v", sp4)
+	}
+	// 논리 엔트리 — 여러 줄 값은 한 엔트리다
+	lines := splitLinesKeepEnds([]byte("[mcp_servers.ctr]\nenabled_tools = [\n \"a\",\n]\nk = 1\n"))
+	got := codexEntries(lines, codexManagedSpans(lines).table)
+	if len(got) != 2 || got[0] != [2]int{1, 3} || got[1] != [2]int{4, 4} {
+		t.Errorf("entries=%v want [[1 3] [4 4]]", got)
+	}
+	if k := codexKeyName("enabled_tools=[\"a\"]"); k != "enabled_tools" {
+		t.Errorf("codexKeyName=%q want enabled_tools", k)
+	}
+	if v := tomlStringList("[\"a\",'b']"); !slices.Equal(v, []string{"a", "b"}) {
+		t.Errorf("tomlStringList=%v want [a b]", v)
 	}
 }
