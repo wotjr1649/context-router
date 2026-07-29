@@ -438,8 +438,14 @@ type codexInstallResult struct {
 	Out      []byte
 	State    codexMCPState
 	Changed  bool
-	Profiles []string // 실제로 기입한 프로필(설치기 안내용)
-	ArgsKept bool     // 되읽지 못해 args·enabled_tools를 손대지 않았다(D81)
+	Profiles []string // 실제로 기입한 프로필(설치기 안내용) — ArgsKept면 되읽기 실패 값(nil)이다.
+	// "산출물이 exec를 노출하는가"를 물으려면 Profiles가 아니라 ExecExposed를 봐야 한다.
+	ArgsKept bool // 되읽지 못해 args·enabled_tools를 손대지 않았다(D81)
+	// ExecExposed — 이 실행이 남기는 산출물(Out)의 enabled_tools가 exec 도구를 담는가(D81,
+	// 리뷰 승격 — 이월 T4-F3의 근본 픽스). ArgsKept일 때도 실제 값을 낸다: 그때 Profiles는
+	// 되읽기 실패로 nil이라 "요청 프로필에 exec가 있는가"를 답하지 못하지만, ExecExposed는
+	// 보존되는 enabled_tools를 직접 봐서 "산출물이 실제로 노출하는가"를 답한다.
+	ExecExposed bool
 }
 
 // installCodexConfigBlock — 관리 테이블 병합(스펙 v0.15 §0 D80·D81·D84). 순수 변환: 파일 IO 없음.
@@ -472,6 +478,14 @@ func installCodexConfigBlock(existing []byte, req codexInstallRequest) codexInst
 			profiles = defaultMCPProfiles
 		}
 	}
+	// execExposed — 아래 세 mcpWritten 반환 모두가 공유하는 산출물 exec 노출 판정(리뷰 승격 —
+	// 이월 T4-F3의 근본 픽스). argsKept면 다시 계산하지 않고 보존하는 view.tools가 최종값이고,
+	// 아니면(첫 기입 포함) enabledToolsForProfiles(profiles)가 최종값이다 — codexTableBody의
+	// keepArgs 인자가 정확히 이 두 갈래로 몸통을 고르는 것과 같은 분기다.
+	execExposed := enabledToolsExposeExec(enabledToolsForProfiles(profiles))
+	if argsKept {
+		execExposed = enabledToolsExposeExec(view.tools)
+	}
 	crlf := bytes.Contains(existing, []byte("\r\n"))
 	eol := "\n"
 	if crlf {
@@ -490,7 +504,7 @@ func installCodexConfigBlock(existing []byte, req codexInstallRequest) codexInst
 		} else {
 			body = append(body, codexEnvBody(lines, codexSpan{}, req.Marker, eol)...)
 		}
-		return codexInstallResult{Out: appendBlock(base, body, crlf), State: mcpWritten, Changed: true, Profiles: profiles}
+		return codexInstallResult{Out: appendBlock(base, body, crlf), State: mcpWritten, Changed: true, Profiles: profiles, ExecExposed: execExposed}
 	}
 	// 무변경 판정(D84): 우리 소유 키 넷의 값이 모두 같고, 새로 만들 테이블도 지울 마커 줄도
 	// 없으면 쓰기와 백업을 생략한다. **키 단위 동치는 바이트 동일을 포함**하므로 호스트가 우리
@@ -501,7 +515,7 @@ func installCodexConfigBlock(existing []byte, req codexInstallRequest) codexInst
 		(argsKept || (slices.Equal(view.args, mcpArgsForProfiles(profiles)) &&
 			slices.Equal(view.tools, enabledToolsForProfiles(profiles))))
 	if !envMissing && !inOldBlock && ownedSame {
-		return codexInstallResult{Out: existing, State: mcpWritten, Profiles: profiles, ArgsKept: argsKept}
+		return codexInstallResult{Out: existing, State: mcpWritten, Profiles: profiles, ArgsKept: argsKept, ExecExposed: execExposed}
 	}
 	if inOldBlock {
 		// D84 마이그레이션 — 마커 두 줄이 **우리 구간 안**에 들어와 있으면(블록이 우리 테이블만
@@ -531,7 +545,7 @@ func installCodexConfigBlock(existing []byte, req codexInstallRequest) codexInst
 	out := spliceCodexLines(lines, edits, drop)
 	return codexInstallResult{
 		Out: out, State: mcpWritten,
-		Changed: !bytes.Equal(out, existing), Profiles: profiles, ArgsKept: argsKept,
+		Changed: !bytes.Equal(out, existing), Profiles: profiles, ArgsKept: argsKept, ExecExposed: execExposed,
 	}
 }
 

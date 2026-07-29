@@ -1194,6 +1194,31 @@ func TestRunHookInstallCodexNotices(t *testing.T) {
 		!strings.Contains(string(cfg2), "enabled_tools = [\"custom\"]") {
 		t.Errorf("해석하지 못한 값을 덮어썼다:\n%s", cfg2)
 	}
+
+	// 되읽지 못하는 args지만 enabled_tools에 exec 도구가 이미 있다(리뷰 라운드 1 — 이월 T4-F3의
+	// 근본 픽스). Profiles는 이 경우 되읽기 실패로 nil이라 "프로필에 exec가 있는가"만 보면 안내가
+	// 빠진다 — 산출물이 실제로 노출하는 도구를 봐야 한다. "켰습니다"가 아니라 "이미 있다" 톤이어야
+	// 정확하다(우리가 이번에 튼 것이 아니다).
+	home3 := t.TempDir()
+	t.Setenv("CODEX_HOME", home3)
+	oddExec := "[mcp_servers.ctr]\ncommand = \"context-router\"\nargs = [\"--profile\", \"global-search\"]\nenabled_tools = [\"ctr_execute\", \"ctr_execute_file\"]\n"
+	if err := os.WriteFile(filepath.Join(home3, "config.toml"), []byte(oddExec), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var out3 bytes.Buffer
+	if err := runHookInstall([]string{"--codex", "--user"}, "", "", false, t.TempDir(), "0.15.0", &out3); err != nil {
+		t.Fatalf("install(odd+exec): %v", err)
+	}
+	if !strings.Contains(out3.String(), "exec") {
+		t.Errorf("exec가 이미 노출돼 있는데 안내가 없다: %q", out3.String())
+	}
+	if strings.Contains(out3.String(), "켰습니다") {
+		t.Errorf("우리가 켠 게 아닌데 '켰습니다' 문면이 나갔다: %q", out3.String())
+	}
+	cfg3, _ := os.ReadFile(filepath.Join(home3, "config.toml"))
+	if !strings.Contains(string(cfg3), "enabled_tools = [\"ctr_execute\", \"ctr_execute_file\"]") {
+		t.Errorf("해석하지 못한 enabled_tools를 덮어썼다:\n%s", cfg3)
+	}
 }
 
 // TestDropsLastSeenUTC — D71: 사유별 마지막 발생 시각을 UTC 날짜로 병기한다. 역순 ts가 섞여도

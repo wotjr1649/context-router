@@ -138,6 +138,15 @@ func enabledToolsForProfiles(profiles []string) []string {
 	return tools
 }
 
+// enabledToolsExposeExec — 최종 enabled_tools 목록이 exec 도구(ctr_execute·ctr_execute_file) 중
+// 하나라도 담고 있는가(D81 설치기 안내용, 리뷰 승격 — 이월 T4-F3의 근본 픽스). Codex 갈래는
+// 되읽기 실패 시(D81 ArgsKept) 이 목록을 프로필에서 다시 계산하지 않고 원문을 그대로 보존하므로
+// "요청한 프로필에 exec가 있는가"와 "산출물이 실제로 노출하는가"가 갈릴 수 있다 — 안내 소비자는
+// 후자를 봐야 한다.
+func enabledToolsExposeExec(tools []string) bool {
+	return slices.Contains(tools, "ctr_execute") || slices.Contains(tools, "ctr_execute_file")
+}
+
 // profilesFromArgs — 등록물의 args를 프로필 집합으로 되읽는다(D81 Codex 갈래). 우리가 쓰는
 // 형태(["--enable", "<쉼표 목록>"])와 아는 이름만 인식하고, **부재와 []는 빈 프로필 집합**으로
 // 되읽는다(D80 동치 규칙 — 현재 사용자 파일이 그 상태다). 그 밖의 형태는 ok=false이며,

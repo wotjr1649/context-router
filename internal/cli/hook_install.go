@@ -668,11 +668,18 @@ func runHookInstallCodex(user, noShadow, storeRootExplicit bool, storeRootRaw, p
 		// 재직렬화가 주석을 지우므로(§3 표1) 파일에 남지 않는 안내는 안내가 아니다. 기입이
 		// 확정된 경우에만 낸다.
 		fmt.Fprintln(stdout, "hook install (codex): 승인 프롬프트가 필요하면 [mcp_servers.ctr]에 default_tools_approval_mode = \"prompt\"를 직접 넣으세요 — 설치기는 그 키를 쓰지 않고, 넣어 둔 키는 재설치가 보존합니다")
-		if slices.Contains(res.Profiles, "exec") {
-			// D81 — exec opt-in이 여는 경로 하나를 명시한다. 승인 모드 키는 서버 테이블 단위라
-			// 별도 [mcp_servers.ctr-exec]에 걸어 둔 게이트가 관리 테이블 쪽 exec에는 걸리지 않는다.
+		if res.ExecExposed {
+			// D81 — exec 노출 경로 하나를 명시한다. 승인 모드 키는 서버 테이블 단위라 별도
+			// [mcp_servers.ctr-exec]에 걸어 둔 게이트가 관리 테이블 쪽 exec에는 걸리지 않는다.
 			// 우리는 그 테이블을 고치지 않는다 — D80이 관리 대상 밖으로 두었다.
-			fmt.Fprintln(stdout, "hook install (codex): exec 프로필을 [mcp_servers.ctr]에 켰습니다 — 별도 [mcp_servers.ctr-exec]에 승인 모드를 걸어 두었다면 그 키는 서버 테이블 단위라 이 경로에는 걸리지 않습니다(같은 두 도구에 게이트 없는 두 번째 경로가 생깁니다)")
+			// 두 톤을 가른다(리뷰 승격 — 이월 T4-F3): Profiles에 exec가 있으면 이번 실행이 실제로
+			// 켠 것이고, 없으면(ArgsKept로 되읽기에 실패해 손대지 않은 값이 이미 그 상태였던 것)
+			// "켰다"고 말하면 부정확하다 — ExecExposed가 그 값을 손대지 않은 경우도 잡아낸다.
+			if slices.Contains(res.Profiles, "exec") {
+				fmt.Fprintln(stdout, "hook install (codex): exec 프로필을 [mcp_servers.ctr]에 켰습니다 — 별도 [mcp_servers.ctr-exec]에 승인 모드를 걸어 두었다면 그 키는 서버 테이블 단위라 이 경로에는 걸리지 않습니다(같은 두 도구에 게이트 없는 두 번째 경로가 생깁니다)")
+			} else {
+				fmt.Fprintln(stdout, "hook install (codex): [mcp_servers.ctr]의 enabled_tools에 exec 도구가 이미 포함돼 있습니다(이번 실행이 켠 것이 아닙니다) — 별도 [mcp_servers.ctr-exec]에 승인 모드를 걸어 두었다면 그 키는 서버 테이블 단위라 이 경로에는 걸리지 않습니다(같은 두 도구에 게이트 없는 두 번째 경로가 있습니다)")
+			}
 		}
 		if res.ArgsKept {
 			fmt.Fprintln(stdout, "hook install (codex): 기존 args를 프로필로 해석하지 못해 args·enabled_tools를 그대로 두었습니다(command와 소유 표식만 갱신) — 프로필을 바꾸려면 --enable로 명시하세요")
