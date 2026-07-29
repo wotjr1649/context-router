@@ -661,13 +661,13 @@ func runHookInstallCodex(user, noShadow, storeRootExplicit bool, storeRootRaw, p
 func reportCodexMCPState(stdout io.Writer, state codexMCPState) {
 	switch state {
 	case mcpWritten:
-		fmt.Fprintln(stdout, "hook install (codex): MCP 등록 블록 기입 완료 — Codex 재시작 시 반영")
+		fmt.Fprintln(stdout, "hook install (codex): MCP 관리 테이블 기입 완료 — Codex 재시작 시 반영")
 	case mcpExistingHeader:
-		fmt.Fprintln(stdout, "hook install (codex): 기존 [mcp_servers.ctr] 등록 감지 — 기입 생략(command 경로를 doctor [10]과 대조해 스테일 여부 확인 권장)")
+		fmt.Fprintln(stdout, "hook install (codex): 표식도 없고 command도 우리 것이 아닌 [mcp_servers.ctr] 감지 — 기입 생략(사용자 등록으로 봅니다. doctor [10]과 대조해 정리한 뒤 재실행하세요)")
 	case mcpConflict:
 		fmt.Fprintln(stdout, "hook install (codex): config.toml에 ctr 관련 흔적 감지 — MCP 기입·가드 등록 보류. doctor 스니펫으로 수동 등록 후 재실행하세요")
 	case mcpMarkerAnomaly:
-		fmt.Fprintln(stdout, "hook install (codex): 관리 블록 마커 이상 — config.toml 무변경·가드 등록 보류. 블록 수동 정리 후 재실행하세요")
+		fmt.Fprintln(stdout, "hook install (codex): 관리 테이블 중복 정의 — config.toml 무변경·가드 등록 보류. 중복 헤더 정리 후 재실행하세요")
 	}
 }
 

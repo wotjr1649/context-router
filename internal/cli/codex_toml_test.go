@@ -311,19 +311,34 @@ func TestCodexInstallProfileReadback(t *testing.T) {
 	}
 }
 
+// TestUninstallCodexConfigBlock — D80 제거 계약(§2-5). 표식이 있는 [mcp_servers.ctr]와 그
+// [mcp_servers.ctr.env] **두 구간만** 제거하고 그 밖의 바이트는 보존한다. 이 계약이 없으면
+// 신규 형식으로 설치된 두 테이블이 hook uninstall --codex 뒤에도 남는다.
 func TestUninstallCodexConfigBlock(t *testing.T) {
-	block := "# BEGIN context-router\n[mcp_servers.ctr]\ncommand = \"context-router\"\nargs = []\nenabled_tools = [\"ctr_search\", \"ctr_fetch\", \"ctr_transform\", \"ctr_record_event\", \"ctr_session_summary\", \"ctr_export_events\"]\n# ingest/net 활성화 시 권장: default_tools_approval_mode = \"prompt\"\n# END context-router\n"
 	cases := []struct {
 		name        string
 		existing    string
 		wantChanged bool
 		wantOut     string
 	}{
-		{"왕복: append 산출물 → 원본+EOF개행", "a = 1\n\n" + block, true, "a = 1\n"},
-		{"블록 부재 무변경", "a = 1\n", false, "a = 1\n"},
-		{"중간 블록 — 직전이 비-빈줄이면 빈줄 미삭제", "a = 1\n" + block + "b = 2\n", true, "a = 1\nb = 2\n"},
-		{"연속 빈 줄 2개 — 정확히 1개만 제거·1개 보존", "a = 1\n\n\n" + block, true, "a = 1\n\n"},
-		{"본문 불일치는 미소유 — 무변경", "# BEGIN context-router\nuser = 1\n# END context-router\n", false, "# BEGIN context-router\nuser = 1\n# END context-router\n"},
+		{"왕복: append 산출물 → 원본+EOF개행", "a = 1\n\n" + ctrTableFixture, true, "a = 1\n"},
+		{"테이블 부재 무변경", "a = 1\n", false, "a = 1\n"},
+		{"중간 구간 — 직전이 비-빈줄이면 빈줄 미삭제", "a = 1\n" + ctrTableFixture + "[b]\nx = 1\n", true, "a = 1\n[b]\nx = 1\n"},
+		{"연속 빈 줄 2개 — 정확히 1개만 제거", "a = 1\n\n\n" + ctrTableFixture, true, "a = 1\n\n"},
+		{"사용자 소유 — 무변경", "[mcp_servers.ctr]\ncommand = \"old\"\n", false, "[mcp_servers.ctr]\ncommand = \"old\"\n"},
+		{
+			"관리 범위 밖 ctr-exec은 무변경", "[mcp_servers.ctr-exec]\ncommand = \"context-router\"\nargs = [\"--enable\", \"exec\"]\n\n" + ctrTableFixture, true,
+			"[mcp_servers.ctr-exec]\ncommand = \"context-router\"\nargs = [\"--enable\", \"exec\"]\n",
+		},
+		{
+			"밀림 파일 — 블록 안 사용자 테이블 보존(§2-4 uninstall)",
+			"# BEGIN context-router\n[mcp_servers.ctr]\ncommand = \"context-router\"\n[hooks.state]\ntrust = \"abc\"\n# END context-router\n", true,
+			"[hooks.state]\ntrust = \"abc\"\n",
+		},
+		{
+			"구 버전 표식도 소유로 인정(§2-10)",
+			"[mcp_servers.ctr]\ncommand = \"other\"\n[mcp_servers.ctr.env]\nCTR_MANAGED = \"context-router/0.14.0\"\n", true, "",
+		},
 	}
 	for _, c := range cases {
 		out, changed := uninstallCodexConfigBlock([]byte(c.existing))
@@ -333,8 +348,8 @@ func TestUninstallCodexConfigBlock(t *testing.T) {
 	}
 }
 
-// D52 — doctor [16] 존재 판별(v0.9 §0): install 상태기계(classReplace/classAppend→동일
-// mcpWritten)는 존재/부재를 구분하지 못하므로 별도 판별 헬퍼가 필요하다(적대 검수 P1).
+// TestProbeCodexMCPBlock — doctor [16] 존재 판별(D52 승계). 우선순위는 install과 1:1이다:
+// 중복 정의 > 구간 밖 충돌 > 테이블 존재. 마커 배치 자체는 더 이상 이상이 아니다(D80).
 func TestProbeCodexMCPBlock(t *testing.T) {
 	cases := []struct {
 		name    string
@@ -343,11 +358,16 @@ func TestProbeCodexMCPBlock(t *testing.T) {
 		anomaly bool
 	}{
 		{"빈 파일 — 부재", "", false, false},
-		{"관리 블록 존재", codexBlockBody, true, false},
-		{"블록 밖 맨 헤더", "[mcp_servers.ctr]\ncommand = \"x\"\n", true, false},
-		{"마커 이상 — BEGIN만", codexBlockBegin + "\n[mcp_servers.ctr]\n", false, true},
+		{"관리 테이블 존재", ctrTableFixture, true, false},
+		{"표식 없는 우리 테이블도 존재", "[mcp_servers.ctr]\ncommand = \"context-router\"\n", true, false},
+		{"사용자 소유 테이블도 존재로 본다", "[mcp_servers.ctr]\ncommand = \"old\"\n", true, false},
 		{"무관 내용 — 부재", "[model]\nname = \"gpt\"\n", false, false},
-		{"소유 블록 + 외부 충돌 — 이상", codexBlockBody + "\nmcp_servers = { ctr = { command = \"other\" } }\n", false, true},
+		{"관리 테이블 중복 정의 — 이상", "[mcp_servers.ctr]\n[x]\n[mcp_servers.ctr]\n", false, true},
+		// 충돌 줄은 픽스처 **앞**에 둔다 — 뒤에 두면 [mcp_servers.ctr.env] 구간이 다음 테이블
+		// 헤더가 없어 EOF까지 뻗으므로 그 줄이 우리 구간 안이 되고, scanOutsideSpans가 건너뛰어
+		// (true,false)가 나온다. 구간 밖 신호를 재려면 구간 밖에 두어야 한다.
+		{"구간 밖 충돌 — 이상", "mcp_servers = { ctr = { command = \"other\" } }\n" + ctrTableFixture, false, true},
+		{"ctr-exec만 있으면 부재", "[mcp_servers.ctr-exec]\ncommand = \"context-router\"\n", false, false},
 	}
 	for _, c := range cases {
 		p, a := probeCodexMCPBlock([]byte(c.in))

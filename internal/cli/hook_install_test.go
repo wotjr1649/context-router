@@ -989,7 +989,12 @@ func TestRunHookUninstallCodexNoFile(t *testing.T) {
 func TestRunHookUninstallCodexConfigOnlyNoHooks(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("CODEX_HOME", home)
-	block := "# BEGIN context-router\n[mcp_servers.ctr]\ncommand = \"context-router\"\nargs = []\nenabled_tools = [\"ctr_search\", \"ctr_fetch\", \"ctr_transform\", \"ctr_record_event\", \"ctr_session_summary\", \"ctr_export_events\"]\n# ingest/net 활성화 시 권장: default_tools_approval_mode = \"prompt\"\n# END context-router\n"
+	block := "[mcp_servers.ctr]\n" +
+		"command = \"context-router\"\n" +
+		"args = [\"--enable\", \"ingest,net\"]\n" +
+		"enabled_tools = [\"ctr_search\"]\n" +
+		"[mcp_servers.ctr.env]\n" +
+		"CTR_MANAGED = \"context-router/0.15.0\"\n"
 	cfg := "model = \"gpt\"\n\n" + block
 	if err := os.WriteFile(filepath.Join(home, "config.toml"), []byte(cfg), 0o644); err != nil {
 		t.Fatal(err)

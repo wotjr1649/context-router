@@ -21,15 +21,6 @@ const (
 	codexBlockEnd   = "# END context-router"
 )
 
-// codexBlockBody — 관리 블록 본문(LF 기준). CRLF 지배 파일엔 개행만 CRLF로 치환해 기입.
-const codexBlockBody = codexBlockBegin + "\n" +
-	"[mcp_servers.ctr]\n" +
-	"command = \"context-router\"\n" +
-	"args = []\n" +
-	"enabled_tools = [\"ctr_search\", \"ctr_fetch\", \"ctr_transform\", \"ctr_record_event\", \"ctr_session_summary\", \"ctr_export_events\"]\n" +
-	"# ingest/net 활성화 시 권장: default_tools_approval_mode = \"prompt\"\n" +
-	codexBlockEnd + "\n"
-
 type codexMCPState int
 
 const (
@@ -375,30 +366,6 @@ func mcpServersAssign(s string) bool {
 		strings.HasPrefix(s, "'mcp_servers'=")
 }
 
-// scanOutside — 블록 밖 검사(계약 3). replace 후보는 소유 블록 라인[begin..end]을 제외.
-func scanOutside(lines [][]byte, class markerClass, begin, end int) (hasHeader, conflict bool) {
-	var hasMcp, hasSignal, assign bool
-	for i, ln := range lines {
-		if class == classReplace && i >= begin && i <= end {
-			continue
-		}
-		s := stripLine(ln)
-		if s == "[mcp_servers.ctr]" {
-			hasHeader = true
-		}
-		if strings.Contains(s, "mcp_servers") {
-			hasMcp = true
-		}
-		if ctrKeySignal(s) {
-			hasSignal = true
-		}
-		if mcpServersAssign(s) {
-			assign = true // 루트 mcp_servers 대입 — 단독 충돌(Codex P1)
-		}
-	}
-	return hasHeader, (hasMcp && hasSignal) || assign
-}
-
 // scanOutsideSpans — 우리 두 구간 **밖**의 중복 정의 신호(D80 — D48의 두 검사를 경계 근거만
 // "마커 블록 밖"에서 "우리 관리 테이블 구간 밖"으로 바꿔 승계한다).
 // ① mcpServersAssign — 루트 mcp_servers 인라인 대입은 그 대입 자체가 정의라, 뒤에
@@ -568,33 +535,21 @@ func installCodexConfigBlock(existing []byte, req codexInstallRequest) codexInst
 	}
 }
 
-// probeCodexMCPBlock — doctor [16] 존재 판별(D52, 스펙 v0.9 §0). install 상태기계는 "무엇을
-// 쓸지"의 분류(classReplace/classAppend→동일 mcpWritten)라 존재/부재 판별에 부적합 — 같은
-// 순수 라인 헬퍼를 재사용해 읽기 전용으로 판정한다. present: 블록 밖 canonical 헤더 또는
-// (충돌 없는) 소유 블록(classReplace). anomaly: 마커 무결성 이상 또는 키-경계 충돌(→ [16]
-// warning ⑤). 우선순위는 installCodexConfigBlock과 1:1 대응(hasHeader > conflict > classReplace)
-// — canonical 헤더 라인은 스스로 mcp_servers·ctr] 신호를 겸해 conflict도 켜므로(예:
-// "[mcp_servers.ctr]"), install처럼 hasHeader를 conflict보다 먼저 봐야 헤더 실존을 존재로 본다.
-// 그다음 conflict를 classReplace보다 먼저 판정해야 한다 — install은 class와 무관하게 conflict면
-// mcpConflict로 반환(교체 분기 진입 자체를 막음)하므로, 소유 블록(classReplace)이라도 블록 밖에
-// 진짜 충돌(예: 루트 mcp_servers 대입)이 있으면 존재가 아니라 이상으로 본다.
+// probeCodexMCPBlock — doctor [16] 존재 판별(D52 승계). install 상태기계는 "무엇을 쓸지"의
+// 분류라 존재/부재 판별에 부적합하므로 같은 순수 헬퍼를 재사용해 읽기 전용으로 판정한다.
+// 우선순위는 installCodexConfigBlock과 1:1이다 — 중복 정의 > 구간 밖 충돌 > 테이블 존재.
+// 소유 여부는 보지 않는다: 우리 이름 자리에 남의 항목이 있어도 "그 이름의 등록은 있다"가
+// 맞고, install은 그 상태를 mcpExistingHeader로 따로 보고한다.
 func probeCodexMCPBlock(existing []byte) (present bool, anomaly bool) {
 	lines := splitLinesKeepEnds(existing)
-	class, begin, end := classifyMarkers(lines)
-	if class == classAnomaly {
+	sp := codexManagedSpans(lines)
+	if sp.dup {
 		return false, true
 	}
-	hasHeader, conflict := scanOutside(lines, class, begin, end)
-	if hasHeader {
-		return true, false
-	}
-	if conflict {
+	if scanOutsideSpans(lines, sp) {
 		return false, true
 	}
-	if class == classReplace {
-		return true, false
-	}
-	return false, false
+	return sp.table.found, false
 }
 
 // appendBlock — 계약 4: 빈 파일은 블록만; 그 외 EOF 개행 정규화 후 구분 빈 줄 1개+블록.
@@ -614,22 +569,40 @@ func appendBlock(existing, block []byte, crlf bool) []byte {
 	return append(out, block...)
 }
 
-// uninstallCodexConfigBlock — 소유 블록 제거(계약 5). 소유 replace 후보만 변경.
+// uninstallCodexConfigBlock — 소유한 관리 테이블 **두 구간만** 제거한다(D80). 구 형식
+// 파일에서는 마커 두 줄도 함께 지우되 **블록 통째가 아니라 그 안의 우리 테이블만** 지운다 —
+// 그래서 밀림 파일에서 블록 사이에 들어온 사용자 테이블이 살아남는다(D84). 구간 직전의 빈 줄
+// 1개는 함께 지운다(append가 넣은 구분 줄의 대칭).
 func uninstallCodexConfigBlock(existing []byte) (out []byte, changed bool) {
 	lines := splitLinesKeepEnds(existing)
-	class, begin, end := classifyMarkers(lines)
-	if class != classReplace {
+	sp := codexManagedSpans(lines)
+	if sp.dup || !sp.table.found {
 		return existing, false
 	}
-	from := begin
-	if begin > 0 && isBlankLine(lines[begin-1]) {
-		from = begin - 1 // 직전 빈 줄 1개만 함께 제거
+	view := codexReadTable(lines, sp.table)
+	marker, markerFound := codexMarkerValue(lines, sp, view)
+	class, begin, end := classifyMarkers(lines)
+	inOldBlock := class == classReplace && sp.table.start > begin && sp.table.start < end
+	if !codexOwnership(marker, markerFound, view.command, inOldBlock) {
+		return existing, false
 	}
-	for _, ln := range lines[:from] {
-		out = append(out, ln...)
+	drop := map[int]bool{}
+	for i := sp.table.start; i < sp.table.end; i++ {
+		drop[i] = true
 	}
-	for _, ln := range lines[end+1:] {
-		out = append(out, ln...)
+	for i := sp.env.start; sp.env.found && i < sp.env.end; i++ {
+		drop[i] = true
+	}
+	if inOldBlock {
+		drop[begin], drop[end] = true, true
+	}
+	if sp.table.start > 0 && !drop[sp.table.start-1] && isBlankLine(lines[sp.table.start-1]) {
+		drop[sp.table.start-1] = true
+	}
+	for i, ln := range lines {
+		if !drop[i] {
+			out = append(out, ln...)
+		}
 	}
 	return out, true
 }

@@ -2355,12 +2355,12 @@ func TestDoctorCodexMCPLine(t *testing.T) {
 	}{
 		{
 			name:        "① config.toml 부재 → 미사용/미설치",
-			setup:       func(t *testing.T, codexHome, projectRoot string) {}, // 아무것도 안 만듦
+			setup:       func(t *testing.T, codexHome, projectRoot string) {},
 			wantContain: []string{"[16] codex: config.toml 없음 — 미사용/미설치"},
 			wantAbsent:  []string{"[16] warning:"},
 		},
 		{
-			name: "② marker 존재 + 블록 부재 → §9-2 소멸 시그니처 경고",
+			name: "② marker 존재 + 테이블 부재 → 소멸 시그니처 경고",
 			setup: func(t *testing.T, codexHome, projectRoot string) {
 				write(t, filepath.Join(codexHome, "config.toml"), []byte("[model]\nname = \"gpt\"\n"))
 				write(t, filepath.Join(codexHome, "hooks.json"), selfHooks)
@@ -2368,7 +2368,7 @@ func TestDoctorCodexMCPLine(t *testing.T) {
 			wantContain: []string{"[16] warning:", "hook install --codex"},
 		},
 		{
-			name: "③ 블록 부재·marker 부재 → 정보 라인",
+			name: "③ 테이블 부재·marker 부재 → 정보 라인",
 			setup: func(t *testing.T, codexHome, projectRoot string) {
 				write(t, filepath.Join(codexHome, "config.toml"), []byte("[model]\nname = \"gpt\"\n"))
 			},
@@ -2376,19 +2376,19 @@ func TestDoctorCodexMCPLine(t *testing.T) {
 			wantAbsent:  []string{"[16] warning:"},
 		},
 		{
-			name: "④ 블록 존재 + marker 존재(user) → 블록=존재·project 미등록",
+			name: "④ 테이블 존재 + marker 존재(user) → 테이블=존재·project 미등록",
 			setup: func(t *testing.T, codexHome, projectRoot string) {
-				write(t, filepath.Join(codexHome, "config.toml"), []byte(codexBlockBody))
+				write(t, filepath.Join(codexHome, "config.toml"), []byte(ctrTableFixture))
 				write(t, filepath.Join(codexHome, "hooks.json"), selfHooks) // user 레벨만 등록
-				// <projectRoot>/.codex/hooks.json은 미생성 → project=미등록
 			},
-			wantContain: []string{"블록=존재", "marker " + ver, "project=미등록"},
+			wantContain: []string{"테이블=존재", "등록됨(", "project=미등록"},
 			wantAbsent:  []string{"[16] warning:"},
 		},
 		{
-			name: "⑤ 마커 이상(BEGIN만) → 수동 확인 경고",
+			name: "⑤ 관리 테이블 중복 정의 → 수동 확인 경고",
 			setup: func(t *testing.T, codexHome, projectRoot string) {
-				write(t, filepath.Join(codexHome, "config.toml"), []byte(codexBlockBegin+"\n[mcp_servers.ctr]\n"))
+				write(t, filepath.Join(codexHome, "config.toml"),
+					[]byte("[mcp_servers.ctr]\n[x]\n[mcp_servers.ctr]\n"))
 			},
 			wantContain: []string{"[16] warning:", "수동 확인"},
 		},

@@ -1888,15 +1888,15 @@ func runDoctor(ctx context.Context, w io.Writer, storeRoot, projectRoot, version
 			present, anomaly := probeCodexMCPBlock(cfgData)
 			switch {
 			case anomaly: // 분기⑤
-				fmt.Fprintf(w, "[16] codex: [mcp_servers.ctr] 블록=이상 (hooks: project=%s user=%s)\n", projScope, userScope)
-				fmt.Fprintln(w, "[16] warning: config.toml 관리 마커 이상/키-경계 충돌 — 수동 확인 필요(hook install --codex 안내 참조)")
+				fmt.Fprintf(w, "[16] codex: [mcp_servers.ctr] 테이블=이상 (hooks: project=%s user=%s)\n", projScope, userScope)
+				fmt.Fprintln(w, "[16] warning: 관리 테이블 중복 정의/키-경계 충돌 — 수동 확인 필요(hook install --codex 안내 참조)")
 			case present: // 분기④
-				fmt.Fprintf(w, "[16] codex: [mcp_servers.ctr] 블록=존재 (hooks: project=%s user=%s)\n", projScope, userScope)
-			case markerPresent: // 분기② — §9-2 소멸 시그니처
-				fmt.Fprintf(w, "[16] codex: [mcp_servers.ctr] 블록=부재 (hooks: project=%s user=%s)\n", projScope, userScope)
-				fmt.Fprintln(w, "[16] warning: 훅은 설치됐으나 MCP 블록 부재 — deny 안내가 가리키는 ctr_search/ctr_fetch를 Codex가 볼 수 없음. hook install --codex 재기입 권장")
+				fmt.Fprintf(w, "[16] codex: [mcp_servers.ctr] 테이블=존재 (hooks: project=%s user=%s)\n", projScope, userScope)
+			case markerPresent: // 분기② — 소멸 시그니처
+				fmt.Fprintf(w, "[16] codex: [mcp_servers.ctr] 테이블=부재 (hooks: project=%s user=%s)\n", projScope, userScope)
+				fmt.Fprintln(w, "[16] warning: 훅은 설치됐으나 MCP 테이블 부재 — deny 안내가 가리키는 ctr_search/ctr_fetch를 Codex가 볼 수 없음. hook install --codex 재기입 권장")
 			default: // 분기③
-				fmt.Fprintf(w, "[16] codex: [mcp_servers.ctr] 블록=부재·훅 미설치 — hook install --codex (hooks: project=%s user=%s)\n", projScope, userScope)
+				fmt.Fprintf(w, "[16] codex: [mcp_servers.ctr] 테이블=부재·훅 미설치 — hook install --codex (hooks: project=%s user=%s)\n", projScope, userScope)
 			}
 		}
 	}
