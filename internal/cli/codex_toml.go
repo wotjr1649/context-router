@@ -325,14 +325,6 @@ func isBlankLine(line []byte) bool {
 	return strings.TrimSpace(string(line)) == ""
 }
 
-// codexBlockBytes — 파일 지배 개행으로 블록 라인 생성(CRLF 지배 시 CRLF).
-func codexBlockBytes(crlf bool) []byte {
-	if crlf {
-		return []byte(strings.ReplaceAll(codexBlockBody, "\n", "\r\n"))
-	}
-	return []byte(codexBlockBody)
-}
-
 // classifyMarkers — 마커 정확 라인 매치로 배치 분류(계약 2). 소유 replace는 begin/end 인덱스도 반환.
 func classifyMarkers(lines [][]byte) (class markerClass, begin, end int) {
 	var begins, ends []int
@@ -407,24 +399,173 @@ func scanOutside(lines [][]byte, class markerClass, begin, end int) (hasHeader, 
 	return hasHeader, (hasMcp && hasSignal) || assign
 }
 
-// installCodexConfigBlock — 관리 블록 병합(스펙 §0 D48·§3). 순수 변환: 파일 IO 없음.
-func installCodexConfigBlock(existing []byte) (out []byte, state codexMCPState) {
-	lines := splitLinesKeepEnds(existing)
-	class, begin, end := classifyMarkers(lines)
-	if class == classAnomaly {
-		return existing, mcpMarkerAnomaly
+// scanOutsideSpans — 우리 두 구간 **밖**의 중복 정의 신호(D80 — D48의 두 검사를 경계 근거만
+// "마커 블록 밖"에서 "우리 관리 테이블 구간 밖"으로 바꿔 승계한다).
+// ① mcpServersAssign — 루트 mcp_servers 인라인 대입은 그 대입 자체가 정의라, 뒤에
+// [mcp_servers.ctr] 헤더를 붙이는 순간 중복 정의 파스 에러가 되어 사용자 Codex 전체가 깨진다.
+// ② ctrKeySignal — 우리 구간 밖의 ctr 키-경계 신호. 관리 테이블 이름이 ctr 그대로이므로 그
+// 리터럴은 새 경계 방식에서 다시 표현할 필요가 없다.
+// 구간은 **이름**으로 잡으므로 소유 여부와 무관하게 제외된다 — 우리 이름 자리에 남의 항목이
+// 있는 상태는 충돌이 아니라 mcpExistingHeader로 보고한다(v0.14의 hasHeader > conflict 우선순위 승계).
+func scanOutsideSpans(lines [][]byte, sp codexSpans) bool {
+	var hasMcp, hasSignal, assign bool
+	for i, ln := range lines {
+		if inCodexSpan(sp.table, i) || inCodexSpan(sp.env, i) {
+			continue
+		}
+		s := stripLine(ln)
+		if strings.Contains(s, "mcp_servers") {
+			hasMcp = true
+		}
+		if ctrKeySignal(s) {
+			hasSignal = true
+		}
+		if mcpServersAssign(s) {
+			assign = true
+		}
 	}
-	if hasHeader, conflict := scanOutside(lines, class, begin, end); hasHeader {
-		return existing, mcpExistingHeader
-	} else if conflict {
-		return existing, mcpConflict
+	return (hasMcp && hasSignal) || assign
+}
+
+func inCodexSpan(sp codexSpan, i int) bool { return sp.found && i >= sp.start && i < sp.end }
+
+// codexSplice — [start, end) 구간을 body로 갈아 끼우는 편집.
+type codexSplice struct {
+	start, end int
+	body       []byte
+}
+
+// spliceCodexLines — 구간들을 새 바이트로 갈아 끼우고 drop에 든 라인을 지운다. 구간은 겹치지
+// 않으며 start 오름차순으로 적용한다. 그 밖의 라인은 **바이트 그대로** 옮긴다.
+func spliceCodexLines(lines [][]byte, edits []codexSplice, drop map[int]bool) []byte {
+	slices.SortFunc(edits, func(a, b codexSplice) int { return a.start - b.start })
+	var out []byte
+	i := 0
+	for _, e := range edits {
+		for ; i < e.start; i++ {
+			if !drop[i] {
+				out = append(out, lines[i]...)
+			}
+		}
+		out = append(out, e.body...)
+		i = e.end
+	}
+	for ; i < len(lines); i++ {
+		if !drop[i] {
+			out = append(out, lines[i]...)
+		}
+	}
+	return out
+}
+
+// codexInstallRequest — 관리 테이블 기입 요청(D80·D81).
+type codexInstallRequest struct {
+	Profiles   []string // 명시 플래그로 정해진 프로필(SetProfile=false면 쓰이지 않는다)
+	SetProfile bool     // --enable/--enable-exec 중 하나라도 있었는가
+	Marker     string   // env.CTR_MANAGED 값(hookMarker(version))
+}
+
+// codexInstallResult — 기입 결과. Changed=false면 Out은 existing과 같고, 호출자는 쓰기와
+// 백업을 **모두** 생략한다(D84 단일 슬롯 계약).
+type codexInstallResult struct {
+	Out      []byte
+	State    codexMCPState
+	Changed  bool
+	Profiles []string // 실제로 기입한 프로필(설치기 안내용)
+	ArgsKept bool     // 되읽지 못해 args·enabled_tools를 손대지 않았다(D81)
+}
+
+// installCodexConfigBlock — 관리 테이블 병합(스펙 v0.15 §0 D80·D81·D84). 순수 변환: 파일 IO 없음.
+// 판정 순서는 probeCodexMCPBlock과 1:1로 유지한다 — 중복 정의 > 구간 밖 충돌 > 소유.
+func installCodexConfigBlock(existing []byte, req codexInstallRequest) codexInstallResult {
+	lines := splitLinesKeepEnds(existing)
+	sp := codexManagedSpans(lines)
+	if sp.dup {
+		return codexInstallResult{Out: existing, State: mcpMarkerAnomaly}
+	}
+	if scanOutsideSpans(lines, sp) {
+		return codexInstallResult{Out: existing, State: mcpConflict}
+	}
+	view := codexReadTable(lines, sp.table)
+	marker, markerFound := codexMarkerValue(lines, sp, view)
+	class, begin, end := classifyMarkers(lines)
+	inOldBlock := class == classReplace && sp.table.found && sp.table.start > begin && sp.table.start < end
+	if sp.table.found && !codexOwnership(marker, markerFound, view.command, inOldBlock) {
+		// 판정 근거는 "블록 밖에 있음"이 아니라 "표식이 없고 명령도 우리 것이 아님"이다(D80).
+		return codexInstallResult{Out: existing, State: mcpExistingHeader}
+	}
+	// 프로필 우선순위(D81): 명시 플래그 > 우리 소유 테이블의 기존 args > 기본 프로필.
+	// Codex 갈래에는 은퇴 이름이 없어 .mcp.json의 셋째 항이 없다.
+	profiles, argsKept := canonicalProfiles(req.Profiles), false
+	if !req.SetProfile {
+		if sp.table.found {
+			p, ok := profilesFromArgs(view.args)
+			profiles, argsKept = p, !ok
+		} else {
+			profiles = defaultMCPProfiles
+		}
 	}
 	crlf := bytes.Contains(existing, []byte("\r\n"))
-	block := codexBlockBytes(crlf)
-	if class == classReplace {
-		return replaceBlock(lines, begin, end, block), mcpWritten
+	eol := "\n"
+	if crlf {
+		eol = "\r\n"
 	}
-	return appendBlock(existing, block, crlf), mcpWritten
+	if !sp.table.found { // 첫 기입 — 관리 테이블을 EOF 뒤에 잇는다
+		body := ensureEOL(codexTableBody(lines, codexSpan{}, view, profiles, false, req.Marker, eol), eol)
+		base := existing
+		if sp.env.found {
+			// 부모 테이블 없이 [mcp_servers.ctr.env]만 있는 파일 — 새 env 헤더를 덧붙이면 같은
+			// 헤더가 두 번 정의돼 D80이 막으려는 파스 에러가 난다(scanOutsideSpans는 그 구간을
+			// 제외하므로 걸러 내지 못한다). 기존 구간을 갈아 끼우고 헤더는 붙이지 않는다.
+			// 산출은 env 서브테이블이 부모보다 앞서는 형태인데 TOML은 그 순서를 허용한다.
+			base = spliceCodexLines(lines,
+				[]codexSplice{{sp.env.start, sp.env.end, codexEnvBody(lines, sp.env, req.Marker, eol)}}, nil)
+		} else {
+			body = append(body, codexEnvBody(lines, codexSpan{}, req.Marker, eol)...)
+		}
+		return codexInstallResult{Out: appendBlock(base, body, crlf), State: mcpWritten, Changed: true, Profiles: profiles}
+	}
+	// 무변경 판정(D84): 우리 소유 키 넷의 값이 모두 같고, 새로 만들 테이블도 지울 마커 줄도
+	// 없으면 쓰기와 백업을 생략한다. **키 단위 동치는 바이트 동일을 포함**하므로 호스트가 우리
+	// 테이블을 다른 형태(키 순서·인용·공백·env 표기)로 되썼을 때에도 무변경 재실행마다 .bak이
+	// 생기지 않는다 — 스펙 §1.3-1 ② 게이트의 두 갈래를 한 경로가 함께 만족한다.
+	envMissing := !sp.env.found && view.inlineEnv < 0
+	ownedSame := view.command == hookBinaryName && marker == req.Marker &&
+		(argsKept || (slices.Equal(view.args, mcpArgsForProfiles(profiles)) &&
+			slices.Equal(view.tools, enabledToolsForProfiles(profiles))))
+	if !envMissing && !inOldBlock && ownedSame {
+		return codexInstallResult{Out: existing, State: mcpWritten, Profiles: profiles, ArgsKept: argsKept}
+	}
+	if inOldBlock {
+		// D84 마이그레이션 — 마커 두 줄이 **우리 구간 안**에 들어와 있으면(블록이 우리 테이블만
+		// 감싼 형태, §3 표4) 아래 drop 맵으로는 지워지지 않는다: spliceCodexLines는 편집 구간
+		// 안에서 drop을 보지 않고 body를 통째로 얹기 때문이다. 그래서 keep에서 먼저 뺀다.
+		// 구간 밖에 있는 마커는 여전히 drop이 지운다 — 두 배치가 서로를 대신하지 않는다.
+		view.keep = slices.DeleteFunc(view.keep, func(i int) bool { return i == begin || i == end })
+	}
+	body := codexTableBody(lines, sp.table, view, profiles, argsKept, req.Marker, eol)
+	if envMissing { // env 서브테이블을 우리 구간 끝에 잇는다(다음 테이블 헤더 앞이라 안전하다)
+		body = append(ensureEOL(body, eol), codexEnvBody(lines, codexSpan{}, req.Marker, eol)...)
+	}
+	edits := []codexSplice{{sp.table.start, sp.table.end, body}}
+	if sp.env.found {
+		edits = append(edits, codexSplice{sp.env.start, sp.env.end, codexEnvBody(lines, sp.env, req.Marker, eol)})
+	}
+	drop := map[int]bool{}
+	if inOldBlock { // D84 마이그레이션 — 추가로 지우는 것은 **마커 두 줄뿐**이다
+		drop[begin], drop[end] = true, true
+	}
+	// Changed는 **기입 바이트와 기존 바이트의 비교**로 정한다 — D84의 1차 기준이 그것이고,
+	// 위 ownedSame(키 단위 동치)은 재직렬화 때문에 바이트 비교가 성립하지 않을 때의 하강
+	// 경로다. 여기를 참으로 고정하면 ownedSame이 접지 못하는 상태가 그대로 새어 나간다:
+	// 표식 키는 있는데 값이 문자열이 아니면 setInlineEnvMarker가 그 줄을 보존하므로 marker가
+	// 영영 req.Marker와 같아지지 않고, 그런 파일은 무변경 재실행마다 .bak이 다시 생겨
+	// 단일 슬롯 계약이 무의미해진다.
+	out := spliceCodexLines(lines, edits, drop)
+	return codexInstallResult{
+		Out: out, State: mcpWritten,
+		Changed: !bytes.Equal(out, existing), Profiles: profiles, ArgsKept: argsKept,
+	}
 }
 
 // probeCodexMCPBlock — doctor [16] 존재 판별(D52, 스펙 v0.9 §0). install 상태기계는 "무엇을
@@ -454,19 +595,6 @@ func probeCodexMCPBlock(existing []byte) (present bool, anomaly bool) {
 		return true, false
 	}
 	return false, false
-}
-
-// replaceBlock — 소유 블록 라인[begin..end]을 fresh 블록으로 교체, 앞뒤 라인은 바이트 보존.
-func replaceBlock(lines [][]byte, begin, end int, block []byte) []byte {
-	var out []byte
-	for _, ln := range lines[:begin] {
-		out = append(out, ln...)
-	}
-	out = append(out, block...)
-	for _, ln := range lines[end+1:] {
-		out = append(out, ln...)
-	}
-	return out
 }
 
 // appendBlock — 계약 4: 빈 파일은 블록만; 그 외 EOF 개행 정규화 후 구분 빈 줄 1개+블록.

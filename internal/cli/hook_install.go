@@ -618,8 +618,9 @@ func runHookInstallCodex(user, noShadow, storeRootExplicit bool, storeRootRaw, p
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return errors.New("hook: config.toml 읽기 실패")
 	}
-	cfgOut, mcpState := installCodexConfigBlock(cfgExisting)
-	if mcpState == mcpWritten {
+	res := installCodexConfigBlock(cfgExisting, codexInstallRequest{Marker: hookMarker(version)})
+	cfgOut, mcpState := res.Out, res.State
+	if mcpState == mcpWritten && res.Changed {
 		if err := atomicWriteFile(cfgPath, cfgOut); err != nil {
 			return errors.New("hook install: config.toml 쓰기 실패")
 		}

@@ -1,57 +1,313 @@
 package cli
 
 import (
+	"bytes"
 	"slices"
 	"strings"
 	"testing"
 )
 
+// ctrTableFixture — v0.15 형식으로 기입된 두 관리 테이블(LF). 골든 비교의 기준 문자열이다.
+const ctrTableFixture = "[mcp_servers.ctr]\n" +
+	"command = \"context-router\"\n" +
+	"args = [\"--enable\", \"ingest,net\"]\n" +
+	"enabled_tools = [\"ctr_search\", \"ctr_fetch\", \"ctr_transform\", \"ctr_record_event\", \"ctr_session_summary\", \"ctr_export_events\", \"ctr_index\", \"ctr_fetch_and_index\"]\n" +
+	"[mcp_servers.ctr.env]\n" +
+	"CTR_MANAGED = \"context-router/0.15.0\"\n"
+
+// baseToolsLine — 프로필이 빈 등록물이 쓰는 enabled_tools 줄(기본 6종). keepArgs=false면
+// 프로필이 비어도 이 줄은 **무조건** 나간다 — enabledToolsForProfiles(nil)이 기본 6종을
+// 돌려주기 때문이다. 빈 프로필 골든에서 이 줄을 빠뜨리면 골든이 실제 산출과 어긋난다.
+const baseToolsLine = "enabled_tools = [\"ctr_search\", \"ctr_fetch\", \"ctr_transform\", " +
+	"\"ctr_record_event\", \"ctr_session_summary\", \"ctr_export_events\"]\n"
+
+// installFixture — 기본 요청(명시 플래그 없음, 0.15.0 표식).
+func installFixture(existing string) codexInstallResult {
+	return installCodexConfigBlock([]byte(existing), codexInstallRequest{Marker: "context-router/0.15.0"})
+}
+
+// TestInstallCodexConfigBlock — D80 기입 계약. v0.14의 마커 리터럴 표를 테이블 경계로 이관한다.
+//   - append/CRLF/무개행 EOF/멱등: 그대로 지킨다(형태만 새 형식).
+//   - 충돌 케이스(quoted key·인라인 대입·점표기·오탐 회피): scanOutsideSpans가 그대로 승계한다.
+//   - 마커 배치 이상 케이스: 마커가 관리 단위가 아니므로 이상이 아니다 — 관리 테이블 **중복
+//     정의**가 그 자리를 잇는다(TOML 파스 에러 방향을 막는 것이 원래 목적이었다).
 func TestInstallCodexConfigBlock(t *testing.T) {
-	block := "# BEGIN context-router\n[mcp_servers.ctr]\ncommand = \"context-router\"\nargs = []\nenabled_tools = [\"ctr_search\", \"ctr_fetch\", \"ctr_transform\", \"ctr_record_event\", \"ctr_session_summary\", \"ctr_export_events\"]\n# ingest/net 활성화 시 권장: default_tools_approval_mode = \"prompt\"\n# END context-router\n"
 	cases := []struct {
 		name      string
 		existing  string
 		wantState codexMCPState
 		wantOut   string // "" = existing 무변경 기대
 	}{
-		{"빈 파일 append", "", mcpWritten, block},
-		{"기존 내용 뒤 append(개행 있음)", "a = 1\n", mcpWritten, "a = 1\n\n" + block},
-		{"무개행 EOF — 개행 1개 추가 후 append", "a = 1", mcpWritten, "a = 1\n\n" + block},
-		{"동일 버전 멱등(f(f(x))==f(x))", block, mcpWritten, block},
-		{"기존 소유 블록 교체(내용 갱신)", "x = 1\n\n# BEGIN context-router\n[mcp_servers.ctr]\nold = true\n# END context-router\n", mcpWritten, "x = 1\n\n" + block},
-		{"충돌: canonical 헤더 → 생략·MCP확정", "[mcp_servers.ctr]\ncommand = \"old\"\n", mcpExistingHeader, ""},
+		{"빈 파일 append", "", mcpWritten, ctrTableFixture},
+		{"기존 내용 뒤 append", "a = 1\n", mcpWritten, "a = 1\n\n" + ctrTableFixture},
+		{"무개행 EOF — 개행 1개 추가 후 append", "a = 1", mcpWritten, "a = 1\n\n" + ctrTableFixture},
+		{"멱등 f(f(x))==f(x)", "a = 1\n\n" + ctrTableFixture, mcpWritten, "a = 1\n\n" + ctrTableFixture},
+		{
+			"인수 — 표식 없는 우리 테이블", "[mcp_servers.ctr]\ncommand = \"context-router\"\nargs = []\n", mcpWritten,
+			"[mcp_servers.ctr]\ncommand = \"context-router\"\n" + baseToolsLine +
+				"[mcp_servers.ctr.env]\nCTR_MANAGED = \"context-router/0.15.0\"\n",
+		},
+		{
+			"인라인 env 표기 — 서브테이블 헤더를 붙이지 않는다(D80 기입 규칙)",
+			"[mcp_servers.ctr]\ncommand = \"context-router\"\nenv = { CTR_MANAGED = \"context-router/0.14.0\" }\n", mcpWritten,
+			"[mcp_servers.ctr]\ncommand = \"context-router\"\n" + baseToolsLine +
+				"env = { CTR_MANAGED = \"context-router/0.15.0\" }\n",
+		},
+		{
+			"부모 테이블 없이 env만 — 새 env 헤더를 붙이지 않는다(중복 정의 금지)",
+			"[mcp_servers.ctr.env]\nCTR_MANAGED = \"context-router/0.14.0\"\n", mcpWritten,
+			"[mcp_servers.ctr.env]\nCTR_MANAGED = \"context-router/0.15.0\"\n\n" +
+				"[mcp_servers.ctr]\ncommand = \"context-router\"\nargs = [\"--enable\", \"ingest,net\"]\n" +
+				"enabled_tools = [\"ctr_search\", \"ctr_fetch\", \"ctr_transform\", \"ctr_record_event\", \"ctr_session_summary\", \"ctr_export_events\", \"ctr_index\", \"ctr_fetch_and_index\"]\n",
+		},
+		{"사용자 소유 — 표식도 command도 남의 것", "[mcp_servers.ctr]\ncommand = \"old\"\n", mcpExistingHeader, ""},
 		{"충돌: quoted key", "[mcp_servers.\"ctr\"]\ncommand = \"x\"\n", mcpConflict, ""},
 		{"충돌: 인라인 테이블", "mcp_servers.ctr = { command = \"x\" }\n", mcpConflict, ""},
 		{"충돌: 부모 테이블+점표기", "[mcp_servers]\nctr.command = \"x\"\n", mcpConflict, ""},
 		{"충돌: 루트 완전-점표기(.ctr. 신호)", "mcp_servers.ctr.command = \"x\"\n", mcpConflict, ""},
 		{"충돌: 루트 인라인 mcp_servers 전체(ctr 신호 무)", "mcp_servers = { foo = { command = \"x\" } }\n", mcpConflict, ""},
 		{"충돌: 루트 인라인 quoted 키", "\"mcp_servers\" = { foo = { command = \"x\" } }\n", mcpConflict, ""},
-		{"비충돌: 헤더 정의 + 타 서버 인라인 값", "[mcp_servers]\nfoo = { command = \"x\" }\n", mcpWritten, "[mcp_servers]\nfoo = { command = \"x\" }\n\n" + block},
-		{"오탐 회피: electron+타 서버", "[mcp_servers.chrome]\ncommand = \"x\"\n# electron debugging notes\n", mcpWritten, "[mcp_servers.chrome]\ncommand = \"x\"\n# electron debugging notes\n\n" + block},
-		{"오탐 회피: spectra 언급", "[mcp_servers.foo]\n# spectra analysis\n", mcpWritten, "[mcp_servers.foo]\n# spectra analysis\n\n" + block},
-		{"블록 밖 보존: hooks.state·주석·미지 키 바이트 그대로", "[hooks.state]\ntrust = \"abc123\"\n# user comment\nunknown_key = 1\n", mcpWritten, "[hooks.state]\ntrust = \"abc123\"\n# user comment\nunknown_key = 1\n\n" + block},
-		{"마커 이상: END 단독", "# END context-router\n", mcpMarkerAnomaly, ""},
-		{"마커 이상: END 부재", "# BEGIN context-router\n[mcp_servers.ctr]\n", mcpMarkerAnomaly, ""},
-		{"마커 이상: 역순", "# END context-router\n# BEGIN context-router\n", mcpMarkerAnomaly, ""},
-		{"마커 이상: 중복 쌍", "# BEGIN context-router\n# END context-router\n# BEGIN context-router\n# END context-router\n", mcpMarkerAnomaly, ""},
-		{"소유권: 유사 마커(자유 접미)는 미소유=마커 0개 취급 append", "# BEGIN context-router migration\nuser = 1\n# END context-router migration\n", mcpWritten, "# BEGIN context-router migration\nuser = 1\n# END context-router migration\n\n" + block},
-		{"소유권: 정확 마커+본문 불일치 → 무변경", "# BEGIN context-router\nuser = 1\n# END context-router\n", mcpMarkerAnomaly, ""},
-		{"CRLF 보존 + CRLF 블록 기입", "a = 1\r\n", mcpWritten, "a = 1\r\n\r\n" + strings.ReplaceAll(block, "\n", "\r\n")},
-		{"CRLF+무개행 EOF — EOF도 CRLF로 정규화", "a = 1\r\nb = 2", mcpWritten, "a = 1\r\nb = 2\r\n\r\n" + strings.ReplaceAll(block, "\n", "\r\n")},
-		{"멱등: 접두 존재 재설치 f(f(x))==f(x)", "a = 1\n\n" + block, mcpWritten, "a = 1\n\n" + block},
+		{"비충돌: 헤더 정의 + 타 서버 인라인 값", "[mcp_servers]\nfoo = { command = \"x\" }\n", mcpWritten, "[mcp_servers]\nfoo = { command = \"x\" }\n\n" + ctrTableFixture},
+		{"오탐 회피: electron+타 서버", "[mcp_servers.chrome]\ncommand = \"x\"\n# electron debugging notes\n", mcpWritten, "[mcp_servers.chrome]\ncommand = \"x\"\n# electron debugging notes\n\n" + ctrTableFixture},
+		{"오탐 회피: spectra 언급", "[mcp_servers.foo]\n# spectra analysis\n", mcpWritten, "[mcp_servers.foo]\n# spectra analysis\n\n" + ctrTableFixture},
+		{
+			"관리 대상 밖: ctr-exec은 무변경 통과", "[mcp_servers.ctr-exec]\ncommand = \"context-router\"\nargs = [\"--enable\", \"exec\"]\nenabled_tools = [\"ctr_execute\", \"ctr_execute_file\"]\ndefault_tools_approval_mode = \"prompt\"\n", mcpWritten,
+			"[mcp_servers.ctr-exec]\ncommand = \"context-router\"\nargs = [\"--enable\", \"exec\"]\nenabled_tools = [\"ctr_execute\", \"ctr_execute_file\"]\ndefault_tools_approval_mode = \"prompt\"\n\n" + ctrTableFixture,
+		},
+		{"이상: 관리 테이블 중복 정의", "[mcp_servers.ctr]\ncommand = \"context-router\"\n[x]\n[mcp_servers.ctr]\n", mcpMarkerAnomaly, ""},
+		{"이상: env 서브테이블 중복 정의", "[mcp_servers.ctr]\ncommand = \"context-router\"\n[mcp_servers.ctr.env]\n[y]\n[mcp_servers.ctr.env]\n", mcpMarkerAnomaly, ""},
+		{"CRLF 보존 + CRLF 기입", "a = 1\r\n", mcpWritten, "a = 1\r\n\r\n" + strings.ReplaceAll(ctrTableFixture, "\n", "\r\n")},
 	}
 	for _, c := range cases {
-		out, state := installCodexConfigBlock([]byte(c.existing))
-		if state != c.wantState {
-			t.Fatalf("%s: state=%d want %d", c.name, state, c.wantState)
+		res := installFixture(c.existing)
+		if res.State != c.wantState {
+			t.Fatalf("%s: state=%d want %d", c.name, res.State, c.wantState)
 		}
 		wantOut := c.wantOut
 		if wantOut == "" {
 			wantOut = c.existing
 		}
-		if string(out) != wantOut {
-			t.Fatalf("%s:\n got=%q\nwant=%q", c.name, out, wantOut)
+		if string(res.Out) != wantOut {
+			t.Fatalf("%s:\n got=%q\nwant=%q", c.name, res.Out, wantOut)
 		}
+	}
+}
+
+// TestCodexInstallScopeAndMigration — D80 범위 제한(§2-1) · 밀림 시나리오(§2-4) · 중복 정의
+// 회피(§2-6) · D84 마이그레이션(§2-11)을 재직렬화된 형태의 픽스처 하나로 함께 본다.
+func TestCodexInstallScopeAndMigration(t *testing.T) {
+	// 재직렬화 형태: 주석 없음 · env 표식 있음 · 우리 테이블 뒤에 사용자 테이블 여럿 ·
+	// **두 관리 테이블 사이에도 사용자 테이블 하나** · 우리 테이블 안에 사용자 키 하나 ·
+	// env 안에 CTR_MANAGED 외 환경변수 하나.
+	src := "[mcp_servers.ctr]\n" +
+		"command = \"context-router\"\n" +
+		"args = [\"--enable\", \"ingest,net\"]\n" +
+		"enabled_tools = [\"ctr_search\"]\n" +
+		"default_tools_approval_mode = \"prompt\"\n" +
+		"[mcp_servers.between]\n" +
+		"command = \"between-cmd\"\n" +
+		"[mcp_servers.ctr.env]\n" +
+		"CTR_MANAGED = \"context-router/0.14.0\"\n" +
+		"CTR_STORE_ROOT = \"D:/ctr\"\n" +
+		"[hooks.state]\n" +
+		"trust = \"abc123\"\n" +
+		"[tui]\n" +
+		"theme = \"dark\"\n"
+	res := installFixture(src)
+	if res.State != mcpWritten {
+		t.Fatalf("state=%d want mcpWritten", res.State)
+	}
+	got := string(res.Out)
+	for _, want := range []string{
+		"[mcp_servers.between]\ncommand = \"between-cmd\"\n", // 두 구간 사이 사용자 테이블
+		"[hooks.state]\ntrust = \"abc123\"\n",                // 뒤 테이블
+		"[tui]\ntheme = \"dark\"\n",
+		"default_tools_approval_mode = \"prompt\"\n", // 우리 테이블 안 사용자 키
+		"CTR_STORE_ROOT = \"D:/ctr\"\n",              // env 안 사용자 환경변수
+		"CTR_MANAGED = \"context-router/0.15.0\"\n",  // 표식은 현재 값으로 self-heal
+		"\"ctr_index\"", // enabled_tools는 프로필에서 다시 도출
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("범위 밖/보존 대상이 사라졌다 — %q 없음:\n%s", want, got)
+		}
+	}
+	// 재설치 왕복: 두 사용자 키가 값째로 남고 바이트가 흔들리지 않는다.
+	again := installCodexConfigBlock(res.Out, codexInstallRequest{Marker: "context-router/0.15.0"})
+	if !bytes.Equal(res.Out, again.Out) {
+		t.Errorf("재설치 멱등 위반:\n1: %s\n2: %s", res.Out, again.Out)
+	}
+	if again.Changed {
+		t.Errorf("무변경 재설치인데 Changed=true")
+	}
+	// 표식을 **갱신할 수 없는** 인라인 형태(값이 문자열이 아니다): 소유는 command로 인수하고
+	// 표식 줄은 원문 그대로 두되, 산출 바이트가 같으면 Changed=false로 접는다. 접지 않으면
+	// 무변경 재실행마다 config.toml을 다시 쓰고 .bak을 다시 남겨 D84 단일 슬롯이 무의미해진다.
+	odd := "[mcp_servers.ctr]\ncommand = \"context-router\"\nenv = { CTR_MANAGED = 1 }\n"
+	ores := installFixture(odd)
+	oagain := installCodexConfigBlock(ores.Out, codexInstallRequest{Marker: "context-router/0.15.0"})
+	if !bytes.Equal(ores.Out, oagain.Out) || oagain.Changed {
+		t.Errorf("갱신할 수 없는 인라인 표식에서 무변경 재실행이 접히지 않았다(changed=%v):\n1: %s\n2: %s", oagain.Changed, ores.Out, oagain.Out)
+	}
+
+	// 밀림 시나리오(§2-4): BEGIN과 END 사이에 사용자 테이블이 들어간 파일.
+	pushed := "# BEGIN context-router\n" +
+		"[mcp_servers.ctr]\n" +
+		"command = \"context-router\"\n" +
+		"[hooks.state.'a.json:SessionStart:0:0']\n" +
+		"trusted_hash = \"sha256:aaa\"\n" +
+		"[hooks.state.'a.json:PostToolUse:0:0']\n" +
+		"trusted_hash = \"sha256:bbb\"\n" +
+		"# END context-router\n"
+	pres := installFixture(pushed)
+	for _, want := range []string{"sha256:aaa", "sha256:bbb", "[hooks.state.'a.json:SessionStart:0:0']"} {
+		if !strings.Contains(string(pres.Out), want) {
+			t.Errorf("밀림 파일의 사용자 테이블이 사라졌다 — %q 없음:\n%s", want, pres.Out)
+		}
+	}
+	// D84 마이그레이션이 추가로 지우는 것은 **마커 두 줄뿐**이다.
+	if strings.Contains(string(pres.Out), codexBlockBegin) || strings.Contains(string(pres.Out), codexBlockEnd) {
+		t.Errorf("구 마커 두 줄이 남았다:\n%s", pres.Out)
+	}
+	if !strings.Contains(string(pres.Out), "CTR_MANAGED = \"context-router/0.15.0\"") {
+		t.Errorf("마이그레이션이 표식을 기입하지 않았다:\n%s", pres.Out)
+	}
+	// 변환 결과에 대한 재실행은 바이트 무변경이다.
+	pagain := installCodexConfigBlock(pres.Out, codexInstallRequest{Marker: "context-router/0.15.0"})
+	if !bytes.Equal(pres.Out, pagain.Out) || pagain.Changed {
+		t.Errorf("마이그레이션 결과가 멱등이 아니다(changed=%v):\n1: %s\n2: %s", pagain.Changed, pres.Out, pagain.Out)
+	}
+
+	// 밀림의 반대 형태(§2-11): 블록이 **우리 테이블만** 감싼 파일(§3 표4의 현재 사용자 파일).
+	// END 줄이 우리 구간 **안**으로 들어오므로 drop 맵으로는 지워지지 않는다 — splice가
+	// 편집 구간 안에서는 drop을 보지 않기 때문이다. keep에서 빼는 경로가 그것을 닫는다.
+	wrapped := "# BEGIN context-router\n" +
+		"[mcp_servers.ctr]\n" +
+		"command = \"context-router\"\n" +
+		"args = []\n" +
+		"enabled_tools = [\"ctr_search\"]\n" +
+		"# ingest/net 활성화 시 권장: default_tools_approval_mode = \"prompt\"\n" +
+		"# END context-router\n" +
+		"[tui]\n" +
+		"theme = \"dark\"\n"
+	wres := installFixture(wrapped)
+	if strings.Contains(string(wres.Out), codexBlockBegin) || strings.Contains(string(wres.Out), codexBlockEnd) {
+		t.Errorf("구 마커가 관리 테이블 안에 남았다:\n%s", wres.Out)
+	}
+	if !strings.Contains(string(wres.Out), "[tui]\ntheme = \"dark\"\n") {
+		t.Errorf("감싼 형태에서 뒤 테이블이 사라졌다:\n%s", wres.Out)
+	}
+	wagain := installCodexConfigBlock(wres.Out, codexInstallRequest{Marker: "context-router/0.15.0"})
+	if !bytes.Equal(wres.Out, wagain.Out) || wagain.Changed {
+		t.Errorf("감싼 형태의 변환 결과가 멱등이 아니다(changed=%v):\n1: %s\n2: %s", wagain.Changed, wres.Out, wagain.Out)
+	}
+
+	// §2-2 install 수준 배치: 여러 줄 값을 **우리 관리 테이블 안**에 둔다 — 경계를 잘못 잡으면
+	// 범위가 그 줄에서 잘려 잔여 키가 우리 테이블 밖으로 새어 나온다. 같은 모양을 **사용자
+	// 테이블 안**에도 둬 우리 범위가 남의 테이블로 번지지 않는지(경계 오인 방향)를 함께 본다.
+	multi := "[mcp_servers.ctr]\n" +
+		"command = \"context-router\"\n" +
+		"note = \"\"\"\n" +
+		"[mcp_servers.fake]\n" +
+		"\"\"\"\n" +
+		"[mcp_servers.user]\n" +
+		"command = \"user-cmd\"\n" +
+		"blob = '''\n" +
+		"[mcp_servers.also_fake]\n" +
+		"'''\n"
+	mres := installFixture(multi)
+	if mres.State != mcpWritten {
+		t.Fatalf("여러 줄 값 픽스처: state=%d want mcpWritten", mres.State)
+	}
+	for _, want := range []string{
+		"note = \"\"\"\n[mcp_servers.fake]\n\"\"\"\n",  // 우리 테이블 안 여러 줄 값이 한 엔트리로 보존
+		"[mcp_servers.user]\ncommand = \"user-cmd\"\n", // 남의 테이블은 손대지 않는다
+		"blob = '''\n[mcp_servers.also_fake]\n'''\n",   // 남의 테이블 안 여러 줄 값도 그대로
+	} {
+		if !strings.Contains(string(mres.Out), want) {
+			t.Errorf("여러 줄 값에서 경계를 잘못 잡았다 — %q 없음:\n%s", want, mres.Out)
+		}
+	}
+
+	// 중복 정의 회피(§2-6) ①: 루트 mcp_servers 인라인 대입 + **우리 테이블이 없는** 파일.
+	// 검사를 우회하면 산출 바이트에 [mcp_servers.ctr] 헤더가 붙는다 — 인라인 대입과 공존하는
+	// 그 헤더가 중복 정의의 전제 조건이다. 아래 dup 픽스처는 이미 헤더를 갖고 있어 이 증거를
+	// 낼 수 없으므로(우회해도 개수가 1로 같다) 헤더 추가 감시선은 이쪽이 맡는다.
+	assign := "mcp_servers = { foo = { command = \"x\" } }\n[tui]\ntheme = \"dark\"\n"
+	ares := installFixture(assign)
+	if ares.State != mcpConflict || string(ares.Out) != assign {
+		t.Errorf("루트 인라인 대입에서 무변경으로 빠지지 않았다: state=%d\n%s", ares.State, ares.Out)
+	}
+	if strings.Contains(string(ares.Out), "[mcp_servers.ctr]") {
+		t.Errorf("[mcp_servers.ctr] 헤더가 새로 붙었다 — 인라인 대입과 공존하면 중복 정의다:\n%s", ares.Out)
+	}
+
+	// 중복 정의 회피(§2-6) ②: 같은 조건에서 D84의 마이그레이션도 중단된다.
+	dup := "mcp_servers = { foo = { command = \"x\" } }\n" + pushed
+	dres := installFixture(dup)
+	if dres.State != mcpConflict || string(dres.Out) != dup {
+		t.Errorf("중복 정의 조건에서 무변경으로 빠지지 않았다: state=%d\n%s", dres.State, dres.Out)
+	}
+	if !strings.Contains(string(dres.Out), codexBlockBegin) {
+		t.Errorf("충돌 조건인데 마이그레이션이 마커를 지웠다:\n%s", dres.Out)
+	}
+}
+
+// TestCodexInstallProfileReadback — D81 Codex 갈래의 되읽기(§2-7). 무플래그 재설치는 기존
+// args를 프로필 집합으로 되읽어 args와 enabled_tools를 **함께** 재조립하고, 되읽지 못하는
+// args에서는 두 키를 **둘 다** 손대지 않는다.
+func TestCodexInstallProfileReadback(t *testing.T) {
+	marker := "context-router/0.15.0"
+	// 우선순위 ①: 명시 플래그가 이긴다.
+	exp := installCodexConfigBlock([]byte(ctrTableFixture),
+		codexInstallRequest{Profiles: []string{"ingest", "net", "exec"}, SetProfile: true, Marker: marker})
+	if !strings.Contains(string(exp.Out), "args = [\"--enable\", \"ingest,net,exec\"]") ||
+		!strings.Contains(string(exp.Out), "\"ctr_execute_file\"") {
+		t.Errorf("명시 프로필이 반영되지 않았다:\n%s", exp.Out)
+	}
+	// 우선순위 ②: 기존 테이블의 args를 되읽는다(기본 프로필로 넓히지 않는다).
+	prev := "[mcp_servers.ctr]\ncommand = \"context-router\"\nargs = [\"--enable\", \"exec\"]\nenabled_tools = [\"stale\"]\n"
+	got := installFixture(prev)
+	if !strings.Contains(string(got.Out), "args = [\"--enable\", \"exec\"]") {
+		t.Errorf("기존 프로필이 보존되지 않았다:\n%s", got.Out)
+	}
+	if strings.Contains(string(got.Out), "\"stale\"") || !strings.Contains(string(got.Out), "\"ctr_execute\"") {
+		t.Errorf("enabled_tools가 args와 함께 재조립되지 않았다:\n%s", got.Out)
+	}
+	// **args 부재/[]는 빈 프로필**로 되읽고 기본 프로필로 넓히지 않는다(§3 표4 현재 사용자 파일).
+	empty := installFixture("[mcp_servers.ctr]\ncommand = \"context-router\"\nargs = []\n")
+	if strings.Contains(string(empty.Out), "args = ") {
+		t.Errorf("빈 프로필을 기본 프로필로 넓혔다:\n%s", empty.Out)
+	}
+	if strings.Contains(string(empty.Out), "ctr_index") {
+		t.Errorf("빈 프로필인데 ingest 도구가 실렸다:\n%s", empty.Out)
+	}
+	// 되읽지 못하는 args — 두 키를 둘 다 손대지 않고 command·표식만 self-heal.
+	odd := "[mcp_servers.ctr]\ncommand = \"context-router\"\nargs = [\"--profile\", \"global-search\"]\nenabled_tools = [\"custom\"]\n"
+	kept := installFixture(odd)
+	if !kept.ArgsKept {
+		t.Errorf("ArgsKept=false — 되읽기 실패를 알리지 않았다")
+	}
+	if !strings.Contains(string(kept.Out), "args = [\"--profile\", \"global-search\"]") ||
+		!strings.Contains(string(kept.Out), "enabled_tools = [\"custom\"]") {
+		t.Errorf("해석하지 못한 값을 덮어썼다:\n%s", kept.Out)
+	}
+	if !strings.Contains(string(kept.Out), "CTR_MANAGED = \""+marker+"\"") {
+		t.Errorf("표식 self-heal이 생략됐다:\n%s", kept.Out)
+	}
+	// 첫 설치(기존 테이블 없음)만 기본 프로필을 쓴다.
+	fresh := installFixture("")
+	if !strings.Contains(string(fresh.Out), "args = [\"--enable\", \"ingest,net\"]") {
+		t.Errorf("첫 설치가 기본 프로필을 쓰지 않았다:\n%s", fresh.Out)
+	}
+	// exec 부재 — D58·D59·D64가 기록한 opt-in 계약의 직접 감시선(§2-7 exec 부재)
+	for _, tool := range []string{"ctr_execute", "ctr_execute_file"} {
+		if strings.Contains(string(fresh.Out), tool) {
+			t.Errorf("무플래그 설치에 %s가 실렸다:\n%s", tool, fresh.Out)
+		}
+	}
+	// 승인 모드 키는 기입하지 않는다(D81).
+	if strings.Contains(string(fresh.Out), "approval_mode") {
+		t.Errorf("설치기가 승인 모드 키를 기입했다:\n%s", fresh.Out)
 	}
 }
 
@@ -101,16 +357,16 @@ func TestProbeCodexMCPBlock(t *testing.T) {
 	}
 }
 
-// 왕복 f_uninstall(f_install(x)) — EOF 개행 정규화 제외 바이트 동일(스펙 §0 D48).
-// oracle의 EOF 개행은 파일 지배 개행을 따른다(Codex 검수 — "\n" 하드코딩이면 CRLF
-// 파일에 LF를 붙이는 혼합-EOL 구현이 통과).
+// TestCodexConfigBlockRoundTrip — 왕복 f_uninstall(f_install(x)): EOF 개행 정규화 제외 바이트
+// 동일. oracle의 EOF 개행은 파일 지배 개행을 따른다("\n" 하드코딩이면 CRLF 파일에 LF를 붙이는
+// 혼합-EOL 구현이 통과한다).
 func TestCodexConfigBlockRoundTrip(t *testing.T) {
 	for _, orig := range []string{"", "a = 1\n", "a = 1", "a = 1\r\n", "a = 1\r\nb = 2"} {
-		installed, state := installCodexConfigBlock([]byte(orig))
-		if state != mcpWritten {
-			t.Fatalf("install(%q) state=%d", orig, state)
+		res := installFixture(orig)
+		if res.State != mcpWritten {
+			t.Fatalf("install(%q) state=%d", orig, res.State)
 		}
-		back, _ := uninstallCodexConfigBlock(installed)
+		back, _ := uninstallCodexConfigBlock(res.Out)
 		want := orig
 		if want != "" && !strings.HasSuffix(want, "\n") {
 			eol := "\n"
