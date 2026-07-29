@@ -2002,7 +2002,7 @@ func runDoctor(ctx context.Context, w io.Writer, storeRoot, projectRoot, version
 	}
 	fmt.Fprintf(w, "[20] mcp markers: .mcp.json=%s codex=%s\n", mcpLabel, codexLabel)
 	if mcpDrift || codexDrift {
-		fmt.Fprintln(w, "[20] warning: MCP 등록물의 버전 표식이 현재 버전과 다릅니다 — doctor --fix로 다시 기입하세요(기존 파일만 고치며 백업을 남깁니다)")
+		fmt.Fprintln(w, "[20] warning: MCP 등록물의 버전 표식이 현재 버전과 다릅니다 — doctor --fix로 다시 기입하세요(기존 파일만 고치며 config.toml은 백업을 남깁니다)")
 	}
 	if fix {
 		doctorFixRegistrations(w, projectRoot, version)
