@@ -898,6 +898,12 @@ func runHookUninstallCodex(user bool, projectRoot string, stdout io.Writer) erro
 	if cfgPath, cErr := codexConfigPath(); cErr == nil {
 		if cfgExisting, rErr := os.ReadFile(cfgPath); rErr == nil {
 			if cfgOut, changed := uninstallCodexConfigBlock(cfgExisting); changed {
+				// D84 — "내용을 바꾸기 직전 config.toml.bak 단일 슬롯"은 제거 경로에도 선다
+				// (리뷰 P1). install·doctor --fix와 같은 규칙이어야 잘못된 제거를 되돌릴 수 있고,
+				// changed 판정 뒤에 두므로 무변경 재실행이 단일 슬롯을 덮지 않는다.
+				if bErr := backupCodexConfig(cfgPath, cfgExisting); bErr != nil {
+					return errors.New("hook uninstall: config.toml 백업 실패")
+				}
 				if wErr := atomicWriteFile(cfgPath, cfgOut); wErr != nil {
 					return errors.New("hook uninstall: config.toml 쓰기 실패")
 				}

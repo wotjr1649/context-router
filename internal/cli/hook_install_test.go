@@ -1089,6 +1089,27 @@ func TestRunHookUninstallCodexConfigOnlyNoHooks(t *testing.T) {
 	if !strings.Contains(out.String(), "MCP 등록 블록 제거 완료") {
 		t.Fatalf("블록 제거 안내 누락: %q", out.String())
 	}
+	// D84 — "내용을 바꾸기 직전 config.toml.bak 단일 슬롯"은 제거 경로에도 선다(리뷰 P1).
+	// 세 writer(install·doctor --fix·uninstall)가 같은 규칙을 써야 잘못된 제거를 되돌릴 수 있다.
+	bak, bakErr := os.ReadFile(filepath.Join(home, "config.toml.bak"))
+	if bakErr != nil {
+		t.Fatalf("제거 경로가 백업을 남기지 않았다: %v", bakErr)
+	}
+	if string(bak) != cfg {
+		t.Fatalf("백업이 원본과 다르다:\n%s", bak)
+	}
+	// 무변경 재실행은 백업도 쓰기도 하지 않는다 — 단일 슬롯이 무변경으로 덮이면 되돌릴 원본이
+	// 사라진다(D84가 install 쪽에서 같은 이유로 changed 판정 뒤에 백업을 둔다).
+	if rmErr := os.Remove(filepath.Join(home, "config.toml.bak")); rmErr != nil {
+		t.Fatal(rmErr)
+	}
+	var again bytes.Buffer
+	if err := runHookUninstall([]string{"--codex", "--user"}, t.TempDir(), &again); err != nil {
+		t.Fatalf("2차 uninstall: %v", err)
+	}
+	if _, statErr := os.Stat(filepath.Join(home, "config.toml.bak")); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("무변경 재실행이 단일 슬롯을 덮었다: %v", statErr)
+	}
 }
 
 // D47 설치 결합 — withGuard=true면 PreToolUse(matcher Bash) 그룹이 추가되고,
