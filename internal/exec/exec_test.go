@@ -687,8 +687,15 @@ func TestRunGoScratchGoEnvWins(t *testing.T) {
 			env = append(env, kv)
 		}
 	}
-	cmd := exec.Command("go", "run", file)
+	// 시한·정리는 runPS1Shell(아래)이 확립한 관용구를 그대로 쓴다 — CommandContext가 예산
+	// 만료·테스트 종료에 자식을 끝내고, WaitDelay가 파이프를 쥔 손자(go run이 만든 바이너리)
+	// 때문에 Wait이 돌아오지 않는 것을 막는다. 예산은 러너 절반이 받는 값과 같은
+	// clampTimeout(0)=120s라 기존 여유가 줄지 않는다(아래 대조군 스폰 전부 동일).
+	ctx, cancel := context.WithTimeout(t.Context(), clampTimeout(0))
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "go", "run", file)
 	cmd.Dir, cmd.Env = scratch, env
+	cmd.WaitDelay = time.Second
 	out, err := cmd.CombinedOutput()
 	if err == nil {
 		t.Fatalf("픽스처 무효 — GOENV 없이도 성공했다(호스트 파일이 툴체인에 도달하지 않음): %s", out)
@@ -781,8 +788,11 @@ func TestRunPyScratchUserSiteWins(t *testing.T) {
 	} else {
 		t.Setenv("HOME", fake)
 	}
-	probe := exec.Command(py, "-c", "import site; print(site.getusersitepackages())")
+	probeCtx, cancelProbe := context.WithTimeout(t.Context(), clampTimeout(0))
+	defer cancelProbe()
+	probe := exec.CommandContext(probeCtx, py, "-c", "import site; print(site.getusersitepackages())")
 	probe.Env = sandbox.BaseEnv() // 자식과 같은 표로 물어야 자식이 볼 경로가 나온다
+	probe.WaitDelay = time.Second
 	out, err := probe.Output()
 	if err != nil {
 		t.Fatalf("user site 경로 조회 실패: %v", err)
@@ -813,8 +823,11 @@ func TestRunPyScratchUserSiteWins(t *testing.T) {
 			env = append(env, kv)
 		}
 	}
-	cmd := exec.Command(py, file)
+	ctx, cancel := context.WithTimeout(t.Context(), clampTimeout(0))
+	defer cancel()
+	cmd := exec.CommandContext(ctx, py, file)
 	cmd.Dir, cmd.Env = scratch, env
+	cmd.WaitDelay = time.Second
 	raw, err := cmd.CombinedOutput()
 	if err != nil || !strings.Contains(string(raw), "host-user-site") {
 		t.Fatalf("픽스처 무효 — 격리 없이도 호스트 user site 모듈이 임포트되지 않았다: %v: %s", err, raw)
@@ -967,8 +980,11 @@ func TestRunJSScratchBunfigWins(t *testing.T) {
 		}
 	}
 	env = append(env, "HOME="+fake, "XDG_CONFIG_HOME="+fake)
-	cmd := exec.Command(bun, file)
+	ctx, cancel := context.WithTimeout(t.Context(), clampTimeout(0))
+	defer cancel()
+	cmd := exec.CommandContext(ctx, bun, file)
 	cmd.Dir, cmd.Env = scratch, env
+	cmd.WaitDelay = time.Second
 	raw, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("격리 없는 절반이 실행 자체에 실패했다: %v: %s", err, raw)
@@ -1012,14 +1028,19 @@ func TestNpmrcScratchConfigWins(t *testing.T) {
 	}
 	registry := func(extra []string) string {
 		t.Helper()
+		ctx, cancel := context.WithTimeout(t.Context(), clampTimeout(0))
+		defer cancel()
 		var cmd *exec.Cmd
 		if runtime.GOOS == "windows" {
 			// npm은 .cmd 래퍼라 CreateProcess로 직접 실행되지 않는다 — cmd.exe 경유.
-			cmd = exec.Command("cmd", "/c", "npm", "config", "get", "registry")
+			// 이 갈래에서 ctx가 끝내는 것은 cmd.exe까지다(그 아래 node는 Job이 없어 남을 수
+			// 있다) — WaitDelay가 파이프를 회수해 Output이 돌아오는 것을 보장한다.
+			cmd = exec.CommandContext(ctx, "cmd", "/c", "npm", "config", "get", "registry")
 		} else {
-			cmd = exec.Command("npm", "config", "get", "registry")
+			cmd = exec.CommandContext(ctx, "npm", "config", "get", "registry")
 		}
 		cmd.Dir, cmd.Env = t.TempDir(), append(sandbox.BaseEnv(), extra...)
+		cmd.WaitDelay = time.Second
 		out, err := cmd.Output()
 		if err != nil {
 			t.Fatalf("npm config get registry: %v", err)
@@ -1124,8 +1145,11 @@ func TestRunShellScratchModulePathWins(t *testing.T) {
 			env = append(env, kv)
 		}
 	}
-	cmd := exec.Command(bin, "-NoProfile", "-NonInteractive", "-File", file)
+	ctx, cancel := context.WithTimeout(t.Context(), clampTimeout(0))
+	defer cancel()
+	cmd := exec.CommandContext(ctx, bin, "-NoProfile", "-NonInteractive", "-File", file)
 	cmd.Dir, cmd.Env = scratch, env
+	cmd.WaitDelay = time.Second
 	raw, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("격리 없는 절반이 실행 자체에 실패했다: %v: %s", err, raw)
@@ -1644,8 +1668,11 @@ func TestRunShellScratchHomeWins(t *testing.T) {
 		t.Fatalf("스니펫 기록 실패: %v", err)
 	}
 	env := sandbox.BaseEnv() // 닫힌 표가 HOME=fakeHome을 그대로 복사한다 — extra 미적용
-	cmd := exec.Command(bin, file)
+	ctx, cancel := context.WithTimeout(t.Context(), clampTimeout(0))
+	defer cancel()
+	cmd := exec.CommandContext(ctx, bin, file)
 	cmd.Dir, cmd.Env = scratch, env
+	cmd.WaitDelay = time.Second
 	raw, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("격리 없는 절반이 실행 자체에 실패했다: %v: %s", err, raw)

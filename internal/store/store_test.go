@@ -784,6 +784,9 @@ func TestOpen_ConcurrentFirstMigration(t *testing.T) {
 			if err := cmd.Start(); err != nil {
 				t.Fatalf("rep %d child %d start: %v", i, c, err)
 			}
+			// 자식은 signal 파일을 시한 없이 폴링한다 — signal 기입 전에 테스트가 이탈하면
+			// 상한 없이 남는다. main_test.go의 spawnCtr과 같은 안전망(정상 Wait 후에는 no-op).
+			t.Cleanup(func() { _ = cmd.Process.Kill(); _, _ = cmd.Process.Wait() })
 			cmds[c] = cmd
 		}
 		time.Sleep(20 * time.Millisecond) // 두 자식이 signal 폴링 루프에 들어갈 시간 확보
@@ -887,6 +890,8 @@ func TestRegister_TwoProcessCASRace(t *testing.T) {
 		if err := cmd.Start(); err != nil {
 			t.Fatalf("child %d start: %v", c, err)
 		}
+		// 시한 없는 signal 폴링 — 이탈 시 상한 없는 잔존을 막는다(spawnCtr과 같은 형태).
+		t.Cleanup(func() { _ = cmd.Process.Kill(); _, _ = cmd.Process.Wait() })
 		cmds[c] = cmd
 	}
 	time.Sleep(20 * time.Millisecond) // 두 자식 모두 signal 폴링 루프에 들어갈 시간 확보
@@ -1024,6 +1029,9 @@ func TestOpen_SurvivesWriteKillMidLoop(t *testing.T) {
 	if err := cmd.Start(); err != nil {
 		t.Fatalf("child start: %v", err)
 	}
+	// 시한 없는 signal 폴링 — 아래 Kill이 t.Fatalf로 이탈하는 갈래(kill 실패·readiness
+	// 타임아웃)를 포함해 잔존을 막는다(spawnCtr과 같은 형태).
+	t.Cleanup(func() { _ = cmd.Process.Kill(); _, _ = cmd.Process.Wait() })
 	time.Sleep(20 * time.Millisecond) // 자식이 signal 폴링 루프에 들어갈 시간 확보
 	if err := os.WriteFile(signal, []byte("go"), 0o600); err != nil {
 		t.Fatal(err)
