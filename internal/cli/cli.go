@@ -1680,7 +1680,11 @@ func runDoctor(ctx context.Context, w io.Writer, storeRoot, projectRoot, version
 			return "파싱실패"
 		case n == 0:
 			return "미등록"
-		case marker != "" && marker != version:
+		case marker == "":
+			// D82 — 훅 등록물은 무버전 마커를 쓴다. 존재·개수만 본다: 버전 비교는 [20]의 MCP
+			// 등록물 검사가 맡는다(여기서 비교하면 상시 불일치 경고가 된다).
+			return fmt.Sprintf("등록됨(%d개)", n)
+		case marker != version:
 			return fmt.Sprintf("등록됨(%d개, marker %s≠%s — hook install 재실행)", n, marker, version)
 		default:
 			return fmt.Sprintf("등록됨(%d개, marker %s)", n, marker)
@@ -1852,7 +1856,7 @@ func runDoctor(ctx context.Context, w io.Writer, storeRoot, projectRoot, version
 
 	// [16] codex 등록 상태(D52, 스펙 v0.9 §0) — 읽기 전용 5분기. 경고는 [14]와 동일하게
 	// failed에 미계상(doctor exit 계약 무변경). trust 해시 검증은 비범위(스펙 §1.2).
-	codexHooksScope := func(path string, pathErr error) (string, bool) { // (표시, marker존재)
+	codexHooksScope := func(path string, pathErr error) (string, bool) { // (표시, 등록 존재)
 		if pathErr != nil {
 			return "확인불가", false
 		}
@@ -1862,7 +1866,9 @@ func runDoctor(ctx context.Context, w io.Writer, storeRoot, projectRoot, version
 			return "파싱실패", false
 		case n == 0:
 			return "미등록", false
-		case marker != "" && marker != version:
+		case marker == "":
+			return fmt.Sprintf("등록됨(%d개)", n), true
+		case marker != version:
 			return fmt.Sprintf("등록됨(%d개, marker %s≠%s — hook install --codex 재실행)", n, marker, version), true
 		default:
 			return fmt.Sprintf("등록됨(%d개, marker %s)", n, marker), true

@@ -65,6 +65,29 @@ func hookMarker(version string) string { return hookBinaryName + "/" + version }
 
 func hookMarkerPrefix() string { return hookBinaryName + "/" }
 
+// hookGroupMarker — **훅 등록물**(.claude/settings.json 그룹의 __ctrManaged, Codex hooks.json의
+// statusMessage)이 쓰는 무버전 소유 표식(D82). 버전은 MCP 등록물에만 둔다 — 이득 둘이다:
+// ① D64 드리프트가 훅 등록물에서 구조적으로 사라진다(버전이 없으니 뒤처질 것이 없다)
+// ② 훅 정의가 릴리스 간 바이트 동일해져 Codex 재신뢰가 릴리스마다 강요되지 않는다.
+// ②는 필요조건까지만 주장한다 — trusted_hash가 무엇을 해싱하는지는 Codex 내부이며 검증되지
+// 않았고, 바이트 동일도 **같은 설치 옵션·같은 MCP 상태 안에서만** 성립한다(buildHookCommand의
+// --store-root·--no-shadow, runHookInstallCodex가 넘기는 mcpConfirmed의 등록 그룹 2개/3개 분기).
+const hookGroupMarker = hookBinaryName
+
+// markerVersion — 소유 표식 값에서 버전을 뽑는다. **무버전 마커는 ""를 돌려준다** — 훅
+// 스코프의 버전 비교가 그 값을 불일치로 읽지 않게 하는 지점이다(D82). strings.TrimPrefix는
+// 무버전 마커에서 무동작이라 "context-router"를 그대로 돌려주고, doctor의
+// `marker != "" && marker != version` 분기가 항상 참이 되어 상시 불일치 경고를 낸다.
+func markerVersion(marker string) string {
+	if marker == hookBinaryName {
+		return ""
+	}
+	if v, ok := strings.CutPrefix(marker, hookMarkerPrefix()); ok {
+		return v
+	}
+	return ""
+}
+
 // buildHookCommand — 등록할 훅 명령 문자열을 조립한다(설계 §7). --store-root는 명시된 경우에만
 // 원시값을 주입한다(기본 절대경로의 불필요한 영구 기입 방지 — 미명시 시 훅은 실행 시점에
 // CTR_STORE_ROOT>OS 기본으로 해석). --no-shadow는 러닝 훅이 CTR_SHADOW_OFF로 반영한다(settings
@@ -92,15 +115,15 @@ type hookGroupProbe struct {
 	} `json:"hooks"`
 }
 
-// isOurHookGroup — 자기 소유 그룹 판정: 소유권 마커(접두사) AND 명령 토큰 정확 일치를 모두
-// 요구한다(결합, 설계 §7). 마커 없는 수동 항목·접두사만 닮은 `context-router hook-wrapper`는
-// 어느 한 조건에서 탈락해 보존된다(오삭제 방지).
+// isOurHookGroup — 자기 소유 그룹 판정: 소유권 마커(정확 일치 또는 접두, isOurMarkerValue —
+// D82) AND 명령 토큰 정확 일치를 모두 요구한다(결합, 설계 §7). 마커 없는 수동 항목·접두사만
+// 닮은 `context-router hook-wrapper`는 어느 한 조건에서 탈락해 보존된다(오삭제 방지).
 func isOurHookGroup(raw json.RawMessage) bool {
 	var p hookGroupProbe
 	if json.Unmarshal(raw, &p) != nil {
 		return false
 	}
-	if !strings.HasPrefix(p.Managed, hookMarkerPrefix()) {
+	if !isOurMarkerValue(p.Managed) {
 		return false // 마커 없음 → 수동 항목, 보존
 	}
 	for _, h := range p.Hooks {
@@ -233,10 +256,12 @@ func isCodexHookCommandToken(cmd string) bool {
 }
 
 // isOurCodexGroup — 그룹의 **모든** 훅 항목이 자기 것(command 토큰 정확 일치 AND statusMessage
-// 마커 접두)일 때만 자기 그룹으로 판정한다(전건 판정 — §11.2 F4). Claude 쪽 isOurHookGroup은
+// 마커 값 일치)일 때만 자기 그룹으로 판정한다(전건 판정 — §11.2 F4). Claude 쪽 isOurHookGroup은
 // 그룹 레벨 __ctrManaged 마커가 소유를 표시하지만 Codex hooks.json은 미지 필드 금지라 항목
 // 레벨 추론뿐이므로, any-판정이면 사용자가 항목을 추가한 혼합 그룹까지 통째로 지워진다 —
-// 혼합 그룹은 불가침(파손 금지 > 멱등 완전성, 잔존 정리는 사용자 /hooks 몫).
+// 혼합 그룹은 불가침(파손 금지 > 멱등 완전성, 잔존 정리는 사용자 /hooks 몫). 마커 판정은
+// 정확 일치 context-router 또는 접두 context-router/다(isOurMarkerValue) — D82가 받아들이는
+// 값 집합을 넓힌 것이지 검사 종류를 바꾼 것이 아니다.
 func isOurCodexGroup(raw json.RawMessage) bool {
 	var p codexGroupProbe
 	if json.Unmarshal(raw, &p) != nil {
@@ -246,7 +271,7 @@ func isOurCodexGroup(raw json.RawMessage) bool {
 		return false
 	}
 	for _, h := range p.Hooks {
-		if !isCodexHookCommandToken(h.Command) || !strings.HasPrefix(h.StatusMessage, hookMarkerPrefix()) {
+		if !isCodexHookCommandToken(h.Command) || !isOurMarkerValue(h.StatusMessage) {
 			return false
 		}
 	}
@@ -549,7 +574,7 @@ func runHookInstall(args []string, storeRoot, storeRootRaw string, storeRootExpl
 		}
 	}
 	command := buildHookCommand(storeRootExplicit, storeRootRaw, *noShadow)
-	merged, err := mergeSettingsFile(path, command, hookMarker(version), true)
+	merged, err := mergeSettingsFile(path, command, hookGroupMarker, true)
 	if err != nil {
 		return err
 	}
@@ -685,7 +710,7 @@ func runHookInstallCodex(user, noShadow, storeRootExplicit bool, storeRootRaw, p
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return errors.New("hook: 설정 파일 읽기 실패")
 	}
-	merged, err := mergeCodexHooks(existing, command, hookMarker(version), true, mcpConfirmed)
+	merged, err := mergeCodexHooks(existing, command, hookGroupMarker, true, mcpConfirmed)
 	if err != nil {
 		return fmt.Errorf("hook: 설정 병합 실패: %w", err)
 	}
@@ -906,7 +931,7 @@ func scanRegisteredHooks(path string) (count int, marker string, err error) {
 			if marker == "" { // 첫 자기 그룹의 마커 버전만(모두 동일 — install 계약)
 				var p hookGroupProbe
 				if json.Unmarshal(g, &p) == nil {
-					marker = strings.TrimPrefix(p.Managed, hookMarkerPrefix())
+					marker = markerVersion(p.Managed)
 				}
 			}
 		}
@@ -955,7 +980,7 @@ func scanCodexRegisteredHooks(path string) (count int, marker string, err error)
 			if marker == "" { // 첫 자기 그룹의 마커만(install이 모든 그룹에 동일 버전 마커를 씀)
 				var p codexGroupProbe
 				if json.Unmarshal(g, &p) == nil && len(p.Hooks) > 0 {
-					marker = strings.TrimPrefix(p.Hooks[0].StatusMessage, hookMarkerPrefix())
+					marker = markerVersion(p.Hooks[0].StatusMessage)
 				}
 			}
 		}

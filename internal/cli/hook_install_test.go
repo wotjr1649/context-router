@@ -132,7 +132,8 @@ func TestHookInstall_EmptyRegistersSixItems(t *testing.T) {
 
 // ①-b D32 업그레이드 재설치(설계 §8 설치 게이트): v0.2 형태 settings(marker 0.2.0 + PreToolUse
 // matcher "Read")를 seed → install 재실행 → PreToolUse 관리 그룹 1개·matcher "Read|Bash|PowerShell|Grep"·총 6그룹·
-// marker 현재 버전으로 갱신(구 matcher 그룹이 잔존하지 않고 대칭 교체된다).
+// marker 무버전 표식(hookGroupMarker)으로 갱신(구 matcher 그룹이 잔존하지 않고 대칭 교체된다 —
+// D82 이후 훅 등록물의 마커는 install에 넘긴 version 인자와 무관하다).
 func TestHookInstall_UpgradeReinstallWidensMatcher(t *testing.T) {
 	projectRoot := t.TempDir()
 	path := filepath.Join(projectRoot, ".claude", "settings.json")
@@ -185,8 +186,8 @@ func TestHookInstall_UpgradeReinstallWidensMatcher(t *testing.T) {
 	if pre[0].Matcher != "Read|Bash|PowerShell|Grep" {
 		t.Fatalf("PreToolUse matcher=%q want Read|Bash|PowerShell|Grep (구 Read 그룹 미교체): %s", pre[0].Matcher, data)
 	}
-	if pre[0].Managed != "context-router/0.3.0" {
-		t.Fatalf("marker=%q want context-router/0.3.0 (버전 미갱신): %s", pre[0].Managed, data)
+	if pre[0].Managed != hookGroupMarker {
+		t.Fatalf("marker=%q want %s (구버전 마커 미교체, D82): %s", pre[0].Managed, hookGroupMarker, data)
 	}
 }
 
@@ -603,44 +604,119 @@ func TestDoctor_UserScopeHookRegistration(t *testing.T) {
 	assertDoctorAscending(t, out)
 }
 
-// D33a 마커 일치: 현재 버전으로 install한 뒤 같은 버전 바이너리로 doctor를 돌리면 [9]가
-// "marker <v>"만 표기하고 불일치 경고(≠)를 내지 않는다.
-func TestDoctor_HookMarkerVersionMatch(t *testing.T) {
+// TestDoctorVersionlessHookMarker — D82 doctor 경고(§2-9). 무버전 마커가 설치된 상태에서
+// 훅 스코프는 버전 불일치 경고를 내지 **않는다**. 같은 픽스처에서 그 훅 등록이 **소유로
+// 인식되는지**를 등록 개수로 함께 단정한다 — 경고만 보면 무버전 마커가 소유 판정에서 아예
+// 탈락해 개수가 0이 된 경우도 "경고 없음"으로 통과한다.
+// 불일치 부재는 **훅 스코프 줄([9]·[16])에 한정**한다 — D83의 [20]은 MCP 등록물의 버전을
+// 비교하는 자리라 같은 픽스처에서 '≠'를 정당하게 인쇄한다.
+func TestDoctorVersionlessHookMarker(t *testing.T) {
 	storeRoot := t.TempDir()
 	projectRoot := t.TempDir()
 	var iout bytes.Buffer
-	if err := runHookInstall(nil, storeRoot, "", false, projectRoot, "9.9.9", &iout); err != nil {
+	if err := runHookInstall(nil, storeRoot, "", false, projectRoot, "0.15.0", &iout); err != nil {
 		t.Fatalf("install: %v", err)
 	}
+	// 설치 버전과 다른 버전으로 doctor를 돌려도 훅 스코프는 흔들리지 않는다.
 	var buf bytes.Buffer
-	if err := runDoctor(context.Background(), &buf, storeRoot, projectRoot, "9.9.9"); err != nil {
+	if err := runDoctor(context.Background(), &buf, storeRoot, projectRoot, "0.16.0"); err != nil {
 		t.Fatalf("runDoctor err=%v out=%s", err, buf.String())
 	}
 	out := buf.String()
-	if !strings.Contains(out, "project=등록됨(6개, marker 9.9.9)") {
-		t.Fatalf("out missing matched marker version:\n%s", out)
+	if !strings.Contains(out, "project=등록됨(6개)") {
+		t.Fatalf("무버전 마커가 소유로 인식되지 않았다(개수 0이면 경고 없음도 공허하다):\n%s", out)
 	}
-	if strings.Contains(out, "≠") {
-		t.Fatalf("out must not warn mismatch on matching versions:\n%s", out)
+	// '≠' 부재는 **훅 스코프 줄에 한정**해 본다 — Task 11이 더하는 [20]은 MCP 등록물의
+	// 버전을 비교하므로 같은 픽스처(설치 0.15.0 · doctor 0.16.0)에서 정당하게 '≠'를
+	// 인쇄한다. 출력 전체를 보면 그 줄이 이 단정을 깨뜨린다.
+	for _, line := range strings.Split(out, "\n") {
+		if !strings.HasPrefix(line, "[9] hooks:") && !strings.HasPrefix(line, "[16] codex:") {
+			continue
+		}
+		if strings.Contains(line, "≠") {
+			t.Fatalf("훅 스코프가 버전 불일치 경고를 냈다: %s", line)
+		}
+	}
+	// 설치 산출물의 마커 값 자체가 무버전이어야 한다(문면만 고친 구현을 배제한다).
+	sb, err := os.ReadFile(filepath.Join(projectRoot, ".claude", "settings.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(sb), `"__ctrManaged": "context-router"`) {
+		t.Fatalf("훅 그룹 마커가 무버전이 아니다:\n%s", sb)
+	}
+	if strings.Contains(string(sb), `"__ctrManaged": "context-router/`) {
+		t.Fatalf("훅 그룹에 버전 있는 마커가 남았다:\n%s", sb)
 	}
 }
 
-// D33a 마커 불일치: 구버전 마커로 install(= 구버전 마커 seed)한 뒤 신버전 바이너리로 doctor를
-// 돌리면 [9]가 "marker <old>≠<new> — hook install 재실행"으로 재설치를 안내한다.
-func TestDoctor_HookMarkerVersionMismatch(t *testing.T) {
-	storeRoot := t.TempDir()
-	projectRoot := t.TempDir()
-	var iout bytes.Buffer
-	if err := runHookInstall(nil, storeRoot, "", false, projectRoot, "0.1.0", &iout); err != nil {
-		t.Fatalf("install(old): %v", err)
+// TestHookRegistrationBytesVersionIndependent — D82의 핵심 단정(§2-8). 서로 다른 두 버전
+// 문자열로 훅 등록물을 조립해 **바이트가 같음**을 단정한다. 조립 지점은 version 인자를 계속
+// 받는 진입점(runHookInstall·runHookInstallCodex)이다 — 마커가 상수가 된 뒤 version을 받지
+// 않는 함수(mergeHookSettings·mergeCodexHooks는 marker만 받는다) 수준에서 조립하면 두 산출이
+// 자동으로 같아져 공허하게 통과한다. 같은 테스트가 **MCP 등록물에서는 버전이 반영됨**을 함께
+// 단정한다 — 한쪽만 보면 "전부 무버전화" 같은 과잉 변경이 통과한다.
+// t.Setenv 사용 → t.Parallel 금지.
+func TestHookRegistrationBytesVersionIndependent(t *testing.T) {
+	run := func(t *testing.T, version string) (settings, mcp, codexHooks, codexCfg []byte) {
+		t.Helper()
+		home := t.TempDir()
+		t.Setenv("CODEX_HOME", home)
+		proj := t.TempDir()
+		var out bytes.Buffer
+		if err := runHookInstall(nil, t.TempDir(), "", false, proj, version, &out); err != nil {
+			t.Fatalf("install(%s): %v", version, err)
+		}
+		if err := runHookInstall([]string{"--codex", "--user"}, "", "", false, proj, version, &out); err != nil {
+			t.Fatalf("install --codex(%s): %v", version, err)
+		}
+		settings, _ = os.ReadFile(filepath.Join(proj, ".claude", "settings.json"))
+		mcp, _ = os.ReadFile(mcpConfigPath(proj))
+		codexHooks, _ = os.ReadFile(filepath.Join(home, "hooks.json"))
+		codexCfg, _ = os.ReadFile(filepath.Join(home, "config.toml"))
+		return settings, mcp, codexHooks, codexCfg
 	}
-	var buf bytes.Buffer
-	if err := runDoctor(context.Background(), &buf, storeRoot, projectRoot, "0.3.0"); err != nil {
-		t.Fatalf("runDoctor err=%v out=%s", err, buf.String())
+	s1, m1, ch1, cc1 := run(t, "0.15.0")
+	s2, m2, ch2, cc2 := run(t, "9.9.9")
+	if !bytes.Equal(s1, s2) {
+		t.Errorf("settings.json이 버전만으로 달라졌다:\n1: %s\n2: %s", s1, s2)
 	}
-	out := buf.String()
-	if !strings.Contains(out, "project=등록됨(6개, marker 0.1.0≠0.3.0 — hook install 재실행)") {
-		t.Fatalf("out missing marker mismatch warning:\n%s", out)
+	if !bytes.Equal(ch1, ch2) {
+		t.Errorf("codex hooks.json이 버전만으로 달라졌다:\n1: %s\n2: %s", ch1, ch2)
+	}
+	if bytes.Equal(m1, m2) {
+		t.Errorf(".mcp.json에 버전이 반영되지 않았다(전부 무버전화는 과잉 변경이다):\n%s", m1)
+	}
+	if bytes.Equal(cc1, cc2) {
+		t.Errorf("config.toml의 env.CTR_MANAGED에 버전이 반영되지 않았다:\n%s", cc1)
+	}
+}
+
+// TestLegacyVersionedMarkerStillOwned — D82 하위 호환(§2-10). 구 마커(context-router/0.14.0)가
+// 소유로 인정되고 대칭 제거된다. uninstall이 구·신 마커 양쪽을 지운다.
+func TestLegacyVersionedMarkerStillOwned(t *testing.T) {
+	for _, marker := range []string{"context-router/0.14.0", "context-router"} {
+		proj := t.TempDir()
+		seed, err := mergeHookSettings(nil, buildHookCommand(false, "", false), marker, true)
+		if err != nil {
+			t.Fatal(err)
+		}
+		path := filepath.Join(proj, ".claude", "settings.json")
+		if err := atomicWriteFile(path, seed); err != nil {
+			t.Fatal(err)
+		}
+		n, _, err := scanRegisteredHooks(path)
+		if err != nil || n != len(hookRegistrations) {
+			t.Fatalf("marker %q: 소유 그룹 %d개 (err=%v) want %d", marker, n, err, len(hookRegistrations))
+		}
+		var out bytes.Buffer
+		if err := runHookUninstall(nil, proj, &out); err != nil {
+			t.Fatalf("marker %q: uninstall: %v", marker, err)
+		}
+		after, _ := os.ReadFile(path)
+		if strings.Contains(string(after), "context-router hook") {
+			t.Fatalf("marker %q: 대칭 제거되지 않았다:\n%s", marker, after)
+		}
 	}
 }
 
