@@ -1457,7 +1457,7 @@ func TestRunnerLabelNodeLeg(t *testing.T) {
 			// (run_unix.go:34) 이 잡(ubuntu)에서 Run을 직접 부르면 안 된다.
 			resp := run(t, Request{Language: lang, Code: "console.log(1)"})
 			// runnerLabel은 filepath.Base(bin) + (version이 있으면) " " + version이다
-			// (internal/exec/exec.go:237-243) — 첫 토큰을 떼고 확장자를 제거해 비교한다.
+			// (internal/exec의 `runnerLabel`) — 첫 토큰을 떼고 확장자를 제거해 비교한다.
 			first := strings.Fields(resp.Runner)[0]
 			base := strings.TrimSuffix(first, filepath.Ext(first))
 			if base != "node" {
@@ -1544,9 +1544,9 @@ func TestRunnerIsolationKeySets(t *testing.T) {
 	}
 	shell := tbl["shell"]
 	if runtime.GOOS == "windows" {
-		// windows 갈래의 extra는 detect가 채우는 psHome·pfDir를 읽는다(exec.go:335-338의 계약) —
-		// detect를 먼저 부르지 않으면 값이 빈 채로 조립된다. 미설치면 Skip한다
-		// (TestShellExtraModuleDirFailureIsErrSetup:1189-1191 선례).
+		// windows 갈래의 extra는 detect가 채우는 psHome·pfDir를 읽는다(`shellRunner`의 windows
+		// 갈래 주석이 적은 계약) — detect를 먼저 부르지 않으면 값이 빈 채로 조립된다. 미설치면
+		// Skip한다(TestShellExtraModuleDirFailureIsErrSetup:1189-1191 선례).
 		if _, _, err := shell.detect(); err != nil {
 			t.Skipf("windows shell 미설치: %v", err)
 		}
@@ -1836,7 +1836,7 @@ func TestSnippetContentNonPS1Unchanged(t *testing.T) {
 }
 
 // psBin — 셸을 고른다. name이 빈 문자열이면 러너와 같은 순서(pwsh → powershell)로
-// 고른다(shellRunner의 detect 순서와 일치 — exec.go:401-411). name을 주면 그 셸만 쓰고
+// 고른다(`shellRunner`의 detect 순서와 일치). name을 주면 그 셸만 쓰고
 // 부재 시 Skip한다 — 5.1 레그를 명시적으로 밟는 관용구는 위
 // TestRunShellPS51ProviderWriteReturns가 선례다.
 func psBin(t *testing.T, name string) string {
@@ -1871,7 +1871,7 @@ func psBin(t *testing.T, name string) string {
 //
 // 타임아웃: -SupportEvent 회귀가 나면 `Get-Job | Wait-Job`이 끝나지 않는다(설계 §3 표6).
 // 그 감시선이 물리는 순간 무한 대기가 되고 go test 기본 10분 패닉으로만 끝난다. 그래서
-// probeVersion(exec.go:639-646)의 CommandContext + WaitDelay 관용구를 그대로 쓰고,
+// probeVersion(`internal/exec`의 같은 이름 헬퍼)의 CommandContext + WaitDelay 관용구를 그대로 쓰고,
 // 타임아웃을 일반 실패와 구분해 진단 가능하게 만든다. 예산 근거: 5.1 기동 실측
 // 170~194ms, 건강한 실행은 1s 안쪽이다(TestRunShellPS51ProviderWriteReturns 선례).
 func runPS1Shell(t *testing.T, shell, dir, code string, promote bool) (exitCode int, stdout, stderr, side string) {
@@ -1880,7 +1880,7 @@ func runPS1Shell(t *testing.T, shell, dir, code string, promote bool) (exitCode 
 		t.Skip("windows shell 갈래 전용(PowerShell -File 계약)")
 	}
 	bin := psBin(t, shell)
-	// 환경도 러너가 만드는 것을 그대로 재현한다(exec.go:133 + shellRunner의 extra). cmd.Env를
+	// 환경도 러너가 만드는 것을 그대로 재현한다(`Run`의 env 조립 + shellRunner의 extra). cmd.Env를
 	// nil로 두면 호스트 환경 **전체**가 상속되어(sandbox.go:134-136이 경고하는 그 경로) D65가
 	// 일부러 떼어낸 호스트 PSModulePath가 스니펫에 닿고, 5.1의 실행 정책이 테스트를 띄운
 	// 세션의 상속 값에 따라 갈린다. 조립을 손으로 하는 것은 detect가 pwsh를 먼저 고르기
@@ -1948,7 +1948,7 @@ func TestD78SignalOnExit(t *testing.T) {
 		{"explicit-exit", "cmd /c exit 71\nexit 3", ctrNativeExitMarker + "71"},
 		{"bare-exit", "cmd /c exit 76\nexit", ctrNativeExitMarker + "76"},
 		// exit 0은 인수 없는 exit과 별개 사례로 남긴다 — 보강의 트리거는 "인수 없는
-		// exit"이 아니라 exit_code == 0(exec.go:189)이라, 사용자에게 실제로 새 줄이
+		// exit"이 아니라 exit_code == 0(`Run`의 D76 보강 조건)이라, 사용자에게 실제로 새 줄이
 		// 붙는 자리가 이 둘 **모두**다(CHANGELOG 0.14.0). 인수 없는 exit만 태우면
 		// 릴리스 문면이 약속한 절반에 감시선이 없다(최종 리뷰).
 		{"exit-zero", "cmd /c exit 71\nexit 0", ctrNativeExitMarker + "71"},
