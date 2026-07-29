@@ -73,14 +73,81 @@ func mcpConfigPath(projectRoot string) string {
 	return filepath.Join(projectRoot, ".mcp.json")
 }
 
-// mcpArgsForProfile — .mcp.json 항목의 args. exec 활성화는 명시 opt-in이므로 설치 시
-// 플래그가 있을 때만 프로필을 켠다(설계 v0.12 D64). 빈 슬라이스를 반환해 JSON에 "args": []
-// 가 남게 한다 — nil이면 키가 사라져 멱등 비교가 흔들린다.
-func mcpArgsForProfile(enableExec bool) []string {
-	if enableExec {
-		return []string{"--enable", "exec"}
+// mcpProfileNames — 설치기가 아는 프로필 이름(D81). 이 순서가 args의 쉼표 목록과
+// enabled_tools의 추가 순서를 함께 정한다 — 두 값이 같은 입력에서 같은 순서로 도출되므로
+// 골든이 입력 순서에 흔들리지 않는다. 서버 쪽 NewServer의 Enable 분기는 손대지 않는다.
+var mcpProfileNames = []string{"ingest", "net", "exec"}
+
+// defaultMCPProfiles — 플래그 없는 **첫** 설치가 쓰는 기본 프로필(D81 개정 — 앞선 초안의
+// "기본값은 프로필 없음"을 대체한다). ctr_index·ctr_fetch_and_index 미등록이 세 세션 이월된
+// 원인이 이 기본값이었다. exec는 --enable-exec 명시 opt-in을 유지한다(D58·D59·D64).
+var defaultMCPProfiles = []string{"ingest", "net"}
+
+// canonicalProfiles — 아는 이름만 mcpProfileNames 순서로 중복 없이 남긴다(정규화 단일 지점).
+func canonicalProfiles(profiles []string) []string {
+	var out []string
+	for _, name := range mcpProfileNames {
+		if slices.Contains(profiles, name) {
+			out = append(out, name)
+		}
 	}
-	return []string{}
+	return out
+}
+
+// mcpArgsForProfiles — 등록물 args. 프로필이 비면 nil을 준다 — Codex 갈래는 그 경우 args 키
+// 자체를 쓰지 않고(재직렬화가 args = []를 지우므로 매 실행이 같은 줄을 되쓴다, D80),
+// .mcp.json 갈래는 mergeMCPServers가 nil을 []로 정규화한다(그쪽은 키가 사라지면 멱등
+// 비교가 흔들린다).
+func mcpArgsForProfiles(profiles []string) []string {
+	list := canonicalProfiles(profiles)
+	if len(list) == 0 {
+		return nil
+	}
+	return []string{"--enable", strings.Join(list, ",")}
+}
+
+// enabledToolsForProfiles — Codex enabled_tools의 **정적** 목록(D81·§1.3-3). 런타임 등록
+// 결과가 아니다 — ctr_transform은 transform.ProbeIsolation, exec 2종은 sandbox.Probe 통과
+// 시에만 실제로 등록되고 세션 3종은 cfg.Session이 있을 때만 등록되므로, 런타임을 기준으로
+// 삼으면 등록물이 호스트마다 갈린다. args와 이 목록이 같은 입력에서 도출되는 것이 계약이다 —
+// 도구가 늘어나는데 allowlist가 그대로면 프로필을 켜도 도구가 보이지 않는다.
+func enabledToolsForProfiles(profiles []string) []string {
+	tools := []string{
+		"ctr_search", "ctr_fetch", "ctr_transform",
+		"ctr_record_event", "ctr_session_summary", "ctr_export_events",
+	}
+	for _, name := range canonicalProfiles(profiles) {
+		switch name {
+		case "ingest":
+			tools = append(tools, "ctr_index")
+		case "net":
+			tools = append(tools, "ctr_fetch_and_index")
+		case "exec":
+			tools = append(tools, "ctr_execute", "ctr_execute_file")
+		}
+	}
+	return tools
+}
+
+// profilesFromArgs — 등록물의 args를 프로필 집합으로 되읽는다(D81 Codex 갈래). 우리가 쓰는
+// 형태(["--enable", "<쉼표 목록>"])와 아는 이름만 인식하고, **부재와 []는 빈 프로필 집합**으로
+// 되읽는다(D80 동치 규칙 — 현재 사용자 파일이 그 상태다). 그 밖의 형태는 ok=false이며,
+// 호출자는 그때 args와 enabled_tools를 **둘 다 손대지 않는다** — 해석하지 못한 값을 기본
+// 프로필로 덮으면 사용자가 켜 둔 프로필이 조용히 바뀐다.
+func profilesFromArgs(args []string) (profiles []string, ok bool) {
+	if len(args) == 0 {
+		return nil, true
+	}
+	if len(args) != 2 || args[0] != "--enable" {
+		return nil, false
+	}
+	for _, name := range strings.Split(args[1], ",") {
+		if !slices.Contains(mcpProfileNames, strings.TrimSpace(name)) {
+			return nil, false
+		}
+		profiles = append(profiles, strings.TrimSpace(name))
+	}
+	return canonicalProfiles(profiles), true
 }
 
 // mergeMCPServers — existing(빈 슬라이스 허용)에 name 항목을 install 여부에 따라

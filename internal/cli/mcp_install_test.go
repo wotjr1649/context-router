@@ -144,7 +144,7 @@ func TestMergeMCPServersRetiresSuperseded(t *testing.T) {
 func TestMergeMCPServersCarriesSupersededProfile(t *testing.T) {
 	retired := `"ctr":{"command":"context-router","args":["--enable","exec"]}`
 	entry := mcpServerEntry{
-		Command: hookBinaryName, Args: mcpArgsForProfile(false),
+		Command: hookBinaryName, Args: mcpArgsForProfiles(nil),
 		AlwaysLoad: true, Managed: hookMarker("0.12.0"),
 	}
 
@@ -1324,4 +1324,74 @@ func mustReadFile(t *testing.T, path string) []byte {
 		t.Fatalf("읽기 실패: %v", err)
 	}
 	return b
+}
+
+// TestMCPProfileHelpers — D81 프로필 정적 대응(§1.3-3). 설치기가 쓰는 목록은 런타임 등록
+// 결과가 아니라 이 순수 함수들이 소유한다 — enabled_tools를 손으로 나열하면 프로필과
+// allowlist가 갈라지는 자리가 새로 생긴다. args와 enabled_tools가 **같은 입력**에서
+// 도출되는지도 여기서 고정한다.
+func TestMCPProfileHelpers(t *testing.T) {
+	if !slices.Equal(defaultMCPProfiles, []string{"ingest", "net"}) {
+		t.Fatalf("기본 프로필=%v want [ingest net] (D81 개정)", defaultMCPProfiles)
+	}
+	base := []string{
+		"ctr_search", "ctr_fetch", "ctr_transform",
+		"ctr_record_event", "ctr_session_summary", "ctr_export_events",
+	}
+	cases := []struct {
+		name     string
+		in       []string
+		wantArgs []string
+		wantAdd  []string
+	}{
+		{"빈 집합은 args 키 자체가 없다", nil, nil, nil},
+		{"기본", defaultMCPProfiles, []string{"--enable", "ingest,net"}, []string{"ctr_index", "ctr_fetch_and_index"}},
+		{"exec만", []string{"exec"}, []string{"--enable", "exec"}, []string{"ctr_execute", "ctr_execute_file"}},
+		{
+			"최대",
+			[]string{"exec", "net", "ingest"},
+			[]string{"--enable", "ingest,net,exec"},
+			[]string{"ctr_index", "ctr_fetch_and_index", "ctr_execute", "ctr_execute_file"},
+		},
+		{"모르는 이름은 떨어진다", []string{"ingest", "bogus"}, []string{"--enable", "ingest"}, []string{"ctr_index"}},
+		{"중복은 한 번만", []string{"net", "net"}, []string{"--enable", "net"}, []string{"ctr_fetch_and_index"}},
+	}
+	for _, c := range cases {
+		if got := mcpArgsForProfiles(c.in); !slices.Equal(got, c.wantArgs) {
+			t.Errorf("%s: args=%v want %v", c.name, got, c.wantArgs)
+		}
+		want := append(append([]string{}, base...), c.wantAdd...)
+		if got := enabledToolsForProfiles(c.in); !slices.Equal(got, want) {
+			t.Errorf("%s: enabled_tools=%v want %v", c.name, got, want)
+		}
+	}
+	// slices.Equal은 nil과 []를 같다고 본다 — 위 "빈 집합" 케이스는 그 둘을 가르지 못하므로
+	// 여기서 따로 고정한다. 가르는 것이 계약이다: Codex 갈래는 nil일 때 args 키 자체를 쓰지
+	// 않는데 []를 쓰면 재직렬화가 그 줄을 지우고(§3 표1) 매 실행이 같은 줄을 되써 D84의
+	// 무변경 판정이 성립하지 않는다(.mcp.json 갈래는 mergeMCPServers가 nil을 []로 정규화하므로
+	// 어느 쪽이든 안전하다 — 이 계약이 걸리는 곳은 Codex 갈래뿐이다).
+	if got := mcpArgsForProfiles(nil); got != nil {
+		t.Errorf("빈 프로필의 args가 nil이 아니다: %#v", got)
+	}
+	// 되읽기: 우리가 쓰는 형태와 아는 이름만 인식한다. 부재·[]는 빈 집합(D80 동치 규칙).
+	readback := []struct {
+		name string
+		in   []string
+		want []string
+		ok   bool
+	}{
+		{"부재", nil, nil, true},
+		{"빈 배열", []string{}, nil, true},
+		{"기본", []string{"--enable", "ingest,net"}, []string{"ingest", "net"}, true},
+		{"순서 무관 정규화", []string{"--enable", "exec,ingest"}, []string{"ingest", "exec"}, true},
+		{"모르는 이름", []string{"--enable", "ingest,bogus"}, nil, false},
+		{"우리가 쓰지 않는 형태", []string{"--profile", "global-search"}, nil, false},
+		{"토큰 수 불일치", []string{"--enable"}, nil, false},
+	}
+	for _, c := range readback {
+		got, ok := profilesFromArgs(c.in)
+		if ok != c.ok || !slices.Equal(got, c.want) {
+			t.Errorf("%s: profilesFromArgs=%v,%v want %v,%v", c.name, got, ok, c.want, c.ok)
+		}
+	}
 }

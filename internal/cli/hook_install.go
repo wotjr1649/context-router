@@ -495,6 +495,11 @@ func runHookInstall(args []string, storeRoot, storeRootRaw string, storeRootExpl
 	if rest := fs.Args(); len(rest) > 0 {
 		return fmt.Errorf("hook install: 예상치 않은 인자 %d개", len(rest))
 	}
+	// Task 7이 --enable 플래그를 더하기 전의 최소 배선: --enable-exec만 프로필로 환원한다.
+	var installProfiles []string
+	if *enableExec {
+		installProfiles = []string{"exec"}
+	}
 	// --codex는 config.toml/hooks.json 경로라 .mcp.json을 만들지 않고, 관리 블록의 도구 목록도
 	// 고정이라 exec 프로필이 반영될 자리가 없다. 조용히 무시하면 사용자는 exec가 켜졌다고 오인한다.
 	if *codex && *enableExec {
@@ -533,7 +538,7 @@ func runHookInstall(args []string, storeRoot, storeRootRaw string, storeRootExpl
 		fmt.Fprintln(stdout, "mcp: 기존 설정을 읽지 못해 .mcp.json 병합을 건너뜁니다")
 	} else {
 		entry := mcpServerEntry{
-			Command: hookBinaryName, Args: mcpArgsForProfile(*enableExec),
+			Command: hookBinaryName, Args: mcpArgsForProfiles(installProfiles),
 			AlwaysLoad: true, Managed: hookMarker(version),
 		}
 		// setProfile=*enableExec: 플래그가 없으면 기존 항목의 args를 보존한다(재설치가 이미 켠
