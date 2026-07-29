@@ -632,15 +632,15 @@ allowlist(`sandbox.BaseEnv()`)와 다른 환경에서 돈다. 그 탓에 `powers
 - **100해시 배치의 절대 보유 시간 검증** — 실 저장소 분포를 재현하는 픽스처나
   도그푸딩 저장소 기반 측정이 선행된다.
 - **`startupPurgeMaxHashes` 값 재조정** — D77 측정 결과가 입력이다.
-- **로컬 설치 산출물의 버전 마커 드리프트** — `.mcp.json`과
-  `.claude/settings.json`의 `__ctrManaged`가 `context-router/0.12.0`인데
-  `internal/buildinfo/buildinfo.go:11`의 `productVersion`은 **0.14.0**이다(v0.14.0
-  릴리스 커밋에서 올랐다). 둘 다 git 추적 대상이 아니므로 이 설계의 범위 밖이지만,
-  D64가 self-heal 대상으로 지목한 상태가 실제로 발생해 있다는 관측이다 — 릴리스 후
-  `hook install` 재실행이 절차에 없다. 이번 릴리스로 드리프트가 **두 마이너**로
-  벌어졌고(0.12.0 vs 0.14.0), 그 폭은 D64 self-heal의 근거를 약화하는 것이 아니라
-  **강화한다** — 절차가 없으면 간극은 릴리스마다 계속 벌어진다. 두 디렉터리가
-  **미추적이지 무시(ignore)는 아니라는** 점도 함께 남긴다.
+- **릴리스 후 `hook install` 재실행이 여전히 자동이 아니다**(관측 갱신 — 드리프트
+  자체는 해소됐다). v0.14.0 릴리스에서 **처음으로 태그 뒤 self-heal까지 한 세션 안에서
+  닫았고**, `doctor [9]`·`[16]`의 `__ctrManaged`가 0.14.0으로 갱신돼 이 문서가 앞서
+  기록했던 "0.12.0 vs 제품 0.14.0" 드리프트는 남아 있지 않다. **그러나 근본 갭은
+  그대로다** — 닫은 것은 절차이지 장치가 아니고, 그 절차는 사람이 기억해 실행해야 한다.
+  다음 릴리스에서 한 번 빠뜨리면 같은 간극이 다시 벌어진다. 자동화하려면 두 가지가
+  함께 필요하다: ① 릴리스 흐름이 설치 산출물의 마커를 검사·재기입하는 지점 ②
+  **Codex `config.toml` 마커 선행 확인의 자동화** — 아래 항목이 그 전제다.
+  두 디렉터리가 **미추적이지 무시(ignore)는 아니라는** 점도 함께 남긴다.
 - **`GOOS=darwin`·`GOOS=netbsd` 축의 1단계가 테스트 파일을 컴파일하지 않는다**
   (`ci.yml:159-164`) — `go build ./...`는 `_test.go`를 보지 않는데 golangci-lint는
   테스트 파일도 린트하고, `internal/sandbox/run_unix_test.go`(`!windows`)가 두 축
@@ -658,4 +658,31 @@ allowlist(`sandbox.BaseEnv()`)와 다른 환경에서 돈다. 그 탓에 `powers
   `PurgeOlderThan` 경로 측정 · doctor `[12]` 로그 로테이션 ·
   `ctr_batch_execute` 재도입(D58) · Windows AppContainer FS 제한(D59) · 타인
   배포 채널·MCP 설치 표준.
-- **이월 Minor** — 로컬 원장 `progress.md`의 잔여분.
+- **Codex `config.toml`의 마커 방식 교체**(session-40이 올렸으나 이 절에 옮겨지지
+  않았던 항목) — `# BEGIN/END context-router` **주석** 마커는 호스트가 파일을 TOML로
+  재직렬화할 때마다 밀린다. 2026-07-28 실측: Codex에서 `/hooks` 신뢰 승인을 하면 END
+  주석이 **파일 최하단으로 밀려** 그 사이에 사용자 테이블 **24개**가 들어갔고
+  (`[mcp_servers.node_repl]`·`[plugins.*]`·`[shell_environment_policy.set]`·
+  `[hooks.state]`의 신뢰 해시 13개 포함), 그 상태에서 `hook install --codex`를
+  실행했다면 `classifyMarkers`가 BEGIN/END 1쌍을 `classReplace`로 판정해 **그 사이를
+  통째로 교체·삭제**했을 것이다. v0.14.0 self-heal 때는 선행 확인으로 안전을 확인한 뒤
+  실행했고 재기입 후에도 마커가 제자리였다 — **확인이 통과했다는 것이지 방식이 안전하다는
+  뜻이 아니다.** 주석이 아니라 호스트 재직렬화에 견디는 표현으로 바꾸는 것이 근본 해결이고,
+  그것이 위 self-heal 자동화의 전제다.
+- **설계 문서가 `exec.go`를 줄 번호로 가리키는 관례**(v0.14 최종 리뷰가 "재발원"으로
+  지목) — 이 문서만 해도 `exec.go`를 `:187`·`:206`·`:258`·`:226-234`·`:278`·`:288`로
+  가리키는데, v0.14 한 번에 인용이 **두 번** 밀렸다(주석 한 줄 추가로 조건문이
+  `:187`→`:189`로 이동, 최종 fix wave가 다시 +4줄). 심볼 이름으로 가리키면 이 부류가
+  구조적으로 사라진다 — `exec_test.go`의 스코프 가드 주석이 이미 줄 번호 대신 테스트
+  이름을 쓰는 선례다. 기계적이고 회귀 위험이 없어 v0.15의 값싼 정리 후보다.
+- **`TestD78Limits`의 `fallback-throw-no-signal`이 파싱 실패를 가르지 못한다** —
+  그 단정은 `exitCode != 1`을 보는데 PowerShell은 미처리 `throw`와 ParserError·로드
+  실패에 **모두 1**을 낸다(v0.14 유도 FAIL이 파싱 불가 픽스처에서 `exit=1`을 실측했다).
+  즉 "스크립트가 파싱조차 안 됐다"까지는 닫히지 않는다. 본문이 `throw` 전에 표지를
+  stdout에 내고 그 표지를 함께 단정하면 닫힌다.
+- **이월 Minor** — v0.14 실행 중 리뷰가 남긴 비차단 항목들. 정본은 세션 기록
+  `docs/prompts/2026-07-28-session-42-v0.14-execution-pr.md`이며(로컬 원장
+  `progress.md`는 gitignored라 머신 이동 시 소실된다), 주요한 것은 `main.go`의 D77
+  문단이 `FailedFiles`를 열거하지 않는 것 · `exec_test.go`의 `t.Fatalf` 문면에 남은
+  "tail" 표현 · here-string 폴백 tail의 런타임 커버리지 상실(바이트 골든이 기전은
+  잠근다) · darwin 축 탐침이 타입 체크까지만 증명하고 linter 소견은 증명하지 않는 것.
