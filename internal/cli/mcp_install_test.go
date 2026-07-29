@@ -784,6 +784,8 @@ func TestHookInstallEnableFlag(t *testing.T) {
 		{"합집합", []string{"--enable", "ingest", "--enable-exec"}, []string{"--enable", "ingest,exec"}},
 		{"순서 무관", []string{"--enable-exec", "--enable", "net"}, []string{"--enable", "net,exec"}},
 		{"쉼표 목록", []string{"--enable", "net,ingest"}, []string{"--enable", "ingest,net"}},
+		// 공백뿐인 값은 진짜 빈 값과 같게 읽혀야 한다 — 그래야 첫 설치에서 기본 프로필이 선다.
+		{"공백뿐인 --enable", []string{"--enable", "   "}, []string{"--enable", "ingest,net"}},
 	}
 	for _, c := range cases {
 		proj := t.TempDir()
@@ -796,6 +798,22 @@ func TestHookInstallEnableFlag(t *testing.T) {
 			t.Errorf("%s: args=%v want %v", c.name, ours.Args, c.want)
 		}
 	}
+	// parseEnableProfiles는 TrimSpace로 공백뿐인 값을 비어있음 취급하는데 setProfile 판정이
+	// 원시 문자열을 보면 두 입력이 갈린다 — 명시 프로필이 없는데 setProfile=true가 되어
+	// 재설치가 이미 켜둔 프로필을 빈 집합으로 덮는다(리뷰 T7-F1). 그 피해를 직접 잰다.
+	reProj := t.TempDir()
+	var first, second bytes.Buffer
+	if err := runHookInstall([]string{"--enable", "exec"}, t.TempDir(), "", false, reProj, "0.15.0", &first); err != nil {
+		t.Fatalf("1차 install: %v", err)
+	}
+	if err := runHookInstall([]string{"--enable", "   "}, t.TempDir(), "", false, reProj, "0.15.0", &second); err != nil {
+		t.Fatalf("2차 install: %v", err)
+	}
+	reBytes, _ := os.ReadFile(mcpConfigPath(reProj))
+	if ours := mcpServersOf(t, reBytes)[ctrMCPServerName]; !slices.Equal(ours.Args, []string{"--enable", "exec"}) {
+		t.Errorf("공백뿐인 --enable이 기존 프로필을 덮었다: args=%v want [--enable exec]", ours.Args)
+	}
+
 	var out bytes.Buffer
 	err := runHookInstall([]string{"--enable", "bogus"}, t.TempDir(), "", false, t.TempDir(), "0.15.0", &out)
 	if err == nil {

@@ -567,7 +567,9 @@ func runHookInstall(args []string, storeRoot, storeRootRaw string, storeRootExpl
 	if *enableExec {
 		installProfiles = append(installProfiles, "exec")
 	}
-	setProfile := *enable != "" || *enableExec
+	// 공백뿐인 --enable은 parseEnableProfiles와 같게 비어있음으로 본다 — 원시 문자열을 비교하면
+	// 프로필이 빈 집합인데 setProfile=true가 되어 기존·은퇴 프로필을 덮는다(리뷰 T7-F1).
+	setProfile := strings.TrimSpace(*enable) != "" || *enableExec
 	if !setProfile {
 		installProfiles = defaultMCPProfiles // 기존 항목도 은퇴 항목도 없는 첫 설치에서만 쓰인다
 	}
