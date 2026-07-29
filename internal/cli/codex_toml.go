@@ -198,7 +198,10 @@ type codexSpan struct {
 // codexSpans — 두 관리 테이블의 구간. **서로 독립 구간**이다(D80): 인접해 있지 않아도 되고,
 // 사이에 사용자 테이블이 오면 그 테이블은 어느 구간에도 들지 않는다 — 두 테이블을 하나의
 // 연속 구간으로 다루면 그 사이 테이블이 삭제 범위에 든다.
-// dup은 같은 이름의 헤더가 둘 이상이라는 뜻이며, 그 자체가 TOML 중복 정의라 무변경으로 뺀다.
+// dup은 "구간 판정을 신뢰할 수 없다"는 뜻이다 — 같은 이름의 헤더가 둘 이상(그 자체가 TOML
+// 중복 정의)이거나, EOF에서 스캐너가 열려 있어(닫히지 않은 문자열·배열) 그 뒤 헤더가 경계로
+// 잡히지 않은 경우다. 둘 다 이미 무효 TOML이며 무변경으로 뺀다.
+// (이름이 두 사유를 함께 담는다 — 이 파일의 열거형 이름·주석 정리는 v0.16 X3에 묶었다.)
 type codexSpans struct {
 	table codexSpan
 	env   codexSpan
@@ -234,6 +237,13 @@ func codexManagedSpans(lines [][]byte) codexSpans {
 			}
 			out.env, cur = codexSpan{start: i, end: len(lines), found: true}, 1
 		}
+	}
+	// 유효 TOML이면 EOF에서 스캐너가 닫힌다 — 열려 있으면 닫히지 않은 문자열·배열이 있어 그 뒤
+	// 헤더가 경계로 잡히지 않았고 우리 구간이 EOF까지 늘어난 상태다. 그대로 기입하면 append한
+	// 헤더까지 그 구간에 삼켜져 재실행마다 테이블이 하나씩 늘고, 매 실행 Changed=true라 D84
+	// 단일 백업 슬롯이 2회차에 원본을 잃는다(적대적 리뷰 A2). 무변경 경로로 뺀다.
+	if sc.open() {
+		out.dup = true
 	}
 	return out
 }
@@ -741,7 +751,14 @@ func tomlInlineValue(s, key string) (value string, found bool) {
 		if v >= len(s) || s[v] != '"' {
 			return "", true
 		}
-		return s[v+1 : v+basicStringLen(s[v:])-1], true
+		// 미종료 문자열이면 basicStringLen이 len(s[v:])를 돌려주므로 하한과 닫힘을 함께 본다 —
+		// 없으면 s[v+1:v+len-1]이 역순 슬라이스로 패닉하고 internal/cli에 recover가 없어
+		// 프로세스가 죽는다(적대적 리뷰 A1). 이미 무효 TOML이니 tomlStringList·inlineMarkerSpan과
+		// 같은 "다루지 않는 형태"로 뺀다.
+		if vl := basicStringLen(s[v:]); vl >= 2 && s[v+vl-1] == '"' {
+			return s[v+1 : v+vl-1], true
+		}
+		return "", true
 	}
 	return "", false
 }

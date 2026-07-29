@@ -668,3 +668,44 @@ func TestCodexTableBodyPreservesUnownedKeys(t *testing.T) {
 		t.Errorf("빈 인라인 env + 후행 주석 처리가 후행 쉼표를 만들었다(TOML 금지):\n%s", cbody)
 	}
 }
+
+// A1(적대적 리뷰) — 인라인 env 대입이 표식 키의 여는 큰따옴표에서 끝나면 basicStringLen이
+// len(s)를 돌려주고 tomlInlineValue가 s[v+1:v+len-1]로 역순 슬라이스해 패닉했다. internal/cli에
+// recover가 없어 프로세스가 죽고, **읽기 전용인 doctor [20]까지 함께 죽었다.** 미종료 문자열은
+// 이미 무효 TOML이므로 tomlStringList·inlineMarkerSpan과 같은 "다루지 않는 형태"로 보낸다.
+func TestCodexUnterminatedInlineMarkerNoPanic(t *testing.T) {
+	cfg := []byte("[mcp_servers.ctr]\ncommand = \"context-router\"\nenv = { " + codexMarkerKey + " = \"\n")
+	// 세 진입점이 모두 tomlInlineValue를 탄다 — 하나라도 패닉하면 이 테스트가 죽는다.
+	res := installCodexConfigBlock(cfg, codexInstallRequest{
+		Profiles: defaultMCPProfiles, SetProfile: true, Marker: hookMarker("0.15.0"),
+	})
+	if res.Out == nil {
+		t.Error("install 산출이 nil")
+	}
+	uninstallCodexConfigBlock(cfg)
+	probeCodexMCPBlock(cfg)
+	// 키는 있고 값이 다루지 않는 형태이면 ("", true)가 기존 계약이다(비문자열 표식과 같다) —
+	// 요점은 그 값이 소유로 읽히지 않는 것이다.
+	if marker, _, found := codexConfigMarker(cfg); found && isOurMarkerValue(marker) {
+		t.Errorf("미종료 문자열을 우리 표식으로 읽었다: %q", marker)
+	}
+}
+
+// A2(적대적 리뷰) — 우리 구간 안에 닫히지 않은 '['가 있으면 스캐너 열림이 EOF까지 유지돼
+// 그 뒤 헤더가 경계로 잡히지 않고, 우리가 append한 [mcp_servers.ctr] 헤더까지 그 구간에
+// 삼켜져 재실행마다 같은 테이블이 하나씩 붙었다(실측 1→2→3). 매 실행 Changed=true라
+// D84 단일 백업 슬롯이 2회차에 원본을 잃는다. 입력이 이미 무효 TOML이므로 무변경으로 닫는다.
+func TestCodexUnclosedBracketFailsClosed(t *testing.T) {
+	cfg := []byte("[mcp_servers.ctr.env]\n" + codexMarkerKey + " = \"context-router/0.15.0\"\nLIST = [\n")
+	req := codexInstallRequest{Profiles: defaultMCPProfiles, SetProfile: true, Marker: hookMarker("0.15.0")}
+	res := installCodexConfigBlock(cfg, req)
+	if res.Changed {
+		t.Errorf("닫히지 않은 대괄호 파일을 바꿨다(state=%d):\n%s", res.State, res.Out)
+	}
+	if n := bytes.Count(res.Out, []byte("[mcp_servers.ctr]")); n != 0 {
+		t.Errorf("무효 TOML에 관리 테이블 헤더를 붙였다: %d개\n%s", n, res.Out)
+	}
+	if !bytes.Equal(res.Out, cfg) {
+		t.Errorf("무변경이어야 하는데 바이트가 달라졌다:\n%s", res.Out)
+	}
+}
