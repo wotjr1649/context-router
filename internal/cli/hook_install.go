@@ -479,6 +479,24 @@ func shadowOffGetenv(k string) string {
 	return os.Getenv(k)
 }
 
+// parseEnableProfiles — --enable의 쉼표 구분 목록을 프로필 집합으로 판다(D81). 모르는 이름은
+// 오류다 — 조용히 떨어뜨리면 사용자가 프로필이 켜졌다고 오인한다. 오류 문면에 입력 원문을
+// 담지 않는다(규약 §6 — 사용자 입력 에코 금지).
+func parseEnableProfiles(raw string) ([]string, error) {
+	if strings.TrimSpace(raw) == "" {
+		return nil, nil
+	}
+	var out []string
+	for _, name := range strings.Split(raw, ",") {
+		name = strings.TrimSpace(name)
+		if !slices.Contains(mcpProfileNames, name) {
+			return nil, fmt.Errorf("hook install: --enable에 모르는 프로필 이름이 있습니다(가능: %s)", strings.Join(mcpProfileNames, ","))
+		}
+		out = append(out, name)
+	}
+	return out, nil
+}
+
 // runHookInstall — install 서브커맨드(설계 §7). --user/--no-shadow/--enable-exec/--codex를 자체
 // flagset으로 파싱한다(--root/--store-root는 main의 prescanRootFlags가 이미 소비·전달 —
 // storeRootExplicit/Raw). Claude 경로는 훅 병합에 이어 .mcp.json 등록과 승인 키까지 다룬다(D64) —
@@ -488,7 +506,8 @@ func runHookInstall(args []string, storeRoot, storeRootRaw string, storeRootExpl
 	fs.SetOutput(io.Discard)
 	user := fs.Bool("user", false, "~/.claude/settings.json에 등록(기본: 프로젝트)")
 	noShadow := fs.Bool("no-shadow", false, "Shadow Recall 비활성(훅 명령에 --no-shadow 주입)")
-	enableExec := fs.Bool("enable-exec", false, ".mcp.json 항목에 exec 프로필(--enable exec)을 켠다")
+	enableExec := fs.Bool("enable-exec", false, "exec 프로필을 켠다(--enable exec와 같다)")
+	enable := fs.String("enable", "", "등록물에 실을 프로필 목록(쉼표 구분: ingest,net,exec)")
 	codex := fs.Bool("codex", false, "Codex CLI hooks.json에 등록(기본: Claude settings.json)")
 	if err := fs.Parse(args); err != nil {
 		return fmt.Errorf("hook install: 플래그 파싱 실패: %w", err)
@@ -496,16 +515,27 @@ func runHookInstall(args []string, storeRoot, storeRootRaw string, storeRootExpl
 	if rest := fs.Args(); len(rest) > 0 {
 		return fmt.Errorf("hook install: 예상치 않은 인자 %d개", len(rest))
 	}
-	// Task 7이 --enable 플래그를 더하기 전의 최소 배선: --enable-exec만 프로필로 환원한다.
-	var installProfiles []string
-	if *enableExec {
-		installProfiles = []string{"exec"}
+	// 프로필 입력(D81): --enable과 --enable-exec을 함께 지정하면 결과는 합집합이고 지정
+	// 순서는 결과를 바꾸지 않는다(canonicalProfiles가 mcpProfileNames 순서로 정규화한다).
+	// setProfile은 "명시 플래그가 있었는가"이며, 없으면 mergeMCPServers·installCodexConfigBlock이
+	// 기존 항목의 프로필을 그대로 유지한다(재설치가 이미 켠 프로필을 끄지 않는다).
+	installProfiles, enableErr := parseEnableProfiles(*enable)
+	if enableErr != nil {
+		return enableErr
 	}
+	if *enableExec {
+		installProfiles = append(installProfiles, "exec")
+	}
+	setProfile := *enable != "" || *enableExec
+	if !setProfile {
+		installProfiles = defaultMCPProfiles // 기존 항목도 은퇴 항목도 없는 첫 설치에서만 쓰인다
+	}
+	installProfiles = canonicalProfiles(installProfiles)
 	// D81 — --codex × --enable-exec 상호 배제를 제거한다. 그 검사의 사유 둘이 모두 해소됐다:
 	// ① --codex가 .mcp.json을 만들지 않는다 → 프로필이 Codex 관리 테이블에도 실리므로 반영될
 	// 자리가 생겼다. ② 관리 블록의 도구 목록이 고정이다 → enabled_tools가 args와 함께 조립된다.
 	if *codex {
-		return runHookInstallCodex(*user, *noShadow, storeRootExplicit, storeRootRaw, projectRoot, version, installProfiles, *enableExec, stdout)
+		return runHookInstallCodex(*user, *noShadow, storeRootExplicit, storeRootRaw, projectRoot, version, installProfiles, setProfile, stdout)
 	}
 	path, err := hookSettingsPath(*user, projectRoot)
 	if err != nil {
@@ -540,10 +570,10 @@ func runHookInstall(args []string, storeRoot, storeRootRaw string, storeRootExpl
 			Command: hookBinaryName, Args: mcpArgsForProfiles(installProfiles),
 			AlwaysLoad: true, Managed: hookMarker(version),
 		}
-		// setProfile=*enableExec: 플래그가 없으면 기존 항목의 args를 보존한다(재설치가 이미 켠
-		// exec를 끄지 않는다). 마커는 setProfile과 무관하게 항상 갱신된다(self-heal).
-		// changed는 install 경로에서 항상 true라 쓰지 않는다(마커 self-heal이 무변경을 배제한다).
-		mcpMerged, _, mergeErr := mergeMCPServers(existing, ctrMCPServerName, entry, true, *enableExec)
+		// setProfile=명시 플래그 유무: 플래그가 없으면 기존 항목의 args를 보존하고(재설치가
+		// 이미 켠 프로필을 끄지 않는다), 우리 이름에 기존 항목이 없을 때만 은퇴 항목의 것을
+		// 이월한다. 둘 다 없는 첫 설치에서만 위 기본 프로필이 실린다(D81 우선순위).
+		mcpMerged, _, mergeErr := mergeMCPServers(existing, ctrMCPServerName, entry, true, setProfile)
 		if mergeErr != nil {
 			// 실패 사유는 둘뿐이다 — 우리 이름 자리에 우리 소유가 아닌 항목이 있거나(소유 관문),
 			// 파일이 해석되지 않거나. 어느 쪽이든 사용자가 손댈 대상을 알려야 조치할 수 있다.

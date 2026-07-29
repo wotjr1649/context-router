@@ -238,13 +238,19 @@ func mergeMCPServers(existing []byte, name string, entry mcpServerEntry, install
 		if entry.Args == nil {
 			entry.Args = []string{} // "args": [] 고정 — nil은 null로 나가 멱등 비교가 흔들린다
 		}
-		retiredArgs, _ := retireSupersededMCPServers(servers, name)
+		retiredArgs, retired := retireSupersededMCPServers(servers, name)
 		// 은퇴시키는 항목의 프로필은 우리 이름으로 이월한다 — 우리 이름에 기존 항목이 없으면
 		// 그 항목이 사용자가 켜 둔 프로필의 유일한 근거이고, 지우면서 이월하지 않으면 재설치가
 		// 도구를 조용히 줄인 뒤 "병합 완료"만 보고한다. 우선순위는 위 args 유지 규칙과 같다:
 		// 명시 플래그(setProfile) > 우리 이름의 기존 항목(prevExists) > 은퇴 항목.
-		if !prevExists && !setProfile && len(retiredArgs) > 0 {
+		// 조건은 **args 길이가 아니라 항목의 존재**다(D81) — 은퇴 항목의 args가 비어 있으면
+		// "빈 프로필"이 사용자의 상태이고, 길이로 재면 그 상태가 기본 프로필로 넓어져
+		// "기존 항목도 은퇴 항목도 없는 첫 설치에서만 기본 프로필"이라는 규칙이 깨진다.
+		if !prevExists && !setProfile && retired {
 			entry.Args = retiredArgs
+			if entry.Args == nil {
+				entry.Args = []string{} // "args": [] 고정 — 위 nil 정규화와 같은 이유
+			}
 		}
 		b, err := json.Marshal(entry)
 		if err != nil {

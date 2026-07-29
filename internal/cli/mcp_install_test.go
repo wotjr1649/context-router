@@ -172,6 +172,23 @@ func TestMergeMCPServersCarriesSupersededProfile(t *testing.T) {
 	if ours := mcpServersOf(t, out3)[ctrMCPServerName]; len(ours.Args) != 0 {
 		t.Errorf("우리 이름의 기존 항목보다 대체 항목을 우선했다: %v", ours.Args)
 	}
+
+	// 은퇴 항목의 args가 **비어 있어도** 그 항목의 존재가 이월 근거다(D81). 길이로 재면 빈
+	// 프로필이 기본 프로필로 넓어져 "기존 항목도 은퇴 항목도 없는 첫 설치에서만 기본 프로필"
+	// 이라는 우선순위가 깨진다 — 재설치가 사용자가 끈 프로필을 조용히 다시 켜는 경로다.
+	// def는 무플래그 설치가 실제로 넘기는 entry다(기본 프로필이 실려 있다).
+	def := mcpServerEntry{
+		Command: hookBinaryName, Args: mcpArgsForProfiles(defaultMCPProfiles),
+		AlwaysLoad: true, Managed: hookMarker("0.15.0"),
+	}
+	emptyRetired := `{"mcpServers":{"ctr":{"command":"context-router","args":[]}}}`
+	out4, _, err := mergeMCPServers([]byte(emptyRetired), ctrMCPServerName, def, true, false)
+	if err != nil {
+		t.Fatalf("merge(빈 은퇴 args): %v", err)
+	}
+	if ours := mcpServersOf(t, out4)[ctrMCPServerName]; len(ours.Args) != 0 {
+		t.Errorf("빈 프로필의 은퇴 항목을 기본 프로필로 넓혔다: %v", ours.Args)
+	}
 }
 
 // TestMergeMCPServersKeepsExplicitAlwaysLoad: 항목에 명시된 alwaysLoad는 재설치가 덮지 않는다 —
@@ -653,8 +670,16 @@ func TestHookInstallWritesMCPConfig(t *testing.T) {
 	if ours.Managed != hookMarker("0.12.0") || !ours.AlwaysLoad {
 		t.Errorf("마커·상시 로드 불일치: %+v", ours)
 	}
-	if len(ours.Args) != 0 {
-		t.Errorf("플래그 없는 설치인데 프로필이 붙었다: %v", ours.Args)
+	// D81 — 플래그 없는 첫 설치는 기본 프로필 ingest,net을 싣는다(B1이 잡은 미등록의 원인이
+	// 기본값이었다). exec는 명시 opt-in이라 여기 들지 않는다(D58·D59·D64).
+	// exec 부재는 **원소 일치가 아니라 부분 문자열**로 본다 — args는 항상
+	// ["--enable", "<쉼표 목록>"] 형태라 exec가 단독 원소로 나올 수 없고,
+	// slices.Contains(ours.Args, "exec")는 어떤 회귀에도 걸리지 않는다.
+	if !slices.Equal(ours.Args, []string{"--enable", "ingest,net"}) {
+		t.Errorf("기본 프로필이 실리지 않았다: %v", ours.Args)
+	}
+	if strings.Contains(strings.Join(ours.Args, ","), "exec") {
+		t.Errorf("무플래그 설치에 exec가 실렸다: %v", ours.Args)
 	}
 
 	// 아무 스코프도 enabledMcpjsonServers를 정의하지 않았으므로 설치 스코프에 직접 써야 한다.
@@ -742,6 +767,42 @@ func TestHookInstallKeepsExecProfileWithoutFlag(t *testing.T) {
 	ours := mcpServersOf(t, b)[ctrMCPServerName]
 	if !slices.Equal(ours.Args, []string{"--enable", "exec"}) {
 		t.Errorf("exec 프로필이 재설치에서 꺼졌다: %v", ours.Args)
+	}
+}
+
+// TestHookInstallEnableFlag — D81 프로필 입력 플래그. --enable은 쉼표 구분 목록을 받고,
+// --enable-exec과 함께 지정하면 결과는 **합집합**이다(지정 순서는 결과를 바꾸지 않는다).
+// 모르는 이름은 조용히 떨어뜨리지 않고 오류로 낸다 — 조용히 무시하면 사용자가 프로필이
+// 켜졌다고 오인한다(제거된 상호 배제 검사가 들던 사유와 같다).
+func TestHookInstallEnableFlag(t *testing.T) {
+	cases := []struct {
+		name string
+		args []string
+		want []string
+	}{
+		{"--enable 단독", []string{"--enable", "ingest"}, []string{"--enable", "ingest"}},
+		{"합집합", []string{"--enable", "ingest", "--enable-exec"}, []string{"--enable", "ingest,exec"}},
+		{"순서 무관", []string{"--enable-exec", "--enable", "net"}, []string{"--enable", "net,exec"}},
+		{"쉼표 목록", []string{"--enable", "net,ingest"}, []string{"--enable", "ingest,net"}},
+	}
+	for _, c := range cases {
+		proj := t.TempDir()
+		var out bytes.Buffer
+		if err := runHookInstall(c.args, t.TempDir(), "", false, proj, "0.15.0", &out); err != nil {
+			t.Fatalf("%s: install: %v", c.name, err)
+		}
+		b, _ := os.ReadFile(mcpConfigPath(proj))
+		if ours := mcpServersOf(t, b)[ctrMCPServerName]; !slices.Equal(ours.Args, c.want) {
+			t.Errorf("%s: args=%v want %v", c.name, ours.Args, c.want)
+		}
+	}
+	var out bytes.Buffer
+	err := runHookInstall([]string{"--enable", "bogus"}, t.TempDir(), "", false, t.TempDir(), "0.15.0", &out)
+	if err == nil {
+		t.Fatalf("모르는 프로필 이름을 받아들였다: %s", out.String())
+	}
+	if strings.Contains(err.Error(), "bogus") {
+		t.Errorf("오류가 사용자 입력을 에코했다: %v", err)
 	}
 }
 
