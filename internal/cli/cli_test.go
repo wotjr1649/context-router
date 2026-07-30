@@ -2395,6 +2395,33 @@ func TestDoctorCodexMCPLine(t *testing.T) {
 			},
 			wantContain: []string{"[16] warning:", "수동 확인"},
 		},
+		// 아래 셋은 D85의 **사유 인쇄** 감시선이다. ⑤는 "수동 확인"만 보므로 사유가 실리지 않는
+		// 옛 문면에서도 통과한다 — 사유마다 필요한 조치가 다르다는 것이 D85의 요구다.
+		{
+			name: "⑥ 이상 — 중복 헤더 사유",
+			setup: func(t *testing.T, codexHome, projectRoot string) {
+				write(t, filepath.Join(codexHome, "config.toml"), []byte("[mcp_servers.ctr]\n[x]\n[mcp_servers.ctr]\n"))
+			},
+			wantContain: []string{"테이블=이상", "헤더가 둘 이상"},
+		},
+		{
+			name: "⑦ 이상 — 정규화 불가 키 사유",
+			setup: func(t *testing.T, codexHome, projectRoot string) {
+				write(t, filepath.Join(codexHome, "config.toml"), []byte("[mcp_servers.ctr]\n\"comm\\u0061nd\" = \"x\"\n"))
+			},
+			wantContain: []string{"테이블=이상", "이스케이프 표기"},
+		},
+		{
+			// wantAbsent가 F6의 감시선이다 — 이 파일은 헤더가 **하나뿐**이므로 "하나만 남기고
+			// 지우세요"는 존재하지 않는 조치를 지시한다. 구간 밖 충돌을 중복 헤더로 접으면 물린다.
+			name: "⑧ 구간 밖 충돌 — 그 상태에 맞는 사유",
+			setup: func(t *testing.T, codexHome, projectRoot string) {
+				write(t, filepath.Join(codexHome, "config.toml"),
+					[]byte("[mcp_servers.ctr]\ncommand = \"context-router\"\n[mcp_servers.ctr.tools.ctr_execute]\napproval_mode = \"never\"\n"))
+			},
+			wantContain: []string{"테이블=이상", "관리 테이블 밖에"},
+			wantAbsent:  []string{"헤더가 둘 이상"},
+		},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

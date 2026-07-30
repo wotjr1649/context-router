@@ -49,7 +49,29 @@ const (
 	anomalyDupHeader                       // 같은 이름의 관리 테이블 헤더가 둘 이상(그 자체가 TOML 중복 정의)
 	anomalyScannerOpen                     // EOF에서 스캐너가 열림(닫히지 않은 문자열·배열)
 	anomalyEscapedKey                      // 우리 구간 안에 정규화 불가 키 표기(D87) — 이스케이프를 해석하지 않으므로 무변경
+	// anomalyOutsideConflict — 우리 두 구간 **밖**의 중복 정의 신호. 구간 판정은 **성공**했으므로
+	// 이것은 구간 판정 사유가 아니라 별개 상태다: codexSpans.anomaly에는 들어가지 않고
+	// probeCodexMCPBlock만 만든다.
+	anomalyOutsideConflict
 )
+
+// reason — 사용자 문면에 실을 사유(D85). 사유마다 **다른 조치**가 필요하므로 문면이 달라야
+// 한다: 중복 헤더는 사용자가 하나를 지우면 되고, 스캐너 열림은 닫히지 않은 문자열·배열을
+// 닫아야 하며, 정규화 불가 키는 이스케이프 표기를 보통 표기로 바꿔야 한다.
+// anomalyNone은 빈 문자열이다 — 호출자가 그 갈래에서 사유를 인쇄하지 않는다.
+func (a codexAnomaly) reason() string {
+	switch a {
+	case anomalyDupHeader:
+		return "관리 테이블 헤더가 둘 이상입니다(TOML 중복 정의) — 하나만 남기고 지우세요"
+	case anomalyScannerOpen:
+		return "파일 끝에서 여러 줄 문자열 또는 배열이 닫히지 않았습니다 — 닫은 뒤 재실행하세요"
+	case anomalyEscapedKey:
+		return "관리 테이블 안의 키가 이스케이프 표기로 적혀 있습니다 — 보통 표기(예: command)로 바꾸세요"
+	case anomalyOutsideConflict:
+		return "관리 테이블 밖에 ctr 관련 정의가 있습니다 — doctor 스니펫으로 수동 정리한 뒤 재실행하세요"
+	}
+	return ""
+}
 
 // splitLinesKeepEnds — 종결자 보존 라인 분해(CRLF 보존 계약). 각 라인은 자신의 "\n"/"\r\n"을
 // 포함하며, 마지막 라인은 종결자 없이 끝날 수 있다.
@@ -675,16 +697,19 @@ func installCodexConfigBlock(existing []byte, req codexInstallRequest) codexInst
 // 우선순위는 installCodexConfigBlock과 1:1이다 — 중복 정의 > 구간 밖 충돌 > 테이블 존재.
 // 소유 여부는 보지 않는다: 우리 이름 자리에 남의 항목이 있어도 "그 이름의 등록은 있다"가
 // 맞고, install은 그 상태를 mcpExistingHeader로 따로 보고한다.
-func probeCodexMCPBlock(existing []byte) (present bool, anomaly bool) {
+// anomaly는 불리언이 아니라 **사유**다(D85) — [16]이 사용자에게 조치를 지목해야 한다. 구간 밖
+// 충돌은 사유가 아니라 별개 상태이므로 anomalyDupHeader로 접지 않고 그대로 둔다: 접으면 헤더가
+// 하나뿐인 파일에 "하나만 남기고 지우세요"라는 존재하지 않는 조치를 지시한다.
+func probeCodexMCPBlock(existing []byte) (present bool, anomaly codexAnomaly) {
 	lines := splitLinesKeepEnds(existing)
 	sp := codexManagedSpans(lines)
 	if sp.anomaly != anomalyNone {
-		return false, true
+		return false, sp.anomaly
 	}
 	if scanOutsideSpans(lines, sp) {
-		return false, true
+		return false, anomalyOutsideConflict
 	}
-	return sp.table.found, false
+	return sp.table.found, anomalyNone
 }
 
 // appendBlock — 계약 4: 빈 파일은 블록만; 그 외 EOF 개행 정규화 후 구분 빈 줄 1개+블록.

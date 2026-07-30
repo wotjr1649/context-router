@@ -740,7 +740,10 @@ func runHookInstallCodex(user, noShadow, storeRootExplicit bool, storeRootRaw, p
 	if err := atomicWriteFile(path, merged); err != nil {
 		return errors.New("hook install: 설정 쓰기 실패")
 	}
-	reportCodexMCPState(stdout, res.State)
+	// installCodexConfigBlock은 상태만 돌려주므로 구간 사유를 따로 읽는다 — 순수 함수의 재호출로
+	// 부작용이 없고, res.State가 mcpMarkerAnomaly가 아닌 갈래에서는 쓰이지 않는다.
+	_, cfgAnomaly := probeCodexMCPBlock(cfgExisting)
+	reportCodexMCPState(stdout, res.State, cfgAnomaly)
 	if res.State == mcpWritten {
 		// D81 — 승인 모드 키는 기입하지 않는다. 예전에는 관리 블록의 주석 한 줄로 권했으나
 		// 재직렬화가 주석을 지우므로(§3 표1) 파일에 남지 않는 안내는 안내가 아니다. 기입이
@@ -773,7 +776,9 @@ func runHookInstallCodex(user, noShadow, storeRootExplicit bool, storeRootRaw, p
 
 // reportCodexMCPState — config.toml 병합 결과 상태별 안내(스펙 §3). 확정(written/existingHeader)은
 // 정보성, 미확정(conflict/markerAnomaly)은 수동 조치 안내 — 가드 등록 보류 사유를 명시한다.
-func reportCodexMCPState(stdout io.Writer, state codexMCPState) {
+// markerAnomaly는 codexAnomaly의 어느 사유로도 도달하므로 안내에 **그 사유**를 싣는다(D85):
+// 중복 헤더 정리만 지시하면 사유가 다른 사용자는 install이 영구 무변경인 이유를 알 수 없다.
+func reportCodexMCPState(stdout io.Writer, state codexMCPState, anomaly codexAnomaly) {
 	switch state {
 	case mcpWritten:
 		fmt.Fprintln(stdout, "hook install (codex): MCP 관리 테이블 기입 완료 — Codex 재시작 시 반영")
@@ -782,7 +787,7 @@ func reportCodexMCPState(stdout io.Writer, state codexMCPState) {
 	case mcpConflict:
 		fmt.Fprintln(stdout, "hook install (codex): config.toml에 ctr 관련 흔적 감지 — MCP 기입·가드 등록 보류. doctor 스니펫으로 수동 등록 후 재실행하세요")
 	case mcpMarkerAnomaly:
-		fmt.Fprintln(stdout, "hook install (codex): 관리 테이블 중복 정의 — config.toml 무변경·가드 등록 보류. 중복 헤더 정리 후 재실행하세요")
+		fmt.Fprintf(stdout, "hook install (codex): config.toml 무변경·가드 등록 보류 — %s\n", anomaly.reason())
 	}
 }
 

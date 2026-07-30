@@ -1914,9 +1914,9 @@ func runDoctor(ctx context.Context, w io.Writer, storeRoot, projectRoot, version
 		default:
 			present, anomaly := probeCodexMCPBlock(cfgData)
 			switch {
-			case anomaly: // 분기⑤
+			case anomaly != anomalyNone: // 분기⑤
 				fmt.Fprintf(w, "[16] codex: [mcp_servers.ctr] 테이블=이상 (hooks: project=%s user=%s)\n", projScope, userScope)
-				fmt.Fprintln(w, "[16] warning: 관리 테이블 중복 정의/키-경계 충돌 — 수동 확인 필요(hook install --codex 안내 참조)")
+				fmt.Fprintf(w, "[16] warning: %s — 수동 확인 필요(hook install --codex 안내 참조)\n", anomaly.reason())
 			case present: // 분기④
 				fmt.Fprintf(w, "[16] codex: [mcp_servers.ctr] 테이블=존재 (hooks: project=%s user=%s)\n", projScope, userScope)
 			case markerPresent: // 분기② — 소멸 시그니처

@@ -360,25 +360,29 @@ func TestProbeCodexMCPBlock(t *testing.T) {
 		name    string
 		in      string
 		present bool
-		anomaly bool
+		anomaly codexAnomaly
 	}{
-		{"빈 파일 — 부재", "", false, false},
-		{"관리 테이블 존재", ctrTableFixture, true, false},
-		{"표식 없는 우리 테이블도 존재", "[mcp_servers.ctr]\ncommand = \"context-router\"\n", true, false},
-		{"사용자 소유 테이블도 존재로 본다", "[mcp_servers.ctr]\ncommand = \"old\"\n", true, false},
-		{"무관 내용 — 부재", "[model]\nname = \"gpt\"\n", false, false},
-		{"관리 테이블 중복 정의 — 이상", "[mcp_servers.ctr]\n[x]\n[mcp_servers.ctr]\n", false, true},
+		{"빈 파일 — 부재", "", false, anomalyNone},
+		{"관리 테이블 존재", ctrTableFixture, true, anomalyNone},
+		{"표식 없는 우리 테이블도 존재", "[mcp_servers.ctr]\ncommand = \"context-router\"\n", true, anomalyNone},
+		{"사용자 소유 테이블도 존재로 본다", "[mcp_servers.ctr]\ncommand = \"old\"\n", true, anomalyNone},
+		{"무관 내용 — 부재", "[model]\nname = \"gpt\"\n", false, anomalyNone},
+		{"관리 테이블 중복 정의 — 이상", "[mcp_servers.ctr]\n[x]\n[mcp_servers.ctr]\n", false, anomalyDupHeader},
 		// 충돌 줄은 픽스처 **앞**에 둔다 — 뒤에 두면 [mcp_servers.ctr.env] 구간이 다음 테이블
 		// 헤더가 없어 EOF까지 뻗으므로 그 줄이 우리 구간 안이 되고, scanOutsideSpans가 건너뛰어
-		// (true,false)가 나온다. 구간 밖 신호를 재려면 구간 밖에 두어야 한다.
-		{"구간 밖 충돌 — 이상", "mcp_servers = { ctr = { command = \"other\" } }\n" + ctrTableFixture, false, true},
-		{"ctr-exec만 있으면 부재", "[mcp_servers.ctr-exec]\ncommand = \"context-router\"\n", false, false},
+		// (true,anomalyNone)이 나온다. 구간 밖 신호를 재려면 구간 밖에 두어야 한다.
+		{"구간 밖 충돌 — 구간 판정 사유가 아닌 별개 상태", "mcp_servers = { ctr = { command = \"other\" } }\n" + ctrTableFixture, false, anomalyOutsideConflict},
+		{"ctr-exec만 있으면 부재", "[mcp_servers.ctr-exec]\ncommand = \"context-router\"\n", false, anomalyNone},
+		// codexManagedSpans의 **우선순위 절** 감시선(이월 T1 리뷰 Minor): 중복 헤더와 EOF 스캐너
+		// 열림을 한 입력에 담는다. 사유가 문면에 실리는 지금부터 뒤바뀐 사유는 사용자에게 틀린
+		// 조치를 지시하므로, sc.open() 갈래의 `out.anomaly == anomalyNone` 절을 지우면 여기서 물린다.
+		{"중복 헤더와 스캐너 열림 — 앞 사유를 유지한다", "[mcp_servers.ctr]\n[x]\n[mcp_servers.ctr]\nk = \"\"\"\nunclosed\n", false, anomalyDupHeader},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			p, a := probeCodexMCPBlock([]byte(c.in))
 			if p != c.present || a != c.anomaly {
-				t.Errorf("present=%v anomaly=%v want %v/%v", p, a, c.present, c.anomaly)
+				t.Errorf("present=%v anomaly=%d want %v/%d", p, a, c.present, c.anomaly)
 			}
 		})
 	}
@@ -881,12 +885,33 @@ func TestCodexEscapedManagedKey(t *testing.T) {
 			if out, changed := uninstallCodexConfigBlock([]byte(c.src)); changed || !bytes.Equal(out, []byte(c.src)) {
 				t.Errorf("uninstall이 무변경이 아니다: changed=%v", changed)
 			}
-			if present, anomaly := probeCodexMCPBlock([]byte(c.src)); present || !anomaly {
-				t.Errorf("probe present=%v anomaly=%v want false/true", present, anomaly)
+			// probe는 구간 사유를 **그대로** 넘긴다(D85) — 기대값을 c.want로 쓴다. 여기에 특정
+			// 사유를 하드코딩하면 "앞 사유를 유지한다" 케이스(중복 헤더)가 물지 않는다.
+			if present, anomaly := probeCodexMCPBlock([]byte(c.src)); present || anomaly != c.want {
+				t.Errorf("probe present=%v anomaly=%d want false/%d", present, anomaly, c.want)
 			}
 			if _, _, found := codexConfigMarker([]byte(c.src)); found {
 				t.Errorf("codexConfigMarker found=true — 이상 파일에서 판독이 성립했다")
 			}
 		})
+	}
+}
+
+// TestCodexAnomalyReason — 세 사유가 서로 다른 문면을 준다(§2-7). 같은 문면이면 사용자는
+// install이 영구 무변경인 이유를 구별할 수 없다.
+func TestCodexAnomalyReason(t *testing.T) {
+	seen := map[string]codexAnomaly{}
+	for _, a := range []codexAnomaly{anomalyDupHeader, anomalyScannerOpen, anomalyEscapedKey} {
+		r := a.reason()
+		if r == "" {
+			t.Errorf("anomaly=%d의 사유 문면이 비었다", a)
+		}
+		if prev, dup := seen[r]; dup {
+			t.Errorf("anomaly=%d와 %d의 사유 문면이 같다: %q", prev, a, r)
+		}
+		seen[r] = a
+	}
+	if anomalyNone.reason() != "" {
+		t.Errorf("anomalyNone의 사유 문면이 비어 있지 않다: %q", anomalyNone.reason())
 	}
 }

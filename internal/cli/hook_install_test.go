@@ -1318,6 +1318,42 @@ func TestRunHookInstallCodexNotices(t *testing.T) {
 	}
 }
 
+// TestHookInstallCodexAnomalyReason — 이상 사유가 설치기 안내에 실린다(§2-7). 사유가 다른
+// 파일에서 중복 헤더 정리만 지시하면 사용자는 install이 무변경인 이유를 알 수 없다.
+func TestHookInstallCodexAnomalyReason(t *testing.T) {
+	cases := []struct {
+		name string
+		cfg  string
+		want string
+	}{
+		{"중복 헤더", "[mcp_servers.ctr]\n[x]\n[mcp_servers.ctr]\n", "헤더가 둘 이상"},
+		{"스캐너 열림", "[mcp_servers.ctr]\nk = \"\"\"\nunclosed\n", "닫히지 않았습니다"},
+		{"이스케이프 키", "[mcp_servers.ctr]\n\"comm\\u0061nd\" = \"x\"\n", "이스케이프 표기"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			codexHome := t.TempDir()
+			t.Setenv("CODEX_HOME", codexHome)
+			cfgPath := filepath.Join(codexHome, "config.toml")
+			write(t, cfgPath, []byte(c.cfg))
+			var out bytes.Buffer
+			if err := runHookInstallCodex(true, false, false, "", t.TempDir(), "0.16.0", nil, false, &out); err != nil {
+				t.Fatalf("runHookInstallCodex: %v", err)
+			}
+			if !strings.Contains(out.String(), c.want) {
+				t.Errorf("안내에 %q 없음:\n%s", c.want, out.String())
+			}
+			after, rErr := os.ReadFile(cfgPath)
+			if rErr != nil {
+				t.Fatal(rErr)
+			}
+			if string(after) != c.cfg {
+				t.Errorf("config.toml이 바뀌었다:\n%s", after)
+			}
+		})
+	}
+}
+
 // TestDropsLastSeenUTC — D71: 사유별 마지막 발생 시각을 UTC 날짜로 병기한다. 역순 ts가 섞여도
 // 최댓값을 쓰고(로그가 시간순임을 가정하지 않는다), 정수 변환에 실패한 ts는 집계만 하고 병기를
 // 생략하며, unparsed에는 ts가 없으므로 병기하지 않는다.
