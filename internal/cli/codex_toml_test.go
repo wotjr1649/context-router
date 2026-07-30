@@ -754,3 +754,118 @@ func TestCodexMarkerInsideMultilineStringNotOwned(t *testing.T) {
 		t.Errorf("uninstall이 미소유 테이블을 지웠다:\n%s", out)
 	}
 }
+
+// TestCodexEscapedManagedKey — D87(§2-6). 관리 키의 유니코드 이스케이프 표기는 TOML이 우리
+// 키와 **같은 키**로 읽으므로, 알아보지 못한 채 정규 키를 새로 기입하면 같은 논리 키가 두 번
+// 정의된다. 무변경으로 닫는다. 대상은 **키 토큰**뿐이다 — 값의 역슬래시(Windows 경로)가
+// 걸리면 그 사용자의 install이 영구 동결된다.
+func TestCodexEscapedManagedKey(t *testing.T) {
+	cases := []struct {
+		name string
+		src  string
+		want codexAnomaly
+	}{
+		{
+			name: "서브테이블 키의 이스케이프 표기 — 이상",
+			src:  "[mcp_servers.ctr]\n\"comm\\u0061nd\" = \"other\"\n",
+			want: anomalyEscapedKey,
+		},
+		{
+			name: "env 서브테이블 표식 키의 이스케이프 표기 — 이상",
+			src:  "[mcp_servers.ctr]\ncommand = \"context-router\"\n[mcp_servers.ctr.env]\n\"CTR_MAN\\u0041GED\" = \"context-router\"\n",
+			want: anomalyEscapedKey,
+		},
+		{
+			name: "인라인 env 안의 표식 키 이스케이프 표기 — 이상",
+			src:  "[mcp_servers.ctr]\ncommand = \"context-router\"\nenv = { \"CTR_MAN\\u0041GED\" = \"context-router\" }\n",
+			want: anomalyEscapedKey,
+		},
+		{
+			name: "값의 역슬래시(Windows 경로) — 이상 아님",
+			src:  "[mcp_servers.ctr]\ncommand = \"C:\\\\bin\\\\context-router.exe\"\n",
+			want: anomalyNone,
+		},
+		{
+			name: "인라인 env 값의 역슬래시 — 이상 아님",
+			src:  "[mcp_servers.ctr]\ncommand = \"context-router\"\nenv = { CTR_STORE_ROOT = \"C:\\\\ctr\\\\store\" }\n",
+			want: anomalyNone,
+		},
+		// tomlKeyTokenHasEscape의 **닫는 따옴표 뒤 '=' 확인** 전용 감시선(태스크 검증에서 추가).
+		// 나머지 픽스처는 그 확인 없이도 엔트리 첫 토큰·env 한정 둘 중 하나에 걸려 통과하므로
+		// 그 절만 지웠을 때 아무도 물지 않았다. env 인라인의 **리터럴 값** 안에 따옴표로 감싼
+		// 역슬래시 토큰이 있고 그 뒤가 '='가 아닌 형태가 그 절이 유일한 감시자다.
+		{
+			name: "인라인 env 리터럴 값 안의 따옴표 경로 — 이상 아님",
+			src:  "[mcp_servers.ctr]\ncommand = \"context-router\"\nenv = { FLAGS = '--a, \"C:\\t\" z' }\n",
+			want: anomalyNone,
+		},
+		{
+			name: "홑따옴표 키 — 이스케이프가 없으므로 이상 아님",
+			src:  "[mcp_servers.ctr]\n'command' = \"context-router\"\n",
+			want: anomalyNone,
+		},
+		{
+			name: "우리 구간 밖의 이스케이프 키 — 이상 아님",
+			src:  "[other]\n\"comm\\u0061nd\" = \"x\"\n[mcp_servers.ctr]\ncommand = \"context-router\"\n",
+			want: anomalyNone,
+		},
+		// 아래 넷은 오탐 감시선이다. 판정이 라인을 문맥 없이 훑거나 닫는 따옴표 뒤 '='를
+		// 확인하지 않으면 이 파일들이 이상으로 판정되어 install·uninstall·--fix가 영구
+		// 무변경으로 굳는다. 셋은 `,` 직후에 키 모양을 두었다 — 그 위치가 초안의 인라인
+		// 루프가 보는 자리이므로 그렇게 두어야 감시선이 실제로 물린다.
+		{
+			name: "배열 원소 값의 역슬래시 — 이상 아님",
+			src:  "[mcp_servers.ctr]\ncommand = \"context-router\"\nargs = [\"--store-root\", \"C:\\\\ctr\\\\store\"]\n",
+			want: anomalyNone,
+		},
+		{
+			name: "여러 줄 문자열 내용이 키 모양 — 이상 아님",
+			src:  "[mcp_servers.ctr]\ncommand = \"context-router\"\nnote = \"\"\"\n\"comm\\u0061nd\" = \"x\"\n\"\"\"\n",
+			want: anomalyNone,
+		},
+		{
+			name: "후행 주석 안이 키 모양 — 이상 아님",
+			src:  "[mcp_servers.ctr]\ncommand = \"context-router\"\nx = 1 # , \"comm\\u0061nd\" = 2\n",
+			want: anomalyNone,
+		},
+		{
+			name: "홑따옴표 값 내부가 키 모양 — 이상 아님",
+			src:  "[mcp_servers.ctr]\ncommand = \"context-router\"\nk = ', \"comm\\u0061nd\" = 1'\n",
+			want: anomalyNone,
+		},
+		// 오탐 감시선이 아니라 **우선순위 절**의 감시선이다(태스크 검증에서 추가): 중복 헤더와
+		// 이스케이프 키를 한 입력에 담아, 앞 사유가 이미 잡혔으면 D87 검사가 그것을 덮지 않는지
+		// 본다. 이스케이프 키는 **마지막** 관리 테이블 구간 안에 두어야 한다 — codexManagedSpans가
+		// 뒤 헤더로 구간을 갈아치우므로 앞 구간에 두면 검사가 아예 닿지 않아 절을 재지 못한다.
+		{
+			name: "중복 헤더와 이스케이프 키가 함께 — 앞 사유를 유지한다",
+			src:  "[mcp_servers.ctr]\nx = 1\n[other]\n[mcp_servers.ctr]\n\"comm\\u0061nd\" = \"y\"\n",
+			want: anomalyDupHeader,
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			sp := codexManagedSpans(splitLinesKeepEnds([]byte(c.src)))
+			if sp.anomaly != c.want {
+				t.Errorf("anomaly=%d want %d", sp.anomaly, c.want)
+			}
+			// 이상이면 네 경로가 모두 무변경이어야 한다.
+			if c.want == anomalyNone {
+				return
+			}
+			res := installCodexConfigBlock([]byte(c.src), codexInstallRequest{Marker: hookMarker("0.16.0")})
+			if res.State != mcpMarkerAnomaly || res.Changed || !bytes.Equal(res.Out, []byte(c.src)) {
+				t.Errorf("install이 무변경이 아니다: state=%d changed=%v", res.State, res.Changed)
+			}
+			if out, changed := uninstallCodexConfigBlock([]byte(c.src)); changed || !bytes.Equal(out, []byte(c.src)) {
+				t.Errorf("uninstall이 무변경이 아니다: changed=%v", changed)
+			}
+			if present, anomaly := probeCodexMCPBlock([]byte(c.src)); present || !anomaly {
+				t.Errorf("probe present=%v anomaly=%v want false/true", present, anomaly)
+			}
+			if _, _, found := codexConfigMarker([]byte(c.src)); found {
+				t.Errorf("codexConfigMarker found=true — 이상 파일에서 판독이 성립했다")
+			}
+		})
+	}
+}

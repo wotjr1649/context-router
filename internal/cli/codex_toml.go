@@ -48,6 +48,7 @@ const (
 	anomalyNone        codexAnomaly = iota // 이상 없음
 	anomalyDupHeader                       // 같은 이름의 관리 테이블 헤더가 둘 이상(그 자체가 TOML 중복 정의)
 	anomalyScannerOpen                     // EOF에서 스캐너가 열림(닫히지 않은 문자열·배열)
+	anomalyEscapedKey                      // 우리 구간 안에 정규화 불가 키 표기(D87) — 이스케이프를 해석하지 않으므로 무변경
 )
 
 // splitLinesKeepEnds — 종결자 보존 라인 분해(CRLF 보존 계약). 각 라인은 자신의 "\n"/"\r\n"을
@@ -257,6 +258,11 @@ func codexManagedSpans(lines [][]byte) codexSpans {
 	if sc.open() && out.anomaly == anomalyNone {
 		out.anomaly = anomalyScannerOpen
 	}
+	// 우리 구간 안의 정규화 불가 키(D87) — 구간이 확정된 뒤에 본다. 앞의 두 사유가 이미
+	// 잡혔으면 유지한다(그쪽이 구조적으로 더 근본이다).
+	if out.anomaly == anomalyNone && codexEscapedKeyInSpans(lines, out) {
+		out.anomaly = anomalyEscapedKey
+	}
 	return out
 }
 
@@ -305,6 +311,65 @@ func codexKeyName(s string) string {
 		return ""
 	}
 	return strings.Trim(s[:i], `"'`)
+}
+
+// tomlKeyTokenHasEscape — 정규화 문자열 s의 **맨 앞이 따옴표 키 표기**이고 그 안에 역슬래시가
+// 있는가(D87). TOML 기본 문자열 키는 이스케이프를 디코드하므로 그런 표기는 우리 키와 **같은
+// 키**가 될 수 있는데 codexKeyName은 이스케이프를 해석하지 않아 알아보지 못한다.
+// 홑따옴표(리터럴) 키에는 이스케이프가 없으므로 대상이 아니다.
+func tomlKeyTokenHasEscape(s string) bool {
+	if s == "" || s[0] != '"' {
+		return false
+	}
+	n := basicStringLen(s)
+	if n < 2 || s[n-1] != '"' {
+		return false // 미종료 문자열 — 우리가 다루지 않는 형태(다른 사유가 잡는다)
+	}
+	// 닫는 따옴표 뒤에 '='가 와야 **키**다. 이 검사가 없으면 값이 키로 오인된다 — 배열 원소의
+	// Windows 경로(args = ["--store-root", "C:\ctr"])가 대표 형태이고, 그러면 그 사용자의
+	// install·uninstall·--fix가 영구 무변경으로 굳는다. 정규화(stripLine)가 공백을 지우므로
+	// 키와 '=' 사이에 공백이 없다 — tomlKeyLen·tomlInlineValue가 쓰는 것과 같은 전제다.
+	if n >= len(s) || s[n] != '=' {
+		return false
+	}
+	return strings.Contains(s[1:n-1], `\`)
+}
+
+// codexEscapedKeyInSpans — 우리 두 구간 안에 정규화 불가 키 표기가 있는가(D87).
+// **엔트리 단위로 본다.** codexEntries가 여러 줄 값을 한 엔트리로 묶고 그 엔트리에서 키는
+// 맨 앞 토큰뿐이므로, 문자열 값 안이나 후행 주석 안의 `"이름" = 값` 모양이 키로 오인되지
+// 않는다 — codexReadTable이 키를 읽는 경로와 **같은 기준**이며, 두 경로가 다른 기준을 쓰면
+// 같은 파일을 두 방식으로 읽는 셈이다(라인을 문맥 없이 훑으면 여러 줄 문자열의 내용 줄·값 뒤
+// 후행 주석·홑따옴표 값 내부가 모두 오탐이 된다).
+// 인라인 테이블의 키 토큰은 **env 엔트리에서만** 본다 — tomlKeyLen·inlineMarkerSpan이 그 줄에만
+// 적용되는 것과 같은 한정이고, 그것이 없으면 다른 키의 값 안에 든 쉼표 뒤 텍스트가 키로 잡힌다.
+// **알려진 한계**: env 인라인 값 안에 따옴표·역슬래시·등호를 함께 담은 문자열은 여전히 키로
+// 보인다. tomlInlineValue·inlineMarkerSpan이 이미 같은 한계를 갖는 형태이며(인라인 테이블의
+// 구조를 따라가지 않는다) D80의 파서 비의존 원칙 아래에서는 그 한계가 계약이다.
+func codexEscapedKeyInSpans(lines [][]byte, sp codexSpans) bool {
+	for _, span := range []codexSpan{sp.table, sp.env} {
+		if !span.found {
+			continue
+		}
+		for _, e := range codexEntries(lines, span) {
+			joined := ""
+			for i := e[0]; i <= e[1]; i++ {
+				joined += stripLine(lines[i])
+			}
+			if tomlKeyTokenHasEscape(joined) {
+				return true
+			}
+			if codexKeyName(joined) != "env" {
+				continue
+			}
+			for j := 0; j < len(joined); j++ {
+				if (joined[j] == '{' || joined[j] == ',') && tomlKeyTokenHasEscape(joined[j+1:]) {
+					return true
+				}
+			}
+		}
+	}
+	return false
 }
 
 // tomlStringList — 정규화 문자열에서 따옴표 안 값을 순서대로 뽑는다. 배열의 줄바꿈·공백·
