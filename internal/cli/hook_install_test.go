@@ -1354,6 +1354,66 @@ func TestHookInstallCodexAnomalyReason(t *testing.T) {
 	}
 }
 
+// TestRunHookInstallCodexMigratesOldFormat — X6(§2-9). v0.14 구 형식 파일을 **실제 파일로** 놓고
+// 설치 배선이 1회 변환하는지, 재실행이 무변경인지, 백업이 단일 슬롯인지 본다. 지금까지 구
+// 형식 픽스처는 순수 함수 테스트에만 있었고 이 배선은 테스트에 없었다.
+func TestRunHookInstallCodexMigratesOldFormat(t *testing.T) {
+	codexHome := t.TempDir()
+	t.Setenv("CODEX_HOME", codexHome)
+	cfgPath := filepath.Join(codexHome, "config.toml")
+	old := codexBlockBegin + "\n" +
+		"[mcp_servers.ctr]\n" +
+		"command = \"context-router\"\n" +
+		"args = [\"--enable\", \"ingest,net\"]\n" +
+		codexBlockEnd + "\n"
+	write(t, cfgPath, []byte(old))
+
+	var out bytes.Buffer
+	if err := runHookInstallCodex(true, false, false, "", t.TempDir(), "0.16.0", nil, false, &out); err != nil {
+		t.Fatalf("1회차: %v out=%s", err, out.String())
+	}
+	after1, err := os.ReadFile(cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := string(after1)
+	// 마커 두 줄이 사라진다
+	if strings.Contains(got, codexBlockBegin) || strings.Contains(got, codexBlockEnd) {
+		t.Errorf("마커가 남아 있다:\n%s", got)
+	}
+	// 표식이 env로 옮겨진다
+	if !strings.Contains(got, codexMarkerKey+" = \""+hookMarker("0.16.0")+"\"") {
+		t.Errorf("표식이 기입되지 않았다:\n%s", got)
+	}
+	// 백업이 원본을 담는다
+	bak, bErr := os.ReadFile(cfgPath + ".bak")
+	if bErr != nil {
+		t.Fatalf(".bak이 없다: %v", bErr)
+	}
+	if string(bak) != old {
+		t.Errorf(".bak이 원본과 다르다:\n%s", bak)
+	}
+
+	// 2회차 — 무변경이고 .bak은 1회차 이전 원본을 그대로 담는다.
+	// (backupCodexConfig는 단일 슬롯을 덮어쓰므로 ".bak이 다시 생기지 않는지"는 존재 검사로
+	//  관측할 수 없다 — 바이트로 잰다. §2-5)
+	var out2 bytes.Buffer
+	if err := runHookInstallCodex(true, false, false, "", t.TempDir(), "0.16.0", nil, false, &out2); err != nil {
+		t.Fatalf("2회차: %v", err)
+	}
+	after2, err := os.ReadFile(cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(after2) != got {
+		t.Errorf("2회차가 파일을 바꿨다:\n%s", after2)
+	}
+	bak2, _ := os.ReadFile(cfgPath + ".bak")
+	if string(bak2) != old {
+		t.Errorf(".bak이 2회차에 덮였다 — 무변경이면 백업하지 않아야 한다:\n%s", bak2)
+	}
+}
+
 // TestDropsLastSeenUTC — D71: 사유별 마지막 발생 시각을 UTC 날짜로 병기한다. 역순 ts가 섞여도
 // 최댓값을 쓰고(로그가 시간순임을 가정하지 않는다), 정수 변환에 실패한 ts는 집계만 하고 병기를
 // 생략하며, unparsed에는 ts가 없으므로 병기하지 않는다.

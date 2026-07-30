@@ -2837,6 +2837,72 @@ func TestDoctorDetectFixEquivalence(t *testing.T) {
 	}
 }
 
+// TestDoctorFixMigratesOldFormat — X6(§2-9). --fix가 v0.14 구 형식을 실제 파일에서 1회
+// 변환하는지, args가 보존되는지(D86), 재실행이 무변경이고 .bak이 원본을 유지하는지.
+func TestDoctorFixMigratesOldFormat(t *testing.T) {
+	codexHome := t.TempDir()
+	t.Setenv("CODEX_HOME", codexHome)
+	cfgPath := filepath.Join(codexHome, "config.toml")
+	old := codexBlockBegin + "\n" +
+		"[mcp_servers.ctr]\n" +
+		"command = \"context-router\"\n" +
+		"args = [\"--enable\", \"ingest\"]\n" +
+		"enabled_tools = [\"ctr_search\", \"ctr_index\", \"ctr_execute\"]\n" +
+		codexBlockEnd + "\n"
+	write(t, cfgPath, []byte(old))
+	projectRoot := t.TempDir()
+
+	var buf bytes.Buffer
+	if err := runDoctor(context.Background(), &buf, t.TempDir(), projectRoot, "0.16.0", true); err != nil {
+		t.Fatalf("--fix: %v out=%s", err, buf.String())
+	}
+	after1, err := os.ReadFile(cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := string(after1)
+	if strings.Contains(got, codexBlockBegin) || strings.Contains(got, codexBlockEnd) {
+		t.Errorf("마커가 남아 있다:\n%s", got)
+	}
+	if !strings.Contains(got, codexMarkerKey+" = \""+hookMarker("0.16.0")+"\"") {
+		t.Errorf("표식이 기입되지 않았다:\n%s", got)
+	}
+	// D86 — 사용자가 넓힌 enabled_tools가 보존된다(프로필 ingest는 ctr_execute를 켜지 않는다)
+	if !strings.Contains(got, "ctr_execute") {
+		t.Errorf("--fix가 사용자 확장을 지웠다:\n%s", got)
+	}
+	if !strings.Contains(got, "args = [\"--enable\", \"ingest\"]") {
+		t.Errorf("--fix가 args를 바꿨다:\n%s", got)
+	}
+	bak, bErr := os.ReadFile(cfgPath + ".bak")
+	if bErr != nil || string(bak) != old {
+		t.Errorf(".bak이 원본을 담지 않았다: err=%v\n%s", bErr, bak)
+	}
+
+	// 2회차 무변경 + .bak 유지
+	var buf2 bytes.Buffer
+	if err := runDoctor(context.Background(), &buf2, t.TempDir(), projectRoot, "0.16.0", true); err != nil {
+		t.Fatalf("--fix 2회차: %v", err)
+	}
+	after2, _ := os.ReadFile(cfgPath)
+	if string(after2) != got {
+		t.Errorf("2회차가 파일을 바꿨다:\n%s", after2)
+	}
+	if !strings.Contains(buf2.String(), "이미 현재 형식·버전입니다") {
+		t.Errorf("2회차가 무변경을 보고하지 않았다:\n%s", buf2.String())
+	}
+	// 스펙 §2-4 — 보고 문면이 무엇을 맞추고 무엇을 보존했는지 알리는지. 1회차 출력을 본다.
+	for _, want := range []string{"표식과 command", "원문 보존"} {
+		if !strings.Contains(buf.String(), want) {
+			t.Errorf("--fix 보고에 %q 없음:\n%s", want, buf.String())
+		}
+	}
+	bak2, _ := os.ReadFile(cfgPath + ".bak")
+	if string(bak2) != old {
+		t.Errorf(".bak이 2회차에 덮였다:\n%s", bak2)
+	}
+}
+
 // TestRunDoctorFixFlag — D83 구현 이음새 ①. doctor 분기에 --fix 하나만 받는 자체 flagset을
 // 열고 그 밖의 인자는 종전대로 거부한다. 오류 문면은 사용자 입력을 에코하지 않는다(규약 §6).
 func TestRunDoctorFixFlag(t *testing.T) {
