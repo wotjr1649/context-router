@@ -3,6 +3,7 @@ package cli
 import (
 	"bytes"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -79,17 +80,19 @@ func TestInstallCodexConfigBlock(t *testing.T) {
 		{"CRLF 보존 + CRLF 기입", "a = 1\r\n", mcpWritten, "a = 1\r\n\r\n" + strings.ReplaceAll(ctrTableFixture, "\n", "\r\n")},
 	}
 	for _, c := range cases {
-		res := installFixture(c.existing)
-		if res.State != c.wantState {
-			t.Fatalf("%s: state=%d want %d", c.name, res.State, c.wantState)
-		}
-		wantOut := c.wantOut
-		if wantOut == "" {
-			wantOut = c.existing
-		}
-		if string(res.Out) != wantOut {
-			t.Fatalf("%s:\n got=%q\nwant=%q", c.name, res.Out, wantOut)
-		}
+		t.Run(c.name, func(t *testing.T) {
+			res := installFixture(c.existing)
+			if res.State != c.wantState {
+				t.Fatalf("state=%d want %d", res.State, c.wantState)
+			}
+			wantOut := c.wantOut
+			if wantOut == "" {
+				wantOut = c.existing
+			}
+			if string(res.Out) != wantOut {
+				t.Fatalf("got=%q\nwant=%q", res.Out, wantOut)
+			}
+		})
 	}
 }
 
@@ -341,10 +344,12 @@ func TestUninstallCodexConfigBlock(t *testing.T) {
 		},
 	}
 	for _, c := range cases {
-		out, changed := uninstallCodexConfigBlock([]byte(c.existing))
-		if changed != c.wantChanged || string(out) != c.wantOut {
-			t.Fatalf("%s: changed=%v out=%q (want %v %q)", c.name, changed, out, c.wantChanged, c.wantOut)
-		}
+		t.Run(c.name, func(t *testing.T) {
+			out, changed := uninstallCodexConfigBlock([]byte(c.existing))
+			if changed != c.wantChanged || string(out) != c.wantOut {
+				t.Fatalf("changed=%v out=%q (want %v %q)", changed, out, c.wantChanged, c.wantOut)
+			}
+		})
 	}
 }
 
@@ -370,10 +375,12 @@ func TestProbeCodexMCPBlock(t *testing.T) {
 		{"ctr-exec만 있으면 부재", "[mcp_servers.ctr-exec]\ncommand = \"context-router\"\n", false, false},
 	}
 	for _, c := range cases {
-		p, a := probeCodexMCPBlock([]byte(c.in))
-		if p != c.present || a != c.anomaly {
-			t.Errorf("%s: present=%v anomaly=%v want %v/%v", c.name, p, a, c.present, c.anomaly)
-		}
+		t.Run(c.name, func(t *testing.T) {
+			p, a := probeCodexMCPBlock([]byte(c.in))
+			if p != c.present || a != c.anomaly {
+				t.Errorf("present=%v anomaly=%v want %v/%v", p, a, c.present, c.anomaly)
+			}
+		})
 	}
 }
 
@@ -381,23 +388,25 @@ func TestProbeCodexMCPBlock(t *testing.T) {
 // 동일. oracle의 EOF 개행은 파일 지배 개행을 따른다("\n" 하드코딩이면 CRLF 파일에 LF를 붙이는
 // 혼합-EOL 구현이 통과한다).
 func TestCodexConfigBlockRoundTrip(t *testing.T) {
-	for _, orig := range []string{"", "a = 1\n", "a = 1", "a = 1\r\n", "a = 1\r\nb = 2"} {
-		res := installFixture(orig)
-		if res.State != mcpWritten {
-			t.Fatalf("install(%q) state=%d", orig, res.State)
-		}
-		back, _ := uninstallCodexConfigBlock(res.Out)
-		want := orig
-		if want != "" && !strings.HasSuffix(want, "\n") {
-			eol := "\n"
-			if strings.Contains(want, "\r\n") {
-				eol = "\r\n"
+	for i, orig := range []string{"", "a = 1\n", "a = 1", "a = 1\r\n", "a = 1\r\nb = 2"} {
+		t.Run(strconv.Itoa(i), func(t *testing.T) {
+			res := installFixture(orig)
+			if res.State != mcpWritten {
+				t.Fatalf("install(%q) state=%d", orig, res.State)
 			}
-			want += eol // 명문 한계: EOF 개행 정규화만 왕복 예외(지배 개행 형식으로)
-		}
-		if string(back) != want {
-			t.Fatalf("왕복(%q): got=%q want=%q", orig, back, want)
-		}
+			back, _ := uninstallCodexConfigBlock(res.Out)
+			want := orig
+			if want != "" && !strings.HasSuffix(want, "\n") {
+				eol := "\n"
+				if strings.Contains(want, "\r\n") {
+					eol = "\r\n"
+				}
+				want += eol // 명문 한계: EOF 개행 정규화만 왕복 예외(지배 개행 형식으로)
+			}
+			if string(back) != want {
+				t.Fatalf("왕복(%q): got=%q want=%q", orig, back, want)
+			}
+		})
 	}
 }
 
@@ -533,11 +542,13 @@ func TestCodexTableOwnershipAndAdoption(t *testing.T) {
 		{"③ 인라인 표식 값이 문자열 아님(뒤 키로 오염 배제)", "[mcp_servers.ctr]\ncommand = \"other\"\nenv = { CTR_MANAGED = 0, X = \"context-router/0.15.0\" }\n", false},
 	}
 	for _, c := range cases {
-		lines, sp, view := codexLinesOf(t, c.src)
-		marker, found := codexMarkerValue(lines, sp, view)
-		if got := codexOwnership(marker, found, view.command, false); got != c.wantOwned {
-			t.Errorf("%s: owned=%v want %v (marker=%q found=%v command=%q)", c.name, got, c.wantOwned, marker, found, view.command)
-		}
+		t.Run(c.name, func(t *testing.T) {
+			lines, sp, view := codexLinesOf(t, c.src)
+			marker, found := codexMarkerValue(lines, sp, view)
+			if got := codexOwnership(marker, found, view.command, false); got != c.wantOwned {
+				t.Errorf("owned=%v want %v (marker=%q found=%v command=%q)", got, c.wantOwned, marker, found, view.command)
+			}
+		})
 	}
 	// 인수 범위는 관리 테이블 이름 하나다 — ctr-exec은 command가 같아도 관리 대상이 아니다.
 	_, sp, _ := codexLinesOf(t, "[mcp_servers.ctr-exec]\ncommand = \"context-router\"\n")
