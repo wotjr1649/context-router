@@ -2642,6 +2642,95 @@ func TestDoctorFix(t *testing.T) {
 	}
 }
 
+// TestCodexRegistrationVerdict — D85(§2-2). 감지와 고침이 같은 판정원을 쓰는지 본다. 권고
+// 술어는 --fix가 실제로 기입하는 조건 전체다: mcpWritten AND 테이블 실존 AND Changed.
+// Changed 하나로 줄이면 "파일은 있고 관리 테이블만 없는" 상태에서 install이 append 경로로
+// Changed=true를 내는데 --fix는 no-create로 거절하므로 오권고가 된다.
+func TestCodexRegistrationVerdict(t *testing.T) {
+	const ver = "0.16.0"
+	ours := "[mcp_servers.ctr]\ncommand = \"context-router\"\nargs = [\"--enable\", \"ingest,net\"]\n" +
+		"enabled_tools = [\"ctr_search\", \"ctr_index\", \"ctr_fetch_and_index\"]\n" +
+		"[mcp_servers.ctr.env]\n" + codexMarkerKey + " = \"context-router/"
+	cases := []struct {
+		name      string
+		cfg       string
+		wantFix   bool
+		wantState codexMCPState
+		wantTable bool
+	}{
+		{
+			name:      "관리 테이블 없음(파일은 있다) — 권고하지 않는다",
+			cfg:       "model = \"gpt\"\n",
+			wantFix:   false,
+			wantState: mcpWritten,
+			wantTable: false,
+		},
+		{
+			name:      "현재 버전 — 권고하지 않는다",
+			cfg:       ours + ver + "\"\n",
+			wantFix:   false,
+			wantState: mcpWritten,
+			wantTable: true,
+		},
+		{
+			name:      "구 버전 표식 — 권고한다",
+			cfg:       ours + "0.15.0\"\n",
+			wantFix:   true,
+			wantState: mcpWritten,
+			wantTable: true,
+		},
+		{
+			name:      "남의 테이블 — 권고하지 않는다",
+			cfg:       "[mcp_servers.ctr]\ncommand = \"other\"\n[mcp_servers.ctr.env]\n" + codexMarkerKey + " = \"other-tool/1.0\"\n",
+			wantFix:   false,
+			wantState: mcpExistingHeader,
+			wantTable: true,
+		},
+		{
+			// 두 케이스의 wantTable은 **true**다(실측). 구간 판정이 실패했거나 충돌이어도
+			// codexManagedSpans가 헤더 자체는 찾았기 때문이다. 구속력 있는 단정은 shouldFix()가
+			// 거짓이라는 것이며, 권고 술어가 State를 먼저 보므로 그 두 상태에서 TableFound가
+			// 무엇이든 권고하지 않는다.
+			name:      "구간 밖 충돌 — 권고하지 않는다",
+			cfg:       ours + "0.15.0\"\n[mcp_servers.ctr.tools.ctr_execute]\napproval_mode = \"never\"\n",
+			wantFix:   false,
+			wantState: mcpConflict,
+			wantTable: true,
+		},
+		{
+			name:      "구간 판정 불가 — 권고하지 않는다",
+			cfg:       "[mcp_servers.ctr]\n[x]\n[mcp_servers.ctr]\n",
+			wantFix:   false,
+			wantState: mcpMarkerAnomaly,
+			wantTable: true,
+		},
+		{
+			name: "사용자가 넓힌 enabled_tools + 현재 버전 — 권고하지 않는다",
+			cfg: "[mcp_servers.ctr]\ncommand = \"context-router\"\nargs = [\"--enable\", \"ingest\"]\n" +
+				"enabled_tools = [\"ctr_search\", \"ctr_index\", \"ctr_execute\"]\n" +
+				"[mcp_servers.ctr.env]\n" + codexMarkerKey + " = \"context-router/" + ver + "\"\n",
+			wantFix:   false,
+			wantState: mcpWritten,
+			wantTable: true,
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			v := codexRegistrationVerdict([]byte(c.cfg), ver)
+			if v.State != c.wantState {
+				t.Errorf("State=%d want %d", v.State, c.wantState)
+			}
+			if v.TableFound != c.wantTable {
+				t.Errorf("TableFound=%v want %v", v.TableFound, c.wantTable)
+			}
+			if v.shouldFix() != c.wantFix {
+				t.Errorf("shouldFix=%v want %v (State=%d TableFound=%v Changed=%v)",
+					v.shouldFix(), c.wantFix, v.State, v.TableFound, v.Changed)
+			}
+		})
+	}
+}
+
 // TestRunDoctorFixFlag — D83 구현 이음새 ①. doctor 분기에 --fix 하나만 받는 자체 flagset을
 // 열고 그 밖의 인자는 종전대로 거부한다. 오류 문면은 사용자 입력을 에코하지 않는다(규약 §6).
 func TestRunDoctorFixFlag(t *testing.T) {

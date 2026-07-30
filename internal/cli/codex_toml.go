@@ -595,18 +595,26 @@ type codexInstallResult struct {
 	// 되읽기 실패로 nil이라 "요청 프로필에 exec가 있는가"를 답하지 못하지만, ExecExposed는
 	// 보존되는 enabled_tools를 직접 봐서 "산출물이 실제로 노출하는가"를 답한다.
 	ExecExposed bool
+	// TableFound — 관리 테이블이 구간으로 잡혔는가(D85). doctor가 "등록물이 있는가"를 묻는
+	// 판정을 이 값으로 답한다 — 별도 판독기(codexConfigMarker)에서 얻으면 판정원이 둘이 되고
+	// 그 둘이 갈리는 것이 이 릴리스가 닫는 어긋남이다. mcpWritten이면서 이 값이 거짓인 상태가
+	// "append하면 된다"이며, --fix는 등록을 만들지 않으므로 그 상태에서 기입하지 않는다.
+	TableFound bool
 }
 
 // installCodexConfigBlock — 관리 테이블 병합(스펙 v0.15 §0 D80·D81·D84). 순수 변환: 파일 IO 없음.
 // 판정 순서는 probeCodexMCPBlock과 1:1로 유지한다 — 중복 정의 > 구간 밖 충돌 > 소유.
+// **읽기 전용 경로가 이 함수를 부른다**(D85 — doctor [20]의 감지원). 그러므로 파일 IO·시간·난수를
+// 들이면 진단이 파일을 쓰거나 결정적이지 않게 된다. 프로필 헬퍼를 포함한 호출 트리 전체가 순수해야
+// 하며, 그 조건은 스펙 v0.16 §1.3 게이트 1과 §3 표4에 있다.
 func installCodexConfigBlock(existing []byte, req codexInstallRequest) codexInstallResult {
 	lines := splitLinesKeepEnds(existing)
 	sp := codexManagedSpans(lines)
 	if sp.anomaly != anomalyNone {
-		return codexInstallResult{Out: existing, State: mcpMarkerAnomaly}
+		return codexInstallResult{Out: existing, State: mcpMarkerAnomaly, TableFound: sp.table.found}
 	}
 	if scanOutsideSpans(lines, sp) {
-		return codexInstallResult{Out: existing, State: mcpConflict}
+		return codexInstallResult{Out: existing, State: mcpConflict, TableFound: sp.table.found}
 	}
 	view := codexReadTable(lines, sp.table)
 	marker, markerFound := codexMarkerValue(lines, sp, view)
@@ -614,7 +622,7 @@ func installCodexConfigBlock(existing []byte, req codexInstallRequest) codexInst
 	inOldBlock := class == classReplace && sp.table.found && sp.table.start > begin && sp.table.start < end
 	if sp.table.found && !codexOwnership(marker, markerFound, view.command, inOldBlock) {
 		// 판정 근거는 "블록 밖에 있음"이 아니라 "표식이 없고 명령도 우리 것이 아님"이다(D80).
-		return codexInstallResult{Out: existing, State: mcpExistingHeader}
+		return codexInstallResult{Out: existing, State: mcpExistingHeader, TableFound: sp.table.found}
 	}
 	// 프로필 우선순위(D81): 명시 플래그 > 우리 소유 테이블의 기존 args > 기본 프로필.
 	// Codex 갈래에는 은퇴 이름이 없어 .mcp.json의 셋째 항이 없다.
@@ -666,7 +674,7 @@ func installCodexConfigBlock(existing []byte, req codexInstallRequest) codexInst
 		} else {
 			body = append(body, codexEnvBody(lines, codexSpan{}, req.Marker, eol)...)
 		}
-		return codexInstallResult{Out: appendBlock(base, body, crlf), State: mcpWritten, Changed: true, Profiles: resultProfiles, ExecExposed: execExposed}
+		return codexInstallResult{Out: appendBlock(base, body, crlf), State: mcpWritten, Changed: true, Profiles: resultProfiles, ExecExposed: execExposed, TableFound: sp.table.found}
 	}
 	// 무변경 판정(D84): 우리 소유 키 넷의 값이 모두 같고, 새로 만들 테이블도 지울 마커 줄도
 	// 없으면 쓰기와 백업을 생략한다. **키 단위 동치는 바이트 동일을 포함**하므로 호스트가 우리
@@ -680,7 +688,7 @@ func installCodexConfigBlock(existing []byte, req codexInstallRequest) codexInst
 		(keepArgs || (slices.Equal(view.args, mcpArgsForProfiles(profiles)) &&
 			slices.Equal(view.tools, enabledToolsForProfiles(profiles))))
 	if !envMissing && !inOldBlock && ownedSame {
-		return codexInstallResult{Out: existing, State: mcpWritten, Profiles: resultProfiles, ArgsKept: argsKept, ExecExposed: execExposed}
+		return codexInstallResult{Out: existing, State: mcpWritten, Profiles: resultProfiles, ArgsKept: argsKept, ExecExposed: execExposed, TableFound: sp.table.found}
 	}
 	if inOldBlock {
 		// D84 마이그레이션 — 마커 두 줄이 **우리 구간 안**에 들어와 있으면(블록이 우리 테이블만
@@ -711,6 +719,7 @@ func installCodexConfigBlock(existing []byte, req codexInstallRequest) codexInst
 	return codexInstallResult{
 		Out: out, State: mcpWritten,
 		Changed: !bytes.Equal(out, existing), Profiles: resultProfiles, ArgsKept: argsKept, ExecExposed: execExposed,
+		TableFound: sp.table.found,
 	}
 }
 

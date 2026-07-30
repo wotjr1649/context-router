@@ -2019,6 +2019,47 @@ func runDoctor(ctx context.Context, w io.Writer, storeRoot, projectRoot, version
 	return nil
 }
 
+// codexVerdict — config.toml 등록물의 판정(D85). 감지(doctor [20])와 고침(doctor --fix)이 이
+// 한 값을 공유한다.
+type codexVerdict struct {
+	State      codexMCPState
+	Anomaly    codexAnomaly
+	TableFound bool
+	Changed    bool
+	Marker     string
+	Command    string
+	// Out — 기입할 산출 바이트. 기입 갈래가 이 값을 쓰므로 **요청 조립 지점이 한 곳으로
+	// 묶인다** — 기입 쪽에서 요청을 다시 조립하면 그 두 조립이 갈릴 수 있고, 그것이 이
+	// 릴리스가 닫는 어긋남과 같은 형태다. 진단 경로는 이 필드를 쓰지 않고 무시한다.
+	Out []byte
+}
+
+// codexRegistrationVerdict — 감지와 고침이 공유하는 판정(D85). **요청 조립이 이 함수 안에만
+// 있다** — "같은 인자로 부른다"를 호출자의 규율로 두면 다음 변경에서 한쪽이 빠지고, 그러면
+// 요청 필드 축으로 감지와 고침이 다시 갈린다(D86의 MarkerOnly가 그 축이다).
+// 이 함수는 판정하지 않는다: installCodexConfigBlock을 부르고 그 결과를 담아 넘길 뿐이므로
+// 판정원은 하나다. 그 함수가 순수 변환(파일 IO 없음)이라는 것이 읽기 전용 경로에서 부를 수
+// 있는 근거이며, 스펙 §1.3 게이트 1이 그것을 확인한다.
+func codexRegistrationVerdict(data []byte, version string) codexVerdict {
+	res := installCodexConfigBlock(data, codexInstallRequest{
+		Marker: hookMarker(version), MarkerOnly: true,
+	})
+	_, anomaly := probeCodexMCPBlock(data)
+	marker, command, _ := codexConfigMarker(data)
+	return codexVerdict{
+		State: res.State, Anomaly: anomaly, TableFound: res.TableFound,
+		Changed: res.Changed, Marker: marker, Command: command, Out: res.Out,
+	}
+}
+
+// shouldFix — doctor --fix가 실제로 기입하는 조건 전체(D85). 셋의 논리곱이며 Changed 하나로
+// 줄이면 "파일은 있고 관리 테이블만 없는" 상태에서 install이 append 경로로 Changed=true를
+// 내는데 --fix는 등록을 만들지 않으므로 오권고가 된다 — 지금 "미등록·무경고"로 옳게 보고되는
+// 가장 흔한 미설치 상태가 그것이다.
+func (v codexVerdict) shouldFix() bool {
+	return v.State == mcpWritten && v.TableFound && v.Changed
+}
+
 // doctorFixRegistrations — doctor --fix(D83). MCP 등록물의 표식을 현재 버전으로 다시 기입하고,
 // D80 형식으로의 마이그레이션이 남은 config.toml을 함께 변환한다. **소유가 확인된 등록물만
 // 고친다** — 부재하는 파일도, 부재하는 등록물도 만들지 않고 안내만 낸다(doctor no-create
@@ -2060,25 +2101,25 @@ func doctorFixRegistrations(w io.Writer, projectRoot, version string) {
 	case err != nil:
 		fmt.Fprintln(w, "[20] fix: config.toml을 읽지 못해 건너뜁니다")
 	default:
-		res := installCodexConfigBlock(data, codexInstallRequest{Marker: hookMarker(version)})
-		_, _, hasTable := codexConfigMarker(data)
+		v := codexRegistrationVerdict(data, version)
 		switch {
-		case res.State != mcpWritten:
-			// 중복 정의·구간 밖 충돌·사용자 소유 테이블이 여기로 온다.
+		case v.State != mcpWritten:
+			// 구간 판정 불가·구간 밖 충돌·사용자 소유 테이블이 여기로 온다. 사유는 [16]과 [20]이
+			// 라벨로 말한다.
 			fmt.Fprintln(w, "[20] fix: config.toml이 기입 가능한 상태가 아닙니다 — [16] 안내를 먼저 따르세요")
-		case !hasTable:
+		case !v.TableFound:
 			// 관리 테이블 자체가 없다 — mcpWritten은 "append하면 된다"는 뜻이지만 --fix는
-			// 등록을 만들지 않는다. 이 상태를 [20]도 "미등록"으로 보고한다.
+			// 등록을 만들지 않는다. 이 상태를 [20]도 "미등록"으로 보고하며 권고하지 않는다.
 			fmt.Fprintln(w, "[20] fix: config.toml에 우리 관리 테이블이 없습니다 — 만들지 않습니다. hook install --codex로 먼저 등록하세요")
-		case !res.Changed:
+		case !v.Changed:
 			fmt.Fprintln(w, "[20] fix: config.toml은 이미 현재 형식·버전입니다 — 무변경")
 		default:
 			if bErr := backupCodexConfig(cfgPath, data); bErr != nil {
 				fmt.Fprintln(w, "[20] fix: config.toml 백업 실패 — 기입하지 않았습니다")
-			} else if wErr := atomicWriteFile(cfgPath, res.Out); wErr != nil {
+			} else if wErr := atomicWriteFile(cfgPath, v.Out); wErr != nil {
 				fmt.Fprintln(w, "[20] fix: config.toml 기록 실패")
 			} else {
-				fmt.Fprintln(w, "[20] fix: config.toml 관리 테이블을 다시 기입했습니다(백업 config.toml.bak)")
+				fmt.Fprintln(w, "[20] fix: config.toml 관리 테이블의 표식과 command를 다시 기입했습니다(args·enabled_tools는 원문 보존, 백업 config.toml.bak)")
 			}
 		}
 	}
