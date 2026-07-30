@@ -1486,6 +1486,8 @@ CTR_MANAGED = "context-router"
 # 승인 프롬프트가 필요하면 [mcp_servers.ctr]에 default_tools_approval_mode = "prompt"를 직접
 # 넣는다. 설치기는 그 키를 쓰지 않고(D64와 같은 사유 — 무프롬프트 모드에서도 프롬프트를 강제해
 # 사용자가 끌 수 없게 된다), 넣어 둔 키는 재설치가 원문 그대로 보존한다.
+# 그 키는 대화형 세션 전용이다 — 프로그램이 Codex를 비대화형으로 몰면 프롬프트에 답할 수단이
+# 없어 그 서버의 도구 호출이 응답 없이 매달린다.
 # exec 프로필은 "hook install --codex --enable-exec"으로 켠다 — args가 ["--enable", "exec"]가
 # 되고 enabled_tools에 "ctr_execute","ctr_execute_file"이 함께 붙는다(ingest·net까지 함께 쓰려면
 # "--enable ingest,net,exec"으로 지정한다 — 두 플래그는 합집합이다). 승인 강도는 Codex 승인 모드가 정한다.

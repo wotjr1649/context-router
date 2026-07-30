@@ -709,3 +709,32 @@ func TestCodexUnclosedBracketFailsClosed(t *testing.T) {
 		t.Errorf("무변경이어야 하는데 바이트가 달라졌다:\n%s", res.Out)
 	}
 }
+
+// C1(Codex 교차 리뷰) — classifyMarkers가 tomlLineScanner 상태를 보지 않아 여러 줄 문자열
+// **내용**인 마커 줄이 마커 쌍으로 세어졌다. 그러면 그 사이의 **미소유** [mcp_servers.ctr]가
+// 소유로 판정돼 install이 사용자 command를 덮고 uninstall이 그 테이블을 통째로 지웠다.
+// 입력·산출 모두 유효 TOML이라 눈에 띄지 않는다. 이 릴리스가 문서로 주장하는 "소유 판정이
+// 파괴적 계산보다 앞이고 미소유 파일은 그대로 반환된다"의 반례였다.
+func TestCodexMarkerInsideMultilineStringNotOwned(t *testing.T) {
+	cfg := []byte("[history]\nnotes = \"\"\"\n" + codexBlockBegin + "\n\"\"\"\n\n" +
+		"[mcp_servers.ctr]\ncommand = \"/opt/mine/my-wrapper\"\nargs = [\"--serve\"]\n" + codexBlockEnd + "\n")
+	res := installCodexConfigBlock(cfg, codexInstallRequest{
+		Profiles: defaultMCPProfiles, SetProfile: true, Marker: hookMarker("0.15.0"),
+	})
+	if res.Changed {
+		t.Errorf("문자열 내용인 마커로 미소유 테이블을 덮었다(state=%d):\n%s", res.State, res.Out)
+	}
+	if !bytes.Contains(res.Out, []byte(`command = "/opt/mine/my-wrapper"`)) {
+		t.Errorf("사용자 command가 사라졌다:\n%s", res.Out)
+	}
+	if !bytes.Contains(res.Out, []byte(codexBlockBegin)) {
+		t.Errorf("문자열 내용 줄이 지워졌다:\n%s", res.Out)
+	}
+	out, changed := uninstallCodexConfigBlock(cfg)
+	if changed {
+		t.Errorf("uninstall이 미소유 테이블을 건드렸다:\n%s", out)
+	}
+	if !bytes.Contains(out, []byte("[mcp_servers.ctr]")) {
+		t.Errorf("uninstall이 미소유 테이블을 지웠다:\n%s", out)
+	}
+}

@@ -329,7 +329,17 @@ func isBlankLine(line []byte) bool {
 // classifyMarkers — 마커 정확 라인 매치로 배치 분류(계약 2). 소유 replace는 begin/end 인덱스도 반환.
 func classifyMarkers(lines [][]byte) (class markerClass, begin, end int) {
 	var begins, ends []int
+	var sc tomlLineScanner
 	for i, ln := range lines {
+		// 여러 줄 문자열·배열 **안**의 줄은 마커가 아니다 — 그 내용이 마커 텍스트와 같으면
+		// 마커 쌍으로 세어져 사이의 **미소유** 테이블이 소유로 판정되고, install이 사용자
+		// command를 덮고 uninstall이 그 테이블을 통째로 지웠다(Codex 교차 리뷰 C1).
+		// codexManagedSpans가 경계를 잡는 것과 같은 기준을 공유한다.
+		inString := sc.open()
+		sc.step(ln)
+		if inString {
+			continue
+		}
 		switch trimEOL(ln) {
 		case codexBlockBegin:
 			begins = append(begins, i)

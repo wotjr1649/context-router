@@ -745,7 +745,7 @@ func runHookInstallCodex(user, noShadow, storeRootExplicit bool, storeRootRaw, p
 		// D81 — 승인 모드 키는 기입하지 않는다. 예전에는 관리 블록의 주석 한 줄로 권했으나
 		// 재직렬화가 주석을 지우므로(§3 표1) 파일에 남지 않는 안내는 안내가 아니다. 기입이
 		// 확정된 경우에만 낸다.
-		fmt.Fprintln(stdout, "hook install (codex): 승인 프롬프트가 필요하면 [mcp_servers.ctr]에 default_tools_approval_mode = \"prompt\"를 직접 넣으세요 — 설치기는 그 키를 쓰지 않고, 넣어 둔 키는 재설치가 보존합니다")
+		fmt.Fprintln(stdout, "hook install (codex): 승인 프롬프트가 필요하면 [mcp_servers.ctr]에 default_tools_approval_mode = \"prompt\"를 직접 넣으세요 — 설치기는 그 키를 쓰지 않고, 넣어 둔 키는 재설치가 보존합니다. 대화형 세션에서만 쓰세요: 프로그램이 Codex를 비대화형으로 몰면 그 프롬프트에 답할 수단이 없어 해당 서버의 도구 호출이 응답 없이 매달립니다")
 		if res.ExecExposed {
 			// D81 — exec 노출 경로 하나를 명시한다. 승인 모드 키는 서버 테이블 단위라 별도
 			// [mcp_servers.ctr-exec]에 걸어 둔 게이트가 관리 테이블 쪽 exec에는 걸리지 않는다.
