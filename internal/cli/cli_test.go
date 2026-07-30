@@ -436,8 +436,8 @@ func seedShadowContentDB(t *testing.T, projDir string) (ownedHash string) {
 
 // seedShadowWorktree — wdir에 정상 session.db를 부트스트랩(session.Open)한 뒤 지정 session_id로
 // artifact_created 이벤트 1건을 raw INSERT한다. session_id 접두(cc:/cx:)를 통제해야 하는데
-// session.Open은 서버 UUID를 발급하므로 공개 API로는 만들 수 없다 — 실제 훅 경로도 external
-// 접두 session_id로 append한다(hook_test.go:110). artifact_refs는 정본 URI JSON 배열.
+// session.Open은 서버 UUID를 발급하므로 공개 API로는 만들 수 없다 — 실제 훅 경로(dispatch)도
+// ExternalSessionID 접두 session_id로 append한다. artifact_refs는 정본 URI JSON 배열.
 func seedShadowWorktree(t *testing.T, wdir, sid string, refs []string) {
 	t.Helper()
 	d, err := session.Open(wdir, session.Options{Producer: "context-router/test"})
@@ -519,7 +519,7 @@ func TestDoctorShadowOwnedIncomplete(t *testing.T) {
 		t.Fatalf("session.Close ok: %v", err)
 	}
 
-	// 손상 worktree: 0xEE 4096B session.db(SQLITE_NOTADB) — 첫 쿼리에서 오류(mcp_test.go:1937).
+	// 손상 worktree: 0xEE 4096B session.db(SQLITE_NOTADB) — 첫 쿼리에서 오류(TestSessionRuntimeStorageErrorMapsToStorageUnavailable와 동형).
 	corrupt := filepath.Join(projDir, "worktrees", "corrupt")
 	if err := os.MkdirAll(corrupt, 0o755); err != nil {
 		t.Fatalf("mkdir corrupt: %v", err)
@@ -630,7 +630,7 @@ func TestDoctorShadowOwnedMultiWorktree(t *testing.T) {
 }
 
 // TestDoctorShadowOwnedNoSessionDecomp — D40 §2: content.db는 있으나 worktrees 세션이 하나도
-// 없으면(usable=0) [15]는 버킷 분해 없이 '세션 분해 없음' 폴백으로 렌더한다(cli.go:1830 경로).
+// 없으면(usable=0) [15]는 버킷 분해 없이 '세션 분해 없음' 폴백으로 렌더한다(runDoctor의 usable=0 분기).
 func TestDoctorShadowOwnedNoSessionDecomp(t *testing.T) {
 	storeRoot, projectRoot, projDir := doctorShadowProjDir(t)
 	seedShadowContentDB(t, projDir) // worktrees 디렉터리 미생성 → usable=0
@@ -3218,7 +3218,7 @@ func TestDoctorPermissionLineOnCheckFailure(t *testing.T) {
 // TestDoctorIndexesRender — D73: 병기가 quick_check 뒤에 오고 기존 부분문자열 단정이 그대로
 // 통과한다(골든 갱신 없이 정보만 더한다).
 func TestDoctorIndexesRender(t *testing.T) {
-	// 전용 doctor 실행 헬퍼는 없다 — 기존 셋업 두 개로 조립해 runDoctor(cli.go:1491)를 직접 부른다.
+	// 전용 doctor 실행 헬퍼는 없다 — 기존 셋업 두 개로 조립해 runDoctor를 직접 부른다.
 	storeRoot, projectRoot, projDir := doctorShadowProjDir(t) // cli_test.go:545
 	seedShadowContentDB(t, projDir)                           // cli_test.go:411 — writable Open이라 여기서 색인이 생긴다
 	var buf bytes.Buffer

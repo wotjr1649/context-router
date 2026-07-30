@@ -336,7 +336,7 @@ func TestMergeMCPServersRejectsForeignSameName(t *testing.T) {
 // TestMergeMCPServersEmptyOrNullTolerant: 공백뿐인 파일과 JSON `null`·`{"mcpServers":null}`
 // (모두 구문상 유효하거나 사실상 빈 파일)에서도 install이 패닉·오류 없이 병합한다. null은
 // Unmarshal이 맵을 nil로 설정해 뒤이은 할당이 패닉하던 경로다 — mergeHookSettings·
-// mergeCodexHooks가 같은 함정을 같은 방식으로 이미 막아 두었다(hook_install.go:125·129).
+// mergeCodexHooks가 같은 함정을 같은 방식으로 이미 막아 두었다.
 func TestMergeMCPServersEmptyOrNullTolerant(t *testing.T) {
 	entry := mcpServerEntry{Command: hookBinaryName, AlwaysLoad: true, Managed: hookMarker("0.12.0")}
 	for _, existing := range []string{" \n\t", "null", `{"mcpServers":null}`} {

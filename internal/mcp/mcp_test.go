@@ -1585,7 +1585,7 @@ func newRecordEventTestServer(t *testing.T, enable ...string) (cs *mcp.ClientSes
 	t.Cleanup(func() { sess.Close() })
 
 	// ScratchRoot: enable에 "exec"가 실리면 registerExecute가 등록되므로 sandbox 부모가 필요하다
-	// (TestSchemaTokenBudget 8-도구 재기준화 경로). 다른 호출자는 enable 비어 6-도구 그대로.
+	// (TestSchemaTokenBudget 10-도구 재기준화 경로). 다른 호출자는 enable 비어 6-도구 그대로.
 	srv, err := NewServer(Config{Canon: canon, Store: st, SelfExe: testSelfExe(t), ScratchRoot: t.TempDir(), Session: sess, Enable: enable})
 	if err != nil {
 		t.Fatalf("new server: %v", err)
