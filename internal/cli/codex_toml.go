@@ -25,17 +25,29 @@ type codexMCPState int
 
 const (
 	mcpWritten        codexMCPState = iota // 블록 기입/갱신 성공 — MCP 확정
-	mcpExistingHeader                      // 블록 밖 정확 [mcp_servers.ctr] 헤더 실존 — 기입 생략·MCP 확정
-	mcpConflict                            // 키-경계 충돌 — 기입 생략·MCP 미확정
-	mcpMarkerAnomaly                       // 마커 무결성·소유권 이상 — 무변경·MCP 미확정
+	mcpExistingHeader                      // 표식도 없고 command도 우리 것이 아닌 [mcp_servers.ctr] 실존 — 기입 생략·MCP 확정
+	mcpConflict                            // 우리 두 구간 **밖**의 중복 정의 신호 — 기입 생략·MCP 미확정
+	mcpMarkerAnomaly                       // 구간 판정 불가(codexAnomaly의 어느 사유든) — 무변경·MCP 미확정
 )
 
 type markerClass int
 
 const (
-	classAppend  markerClass = iota // 마커 0쌍 — append 후보
-	classReplace                    // 소유 블록 1쌍 — 교체 후보
-	classAnomaly                    // 그 외 마커 배치 — 무변경
+	classAppend  markerClass = iota // 마커 0쌍 — append 후보. **반환 전용**(비교 소비자 없음)
+	classReplace                    // 소유 블록 1쌍 — 교체 후보. inOldBlock 판정이 이 값을 비교한다
+	classAnomaly                    // 그 외 마커 배치 — 무변경. **반환 전용**(비교 소비자 없음)
+)
+
+// codexAnomaly — 구간 판정을 신뢰할 수 없는 사유(D85·D87). 불리언이 아니라 열거형인 이유는
+// 사용자에게 **사유를 알려야** 하기 때문이다: [16]의 기존 안내는 중복 헤더 정리를 지시하므로,
+// 사유가 다른 파일에서 그 안내만 보이면 install이 영구히 무변경인 이유를 알 수 없다.
+// 어느 사유든 결과는 같다 — 무변경 경로로 빠지고 --fix를 권하지 않는다.
+type codexAnomaly int
+
+const (
+	anomalyNone        codexAnomaly = iota // 이상 없음
+	anomalyDupHeader                       // 같은 이름의 관리 테이블 헤더가 둘 이상(그 자체가 TOML 중복 정의)
+	anomalyScannerOpen                     // EOF에서 스캐너가 열림(닫히지 않은 문자열·배열)
 )
 
 // splitLinesKeepEnds — 종결자 보존 라인 분해(CRLF 보존 계약). 각 라인은 자신의 "\n"/"\r\n"을
@@ -198,14 +210,12 @@ type codexSpan struct {
 // codexSpans — 두 관리 테이블의 구간. **서로 독립 구간**이다(D80): 인접해 있지 않아도 되고,
 // 사이에 사용자 테이블이 오면 그 테이블은 어느 구간에도 들지 않는다 — 두 테이블을 하나의
 // 연속 구간으로 다루면 그 사이 테이블이 삭제 범위에 든다.
-// dup은 "구간 판정을 신뢰할 수 없다"는 뜻이다 — 같은 이름의 헤더가 둘 이상(그 자체가 TOML
-// 중복 정의)이거나, EOF에서 스캐너가 열려 있어(닫히지 않은 문자열·배열) 그 뒤 헤더가 경계로
-// 잡히지 않은 경우다. 둘 다 이미 무효 TOML이며 무변경으로 뺀다.
-// (이름이 두 사유를 함께 담는다 — 이 파일의 열거형 이름·주석 정리는 v0.16 X3에 묶었다.)
+// anomaly는 "구간 판정을 신뢰할 수 없다"는 뜻이며 **그 사유를 담는다**(D85가 사유를 인쇄한다).
+// 어느 사유든 이미 무효 TOML이거나 우리가 다루지 않는 형태이므로 무변경으로 뺀다.
 type codexSpans struct {
-	table codexSpan
-	env   codexSpan
-	dup   bool
+	table   codexSpan
+	env     codexSpan
+	anomaly codexAnomaly
 }
 
 // codexManagedSpans — 라인 목록에서 두 관리 테이블의 구간을 잡는다.
@@ -228,12 +238,12 @@ func codexManagedSpans(lines [][]byte) codexSpans {
 		switch name {
 		case codexManagedTable:
 			if out.table.found {
-				out.dup = true
+				out.anomaly = anomalyDupHeader
 			}
 			out.table, cur = codexSpan{start: i, end: len(lines), found: true}, 0
 		case codexManagedEnv:
 			if out.env.found {
-				out.dup = true
+				out.anomaly = anomalyDupHeader
 			}
 			out.env, cur = codexSpan{start: i, end: len(lines), found: true}, 1
 		}
@@ -242,8 +252,10 @@ func codexManagedSpans(lines [][]byte) codexSpans {
 	// 헤더가 경계로 잡히지 않았고 우리 구간이 EOF까지 늘어난 상태다. 그대로 기입하면 append한
 	// 헤더까지 그 구간에 삼켜져 재실행마다 테이블이 하나씩 늘고, 매 실행 Changed=true라 D84
 	// 단일 백업 슬롯이 2회차에 원본을 잃는다(적대적 리뷰 A2). 무변경 경로로 뺀다.
-	if sc.open() {
-		out.dup = true
+	// 중복 헤더가 이미 잡혔으면 그 사유를 유지한다 — 구조적으로 더 근본이고, 사용자가 먼저
+	// 고쳐야 하는 것이 그쪽이다.
+	if sc.open() && out.anomaly == anomalyNone {
+		out.anomaly = anomalyScannerOpen
 	}
 	return out
 }
@@ -473,7 +485,7 @@ type codexInstallResult struct {
 func installCodexConfigBlock(existing []byte, req codexInstallRequest) codexInstallResult {
 	lines := splitLinesKeepEnds(existing)
 	sp := codexManagedSpans(lines)
-	if sp.dup {
+	if sp.anomaly != anomalyNone {
 		return codexInstallResult{Out: existing, State: mcpMarkerAnomaly}
 	}
 	if scanOutsideSpans(lines, sp) {
@@ -577,7 +589,7 @@ func installCodexConfigBlock(existing []byte, req codexInstallRequest) codexInst
 func probeCodexMCPBlock(existing []byte) (present bool, anomaly bool) {
 	lines := splitLinesKeepEnds(existing)
 	sp := codexManagedSpans(lines)
-	if sp.dup {
+	if sp.anomaly != anomalyNone {
 		return false, true
 	}
 	if scanOutsideSpans(lines, sp) {
@@ -610,7 +622,7 @@ func appendBlock(existing, block []byte, crlf bool) []byte {
 func uninstallCodexConfigBlock(existing []byte) (out []byte, changed bool) {
 	lines := splitLinesKeepEnds(existing)
 	sp := codexManagedSpans(lines)
-	if sp.dup || !sp.table.found {
+	if sp.anomaly != anomalyNone || !sp.table.found {
 		return existing, false
 	}
 	view := codexReadTable(lines, sp.table)
@@ -660,7 +672,7 @@ func codexConfigPath() (string, error) {
 func codexConfigMarker(existing []byte) (marker, command string, found bool) {
 	lines := splitLinesKeepEnds(existing)
 	sp := codexManagedSpans(lines)
-	if sp.dup || !sp.table.found {
+	if sp.anomaly != anomalyNone || !sp.table.found {
 		return "", "", false
 	}
 	view := codexReadTable(lines, sp.table)

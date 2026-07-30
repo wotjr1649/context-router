@@ -477,8 +477,8 @@ func TestCodexManagedSpans(t *testing.T) {
 	if !sp.env.found || sp.env.start != 5 || sp.env.end != 7 {
 		t.Errorf("env=%+v want {5 7 true}", sp.env)
 	}
-	if sp.dup {
-		t.Errorf("dup=true인데 중복 헤더가 없다")
+	if sp.anomaly != anomalyNone {
+		t.Errorf("anomaly=%d인데 이상이 없다", sp.anomaly)
 	}
 	// EOF 종료
 	sp2 := codexManagedSpans(splitLinesKeepEnds([]byte("[mcp_servers.ctr]\na = 1\nb = 2\n")))
@@ -487,13 +487,18 @@ func TestCodexManagedSpans(t *testing.T) {
 	}
 	// 중복 정의
 	sp3 := codexManagedSpans(splitLinesKeepEnds([]byte("[mcp_servers.ctr]\n[x]\n[mcp_servers.ctr]\n")))
-	if !sp3.dup {
-		t.Errorf("같은 이름 헤더 둘인데 dup=false")
+	if sp3.anomaly != anomalyDupHeader {
+		t.Errorf("같은 이름 헤더 둘인데 anomaly=%d want %d", sp3.anomaly, anomalyDupHeader)
 	}
 	// [mcp_servers.ctr-exec]는 관리 대상이 아니다(D80 — 사용자가 만든 별도 등록)
 	sp4 := codexManagedSpans(splitLinesKeepEnds([]byte("[mcp_servers.ctr-exec]\ncommand = \"context-router\"\n")))
 	if sp4.table.found || sp4.env.found {
 		t.Errorf("ctr-exec을 관리 테이블로 잡았다: %+v", sp4)
+	}
+	// EOF에서 스캐너가 열린 파일 — 사유가 중복 헤더와 구별돼야 한다
+	sp5 := codexManagedSpans(splitLinesKeepEnds([]byte("[mcp_servers.ctr]\nk = \"\"\"\nunclosed\n")))
+	if sp5.anomaly != anomalyScannerOpen {
+		t.Errorf("EOF 스캐너 열림 anomaly=%d want %d", sp5.anomaly, anomalyScannerOpen)
 	}
 	// 논리 엔트리 — 여러 줄 값은 한 엔트리다
 	lines := splitLinesKeepEnds([]byte("[mcp_servers.ctr]\nenabled_tools = [\n \"a\",\n]\nk = 1\n"))
