@@ -2101,9 +2101,12 @@ type codexVerdict struct {
 // codexRegistrationVerdict — 감지와 고침이 공유하는 판정(D85). **요청 조립이 이 함수 안에만
 // 있다** — "같은 인자로 부른다"를 호출자의 규율로 두면 다음 변경에서 한쪽이 빠지고, 그러면
 // 요청 필드 축으로 감지와 고침이 다시 갈린다(D86의 MarkerOnly가 그 축이다).
-// 이 함수는 판정하지 않는다: installCodexConfigBlock을 부르고 그 결과를 담아 넘길 뿐이므로
-// 판정원은 하나다. 그 함수가 순수 변환(파일 IO 없음)이라는 것이 읽기 전용 경로에서 부를 수
-// 있는 근거이며, 스펙 §1.3 게이트 1이 그것을 확인한다.
+// 이 함수는 그 자체로 판정하지 않는다 — **권고에 쓰이는 State·TableFound·Changed·Out은
+// installCodexConfigBlock 하나에서 오고**, 라벨 전용 Anomaly·Marker·Command는 같은 바이트를
+// 다시 읽는 두 순수 판독기(probeCodexMCPBlock·codexConfigMarker)에서 온다. 셋 모두 같은
+// 바이트에서 codexManagedSpans를 다시 도출하므로 값은 일치한다. installCodexConfigBlock이
+// 순수 변환(파일 IO 없음)이라는 것이 읽기 전용 경로에서 부를 수 있는 근거이며, 스펙 §1.3
+// 게이트 1이 그것을 확인한다.
 func codexRegistrationVerdict(data []byte, version string) codexVerdict {
 	res := installCodexConfigBlock(data, codexInstallRequest{
 		Marker: hookMarker(version), MarkerOnly: true,
@@ -2127,10 +2130,12 @@ func (v codexVerdict) shouldFix() bool {
 // doctorFixRegistrations — doctor --fix(D83). MCP 등록물의 표식을 현재 버전으로 다시 기입하고,
 // D80 형식으로의 마이그레이션이 남은 config.toml을 함께 변환한다. **소유가 확인된 등록물만
 // 고친다** — 부재하는 파일도, 부재하는 등록물도 만들지 않고 안내만 낸다(doctor no-create
-// 원칙의 범위는 파일이 아니라 등록물이다). 그 조건이 ownedRegistration이며 [20]이 "미등록"으로
-// 보고하는 상태와 같은 술어라 감지와 고침의 대상이 어긋나지 않는다. 기입은 새 경로를 만들지
-// 않고 install이 쓰는 경로를 그대로 쓴다: Codex는 installCodexConfigBlock, .mcp.json은
-// mergeMCPServers. D84의 백업과 무변경 판정도 그 경로에 있는 것을 그대로 쓴다.
+// 원칙의 범위는 파일이 아니라 등록물이다). **이 조건은 .mcp.json 갈래 한정이다** — 그쪽은
+// ownedRegistration이 [20]이 "미등록"으로 보고하는 상태와 같은 술어라 감지와 고침의 대상이
+// 어긋나지 않는다. Codex 갈래의 조건은 codexVerdict.shouldFix()가 쓰는 State·TableFound·
+// Changed 세 필드다(D85). 기입은 새 경로를 만들지 않고 install이 쓰는 경로를 그대로 쓴다:
+// Codex는 installCodexConfigBlock, .mcp.json은 mergeMCPServers. D84의 백업과 무변경 판정도
+// 그 경로에 있는 것을 그대로 쓴다.
 // 자동이 아니라 명시적 행위인 이유는 §0에 있다 — 기동 시 자동 재기입은 제품이 사용자 설정
 // 파일을 예고 없이 고치는 동작이 되고, 마커 교체 직후가 그 경로의 검증이 가장 얕은 시점이다.
 func doctorFixRegistrations(w io.Writer, projectRoot, version string) {
