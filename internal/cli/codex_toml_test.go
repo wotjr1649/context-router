@@ -915,3 +915,105 @@ func TestCodexAnomalyReason(t *testing.T) {
 		t.Errorf("anomalyNone의 사유 문면이 비어 있지 않다: %q", anomalyNone.reason())
 	}
 }
+
+// TestCodexInstallMarkerOnly — D86(§2-3·§2-4·§2-5·§2-8). 표식 전용 갈래는 args·enabled_tools를
+// 원문으로 보존하고 표식과 command만 맞춘다. **args는 우리 형식이어야 한다** — 우리 형식이
+// 아니면 profilesFromArgs가 ok=false를 내 D81의 되읽기 실패 경로가 이미 두 값을 보존하므로,
+// 그 픽스처로는 이 갈래를 되돌려도 통과한다(물지 않는 검사).
+func TestCodexInstallMarkerOnly(t *testing.T) {
+	// 우리 형식 args + 사용자가 손으로 넓힌 enabled_tools(프로필이 켜지 않는 ctr_execute를 더했다)
+	src := "[mcp_servers.ctr]\n" +
+		"command = \"context-router\"\n" +
+		"args = [\"--enable\", \"ingest\"]\n" +
+		"enabled_tools = [\"ctr_search\", \"ctr_index\", \"ctr_execute\"]\n" +
+		"[mcp_servers.ctr.env]\n" +
+		codexMarkerKey + " = \"context-router/0.15.0\"\n"
+
+	res := installCodexConfigBlock([]byte(src), codexInstallRequest{
+		Marker: hookMarker("0.16.0"), MarkerOnly: true,
+	})
+	if res.State != mcpWritten || !res.Changed {
+		t.Fatalf("state=%d changed=%v want mcpWritten/true", res.State, res.Changed)
+	}
+	out := string(res.Out)
+	// 사용자가 넓힌 목록이 바이트 그대로 남는다
+	if !strings.Contains(out, "enabled_tools = [\"ctr_search\", \"ctr_index\", \"ctr_execute\"]") {
+		t.Errorf("enabled_tools가 보존되지 않았다:\n%s", out)
+	}
+	if !strings.Contains(out, "args = [\"--enable\", \"ingest\"]") {
+		t.Errorf("args가 보존되지 않았다:\n%s", out)
+	}
+	// 표식은 현재 버전이 된다
+	if !strings.Contains(out, codexMarkerKey+" = \""+hookMarker("0.16.0")+"\"") {
+		t.Errorf("표식이 현재 버전이 아니다:\n%s", out)
+	}
+	// 이 갈래는 프로필을 기입하지 않으므로 "실제로 기입한 프로필"이 없다
+	if res.Profiles != nil {
+		t.Errorf("MarkerOnly인데 Profiles=%v", res.Profiles)
+	}
+	// ArgsKept는 되읽기 실패 전용이다 — 이 픽스처는 되읽기에 성공한다
+	if res.ArgsKept {
+		t.Errorf("ArgsKept=true — 되읽기에 성공한 픽스처인데 의미가 오염됐다")
+	}
+	// 산출물이 실제로 노출하는 것을 답해야 한다(보존된 목록에 exec가 있다)
+	if !res.ExecExposed {
+		t.Errorf("ExecExposed=false — 보존된 enabled_tools에 ctr_execute가 있다")
+	}
+
+	// 멱등: 산출물에 같은 요청을 다시 걸면 무변경이다(D84 단일 백업 슬롯의 전제)
+	res2 := installCodexConfigBlock(res.Out, codexInstallRequest{
+		Marker: hookMarker("0.16.0"), MarkerOnly: true,
+	})
+	if res2.Changed {
+		t.Errorf("2회차가 무변경이 아니다:\n%s", res2.Out)
+	}
+
+	// **호스트 재직렬화 형태에서의 무변경** — 이 단정이 ownedSame의 keepArgs 절을 재는 것이다.
+	// 위 멱등 단정만으로는 부족하다: 산출물은 우리 형식이라 바이트 비교로 이미 무변경이 나오므로
+	// keepArgs 절을 되돌려도 통과한다(물지 않는 검사). 대입 공백이 우리 형식과 다른 파일은
+	// 바이트 비교가 성립하지 않아 키 단위 동치가 판정해야 하고, 보존하는 값을 비교하면
+	// enabled_tools가 프로필 조립값과 달라 매 실행 재기입된다(D84 단일 슬롯 무의미화).
+	reser := "[mcp_servers.ctr]\n" +
+		"command=\"context-router\"\n" +
+		"args=[\"--enable\",\"ingest\"]\n" +
+		"enabled_tools=[\"ctr_search\",\"ctr_index\",\"ctr_execute\"]\n" +
+		"[mcp_servers.ctr.env]\n" +
+		codexMarkerKey + "=\"" + hookMarker("0.16.0") + "\"\n"
+	if r := installCodexConfigBlock([]byte(reser), codexInstallRequest{
+		Marker: hookMarker("0.16.0"), MarkerOnly: true,
+	}); r.Changed {
+		t.Errorf("재직렬화 형태에서 무변경이 아니다 — ownedSame이 keepArgs를 보지 않는다:\n%s", r.Out)
+	}
+
+	// install(MarkerOnly 없음)은 종전대로 프로필에서 재조립한다 — D81 불변(§2-8)
+	res3 := installCodexConfigBlock([]byte(src), codexInstallRequest{Marker: hookMarker("0.16.0")})
+	if strings.Contains(string(res3.Out), "ctr_execute") {
+		t.Errorf("install이 사용자 확장을 보존했다 — D81 재조립이 깨졌다:\n%s", res3.Out)
+	}
+}
+
+// TestCodexInstallMarkerOnlyRewritesCommand — D86(§2-4). 표식은 우리 것이고 command가
+// 절대경로인 등록물에서 command는 우리 값으로 맞춰지고 args·enabled_tools는 보존된다.
+// "표식만 갱신한다"가 아니라 "표식과 command를 맞춘다"가 정확한 계약이다.
+func TestCodexInstallMarkerOnlyRewritesCommand(t *testing.T) {
+	src := "[mcp_servers.ctr]\n" +
+		"command = \"C:\\\\bin\\\\context-router.exe\"\n" +
+		"args = [\"--enable\", \"ingest,net\"]\n" +
+		"enabled_tools = [\"ctr_search\"]\n" +
+		"[mcp_servers.ctr.env]\n" +
+		codexMarkerKey + " = \"context-router/0.15.0\"\n"
+
+	res := installCodexConfigBlock([]byte(src), codexInstallRequest{
+		Marker: hookMarker("0.16.0"), MarkerOnly: true,
+	})
+	if res.State != mcpWritten || !res.Changed {
+		t.Fatalf("state=%d changed=%v", res.State, res.Changed)
+	}
+	out := string(res.Out)
+	if !strings.Contains(out, "command = \"context-router\"") {
+		t.Errorf("command가 우리 값으로 맞춰지지 않았다:\n%s", out)
+	}
+	if !strings.Contains(out, "enabled_tools = [\"ctr_search\"]") {
+		t.Errorf("enabled_tools가 보존되지 않았다:\n%s", out)
+	}
+}

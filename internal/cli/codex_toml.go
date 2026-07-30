@@ -568,11 +568,17 @@ func spliceCodexLines(lines [][]byte, edits []codexSplice, drop map[int]bool) []
 	return out
 }
 
-// codexInstallRequest — 관리 테이블 기입 요청(D80·D81).
+// codexInstallRequest — 관리 테이블 기입 요청(D80·D81·D86).
 type codexInstallRequest struct {
 	Profiles   []string // 명시 플래그로 정해진 프로필(SetProfile=false면 쓰이지 않는다)
 	SetProfile bool     // --enable/--enable-exec 중 하나라도 있었는가
 	Marker     string   // env.CTR_MANAGED 값(hookMarker(version))
+	// MarkerOnly — 표식과 command만 맞추고 args·enabled_tools는 원문을 보존한다(D86).
+	// doctor --fix가 세우며 install은 세우지 않는다: install은 "등록을 원하는 상태로 만든다"이고
+	// --fix는 "표식을 현재 버전으로"라, 같은 함수를 쓰면서 그 차이를 인자로 표현하지 않으면
+	// --fix가 사용자가 손으로 넓힌 enabled_tools를 프로필 기본값으로 되돌린다.
+	// **첫 기입 경로에서는 무시된다** — 보존할 원문이 없고, --fix는 등록을 만들지 않는다.
+	MarkerOnly bool
 }
 
 // codexInstallResult — 기입 결과. Changed=false면 Out은 existing과 같고, 호출자는 쓰기와
@@ -581,7 +587,7 @@ type codexInstallResult struct {
 	Out      []byte
 	State    codexMCPState
 	Changed  bool
-	Profiles []string // 실제로 기입한 프로필(설치기 안내용) — ArgsKept면 되읽기 실패 값(nil)이다.
+	Profiles []string // 실제로 기입한 프로필(설치기 안내용) — ArgsKept면 되읽기 실패 값(nil)이고, MarkerOnly면 기입하지 않으므로 nil이다.
 	// "산출물이 exec를 노출하는가"를 물으려면 Profiles가 아니라 ExecExposed를 봐야 한다.
 	ArgsKept bool // 되읽지 못해 args·enabled_tools를 손대지 않았다(D81)
 	// ExecExposed — 이 실행이 남기는 산출물(Out)의 enabled_tools가 exec 도구를 담는가(D81,
@@ -621,13 +627,25 @@ func installCodexConfigBlock(existing []byte, req codexInstallRequest) codexInst
 			profiles = defaultMCPProfiles
 		}
 	}
+	// keepArgs — 몸통 조립에서 args·enabled_tools를 보존 라인으로 되돌리는가. 두 사유가 여기서
+	// 합류한다: 되읽기 실패(D81 argsKept)와 표식 전용 요청(D86 MarkerOnly). 결과 필드 ArgsKept는
+	// **앞의 것만** 담는다 — 합치면 설치기 안내가 "프로필을 해석하지 못했다"를 잘못 말한다.
+	keepArgs := argsKept || req.MarkerOnly
 	// execExposed — 아래 세 mcpWritten 반환 모두가 공유하는 산출물 exec 노출 판정(리뷰 승격 —
-	// 이월 T4-F3의 근본 픽스). argsKept면 다시 계산하지 않고 보존하는 view.tools가 최종값이고,
-	// 아니면(첫 기입 포함) enabledToolsForProfiles(profiles)가 최종값이다 — codexTableBody의
-	// keepArgs 인자가 정확히 이 두 갈래로 몸통을 고르는 것과 같은 분기다.
+	// 이월 T4-F3의 근본 픽스). **기존 테이블이 있고** 보존 갈래일 때만 view.tools가 최종값이다.
+	// 테이블이 없으면 첫 기입 경로가 몸통을 profiles로 조립하므로(MarkerOnly는 그 경로에서
+	// 무시된다) 보존 목록을 보면 결과 필드가 산출물과 어긋난다 — view가 비어 있어 늘 false가
+	// 된다. 아니면(첫 기입 포함) enabledToolsForProfiles(profiles)가 최종값이다 —
+	// codexTableBody의 keepArgs 인자가 정확히 이 두 갈래로 몸통을 고르는 것과 같은 분기다.
 	execExposed := enabledToolsExposeExec(enabledToolsForProfiles(profiles))
-	if argsKept {
+	if keepArgs && sp.table.found {
 		execExposed = enabledToolsExposeExec(view.tools)
+	}
+	// resultProfiles — 설치기 안내가 읽는 "실제로 기입한 프로필". 표식 전용 갈래는 프로필을
+	// 기입하지 않으므로 그 값이 없다(D86) — 되읽은 값을 실으면 그 필드의 의미가 성립하지 않는다.
+	resultProfiles := profiles
+	if req.MarkerOnly {
+		resultProfiles = nil
 	}
 	crlf := bytes.Contains(existing, []byte("\r\n"))
 	eol := "\n"
@@ -635,6 +653,7 @@ func installCodexConfigBlock(existing []byte, req codexInstallRequest) codexInst
 		eol = "\r\n"
 	}
 	if !sp.table.found { // 첫 기입 — 관리 테이블을 EOF 뒤에 잇는다
+		// MarkerOnly는 여기서 무시한다 — 보존할 원문이 없고 --fix는 등록을 만들지 않는다(D86).
 		body := ensureEOL(codexTableBody(lines, codexSpan{}, view, profiles, false, req.Marker, eol), eol)
 		base := existing
 		if sp.env.found {
@@ -647,18 +666,21 @@ func installCodexConfigBlock(existing []byte, req codexInstallRequest) codexInst
 		} else {
 			body = append(body, codexEnvBody(lines, codexSpan{}, req.Marker, eol)...)
 		}
-		return codexInstallResult{Out: appendBlock(base, body, crlf), State: mcpWritten, Changed: true, Profiles: profiles, ExecExposed: execExposed}
+		return codexInstallResult{Out: appendBlock(base, body, crlf), State: mcpWritten, Changed: true, Profiles: resultProfiles, ExecExposed: execExposed}
 	}
 	// 무변경 판정(D84): 우리 소유 키 넷의 값이 모두 같고, 새로 만들 테이블도 지울 마커 줄도
 	// 없으면 쓰기와 백업을 생략한다. **키 단위 동치는 바이트 동일을 포함**하므로 호스트가 우리
 	// 테이블을 다른 형태(키 순서·인용·공백·env 표기)로 되썼을 때에도 무변경 재실행마다 .bak이
 	// 생기지 않는다 — 스펙 §1.3-1 ② 게이트의 두 갈래를 한 경로가 함께 만족한다.
 	envMissing := !sp.env.found && view.inlineEnv < 0
+	// keepArgs 갈래에서는 args·enabled_tools를 비교하지 않는다 — 보존하는 값을 비교하면 사용자가
+	// 넓힌 목록이 매 실행 "다르다"로 읽혀 .bak이 매번 새로 생기고 D84 단일 슬롯 계약이
+	// 무의미해진다.
 	ownedSame := view.command == hookBinaryName && marker == req.Marker &&
-		(argsKept || (slices.Equal(view.args, mcpArgsForProfiles(profiles)) &&
+		(keepArgs || (slices.Equal(view.args, mcpArgsForProfiles(profiles)) &&
 			slices.Equal(view.tools, enabledToolsForProfiles(profiles))))
 	if !envMissing && !inOldBlock && ownedSame {
-		return codexInstallResult{Out: existing, State: mcpWritten, Profiles: profiles, ArgsKept: argsKept, ExecExposed: execExposed}
+		return codexInstallResult{Out: existing, State: mcpWritten, Profiles: resultProfiles, ArgsKept: argsKept, ExecExposed: execExposed}
 	}
 	if inOldBlock {
 		// D84 마이그레이션 — 마커 두 줄이 **우리 구간 안**에 들어와 있으면(블록이 우리 테이블만
@@ -667,7 +689,7 @@ func installCodexConfigBlock(existing []byte, req codexInstallRequest) codexInst
 		// 구간 밖에 있는 마커는 여전히 drop이 지운다 — 두 배치가 서로를 대신하지 않는다.
 		view.keep = slices.DeleteFunc(view.keep, func(i int) bool { return i == begin || i == end })
 	}
-	body := codexTableBody(lines, sp.table, view, profiles, argsKept, req.Marker, eol)
+	body := codexTableBody(lines, sp.table, view, profiles, keepArgs, req.Marker, eol)
 	if envMissing { // env 서브테이블을 우리 구간 끝에 잇는다(다음 테이블 헤더 앞이라 안전하다)
 		body = append(ensureEOL(body, eol), codexEnvBody(lines, codexSpan{}, req.Marker, eol)...)
 	}
@@ -688,7 +710,7 @@ func installCodexConfigBlock(existing []byte, req codexInstallRequest) codexInst
 	out := spliceCodexLines(lines, edits, drop)
 	return codexInstallResult{
 		Out: out, State: mcpWritten,
-		Changed: !bytes.Equal(out, existing), Profiles: profiles, ArgsKept: argsKept, ExecExposed: execExposed,
+		Changed: !bytes.Equal(out, existing), Profiles: resultProfiles, ArgsKept: argsKept, ExecExposed: execExposed,
 	}
 }
 
@@ -1040,7 +1062,8 @@ func setInlineEnvMarker(line []byte, old string, oldFound bool, marker, eol stri
 
 // codexTableBody — 관리 테이블 구간의 새 내용(소유 키 + 보존 라인). 기존 테이블이면 헤더
 // 라인을 원문 그대로 옮긴다 — 호스트가 헤더 공백을 바꿔 놓아도 그것만으로 재기입이 나지
-// 않게 하는 지점이다. keepArgs면 args·enabled_tools를 보존 라인으로 되돌린다(D81 되읽기 실패).
+// 않게 하는 지점이다. keepArgs면 args·enabled_tools를 보존 라인으로 되돌린다 — 호출자가 그
+// 인자에 두 사유를 합류시킨다(D81 되읽기 실패·D86 표식 전용).
 func codexTableBody(lines [][]byte, sp codexSpan, view codexTableView, profiles []string, keepArgs bool, marker, eol string) []byte {
 	var b []byte
 	if sp.found {
