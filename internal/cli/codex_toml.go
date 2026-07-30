@@ -335,6 +335,27 @@ func tomlKeyTokenHasEscape(s string) bool {
 	return strings.Contains(s[1:n-1], `\`)
 }
 
+// stripTrailingComment — 정규화 문자열에서 **문자열 밖** '#'부터를 잘라 낸다(D87 오탐 방지).
+// 후행 주석은 TOML 데이터가 아니므로 그 안의 `"이름" = 값` 모양이 인라인 테이블의 키로 잡히면
+// 정상 파일이 이상으로 판정되고 그 사용자의 install·uninstall·--fix가 영구 무변경으로 굳는다.
+// 따옴표 건너뛰기 걸음은 tomlStringList·tomlLineScanner.advance가 쓰는 것과 **같은 기준**이다 —
+// 홑따옴표 리터럴 안의 '#'은 주석이 아니므로 거기서 자르면 그 뒤의 진짜 키를 놓친다.
+func stripTrailingComment(s string) string {
+	for i := 0; i < len(s); {
+		switch s[i] {
+		case '"':
+			i += basicStringLen(s[i:])
+		case '\'':
+			i += literalStringLen(s[i:])
+		case '#':
+			return s[:i]
+		default:
+			i++
+		}
+	}
+	return s
+}
+
 // codexEscapedKeyInSpans — 우리 두 구간 안에 정규화 불가 키 표기가 있는가(D87).
 // **엔트리 단위로 본다.** codexEntries가 여러 줄 값을 한 엔트리로 묶고 그 엔트리에서 키는
 // 맨 앞 토큰뿐이므로, 문자열 값 안이나 후행 주석 안의 `"이름" = 값` 모양이 키로 오인되지
@@ -362,8 +383,11 @@ func codexEscapedKeyInSpans(lines [][]byte, sp codexSpans) bool {
 			if codexKeyName(joined) != "env" {
 				continue
 			}
-			for j := 0; j < len(joined); j++ {
-				if (joined[j] == '{' || joined[j] == ',') && tomlKeyTokenHasEscape(joined[j+1:]) {
+			// 인라인 키 토큰은 **후행 주석을 뺀** 부분에서만 본다 — 주석 안의 키 모양까지 잡으면
+			// `env = { A = "1" } # TODO: , "C:\t" = 2` 같은 정상 파일이 이상이 된다.
+			inline := stripTrailingComment(joined)
+			for j := 0; j < len(inline); j++ {
+				if (inline[j] == '{' || inline[j] == ',') && tomlKeyTokenHasEscape(inline[j+1:]) {
 					return true
 				}
 			}

@@ -799,6 +799,27 @@ func TestCodexEscapedManagedKey(t *testing.T) {
 			src:  "[mcp_servers.ctr]\ncommand = \"context-router\"\nenv = { FLAGS = '--a, \"C:\\t\" z' }\n",
 			want: anomalyNone,
 		},
+		// 아래 셋은 **env 엔트리의 후행 주석** 축이다(리뷰 F1). 인라인 키 토큰 검사가 주석까지
+		// 훑으면 정상 파일이 이상으로 판정돼 그 사용자의 install·uninstall·--fix가 영구 무변경으로
+		// 굳는다 — 주석은 TOML 데이터가 아니다. 위 "후행 주석 안이 키 모양" 픽스처는 그 엔트리의
+		// 키가 x라 env 한정에 걸려 인라인 루프가 아예 돌지 않으므로 이 축을 재지 못한다.
+		{
+			name: "env 엔트리의 후행 주석 안이 키 모양 — 이상 아님",
+			src:  "[mcp_servers.ctr]\ncommand = \"context-router\"\nenv = { A = \"1\" } # TODO: , \"C:\\t\" = 2\n",
+			want: anomalyNone,
+		},
+		{
+			name: "표식 키 이스케이프 + 후행 주석 — 주석 절단이 판정을 죽이지 않는다",
+			src:  "[mcp_servers.ctr]\ncommand = \"context-router\"\nenv = { \"CTR_MAN\\u0041GED\" = \"x\" } # note\n",
+			want: anomalyEscapedKey,
+		},
+		{
+			// 절단은 **문자열 밖** '#'에서만 한다 — 홑따옴표 리터럴 안의 '#'은 주석이 아니므로
+			// 거기서 자르면 그 뒤의 진짜 이스케이프 표식 키를 놓친다(미탐 축).
+			name: "홑따옴표 값 안의 # 뒤 표식 키 이스케이프 — 이상",
+			src:  "[mcp_servers.ctr]\ncommand = \"context-router\"\nenv = { A = 'x#y', \"CTR_MAN\\u0041GED\" = \"z\" }\n",
+			want: anomalyEscapedKey,
+		},
 		{
 			name: "홑따옴표 키 — 이스케이프가 없으므로 이상 아님",
 			src:  "[mcp_servers.ctr]\n'command' = \"context-router\"\n",
