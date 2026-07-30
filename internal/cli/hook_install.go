@@ -99,7 +99,9 @@ func markerDrift(marker, version string) bool {
 // 만족하거나 command가 hookBinaryName이면 참이다 — D80의 인수 절과 같은 기준이다.
 // 거짓이면 --fix는 병합하지 않고 hook install만 안내한다: 부재 파일뿐 아니라 **부재 등록물도
 // 만들지 않는 것**이 no-create 원칙의 범위이고, 등록 생성은 hook install의 일이다.
-// [20]의 "미등록" 표시가 이 술어의 거짓과 같은 조건이라 감지와 고침의 대상이 일치한다.
+// **이 주장은 .mcp.json 갈래 한정이다**: 그쪽은 [20]의 "미등록"이 이 술어의 거짓과 같은
+// 조건이다. Codex 갈래에서는 D84의 구 블록 절이 이 술어에 없어 거짓이어도 --fix가 인수하므로,
+// 그쪽 권고는 codexVerdict.shouldFix()가 정하고 이 술어는 구형식 라벨 구별에만 쓴다(D85).
 func ownedRegistration(marker, command string, found bool) bool {
 	return found && (isOurMarkerValue(marker) || command == hookBinaryName)
 }

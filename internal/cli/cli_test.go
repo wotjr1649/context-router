@@ -2731,6 +2731,112 @@ func TestCodexRegistrationVerdict(t *testing.T) {
 	}
 }
 
+// TestDoctorDetectFixEquivalence — D85(§2-1·§2-2). 감지와 고침을 한 표에서 함께 단정한다.
+// 경고가 --fix를 권한 모든 상태에서 --fix가 config.toml을 바꾸고, 권하지 않은 모든 상태에서
+// 바꾸지 않는다. **Codex 갈래 한정**이다 — .mcp.json 갈래는 경고 없이도 재직렬화 형식 차이·
+// 은퇴 항목 정리로 파일을 다시 쓴다(스펙 §1.2 첫 항, 비범위).
+func TestDoctorDetectFixEquivalence(t *testing.T) {
+	const ver = "0.16.0"
+	ours := "[mcp_servers.ctr]\ncommand = \"context-router\"\nargs = [\"--enable\", \"ingest,net\"]\n" +
+		"enabled_tools = [\"ctr_search\", \"ctr_index\", \"ctr_fetch_and_index\"]\n" +
+		"[mcp_servers.ctr.env]\n" + codexMarkerKey + " = \"context-router/"
+	cases := []struct {
+		name      string
+		cfg       string // "" = config.toml을 만들지 않는다
+		wantLabel string // [20] 라벨에 포함될 문자열
+		wantWarn  bool   // [20] warning 유무 = --fix가 바꾸는가
+	}{
+		{name: "① 파일 부재", cfg: "", wantLabel: "codex=없음", wantWarn: false},
+		{name: "② 현재 버전", cfg: ours + ver + "\"\n", wantLabel: "codex=marker " + ver, wantWarn: false},
+		{name: "③ 구 버전 표식", cfg: ours + "0.15.0\"\n", wantLabel: "≠" + ver, wantWarn: true},
+		{name: "④ 무버전 표식", cfg: "[mcp_servers.ctr]\ncommand = \"context-router\"\n[mcp_servers.ctr.env]\n" + codexMarkerKey + " = \"context-router\"\n", wantLabel: "버전미상", wantWarn: true},
+		{name: "⑤ 남의 테이블", cfg: "[mcp_servers.ctr]\ncommand = \"other\"\n[mcp_servers.ctr.env]\n" + codexMarkerKey + " = \"other-tool/1.0\"\n", wantLabel: "codex=미등록", wantWarn: false},
+		{name: "⑥ 표식 없는 우리 테이블", cfg: "[mcp_servers.ctr]\ncommand = \"context-router\"\nargs = []\n", wantLabel: "codex=표식없음", wantWarn: true},
+		{name: "⑦ 파일 존재·관리 테이블 부재", cfg: "model = \"gpt\"\n", wantLabel: "codex=미등록", wantWarn: false},
+		{name: "⑧ 구 블록 + 비표준 command", cfg: codexBlockBegin + "\n[mcp_servers.ctr]\ncommand = \"C:\\\\bin\\\\ctr.exe\"\n" + codexBlockEnd + "\n", wantLabel: "codex=구형식", wantWarn: true},
+		{name: "⑨ 구간 밖 충돌", cfg: ours + "0.15.0\"\n[mcp_servers.ctr.tools.ctr_execute]\napproval_mode = \"never\"\n", wantLabel: "codex=충돌", wantWarn: false},
+		{name: "⑩ 중복 헤더", cfg: "[mcp_servers.ctr]\n[x]\n[mcp_servers.ctr]\n", wantLabel: "codex=이상", wantWarn: false},
+		{name: "⑪ EOF 스캐너 열림", cfg: "[mcp_servers.ctr]\nk = \"\"\"\nunclosed\n", wantLabel: "codex=이상", wantWarn: false},
+		{name: "⑫ 정규화 불가 키", cfg: "[mcp_servers.ctr]\n\"comm\\u0061nd\" = \"x\"\n", wantLabel: "codex=이상", wantWarn: false},
+		{
+			name: "⑬ 사용자가 넓힌 enabled_tools",
+			cfg: "[mcp_servers.ctr]\ncommand = \"context-router\"\nargs = [\"--enable\", \"ingest\"]\n" +
+				"enabled_tools = [\"ctr_search\", \"ctr_index\", \"ctr_execute\"]\n" +
+				"[mcp_servers.ctr.env]\n" + codexMarkerKey + " = \"context-router/" + ver + "\"\n",
+			wantLabel: "codex=marker " + ver, wantWarn: false,
+		},
+		{
+			// 스펙 §2-6이 정규화 불가 키의 **두 형태**를 요구한다. ⑫는 서브테이블 형태이므로
+			// 인라인 형태를 배선 수준에서 함께 잰다 — 그 형태는 키 토큰이 env라 서브테이블
+			// 검사에 걸리지 않는 별개 경로다.
+			name:      "⑭ 정규화 불가 키(인라인 env 형태)",
+			cfg:       "[mcp_servers.ctr]\ncommand = \"context-router\"\nenv = { \"CTR_MAN\\u0041GED\" = \"context-router\" }\n",
+			wantLabel: "codex=이상", wantWarn: false,
+		},
+		{
+			// 표식은 **현재 버전**인데 형식(구 BEGIN/END 블록)이 어긋나 --fix가 파일을 바꾸는
+			// 상태다. 이 행이 두 가지를 함께 잡는다: ① 버전 접미를 shouldFix로 붙이면 같은
+			// 버전을 좌우에 둔 "0.16.0≠0.16.0"이 나온다는 것(그래서 codexMarkerLabel이 버전
+			// **비교**로 붙인다), ② 그 상태를 형식 접미로 구별한다는 것. 이 행이 없으면 두
+			// 규칙 모두 어떤 단정에도 걸리지 않는다(실측).
+			name: "⑮ 구 블록 + 현재 버전 표식 — 형식 드리프트",
+			cfg: codexBlockBegin + "\n[mcp_servers.ctr]\ncommand = \"context-router\"\n" +
+				"[mcp_servers.ctr.env]\n" + codexMarkerKey + " = \"context-router/" + ver + "\"\n" +
+				codexBlockEnd + "\n",
+			wantLabel: "codex=marker " + ver + "(형식)", wantWarn: true,
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			codexHome := t.TempDir()
+			t.Setenv("CODEX_HOME", codexHome)
+			cfgPath := filepath.Join(codexHome, "config.toml")
+			if c.cfg != "" {
+				write(t, cfgPath, []byte(c.cfg))
+			}
+			projectRoot := t.TempDir()
+
+			// 감지 — [20] 라벨과 경고
+			var buf bytes.Buffer
+			if err := runDoctor(context.Background(), &buf, t.TempDir(), projectRoot, ver, false); err != nil {
+				t.Fatalf("runDoctor: %v out=%s", err, buf.String())
+			}
+			out := buf.String()
+			if !strings.Contains(out, c.wantLabel) {
+				t.Errorf("라벨 %q 없음:\n%s", c.wantLabel, out)
+			}
+			// 경고는 Codex 갈래가 유일한 원인이어야 한다 — .mcp.json은 만들지 않았으므로 그쪽
+			// 라벨은 "없음"이고 경고를 내지 않는다.
+			gotWarn := strings.Contains(out, "[20] warning:")
+			if gotWarn != c.wantWarn {
+				t.Errorf("warning=%v want %v:\n%s", gotWarn, c.wantWarn, out)
+			}
+			// 이상 라벨은 세 사유를 한 값으로 묶으므로 [20]이 사유 줄을 함께 낸다(§2-7).
+			// 사유가 없으면 사용자는 install이 영구히 무변경인 이유를 알 수 없다.
+			if strings.Contains(c.wantLabel, "이상") && !strings.Contains(out, "[20] codex: ") {
+				t.Errorf("이상 라벨인데 사유 줄이 없다:\n%s", out)
+			}
+
+			// 고침 — --fix가 파일을 바꾸는가
+			if c.cfg == "" {
+				return // 부재 파일은 만들지 않는다(다른 테스트가 단정한다)
+			}
+			var fixBuf bytes.Buffer
+			if err := runDoctor(context.Background(), &fixBuf, t.TempDir(), projectRoot, ver, true); err != nil {
+				t.Fatalf("runDoctor --fix: %v out=%s", err, fixBuf.String())
+			}
+			after, rErr := os.ReadFile(cfgPath)
+			if rErr != nil {
+				t.Fatal(rErr)
+			}
+			changed := string(after) != c.cfg
+			if changed != c.wantWarn {
+				t.Errorf("--fix changed=%v인데 경고는 %v였다 — 감지와 고침이 어긋난다\n%s", changed, c.wantWarn, fixBuf.String())
+			}
+		})
+	}
+}
+
 // TestRunDoctorFixFlag — D83 구현 이음새 ①. doctor 분기에 --fix 하나만 받는 자체 flagset을
 // 열고 그 밖의 인자는 종전대로 거부한다. 오류 문면은 사용자 입력을 에코하지 않는다(규약 §6).
 func TestRunDoctorFixFlag(t *testing.T) {

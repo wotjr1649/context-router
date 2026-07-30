@@ -1998,13 +1998,22 @@ func runDoctor(ctx context.Context, w io.Writer, storeRoot, projectRoot, version
 	mcpData, mcpReadErr := os.ReadFile(mcpConfigPath(projectRoot))
 	mcpLabel, mcpDrift := markerState(mcpData, mcpReadErr, mcpManagedMarker)
 	codexLabel, codexDrift := "확인불가", false
+	codexReason := ""
 	if cfgP, cfgErr := codexConfigPath(); cfgErr == nil {
 		cfgData, cfgReadErr := os.ReadFile(cfgP)
-		codexLabel, codexDrift = markerState(cfgData, cfgReadErr, codexConfigMarker)
+		codexLabel, codexDrift, codexReason = codexMarkerLabel(cfgData, cfgReadErr, version)
 	}
 	fmt.Fprintf(w, "[20] mcp markers: .mcp.json=%s codex=%s\n", mcpLabel, codexLabel)
+	if codexReason != "" {
+		// 이상 라벨은 세 사유를 한 값으로 묶으므로 사유를 함께 낸다 — 사유마다 필요한 조치가
+		// 다르고, 그것을 알리지 않으면 사용자는 install이 영구히 무변경인 이유를 알 수 없다.
+		fmt.Fprintf(w, "[20] codex: %s\n", codexReason)
+	}
 	if mcpDrift || codexDrift {
-		fmt.Fprintln(w, "[20] warning: MCP 등록물의 버전 표식이 현재 버전과 다릅니다 — doctor --fix로 다시 기입하세요(기존 파일만 고치며 config.toml은 백업을 남깁니다)")
+		// 문면을 사유 중립으로 둔다 — 표식은 현재인데 형식·command가 어긋나 --fix가 파일을
+		// 바꾸는 상태(구형식 포함)에서 "버전 표식이 다르다"는 사유를 잘못 말한다. 사유는
+		// 라벨이 담는다. .mcp.json 갈래는 은퇴 이름 항목도 함께 정리하므로 그것을 예고한다.
+		fmt.Fprintln(w, "[20] warning: 다시 기입이 필요한 MCP 등록물이 있습니다 — doctor --fix로 고치세요(기존 파일만 고치고 등록을 만들지 않습니다. config.toml은 백업을 남기고 args·enabled_tools는 보존합니다. .mcp.json은 대체된 옛 이름의 항목을 함께 정리합니다)")
 	}
 	if fix {
 		doctorFixRegistrations(w, projectRoot, version)
@@ -2017,6 +2026,61 @@ func runDoctor(ctx context.Context, w io.Writer, storeRoot, projectRoot, version
 		return fmt.Errorf("doctor: 진단 실패 항목 %d개", len(failed))
 	}
 	return nil
+}
+
+// codexMarkerLabel — [20]의 Codex 라벨·권고 여부·사유(D85). **권고는 codexVerdict.shouldFix()가
+// 정한다** — 라벨은 진단 정보라 자유도가 있지만 권고는 --fix의 행동과 등가여야 한다.
+// 라벨 셋이 추가된다: 구간 밖 충돌은 충돌, 구간 판정 불가는 이상, 소유하지만
+// ownedRegistration이 거짓인 인수 대상은 구형식이다. 마지막 술어가 여전히 필요한 이유는 그
+// 거짓이 **인수 경로임을 가리키는 유일한 신호**라는 것이다 — 판정 권한을 나눠 갖는 것이
+// 아니라 라벨을 구별할 뿐이다.
+// 셋째 반환값은 사유이며 이상 갈래에서만 비어 있지 않다 — 그 라벨이 세 사유를 한 값으로
+// 묶으므로 호출자가 별도 줄로 낸다.
+// .mcp.json 갈래는 이 함수를 쓰지 않고 runDoctor의 markerState 클로저에 남는다(D85).
+func codexMarkerLabel(data []byte, readErr error, version string) (label string, fix bool, reason string) {
+	switch {
+	case errors.Is(readErr, os.ErrNotExist):
+		return "없음", false, ""
+	case readErr != nil:
+		return "읽기실패", false, ""
+	}
+	v := codexRegistrationVerdict(data, version)
+	shouldFix := v.shouldFix()
+	switch v.State {
+	case mcpMarkerAnomaly:
+		return "이상", false, v.Anomaly.reason()
+	case mcpConflict:
+		return "충돌", false, ""
+	case mcpExistingHeader:
+		return "미등록", false, ""
+	}
+	if !v.TableFound {
+		// **권고값을 여기서 고정하지 않는다.** shouldFix가 이미 TableFound를 보므로 거짓이
+		// 나오고, false를 하드코딩하면 판정원이 둘이 되어 shouldFix의 결함이 이 갈래에서
+		// 가려진다 — 그 절을 되돌리는 유도 FAIL이 물지 않게 된다.
+		return "미등록", shouldFix, "" // append하면 되지만 --fix는 등록을 만들지 않는다
+	}
+	if !ownedRegistration(v.Marker, v.Command, true) {
+		return "구형식", shouldFix, "" // D84 셋째 절이 소유로 받는 인수 대상
+	}
+	if !isOurMarkerValue(v.Marker) {
+		return "표식없음", shouldFix, ""
+	}
+	// 버전 불일치 접미는 **버전 비교**로 붙인다. shouldFix로 붙이면 표식이 현재 버전인데 형식
+	// 드리프트 때문에 기입이 필요한 파일(구 블록 안의 현재 버전 표식)에서 같은 버전을 좌우에 둔
+	// 표기가 나온다. 형식 드리프트는 별도 접미로 구별한다.
+	// early return으로 적는다 — if-else 체인은 revive의 indent-error-flow에 걸린다.
+	mv := markerVersion(v.Marker)
+	if mv == "" {
+		return "marker 버전미상≠" + version, shouldFix, ""
+	}
+	if mv != version {
+		return "marker " + mv + "≠" + version, shouldFix, ""
+	}
+	if shouldFix {
+		return "marker " + mv + "(형식)", true, ""
+	}
+	return "marker " + mv, false, ""
 }
 
 // codexVerdict — config.toml 등록물의 판정(D85). 감지(doctor [20])와 고침(doctor --fix)이 이
@@ -2089,7 +2153,7 @@ func doctorFixRegistrations(w io.Writer, projectRoot, version string) {
 		} else if wErr := atomicWriteFile(mcpPath, merged); wErr != nil {
 			fmt.Fprintln(w, "[20] fix: .mcp.json 기록 실패")
 		} else {
-			fmt.Fprintf(w, "[20] fix: .mcp.json 표식을 %s로 다시 기입했습니다\n", version)
+			fmt.Fprintf(w, "[20] fix: .mcp.json 표식을 %s로 다시 기입했습니다(프로필은 보존, 대체된 옛 이름의 항목이 있으면 함께 정리했습니다)\n", version)
 		}
 	}
 	cfgPath, cfgErr := codexConfigPath()
