@@ -6,6 +6,12 @@ package cli
 // 문자열·배열의 열림 상태를 추적해 테이블 헤더만 경계로 잡고, 그 경계 안에서만 바이트를
 // 바꾼다 — TOML 문법상 헤더와 다음 헤더 사이에는 그 테이블의 키만 올 수 있으므로 blast
 // radius가 우리 테이블 안으로 구조적으로 묶인다. 순수 바이트 변환 — IO는 호출자.
+//
+// D88 — 왕복 보존의 예외: **우리가 기입하는 키 줄의 후행 주석은 보존 대상이 아니다.** 보존은
+// 키 단위 약속이고 관리 키 넷의 물리 라인은 통째로 재생성되므로 그 줄의 주석은 사라진다.
+// 인라인 env 경로는 예외의 예외다 — inlineMarkerSpan·setInlineEnvMarker가 값 토큰만 치환하므로
+// 그 줄의 주석은 남는다. 키별 값 스팬 판독기로 닫지 않는 이유는 파서 비의존 원칙 아래에서
+// 그 판독기의 정확성이 새 위험이 되기 때문이다.
 
 import (
 	"bytes"
@@ -1073,6 +1079,9 @@ func setInlineEnvMarker(line []byte, old string, oldFound bool, marker, eol stri
 // 라인을 원문 그대로 옮긴다 — 호스트가 헤더 공백을 바꿔 놓아도 그것만으로 재기입이 나지
 // 않게 하는 지점이다. keepArgs면 args·enabled_tools를 보존 라인으로 되돌린다 — 호출자가 그
 // 인자에 두 사유를 합류시킨다(D81 되읽기 실패·D86 표식 전용).
+//
+// D88 — 이 재생성이 관리 키 줄의 후행 주석을 지운다. 보존 대상이 아니라는 것이 계약이며,
+// 보존 라인(keep)의 주석은 원문 그대로 옮겨진다.
 func codexTableBody(lines [][]byte, sp codexSpan, view codexTableView, profiles []string, keepArgs bool, marker, eol string) []byte {
 	var b []byte
 	if sp.found {
