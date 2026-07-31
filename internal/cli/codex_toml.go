@@ -66,6 +66,9 @@ const (
 	// 반대다: 나머지는 사용자 파일을 고치라는 지시이고 이것은 **우리 결함의 자수**다.
 	anomalyOutputInvalid
 	anomalyDottedEnv // env 키가 점 표기로 적혀 표식을 쓸 자리가 없다(D90)
+	// anomalyNotOwned — 관리 테이블이 있으나 우리 소유가 아니다(**제거 경로 전용**). install은
+	// 같은 상태를 mcpExistingHeader로 보고하므로 거기서 세우면 그 갈래의 문면이 뒤바뀐다.
+	anomalyNotOwned
 )
 
 // reason — 사용자 문면에 실을 사유(D85). 사유마다 **다른 조치**가 필요하므로 문면이 달라야
@@ -86,6 +89,8 @@ func (a codexAnomaly) reason() string {
 		return "이 도구가 만든 결과가 유효한 TOML이 아니어서 기입하지 않았습니다 — 제품 결함이니 파일 형태와 함께 알려 주세요"
 	case anomalyDottedEnv:
 		return "env 키가 점 표기(env.NAME)로 적혀 있습니다 — [mcp_servers.ctr.env] 테이블로 옮긴 뒤 재실행하세요"
+	case anomalyNotOwned:
+		return "관리 테이블이 남아 있으나 표식도 command도 우리 것이 아닙니다 — 사용자 등록으로 보고 건드리지 않았습니다. 직접 정리하세요"
 	}
 	return ""
 }
@@ -929,7 +934,9 @@ func uninstallCodexConfigBlock(existing []byte) (out []byte, changed bool, anoma
 	class, begin, end := classifyMarkers(lines)
 	inOldBlock := class == classReplace && sp.table.start > begin && sp.table.start < end
 	if !codexOwnership(marker, markerFound, view.command, inOldBlock) {
-		return existing, false, anomalyNone
+		// 테이블 부재 갈래(위)와 **같은 반환값이면 호출자가 가르지 못한다** — 캐치올 분기를
+		// 두면 미설치 사용자의 흔한 실행에 잔존 문면이 나간다. 사유값으로 가른다.
+		return existing, false, anomalyNotOwned
 	}
 	drop := map[int]bool{}
 	for i := sp.table.start; i < sp.table.end; i++ {
