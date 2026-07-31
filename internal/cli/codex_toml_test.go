@@ -1316,3 +1316,87 @@ func TestCodexInstallOutputAlwaysParses(t *testing.T) {
 		}
 	}
 }
+
+// TestCodexDottedEnvNoHeaderAppend — D90. 점 표기 env 키가 있으면 헤더를 붙이지 않는다.
+// 붙이면 같은 논리 테이블이 두 번 정의돼 사용자의 Codex가 그 파일 전체를 읽지 못한다.
+func TestCodexDottedEnvNoHeaderAppend(t *testing.T) {
+	src := "[mcp_servers.ctr]\ncommand = \"context-router\"\nenv.FOO = \"bar\"\n"
+	res := installCodexConfigBlock([]byte(src), codexInstallRequest{Marker: hookMarker("0.17.0")})
+	if strings.Contains(string(res.Out), "[mcp_servers.ctr.env]") {
+		t.Fatalf("env 헤더를 덧붙였다 — 중복 정의:\n%s", res.Out)
+	}
+	// 표식을 쓸 자리가 없으므로 무변경 + 사유
+	if res.State != mcpMarkerAnomaly || res.Anomaly != anomalyDottedEnv {
+		t.Errorf("state=%d anomaly=%d want mcpMarkerAnomaly/anomalyDottedEnv", res.State, res.Anomaly)
+	}
+	if string(res.Out) != src {
+		t.Errorf("산출이 입력과 다르다:\n%s", res.Out)
+	}
+	// 게이트가 아니라 D90이 잡았는지 — 게이트가 잡았다면 상태가 달랐을 것이다
+	if res.State == mcpOutputInvalid {
+		t.Errorf("게이트가 먼저 잡았다 — D90 단정이 게이트에 가려진다")
+	}
+}
+
+// TestCodexDottedEnvCurrentMarkerWrites — 표식이 이미 현재 값이면 이탈하지 않는다. 이탈
+// 조건을 "점 표기가 있으면"으로 넓히면 고칠 것이 없는 파일에 사유를 내는 오경보가 된다.
+func TestCodexDottedEnvCurrentMarkerWrites(t *testing.T) {
+	// **command는 우리 것이어야 한다.** D90은 점 표기 표식을 소유 판정에 쓰지 않으므로,
+	// command가 남의 값이면 소유가 서지 않아 mcpExistingHeader로 먼저 빠진다 — 그러면 이
+	// 단정은 구조적으로 통과할 수 없고, 구현자가 "고치려다" D90이 금지한 소유 판정 확장으로
+	// 범위를 넘게 된다.
+	src := "[mcp_servers.ctr]\ncommand = \"context-router\"\nenv.CTR_MANAGED = \"" + hookMarker("0.17.0") + "\"\nenv.FOO = \"bar\"\n"
+	res := installCodexConfigBlock([]byte(src), codexInstallRequest{Marker: hookMarker("0.17.0")})
+	if res.State != mcpWritten {
+		t.Fatalf("state=%d want mcpWritten — 표식이 현재 값이면 평소대로 기입한다", res.State)
+	}
+	if strings.Contains(string(res.Out), "[mcp_servers.ctr.env]") {
+		t.Errorf("env 헤더를 덧붙였다:\n%s", res.Out)
+	}
+	if !strings.Contains(string(res.Out), "env.FOO = \"bar\"") {
+		t.Errorf("사용자의 점 표기 줄이 사라졌다:\n%s", res.Out)
+	}
+	if !codexTOMLParses(res.Out) {
+		t.Errorf("산출물이 파스되지 않는다:\n%s", res.Out)
+	}
+	// 멱등
+	if again := installCodexConfigBlock(res.Out, codexInstallRequest{Marker: hookMarker("0.17.0")}); again.Changed {
+		t.Errorf("2회차가 무변경이 아니다:\n%s", again.Out)
+	}
+}
+
+// TestCodexDottedEnvJudgmentUnchanged — D90은 **정보만 더한다**. 소유·표식·이상 판정을
+// 손대지 않으므로 uninstall과 probe의 동작이 불변이다.
+func TestCodexDottedEnvJudgmentUnchanged(t *testing.T) {
+	src := "[mcp_servers.ctr]\ncommand = \"context-router\"\nenv.CTR_MANAGED = \"context-router/0.15.0\"\n"
+	out, changed, anomaly := uninstallCodexConfigBlock([]byte(src))
+	if !changed || anomaly != anomalyNone {
+		t.Errorf("uninstall이 바뀌었다: changed=%v anomaly=%d", changed, anomaly)
+	}
+	if strings.Contains(string(out), "mcp_servers.ctr") {
+		t.Errorf("제거가 불완전하다:\n%s", out)
+	}
+	if _, a := probeCodexMCPBlock([]byte(src)); a != anomalyNone {
+		t.Errorf("probe가 바뀌었다: anomaly=%d", a)
+	}
+}
+
+// TestCodexDottedHead — 술어. 입력은 **문자열 밖 공백만 무시한 원문 LHS**다. 전면 정규화된
+// 라인에 걸면 따옴표 안 공백까지 지워져 "e n v"가 env로 읽히고 타인 테이블에 소유가 선다.
+func TestCodexDottedHead(t *testing.T) {
+	cases := []struct{ in, head, rest string }{
+		{`env.FOO = "bar"`, "env", "FOO"},
+		{`env."CTR_MANAGED" = "x"`, "env", "CTR_MANAGED"},
+		{`"env".FOO = "bar"`, "env", "FOO"},
+		{`"env.FOO" = "bar"`, "", ""},   // 단일 키 — 점 경로가 아니다
+		{`"e n v".FOO = "bar"`, "", ""}, // 따옴표 안 공백은 이름의 일부다
+		{`env.A.B = 1`, "env", ""},      // 세 마디 — env 정의로는 세되 표식 자리가 아니다
+		{`command = "x"`, "", ""},
+	}
+	for _, c := range cases {
+		head, rest := tomlDottedEnvKey(c.in)
+		if head != c.head || rest != c.rest {
+			t.Errorf("tomlDottedEnvKey(%q) = (%q,%q), want (%q,%q)", c.in, head, rest, c.head, c.rest)
+		}
+	}
+}

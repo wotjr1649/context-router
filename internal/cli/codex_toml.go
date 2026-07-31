@@ -65,6 +65,7 @@ const (
 	// anomalyOutputInvalid — 우리가 만든 산출물이 파스되지 않았다(D89). 다른 사유와 성격이
 	// 반대다: 나머지는 사용자 파일을 고치라는 지시이고 이것은 **우리 결함의 자수**다.
 	anomalyOutputInvalid
+	anomalyDottedEnv // env 키가 점 표기로 적혀 표식을 쓸 자리가 없다(D90)
 )
 
 // reason — 사용자 문면에 실을 사유(D85). 사유마다 **다른 조치**가 필요하므로 문면이 달라야
@@ -83,6 +84,8 @@ func (a codexAnomaly) reason() string {
 		return "관리 테이블 밖에 ctr 관련 정의가 있습니다 — doctor 스니펫으로 수동 정리한 뒤 재실행하세요"
 	case anomalyOutputInvalid:
 		return "이 도구가 만든 결과가 유효한 TOML이 아니어서 기입하지 않았습니다 — 제품 결함이니 파일 형태와 함께 알려 주세요"
+	case anomalyDottedEnv:
+		return "env 키가 점 표기(env.NAME)로 적혀 있습니다 — [mcp_servers.ctr.env] 테이블로 옮긴 뒤 재실행하세요"
 	}
 	return ""
 }
@@ -347,6 +350,73 @@ func codexKeyName(s string) string {
 		return ""
 	}
 	return strings.Trim(s[:i], `"'`)
+}
+
+// tomlDottedEnvKey — 원문 LHS가 `env.<둘째 마디>` 점 경로인가(D90). head는 첫 마디가 env일 때
+// "env", 아니면 ""다. rest는 마디가 정확히 둘일 때 둘째 마디의 따옴표를 벗긴 이름이고, 마디가
+// 셋 이상이면 ""다 — 그 형태도 env 서브테이블을 정의하지만 표식 자리는 아니다.
+//
+// **입력은 정규화 라인이 아니다.** stripLine은 따옴표 안 공백까지 지우므로 그 결과에 걸면
+// `"e n v".CTR_MANAGED`가 env로 읽히고, 타인 테이블에 우리 표식이 선다. 문자열 밖 공백만
+// 무시한 원문 LHS를 받는다.
+func tomlDottedEnvKey(s string) (head, rest string) {
+	lhs := s
+	if i := tomlTopLevelEq(s); i >= 0 {
+		lhs = s[:i]
+	} else {
+		return "", ""
+	}
+	segs := tomlSplitDotted(lhs)
+	// 따옴표 표기(`"env".FOO`)는 벗기면 같은 키이므로 여기서 인식한다. 반면 첫 마디가
+	// 이스케이프를 담으면 벗겨도 env와 같아지지 않아 아래 비교가 그대로 배제한다 — 이 술어는
+	// codexKeyName과 같이 이스케이프를 해석하지 않으며, 그 형태가 남기는 헤더 중복은 산출물
+	// 유효성 게이트(D89)가 무변경으로 받아 낸다(실측: state=mcpOutputInvalid).
+	if len(segs) < 2 || strings.Trim(segs[0], `"'`) != "env" {
+		return "", ""
+	}
+	if len(segs) != 2 {
+		return "env", ""
+	}
+	return "env", strings.Trim(segs[1], `"'`)
+}
+
+// tomlSplitDotted — LHS를 **따옴표 밖의 '.'**에서 마디로 가른다. 따옴표 안의 '.'는 이름의
+// 일부이므로 단일 키 "env.FOO"가 점 경로로 오인되지 않는다. 각 마디의 앞뒤 공백은 지운다.
+func tomlSplitDotted(s string) []string {
+	var out []string
+	start := 0
+	for i := 0; i < len(s); {
+		switch s[i] {
+		case '"':
+			i += basicStringLen(s[i:])
+		case '\'':
+			i += literalStringLen(s[i:])
+		case '.':
+			out = append(out, strings.TrimSpace(s[start:i]))
+			i++
+			start = i
+		default:
+			i++
+		}
+	}
+	return append(out, strings.TrimSpace(s[start:]))
+}
+
+// tomlTopLevelEq — 따옴표 밖 첫 '='의 위치(없으면 -1). LHS를 자르는 데만 쓴다.
+func tomlTopLevelEq(s string) int {
+	for i := 0; i < len(s); {
+		switch s[i] {
+		case '"':
+			i += basicStringLen(s[i:])
+		case '\'':
+			i += literalStringLen(s[i:])
+		case '=':
+			return i
+		default:
+			i++
+		}
+	}
+	return -1
 }
 
 // tomlKeyTokenHasEscape — 정규화 문자열 s의 **맨 앞이 따옴표 키 표기**이고 그 안에 역슬래시가
@@ -723,11 +793,19 @@ func installCodexConfigBlock(existing []byte, req codexInstallRequest) codexInst
 		}
 		return gateCodexOutput(existing, codexInstallResult{Out: appendBlock(base, body, crlf), State: mcpWritten, Changed: true, Profiles: resultProfiles, ExecExposed: execExposed, TableFound: sp.table.found, InputParses: inputParses})
 	}
+	// D90 — 점 표기 env가 있고 표식을 새로 넣거나 갱신해야 하면 쓸 자리가 없다. 헤더를 붙이면
+	// 같은 논리 테이블이 두 번 정의되고, 점 표기로 쓰면 이전 릴리스 바이너리가 그 파일을 깬다.
+	// 표식이 이미 현재 값이면 이탈하지 않는다 — 고칠 것이 없는 파일에 사유를 내는 오경보다.
+	if view.dottedEnv && !(view.dottedMarkerFound && view.dottedMarker == req.Marker) && marker != req.Marker {
+		return codexInstallResult{Out: existing, State: mcpMarkerAnomaly, TableFound: sp.table.found, Anomaly: anomalyDottedEnv, InputParses: inputParses}
+	}
 	// 무변경 판정(D84): 우리 소유 키 넷의 값이 모두 같고, 새로 만들 테이블도 지울 마커 줄도
 	// 없으면 쓰기와 백업을 생략한다. **키 단위 동치는 바이트 동일을 포함**하므로 호스트가 우리
 	// 테이블을 다른 형태(키 순서·인용·공백·env 표기)로 되썼을 때에도 무변경 재실행마다 .bak이
 	// 생기지 않는다 — 스펙 §1.3-1 ② 게이트의 두 갈래를 한 경로가 함께 만족한다.
-	envMissing := !sp.env.found && view.inlineEnv < 0
+	// 점 표기 env가 이미 그 서브테이블을 정의하므로 헤더를 붙이면 중복 정의다(D90) — 인라인
+	// 대입과 같은 이유로 같은 자리에서 뺀다.
+	envMissing := !sp.env.found && view.inlineEnv < 0 && !view.dottedEnv
 	// keepArgs 갈래에서는 args·enabled_tools를 비교하지 않는다 — 보존하는 값을 비교하면 사용자가
 	// 넓힌 목록이 매 실행 "다르다"로 읽혀 .bak이 매번 새로 생기고 D84 단일 슬롯 계약이
 	// 무의미해진다.
@@ -884,6 +962,12 @@ type codexTableView struct {
 	// inlineEnv — 인라인 env 대입 줄 인덱스(-1이면 없음). 이 줄이 있으면 [mcp_servers.ctr.env]
 	// 헤더를 새로 붙이지 않는다(중복 정의 금지) — 표식은 그 줄 안에서 갈아 끼운다.
 	inlineEnv int
+	// dottedEnv — 구간 안에 점 표기 env.* 키가 있는가, 그중 표식 줄의 값은 무엇인가(D90).
+	// **정보 필드다** — 소유·표식·이상 판정은 이 값을 보지 않으므로 uninstall·probe·라벨의
+	// 동작이 불변이다. 소비자는 installCodexConfigBlock 하나다.
+	dottedEnv         bool
+	dottedMarker      string
+	dottedMarkerFound bool
 	// keep — 우리 소유가 아닌 라인. 원문 그대로 되돌린다.
 	// argsLines·toolsLines — 되읽기 실패 시 keep에 합류해 args·enabled_tools도 원문으로 돌아간다.
 	keep, argsLines, toolsLines []int
@@ -926,6 +1010,22 @@ func codexReadTable(lines [][]byte, sp codexSpan) codexTableView {
 			// 인라인 env 대입은 보존 라인으로 두고 표식만 갈아 끼운다 — 이 줄이 있는데
 			// [mcp_servers.ctr.env] 헤더를 새로 붙이면 중복 정의로 사용자 Codex가 깨진다.
 			view.inlineEnv = e[0]
+		}
+		// D90 — 점 표기 `env.<이름>`도 TOML에서는 mcp_servers.ctr.env를 **정의**한다. 위 switch의
+		// 어느 case에도 걸리지 않으므로 이 줄은 그대로 아래 keep으로 떨어져야 한다 — 형제 case를
+		// 따라 continue로 빼면 사용자의 env 줄이 재기입 때 조용히 사라진다. 술어에 넘기는 것은
+		// **엔트리 첫 줄의 원문**이다(점 표기 키는 한 줄이다): joined는 따옴표 안 공백까지 지운
+		// 정규화라 그것에 걸면 `"e n v"`가 env로 읽혀 타인 테이블에 우리 표식이 선다.
+		if head, rest := tomlDottedEnvKey(trimEOL(lines[e[0]])); head == "env" {
+			view.dottedEnv = true
+			if rest == codexMarkerKey {
+				// 값은 위에서 이미 읽은 values를 그대로 쓴다 — 같은 엔트리를 두 기준으로 읽으면
+				// 그 둘이 갈린다. 문자열이 아닌 값은 ""로 남아 "현재 값이 아니다"로 읽힌다.
+				view.dottedMarkerFound = true
+				if len(values) > 0 {
+					view.dottedMarker = values[0]
+				}
+			}
 		}
 		for i := e[0]; i <= e[1]; i++ {
 			view.keep = append(view.keep, i)
