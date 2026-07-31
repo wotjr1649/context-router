@@ -255,6 +255,45 @@ func TestCodexInstallScopeAndMigration(t *testing.T) {
 	}
 }
 
+// TestCodexMigrationDropsBothMarkers — 구 블록이 두 테이블을 모두 감쌌고 env가 마지막이면
+// 종료 마커가 env 구간 안에 들어 보존 라인으로 옮겨진다. 짝 없는 마커가 남으면 이후
+// 마커 분류가 이상으로 떨어져 그 파일의 마이그레이션 경로가 닫힌다.
+func TestCodexMigrationDropsBothMarkers(t *testing.T) {
+	for _, name := range []string{"정방향", "거울"} {
+		t.Run(name, func(t *testing.T) {
+			// 정방향 — 종료 마커가 env 구간 안(env가 마지막 테이블)
+			src := codexBlockBegin + "\n[mcp_servers.ctr]\ncommand = \"context-router\"\n\n[mcp_servers.ctr.env]\nCTR_MANAGED = \"context-router/0.15.0\"\n" + codexBlockEnd + "\n"
+			if name == "거울" {
+				// **시작 마커가 env 구간 안**이어야 한다. 두 테이블 순서만 바꾸면 시작 마커가
+				// 첫 헤더보다 앞에 남아 drop 맵이 이미 지우므로 수정 전에도 통과한다.
+				src = "[mcp_servers.ctr.env]\n" + codexBlockBegin + "\nCTR_MANAGED = \"context-router/0.15.0\"\n\n[mcp_servers.ctr]\ncommand = \"context-router\"\n" + codexBlockEnd + "\n"
+			}
+			res := installCodexConfigBlock([]byte(src), codexInstallRequest{Marker: hookMarker("0.17.0")})
+			if strings.Contains(string(res.Out), codexBlockBegin) || strings.Contains(string(res.Out), codexBlockEnd) {
+				t.Errorf("마커가 남았다:\n%s", res.Out)
+			}
+			if !codexTOMLParses(res.Out) {
+				t.Errorf("산출물이 파스되지 않는다:\n%s", res.Out)
+			}
+			// 멱등 — 바이트를 바꾸는 변환이므로 재실행이 무변경이어야 D84 단일 백업 슬롯이
+			// 2회차에 원본을 잃지 않는다.
+			again := installCodexConfigBlock(res.Out, codexInstallRequest{Marker: hookMarker("0.17.0")})
+			if !bytes.Equal(res.Out, again.Out) || again.Changed {
+				t.Errorf("마이그레이션 결과가 멱등이 아니다(changed=%v):\n1: %s\n2: %s", again.Changed, res.Out, again.Out)
+			}
+		})
+	}
+}
+
+// TestCodexEnvBodyKeepsUserComment — 무효값을 넘기는 호출부에서 구간 첫 줄이 지워지면 안 된다.
+func TestCodexEnvBodyKeepsUserComment(t *testing.T) {
+	src := "[mcp_servers.ctr]\ncommand = \"context-router\"\n\n[mcp_servers.ctr.env]\n# 사용자 주석\nUSER = \"keep\"\n"
+	res := installCodexConfigBlock([]byte(src), codexInstallRequest{Marker: hookMarker("0.17.0")})
+	if !strings.Contains(string(res.Out), "# 사용자 주석") || !strings.Contains(string(res.Out), "USER = \"keep\"") {
+		t.Errorf("보존 라인이 사라졌다:\n%s", res.Out)
+	}
+}
+
 // TestCodexInstallProfileReadback — D81 Codex 갈래의 되읽기(§2-7). 무플래그 재설치는 기존
 // args를 프로필 집합으로 되읽어 args와 enabled_tools를 **함께** 재조립하고, 되읽지 못하는
 // args에서는 두 키를 **둘 다** 손대지 않는다.
@@ -608,7 +647,7 @@ func TestCodexTableBodyPreservesUnownedKeys(t *testing.T) {
 	esrc := "[mcp_servers.ctr.env]\nCTR_MANAGED = \"context-router/0.14.0\"\nCTR_STORE_ROOT = \"D:/ctr\"\n"
 	elines := splitLinesKeepEnds([]byte(esrc))
 	esp := codexManagedSpans(elines)
-	ebody := string(codexEnvBody(elines, esp.env, "context-router/0.15.0", "\n"))
+	ebody := string(codexEnvBody(elines, esp.env, "context-router/0.15.0", "\n", -1, -1))
 	if !strings.Contains(ebody, "CTR_MANAGED = \"context-router/0.15.0\"\n") {
 		t.Errorf("표식이 현재 값으로 갱신되지 않았다:\n%s", ebody)
 	}
@@ -675,7 +714,7 @@ func TestCodexTableBodyPreservesUnownedKeys(t *testing.T) {
 	fesrc := "[mcp_servers.ctr.env]\n\"CTR_MANAGED=x\" = \"y\"\nCTR_MANAGED = \"context-router/0.14.0\"\n"
 	felines := splitLinesKeepEnds([]byte(fesrc))
 	fesp := codexManagedSpans(felines)
-	febody := string(codexEnvBody(felines, fesp.env, "context-router/0.15.0", "\n"))
+	febody := string(codexEnvBody(felines, fesp.env, "context-router/0.15.0", "\n", -1, -1))
 	if !strings.Contains(febody, "\"CTR_MANAGED=x\" = \"y\"\n") {
 		t.Errorf("codexEnvBody에서 따옴표 키 오분류로 사용자 줄이 사라졌다:\n%s", febody)
 	}
