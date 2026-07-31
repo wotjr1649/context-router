@@ -259,18 +259,27 @@ func TestCodexInstallScopeAndMigration(t *testing.T) {
 // 종료 마커가 env 구간 안에 들어 보존 라인으로 옮겨진다. 짝 없는 마커가 남으면 이후
 // 마커 분류가 이상으로 떨어져 그 파일의 마이그레이션 경로가 닫힌다.
 func TestCodexMigrationDropsBothMarkers(t *testing.T) {
+	// keep — **env 구간 안**의 사용자 엔트리. 마커와 표식뿐인 픽스처였다면 제외 조건을 넓혀도
+	// (예: 마커 두 줄 사이를 통째로) 마커·파스·멱등 셋이 모두 통과해, 사용자 설정을 지우는
+	// 방향이 무방비가 된다. **여러 줄 값**으로 둔 것은 파스 단정에도 이빨을 주기 위해서다 —
+	// 남은 마커는 TOML 주석이라 그것만으로는 파스가 깨지지 않지만, 제외가 엔트리 경계를 자르면
+	// 삼중 따옴표 잔해가 남아 그때 깨진다.
+	const keep = "CTR_KEEP = \"\"\"\nkeep-me\n\"\"\"\n"
 	for _, name := range []string{"정방향", "거울"} {
 		t.Run(name, func(t *testing.T) {
 			// 정방향 — 종료 마커가 env 구간 안(env가 마지막 테이블)
-			src := codexBlockBegin + "\n[mcp_servers.ctr]\ncommand = \"context-router\"\n\n[mcp_servers.ctr.env]\nCTR_MANAGED = \"context-router/0.15.0\"\n" + codexBlockEnd + "\n"
+			src := codexBlockBegin + "\n[mcp_servers.ctr]\ncommand = \"context-router\"\n\n[mcp_servers.ctr.env]\nCTR_MANAGED = \"context-router/0.15.0\"\n" + keep + codexBlockEnd + "\n"
 			if name == "거울" {
 				// **시작 마커가 env 구간 안**이어야 한다. 두 테이블 순서만 바꾸면 시작 마커가
 				// 첫 헤더보다 앞에 남아 drop 맵이 이미 지우므로 수정 전에도 통과한다.
-				src = "[mcp_servers.ctr.env]\n" + codexBlockBegin + "\nCTR_MANAGED = \"context-router/0.15.0\"\n\n[mcp_servers.ctr]\ncommand = \"context-router\"\n" + codexBlockEnd + "\n"
+				src = "[mcp_servers.ctr.env]\n" + codexBlockBegin + "\nCTR_MANAGED = \"context-router/0.15.0\"\n" + keep + "\n[mcp_servers.ctr]\ncommand = \"context-router\"\n" + codexBlockEnd + "\n"
 			}
 			res := installCodexConfigBlock([]byte(src), codexInstallRequest{Marker: hookMarker("0.17.0")})
 			if strings.Contains(string(res.Out), codexBlockBegin) || strings.Contains(string(res.Out), codexBlockEnd) {
 				t.Errorf("마커가 남았다:\n%s", res.Out)
+			}
+			if !strings.Contains(string(res.Out), keep) {
+				t.Errorf("마커를 빼면서 env 구간의 사용자 엔트리까지 지웠다:\n%s", res.Out)
 			}
 			if !codexTOMLParses(res.Out) {
 				t.Errorf("산출물이 파스되지 않는다:\n%s", res.Out)
@@ -291,6 +300,12 @@ func TestCodexEnvBodyKeepsUserComment(t *testing.T) {
 	res := installCodexConfigBlock([]byte(src), codexInstallRequest{Marker: hookMarker("0.17.0")})
 	if !strings.Contains(string(res.Out), "# 사용자 주석") || !strings.Contains(string(res.Out), "USER = \"keep\"") {
 		t.Errorf("보존 라인이 사라졌다:\n%s", res.Out)
+	}
+	// 이 픽스처도 바이트를 바꾼다(표식이 없어 CTR_MANAGED·enabled_tools가 새로 붙는다) —
+	// D84 단일 백업 슬롯이 2회차 무변경 위에 서므로 같은 게이트를 건다.
+	again := installCodexConfigBlock(res.Out, codexInstallRequest{Marker: hookMarker("0.17.0")})
+	if !bytes.Equal(res.Out, again.Out) || again.Changed {
+		t.Errorf("보존 갈래 재실행이 멱등이 아니다(changed=%v):\n1: %s\n2: %s", again.Changed, res.Out, again.Out)
 	}
 }
 
