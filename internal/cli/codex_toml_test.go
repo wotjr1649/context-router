@@ -1295,13 +1295,13 @@ func TestCodexInstallOutputAlwaysParses(t *testing.T) {
 			t.Errorf("[%d] 정상 입력에서 게이트가 오발화했다:\n%s", i, src)
 			continue
 		}
-		// 입력이 이미 무효인 행(중복 헤더·닫히지 않은 값)에는 산출물 파스를 요구할 수 없다 —
+		// 입력이 이미 무효인 행(중복 헤더·닫히지 않은 값)에는 **산출물 파스만** 요구하지 않는다 —
 		// 그 무효는 우리가 들인 것이 아니고 게이트의 비대칭 절이 그 행을 통과시킨다. 위 오발화
 		// 단정은 그 행에도 그대로 걸리므로 비대칭 절을 되돌리면 여기서 물린다.
-		if !codexTOMLParses([]byte(src)) {
-			continue
-		}
-		if !codexTOMLParses(res.Out) {
+		// **아래 멱등·제거 단정은 그 행에도 그대로 건다**: 무효 입력이면서 바이트를 바꾸는 행이
+		// 실재하고(인라인 표식 되쓰기 둘), 2회차가 무변경이 아니면 D84 단일 백업 슬롯이 2회차에
+		// 원본을 잃는다 — 입력의 유효성과 무관한 계약이다.
+		if codexTOMLParses([]byte(src)) && !codexTOMLParses(res.Out) {
 			t.Errorf("[%d] 산출물이 파스되지 않는다:\n%s", i, res.Out)
 		}
 		// 멱등(Global Constraints) — 바이트를 바꾸는 픽스처는 2회차가 무변경이어야 한다.
