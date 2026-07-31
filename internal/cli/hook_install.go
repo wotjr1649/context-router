@@ -742,9 +742,14 @@ func runHookInstallCodex(user, noShadow, storeRootExplicit bool, storeRootRaw, p
 	if err := atomicWriteFile(path, merged); err != nil {
 		return errors.New("hook install: 설정 쓰기 실패")
 	}
-	// installCodexConfigBlock은 상태만 돌려주므로 구간 사유를 따로 읽는다 — 순수 함수의 재호출로
-	// 부작용이 없고, res.State가 mcpMarkerAnomaly가 아닌 갈래에서는 쓰이지 않는다.
-	_, cfgAnomaly := probeCodexMCPBlock(cfgExisting)
+	// 사유는 결과가 실은 것을 **우선**한다(D89) — install만 아는 이탈(게이트·점 표기)은
+	// probe가 알지 못하므로 probe의 사유로 덮으면 빈 문자열이 나간다. 결과가 사유를 싣지 않는
+	// 갈래에서만 probe를 읽는다: 구간 밖 충돌은 install이 상태만 내고 사유는 probe에만 있다.
+	// probe는 순수 함수라 이 재호출에 부작용이 없다.
+	cfgAnomaly := res.Anomaly
+	if cfgAnomaly == anomalyNone {
+		_, cfgAnomaly = probeCodexMCPBlock(cfgExisting)
+	}
 	reportCodexMCPState(stdout, res.State, cfgAnomaly)
 	if res.State == mcpWritten {
 		// D81 — 승인 모드 키는 기입하지 않는다. 예전에는 관리 블록의 주석 한 줄로 권했으나

@@ -2106,8 +2106,11 @@ type codexVerdict struct {
 // 있다** — "같은 인자로 부른다"를 호출자의 규율로 두면 다음 변경에서 한쪽이 빠지고, 그러면
 // 요청 필드 축으로 감지와 고침이 다시 갈린다(D86의 MarkerOnly가 그 축이다).
 // 이 함수는 그 자체로 판정하지 않는다 — **권고에 쓰이는 State·TableFound·Changed·Out은
-// installCodexConfigBlock 하나에서 오고**, 라벨 전용 Anomaly·Marker·Command는 같은 바이트를
-// 다시 읽는 두 순수 판독기(probeCodexMCPBlock·codexConfigMarker)에서 온다. 셋 모두 같은
+// installCodexConfigBlock 하나에서 오고**, 라벨 전용 Marker·Command는 같은 바이트를 다시 읽는
+// 순수 판독기(codexConfigMarker)에서 온다. 라벨 전용 Anomaly는 결과가 실은 사유를 **우선**하고
+// 그것이 없을 때만 probeCodexMCPBlock을 읽는다(D89) — install만 아는 이탈은 probe가 알지 못하고
+// 구간 밖 충돌은 반대로 probe에만 사유가 있어, 한쪽만 읽으면 사유 하나가 판정값에서 사라진다.
+// 셋 모두 같은
 // 바이트에서 codexManagedSpans를 다시 도출하므로 값은 일치한다. installCodexConfigBlock이
 // 순수 변환(파일 IO 없음)이라는 것이 읽기 전용 경로에서 부를 수 있는 근거이며, 스펙 §1.3
 // 게이트 1이 그것을 확인한다.
@@ -2115,7 +2118,10 @@ func codexRegistrationVerdict(data []byte, version string) codexVerdict {
 	res := installCodexConfigBlock(data, codexInstallRequest{
 		Marker: hookMarker(version), MarkerOnly: true,
 	})
-	_, anomaly := probeCodexMCPBlock(data)
+	anomaly := res.Anomaly
+	if anomaly == anomalyNone {
+		_, anomaly = probeCodexMCPBlock(data)
+	}
 	marker, command, _ := codexConfigMarker(data)
 	return codexVerdict{
 		State: res.State, Anomaly: anomaly, TableFound: res.TableFound,
