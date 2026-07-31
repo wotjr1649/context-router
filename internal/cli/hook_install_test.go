@@ -971,6 +971,7 @@ func TestCodexHooksPathCodexHome(t *testing.T) {
 
 // e2e: hook install --codex가 파일 생성 + 신뢰 승인 안내를 출력한다.
 func TestRunHookInstallCodex(t *testing.T) {
+	isolateCodexHome(t) // config.toml은 스코프 무관 CODEX_HOME/홈 — 공유 임시 홈 오염 차단
 	root := t.TempDir()
 	var out bytes.Buffer
 	if err := runHookInstall([]string{"--codex"}, "", "", false, root, "0.4.0", &out); err != nil {
@@ -1017,6 +1018,7 @@ func TestIsOurCodexGroupEdges(t *testing.T) {
 // e2e: hook uninstall --codex run 분기(v0.4 최종 리뷰 이월 — 기존 커버는 merge 레벨만) —
 // install 산출물에서 자기 그룹만 제거, 선존 외래 그룹 보존, 제거 완료 안내 출력.
 func TestRunHookUninstallCodex(t *testing.T) {
+	isolateCodexHome(t) // config.toml은 스코프 무관 CODEX_HOME/홈 — 공유 임시 홈 오염 차단
 	root := t.TempDir()
 	foreign := []byte(`{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"pwsh -File policy.ps1","timeout":10}]}]}}`)
 	if err := os.MkdirAll(filepath.Join(root, ".codex"), 0o755); err != nil {
@@ -1049,6 +1051,7 @@ func TestRunHookUninstallCodex(t *testing.T) {
 
 // e2e: hook uninstall --codex 파일 미존재 no-op 분기 — 안내만 출력, 오류·파일 생성 없음.
 func TestRunHookUninstallCodexNoFile(t *testing.T) {
+	isolateCodexHome(t) // config.toml은 스코프 무관 CODEX_HOME/홈 — 공유 임시 홈 오염 차단
 	root := t.TempDir()
 	var out bytes.Buffer
 	if err := runHookUninstall([]string{"--codex"}, root, &out); err != nil {
@@ -1177,7 +1180,8 @@ func TestHookUninstallCodexNotOwned(t *testing.T) {
 			if err := runHookUninstallCodex(false, t.TempDir(), &buf); err != nil {
 				t.Fatalf("uninstall 실패: %v", err)
 			}
-			got := strings.Contains(buf.String(), "MCP 등록 제거 보류")
+			// 사유까지 특정한다 — 여섯 사유가 공유하는 접두만 보면 엉뚱한 사유가 나가도 초록이다.
+			got := strings.Contains(buf.String(), anomalyNotOwned.reason())
 			if got != c.wantMsg {
 				t.Errorf("문면=%v want %v\n%s", got, c.wantMsg, buf.String())
 			}
