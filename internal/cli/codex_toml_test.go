@@ -945,6 +945,57 @@ func TestCodexInstallAnomalyChannel(t *testing.T) {
 	}
 }
 
+// codexGateFixture — 게이트가 실제로 물리는 **정본 형태**. 이스케이프를 담은 헤더 이름은
+// TOML이 mcp_servers.ctr로 읽지만 우리 스캐너는 리터럴로 비교해 우리 구간으로 잡지 못하고,
+// ctrKeySignal의 리터럴 여섯에도 걸리지 않아 충돌로도 서지 않는다. 그래서 install이
+// [mcp_servers.ctr]를 append하고 같은 논리 테이블이 두 번 정의된다.
+// **입력 자체는 유효 TOML이다**(r는 TOML 1.0의 유효 이스케이프) — 게이트의 비대칭
+// 계약이 성립하는 형태다. 관리 테이블이 잡히지 않으므로 append 경로로 나간다.
+const codexGateFixture = "[mcp_servers.\"ct\\u0072\"]\ncommand = \"other\"\n"
+
+// TestCodexInstallOutputInvalidGate — D89. 입력은 파스되는데 산출물이 파스되지 않으면
+// 무변경으로 이탈하고 새 상태·고정 사유를 낸다.
+func TestCodexInstallOutputInvalidGate(t *testing.T) {
+	if !codexTOMLParses([]byte(codexGateFixture)) {
+		t.Fatalf("픽스처 입력이 파스되지 않는다 — 비대칭 계약을 잴 수 없다")
+	}
+	res := installCodexConfigBlock([]byte(codexGateFixture), codexInstallRequest{Marker: hookMarker("0.17.0")})
+	if res.State != mcpOutputInvalid {
+		t.Fatalf("state=%d want mcpOutputInvalid", res.State)
+	}
+	// 스펙 §3 표4 — 그 상태의 결과 필드값
+	if string(res.Out) != codexGateFixture {
+		t.Errorf("산출이 입력과 다르다 — 무변경 이탈이어야 한다:\n%s", res.Out)
+	}
+	if res.Changed {
+		t.Errorf("Changed=true — 쓰기·백업을 함께 생략해야 한다")
+	}
+	if res.TableFound {
+		t.Errorf("TableFound=true — 이 입력에는 우리 구간이 없다")
+	}
+	if res.Profiles != nil || res.ArgsKept || res.ExecExposed {
+		t.Errorf("기입하지 않았는데 기입 결과 필드가 찼다: profiles=%v argsKept=%v exec=%v", res.Profiles, res.ArgsKept, res.ExecExposed)
+	}
+	if res.Anomaly != anomalyOutputInvalid {
+		t.Errorf("Anomaly=%d want anomalyOutputInvalid", res.Anomaly)
+	}
+}
+
+// TestCodexInstallGateAsymmetry — 게이트의 **비대칭 절**. 입력이 이미 무효면 게이트는
+// 작동하지 않는다 — 산출물의 무효는 우리가 들인 것이 아니므로 되돌려도 이득이 없다.
+// (`bytes.Equal` 단축은 파스 횟수 전용이라 반환값으로 관측할 수 없다 — 단정 대상이 아니다.)
+func TestCodexInstallGateAsymmetry(t *testing.T) {
+	// 입력이 이미 무효(같은 테이블 안 키 두 번)이지만 우리 구간이 없어 append 갈래로 나간다.
+	src := "[other]\nx = 1\nx = 2\n"
+	if codexTOMLParses([]byte(src)) {
+		t.Fatalf("픽스처 입력이 파스된다 — 비대칭 절을 잴 수 없다")
+	}
+	res := installCodexConfigBlock([]byte(src), codexInstallRequest{Marker: hookMarker("0.17.0")})
+	if res.State != mcpWritten || !res.Changed {
+		t.Errorf("state=%d changed=%v — 무효 입력에서 게이트가 작동했다", res.State, res.Changed)
+	}
+}
+
 // TestCodexInstallMarkerOnly — D86(§2-3·§2-4·§2-5·§2-8). 표식 전용 갈래는 args·enabled_tools를
 // 원문으로 보존하고 표식과 command만 맞춘다. **args는 우리 형식이어야 한다** — 우리 형식이
 // 아니면 profilesFromArgs가 ok=false를 내 D81의 되읽기 실패 경로가 이미 두 값을 보존하므로,
@@ -1137,5 +1188,131 @@ func TestCodexInlineMarkerInsideStringValue(t *testing.T) {
 				t.Fatalf("사용자 값을 건드렸다: changed=%v\ngot =%q\nwant=%q", res.Changed, res.Out, c.src)
 			}
 		})
+	}
+}
+
+// TestCodexInstallOutputAlwaysParses — §1.3 사후 게이트 5. 우리 정상 산출물이 지정 파서를
+// 통과해야 한다. 새 파서는 종전 후보보다 엄격하므로 산출물 거부 방향의 회귀가 새로 열리고,
+// 그 회귀는 install을 영구 무변경으로 만든다.
+// **목록은 손으로 고른 다섯이 아니다** — 이 파일의 표 주도 테스트(TestInstallCodexConfigBlock·
+// TestUninstallCodexConfigBlock·TestProbeCodexMCPBlock·TestCodexEscapedManagedKey·
+// TestCodexInlineMarker* 계열)와 그 지역 픽스처를 훑어 합쳤다. 같은 갈래를 두 번 재는 행은
+// 접었지만 **우리가 사용자 줄 안의 바이트를 되쓰는 행은 접지 않는다** — 게이트가 물 위험이
+// 실제로 있는 자리가 거기이고, 파일 수준에서 append만 하는 행들과 달리 산출물의 유효성이
+// 보존 바이트에 달려 있다.
+func TestCodexInstallOutputAlwaysParses(t *testing.T) {
+	srcs := []string{
+		// ① 브리프의 기본 다섯
+		"",
+		"[mcp_servers.ctr]\ncommand = \"context-router\"\n",
+		"[other]\nx = 1\n",
+		"[mcp_servers.ctr]\ncommand = \"context-router\"\nenv = { CTR_MANAGED = \"context-router/0.15.0\" }\n",
+		"[mcp_servers.ctr]\ncommand = \"context-router\"\n\n[mcp_servers.ctr.env]\nCTR_MANAGED = \"context-router/0.15.0\"\nUSER = \"keep\"\n",
+		// ② TestInstallCodexConfigBlock의 existing — append 갈래의 파일 수준 형태
+		"a = 1\n",
+		"a = 1",     // 무개행 EOF
+		"a = 1\r\n", // CRLF 지배
+		"a = 1\n\n" + ctrTableFixture,
+		"[mcp_servers]\nfoo = { command = \"x\" }\n",                          // 이미 정의된 부모 아래 서브테이블
+		"[mcp_servers.chrome]\ncommand = \"x\"\n# electron debugging notes\n", // 오탐 회피 대표
+		"[mcp_servers.ctr-exec]\ncommand = \"context-router\"\nargs = [\"--enable\", \"exec\"]\nenabled_tools = [\"ctr_execute\", \"ctr_execute_file\"]\ndefault_tools_approval_mode = \"prompt\"\n",
+		"[mcp_servers.ctr.env]\nCTR_MANAGED = \"context-router/0.14.0\"\n",                                     // 부모 없는 env — 산출이 순서 역전
+		"[mcp_servers.ctr]\ncommand = \"context-router\"\nargs = []\n",                                         // 인수(표식 없는 우리 테이블)
+		"[mcp_servers.ctr]\ncommand = \"old\"\n",                                                               // mcpExistingHeader 무변경
+		"[mcp_servers.\"ctr\"]\ncommand = \"x\"\n",                                                             // 충돌 — 따옴표 키
+		"mcp_servers.ctr = { command = \"x\" }\n",                                                              // 충돌 — 인라인 대입
+		"[mcp_servers]\nctr.command = \"x\"\n",                                                                 // 충돌 — 점표기
+		"mcp_servers = { foo = { command = \"x\" } }\n",                                                        // 충돌 — 루트 인라인
+		"[mcp_servers.ctr]\ncommand = \"context-router\"\n[x]\n[mcp_servers.ctr]\n",                            // 무효 입력 — 중복 헤더
+		"[mcp_servers.ctr]\ncommand = \"context-router\"\n[mcp_servers.ctr.env]\n[y]\n[mcp_servers.ctr.env]\n", // 무효 입력 — env 중복
+		// ③ TestUninstallCodexConfigBlock의 existing
+		"a = 1\n" + ctrTableFixture + "[b]\nx = 1\n",
+		"a = 1\n\n\n" + ctrTableFixture,
+		"[mcp_servers.ctr]\ncommand = \"other\"\n[mcp_servers.ctr.env]\nCTR_MANAGED = \"context-router/0.14.0\"\n",
+		// 구 마커가 우리 관리 테이블을 감싼 **마이그레이션 입력**. 우리가 실제로 내보내는 산출물
+		// 중 눈금 테스트가 덮지 않은 유일한 형태다 — 마커 두 줄을 지우고 되쓰는 갈래가 여기서만
+		// 산출을 만든다.
+		codexBlockBegin + "\n[mcp_servers.ctr]\ncommand = \"context-router\"\n[hooks.state]\ntrust = \"abc\"\n" + codexBlockEnd + "\n",
+		// 블록이 **우리 테이블만** 감싼 형태 — END가 우리 구간 안이라 keep에서 빼는 갈래를 탄다.
+		codexBlockBegin + "\n[mcp_servers.ctr]\ncommand = \"context-router\"\nargs = []\nenabled_tools = [\"ctr_search\"]\n" + codexBlockEnd + "\n[tui]\ntheme = \"dark\"\n",
+		// ④ TestProbeCodexMCPBlock의 in
+		ctrTableFixture,
+		"[model]\nname = \"gpt\"\n",
+		"mcp_servers = { ctr = { command = \"other\" } }\n" + ctrTableFixture, // 구간 밖 충돌
+		"[mcp_servers.ctr-exec]\ncommand = \"context-router\"\n",
+		"[mcp_servers.ctr]\n[x]\n[mcp_servers.ctr]\nk = \"\"\"\nunclosed\n", // 무효 입력 — 스캐너 열림
+		// ⑤ TestCodexEscapedManagedKey의 src — 우리 구간 **안**의 보존 바이트. 그 표는
+		// anomalyNone 행에서 install을 부르지 않으므로 이 행들이 산출을 만드는 것은 여기가 처음이다.
+		"[mcp_servers.ctr]\ncommand = \"C:\\\\bin\\\\context-router.exe\"\n",
+		"[mcp_servers.ctr]\ncommand = \"context-router\"\nenv = { CTR_STORE_ROOT = \"C:\\\\ctr\\\\store\" }\n",
+		"[mcp_servers.ctr]\ncommand = \"context-router\"\nenv = { FLAGS = '--a, \"C:\\t\" z' }\n",
+		"[mcp_servers.ctr]\ncommand = \"context-router\"\nenv = { A = \"1\" } # TODO: , \"C:\\t\" = 2\n",
+		"[mcp_servers.ctr]\n'command' = \"context-router\"\n",
+		"[other]\n\"comm\\u0061nd\" = \"x\"\n[mcp_servers.ctr]\ncommand = \"context-router\"\n",
+		"[mcp_servers.ctr]\ncommand = \"context-router\"\nargs = [\"--store-root\", \"C:\\\\ctr\\\\store\"]\n",
+		"[mcp_servers.ctr]\ncommand = \"context-router\"\nnote = \"\"\"\n\"comm\\u0061nd\" = \"x\"\n\"\"\"\n",
+		"[mcp_servers.ctr]\ncommand = \"context-router\"\nx = 1 # , \"comm\\u0061nd\" = 2\n",
+		"[mcp_servers.ctr]\ncommand = \"context-router\"\nk = ', \"comm\\u0061nd\" = 1'\n",
+		"[mcp_servers.ctr]\n\"comm\\u0061nd\" = \"other\"\n", // 이상 — 무변경
+		// ⑥ 인라인 표식 되쓰기 — 우리가 **사용자 줄 안의 바이트**를 치환하는 갈래.
+		// TestCodexInlineMarkerNonStringValue·TestCodexInlineMarkerInsideStringValue의 src와
+		// TestCodexTableBodyPreservesUnownedKeys의 지역 픽스처.
+		"[mcp_servers.ctr]\ncommand = \"context-router\"\nenv = { CTR_MANAGED = 0 }\n",
+		"[mcp_servers.ctr]\ncommand = \"context-router\"\nenv = { CTR_MANAGED = 0, PATH = \"/x\" }\n",
+		"[mcp_servers.ctr]\ncommand = \"context-router\"\nenv = { CTR_MANAGED = 'a,b}', X = 1 }\n",
+		"[mcp_servers.ctr]\ncommand = \"context-router\"\nenv = { CTR_MANAGED = [1,\n2] }\n",
+		"[mcp_servers.ctr]\ncommand = \"context-router\"\nenv = { CTR_MANAGED = 0 # a, b\n", // 무효 입력 — 닫히지 않은 인라인
+		"[mcp_servers.ctr]\ncommand = \"context-router\"\nenv = { A = \"x, CTR_MANAGED = 0, y\", B = 1 }\n",
+		"[mcp_servers.ctr]\ncommand = \"context-router\"\nenv = { A = 'x, CTR_MANAGED = \"0\", y', B = 1 }\n",
+		"[mcp_servers.ctr]\ncommand = \"context-router\"\nenv = { CTR_STORE_ROOT = \"context-router/0.14.0\", CTR_MANAGED = \"context-router/0.14.0\" }\n",
+		"[mcp_servers.ctr]\ncommand = \"context-router\"\nenv = {} # }\n",
+		"[mcp_servers.ctr]\ncommand = \"context-router\"\nenv = { \"CTR_MANAGED\" = \"context-router/0.14.0\" }\n",
+		"[mcp_servers.ctr]\ncommand = \"context-router\"\nenv = { CTR_MANAGED = \"\n", // 무효 입력 — 미종료 문자열
+		// ⑦ 재직렬화·보존 갈래(TestCodexInstallMarkerOnly 계열·TestCodexInstallScopeAndMigration·
+		// TestCodexInstallProfileReadback·TestCodexTableBodyPreservesUnownedKeys의 지역 픽스처).
+		"[mcp_servers.ctr]\ncommand = \"context-router\"\nargs = [\"--enable\", \"ingest\"]\nenabled_tools = [\"ctr_search\", \"ctr_index\", \"ctr_execute\"]\n[mcp_servers.ctr.env]\nCTR_MANAGED = \"context-router/0.15.0\"\n",
+		"[mcp_servers.ctr]\ncommand=\"context-router\"\nargs=[\"--enable\",\"ingest\"]\nenabled_tools=[\"ctr_search\",\"ctr_index\"]\n[mcp_servers.ctr.env]\nCTR_MANAGED=\"context-router/0.16.0\"\n",
+		"[mcp_servers.ctr]\ncommand = \"C:\\\\bin\\\\context-router.exe\"\nargs = [\"--enable\", \"ingest,net\"]\nenabled_tools = [\"ctr_search\"]\n[mcp_servers.ctr.env]\nCTR_MANAGED = \"context-router/0.15.0\"\n",
+		"[mcp_servers.ctr]\ncommand = \"context-router\"\nargs = [\"--profile\", \"global-search\"]\nenabled_tools = [\"custom\"]\n", // 되읽기 실패 — keepArgs 보존
+		"[mcp_servers.ctr]\ncommand = \"context-router\"\nargs = []\nenabled_tools = [\"ctr_search\"]\ndefault_tools_approval_mode = \"prompt\"\nstartup_timeout_sec = 30\n",
+		"[mcp_servers.ctr]\ncommand = \"context-router\"\n\"args=x\" = \"y\"\nreal_user_key = 1\n",          // T3-F1 따옴표 키
+		"[mcp_servers.ctr.env]\n\"CTR_MANAGED=x\" = \"y\"\nCTR_MANAGED = \"context-router/0.14.0\"\n",       // T3-F1 넷째 경로
+		"[mcp_servers.ctr]\ncommand = \"other\"\n[mcp_servers.ctr.env]\nCTR_MANAGED = \"other-tool/1.0\"\n", // 사용자 소유
+		"[mcp_servers.ctr]\ncommand = \"other\"\n[mcp_servers.ctr.env]\nCTR_MANAGED = \"\"\n",
+		"[mcp_servers.ctr]\ncommand = \"other\"\nenv = { CTR_MANAGED = 0, X = \"context-router/0.15.0\" }\n",
+		// 우리 테이블 안·남의 테이블 안 여러 줄 값(§2-2 경계 오인 양방향)
+		"[mcp_servers.ctr]\ncommand = \"context-router\"\nnote = \"\"\"\n[mcp_servers.fake]\n\"\"\"\n[mcp_servers.user]\ncommand = \"user-cmd\"\nblob = '''\n[mcp_servers.also_fake]\n'''\n",
+		// 두 관리 테이블 사이에 사용자 테이블이 낀 재직렬화 형태
+		"[mcp_servers.ctr]\ncommand = \"context-router\"\nargs = [\"--enable\", \"ingest,net\"]\nenabled_tools = [\"ctr_search\"]\ndefault_tools_approval_mode = \"prompt\"\n[mcp_servers.between]\ncommand = \"between-cmd\"\n[mcp_servers.ctr.env]\nCTR_MANAGED = \"context-router/0.14.0\"\nCTR_STORE_ROOT = \"D:/ctr\"\n[hooks.state]\ntrust = \"abc123\"\n[tui]\ntheme = \"dark\"\n",
+		// 여러 줄 문자열 **내용**이 마커 줄 — 소유 오판 방지(C1)
+		"[history]\nnotes = \"\"\"\n" + codexBlockBegin + "\n\"\"\"\n\n[mcp_servers.ctr]\ncommand = \"/opt/mine/my-wrapper\"\nargs = [\"--serve\"]\n" + codexBlockEnd + "\n",
+		// 우리 구간 안에 닫히지 않은 '[' — 무효 입력(A2)
+		"[mcp_servers.ctr.env]\nCTR_MANAGED = \"context-router/0.15.0\"\nLIST = [\n",
+	}
+	for i, src := range srcs {
+		res := installCodexConfigBlock([]byte(src), codexInstallRequest{Marker: hookMarker("0.17.0")})
+		if res.State == mcpOutputInvalid {
+			t.Errorf("[%d] 정상 입력에서 게이트가 오발화했다:\n%s", i, src)
+			continue
+		}
+		// 입력이 이미 무효인 행(중복 헤더·닫히지 않은 값)에는 산출물 파스를 요구할 수 없다 —
+		// 그 무효는 우리가 들인 것이 아니고 게이트의 비대칭 절이 그 행을 통과시킨다. 위 오발화
+		// 단정은 그 행에도 그대로 걸리므로 비대칭 절을 되돌리면 여기서 물린다.
+		if !codexTOMLParses([]byte(src)) {
+			continue
+		}
+		if !codexTOMLParses(res.Out) {
+			t.Errorf("[%d] 산출물이 파스되지 않는다:\n%s", i, res.Out)
+		}
+		// 멱등(Global Constraints) — 바이트를 바꾸는 픽스처는 2회차가 무변경이어야 한다.
+		if res.Changed {
+			if again := installCodexConfigBlock(res.Out, codexInstallRequest{Marker: hookMarker("0.17.0")}); again.Changed {
+				t.Errorf("[%d] 2회차가 무변경이 아니다:\n%s", i, again.Out)
+			}
+		}
+		// 제거 산출물도 파스돼야 한다 — 스펙 §1.3 사후 5는 install·uninstall 둘 다 요구한다.
+		if out, changed, _ := uninstallCodexConfigBlock([]byte(src)); changed && !codexTOMLParses(out) {
+			t.Errorf("[%d] 제거 산출물이 파스되지 않는다:\n%s", i, out)
+		}
 	}
 }

@@ -36,6 +36,7 @@ const (
 	mcpExistingHeader                      // 표식도 없고 command도 우리 것이 아닌 [mcp_servers.ctr] 실존 — 기입 생략·MCP 확정
 	mcpConflict                            // 우리 두 구간 **밖**의 중복 정의 신호 — 기입 생략·MCP 미확정
 	mcpMarkerAnomaly                       // 구간 판정 불가(codexAnomaly의 어느 사유든) — 무변경·MCP 미확정
+	mcpOutputInvalid                       // 산출물이 파스되지 않아 기입하지 않았다(D89) — 무변경·MCP 미확정
 )
 
 type markerClass int
@@ -61,6 +62,9 @@ const (
 	// 이것은 구간 판정 사유가 아니라 별개 상태다: codexSpans.anomaly에는 들어가지 않고
 	// probeCodexMCPBlock만 만든다.
 	anomalyOutsideConflict
+	// anomalyOutputInvalid — 우리가 만든 산출물이 파스되지 않았다(D89). 다른 사유와 성격이
+	// 반대다: 나머지는 사용자 파일을 고치라는 지시이고 이것은 **우리 결함의 자수**다.
+	anomalyOutputInvalid
 )
 
 // reason — 사용자 문면에 실을 사유(D85). 사유마다 **다른 조치**가 필요하므로 문면이 달라야
@@ -77,6 +81,8 @@ func (a codexAnomaly) reason() string {
 		return "관리 테이블 안의 키가 이스케이프 표기로 적혀 있습니다 — 보통 표기(예: command)로 바꾸세요"
 	case anomalyOutsideConflict:
 		return "관리 테이블 밖에 ctr 관련 정의가 있습니다 — doctor 스니펫으로 수동 정리한 뒤 재실행하세요"
+	case anomalyOutputInvalid:
+		return "이 도구가 만든 결과가 유효한 TOML이 아니어서 기입하지 않았습니다 — 제품 결함이니 파일 형태와 함께 알려 주세요"
 	}
 	return ""
 }
@@ -616,6 +622,21 @@ type codexInstallResult struct {
 	Anomaly codexAnomaly
 }
 
+// gateCodexOutput — D89 산출물 유효성 게이트. **비대칭**이다: 우리 파서 기준으로 입력이
+// 파스되고 산출물이 파스되지 않을 때만 무변경으로 되돌린다. 입력이 이미 무효면 산출물의
+// 무효는 우리가 들인 것이 아니므로 되돌려도 사용자에게 이득이 없다.
+// 구문 유효성만 본다 — 파스되면서 사용자 값이 바뀌는 갈래는 이 게이트의 대상이 아니다(§1.2).
+// 바이트가 같으면 건너뛴다: 무변경 실행마다 입력을 두 번 파스하지 않기 위해서다.
+func gateCodexOutput(existing []byte, res codexInstallResult) codexInstallResult {
+	if bytes.Equal(res.Out, existing) || codexTOMLParses(res.Out) || !codexTOMLParses(existing) {
+		return res
+	}
+	return codexInstallResult{
+		Out: existing, State: mcpOutputInvalid,
+		TableFound: res.TableFound, Anomaly: anomalyOutputInvalid,
+	}
+}
+
 // installCodexConfigBlock — 관리 테이블 병합(스펙 v0.15 §0 D80·D81·D84). 순수 변환: 파일 IO 없음.
 // 판정 순서는 probeCodexMCPBlock과 1:1로 유지한다 — 중복 정의 > 구간 밖 충돌 > 소유.
 // **읽기 전용 경로가 이 함수를 부른다**(D85 — doctor [20]의 감지원). 그러므로 파일 IO·시간·난수를
@@ -688,7 +709,7 @@ func installCodexConfigBlock(existing []byte, req codexInstallRequest) codexInst
 		} else {
 			body = append(body, codexEnvBody(lines, codexSpan{}, req.Marker, eol)...)
 		}
-		return codexInstallResult{Out: appendBlock(base, body, crlf), State: mcpWritten, Changed: true, Profiles: resultProfiles, ExecExposed: execExposed, TableFound: sp.table.found}
+		return gateCodexOutput(existing, codexInstallResult{Out: appendBlock(base, body, crlf), State: mcpWritten, Changed: true, Profiles: resultProfiles, ExecExposed: execExposed, TableFound: sp.table.found})
 	}
 	// 무변경 판정(D84): 우리 소유 키 넷의 값이 모두 같고, 새로 만들 테이블도 지울 마커 줄도
 	// 없으면 쓰기와 백업을 생략한다. **키 단위 동치는 바이트 동일을 포함**하므로 호스트가 우리
@@ -730,11 +751,11 @@ func installCodexConfigBlock(existing []byte, req codexInstallRequest) codexInst
 	// 보존하므로 marker가 영영 req.Marker와 같아지지 않고, 그런 파일은 무변경 재실행마다
 	// .bak이 다시 생겨 단일 슬롯 계약이 무의미해진다.
 	out := spliceCodexLines(lines, edits, drop)
-	return codexInstallResult{
+	return gateCodexOutput(existing, codexInstallResult{
 		Out: out, State: mcpWritten,
 		Changed: !bytes.Equal(out, existing), Profiles: resultProfiles, ArgsKept: argsKept, ExecExposed: execExposed,
 		TableFound: sp.table.found,
-	}
+	})
 }
 
 // probeCodexMCPBlock — doctor [16] 존재 판별(D52 승계). install 상태기계는 "무엇을 쓸지"의

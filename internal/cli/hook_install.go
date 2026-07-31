@@ -793,7 +793,7 @@ func reportCodexMCPState(stdout io.Writer, state codexMCPState, anomaly codexAno
 		fmt.Fprintln(stdout, "hook install (codex): 표식도 없고 command도 우리 것이 아닌 [mcp_servers.ctr] 감지 — 기입 생략(사용자 등록으로 봅니다. doctor [10]과 대조해 정리한 뒤 재실행하세요)")
 	case mcpConflict:
 		fmt.Fprintln(stdout, "hook install (codex): config.toml에 ctr 관련 흔적 감지 — MCP 기입·가드 등록 보류. doctor 스니펫으로 수동 등록 후 재실행하세요")
-	case mcpMarkerAnomaly:
+	case mcpMarkerAnomaly, mcpOutputInvalid:
 		fmt.Fprintf(stdout, "hook install (codex): config.toml 무변경·가드 등록 보류 — %s\n", anomaly.reason())
 	}
 }
