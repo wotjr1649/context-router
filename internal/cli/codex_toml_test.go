@@ -1402,10 +1402,12 @@ func TestCodexDottedEnvNoHeaderAppend(t *testing.T) {
 // TestCodexDottedEnvCurrentMarkerWrites — 표식이 이미 현재 값이면 이탈하지 않는다. 이탈
 // 조건을 "점 표기가 있으면"으로 넓히면 고칠 것이 없는 파일에 사유를 내는 오경보가 된다.
 func TestCodexDottedEnvCurrentMarkerWrites(t *testing.T) {
-	// **command는 우리 것이어야 한다.** D90은 점 표기 표식을 소유 판정에 쓰지 않으므로,
-	// command가 남의 값이면 소유가 서지 않아 mcpExistingHeader로 먼저 빠진다 — 그러면 이
-	// 단정은 구조적으로 통과할 수 없고, 구현자가 "고치려다" D90이 금지한 소유 판정 확장으로
-	// 범위를 넘게 된다.
+	// **D90 개정 뒤 점 표기 표식은 소유 근거다** — codexMarkerValue가 그 형태를 셋째 경로로
+	// 읽고 codexOwnership이 그 값을 본다. 그래서 이 픽스처의 소유는 표식 하나로 서며 command가
+	// 우리 값인 것은 소유의 조건이 아니다. 이 자리가 재는 것도 소유가 아니라 **이탈 조건의
+	// 한정**이다: 점 표기가 있어도 표식이 이미 현재 값이면 쓸 자리가 필요 없으므로 이탈하지
+	// 않는다. 소유가 표식 하나로 서는 것을 되돌렸을 때 물리는 자리는
+	// TestCodexDottedEnvJudgmentUnified다 — 그쪽 픽스처의 command는 우리 것이 아니다.
 	src := "[mcp_servers.ctr]\ncommand = \"context-router\"\nenv.CTR_MANAGED = \"" + hookMarker("0.17.0") + "\"\nenv.FOO = \"bar\"\n"
 	res := installCodexConfigBlock([]byte(src), codexInstallRequest{Marker: hookMarker("0.17.0")})
 	if res.State != mcpWritten {
