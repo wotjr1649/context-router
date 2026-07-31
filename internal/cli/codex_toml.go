@@ -694,6 +694,13 @@ type codexInstallResult struct {
 	// 어떤 기입도 가르지 않는다** — 기입 정책은 이 릴리스에서 무변경이고, 게이트가 계약상
 	// 작동하지 않는 입력임을 사용자에게 알리기만 한다. 상태 값이 아니라 필드인 근거가 그것이다.
 	InputParses bool
+	// D91 진단 전용 필드 넷. 별도 판독기를 만들면 같은 바이트를 읽는 네 번째 판정원이 되므로
+	// 이미 판독한 값을 그대로 실어 낸다. **모든 반환 갈래에서 정의된 값을 갖는다** — 기입 없이
+	// 빠지는 반환에서도 채워야 [20]의 판정 대상 한정이 성립한다.
+	Tools        []string // 등록물의 enabled_tools 값
+	ToolsPresent bool     // 그 키의 물리 라인이 실재하는가(부재와 []를 가른다)
+	WantTools    []string // 등록물의 args가 요구하는 도구 집합
+	ArgsReadable bool     // args를 프로필로 되읽었는가
 }
 
 // gateCodexOutput — D89 산출물 유효성 게이트. **비대칭**이다: 우리 파서 기준으로 입력이
@@ -704,7 +711,8 @@ type codexInstallResult struct {
 // 입력 파스는 **결과에 실려 온 값을 읽는다** — 여기서 다시 부르면 D89의 "입력은 호출마다
 // 정확히 한 번" 계약이 깨지고 같은 바이트를 두 번 파스한다.
 // 되돌린 결과에도 InputParses를 그대로 싣는다 — 라벨 전용 필드라 이 갈래에서 잃으면 [16]이
-// 파스되지 않는 입력을 파스된다고 말한다.
+// 파스되지 않는 입력을 파스된다고 말한다. D91 진단 필드 넷도 같은 이유로 그대로 옮긴다 —
+// 판독은 되돌리기 전에 이미 끝났고, 여기서 영값으로 떨어뜨리면 그 상태의 진단이 사라진다.
 func gateCodexOutput(existing []byte, res codexInstallResult) codexInstallResult {
 	if bytes.Equal(res.Out, existing) || codexTOMLParses(res.Out) || !res.InputParses {
 		return res
@@ -712,7 +720,11 @@ func gateCodexOutput(existing []byte, res codexInstallResult) codexInstallResult
 	return codexInstallResult{
 		Out: existing, State: mcpOutputInvalid,
 		TableFound: res.TableFound, Anomaly: anomalyOutputInvalid,
-		InputParses: res.InputParses,
+		InputParses:  res.InputParses,
+		Tools:        res.Tools,
+		ToolsPresent: res.ToolsPresent,
+		WantTools:    res.WantTools,
+		ArgsReadable: res.ArgsReadable,
 	}
 }
 
@@ -734,12 +746,23 @@ func installCodexConfigBlock(existing []byte, req codexInstallRequest) codexInst
 		return codexInstallResult{Out: existing, State: mcpConflict, TableFound: sp.table.found, InputParses: inputParses}
 	}
 	view := codexReadTable(lines, sp.table)
+	// D91 — 되읽기에 실패하면 프로필 무관 기본 집합만으로 판정한다. 통째로 유보하면 도구 0개
+	// allowlist 형태가 되읽기 실패 파일에서 그대로 열린다.
+	diagProfiles, argsReadable := profilesFromArgs(view.args)
+	if !argsReadable {
+		diagProfiles = nil
+	}
+	diag := codexInstallResult{
+		Tools: view.tools, ToolsPresent: len(view.toolsLines) > 0,
+		WantTools: enabledToolsForProfiles(diagProfiles), ArgsReadable: argsReadable,
+	}
 	marker, markerFound := codexMarkerValue(lines, sp, view)
 	class, begin, end := classifyMarkers(lines)
 	inOldBlock := class == classReplace && sp.table.found && sp.table.start > begin && sp.table.start < end
 	if sp.table.found && !codexOwnership(marker, markerFound, view.command, inOldBlock) {
 		// 판정 근거는 "블록 밖에 있음"이 아니라 "표식이 없고 명령도 우리 것이 아님"이다(D80).
-		return codexInstallResult{Out: existing, State: mcpExistingHeader, TableFound: sp.table.found, InputParses: inputParses}
+		return codexInstallResult{Out: existing, State: mcpExistingHeader, TableFound: sp.table.found, InputParses: inputParses,
+			Tools: diag.Tools, ToolsPresent: diag.ToolsPresent, WantTools: diag.WantTools, ArgsReadable: diag.ArgsReadable}
 	}
 	// 프로필 우선순위(D81): 명시 플래그 > 우리 소유 테이블의 기존 args > 기본 프로필.
 	// Codex 갈래에는 은퇴 이름이 없어 .mcp.json의 셋째 항이 없다.
@@ -791,13 +814,15 @@ func installCodexConfigBlock(existing []byte, req codexInstallRequest) codexInst
 		} else {
 			body = append(body, codexEnvBody(lines, codexSpan{}, req.Marker, eol)...)
 		}
-		return gateCodexOutput(existing, codexInstallResult{Out: appendBlock(base, body, crlf), State: mcpWritten, Changed: true, Profiles: resultProfiles, ExecExposed: execExposed, TableFound: sp.table.found, InputParses: inputParses})
+		return gateCodexOutput(existing, codexInstallResult{Out: appendBlock(base, body, crlf), State: mcpWritten, Changed: true, Profiles: resultProfiles, ExecExposed: execExposed, TableFound: sp.table.found, InputParses: inputParses,
+			Tools: diag.Tools, ToolsPresent: diag.ToolsPresent, WantTools: diag.WantTools, ArgsReadable: diag.ArgsReadable})
 	}
 	// D90 — 점 표기 env가 있고 표식을 새로 넣거나 갱신해야 하면 쓸 자리가 없다. 헤더를 붙이면
 	// 같은 논리 테이블이 두 번 정의되고, 점 표기로 쓰면 이전 릴리스 바이너리가 그 파일을 깬다.
 	// 표식이 이미 현재 값이면 이탈하지 않는다 — 고칠 것이 없는 파일에 사유를 내는 오경보다.
 	if view.dottedEnv && !(view.dottedMarkerFound && view.dottedMarker == req.Marker) && marker != req.Marker {
-		return codexInstallResult{Out: existing, State: mcpMarkerAnomaly, TableFound: sp.table.found, Anomaly: anomalyDottedEnv, InputParses: inputParses}
+		return codexInstallResult{Out: existing, State: mcpMarkerAnomaly, TableFound: sp.table.found, Anomaly: anomalyDottedEnv, InputParses: inputParses,
+			Tools: diag.Tools, ToolsPresent: diag.ToolsPresent, WantTools: diag.WantTools, ArgsReadable: diag.ArgsReadable}
 	}
 	// 무변경 판정(D84): 우리 소유 키 넷의 값이 모두 같고, 새로 만들 테이블도 지울 마커 줄도
 	// 없으면 쓰기와 백업을 생략한다. **키 단위 동치는 바이트 동일을 포함**하므로 호스트가 우리
@@ -813,7 +838,8 @@ func installCodexConfigBlock(existing []byte, req codexInstallRequest) codexInst
 		(keepArgs || (slices.Equal(view.args, mcpArgsForProfiles(profiles)) &&
 			slices.Equal(view.tools, enabledToolsForProfiles(profiles))))
 	if !envMissing && !inOldBlock && ownedSame {
-		return codexInstallResult{Out: existing, State: mcpWritten, Profiles: resultProfiles, ArgsKept: argsKept, ExecExposed: execExposed, TableFound: sp.table.found, InputParses: inputParses}
+		return codexInstallResult{Out: existing, State: mcpWritten, Profiles: resultProfiles, ArgsKept: argsKept, ExecExposed: execExposed, TableFound: sp.table.found, InputParses: inputParses,
+			Tools: diag.Tools, ToolsPresent: diag.ToolsPresent, WantTools: diag.WantTools, ArgsReadable: diag.ArgsReadable}
 	}
 	if inOldBlock {
 		// D84 마이그레이션 — 마커 두 줄이 **우리 구간 안**에 들어와 있으면(블록이 우리 테이블만
@@ -845,6 +871,7 @@ func installCodexConfigBlock(existing []byte, req codexInstallRequest) codexInst
 		Out: out, State: mcpWritten,
 		Changed: !bytes.Equal(out, existing), Profiles: resultProfiles, ArgsKept: argsKept, ExecExposed: execExposed,
 		TableFound: sp.table.found, InputParses: inputParses,
+		Tools: diag.Tools, ToolsPresent: diag.ToolsPresent, WantTools: diag.WantTools, ArgsReadable: diag.ArgsReadable,
 	})
 }
 

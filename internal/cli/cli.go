@@ -17,6 +17,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime/debug"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -2040,6 +2041,13 @@ func runDoctor(ctx context.Context, w io.Writer, storeRoot, projectRoot, version
 		// 다르고, 그것을 알리지 않으면 사용자는 install이 영구히 무변경인 이유를 알 수 없다.
 		fmt.Fprintf(w, "[20] codex: %s\n", codexReason)
 	}
+	// D91 — 등록물이 프로필이 요구하는 도구를 다 담고 있는가. 넓힌 것은 통과하고 모자란 것만
+	// 알린다(D86의 보호 대상이 나그가 되면 안 된다). 기입 없이 이탈하는 상태에는 권하지
+	// 않는다 — 실행해도 바뀌지 않는 명령을 안내하게 된다. failed에 계상하지 않는다.
+	if codexVerdictOK && codexVerdictOnce.State == mcpWritten && codexVerdictOnce.TableFound &&
+		codexVerdictOnce.ToolsPresent && !toolsCover(codexVerdictOnce.Tools, codexVerdictOnce.WantTools) {
+		fmt.Fprintln(w, "[20] codex: 등록물의 도구 목록이 프로필보다 모자랍니다 — hook install --codex로 반영하세요(그 명령은 도구 목록을 프로필 기본값으로 다시 씁니다 — 손으로 더한 항목이 있으면 사라집니다)")
+	}
 	if mcpDrift || codexDrift {
 		// 문면을 사유 중립으로 둔다 — 표식은 현재인데 형식·command가 어긋나 --fix가 파일을
 		// 바꾸는 상태(구형식 포함)에서 "버전 표식이 다르다"는 사유를 잘못 말한다. 사유는
@@ -2132,6 +2140,12 @@ type codexVerdict struct {
 	// InputParses — 입력 config.toml이 TOML로 파스되는가(D89 부수 결정 ②). 라벨 전용이며 권고를
 	// 가르지 않는다 — shouldFix()가 보지 않는 것이 그 계약이다.
 	InputParses bool
+	// D91 진단 필드 넷 — codexInstallResult와 **같은 이름·같은 타입**으로 나른다. [20]은
+	// codexVerdict만 읽으므로 두 구조체를 모두 지나야 그 절에 값이 닿는다.
+	Tools        []string
+	ToolsPresent bool
+	WantTools    []string
+	ArgsReadable bool
 }
 
 // codexRegistrationVerdict — 감지와 고침이 공유하는 판정(D85). **요청 조립이 이 함수 안에만
@@ -2159,6 +2173,8 @@ func codexRegistrationVerdict(data []byte, version string) codexVerdict {
 		State: res.State, Anomaly: anomaly, TableFound: res.TableFound,
 		Changed: res.Changed, Marker: marker, Command: command, Out: res.Out,
 		InputParses: res.InputParses,
+		Tools:       res.Tools, ToolsPresent: res.ToolsPresent,
+		WantTools: res.WantTools, ArgsReadable: res.ArgsReadable,
 	}
 }
 
@@ -2169,6 +2185,17 @@ func codexRegistrationVerdict(data []byte, version string) codexVerdict {
 // 새 상태 mcpOutputInvalid는 이 술어의 첫 항에서 거짓이 되어 권고가 서지 않는다(D89).
 func (v codexVerdict) shouldFix() bool {
 	return v.State == mcpWritten && v.TableFound && v.Changed
+}
+
+// toolsCover — have가 want를 전부 담는가(D91). 순서·중복은 보지 않는다 — 사용자가 넓힌
+// 목록은 상위집합이므로 통과해야 한다.
+func toolsCover(have, want []string) bool {
+	for _, w := range want {
+		if !slices.Contains(have, w) {
+			return false
+		}
+	}
+	return true
 }
 
 // doctorFixRegistrations — doctor --fix(D83). MCP 등록물의 표식을 현재 버전으로 다시 기입하고,
