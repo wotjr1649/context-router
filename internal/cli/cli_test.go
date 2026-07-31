@@ -2818,8 +2818,8 @@ func TestMarkerDriftLabel(t *testing.T) {
 
 // TestDoctorDetectFixEquivalence — D85(§2-1·§2-2). 감지와 고침을 한 표에서 함께 단정한다.
 // 경고가 --fix를 권한 모든 상태에서 --fix가 config.toml을 바꾸고, 권하지 않은 모든 상태에서
-// 바꾸지 않는다. **Codex 갈래 한정**이다 — .mcp.json 갈래는 경고 없이도 재직렬화 형식 차이·
-// 은퇴 항목 정리로 파일을 다시 쓴다(스펙 §1.2 첫 항, 비범위).
+// 바꾸지 않는다. **표가 세우는 픽스처는 Codex 갈래 한정**이다(.mcp.json을 만들지 않는다) —
+// 그쪽의 같은 등가는 TestDoctorMcpRetire* 둘이 잰다.
 func TestDoctorDetectFixEquivalence(t *testing.T) {
 	const ver = "0.16.0"
 	ours := "[mcp_servers.ctr]\ncommand = \"context-router\"\nargs = [\"--enable\", \"ingest,net\"]\n" +
@@ -3643,5 +3643,96 @@ func TestDoctorMarkerWarningBothDrift(t *testing.T) {
 	want := fmt.Sprintf("[20] warning: 다시 기입이 필요한 MCP 등록물이 있습니다 — doctor --fix로 고치세요(기존 파일만 고치고 등록을 만들지 않습니다. args·enabled_tools는 보존하지만 command는 %q로 다시 씁니다 — 직접 고쳐 둔 실행 경로가 있으면 그 값이 사라집니다. config.toml은 백업을 남깁니다. .mcp.json은 대체된 옛 이름의 항목을 함께 정리합니다)", hookBinaryName)
 	if got := doctorWarningLine(out); got != want {
 		t.Errorf("경고 줄이 다르다\n got=%s\nwant=%s", got, want)
+	}
+}
+
+// mcpFixtureCurrentMarker — .mcp.json 픽스처. 우리 항목은 **현재 버전 표식**이고 병합기가 내는
+// 형태(2칸 들여쓰기·구조체 필드 순서·끝 줄바꿈) 그대로다 — 그래서 은퇴 항목을 빼면 --fix가 다시
+// 쓸 것이 하나도 없다. 그 대조가 픽스처의 정밀도를 스스로 증명한다: 형태가 어긋나면 대조군에서
+// 예고가 나와 바로 깨진다.
+func mcpFixtureCurrentMarker(retired bool) string {
+	old := ""
+	if retired {
+		old = "    \"ctr\": {\n      \"command\": \"context-router\"\n    },\n"
+	}
+	return "{\n  \"mcpServers\": {\n" + old +
+		"    \"ctr-exec\": {\n" +
+		"      \"command\": \"context-router\",\n" +
+		"      \"args\": [],\n" +
+		"      \"alwaysLoad\": true,\n" +
+		"      \"__ctrManaged\": \"" + hookMarker("0.17.0") + "\"\n" +
+		"    }\n  }\n}\n"
+}
+
+// TestDoctorMcpRetireAnnouncedAtCurrentMarker — [20]의 .mcp.json 절은 **--fix가 그 파일을 다시
+// 쓰는가**에 걸려야 한다. 표식 드리프트에 걸면 표식이 현재 버전이면서 은퇴 이름 항목이 남은
+// 파일에서 절이 빠지는데, 같은 실행의 --fix는 그 항목을 지우고 파일을 다시 쓴다 — 사용자는
+// 되돌릴 기회 없이 자기 항목을 잃는다. 예고와 행동을 한 테스트에서 함께 잰다.
+func TestDoctorMcpRetireAnnouncedAtCurrentMarker(t *testing.T) {
+	home := isolateCodexHome(t)
+	// config.toml만 드리프트시킨다 — 경고 블록 자체는 그쪽이 세우므로 아래 단정이 재는 것이
+	// 블록의 유무가 아니라 .mcp.json 절의 유무다.
+	writeCodexConfig(t, home, "[mcp_servers.ctr]\ncommand = \"context-router\"\n\n[mcp_servers.ctr.env]\nCTR_MANAGED = \"context-router/0.1.0\"\n")
+	proj := t.TempDir()
+	path := filepath.Join(proj, ".mcp.json")
+	write(t, path, []byte(mcpFixtureCurrentMarker(true)))
+
+	out, _ := doctorOut(t, proj, false)
+	// 픽스처가 정말 "표식은 현재 버전" 갈래인지 먼저 못박는다 — 드리프트로 흘러가면 아래 단정은
+	// 이 결함이 아니라 종전 조건을 재게 된다.
+	if !strings.Contains(out, ".mcp.json=marker 0.17.0 codex=") {
+		t.Fatalf("픽스처가 현재 버전 표식 갈래가 아니다:\n%s", out)
+	}
+	if warn := doctorWarningLine(out); !strings.Contains(warn, "옛 이름의 항목") {
+		t.Errorf("--fix가 은퇴 항목을 지우는데 예고가 없다:\n%s", out)
+	}
+	// 대조군 — 은퇴 항목만 뺀 같은 파일은 --fix가 손대지 않으므로 절도 나오지 않는다. 이 단정이
+	// 없으면 절을 무조건 붙여도 위 단정이 통과한다(경고 블록은 config.toml이 세우므로 이 대조는
+	// 공허하지 않다).
+	clean := t.TempDir()
+	write(t, filepath.Join(clean, ".mcp.json"), []byte(mcpFixtureCurrentMarker(false)))
+	cleanOut, _ := doctorOut(t, clean, false)
+	if warn := doctorWarningLine(cleanOut); strings.Contains(warn, "옛 이름의 항목") {
+		t.Errorf("--fix가 다시 쓸 것이 없는데 은퇴 정리를 예고했다:\n%s", cleanOut)
+	}
+
+	// 예고가 사실인지 같은 픽스처로 확인한다 — 문면만 맞추고 행동이 다르면 다시 어긋난다.
+	fixOut, _ := doctorOut(t, proj, true)
+	after, rErr := os.ReadFile(path)
+	if rErr != nil {
+		t.Fatal(rErr)
+	}
+	var doc struct {
+		Servers map[string]json.RawMessage `json:"mcpServers"`
+	}
+	if err := json.Unmarshal(after, &doc); err != nil {
+		t.Fatalf(".mcp.json 파싱 실패: %v", err)
+	}
+	if _, ok := doc.Servers["ctr"]; ok {
+		t.Errorf("--fix가 은퇴 항목을 지우지 않았다 — 픽스처가 그 갈래가 아니다:\n%s", fixOut)
+	}
+	if _, ok := doc.Servers[ctrMCPServerName]; !ok {
+		t.Errorf("--fix가 우리 항목까지 지웠다:\n%s", fixOut)
+	}
+}
+
+// TestDoctorMcpRetireWarnsWithoutCodexDrift — 경고 **블록**의 진입 조건도 같은 축이어야 한다.
+// config.toml이 드리프트하지 않으면 블록이 통째로 빠지는데 --fix는 그래도 .mcp.json의 은퇴 이름
+// 항목을 지운다 — 예고가 사라지는 자리가 절 하나 위에 하나 더 있다. 반대쪽 절의 부재도 함께
+// 단정해 없는 파일의 수리 동작을 약속하지 않는 것을 이 방향에서도 잠근다.
+func TestDoctorMcpRetireWarnsWithoutCodexDrift(t *testing.T) {
+	isolateCodexHome(t) // config.toml 없음 → codexDrift 거짓
+	proj := t.TempDir()
+	write(t, filepath.Join(proj, ".mcp.json"), []byte(mcpFixtureCurrentMarker(true)))
+	out, _ := doctorOut(t, proj, false)
+	if !strings.Contains(out, "codex=없음") {
+		t.Fatalf("픽스처가 config.toml 부재 갈래가 아니다:\n%s", out)
+	}
+	warn := doctorWarningLine(out)
+	if !strings.Contains(warn, "옛 이름의 항목") {
+		t.Errorf("config.toml이 멀쩡하다는 이유로 .mcp.json 예고가 통째로 빠졌다:\n%s", out)
+	}
+	if strings.Contains(warn, "config.toml은 백업을 남깁니다") {
+		t.Errorf("config.toml이 없는데 백업을 약속했다:\n%s", out)
 	}
 }

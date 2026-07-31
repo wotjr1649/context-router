@@ -2018,6 +2018,20 @@ func runDoctor(ctx context.Context, w io.Writer, storeRoot, projectRoot, version
 	}
 	mcpData, mcpReadErr := os.ReadFile(mcpConfigPath(projectRoot))
 	mcpLabel, mcpDrift := markerState(mcpData, mcpReadErr, mcpManagedMarker)
+	// 경고와 그 안의 .mcp.json 절은 **--fix가 그 파일을 다시 쓰는가**에 건다 — 표식 드리프트가
+	// 아니다. --fix는 표식이 현재 버전이어도 대체된 옛 이름의 항목을 지우고 command를 우리 값으로
+	// 되쓰므로, 드리프트로 걸면 예고 없이 사용자 항목이 사라지는 상태가 남는다(D85가 Codex 갈래에
+	// 세운 "권고는 --fix의 행동과 등가"를 이쪽에도 그대로 적용한다). 조건을 문장으로 다시 적지
+	// 않고 --fix가 기입할 내용을 그대로 만들어 비교한다 — 조건을 두 자리에 적는 것이 이 어긋남을
+	// 만든 원인이다. 부재·읽기실패·미소유는 --fix가 손대지 않는 상태라 거짓이고, 그래서 없는
+	// 파일의 수리 동작을 약속하지 않는다. 표식 드리프트는 병합을 계산하지 않고 그대로 받는다 —
+	// 그 상태에서 --fix가 기입하지 못하는 경우는 항목 자체가 해석되지 않을 때뿐이고, 그쪽은
+	// --fix가 사유를 따로 인쇄한다.
+	mcpFixWrites := mcpDrift
+	if !mcpFixWrites && mcpReadErr == nil && ownedRegistration(mcpManagedMarker(mcpData)) {
+		merged, mErr := mcpFixMerge(mcpData, version)
+		mcpFixWrites = mErr == nil && !bytes.Equal(mcpData, merged)
+	}
 	// [16]이 세운 판정을 그대로 쓴다 — 파일을 다시 읽지 않는다(D89). 경로 해석 실패는 어느
 	// case에도 걸리지 않아 "확인불가" 초기값이 살아남는다: 그 상태에서는 읽기 오류도 판정도
 	// 없으므로 세 case가 모두 거짓이다.
@@ -2054,12 +2068,12 @@ func runDoctor(ctx context.Context, w io.Writer, storeRoot, projectRoot, version
 		}
 		fmt.Fprintln(w, msg)
 	}
-	if mcpDrift || codexDrift {
+	if mcpFixWrites || codexDrift {
 		// 문면을 사유 중립으로 둔다 — 표식은 현재인데 형식·command가 어긋나 --fix가 파일을
 		// 바꾸는 상태(구형식 포함)에서 "버전 표식이 다르다"는 사유를 잘못 말한다. 사유는
-		// 라벨이 담는다. **파일별 절은 각자의 드리프트에만 붙인다** — 인쇄 조건이 둘의
-		// 논리합이라 한 문면으로 두면 .mcp.json만 어긋난 사용자에게 config.toml 백업을, 그 반대
-		// 사용자에게 은퇴 이름 항목 정리를 예고한다. 없는 파일의 수리 동작을 약속하는 문면이다.
+		// 라벨이 담는다. **파일별 절은 그 파일에 --fix가 손대는 조건에만 붙인다** — 인쇄 조건이
+		// 둘의 논리합이라 한 문면으로 두면 .mcp.json만 어긋난 사용자에게 config.toml 백업을, 그
+		// 반대 사용자에게 은퇴 이름 항목 정리를 예고한다. 없는 파일의 수리 동작을 약속하는 문면이다.
 		// **command 되쓰기도 예고한다**: 이 경고는 --fix가 파일을 바꾸는 모든 상태에서 나오고
 		// 그중에는 command만 사용자가 고쳐 둔 등록물이 있다(D86이 표식과 command를 맞춘다).
 		// 보존되는 것만 열거하면 절대경로·래퍼로 고쳐 둔 값이 예고 없이 사라지고, PATH에 우리
@@ -2070,7 +2084,7 @@ func runDoctor(ctx context.Context, w io.Writer, storeRoot, projectRoot, version
 		if codexDrift {
 			b.WriteString(". config.toml은 백업을 남깁니다")
 		}
-		if mcpDrift {
+		if mcpFixWrites {
 			b.WriteString(". .mcp.json은 대체된 옛 이름의 항목을 함께 정리합니다")
 		}
 		b.WriteString(")")
@@ -2252,9 +2266,9 @@ func doctorFixRegistrations(w io.Writer, projectRoot, version string) {
 	case !ownedRegistration(mcpManagedMarker(data)):
 		fmt.Fprintln(w, "[20] fix: .mcp.json에 우리 소유로 확인된 등록물이 없습니다 — 만들지 않습니다. hook install로 먼저 등록하세요")
 	default:
-		entry := mcpServerEntry{Command: hookBinaryName, AlwaysLoad: true, Managed: hookMarker(version)}
-		// setProfile=false — 표식만 고치고 프로필은 기존 항목의 것을 그대로 둔다.
-		if merged, _, mErr := mergeMCPServers(data, ctrMCPServerName, entry, true, false); mErr != nil {
+		// 기입할 내용은 [20]의 예고와 **같은 계산**에서 나온다 — 아래 갈래를 조건 문장으로 다시
+		// 적으면 예고와 행동이 갈린다.
+		if merged, mErr := mcpFixMerge(data, version); mErr != nil {
 			fmt.Fprintf(w, "[20] fix: %q 이름에 우리가 소유하지 않은 항목이 있어 .mcp.json을 그대로 두었습니다\n", ctrMCPServerName)
 		} else if bytes.Equal(data, merged) {
 			fmt.Fprintln(w, "[20] fix: .mcp.json은 이미 현재 버전입니다 — 무변경")
@@ -2298,6 +2312,16 @@ func doctorFixRegistrations(w io.Writer, projectRoot, version string) {
 	if missing > 0 {
 		fmt.Fprintf(w, "[20] fix: 대상 파일이 없어 %d건을 건너뛰었습니다 — 만들지 않습니다. hook install로 먼저 등록하세요\n", missing)
 	}
+}
+
+// mcpFixMerge — --fix가 .mcp.json에 기입할 내용. [20]의 예고와 --fix의 기입이 **같은 계산**을
+// 쓰게 하는 단일 지점이다: 조건을 두 자리에 따로 적으면 갈리고, 갈린 쪽이 예고라면 사용자는
+// 예고 없이 자기 항목을 잃는다(은퇴 이름 정리도 command 되쓰기도 표식 드리프트 없이 일어난다).
+// setProfile=false — 표식만 고치고 프로필은 기존 항목의 것을 그대로 둔다.
+func mcpFixMerge(data []byte, version string) ([]byte, error) {
+	entry := mcpServerEntry{Command: hookBinaryName, AlwaysLoad: true, Managed: hookMarker(version)}
+	merged, _, err := mergeMCPServers(data, ctrMCPServerName, entry, true, false)
+	return merged, err
 }
 
 // readIfPathOK — 경로 해석이 실패했으면 읽지 않는다(doctorFixRegistrations의 switch 초기화용).
