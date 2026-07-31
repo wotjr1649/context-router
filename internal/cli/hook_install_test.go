@@ -1112,6 +1112,47 @@ func TestRunHookUninstallCodexConfigOnlyNoHooks(t *testing.T) {
 	}
 }
 
+// TestRunHookUninstallCodexReportsSpanAnomaly — 구간 판정 이상으로 config.toml을 손대지
+// 못했으면 **그 사실과 사유**를 인쇄한다. 종전에는 changed 갈래에만 인쇄가 있어 이 이탈에서
+// 아무 줄도 나오지 않았고, 사용자는 "훅 항목 제거 완료 + exit 0"만 보는데 두 관리 테이블이
+// 파일에 남아 Codex가 매 세션 MCP 서버를 계속 띄웠다. D87이 이스케이프 표기 키를 공유 판정에
+// 더하면서 이 이탈은 중복 헤더·미종료 문자열 밖으로 넓어졌다.
+// 종료코드 계약은 그대로다 — 인쇄만 는다.
+// t.Setenv 사용 → t.Parallel 금지.
+func TestRunHookUninstallCodexReportsSpanAnomaly(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("CODEX_HOME", home)
+	// 관리 테이블 안의 이스케이프 표기 키 — 어느 관리 키로도 디코드되지 않지만 우리는
+	// 이스케이프를 해석하지 않으므로 구간 판정을 신뢰할 수 없다(D87).
+	cfg := "[mcp_servers.ctr]\n" +
+		"command = \"context-router\"\n" +
+		`"my\tkey" = 1` + "\n" +
+		"[mcp_servers.ctr.env]\n" +
+		codexMarkerKey + " = \"context-router/0.16.0\"\n"
+	cfgPath := filepath.Join(home, "config.toml")
+	if err := os.WriteFile(cfgPath, []byte(cfg), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	if err := runHookUninstall([]string{"--codex", "--user"}, t.TempDir(), &out); err != nil {
+		t.Fatalf("종료코드 계약이 바뀌었다: %v", err) // 인쇄만 는다 — 실패로 바뀌면 안 된다
+	}
+	got, err := os.ReadFile(cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != cfg {
+		t.Fatalf("이상 파일을 손댔다:\n%s", got)
+	}
+	s := out.String()
+	if !strings.Contains(s, "config.toml") {
+		t.Errorf("config.toml을 손대지 못했다는 사실을 알리지 않았다:\n%s", s)
+	}
+	if !strings.Contains(s, anomalyEscapedKey.reason()) {
+		t.Errorf("무변경 사유를 알리지 않았다:\n%s", s)
+	}
+}
+
 // D47 설치 결합 — withGuard=true면 PreToolUse(matcher Bash) 그룹이 추가되고,
 // uninstall은 withGuard 무관하게 전 이벤트 소거(제거 대칭). 가드 포함 재병합은 멱등.
 // (matcher 단정은 json.MarshalIndent 실출력 형식 "matcher": "Bash"에 맞춘다 — 브리프의

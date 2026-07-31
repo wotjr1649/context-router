@@ -2837,6 +2837,110 @@ func TestDoctorDetectFixEquivalence(t *testing.T) {
 	}
 }
 
+// doctorWarningLine — [20] 경고 줄만 뽑는다(문면 단정용). 없으면 ""다.
+func doctorWarningLine(out string) string {
+	for _, ln := range strings.Split(out, "\n") {
+		if strings.HasPrefix(ln, "[20] warning:") {
+			return ln
+		}
+	}
+	return ""
+}
+
+// TestDoctorWarningAnnouncesCommandRewrite — [20] 경고는 --fix가 **command를 다시 쓴다는
+// 것**을 예고해야 한다. 경고 조건이 "표식 버전 불일치"에서 "--fix가 파일을 바꾸는가"로
+// 넓어지면서(D85) command만 고쳐 둔 등록물이 처음으로 이 권고의 대상이 됐다 — 권고를 따르면
+// 그 값이 우리 이름으로 되돌아가고, PATH에 그 이름이 없는 호스트에서는 Codex가 그 서버를
+// 기동하지 못한다. 문면이 보존되는 것(args·enabled_tools)만 열거하면 사용자는 그 손실을
+// 예상할 수 없다. 같은 테스트에서 --fix의 실제 행동을 함께 재 문면이 사실인지 확인한다.
+// t.Setenv 사용 → t.Parallel 금지.
+func TestDoctorWarningAnnouncesCommandRewrite(t *testing.T) {
+	const ver = "0.16.0"
+	codexHome := t.TempDir()
+	t.Setenv("CODEX_HOME", codexHome)
+	cfgPath := filepath.Join(codexHome, "config.toml")
+	// 표식은 현재 버전이고 command만 사용자가 고쳐 둔 등록물(PATH에 없는 바이너리를 가리킨다).
+	cfg := "[mcp_servers.ctr]\ncommand = \"C:\\\\bin\\\\context-router.exe\"\n" +
+		"[mcp_servers.ctr.env]\n" + codexMarkerKey + " = \"context-router/" + ver + "\"\n"
+	write(t, cfgPath, []byte(cfg))
+	projectRoot := t.TempDir()
+
+	var buf bytes.Buffer
+	if err := runDoctor(context.Background(), &buf, t.TempDir(), projectRoot, ver, false); err != nil {
+		t.Fatalf("runDoctor: %v out=%s", err, buf.String())
+	}
+	warn := doctorWarningLine(buf.String())
+	if warn == "" {
+		t.Fatalf("형식 드리프트인데 경고가 없다:\n%s", buf.String())
+	}
+	if !strings.Contains(warn, "command") || !strings.Contains(warn, hookBinaryName) {
+		t.Errorf("경고가 command 되쓰기를 예고하지 않는다:\n%s", warn)
+	}
+
+	// 문면이 사실인가 — --fix는 실제로 command를 우리 이름으로 되쓴다(D86 확정 동작).
+	var fixBuf bytes.Buffer
+	if err := runDoctor(context.Background(), &fixBuf, t.TempDir(), projectRoot, ver, true); err != nil {
+		t.Fatalf("runDoctor --fix: %v out=%s", err, fixBuf.String())
+	}
+	after, err := os.ReadFile(cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(after), "command = \""+hookBinaryName+"\"") {
+		t.Errorf("--fix가 command를 되쓰지 않았다 — 경고 문면과 어긋난다:\n%s", after)
+	}
+}
+
+// TestDoctorNonStringMarkerIsDrift — 표식 키의 **값이 문자열이 아닌** 등록물은 드리프트다.
+// 종전에는 setInlineEnvMarker가 그 줄을 보존해 표식이 영영 현재 값이 되지 못했고, 그래서
+// Changed가 거짓이라 [20]은 "표식없음"을 경고 없이 내면서 같은 실행의 --fix가 "이미 현재
+// 형식·버전입니다"라고 보고했다 — 두 줄이 서로 모순이고 사용자에게 다음 조치가 없었다.
+// t.Setenv 사용 → t.Parallel 금지.
+func TestDoctorNonStringMarkerIsDrift(t *testing.T) {
+	const ver = "0.16.0"
+	codexHome := t.TempDir()
+	t.Setenv("CODEX_HOME", codexHome)
+	cfgPath := filepath.Join(codexHome, "config.toml")
+	cfg := "[mcp_servers.ctr]\ncommand = \"context-router\"\n" +
+		"env = { " + codexMarkerKey + " = 0 }\n"
+	write(t, cfgPath, []byte(cfg))
+	projectRoot := t.TempDir()
+
+	var buf bytes.Buffer
+	if err := runDoctor(context.Background(), &buf, t.TempDir(), projectRoot, ver, false); err != nil {
+		t.Fatalf("runDoctor: %v out=%s", err, buf.String())
+	}
+	if doctorWarningLine(buf.String()) == "" {
+		t.Errorf("판독되지 않는 표식인데 경고가 없다:\n%s", buf.String())
+	}
+
+	var fixBuf bytes.Buffer
+	if err := runDoctor(context.Background(), &fixBuf, t.TempDir(), projectRoot, ver, true); err != nil {
+		t.Fatalf("runDoctor --fix: %v out=%s", err, fixBuf.String())
+	}
+	if strings.Contains(fixBuf.String(), "이미 현재 형식·버전입니다") {
+		t.Errorf("경고를 낸 실행이 무변경을 보고했다:\n%s", fixBuf.String())
+	}
+	after, err := os.ReadFile(cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(after), codexMarkerKey+" = \""+hookMarker(ver)+"\"") {
+		t.Errorf("--fix가 표식을 관리 표식 문자열로 교체하지 않았다:\n%s", after)
+	}
+
+	// 재실행 무변경 — 드리프트로 올린 상태가 매 실행 다시 기입되면 D84 단일 백업 슬롯이
+	// 2회차에 원본을 잃는다.
+	before, _ := os.ReadFile(cfgPath)
+	var againBuf bytes.Buffer
+	if err := runDoctor(context.Background(), &againBuf, t.TempDir(), projectRoot, ver, true); err != nil {
+		t.Fatalf("runDoctor --fix 2: %v", err)
+	}
+	if again, _ := os.ReadFile(cfgPath); !bytes.Equal(before, again) {
+		t.Errorf("고친 뒤 재실행이 파일을 또 바꿨다:\n%s", again)
+	}
+}
+
 // TestDoctorFixMigratesOldFormat — X6(§2-9). --fix가 v0.14 구 형식을 실제 파일에서 1회
 // 변환하는지, args가 보존되는지(D86), 재실행이 무변경이고 .bak이 원본을 유지하는지.
 func TestDoctorFixMigratesOldFormat(t *testing.T) {

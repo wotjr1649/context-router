@@ -720,9 +720,9 @@ func installCodexConfigBlock(existing []byte, req codexInstallRequest) codexInst
 	// Changed는 **기입 바이트와 기존 바이트의 비교**로 정한다 — D84의 1차 기준이 그것이고,
 	// 위 ownedSame(키 단위 동치)은 재직렬화 때문에 바이트 비교가 성립하지 않을 때의 하강
 	// 경로다. 여기를 참으로 고정하면 ownedSame이 접지 못하는 상태가 그대로 새어 나간다:
-	// 표식 키는 있는데 값이 문자열이 아니면 setInlineEnvMarker가 그 줄을 보존하므로 marker가
-	// 영영 req.Marker와 같아지지 않고, 그런 파일은 무변경 재실행마다 .bak이 다시 생겨
-	// 단일 슬롯 계약이 무의미해진다.
+	// 인라인 env 대입이 여는 중괄호 없이 다음 줄로 이어지면 setInlineEnvMarker가 그 줄을
+	// 보존하므로 marker가 영영 req.Marker와 같아지지 않고, 그런 파일은 무변경 재실행마다
+	// .bak이 다시 생겨 단일 슬롯 계약이 무의미해진다.
 	out := spliceCodexLines(lines, edits, drop)
 	return codexInstallResult{
 		Out: out, State: mcpWritten,
@@ -772,18 +772,22 @@ func appendBlock(existing, block []byte, crlf bool) []byte {
 // 파일에서는 마커 두 줄도 함께 지우되 **블록 통째가 아니라 그 안의 우리 테이블만** 지운다 —
 // 그래서 밀림 파일에서 블록 사이에 들어온 사용자 테이블이 살아남는다(D84). 구간 직전의 빈 줄
 // 1개는 함께 지운다(append가 넣은 구분 줄의 대칭).
-func uninstallCodexConfigBlock(existing []byte) (out []byte, changed bool) {
+// 구간 판정 이상은 **사유째 돌려준다**(D85) — 무변경으로 이탈했다는 것만으로는 호출자가
+// "관리 테이블이 남았다"와 그 조치를 사용자에게 알릴 수 없고, 그러면 제거가 성공한 문면만
+// 보이는데 Codex는 그 MCP 서버를 계속 띄운다. 판정을 내린 자리에서 실어 보내므로 호출자가
+// 같은 판정을 다시 도출하지 않는다.
+func uninstallCodexConfigBlock(existing []byte) (out []byte, changed bool, anomaly codexAnomaly) {
 	lines := splitLinesKeepEnds(existing)
 	sp := codexManagedSpans(lines)
 	if sp.anomaly != anomalyNone || !sp.table.found {
-		return existing, false
+		return existing, false, sp.anomaly
 	}
 	view := codexReadTable(lines, sp.table)
 	marker, markerFound := codexMarkerValue(lines, sp, view)
 	class, begin, end := classifyMarkers(lines)
 	inOldBlock := class == classReplace && sp.table.start > begin && sp.table.start < end
 	if !codexOwnership(marker, markerFound, view.command, inOldBlock) {
-		return existing, false
+		return existing, false, anomalyNone
 	}
 	drop := map[int]bool{}
 	for i := sp.table.start; i < sp.table.end; i++ {
@@ -803,7 +807,7 @@ func uninstallCodexConfigBlock(existing []byte) (out []byte, changed bool) {
 			out = append(out, ln...)
 		}
 	}
-	return out, true
+	return out, true, anomalyNone
 }
 
 // codexConfigPath — $CODEX_HOME/config.toml, 미설정 시 ~/.codex/config.toml
@@ -1001,11 +1005,14 @@ func ensureEOL(b []byte, eol string) []byte {
 	return b
 }
 
-// inlineMarkerSpan — 인라인 env 대입 줄(**원문**)에서 key의 문자열 값 구간 [start,end)를
-// 찾는다. 키 경계는 '{' 또는 ',' 다음의 첫 비공백 토큰으로 한정하고 따옴표 표기도 같은 키로
+// inlineMarkerSpan — 인라인 env 대입 줄(**원문**)에서 key의 값 구간 [start,end)를 찾는다.
+// 키 경계는 '{' 또는 ',' 다음의 첫 비공백 토큰으로 한정하고 따옴표 표기도 같은 키로
 // 본다(tomlKeyLen) — 읽기(tomlInlineValue)와 되쓰기가 같은 키 기준을 써야 "부재로 읽고 다시
 // 넣는" 중복 키가 생기지 않는다. 부분 문자열로 찾으면 다른 키의 값 안에 든 같은 이름까지
-// 잡는다. 없거나 값이 문자열이 아니면 (-1,-1)이다. tomlInlineValue와 달리 정규화 문자열이
+// 잡는다. **값이 문자열이 아니어도 그 값 토큰의 구간을 돌려준다** — 이 키는 우리 표식이므로
+// 판독되지 않는 값은 드리프트이고, 그 자리를 표식 문자열로 치환하는 것이 유일하게 중복 키를
+// 만들지 않는 정리 경로다(tomlInlineValueEnd가 끝을 잡는다). 키가 없거나 값 토큰의 끝을 그
+// 줄에서 찾지 못하면(여러 줄 값 등) (-1,-1)이다. tomlInlineValue와 달리 정규화 문자열이
 // 아니라 원문을 받는다 — 되쓰기는 원문 바이트를 보존해야 하므로 stripLine이 지운 공백 위치를
 // 쓸 수 없다.
 func inlineMarkerSpan(s, key string) (start, end int) {
@@ -1030,20 +1037,65 @@ func inlineMarkerSpan(s, key string) (start, end int) {
 		}
 		j = skipSpace(j + 1)
 		if j >= len(s) || s[j] != '"' {
-			return -1, -1 // 키는 있으나 문자열 값이 아니다 — 우리가 다루지 않는 형태
+			if e := tomlInlineValueEnd(s, j); e > j {
+				return j, e // 판독되지 않는 값 — 토큰째 표식 문자열로 갈아 끼운다
+			}
+			return -1, -1
 		}
 		return j, j + basicStringLen(s[j:])
 	}
 	return -1, -1
 }
 
+// tomlInlineValueEnd — 인라인 테이블 안에서 i부터 시작하는 값 토큰의 끝(다음 최상위 ',' 또는
+// '}' 앞, 후행 공백 제외). 따옴표 문자열과 중첩 배열·인라인 테이블 안의 그 문자는 종결자가
+// 아니다 — 건너뛰기 기준은 tomlLineScanner.advance·stripTrailingComment와 같다. 부분 문자열로
+// 끝을 찾으면 값 안에 쉼표·중괄호를 담은 사용자 인라인 테이블이 깨진다. 종결자를 그 줄에서
+// 찾지 못하면 -1이다: 값이 다음 줄로 이어지는 형태는 우리가 다루지 않으므로 호출자가 원문을
+// 그대로 둔다. 문자열 밖 '#'도 같은 취급이다 — 닫히지 않은 인라인 테이블이라는 뜻이다.
+func tomlInlineValueEnd(s string, i int) int {
+	depth := 0
+	for i < len(s) {
+		switch c := s[i]; c {
+		case '"':
+			i += basicStringLen(s[i:])
+		case '\'':
+			i += literalStringLen(s[i:])
+		case '[', '{':
+			depth++
+			i++
+		case ']':
+			depth--
+			i++
+		case ',', '}':
+			if depth == 0 {
+				for i > 0 && (s[i-1] == ' ' || s[i-1] == '\t') {
+					i--
+				}
+				return i
+			}
+			if c == '}' {
+				depth--
+			}
+			i++
+		case '#':
+			return -1
+		default:
+			i++
+		}
+	}
+	return -1
+}
+
 // setInlineEnvMarker — 인라인 env 대입 줄에 소유 표식을 심는다. 이미 있으면 **그 키의 값
 // 구간만** 바꾸고, 없으면 여는 중괄호 뒤에 더한다(내부가 비면 쉼표를 붙이지 않는다 — TOML은
-// 인라인 테이블의 후행 쉼표를 허용하지 않는다). 그 밖의 키는 원문 그대로 남는다. 키는 있는데
-// 값이 문자열이 아니면 우리가 다루지 않는 형태이므로 원문을 그대로 둔다(중복 키 생성 금지) —
-// 그 판정은 inlineMarkerSpan이 돌려주는 (-1,-1)이 내린다. **빈 문자열 값은 그 부류가 아니다**:
-// 값 구간이 있으므로 제자리에서 현재 값으로 갱신한다 — 갱신하지 않으면 표식이 영영 현재 값이
-// 되지 못하고, 그 상태가 D84 무변경 판정을 매번 어긋나게 한다.
+// 인라인 테이블의 후행 쉼표를 허용하지 않는다). 그 밖의 키는 원문 그대로 남는다. 값이
+// 문자열이 아니어도(정수·불리언·홑따옴표 등) 그 토큰을 표식 문자열로 갈아 끼운다 — 삽입이
+// 아니라 치환이라 중복 키가 생기지 않고, 그대로 두면 표식이 영영 현재 값이 되지 못해 doctor가
+// "경고 없는 표식없음"과 "무변경" 두 줄을 함께 내는 상태로 굳는다. **빈 문자열 값도 같다**:
+// 값 구간이 있으므로 제자리에서 현재 값으로 갱신한다. 값 토큰의 끝을 그 줄에서 찾지 못하는
+// 형태(여러 줄 값)와 여는 중괄호가 그 줄에 없는 형태만 원문을 그대로 둔다 — 그 판정은
+// inlineMarkerSpan이 돌려주는 (-1,-1)이 내린다.
 // 값으로 첫 일치를 치환하지 않는 이유: 표식과 **값이 같은** 사용자 키가 앞서 있으면 그 값이
 // 바뀌고 CTR_MANAGED는 옛 값으로 남는다 — 사용자 환경변수를 조용히 고치는 경로다.
 func setInlineEnvMarker(line []byte, old string, oldFound bool, marker, eol string) []byte {

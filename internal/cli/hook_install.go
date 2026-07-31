@@ -909,7 +909,9 @@ func runHookUninstallCodex(user bool, projectRoot string, stdout io.Writer) erro
 	// config.toml 관리 블록 제거는 hooks.json 유무와 무관하게 항상 시도한다(부분 설치 잔존 방지, P2).
 	if cfgPath, cErr := codexConfigPath(); cErr == nil {
 		if cfgExisting, rErr := os.ReadFile(cfgPath); rErr == nil {
-			if cfgOut, changed := uninstallCodexConfigBlock(cfgExisting); changed {
+			cfgOut, changed, cfgAnomaly := uninstallCodexConfigBlock(cfgExisting)
+			switch {
+			case changed:
 				// D84 — "내용을 바꾸기 직전 config.toml.bak 단일 슬롯"은 제거 경로에도 선다
 				// (리뷰 P1). install·doctor --fix와 같은 규칙이어야 잘못된 제거를 되돌릴 수 있고,
 				// changed 판정 뒤에 두므로 무변경 재실행이 단일 슬롯을 덮지 않는다.
@@ -920,6 +922,11 @@ func runHookUninstallCodex(user bool, projectRoot string, stdout io.Writer) erro
 					return errors.New("hook uninstall: config.toml 쓰기 실패")
 				}
 				fmt.Fprintln(stdout, "hook uninstall (codex): MCP 등록 블록 제거 완료 — 다른 프로젝트가 Codex 가드를 계속 사용하면 그 프로젝트에서 hook install --codex 재실행으로 재기입하세요")
+			case cfgAnomaly != anomalyNone:
+				// 구간 판정 이상으로 무변경 이탈했다 — 알리지 않으면 훅 제거 문면과 exit 0만 보이는데
+				// 관리 테이블은 파일에 남아 Codex가 그 MCP 서버를 계속 띄운다. 설치기의 같은 갈래
+				// (reportCodexMCPState)와 같은 형태로 사유를 싣는다. 종료코드 계약은 바뀌지 않는다.
+				fmt.Fprintf(stdout, "hook uninstall (codex): config.toml 무변경·MCP 등록 제거 보류 — %s\n", cfgAnomaly.reason())
 			}
 		}
 	}

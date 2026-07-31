@@ -345,7 +345,7 @@ func TestUninstallCodexConfigBlock(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			out, changed := uninstallCodexConfigBlock([]byte(c.existing))
+			out, changed, _ := uninstallCodexConfigBlock([]byte(c.existing))
 			if changed != c.wantChanged || string(out) != c.wantOut {
 				t.Fatalf("changed=%v out=%q (want %v %q)", changed, out, c.wantChanged, c.wantOut)
 			}
@@ -398,7 +398,7 @@ func TestCodexConfigBlockRoundTrip(t *testing.T) {
 			if res.State != mcpWritten {
 				t.Fatalf("install(%q) state=%d", orig, res.State)
 			}
-			back, _ := uninstallCodexConfigBlock(res.Out)
+			back, _, _ := uninstallCodexConfigBlock(res.Out)
 			want := orig
 			if want != "" && !strings.HasSuffix(want, "\n") {
 				eol := "\n"
@@ -750,7 +750,7 @@ func TestCodexMarkerInsideMultilineStringNotOwned(t *testing.T) {
 	if !bytes.Contains(res.Out, []byte(codexBlockBegin)) {
 		t.Errorf("문자열 내용 줄이 지워졌다:\n%s", res.Out)
 	}
-	out, changed := uninstallCodexConfigBlock(cfg)
+	out, changed, _ := uninstallCodexConfigBlock(cfg)
 	if changed {
 		t.Errorf("uninstall이 미소유 테이블을 건드렸다:\n%s", out)
 	}
@@ -882,8 +882,10 @@ func TestCodexEscapedManagedKey(t *testing.T) {
 			if res.State != mcpMarkerAnomaly || res.Changed || !bytes.Equal(res.Out, []byte(c.src)) {
 				t.Errorf("install이 무변경이 아니다: state=%d changed=%v", res.State, res.Changed)
 			}
-			if out, changed := uninstallCodexConfigBlock([]byte(c.src)); changed || !bytes.Equal(out, []byte(c.src)) {
-				t.Errorf("uninstall이 무변경이 아니다: changed=%v", changed)
+			// uninstall도 사유를 **그대로** 넘긴다 — 무변경만으로는 호출자가 "관리 테이블이
+			// 남았다"를 알릴 수 없어 제거 성공 문면만 보인다. 기대값은 probe와 같이 c.want다.
+			if out, changed, anomaly := uninstallCodexConfigBlock([]byte(c.src)); changed || !bytes.Equal(out, []byte(c.src)) || anomaly != c.want {
+				t.Errorf("uninstall이 무변경·사유 전파가 아니다: changed=%v anomaly=%d want %d", changed, anomaly, c.want)
 			}
 			// probe는 구간 사유를 **그대로** 넘긴다(D85) — 기대값을 c.want로 쓴다. 여기에 특정
 			// 사유를 하드코딩하면 "앞 사유를 유지한다" 케이스(중복 헤더)가 물지 않는다.
@@ -1015,5 +1017,59 @@ func TestCodexInstallMarkerOnlyRewritesCommand(t *testing.T) {
 	}
 	if !strings.Contains(out, "enabled_tools = [\"ctr_search\"]") {
 		t.Errorf("enabled_tools가 보존되지 않았다:\n%s", out)
+	}
+}
+
+// TestCodexInlineMarkerNonStringValue — 인라인 env의 표식 값이 문자열이 아니면 그 **값 토큰만**
+// 관리 표식 문자열로 갈아 끼운다(삽입이 아니라 치환이라 중복 키가 생기지 않는다). 종전에는
+// 원문을 그대로 두어 표식이 영영 현재 값이 되지 못했고, 그 상태가 doctor에서 "경고 없는
+// 표식없음 + 무변경 보고"라는 서로 모순된 두 줄로 새어 나왔다. 종결자를 그 줄에서 찾지 못하는
+// 형태(여러 줄 값)는 여전히 다루지 않는다 — 그 경계를 마지막 케이스가 잰다.
+func TestCodexInlineMarkerNonStringValue(t *testing.T) {
+	const head = "[mcp_servers.ctr]\ncommand = \"context-router\"\n"
+	marker := hookMarker("0.16.0")
+	cases := []struct {
+		name, src, want string
+	}{
+		{
+			"정수 값 — 표식 문자열로 교체",
+			head + "env = { " + codexMarkerKey + " = 0 }\n",
+			head + "env = { " + codexMarkerKey + " = \"" + marker + "\" }\n",
+		},
+		{
+			"뒤 키는 원문 그대로",
+			head + "env = { " + codexMarkerKey + " = 0, PATH = \"/x\" }\n",
+			head + "env = { " + codexMarkerKey + " = \"" + marker + "\", PATH = \"/x\" }\n",
+		},
+		{
+			// 값 안의 쉼표·중괄호는 종결자가 아니다 — 부분 문자열로 끝을 찾으면 여기서 사용자
+			// 인라인 테이블이 깨진다.
+			"홑따옴표 값 안의 쉼표·중괄호",
+			head + "env = { " + codexMarkerKey + " = 'a,b}', X = 1 }\n",
+			head + "env = { " + codexMarkerKey + " = \"" + marker + "\", X = 1 }\n",
+		},
+		{
+			"여러 줄 값 — 다루지 않는 형태(무변경)",
+			head + "env = { " + codexMarkerKey + " = [1,\n2] }\n",
+			head + "env = { " + codexMarkerKey + " = [1,\n2] }\n",
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			res := installCodexConfigBlock([]byte(c.src), codexInstallRequest{Marker: marker, MarkerOnly: true})
+			if res.State != mcpWritten {
+				t.Fatalf("state=%d want mcpWritten", res.State)
+			}
+			if string(res.Out) != c.want {
+				t.Fatalf("got=%q\nwant=%q", res.Out, c.want)
+			}
+			if res.Changed != (c.src != c.want) {
+				t.Errorf("Changed=%v — 산출이 원문과 다른가와 어긋난다", res.Changed)
+			}
+			// 멱등 — 교체한 뒤 재실행이 또 바꾸면 D84 단일 백업 슬롯이 2회차에 원본을 잃는다.
+			if again := installCodexConfigBlock(res.Out, codexInstallRequest{Marker: marker, MarkerOnly: true}); again.Changed {
+				t.Errorf("2회차가 무변경이 아니다:\n%s", again.Out)
+			}
+		})
 	}
 }
