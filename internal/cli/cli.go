@@ -2053,6 +2053,8 @@ func codexMarkerLabel(data []byte, readErr error, version string) (label string,
 	switch v.State {
 	case mcpMarkerAnomaly:
 		return "이상", false, v.Anomaly.reason()
+	case mcpOutputInvalid:
+		return "기입불가", false, v.Anomaly.reason()
 	case mcpConflict:
 		return "충돌", false, ""
 	case mcpExistingHeader:
@@ -2133,6 +2135,7 @@ func codexRegistrationVerdict(data []byte, version string) codexVerdict {
 // 줄이면 "파일은 있고 관리 테이블만 없는" 상태에서 install이 append 경로로 Changed=true를
 // 내는데 --fix는 등록을 만들지 않으므로 오권고가 된다 — 지금 "미등록·무경고"로 옳게 보고되는
 // 가장 흔한 미설치 상태가 그것이다.
+// 새 상태 mcpOutputInvalid는 이 술어의 첫 항에서 거짓이 되어 권고가 서지 않는다(D89).
 func (v codexVerdict) shouldFix() bool {
 	return v.State == mcpWritten && v.TableFound && v.Changed
 }

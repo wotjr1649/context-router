@@ -1508,3 +1508,44 @@ func TestDropsLastSeenUTC(t *testing.T) {
 		t.Fatalf("formatDropCount(0,nil,nil)=%q want \"0\"", got)
 	}
 }
+
+// TestHookInstallCodexGateReport — D89 소비자 1·2·3. 기입을 건너뛴 실행이 기입 완료를
+// 인쇄하거나 MCP 확정으로 가드 훅을 등록하면 안 된다.
+func TestHookInstallCodexGateReport(t *testing.T) {
+	home := isolateCodexHome(t)
+	cfg := filepath.Join(home, "config.toml")
+	writeCodexConfig(t, home, codexGateFixture)
+	proj := t.TempDir()
+	var buf bytes.Buffer
+	if err := runHookInstallCodex(false, false, false, "", proj, "0.17.0", nil, false, &buf); err != nil {
+		t.Fatalf("install 실패: %v", err)
+	}
+	out := buf.String()
+	if strings.Contains(out, "MCP 관리 테이블 기입 완료") {
+		t.Errorf("소비자 3 — 기입을 건너뛰고 완료를 인쇄했다:\n%s", out)
+	}
+	if !strings.Contains(out, anomalyOutputInvalid.reason()) {
+		t.Errorf("사유가 나오지 않았다:\n%s", out)
+	}
+	// 소비자 1 — 파일이 바뀌지 않았다
+	got, err := os.ReadFile(cfg)
+	if err != nil {
+		t.Fatalf("config.toml 읽기 실패: %v", err)
+	}
+	if string(got) != codexGateFixture {
+		t.Errorf("config.toml이 바뀌었다:\n%s", got)
+	}
+	// 소비자 2 — 가드 훅이 등록되지 않았다. 훅 파일 경로는 codexHooksPath가 정하므로
+	// 그 함수로 얻는다(프로젝트/사용자 갈래가 있어 경로를 손으로 조립하면 어긋난다).
+	hp, err := codexHooksPath(false, proj)
+	if err != nil {
+		t.Fatalf("훅 경로 해석 실패: %v", err)
+	}
+	hooks, err := os.ReadFile(hp)
+	if err != nil {
+		t.Fatalf("hooks.json 읽기 실패: %v", err)
+	}
+	if strings.Contains(string(hooks), "PreToolUse") {
+		t.Errorf("MCP 미확정인데 가드 그룹이 등록됐다:\n%s", hooks)
+	}
+}

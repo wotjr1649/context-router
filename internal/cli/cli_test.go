@@ -3414,3 +3414,30 @@ func TestDoctorIndexesRender(t *testing.T) {
 		t.Fatalf("indexes 병기가 quick_check 뒤에 없다:\n%s", out)
 	}
 }
+
+// TestDoctorCodexGateLabel — D89 소비자 5(라벨 생성기). 미배선이면 그 switch에 기본 갈래가
+// 없어 정상 계열 라벨(marker …)이 경고 없이 나간다.
+func TestDoctorCodexGateLabel(t *testing.T) {
+	home := isolateCodexHome(t)
+	writeCodexConfig(t, home, codexGateFixture)
+	out, _ := doctorOut(t, t.TempDir(), false)
+	if !strings.Contains(out, "codex=기입불가") {
+		t.Errorf("[20] 라벨에 기입불가가 없다:\n%s", out)
+	}
+	if strings.Contains(out, "codex=marker ") {
+		t.Errorf("[20]이 정상 계열 라벨을 냈다:\n%s", out)
+	}
+	if !strings.Contains(out, anomalyOutputInvalid.reason()) {
+		t.Errorf("[20] 사유 줄이 없다:\n%s", out)
+	}
+	// 소비자 4 — --fix가 기입 불가를 **명시적으로** 말해야 한다. 부정 단정만 두면 게이트가
+	// 없을 때도 그 문구가 안 나오므로(그 픽스처는 TableFound=false라 "관리 테이블이
+	// 없습니다"가 나간다) 감시선이 서지 않는다.
+	fixOut, _ := doctorOut(t, t.TempDir(), true)
+	if !strings.Contains(fixOut, "기입 가능한 상태가 아닙니다") {
+		t.Errorf("--fix가 기입불가 상태를 그렇게 보고하지 않았다:\n%s", fixOut)
+	}
+	if strings.Contains(fixOut, "이미 현재 형식") {
+		t.Errorf("--fix가 기입불가 상태를 정상으로 보고했다:\n%s", fixOut)
+	}
+}
