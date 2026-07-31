@@ -17,7 +17,7 @@
 | D5 | Go 실행 = 외부 toolchain 감지 (v0.2 구현 시) |
 | D6 | stats CLI 전용 |
 | D7 | 이름 유지 + 네임스페이스 선점 (git 저장소 생성 완료) |
-| D8 | go-sdk v1.6.1 + modernc v1.54.0/libc v1.74.1 + starlark-go + x/sys **+ readeck/go-readability + html-to-markdown/v2 (D12 수반, 총 7개)**; cobra·yaml·ORM·DI 미사용 |
+| D8 | go-sdk v1.6.1 + modernc v1.54.0/libc v1.74.1 + starlark-go + x/sys **+ readeck/go-readability + html-to-markdown/v2 (D12 수반, 총 7개 — 아래 v0.17 개정)**; cobra·yaml·ORM·DI 미사용 |
 | D9 | 전 DB `WAL + synchronous=NORMAL + busy_timeout=5000 + foreign_keys=ON + user_version` |
 | D10 | v0.0.1 계약 재정의: 코어 6 MCP 도구 + CLI 4종, exec 3종 구현째 v0.2 |
 | D11 | SDK: 현행 v1.6.1로 진행, 차기 스펙 정식 출시 시 업그레이드 마일스톤 |
@@ -449,7 +449,7 @@ context-router/
 ├─ internal/ident/              # canonicalization (§3.2)
 ├─ internal/cli/                # doctor/stats/purge/upgrade
 ├─ testdata/                    # golden fixtures, canary, hostile paths, html corpus
-├─ go.mod                       # D8 의존성 7개
+├─ go.mod                       # D8 의존성 (개수는 §0 v0.17 개정)
 └─ docs/
 ```
 
