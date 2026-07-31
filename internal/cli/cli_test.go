@@ -3490,3 +3490,45 @@ func TestDoctorCodexUnownedTable(t *testing.T) {
 		t.Errorf("[16] 막다른 갈래에 조치가 없다:\n%s", out)
 	}
 }
+
+// TestDoctorCodexToolsShort — D91. 모자란 목록만 알린다. 넓힌 것은 통과하고, 키가 아예 없는
+// 등록물은 부족으로 세지 않는다(부재와 빈 배열의 의미가 반대다).
+func TestDoctorCodexToolsShort(t *testing.T) {
+	const want = "도구 목록이 프로필보다 모자랍니다"
+	cases := []struct {
+		name  string
+		table string
+		short bool
+	}{
+		{"모자람", "enabled_tools = [\"ctr_search\"]\n", true},
+		{"정확히 프로필대로", "enabled_tools = [\"ctr_search\", \"ctr_fetch\", \"ctr_transform\", \"ctr_record_event\", \"ctr_session_summary\", \"ctr_export_events\", \"ctr_index\", \"ctr_fetch_and_index\"]\n", false},
+		{"사용자가 넓힘", "enabled_tools = [\"ctr_search\", \"ctr_fetch\", \"ctr_transform\", \"ctr_record_event\", \"ctr_session_summary\", \"ctr_export_events\", \"ctr_index\", \"ctr_fetch_and_index\", \"ctr_execute\"]\n", false},
+		{"키 부재", "", false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			home := isolateCodexHome(t)
+			src := "[mcp_servers.ctr]\ncommand = \"context-router\"\nargs = [\"--enable\", \"ingest,net\"]\n" + c.table +
+				"\n[mcp_servers.ctr.env]\nCTR_MANAGED = \"" + hookMarker("0.17.0") + "\"\n"
+			writeCodexConfig(t, home, src)
+			out, _ := doctorOut(t, t.TempDir(), false)
+			if got := strings.Contains(out, want); got != c.short {
+				t.Errorf("부족 경고=%v want %v\n%s", got, c.short, out)
+			}
+			if c.short && !strings.Contains(out, "손으로 더한 항목이 있으면 사라집니다") {
+				t.Errorf("권고가 되돌림을 예고하지 않는다:\n%s", out)
+			}
+		})
+	}
+}
+
+// TestDoctorCodexToolsOnlyWhenWritable — 기입 없이 이탈하는 상태에는 도구 조치를 권하지
+// 않는다 — 실행해도 바뀌지 않는 명령을 안내하게 된다.
+func TestDoctorCodexToolsOnlyWhenWritable(t *testing.T) {
+	home := isolateCodexHome(t)
+	writeCodexConfig(t, home, "[mcp_servers.ctr]\ncommand = \"other\"\nenabled_tools = [\"x\"]\n")
+	out, _ := doctorOut(t, t.TempDir(), false)
+	if strings.Contains(out, "도구 목록이 프로필보다 모자랍니다") {
+		t.Errorf("사용자 소유 테이블에 도구 조치를 권했다:\n%s", out)
+	}
+}
