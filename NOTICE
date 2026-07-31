@@ -25,7 +25,7 @@ The table below lists every Go module dependency actually reachable from the
 compiled binary (direct and indirect, per `go list -deps -f '{{if .Module}}
 {{.Module.Path}} {{.Module.Version}}{{end}}' ./cmd/context-router`, unioned
 across the GOOS=linux/windows/darwin build targets so OS-gated modules such as
-the Linux-only sandbox are included), 28 in total. License type and copyright
+the Linux-only sandbox are included), 29 in total. License type and copyright
 holder were verified against each module's own LICENSE file in the local Go
 module cache (`go env GOMODCACHE`), matched to the exact version pinned in
 go.mod/go.sum.
@@ -117,6 +117,12 @@ Module:    github.com/ncruces/go-strftime
 Version:   v1.0.0
 License:   MIT
 Copyright: Copyright (c) 2022 Nuno Cruces
+
+--------------------------------------------------------------------------------
+Module:    github.com/pelletier/go-toml/v2
+Version:   v2.4.3
+License:   MIT
+Copyright: Copyright (c) 2021 - 2023 Thomas Pelletier
 
 --------------------------------------------------------------------------------
 Module:    github.com/remyoudompheng/bigfft
