@@ -3581,10 +3581,14 @@ func TestDoctorMarkerWarningSplit(t *testing.T) {
 	if !strings.Contains(out, "codex=없음") {
 		t.Fatalf("픽스처가 config.toml 부재 갈래가 아니다:\n%s", out)
 	}
-	if !strings.Contains(out, "옛 이름의 항목") {
+	// 절 단정은 **경고 줄에만** 건다 — 두 절의 어구는 --fix 성공 줄에도 있어(`[20] fix:`),
+	// 전체 출력을 보면 픽스처가 언젠가 fix=true가 되는 순간 부재 단정이 거짓 실패로,
+	// 존재 단정이 경고 절 없이도 통과로 조용히 뒤집힌다.
+	warn := doctorWarningLine(out)
+	if !strings.Contains(warn, "옛 이름의 항목") {
 		t.Errorf(".mcp.json 드리프트인데 은퇴 정리 예고가 없다:\n%s", out)
 	}
-	if strings.Contains(out, "config.toml은 백업을 남깁니다") {
+	if strings.Contains(warn, "config.toml은 백업을 남깁니다") {
 		t.Errorf("config.toml이 없는데 백업을 약속했다:\n%s", out)
 	}
 }
@@ -3598,10 +3602,31 @@ func TestDoctorMarkerWarningSplitCodexOnly(t *testing.T) {
 	if !strings.Contains(out, ".mcp.json=없음") {
 		t.Fatalf("픽스처가 .mcp.json 부재 갈래가 아니다:\n%s", out)
 	}
-	if !strings.Contains(out, "config.toml은 백업을 남깁니다") {
+	warn := doctorWarningLine(out)
+	if !strings.Contains(warn, "config.toml은 백업을 남깁니다") {
 		t.Errorf("config.toml 드리프트인데 백업 예고가 없다:\n%s", out)
 	}
-	if strings.Contains(out, "옛 이름의 항목") {
+	if strings.Contains(warn, "옛 이름의 항목") {
 		t.Errorf(".mcp.json이 없는데 은퇴 정리를 예고했다:\n%s", out)
+	}
+}
+
+// TestDoctorMarkerWarningBothDrift — 두 절이 **함께** 나오는 경우를 한 줄 동등 비교로 잠근다.
+// 한쪽만 세운 픽스처 둘로는 조립을 배타 분기(else if)로 바꿔도 전부 초록이다 — 각 테스트가
+// 자기 절만 보고 반대쪽 부재를 단정하므로 논리합과 배타 분기를 구별하지 못한다. 절의 순서도
+// 여기서만 물린다. want는 cli.go의 리터럴을 그대로 옮긴 것이라 %q도 원문 그대로 둔다.
+func TestDoctorMarkerWarningBothDrift(t *testing.T) {
+	home := isolateCodexHome(t)
+	writeCodexConfig(t, home, "[mcp_servers.ctr]\ncommand = \"context-router\"\n\n[mcp_servers.ctr.env]\nCTR_MANAGED = \"context-router/0.1.0\"\n")
+	proj := t.TempDir()
+	if err := os.WriteFile(filepath.Join(proj, ".mcp.json"), []byte(`{"mcpServers":{"ctr-exec":{"command":"context-router","__ctrManaged":"context-router/0.1.0"}}}`), 0o600); err != nil {
+		t.Fatalf(".mcp.json 쓰기 실패: %v", err)
+	}
+	out, _ := doctorOut(t, proj, false)
+	// 픽스처 핀은 따로 두지 않는다 — 어느 한쪽 드리프트가 서지 않으면 그 절이 빠져 이 동등
+	// 비교가 바로 깨진다.
+	want := fmt.Sprintf("[20] warning: 다시 기입이 필요한 MCP 등록물이 있습니다 — doctor --fix로 고치세요(기존 파일만 고치고 등록을 만들지 않습니다. args·enabled_tools는 보존하지만 command는 %q로 다시 씁니다 — 직접 고쳐 둔 실행 경로가 있으면 그 값이 사라집니다. config.toml은 백업을 남깁니다. .mcp.json은 대체된 옛 이름의 항목을 함께 정리합니다)", hookBinaryName)
+	if got := doctorWarningLine(out); got != want {
+		t.Errorf("경고 줄이 다르다\n got=%s\nwant=%s", got, want)
 	}
 }
