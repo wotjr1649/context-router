@@ -2846,7 +2846,7 @@ func TestDoctorDetectFixEquivalence(t *testing.T) {
 		{
 			// 표식은 **현재 버전**인데 형식(구 BEGIN/END 블록)이 어긋나 --fix가 파일을 바꾸는
 			// 상태다. 이 행이 두 가지를 함께 잡는다: ① 버전 접미를 shouldFix로 붙이면 같은
-			// 버전을 좌우에 둔 "0.16.0≠0.16.0"이 나온다는 것(그래서 codexMarkerLabel이 버전
+			// 버전을 좌우에 둔 "0.16.0≠0.16.0"이 나온다는 것(그래서 codexVerdictLabel이 버전
 			// **비교**로 붙인다), ② 그 상태를 형식 접미로 구별한다는 것. 이 행이 없으면 두
 			// 규칙 모두 어떤 단정에도 걸리지 않는다(실측).
 			name: "⑮ 구 블록 + 현재 버전 표식 — 형식 드리프트",
@@ -3439,5 +3439,52 @@ func TestDoctorCodexGateLabel(t *testing.T) {
 	}
 	if strings.Contains(fixOut, "이미 현재 형식") {
 		t.Errorf("--fix가 기입불가 상태를 정상으로 보고했다:\n%s", fixOut)
+	}
+}
+
+// TestDoctorCodexInputUnparsable — D89 부수 결정 ②. Codex가 통째로 읽지 못하는 파일을
+// doctor가 정상으로 보고하면 안 된다. failed에 계상하지 않으므로 종료코드는 그대로다.
+func TestDoctorCodexInputUnparsable(t *testing.T) {
+	home := isolateCodexHome(t)
+	// 같은 테이블 헤더 두 번 — **파서만** 거부한다. codexManagedSpans는 우리 두 이름의 중복만
+	// 세므로 [a]가 겹쳐도 anomalyNone이고, 그래서 이 픽스처는 이상 갈래에 걸리지 않고
+	// InputParses 축을 홀로 물린다(이상 갈래가 대신 물면 무엇을 쟀는지 알 수 없다).
+	writeCodexConfig(t, home, "[a]\nx = 1\n\n[a]\ny = 2\n")
+	out, err := doctorOut(t, t.TempDir(), false)
+	if !strings.Contains(out, "[16]") || !strings.Contains(out, "TOML로 파스되지 않습니다") {
+		t.Errorf("[16]에 입력 파스 실패 줄이 없다:\n%s", out)
+	}
+	if err != nil {
+		t.Errorf("입력 파스 실패가 종료코드를 바꿨다: %v", err)
+	}
+}
+
+// TestDoctorCodexSingleVerdict — [16]과 [20]이 같은 판정을 쓴다. 판정원이 갈리면 같은 파일을
+// 두 절이 다르게 부른다.
+func TestDoctorCodexSingleVerdict(t *testing.T) {
+	home := isolateCodexHome(t)
+	writeCodexConfig(t, home, codexGateFixture)
+	out, _ := doctorOut(t, t.TempDir(), false)
+	// **긍정 단정이어야 한다.** 부정형("테이블=존재" 없음)은 판정원 교체 전에도 통과한다 —
+	// 그 픽스처에서 현행 probe는 관리 테이블을 못 잡아 [16]이 "테이블=부재"를 인쇄한다.
+	if !strings.Contains(out, "[16] codex: [mcp_servers.ctr] 테이블=기입불가") {
+		t.Errorf("[16]이 게이트 상태를 모른다:\n%s", out)
+	}
+	if !strings.Contains(out, anomalyOutputInvalid.reason()) {
+		t.Errorf("[16] 사유 줄이 없다:\n%s", out)
+	}
+}
+
+// TestDoctorCodexUnownedTable — [16]의 미소유 갈래(신설). 소유를 구별하면 그 갈래의 문면이
+// 바뀌고 막다른 경로에 조치가 생긴다(스펙 §2.3·§1.4-마가 이 픽스처를 명시적으로 요구한다).
+func TestDoctorCodexUnownedTable(t *testing.T) {
+	home := isolateCodexHome(t)
+	writeCodexConfig(t, home, "[mcp_servers.ctr]\ncommand = \"other-binary\"\n")
+	out, _ := doctorOut(t, t.TempDir(), false)
+	if !strings.Contains(out, "테이블=존재(사용자 소유)") {
+		t.Errorf("[16]이 미소유를 구별하지 않는다:\n%s", out)
+	}
+	if !strings.Contains(out, "이름을 바꾸거나 수동으로 정리한 뒤") {
+		t.Errorf("[16] 막다른 갈래에 조치가 없다:\n%s", out)
 	}
 }
