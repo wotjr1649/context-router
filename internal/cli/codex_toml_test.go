@@ -909,6 +909,7 @@ func TestCodexAnomalyReason(t *testing.T) {
 	for _, a := range []codexAnomaly{
 		anomalyDupHeader, anomalyScannerOpen, anomalyEscapedKey,
 		anomalyOutsideConflict, anomalyOutputInvalid, anomalyDottedEnv,
+		anomalyNotOwned,
 	} {
 		r := a.reason()
 		if r == "" {

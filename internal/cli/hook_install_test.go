@@ -1156,6 +1156,35 @@ func TestRunHookUninstallCodexReportsSpanAnomaly(t *testing.T) {
 	}
 }
 
+// TestHookUninstallCodexNotOwned — 소유 판정에 실패해 무변경으로 빠진 갈래에 문면이 있어야
+// 한다. 없으면 훅 제거 문면과 종료코드 0만 보이는데 관리 테이블은 남아 Codex가 그 MCP
+// 서버를 계속 띄운다. **테이블이 아예 없는 갈래는 무문면이다** — 미설치 사용자의 흔한
+// 실행에 잔존 문면이 나가면 안 된다.
+// t.Setenv(isolateCodexHome) 사용 → t.Parallel 금지.
+func TestHookUninstallCodexNotOwned(t *testing.T) {
+	cases := []struct {
+		name, src string
+		wantMsg   bool
+	}{
+		{"소유 실패", "[mcp_servers.ctr]\ncommand = \"other\"\n", true},
+		{"테이블 부재", "[other]\nx = 1\n", false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			home := isolateCodexHome(t)
+			writeCodexConfig(t, home, c.src)
+			var buf bytes.Buffer
+			if err := runHookUninstallCodex(false, t.TempDir(), &buf); err != nil {
+				t.Fatalf("uninstall 실패: %v", err)
+			}
+			got := strings.Contains(buf.String(), "MCP 등록 제거 보류")
+			if got != c.wantMsg {
+				t.Errorf("문면=%v want %v\n%s", got, c.wantMsg, buf.String())
+			}
+		})
+	}
+}
+
 // D47 설치 결합 — withGuard=true면 PreToolUse(matcher Bash) 그룹이 추가되고,
 // uninstall은 withGuard 무관하게 전 이벤트 소거(제거 대칭). 가드 포함 재병합은 멱등.
 // (matcher 단정은 json.MarshalIndent 실출력 형식 "matcher": "Bash"에 맞춘다 — 브리프의
