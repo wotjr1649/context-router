@@ -2061,12 +2061,24 @@ func runDoctor(ctx context.Context, w io.Writer, storeRoot, projectRoot, version
 	if mcpDrift || codexDrift {
 		// 문면을 사유 중립으로 둔다 — 표식은 현재인데 형식·command가 어긋나 --fix가 파일을
 		// 바꾸는 상태(구형식 포함)에서 "버전 표식이 다르다"는 사유를 잘못 말한다. 사유는
-		// 라벨이 담는다. .mcp.json 갈래는 은퇴 이름 항목도 함께 정리하므로 그것을 예고한다.
+		// 라벨이 담는다. **파일별 절은 각자의 드리프트에만 붙인다** — 인쇄 조건이 둘의
+		// 논리합이라 한 문면으로 두면 .mcp.json만 어긋난 사용자에게 config.toml 백업을, 그 반대
+		// 사용자에게 은퇴 이름 항목 정리를 예고한다. 없는 파일의 수리 동작을 약속하는 문면이다.
 		// **command 되쓰기도 예고한다**: 이 경고는 --fix가 파일을 바꾸는 모든 상태에서 나오고
 		// 그중에는 command만 사용자가 고쳐 둔 등록물이 있다(D86이 표식과 command를 맞춘다).
 		// 보존되는 것만 열거하면 절대경로·래퍼로 고쳐 둔 값이 예고 없이 사라지고, PATH에 우리
-		// 이름이 없는 호스트에서는 그 등록이 더 이상 기동하지 않는다.
-		fmt.Fprintf(w, "[20] warning: 다시 기입이 필요한 MCP 등록물이 있습니다 — doctor --fix로 고치세요(기존 파일만 고치고 등록을 만들지 않습니다. args·enabled_tools는 보존하지만 command는 %q로 다시 씁니다 — 직접 고쳐 둔 실행 경로가 있으면 그 값이 사라집니다. config.toml은 백업을 남깁니다. .mcp.json은 대체된 옛 이름의 항목을 함께 정리합니다)\n", hookBinaryName)
+		// 이름이 없는 호스트에서는 그 등록이 더 이상 기동하지 않는다. 그 절은 두 갈래 공통이라
+		// 도입부에 남는다.
+		var b strings.Builder
+		fmt.Fprintf(&b, "[20] warning: 다시 기입이 필요한 MCP 등록물이 있습니다 — doctor --fix로 고치세요(기존 파일만 고치고 등록을 만들지 않습니다. args·enabled_tools는 보존하지만 command는 %q로 다시 씁니다 — 직접 고쳐 둔 실행 경로가 있으면 그 값이 사라집니다", hookBinaryName)
+		if codexDrift {
+			b.WriteString(". config.toml은 백업을 남깁니다")
+		}
+		if mcpDrift {
+			b.WriteString(". .mcp.json은 대체된 옛 이름의 항목을 함께 정리합니다")
+		}
+		b.WriteString(")")
+		fmt.Fprintln(w, b.String())
 	}
 	if fix {
 		doctorFixRegistrations(w, projectRoot, version)

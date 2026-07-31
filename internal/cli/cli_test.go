@@ -3566,3 +3566,42 @@ func TestDoctorCodexToolsArgsUnreadable(t *testing.T) {
 		t.Errorf("목록을 보존하는 명령을 조치로 안내했다:\n%s", out)
 	}
 }
+
+// TestDoctorMarkerWarningSplit — 한 문면이 두 파일의 조치를 함께 예고하면 반대쪽 드리프트만
+// 있는 사용자에게 없는 파일의 수리 동작이 약속된다. 각 절은 자기 드리프트에만 나온다.
+func TestDoctorMarkerWarningSplit(t *testing.T) {
+	isolateCodexHome(t) // config.toml 없음 → codexDrift 거짓
+	proj := t.TempDir()
+	if err := os.WriteFile(filepath.Join(proj, ".mcp.json"), []byte(`{"mcpServers":{"ctr-exec":{"command":"context-router","__ctrManaged":"context-router/0.1.0"}}}`), 0o600); err != nil {
+		t.Fatalf(".mcp.json 쓰기 실패: %v", err)
+	}
+	out, _ := doctorOut(t, proj, false)
+	// 픽스처가 정말 한쪽 드리프트만 만드는지 먼저 못박는다 — 반대쪽도 드리프트면 아래 부재
+	// 단정은 조건 분리가 아니라 우연을 잰다.
+	if !strings.Contains(out, "codex=없음") {
+		t.Fatalf("픽스처가 config.toml 부재 갈래가 아니다:\n%s", out)
+	}
+	if !strings.Contains(out, "옛 이름의 항목") {
+		t.Errorf(".mcp.json 드리프트인데 은퇴 정리 예고가 없다:\n%s", out)
+	}
+	if strings.Contains(out, "config.toml은 백업을 남깁니다") {
+		t.Errorf("config.toml이 없는데 백업을 약속했다:\n%s", out)
+	}
+}
+
+// TestDoctorMarkerWarningSplitCodexOnly — 반대 방향. 절마다 그 드리프트만 있는 픽스처로
+// 확인하지 않으면, 백업 절이 .mcp.json 조건에 잘못 걸려도 통과한다(스펙 §2.3).
+func TestDoctorMarkerWarningSplitCodexOnly(t *testing.T) {
+	home := isolateCodexHome(t)
+	writeCodexConfig(t, home, "[mcp_servers.ctr]\ncommand = \"context-router\"\n\n[mcp_servers.ctr.env]\nCTR_MANAGED = \"context-router/0.1.0\"\n")
+	out, _ := doctorOut(t, t.TempDir(), false) // .mcp.json 없음 → mcpDrift 거짓
+	if !strings.Contains(out, ".mcp.json=없음") {
+		t.Fatalf("픽스처가 .mcp.json 부재 갈래가 아니다:\n%s", out)
+	}
+	if !strings.Contains(out, "config.toml은 백업을 남깁니다") {
+		t.Errorf("config.toml 드리프트인데 백업 예고가 없다:\n%s", out)
+	}
+	if strings.Contains(out, "옛 이름의 항목") {
+		t.Errorf(".mcp.json이 없는데 은퇴 정리를 예고했다:\n%s", out)
+	}
+}
