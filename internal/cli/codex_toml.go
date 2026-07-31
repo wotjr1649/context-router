@@ -360,13 +360,11 @@ func codexKeyName(s string) string {
 // `"e n v".CTR_MANAGED`가 env로 읽히고, 타인 테이블에 우리 표식이 선다. 문자열 밖 공백만
 // 무시한 원문 LHS를 받는다.
 func tomlDottedEnvKey(s string) (head, rest string) {
-	lhs := s
-	if i := tomlTopLevelEq(s); i >= 0 {
-		lhs = s[:i]
-	} else {
+	i := tomlTopLevelEq(s)
+	if i < 0 {
 		return "", ""
 	}
-	segs := tomlSplitDotted(lhs)
+	segs := tomlSplitDotted(s[:i])
 	// 따옴표 표기(`"env".FOO`)는 벗기면 같은 키이므로 여기서 인식한다. 반면 첫 마디가
 	// 이스케이프를 담으면 벗겨도 env와 같아지지 않아 아래 비교가 그대로 배제한다 — 이 술어는
 	// codexKeyName과 같이 이스케이프를 해석하지 않으며, 그 형태가 남기는 헤더 중복은 산출물
@@ -820,7 +818,7 @@ func installCodexConfigBlock(existing []byte, req codexInstallRequest) codexInst
 	// D90 — 점 표기 env가 있고 표식을 새로 넣거나 갱신해야 하면 쓸 자리가 없다. 헤더를 붙이면
 	// 같은 논리 테이블이 두 번 정의되고, 점 표기로 쓰면 이전 릴리스 바이너리가 그 파일을 깬다.
 	// 표식이 이미 현재 값이면 이탈하지 않는다 — 고칠 것이 없는 파일에 사유를 내는 오경보다.
-	if view.dottedEnv && !(view.dottedMarkerFound && view.dottedMarker == req.Marker) && marker != req.Marker {
+	if view.dottedEnv && (!view.dottedMarkerFound || view.dottedMarker != req.Marker) && marker != req.Marker {
 		return codexInstallResult{Out: existing, State: mcpMarkerAnomaly, TableFound: sp.table.found, Anomaly: anomalyDottedEnv, InputParses: inputParses,
 			Tools: diag.Tools, ToolsPresent: diag.ToolsPresent, WantTools: diag.WantTools, ArgsReadable: diag.ArgsReadable}
 	}
