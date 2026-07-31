@@ -3532,3 +3532,32 @@ func TestDoctorCodexToolsOnlyWhenWritable(t *testing.T) {
 		t.Errorf("사용자 소유 테이블에 도구 조치를 권했다:\n%s", out)
 	}
 }
+
+// TestDoctorCodexToolsArgsUnreadable — D91 리뷰 F1. args를 프로필로 되읽지 못하면
+// installCodexConfigBlock의 keepArgs가 서서 hook install --codex도 목록을 **보존한다** —
+// 그 상태에 기본 문면을 내면 실행해도 부족이 그대로인 명령을 조치로 안내하게 된다.
+// 감지는 유지하고(D91이 유보를 명시적으로 반대한다) 문면만 가른다.
+func TestDoctorCodexToolsArgsUnreadable(t *testing.T) {
+	home := isolateCodexHome(t)
+	src := "[mcp_servers.ctr]\ncommand = \"context-router\"\nargs = [\"--profile\", \"global-search\"]\n" +
+		"enabled_tools = [\"custom\"]\n\n[mcp_servers.ctr.env]\nCTR_MANAGED = \"" + hookMarker("0.17.0") + "\"\n"
+	writeCodexConfig(t, home, src)
+	// 픽스처가 실제로 그 갈래인지 먼저 못박는다 — 다른 상태로 흘러가면 아래 단정이 무엇을
+	// 쟀는지 알 수 없어진다(그 축이 무너져도 문면 단정은 조용히 통과할 수 있다).
+	if v := codexRegistrationVerdict([]byte(src), "0.17.0"); v.State != mcpWritten ||
+		!v.TableFound || !v.ToolsPresent || v.ArgsReadable {
+		t.Fatalf("픽스처가 되읽기 실패 갈래가 아니다: state=%d table=%v toolsPresent=%v argsReadable=%v",
+			v.State, v.TableFound, v.ToolsPresent, v.ArgsReadable)
+	}
+	out, _ := doctorOut(t, t.TempDir(), false)
+	if !strings.Contains(out, "args를 프로필로 해석하지 못해") {
+		t.Errorf("되읽기 실패를 알리지 않는다:\n%s", out)
+	}
+	if !strings.Contains(out, "hook install --codex --enable <프로필>") {
+		t.Errorf("프로필을 명시하는 형태를 안내하지 않는다:\n%s", out)
+	}
+	// 기본 문면이 그대로 나가면 그 명령은 이 상태에서 목록을 보존한다 — 조치가 아니다.
+	if strings.Contains(out, "hook install --codex로 반영하세요") {
+		t.Errorf("목록을 보존하는 명령을 조치로 안내했다:\n%s", out)
+	}
+}

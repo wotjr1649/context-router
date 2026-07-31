@@ -2046,7 +2046,15 @@ func runDoctor(ctx context.Context, w io.Writer, storeRoot, projectRoot, version
 	// 않는다 — 실행해도 바뀌지 않는 명령을 안내하게 된다. failed에 계상하지 않는다.
 	if codexVerdictOK && codexVerdictOnce.State == mcpWritten && codexVerdictOnce.TableFound &&
 		codexVerdictOnce.ToolsPresent && !toolsCover(codexVerdictOnce.Tools, codexVerdictOnce.WantTools) {
-		fmt.Fprintln(w, "[20] codex: 등록물의 도구 목록이 프로필보다 모자랍니다 — hook install --codex로 반영하세요(그 명령은 도구 목록을 프로필 기본값으로 다시 씁니다 — 손으로 더한 항목이 있으면 사라집니다)")
+		msg := "[20] codex: 등록물의 도구 목록이 프로필보다 모자랍니다 — hook install --codex로 반영하세요(그 명령은 도구 목록을 프로필 기본값으로 다시 씁니다 — 손으로 더한 항목이 있으면 사라집니다)"
+		if !codexVerdictOnce.ArgsReadable {
+			// 되읽기 실패면 installCodexConfigBlock의 keepArgs가 서서 그 명령도 목록을 **보존한다** —
+			// 감지는 그대로 두고(D91이 유보를 명시적으로 반대한다) 조치만 실제로 듣는 형태로 바꾼다.
+			// 프로필은 자리표시자로 둔다 — 되읽지 못한 값을 추측해 제시하면 사용자가 켜 둔 프로필이
+			// 우리 추측으로 바뀐다.
+			msg = "[20] codex: 등록물의 도구 목록이 프로필보다 모자랍니다 — 다만 args를 프로필로 해석하지 못해 hook install --codex는 목록을 보존합니다. hook install --codex --enable <프로필>로 프로필을 명시해야 다시 씁니다(그 명령은 도구 목록을 프로필 기본값으로 다시 씁니다 — 손으로 더한 항목이 있으면 사라집니다)"
+		}
+		fmt.Fprintln(w, msg)
 	}
 	if mcpDrift || codexDrift {
 		// 문면을 사유 중립으로 둔다 — 표식은 현재인데 형식·command가 어긋나 --fix가 파일을
