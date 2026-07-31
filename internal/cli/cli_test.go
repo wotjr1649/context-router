@@ -3470,7 +3470,9 @@ func TestDoctorCodexSingleVerdict(t *testing.T) {
 	if !strings.Contains(out, "[16] codex: [mcp_servers.ctr] 테이블=기입불가") {
 		t.Errorf("[16]이 게이트 상태를 모른다:\n%s", out)
 	}
-	if !strings.Contains(out, anomalyOutputInvalid.reason()) {
+	// **`[16]` 줄에 한정한다.** 사유만 보면 [20]이 이미 같은 문자열을 인쇄하므로 늘 참이고,
+	// TestDoctorCodexGateLabel의 단정과 완전히 겹쳐 [16]의 사유 줄을 통째로 지워도 물지 않는다.
+	if !strings.Contains(out, "[16] warning: "+anomalyOutputInvalid.reason()) {
 		t.Errorf("[16] 사유 줄이 없다:\n%s", out)
 	}
 }
