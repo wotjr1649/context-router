@@ -370,7 +370,7 @@ func tomlDottedEnvKey(s string) (head, rest string) {
 	// 따옴표 표기(`"env".FOO`)는 벗기면 같은 키이므로 여기서 인식한다. 반면 첫 마디가
 	// 이스케이프를 담으면 벗겨도 env와 같아지지 않아 아래 비교가 그대로 배제한다 — 이 술어는
 	// codexKeyName과 같이 이스케이프를 해석하지 않으며, 그 형태가 남기는 헤더 중복은 산출물
-	// 유효성 게이트(D89)가 무변경으로 받아 낸다(실측: state=mcpOutputInvalid).
+	// 유효성 게이트(D89)가 무변경으로 받아 낸다 — TestCodexDottedHead가 그 둘을 고정한다.
 	if len(segs) < 2 || strings.Trim(segs[0], `"'`) != "env" {
 		return "", ""
 	}

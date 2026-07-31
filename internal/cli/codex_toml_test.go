@@ -899,11 +899,17 @@ func TestCodexEscapedManagedKey(t *testing.T) {
 	}
 }
 
-// TestCodexAnomalyReason — 세 사유가 서로 다른 문면을 준다(§2-7). 같은 문면이면 사용자는
+// TestCodexAnomalyReason — 사유마다 서로 다른 문면을 준다(§2-7). 같은 문면이면 사용자는
 // install이 영구 무변경인 이유를 구별할 수 없다.
+// **사유를 더하면 이 목록에도 더한다.** reason()은 default에서 ""를 돌려주므로 case를 빠뜨리면
+// 사용자에게 빈 문면이 나가는데, 목록이 뒤처지면 그 무성 실패를 잡는 단정이 하나도 없다.
+// anomalyNone은 의도적으로 빈 문자열이라 이 목록의 대상이 아니다 — 아래에서 따로 단정한다.
 func TestCodexAnomalyReason(t *testing.T) {
 	seen := map[string]codexAnomaly{}
-	for _, a := range []codexAnomaly{anomalyDupHeader, anomalyScannerOpen, anomalyEscapedKey} {
+	for _, a := range []codexAnomaly{
+		anomalyDupHeader, anomalyScannerOpen, anomalyEscapedKey,
+		anomalyOutsideConflict, anomalyOutputInvalid, anomalyDottedEnv,
+	} {
 		r := a.reason()
 		if r == "" {
 			t.Errorf("anomaly=%d의 사유 문면이 비었다", a)
@@ -1365,6 +1371,32 @@ func TestCodexDottedEnvCurrentMarkerWrites(t *testing.T) {
 	}
 }
 
+// TestCodexDottedEnvQuotedSpaceIsNotEnv — 술어에 넘기는 인자가 **원문**인지를 호출부에서 재는
+// 자리(D90 판정 술어 첫 항). `"e n v"`는 env가 아니라 남의 서브테이블이므로 우리는 평소대로
+// [mcp_servers.ctr.env]를 만들어야 한다. codexReadTable이 정규화(joined)를 넘기면 stripLine이
+// 따옴표 안 공백을 지워 그 줄이 env 정의로 읽히고, 헤더가 서지 않아 우리 표식이 남의 테이블에
+// 있는 것처럼 취급된다 — 헤더 실존을 **긍정으로** 단정해야 그 되돌림이 여기서 물린다.
+// (술어 단위의 `TestCodexDottedHead`는 인자를 재지 못한다 — 그쪽만으로는 joined로 바꿔도 녹색이다.)
+func TestCodexDottedEnvQuotedSpaceIsNotEnv(t *testing.T) {
+	src := "[mcp_servers.ctr]\ncommand = \"context-router\"\n\"e n v\".CTR_MANAGED = \"" + hookMarker("0.17.0") + "\"\n"
+	res := installCodexConfigBlock([]byte(src), codexInstallRequest{Marker: hookMarker("0.17.0")})
+	if res.State != mcpWritten {
+		t.Fatalf("state=%d want mcpWritten", res.State)
+	}
+	if !strings.Contains(string(res.Out), "[mcp_servers.ctr.env]") {
+		t.Errorf("env 헤더가 서지 않았다 — \"e n v\"를 env로 읽었다:\n%s", res.Out)
+	}
+	if !strings.Contains(string(res.Out), "\"e n v\".CTR_MANAGED") {
+		t.Errorf("남의 점 표기 줄이 사라졌다:\n%s", res.Out)
+	}
+	if !codexTOMLParses(res.Out) {
+		t.Errorf("산출물이 파스되지 않는다:\n%s", res.Out)
+	}
+	if again := installCodexConfigBlock(res.Out, codexInstallRequest{Marker: hookMarker("0.17.0")}); again.Changed {
+		t.Errorf("2회차가 무변경이 아니다:\n%s", again.Out)
+	}
+}
+
 // TestCodexDottedEnvJudgmentUnchanged — D90은 **정보만 더한다**. 소유·표식·이상 판정을
 // 손대지 않으므로 uninstall과 probe의 동작이 불변이다.
 func TestCodexDottedEnvJudgmentUnchanged(t *testing.T) {
@@ -1398,5 +1430,15 @@ func TestCodexDottedHead(t *testing.T) {
 		if head != c.head || rest != c.rest {
 			t.Errorf("tomlDottedEnvKey(%q) = (%q,%q), want (%q,%q)", c.in, head, rest, c.head, c.rest)
 		}
+	}
+	// 첫 마디가 이스케이프 표기면 이 술어는 인식하지 않는다 — 그 형태가 남기는 헤더 중복을
+	// 실제로 받아 내는 것은 D89 게이트다. tomlDottedEnvKey 주석이 펴는 그 주장을 여기서
+	// 고정한다: 단정이 없으면 게이트가 그 경로에서 빠져도 아무것도 물지 않는다.
+	if head, _ := tomlDottedEnvKey("\"\\u0065nv\".CTR_MANAGED = \"x\""); head != "" {
+		t.Errorf("이스케이프 마디를 env로 인식했다: head=%q", head)
+	}
+	esc := "[mcp_servers.ctr]\ncommand = \"context-router\"\n\"\\u0065nv\".CTR_MANAGED = \"x\"\n"
+	if res := installCodexConfigBlock([]byte(esc), codexInstallRequest{Marker: hookMarker("0.17.0")}); res.State != mcpOutputInvalid {
+		t.Errorf("state=%d want mcpOutputInvalid — 게이트가 받지 않으면 헤더 중복이 그대로 나간다", res.State)
 	}
 }
