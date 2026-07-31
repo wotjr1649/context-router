@@ -2801,6 +2801,21 @@ func TestCodexRegistrationVerdict(t *testing.T) {
 	}
 }
 
+// TestMarkerDriftLabel — 라벨 문법의 소유자를 하나로 둔다. 문법이 여러 자리에 복제돼 있으면
+// 한 자리만 고친 변경이 표면상 어긋난 두 줄을 만든다.
+func TestMarkerDriftLabel(t *testing.T) {
+	cases := []struct{ marker, version, want string }{
+		{"context-router/0.16.0", "0.17.0", "marker 0.16.0≠0.17.0"},
+		{"context-router", "0.17.0", "marker 버전미상≠0.17.0"},
+		{"context-router/0.17.0", "0.17.0", "marker 0.17.0"},
+	}
+	for _, c := range cases {
+		if got := markerDriftLabel(c.marker, c.version); got != c.want {
+			t.Errorf("markerDriftLabel(%q,%q) = %q, want %q", c.marker, c.version, got, c.want)
+		}
+	}
+}
+
 // TestDoctorDetectFixEquivalence — D85(§2-1·§2-2). 감지와 고침을 한 표에서 함께 단정한다.
 // 경고가 --fix를 권한 모든 상태에서 --fix가 config.toml을 바꾸고, 권하지 않은 모든 상태에서
 // 바꾸지 않는다. **Codex 갈래 한정**이다 — .mcp.json 갈래는 경고 없이도 재직렬화 형식 차이·
