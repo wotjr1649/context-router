@@ -1053,6 +1053,14 @@ func TestCodexInlineMarkerNonStringValue(t *testing.T) {
 			head + "env = { " + codexMarkerKey + " = [1,\n2] }\n",
 			head + "env = { " + codexMarkerKey + " = [1,\n2] }\n",
 		},
+		{
+			// 후행 주석 안의 쉼표는 값 토큰의 종결자가 아니다(tomlInlineValueEnd의 '#' 갈래).
+			// 그 갈래가 없으면 값 구간이 주석 안까지 늘어나 주석 절반이 표식 문자열로 갈린다.
+			// 닫는 중괄호가 주석에 먹혀 이미 무효 TOML인 줄이므로 무변경이 계약이다.
+			"주석 안의 쉼표 — 종결자가 아니다(무변경)",
+			head + "env = { " + codexMarkerKey + " = 0 # a, b\n",
+			head + "env = { " + codexMarkerKey + " = 0 # a, b\n",
+		},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -1069,6 +1077,37 @@ func TestCodexInlineMarkerNonStringValue(t *testing.T) {
 			// 멱등 — 교체한 뒤 재실행이 또 바꾸면 D84 단일 백업 슬롯이 2회차에 원본을 잃는다.
 			if again := installCodexConfigBlock(res.Out, codexInstallRequest{Marker: marker, MarkerOnly: true}); again.Changed {
 				t.Errorf("2회차가 무변경이 아니다:\n%s", again.Out)
+			}
+		})
+	}
+}
+
+// TestCodexInlineMarkerInsideStringValue — 인라인 env의 **다른 키의 문자열 값 안**에 표식 키와
+// 같은 모양이 들어 있어도 그 자리는 값이지 키가 아니다. inlineMarkerSpan의 바깥 루프가 문자열
+// 토큰을 건너뛰지 않으면 값 안의 `, CTR_MANAGED = …`가 키 경계로 잡혀 사용자 값 한가운데를
+// 치환한다 — 큰따옴표 값 안이면 넣은 따옴표가 값을 조기에 닫아 그 줄이 파스되지 않고,
+// 홑따옴표 값 안이면 파스는 되지만 사용자 환경변수가 조용히 바뀐다. 둘 다 무변경이 계약이다.
+func TestCodexInlineMarkerInsideStringValue(t *testing.T) {
+	const head = "[mcp_servers.ctr]\ncommand = \"context-router\"\n"
+	marker := hookMarker("0.16.0")
+	cases := []struct{ name, src string }{
+		{
+			"큰따옴표 값 안 — 치환하면 파스 불가",
+			head + "env = { A = \"x, " + codexMarkerKey + " = 0, y\", B = 1 }\n",
+		},
+		{
+			"홑따옴표 값 안 — 치환하면 사용자 값이 바뀐다",
+			head + "env = { A = 'x, " + codexMarkerKey + " = \"0\", y', B = 1 }\n",
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			res := installCodexConfigBlock([]byte(c.src), codexInstallRequest{Marker: marker, MarkerOnly: true})
+			if res.State != mcpWritten {
+				t.Fatalf("state=%d want mcpWritten", res.State)
+			}
+			if string(res.Out) != c.src || res.Changed {
+				t.Fatalf("사용자 값을 건드렸다: changed=%v\ngot =%q\nwant=%q", res.Changed, res.Out, c.src)
 			}
 		})
 	}

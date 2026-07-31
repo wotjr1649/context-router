@@ -395,8 +395,9 @@ func stripTrailingComment(s string) string {
 // 인라인 테이블의 키 토큰은 **env 엔트리에서만** 본다 — tomlKeyLen·inlineMarkerSpan이 그 줄에만
 // 적용되는 것과 같은 한정이고, 그것이 없으면 다른 키의 값 안에 든 쉼표 뒤 텍스트가 키로 잡힌다.
 // **알려진 한계**: env 인라인 값 안에 따옴표·역슬래시·등호를 함께 담은 문자열은 여전히 키로
-// 보인다. tomlInlineValue·inlineMarkerSpan이 이미 같은 한계를 갖는 형태이며(인라인 테이블의
-// 구조를 따라가지 않는다) D80의 파서 비의존 원칙 아래에서는 그 한계가 계약이다.
+// 보인다. tomlInlineValue가 이미 같은 한계를 갖는 형태이며(인라인 테이블의 구조를 따라가지
+// 않는다) D80의 파서 비의존 원칙 아래에서는 그 한계가 계약이다. inlineMarkerSpan은 되쓰기라
+// 값 안을 치환하면 사용자 파일이 깨지므로 그쪽만 문자열 토큰을 건너뛴다.
 func codexEscapedKeyInSpans(lines [][]byte, sp codexSpans) bool {
 	for _, span := range []codexSpan{sp.table, sp.env} {
 		if !span.found {
@@ -1009,12 +1010,15 @@ func ensureEOL(b []byte, eol string) []byte {
 // 키 경계는 '{' 또는 ',' 다음의 첫 비공백 토큰으로 한정하고 따옴표 표기도 같은 키로
 // 본다(tomlKeyLen) — 읽기(tomlInlineValue)와 되쓰기가 같은 키 기준을 써야 "부재로 읽고 다시
 // 넣는" 중복 키가 생기지 않는다. 부분 문자열로 찾으면 다른 키의 값 안에 든 같은 이름까지
-// 잡는다. **값이 문자열이 아니어도 그 값 토큰의 구간을 돌려준다** — 이 키는 우리 표식이므로
-// 판독되지 않는 값은 드리프트이고, 그 자리를 표식 문자열로 치환하는 것이 유일하게 중복 키를
-// 만들지 않는 정리 경로다(tomlInlineValueEnd가 끝을 잡는다). 키가 없거나 값 토큰의 끝을 그
-// 줄에서 찾지 못하면(여러 줄 값 등) (-1,-1)이다. tomlInlineValue와 달리 정규화 문자열이
-// 아니라 원문을 받는다 — 되쓰기는 원문 바이트를 보존해야 하므로 stripLine이 지운 공백 위치를
-// 쓸 수 없다.
+// 잡는다. **문자열 토큰은 통째로 건너뛴다**(stripTrailingComment·tomlInlineValueEnd와 같은
+// 기준) — 문자열 안의 쉼표는 키 경계가 아니므로, 건너뛰지 않으면 다른 키의 값 한가운데를
+// 표식 문자열로 치환해 큰따옴표 값에서는 그 줄이 파스되지 않고 홑따옴표 값에서는 사용자
+// 환경변수가 조용히 바뀐다. **값이 문자열이 아니어도 그 값 토큰의 구간을 돌려준다** — 이 키는
+// 우리 표식이므로 판독되지 않는 값은 드리프트이고, 그 자리를 표식 문자열로 치환하는 것이
+// 유일하게 중복 키를 만들지 않는 정리 경로다(tomlInlineValueEnd가 끝을 잡는다). 키가 없거나
+// 값 토큰의 끝을 그 줄에서 찾지 못하면(여러 줄 값 등) (-1,-1)이다. tomlInlineValue와 달리
+// 정규화 문자열이 아니라 원문을 받는다 — 되쓰기는 원문 바이트를 보존해야 하므로 stripLine이
+// 지운 공백 위치를 쓸 수 없다.
 func inlineMarkerSpan(s, key string) (start, end int) {
 	skipSpace := func(i int) int {
 		for i < len(s) && (s[i] == ' ' || s[i] == '\t') {
@@ -1022,11 +1026,21 @@ func inlineMarkerSpan(s, key string) (start, end int) {
 		}
 		return i
 	}
-	for i := 0; i < len(s); i++ {
-		if s[i] != '{' && s[i] != ',' {
+	for i := 0; i < len(s); {
+		switch s[i] {
+		case '"':
+			i += basicStringLen(s[i:]) // 두 길이 함수 모두 최소 1을 돌려준다 — 전진이 보장된다
+			continue
+		case '\'':
+			i += literalStringLen(s[i:])
+			continue
+		case '{', ',':
+			i++
+		default:
+			i++
 			continue
 		}
-		j := skipSpace(i + 1)
+		j := skipSpace(i)
 		n := tomlKeyLen(s[j:], key)
 		if n < 0 {
 			continue

@@ -2873,7 +2873,9 @@ func TestDoctorWarningAnnouncesCommandRewrite(t *testing.T) {
 	if warn == "" {
 		t.Fatalf("형식 드리프트인데 경고가 없다:\n%s", buf.String())
 	}
-	if !strings.Contains(warn, "command") || !strings.Contains(warn, hookBinaryName) {
+	// 되쓰기 **방향**까지 한 어구로 결속한다 — command와 우리 이름이 줄 어딘가에 있는지만 보면
+	// "command는 보존합니다" 같은 **반대 뜻** 문면도 통과해 감시선이 물지 않는다.
+	if !strings.Contains(warn, "command는 \""+hookBinaryName+"\"로 다시 씁니다") {
 		t.Errorf("경고가 command 되쓰기를 예고하지 않는다:\n%s", warn)
 	}
 
