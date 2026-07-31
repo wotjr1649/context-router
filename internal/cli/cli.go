@@ -2011,14 +2011,10 @@ func runDoctor(ctx context.Context, w io.Writer, storeRoot, projectRoot, version
 			// 이것을 "미등록"으로 접으면 [20]은 고칠 것이 없다고 말하는데 --fix는 파일을 바꾼다.
 			return "표식없음", true
 		}
-		v := markerVersion(marker)
-		if !markerDrift(marker, version) {
-			return "marker " + v, false
-		}
-		if v == "" { // 무버전 표식 — "표식 있음·버전 미상"(hostSnippet 붙여넣기 경로)
-			return "marker 버전미상≠" + version, true
-		}
-		return "marker " + v + "≠" + version, true
+		// 라벨 조립은 markerDriftLabel이 소유하고 판정은 markerDrift 그대로다. 여기까지 오면
+		// isOurMarkerValue가 참이라 markerDrift가 곧 버전 비교이고, 그래서 헬퍼의 세 갈래가
+		// 이 자리의 세 갈래와 1:1이다(무버전 표식은 양쪽 모두 드리프트로 본다).
+		return markerDriftLabel(marker, version), markerDrift(marker, version)
 	}
 	mcpData, mcpReadErr := os.ReadFile(mcpConfigPath(projectRoot))
 	mcpLabel, mcpDrift := markerState(mcpData, mcpReadErr, mcpManagedMarker)
@@ -2093,6 +2089,22 @@ func runDoctor(ctx context.Context, w io.Writer, storeRoot, projectRoot, version
 	return nil
 }
 
+// markerDriftLabel — 표식 값과 현재 버전으로 [20]의 두 갈래가 함께 쓰는 라벨 조각을 만든다.
+// **문자열 조립만 공유한다** — 판정(무엇을 드리프트로 볼지)은 각 자리가 그대로 갖는다.
+// D85가 .mcp.json 갈래를 클로저에 남긴 분리를 되돌리지 않기 위해서다.
+// 무버전 표식이 "버전미상≠"으로 나가는 이유는 markerDrift가 그것을 드리프트로 보는 것과
+// 같다 — 표식은 있고 버전만 모르는 상태이며 --fix가 현재 버전으로 채운다(D80).
+func markerDriftLabel(marker, version string) string {
+	v := markerVersion(marker)
+	if v == "" {
+		return "marker 버전미상≠" + version
+	}
+	if v != version {
+		return "marker " + v + "≠" + version
+	}
+	return "marker " + v
+}
+
 // codexVerdictLabel — **판정 하나에서** [20]의 Codex 라벨·권고 여부·사유를 만든다(D85). 읽기
 // 오류 갈래는 호출부가 정한다 — 판정이 서지 않은 상태를 라벨 함수가 다시 판정하면 판정원이
 // 둘이 되고, 그것이 [16]과 [20]을 갈라 놓았던 어긋남이다(D89 부수 결정 ①).
@@ -2129,21 +2141,19 @@ func codexVerdictLabel(v codexVerdict, version string) (label string, fix bool, 
 	if !isOurMarkerValue(v.Marker) {
 		return "표식없음", shouldFix, ""
 	}
-	// 버전 불일치 접미는 **버전 비교**로 붙인다. shouldFix로 붙이면 표식이 현재 버전인데 형식
-	// 드리프트 때문에 기입이 필요한 파일(구 블록 안의 현재 버전 표식)에서 같은 버전을 좌우에 둔
-	// 표기가 나온다. 형식 드리프트는 별도 접미로 구별한다.
+	// 버전 불일치 접미는 markerDriftLabel이 **버전 비교**로 붙인다. shouldFix로 붙이면 표식이
+	// 현재 버전인데 형식 드리프트 때문에 기입이 필요한 파일(구 블록 안의 현재 버전 표식)에서
+	// 같은 버전을 좌우에 둔 표기가 나온다. 그 상태는 헬퍼가 만든 조각에 형식 접미를 더해
+	// 구별한다 — 여기서만 나오는 갈래라 헬퍼에 넣지 않는다.
 	// early return으로 적는다 — if-else 체인은 revive의 indent-error-flow에 걸린다.
-	mv := markerVersion(v.Marker)
-	if mv == "" {
-		return "marker 버전미상≠" + version, shouldFix, ""
-	}
-	if mv != version {
-		return "marker " + mv + "≠" + version, shouldFix, ""
+	base := markerDriftLabel(v.Marker, version)
+	if markerVersion(v.Marker) != version {
+		return base, shouldFix, ""
 	}
 	if shouldFix {
-		return "marker " + mv + "(형식)", true, ""
+		return base + "(형식)", true, ""
 	}
-	return "marker " + mv, false, ""
+	return base, false, ""
 }
 
 // codexVerdict — config.toml 등록물의 판정(D85). 감지(doctor [20])와 고침(doctor --fix)이 이
