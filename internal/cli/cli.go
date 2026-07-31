@@ -1900,24 +1900,48 @@ func runDoctor(ctx context.Context, w io.Writer, storeRoot, projectRoot, version
 	projScope, projMarker := codexHooksScope(projCodexHooks, nil)
 	userScope, userMarker := codexHooksScope(userCodexHooks, userCodexHooksErr)
 	markerPresent := projMarker || userMarker
+	// [16]과 [20]이 **한 번 계산한 판정을 공유한다**(D89). 두 절이 각자 판정하면 게이트가 물린
+	// 파일을 [16]은 "테이블=부재", [20]은 "기입불가"로 불러 같은 파일에 두 이름이 붙는다.
+	// 읽기는 여기서만 한다 — [20]이 다시 읽으면 doctor 1회가 같은 파일을 두 번 읽고 그 사이의
+	// 변경이 두 절을 다시 갈라 놓는다.
+	var codexVerdictOnce codexVerdict
+	var codexVerdictOK bool
+	var codexReadErr error
 	cfgPath, cfgPathErr := codexConfigPath()
 	switch {
 	case cfgPathErr != nil:
 		fmt.Fprintln(w, "[16] codex: config.toml 경로 확인불가")
 	default:
 		cfgData, readErr := os.ReadFile(cfgPath)
+		codexReadErr = readErr
 		switch {
 		case os.IsNotExist(readErr): // 분기① — 마커 여부 무관(상태 루트 부재=미사용, 소멸 시그니처 아님)
 			fmt.Fprintf(w, "[16] codex: config.toml 없음 — 미사용/미설치 (hooks: project=%s user=%s)\n", projScope, userScope)
 		case readErr != nil:
 			fmt.Fprintln(w, "[16] codex: config.toml 읽기 실패")
 		default:
-			present, anomaly := probeCodexMCPBlock(cfgData)
+			// 판정원을 codexRegistrationVerdict로 옮긴다(D89) — probeCodexMCPBlock만 보면 [16]이
+			// 게이트를 알지 못해 같은 파일을 [20]과 다르게 부른다.
+			codexVerdictOnce, codexVerdictOK = codexRegistrationVerdict(cfgData, version), true
+			v := codexVerdictOnce
+			// 인쇄 조건에 **판정 성립을 함께 건다.** 여기서는 바로 위 대입 때문에 늘 참이지만,
+			// 이 줄이 절 밖으로 옮겨지면 판정이 서지 않은 자리에서 v가 영값이 되어 InputParses가
+			// 거짓이 되고 정보 줄이 오인쇄된다 — 그 하나뿐인 위험을 인쇄 지점에 묶어 둔다.
+			if codexVerdictOK && !v.InputParses {
+				// 정보 줄 — failed에 계상하지 않는다(종료코드 계약 무변경).
+				fmt.Fprintln(w, "[16] codex: config.toml이 TOML로 파스되지 않습니다 — Codex가 이 파일의 모든 설정을 읽지 못합니다")
+			}
 			switch {
-			case anomaly != anomalyNone: // 분기⑤
+			case v.State == mcpOutputInvalid: // 신설 — 산출물 유효성 게이트가 물린 상태
+				fmt.Fprintf(w, "[16] codex: [mcp_servers.ctr] 테이블=기입불가 (hooks: project=%s user=%s)\n", projScope, userScope)
+				fmt.Fprintf(w, "[16] warning: %s\n", v.Anomaly.reason())
+			case v.Anomaly != anomalyNone: // 분기⑤
 				fmt.Fprintf(w, "[16] codex: [mcp_servers.ctr] 테이블=이상 (hooks: project=%s user=%s)\n", projScope, userScope)
-				fmt.Fprintf(w, "[16] warning: %s — 수동 확인 필요(hook install --codex 안내 참조)\n", anomaly.reason())
-			case present: // 분기④
+				fmt.Fprintf(w, "[16] warning: %s — 수동 확인 필요(hook install --codex 안내 참조)\n", v.Anomaly.reason())
+			case v.State == mcpExistingHeader: // 분기④에서 갈라 나온 미소유 갈래(신설)
+				fmt.Fprintf(w, "[16] codex: [mcp_servers.ctr] 테이블=존재(사용자 소유) (hooks: project=%s user=%s)\n", projScope, userScope)
+				fmt.Fprintln(w, "[16] warning: 표식도 command도 우리 것이 아닙니다 — 그 테이블의 이름을 바꾸거나 수동으로 정리한 뒤 hook install --codex를 재실행하세요")
+			case v.TableFound: // 분기④
 				fmt.Fprintf(w, "[16] codex: [mcp_servers.ctr] 테이블=존재 (hooks: project=%s user=%s)\n", projScope, userScope)
 			case markerPresent: // 분기② — 소멸 시그니처
 				fmt.Fprintf(w, "[16] codex: [mcp_servers.ctr] 테이블=부재 (hooks: project=%s user=%s)\n", projScope, userScope)
@@ -1997,11 +2021,18 @@ func runDoctor(ctx context.Context, w io.Writer, storeRoot, projectRoot, version
 	}
 	mcpData, mcpReadErr := os.ReadFile(mcpConfigPath(projectRoot))
 	mcpLabel, mcpDrift := markerState(mcpData, mcpReadErr, mcpManagedMarker)
+	// [16]이 세운 판정을 그대로 쓴다 — 파일을 다시 읽지 않는다(D89). 경로 해석 실패는 어느
+	// case에도 걸리지 않아 "확인불가" 초기값이 살아남는다: 그 상태에서는 읽기 오류도 판정도
+	// 없으므로 세 case가 모두 거짓이다.
 	codexLabel, codexDrift := "확인불가", false
 	codexReason := ""
-	if cfgP, cfgErr := codexConfigPath(); cfgErr == nil {
-		cfgData, cfgReadErr := os.ReadFile(cfgP)
-		codexLabel, codexDrift, codexReason = codexMarkerLabel(cfgData, cfgReadErr, version)
+	switch {
+	case errors.Is(codexReadErr, os.ErrNotExist):
+		codexLabel = "없음"
+	case codexReadErr != nil:
+		codexLabel = "읽기실패"
+	case codexVerdictOK:
+		codexLabel, codexDrift, codexReason = codexVerdictLabel(codexVerdictOnce, version)
 	}
 	fmt.Fprintf(w, "[20] mcp markers: .mcp.json=%s codex=%s\n", mcpLabel, codexLabel)
 	if codexReason != "" {
@@ -2032,8 +2063,11 @@ func runDoctor(ctx context.Context, w io.Writer, storeRoot, projectRoot, version
 	return nil
 }
 
-// codexMarkerLabel — [20]의 Codex 라벨·권고 여부·사유(D85). **권고는 codexVerdict.shouldFix()가
-// 정한다** — 라벨은 진단 정보라 자유도가 있지만 권고는 --fix의 행동과 등가여야 한다.
+// codexVerdictLabel — **판정 하나에서** [20]의 Codex 라벨·권고 여부·사유를 만든다(D85). 읽기
+// 오류 갈래는 호출부가 정한다 — 판정이 서지 않은 상태를 라벨 함수가 다시 판정하면 판정원이
+// 둘이 되고, 그것이 [16]과 [20]을 갈라 놓았던 어긋남이다(D89 부수 결정 ①).
+// **권고는 codexVerdict.shouldFix()가 정한다** — 라벨은 진단 정보라 자유도가 있지만 권고는
+// --fix의 행동과 등가여야 한다.
 // 라벨 셋이 추가된다: 구간 밖 충돌은 충돌, 구간 판정 불가는 이상, 소유하지만
 // ownedRegistration이 거짓인 인수 대상은 구형식이다. 마지막 술어가 여전히 필요한 이유는 그
 // 거짓이 **인수 경로임을 가리키는 유일한 신호**라는 것이다 — 판정 권한을 나눠 갖는 것이
@@ -2041,14 +2075,7 @@ func runDoctor(ctx context.Context, w io.Writer, storeRoot, projectRoot, version
 // 셋째 반환값은 사유이며 이상 갈래에서만 비어 있지 않다 — 그 라벨이 세 사유를 한 값으로
 // 묶으므로 호출자가 별도 줄로 낸다.
 // .mcp.json 갈래는 이 함수를 쓰지 않고 runDoctor의 markerState 클로저에 남는다(D85).
-func codexMarkerLabel(data []byte, readErr error, version string) (label string, fix bool, reason string) {
-	switch {
-	case errors.Is(readErr, os.ErrNotExist):
-		return "없음", false, ""
-	case readErr != nil:
-		return "읽기실패", false, ""
-	}
-	v := codexRegistrationVerdict(data, version)
+func codexVerdictLabel(v codexVerdict, version string) (label string, fix bool, reason string) {
 	shouldFix := v.shouldFix()
 	switch v.State {
 	case mcpMarkerAnomaly:
@@ -2102,6 +2129,9 @@ type codexVerdict struct {
 	// 묶인다** — 기입 쪽에서 요청을 다시 조립하면 그 두 조립이 갈릴 수 있고, 그것이 이
 	// 릴리스가 닫는 어긋남과 같은 형태다. 진단 경로는 이 필드를 쓰지 않고 무시한다.
 	Out []byte
+	// InputParses — 입력 config.toml이 TOML로 파스되는가(D89 부수 결정 ②). 라벨 전용이며 권고를
+	// 가르지 않는다 — shouldFix()가 보지 않는 것이 그 계약이다.
+	InputParses bool
 }
 
 // codexRegistrationVerdict — 감지와 고침이 공유하는 판정(D85). **요청 조립이 이 함수 안에만
@@ -2128,6 +2158,7 @@ func codexRegistrationVerdict(data []byte, version string) codexVerdict {
 	return codexVerdict{
 		State: res.State, Anomaly: anomaly, TableFound: res.TableFound,
 		Changed: res.Changed, Marker: marker, Command: command, Out: res.Out,
+		InputParses: res.InputParses,
 	}
 }
 

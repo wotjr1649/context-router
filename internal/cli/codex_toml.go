@@ -620,20 +620,29 @@ type codexInstallResult struct {
 	// 있고 사유를 인쇄하는 두 자리는 probe에서 사유를 받으므로, 이 필드가 없으면 그 이탈이
 	// 빈 사유로 나간다. anomalyNone이면 호출자가 종전대로 probe의 사유를 쓴다.
 	Anomaly codexAnomaly
+	// InputParses — 입력 바이트가 우리 파서로 파스되는가(D89 부수 결정 ②). **라벨 전용이며
+	// 어떤 기입도 가르지 않는다** — 기입 정책은 이 릴리스에서 무변경이고, 게이트가 계약상
+	// 작동하지 않는 입력임을 사용자에게 알리기만 한다. 상태 값이 아니라 필드인 근거가 그것이다.
+	InputParses bool
 }
 
 // gateCodexOutput — D89 산출물 유효성 게이트. **비대칭**이다: 우리 파서 기준으로 입력이
 // 파스되고 산출물이 파스되지 않을 때만 무변경으로 되돌린다. 입력이 이미 무효면 산출물의
 // 무효는 우리가 들인 것이 아니므로 되돌려도 사용자에게 이득이 없다.
 // 구문 유효성만 본다 — 파스되면서 사용자 값이 바뀌는 갈래는 이 게이트의 대상이 아니다(§1.2).
-// 바이트가 같으면 건너뛴다: 무변경 실행마다 입력을 두 번 파스하지 않기 위해서다.
+// 바이트가 같으면 건너뛴다: 그때는 산출물이 곧 입력이라 파스 결과가 이미 res.InputParses다.
+// 입력 파스는 **결과에 실려 온 값을 읽는다** — 여기서 다시 부르면 D89의 "입력은 호출마다
+// 정확히 한 번" 계약이 깨지고 같은 바이트를 두 번 파스한다.
+// 되돌린 결과에도 InputParses를 그대로 싣는다 — 라벨 전용 필드라 이 갈래에서 잃으면 [16]이
+// 파스되지 않는 입력을 파스된다고 말한다.
 func gateCodexOutput(existing []byte, res codexInstallResult) codexInstallResult {
-	if bytes.Equal(res.Out, existing) || codexTOMLParses(res.Out) || !codexTOMLParses(existing) {
+	if bytes.Equal(res.Out, existing) || codexTOMLParses(res.Out) || !res.InputParses {
 		return res
 	}
 	return codexInstallResult{
 		Out: existing, State: mcpOutputInvalid,
 		TableFound: res.TableFound, Anomaly: anomalyOutputInvalid,
+		InputParses: res.InputParses,
 	}
 }
 
@@ -643,13 +652,16 @@ func gateCodexOutput(existing []byte, res codexInstallResult) codexInstallResult
 // 들이면 진단이 파일을 쓰거나 결정적이지 않게 된다. 프로필 헬퍼를 포함한 호출 트리 전체가 순수해야
 // 하며, 그 조건은 스펙 v0.16 §1.3 게이트 1과 §3 표4에 있다.
 func installCodexConfigBlock(existing []byte, req codexInstallRequest) codexInstallResult {
+	// 입력 파스는 여기서 **한 번만** 한다(D89) — 모든 반환이 이 값을 실어 나르고 게이트도 그것을
+	// 읽는다. 이탈 갈래에서 빼면 그 상태의 [16]이 입력 파스 실패를 알지 못한다.
+	inputParses := codexTOMLParses(existing)
 	lines := splitLinesKeepEnds(existing)
 	sp := codexManagedSpans(lines)
 	if sp.anomaly != anomalyNone {
-		return codexInstallResult{Out: existing, State: mcpMarkerAnomaly, TableFound: sp.table.found, Anomaly: sp.anomaly}
+		return codexInstallResult{Out: existing, State: mcpMarkerAnomaly, TableFound: sp.table.found, Anomaly: sp.anomaly, InputParses: inputParses}
 	}
 	if scanOutsideSpans(lines, sp) {
-		return codexInstallResult{Out: existing, State: mcpConflict, TableFound: sp.table.found}
+		return codexInstallResult{Out: existing, State: mcpConflict, TableFound: sp.table.found, InputParses: inputParses}
 	}
 	view := codexReadTable(lines, sp.table)
 	marker, markerFound := codexMarkerValue(lines, sp, view)
@@ -657,7 +669,7 @@ func installCodexConfigBlock(existing []byte, req codexInstallRequest) codexInst
 	inOldBlock := class == classReplace && sp.table.found && sp.table.start > begin && sp.table.start < end
 	if sp.table.found && !codexOwnership(marker, markerFound, view.command, inOldBlock) {
 		// 판정 근거는 "블록 밖에 있음"이 아니라 "표식이 없고 명령도 우리 것이 아님"이다(D80).
-		return codexInstallResult{Out: existing, State: mcpExistingHeader, TableFound: sp.table.found}
+		return codexInstallResult{Out: existing, State: mcpExistingHeader, TableFound: sp.table.found, InputParses: inputParses}
 	}
 	// 프로필 우선순위(D81): 명시 플래그 > 우리 소유 테이블의 기존 args > 기본 프로필.
 	// Codex 갈래에는 은퇴 이름이 없어 .mcp.json의 셋째 항이 없다.
@@ -709,7 +721,7 @@ func installCodexConfigBlock(existing []byte, req codexInstallRequest) codexInst
 		} else {
 			body = append(body, codexEnvBody(lines, codexSpan{}, req.Marker, eol)...)
 		}
-		return gateCodexOutput(existing, codexInstallResult{Out: appendBlock(base, body, crlf), State: mcpWritten, Changed: true, Profiles: resultProfiles, ExecExposed: execExposed, TableFound: sp.table.found})
+		return gateCodexOutput(existing, codexInstallResult{Out: appendBlock(base, body, crlf), State: mcpWritten, Changed: true, Profiles: resultProfiles, ExecExposed: execExposed, TableFound: sp.table.found, InputParses: inputParses})
 	}
 	// 무변경 판정(D84): 우리 소유 키 넷의 값이 모두 같고, 새로 만들 테이블도 지울 마커 줄도
 	// 없으면 쓰기와 백업을 생략한다. **키 단위 동치는 바이트 동일을 포함**하므로 호스트가 우리
@@ -723,7 +735,7 @@ func installCodexConfigBlock(existing []byte, req codexInstallRequest) codexInst
 		(keepArgs || (slices.Equal(view.args, mcpArgsForProfiles(profiles)) &&
 			slices.Equal(view.tools, enabledToolsForProfiles(profiles))))
 	if !envMissing && !inOldBlock && ownedSame {
-		return codexInstallResult{Out: existing, State: mcpWritten, Profiles: resultProfiles, ArgsKept: argsKept, ExecExposed: execExposed, TableFound: sp.table.found}
+		return codexInstallResult{Out: existing, State: mcpWritten, Profiles: resultProfiles, ArgsKept: argsKept, ExecExposed: execExposed, TableFound: sp.table.found, InputParses: inputParses}
 	}
 	if inOldBlock {
 		// D84 마이그레이션 — 마커 두 줄이 **우리 구간 안**에 들어와 있으면(블록이 우리 테이블만
@@ -754,7 +766,7 @@ func installCodexConfigBlock(existing []byte, req codexInstallRequest) codexInst
 	return gateCodexOutput(existing, codexInstallResult{
 		Out: out, State: mcpWritten,
 		Changed: !bytes.Equal(out, existing), Profiles: resultProfiles, ArgsKept: argsKept, ExecExposed: execExposed,
-		TableFound: sp.table.found,
+		TableFound: sp.table.found, InputParses: inputParses,
 	})
 }
 
