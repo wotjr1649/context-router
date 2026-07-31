@@ -25,9 +25,11 @@ import (
 	"github.com/wotjr1649/context-router/internal/store"
 )
 
-// isolateCodexHome — doctor·설치기 테스트가 호스트의 ~/.codex를 읽지 않게 CODEX_HOME을
-// 빈 임시 디렉터리로 돌린다. 세우지 않으면 codexConfigPath·codexHooksPath가 홈으로 떨어져
-// 같은 테스트가 호스트마다 다른 결과를 낸다. 돌려주는 경로에 픽스처를 써서 상태를 만든다.
+// isolateCodexHome — doctor·설치기 테스트에 각자의 CODEX_HOME을 준다. 호스트 격리가 목적이
+// **아니다**: TestMain이 이미 CODEX_HOME을 비우고 HOME·USERPROFILE을 임시로 돌려 실제
+// ~/.codex는 닿지 않는다. 결함은 그 임시 홈이 패키지 전체에 공유된다는 것이다 — CODEX_HOME을
+// 세우지 않는 설치기 테스트가 쓴 config.toml을 뒤에 도는 doctor 테스트가 읽어, 단정이 실행
+// 순서에 종속된다. 돌려주는 경로에 픽스처를 써서 상태를 만든다.
 func isolateCodexHome(t *testing.T) string {
 	t.Helper()
 	dir := t.TempDir()
@@ -54,8 +56,9 @@ func doctorOut(t *testing.T, projectRoot string, fix bool) (string, error) {
 
 // TestIsolateCodexHome — 격리 헬퍼가 실제로 codexConfigPath를 돌리는가. 뒤 태스크의 doctor
 // 단정이 전부 이 헬퍼 위에 서므로, 헬퍼가 조용히 망가지면 그 단정들이 공유 임시 홈을 보게
-// 되고 무엇을 단정했는지 알 수 없어진다. 부정형("공유 홈을 안 본다")은 격리 전에도 통과하므로
-// 긍정형으로 둔다 — 경로가 반환 디렉터리 아래인지, 거기 쓴 픽스처를 doctor가 실제로 읽는지.
+// 되고 무엇을 단정했는지 알 수 없어진다. 긍정형으로 둔다 — 경로 자체를 단정하면 픽스처가
+// 바꾸는 문면뿐 아니라 홈이 어디로 떨어지는지까지 잡는다(반환 디렉터리 아래인지, 거기 쓴
+// 픽스처를 doctor가 실제로 읽는지).
 func TestIsolateCodexHome(t *testing.T) {
 	home := isolateCodexHome(t)
 	got, err := codexConfigPath()
