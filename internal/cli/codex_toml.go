@@ -812,10 +812,11 @@ func installCodexConfigBlock(existing []byte, req codexInstallRequest) codexInst
 			// 헤더가 두 번 정의돼 D80이 막으려는 파스 에러가 난다(scanOutsideSpans는 그 구간을
 			// 제외하므로 걸러 내지 못한다). 기존 구간을 갈아 끼우고 헤더는 붙이지 않는다.
 			// 산출은 env 서브테이블이 부모보다 앞서는 형태인데 TOML은 그 순서를 허용한다.
+			// 마커 제외는 없다 — 이 갈래는 관리 테이블이 없어 inOldBlock이 서지 않는다.
 			base = spliceCodexLines(lines,
-				[]codexSplice{{sp.env.start, sp.env.end, codexEnvBody(lines, sp.env, req.Marker, eol)}}, nil)
+				[]codexSplice{{sp.env.start, sp.env.end, codexEnvBody(lines, sp.env, req.Marker, eol, -1, -1)}}, nil)
 		} else {
-			body = append(body, codexEnvBody(lines, codexSpan{}, req.Marker, eol)...)
+			body = append(body, codexEnvBody(lines, codexSpan{}, req.Marker, eol, -1, -1)...)
 		}
 		return gateCodexOutput(existing, codexInstallResult{Out: appendBlock(base, body, crlf), State: mcpWritten, Changed: true, Profiles: resultProfiles, ExecExposed: execExposed, TableFound: sp.table.found, InputParses: inputParses,
 			Tools: diag.Tools, ToolsPresent: diag.ToolsPresent, WantTools: diag.WantTools, ArgsReadable: diag.ArgsReadable})
@@ -844,20 +845,25 @@ func installCodexConfigBlock(existing []byte, req codexInstallRequest) codexInst
 		return codexInstallResult{Out: existing, State: mcpWritten, Profiles: resultProfiles, ArgsKept: argsKept, ExecExposed: execExposed, TableFound: sp.table.found, InputParses: inputParses,
 			Tools: diag.Tools, ToolsPresent: diag.ToolsPresent, WantTools: diag.WantTools, ArgsReadable: diag.ArgsReadable}
 	}
+	// D84 마이그레이션 — 마커 두 줄이 **우리 구간 안**에 들어와 있으면 아래 drop 맵으로는
+	// 지워지지 않는다: spliceCodexLines는 편집 구간 안에서 drop을 보지 않고 body를 통째로 얹기
+	// 때문이다. 그래서 **두 구간의 조립기가 각자** 뺀다 — 블록이 우리 테이블만 감싼 형태(§3 표4)는
+	// 관리 테이블 쪽 keep이, 블록이 두 테이블을 모두 감싸 한쪽 마커가 env 구간에 들어온 형태는
+	// codexEnvBody의 dropBegin·dropEnd가 받는다. 한쪽만 두면 짝 없는 마커가 남고, 그러면 다음
+	// 실행의 마커 분류가 이상으로 떨어져 그 파일의 마이그레이션 경로가 닫힌다. 구간 밖 마커는
+	// 여전히 drop이 지운다 — 셋이 서로를 대신하지 않는다.
+	dropBegin, dropEnd := -1, -1
 	if inOldBlock {
-		// D84 마이그레이션 — 마커 두 줄이 **우리 구간 안**에 들어와 있으면(블록이 우리 테이블만
-		// 감싼 형태, §3 표4) 아래 drop 맵으로는 지워지지 않는다: spliceCodexLines는 편집 구간
-		// 안에서 drop을 보지 않고 body를 통째로 얹기 때문이다. 그래서 keep에서 먼저 뺀다.
-		// 구간 밖에 있는 마커는 여전히 drop이 지운다 — 두 배치가 서로를 대신하지 않는다.
+		dropBegin, dropEnd = begin, end
 		view.keep = slices.DeleteFunc(view.keep, func(i int) bool { return i == begin || i == end })
 	}
 	body := codexTableBody(lines, sp.table, view, profiles, keepArgs, req.Marker, eol)
 	if envMissing { // env 서브테이블을 우리 구간 끝에 잇는다(다음 테이블 헤더 앞이라 안전하다)
-		body = append(ensureEOL(body, eol), codexEnvBody(lines, codexSpan{}, req.Marker, eol)...)
+		body = append(ensureEOL(body, eol), codexEnvBody(lines, codexSpan{}, req.Marker, eol, -1, -1)...)
 	}
 	edits := []codexSplice{{sp.table.start, sp.table.end, body}}
 	if sp.env.found {
-		edits = append(edits, codexSplice{sp.env.start, sp.env.end, codexEnvBody(lines, sp.env, req.Marker, eol)})
+		edits = append(edits, codexSplice{sp.env.start, sp.env.end, codexEnvBody(lines, sp.env, req.Marker, eol, dropBegin, dropEnd)})
 	}
 	drop := map[int]bool{}
 	if inOldBlock { // D84 마이그레이션 — 추가로 지우는 것은 **마커 두 줄뿐**이다
@@ -1353,7 +1359,14 @@ func codexTableBody(lines [][]byte, sp codexSpan, view codexTableView, profiles 
 
 // codexEnvBody — [mcp_servers.ctr.env] 구간의 새 내용. CTR_MANAGED만 우리 것이고 나머지
 // 환경변수는 보존한다(D80).
-func codexEnvBody(lines [][]byte, sp codexSpan, marker, eol string) []byte {
+//
+// dropBegin·dropEnd — 마이그레이션 갈래에서 **이 구간 안에 들어온 구 마커 두 줄**의 인덱스.
+// 구간 편집은 편집 범위 안에서 drop 맵을 보지 않으므로 여기서 빼야 한다 — 관리 테이블 쪽이
+// view.keep에서 같은 일을 하는 것과 같은 기제다. 무효값은 (-1, -1)이다: 엔트리 첫 줄은
+// sp.start+1 이상이라 마커 분류가 마커 없을 때 돌려주는 (0, 0)도 실제로는 어느 엔트리와도
+// 겹치지 않지만, 그 값을 무효로 쓰면 "마커가 없다"와 "0행이 마커다"가 같은 값이 된다 —
+// 마이그레이션이 아닌 호출이 유효 인덱스를 넘기지 않는다는 것을 값 자체로 못박는다.
+func codexEnvBody(lines [][]byte, sp codexSpan, marker, eol string, dropBegin, dropEnd int) []byte {
 	var b []byte
 	if sp.found {
 		b = append(b, lines[sp.start]...)
@@ -1366,6 +1379,9 @@ func codexEnvBody(lines [][]byte, sp codexSpan, marker, eol string) []byte {
 		return b
 	}
 	for _, e := range codexEntries(lines, sp) {
+		if e[0] == dropBegin || e[0] == dropEnd {
+			continue
+		}
 		joined := ""
 		for i := e[0]; i <= e[1]; i++ {
 			joined += stripLine(lines[i])
