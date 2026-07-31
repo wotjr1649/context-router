@@ -468,6 +468,7 @@ func TestHookInstall_CommandReflectsFlags(t *testing.T) {
 // ⑥ doctor: 훅 등록/미등록 상태 문구 + drops 두 위치 합산 + 항목 [1]~[13] 오름차순.
 func TestDoctor_HookItemsAndAscendingOrder(t *testing.T) {
 	t.Run("unregistered", func(t *testing.T) {
+		isolateCodexHome(t)
 		storeRoot := t.TempDir()
 		projectRoot := t.TempDir()
 		var buf bytes.Buffer
@@ -491,6 +492,7 @@ func TestDoctor_HookItemsAndAscendingOrder(t *testing.T) {
 	})
 
 	t.Run("registered_with_drops", func(t *testing.T) {
+		isolateCodexHome(t)
 		storeRoot := t.TempDir()
 		projectRoot := t.TempDir()
 		var iout bytes.Buffer
@@ -611,6 +613,7 @@ func TestDoctor_UserScopeHookRegistration(t *testing.T) {
 // 불일치 부재는 **훅 스코프 줄([9]·[16])에 한정**한다 — D83의 [20]은 MCP 등록물의 버전을
 // 비교하는 자리라 같은 픽스처에서 '≠'를 정당하게 인쇄한다.
 func TestDoctorVersionlessHookMarker(t *testing.T) {
+	isolateCodexHome(t)
 	storeRoot := t.TempDir()
 	projectRoot := t.TempDir()
 	var iout bytes.Buffer
