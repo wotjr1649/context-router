@@ -8,6 +8,7 @@ require (
 	github.com/google/uuid v1.6.0
 	github.com/landlock-lsm/go-landlock v0.9.0
 	github.com/modelcontextprotocol/go-sdk v1.6.1
+	github.com/pelletier/go-toml/v2 v2.4.3
 	go.starlark.net v0.0.0-20260708150628-5395d018f003
 	golang.org/x/net v0.57.0
 	golang.org/x/sys v0.47.0

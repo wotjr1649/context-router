@@ -23,6 +23,10 @@
 | D11 | SDK: 현행 v1.6.1로 진행, 차기 스펙 정식 출시 시 업그레이드 마일스톤 |
 | D12 | fetch text/html = readability 본문 추출 → markdown 변환, 구조 보존 판정 실패 시 전체 변환 fail-open, 원문 HTML은 비색인 source blob으로 보존 |
 
+> **v0.17 개정**: "총 7개"는 실측(직접 9)과 어긋난 채 남아 있었다. 검증 전용 TOML 파서
+> (pelletier/go-toml/v2)를 더해 직접 10이 된다. 이 항목은 **개수 상한이 아니라 프레임워크
+> 금지**가 본절이다 — cobra·yaml·ORM·DI 미사용은 그대로다.
+
 ## 1. v0.0.1 제품 계약
 
 ### 1.1 범위
