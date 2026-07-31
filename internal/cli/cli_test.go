@@ -3413,8 +3413,8 @@ func TestDoctorPermissionLineOnCheckFailure(t *testing.T) {
 func TestDoctorIndexesRender(t *testing.T) {
 	isolateCodexHome(t)
 	// 전용 doctor 실행 헬퍼는 없다 — 기존 셋업 두 개로 조립해 runDoctor를 직접 부른다.
-	storeRoot, projectRoot, projDir := doctorShadowProjDir(t) // cli_test.go:545
-	seedShadowContentDB(t, projDir)                           // cli_test.go:411 — writable Open이라 여기서 색인이 생긴다
+	storeRoot, projectRoot, projDir := doctorShadowProjDir(t)
+	seedShadowContentDB(t, projDir) // writable Open이라 여기서 색인이 생긴다
 	var buf bytes.Buffer
 	// doctor는 실패 항목이 있으면 오류를 낼 수 있다 — 이 테스트는 [3] 렌더만 보므로 출력으로 판정하고
 	// 오류는 로그로 남긴다.
