@@ -1535,6 +1535,13 @@ func TestHookInstallCodexGateReport(t *testing.T) {
 	if string(got) != codexGateFixture {
 		t.Errorf("config.toml이 바뀌었다:\n%s", got)
 	}
+	// 소비자 1 — **쓰기 분기 자체가 실행되지 않았다**. 위 바이트 단정만으로는 이것을 재지
+	// 못한다: 게이트가 Out을 existing으로 되돌리므로 가드를 통째로 지워도 기입 바이트가 같다.
+	// 가드 안에는 backupCodexConfig가 함께 있고 그것은 되돌린 Out과 무관하게 파일을 새로
+	// 만드므로, .bak의 부재가 그 분기가 돌지 않았다는 관측 가능한 증거다(D84 단일 슬롯).
+	if _, sErr := os.Stat(cfg + ".bak"); !os.IsNotExist(sErr) {
+		t.Errorf("쓰기 분기가 돌았다 — 기입을 건너뛰었는데 백업이 생겼다(stat err=%v)", sErr)
+	}
 	// 소비자 2 — 가드 훅이 등록되지 않았다. 훅 파일 경로는 codexHooksPath가 정하므로
 	// 그 함수로 얻는다(프로젝트/사용자 갈래가 있어 경로를 손으로 조립하면 어긋난다).
 	hp, err := codexHooksPath(false, proj)
