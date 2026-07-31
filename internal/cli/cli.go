@@ -2051,8 +2051,10 @@ func runDoctor(ctx context.Context, w io.Writer, storeRoot, projectRoot, version
 			// 되읽기 실패면 installCodexConfigBlock의 keepArgs가 서서 그 명령도 목록을 **보존한다** —
 			// 감지는 그대로 두고(D91이 유보를 명시적으로 반대한다) 조치만 실제로 듣는 형태로 바꾼다.
 			// 프로필은 자리표시자로 둔다 — 되읽지 못한 값을 추측해 제시하면 사용자가 켜 둔 프로필이
-			// 우리 추측으로 바뀐다.
-			msg = "[20] codex: 등록물의 도구 목록이 프로필보다 모자랍니다 — 다만 args를 프로필로 해석하지 못해 hook install --codex는 목록을 보존합니다. hook install --codex --enable <프로필>로 프로필을 명시해야 다시 씁니다(그 명령은 도구 목록을 프로필 기본값으로 다시 씁니다 — 손으로 더한 항목이 있으면 사라집니다)"
+			// 우리 추측으로 바뀐다. **args 교체도 함께 예고한다**: 그 명령은 keepArgs가 서지 않아
+			// 해석하지 못한 args를 프로필 값으로 다시 쓰는데, 그 args가 바로 이 갈래를 세운
+			// 원인이다 — 형제 경고가 같은 이유로 command 되쓰기를 예고하는 것과 같은 관례다.
+			msg = "[20] codex: 등록물의 도구 목록이 프로필보다 모자랍니다 — 다만 args를 프로필로 해석하지 못해 hook install --codex는 목록을 보존합니다. hook install --codex --enable <프로필>로 프로필을 명시해야 다시 씁니다(그 명령은 도구 목록을 프로필 기본값으로 다시 씁니다 — 손으로 더한 항목이 있으면 사라집니다. 해석하지 못한 기존 args도 프로필 값으로 함께 교체합니다 — 직접 적어 둔 인자가 있으면 그 값이 사라집니다)"
 		}
 		fmt.Fprintln(w, msg)
 	}

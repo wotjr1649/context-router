@@ -3556,6 +3556,11 @@ func TestDoctorCodexToolsArgsUnreadable(t *testing.T) {
 	if !strings.Contains(out, "hook install --codex --enable <프로필>") {
 		t.Errorf("프로필을 명시하는 형태를 안내하지 않는다:\n%s", out)
 	}
+	// 권한 명령이 **원인이 된 그 args를** 교체한다 — 형제 경고가 같은 이유로 command 되쓰기를
+	// 예고하는 것과 같은 관례다. 예고가 빠지면 안내대로 실행한 사용자가 자기 설정을 잃는다.
+	if !strings.Contains(out, "해석하지 못한 기존 args도 프로필 값으로 함께 교체합니다") {
+		t.Errorf("args 교체를 예고하지 않는다:\n%s", out)
+	}
 	// 기본 문면이 그대로 나가면 그 명령은 이 상태에서 목록을 보존한다 — 조치가 아니다.
 	if strings.Contains(out, "hook install --codex로 반영하세요") {
 		t.Errorf("목록을 보존하는 명령을 조치로 안내했다:\n%s", out)
