@@ -25,6 +25,53 @@ import (
 	"github.com/wotjr1649/context-router/internal/store"
 )
 
+// isolateCodexHome — doctor·설치기 테스트가 호스트의 ~/.codex를 읽지 않게 CODEX_HOME을
+// 빈 임시 디렉터리로 돌린다. 세우지 않으면 codexConfigPath·codexHooksPath가 홈으로 떨어져
+// 같은 테스트가 호스트마다 다른 결과를 낸다. 돌려주는 경로에 픽스처를 써서 상태를 만든다.
+func isolateCodexHome(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	t.Setenv("CODEX_HOME", dir)
+	return dir
+}
+
+// writeCodexConfig — CODEX_HOME에 config.toml을 쓴다.
+func writeCodexConfig(t *testing.T, home, src string) {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(home, "config.toml"), []byte(src), 0o600); err != nil {
+		t.Fatalf("config.toml 쓰기 실패: %v", err)
+	}
+}
+
+// doctorOut — doctor를 돌려 출력과 오류를 돌려준다. runDoctor의 시그니처를 한 자리에만 두어
+// 뒤 태스크가 인자 순서를 되풀이하지 않게 한다.
+func doctorOut(t *testing.T, projectRoot string, fix bool) (string, error) {
+	t.Helper()
+	var buf bytes.Buffer
+	err := runDoctor(context.Background(), &buf, t.TempDir(), projectRoot, "0.17.0", fix)
+	return buf.String(), err
+}
+
+// TestIsolateCodexHome — 격리 헬퍼가 실제로 codexConfigPath를 돌리는가. 뒤 태스크의 doctor
+// 단정이 전부 이 헬퍼 위에 서므로, 헬퍼가 조용히 망가지면 그 단정들이 공유 임시 홈을 보게
+// 되고 무엇을 단정했는지 알 수 없어진다. 부정형("공유 홈을 안 본다")은 격리 전에도 통과하므로
+// 긍정형으로 둔다 — 경로가 반환 디렉터리 아래인지, 거기 쓴 픽스처를 doctor가 실제로 읽는지.
+func TestIsolateCodexHome(t *testing.T) {
+	home := isolateCodexHome(t)
+	got, err := codexConfigPath()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := filepath.Join(home, "config.toml"); got != want {
+		t.Fatalf("codexConfigPath = %q, want %q", got, want)
+	}
+	writeCodexConfig(t, home, "[mcp_servers.ctr]\ncommand = \"context-router\"\n")
+	out, _ := doctorOut(t, t.TempDir(), false)
+	if !strings.Contains(out, "[16] codex: [mcp_servers.ctr] 테이블=존재") {
+		t.Errorf("doctor가 격리된 홈의 픽스처를 읽지 않았다:\n%s", out)
+	}
+}
+
 // D56 — version 서브커맨드: ProductVersion 1줄만 출력(CI 추출 표면, 스펙 §0).
 func TestRunVersionSubcommand(t *testing.T) {
 	var out, errOut bytes.Buffer
@@ -152,6 +199,7 @@ func TestRunUpgrade_Table(t *testing.T) {
 // doctor는 store를 생성하면 안 된다(no-create, 설계 §7) — storeRoot 자체도, 프로젝트별
 // store 디렉터리도 실행 후 여전히 존재하지 않아야 한다.
 func TestRunDoctor_Smoke(t *testing.T) {
+	isolateCodexHome(t)
 	base := t.TempDir()
 	storeRoot := filepath.Join(base, "storeroot") // 의도적 미생성 — 부모(base)만 존재
 	projectRoot := filepath.Join(base, "proj")
@@ -194,6 +242,7 @@ func TestRunDoctor_Smoke(t *testing.T) {
 // "fts5: 가능" 출력을 직접 검증한다(TestRunDoctor_Smoke는 미초기화 분기만 커버해 이 버그를
 // 가렸었다).
 func TestRunDoctor_InitializedStore(t *testing.T) {
+	isolateCodexHome(t)
 	storeRoot := t.TempDir()
 	projectRoot := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(projectRoot, ".git"), 0o755); err != nil {
@@ -230,6 +279,7 @@ func TestRunDoctor_InitializedStore(t *testing.T) {
 // 상이) + raw blob 2회 기록(동일 20B 콘텐츠 → dedup으로 물리 1파일). blob 바이트는 물리 파일
 // 합산이라 10+15+20=45 — DB 파일 크기 합산이나 0 방출 오구현, dedup 미반영(65) 오구현을 걸러낸다.
 func TestRunDoctor_ContentDBSize(t *testing.T) {
+	isolateCodexHome(t)
 	storeRoot := t.TempDir()
 	projectRoot := t.TempDir()
 	canon, err := ident.Canonicalize(projectRoot)
@@ -329,6 +379,7 @@ func TestStoreWarnBytes(t *testing.T) {
 }
 
 func TestRunDoctor_StoreSizeWarn(t *testing.T) {
+	isolateCodexHome(t)
 	storeRoot, projectRoot := doctorSizeWarnSetup(t)
 	t.Setenv("CTR_STORE_WARN_BYTES", "5") // blob 10B > 5B → 발화
 	var buf bytes.Buffer
@@ -343,6 +394,7 @@ func TestRunDoctor_StoreSizeWarn(t *testing.T) {
 }
 
 func TestRunDoctor_StoreSizeWarnSilentUnderThreshold(t *testing.T) {
+	isolateCodexHome(t)
 	storeRoot, projectRoot := doctorSizeWarnSetup(t) // 임계 미설정 — 기본 100MiB
 	var buf bytes.Buffer
 	if err := runDoctor(context.Background(), &buf, storeRoot, projectRoot, "0.0.1-dev", false); err != nil {
@@ -360,6 +412,7 @@ func TestRunDoctor_StoreSizeWarnSilentUnderThreshold(t *testing.T) {
 // 픽스처·doctor 실행부는 TestRunDoctor_StoreSizeWarn과 동일. 역방향 축 독립(file 키 조정 시
 // blob 침묵)도 여기서 단정 — AxisIndependent 테스트의 blob→file 방향과 쌍.
 func TestRunDoctor_ContentFileWarn(t *testing.T) {
+	isolateCodexHome(t)
 	storeRoot, projectRoot := doctorSizeWarnSetup(t)
 	t.Setenv("CTR_CONTENT_FILE_WARN_BYTES", "1")
 	var buf bytes.Buffer
@@ -378,6 +431,7 @@ func TestRunDoctor_ContentFileWarn(t *testing.T) {
 // TestRunDoctor_ContentFileWarnAxisIndependent — D46 축 독립: blob 키만 낮추면 blob 경고만
 // 발화하고 파일 경고는 기본 100MiB 임계라 침묵한다(소형 픽스처 ≪ 100MiB — 전용 키 분리 판별).
 func TestRunDoctor_ContentFileWarnAxisIndependent(t *testing.T) {
+	isolateCodexHome(t)
 	storeRoot, projectRoot := doctorSizeWarnSetup(t)
 	t.Setenv("CTR_STORE_WARN_BYTES", "1")
 	var buf bytes.Buffer
@@ -469,6 +523,7 @@ func seedShadowWorktree(t *testing.T, wdir, sid string, refs []string) {
 // TestDoctorShadowOwnedLine — D40 §2: [15] 접두 분해. hook 단독(귀속) hash를 cc: 세션이
 // artifact_created로 참조 → cc: 버킷. 비귀속(file) ref는 귀속 hash가 아니라 무시된다.
 func TestDoctorShadowOwnedLine(t *testing.T) {
+	isolateCodexHome(t)
 	storeRoot := t.TempDir()
 	projectRoot := t.TempDir()
 	canon, err := ident.Canonicalize(projectRoot)
@@ -502,6 +557,7 @@ func TestDoctorShadowOwnedLine(t *testing.T) {
 // TestDoctorShadowOwnedIncomplete — 손상 session.db 1개가 섞여도 그 worktree만 건너뛰고 괄호
 // 끝에 incomplete를 병기하며, [15] 실패는 doctor 전역 failed에 안 들어가 성공 종료한다.
 func TestDoctorShadowOwnedIncomplete(t *testing.T) {
+	isolateCodexHome(t)
 	storeRoot := t.TempDir()
 	projectRoot := t.TempDir()
 	canon, err := ident.Canonicalize(projectRoot)
@@ -557,6 +613,7 @@ func doctorShadowProjDir(t *testing.T) (storeRoot, projectRoot, projDir string) 
 // TestDoctorShadowOwnedShared — D40 §2: 같은 귀속 hash를 cc:·cx: 세션이 함께 참조하면(한 worktree
 // 내 두 세션) shared 버킷으로 집계되고 cc:/cx:/unattributed는 0이다.
 func TestDoctorShadowOwnedShared(t *testing.T) {
+	isolateCodexHome(t)
 	storeRoot, projectRoot, projDir := doctorShadowProjDir(t)
 	ownedHash := seedShadowContentDB(t, projDir)
 
@@ -584,6 +641,7 @@ func TestDoctorShadowOwnedShared(t *testing.T) {
 // TestDoctorShadowOwnedUnattributed — D40 §2: 귀속 hash가 어느 세션에도 참조되지 않으면(세션은
 // 있으나 비귀속 hash만 참조) unattributed 버킷으로 집계된다(usable≥1이라 폴백 아님).
 func TestDoctorShadowOwnedUnattributed(t *testing.T) {
+	isolateCodexHome(t)
 	storeRoot, projectRoot, projDir := doctorShadowProjDir(t)
 	seedShadowContentDB(t, projDir) // ownedHash 존재하나 아래 세션은 참조하지 않음
 
@@ -608,6 +666,7 @@ func TestDoctorShadowOwnedUnattributed(t *testing.T) {
 // wt2(cx:)가 각각 같은 hash를 참조 → shared는 두 worktree를 모두 순회해 접두를 병합했을 때에만
 // 나온다(한쪽만 읽으면 cc:/cx: 단독). shared 결과가 곧 다중 worktree 합산의 증거.
 func TestDoctorShadowOwnedMultiWorktree(t *testing.T) {
+	isolateCodexHome(t)
 	storeRoot, projectRoot, projDir := doctorShadowProjDir(t)
 	ownedHash := seedShadowContentDB(t, projDir)
 
@@ -632,6 +691,7 @@ func TestDoctorShadowOwnedMultiWorktree(t *testing.T) {
 // TestDoctorShadowOwnedNoSessionDecomp — D40 §2: content.db는 있으나 worktrees 세션이 하나도
 // 없으면(usable=0) [15]는 버킷 분해 없이 '세션 분해 없음' 폴백으로 렌더한다(runDoctor의 usable=0 분기).
 func TestDoctorShadowOwnedNoSessionDecomp(t *testing.T) {
+	isolateCodexHome(t)
 	storeRoot, projectRoot, projDir := doctorShadowProjDir(t)
 	seedShadowContentDB(t, projDir) // worktrees 디렉터리 미생성 → usable=0
 
@@ -1731,6 +1791,7 @@ func TestRunStats_Provider_ContextCanceled(t *testing.T) {
 // 번에 만들 수 있으므로 writable=true로 판정해야 한다(리뷰 Fix Round 3, item 2 — 예전
 // 구현은 filepath.Dir 한 단계만 봐서 이 경우 항상 writable=false로 오판했다).
 func TestRunDoctor_StoreRootDeepMissingParents_Writable(t *testing.T) {
+	isolateCodexHome(t)
 	base := t.TempDir()
 	storeRoot := filepath.Join(base, "a", "b", "c") // a,b,c 전부 미생성
 	projectRoot := t.TempDir()
@@ -1755,6 +1816,7 @@ func TestRunDoctor_StoreRootDeepMissingParents_Writable(t *testing.T) {
 // 실패한다. ENOTDIR(비디렉터리 조상)은 미존재와 구분해 writable=false로 즉시 실패
 // 보고해야 한다.
 func TestRunDoctor_StoreRootAncestorIsFile_Rejected(t *testing.T) {
+	isolateCodexHome(t)
 	base := t.TempDir()
 	ancestorFile := filepath.Join(base, "ancestor-is-a-file")
 	if err := os.WriteFile(ancestorFile, []byte("x"), 0o600); err != nil {
@@ -1777,6 +1839,7 @@ func TestRunDoctor_StoreRootAncestorIsFile_Rejected(t *testing.T) {
 // store.Open의 MkdirAll이 절대 성공할 수 없으므로 프로브 없이 writable=false로 명시
 // 거부해야 한다(리뷰 Fix Round 3, item 2).
 func TestRunDoctor_StoreRootIsFile_Rejected(t *testing.T) {
+	isolateCodexHome(t)
 	base := t.TempDir()
 	storeRoot := filepath.Join(base, "storeroot-is-a-file")
 	if err := os.WriteFile(storeRoot, []byte("x"), 0o600); err != nil {
@@ -1918,6 +1981,7 @@ func TestRunSessionExport_WorktreeContract(t *testing.T) {
 // 프로브·session.recover-pending 마커 존재 3항목을 출력한다(설계 §7).
 func TestRunDoctor_SessionItems(t *testing.T) {
 	t.Run("not_initialized_is_informational_not_failure", func(t *testing.T) {
+		isolateCodexHome(t)
 		storeRoot := t.TempDir()
 		projectRoot := t.TempDir()
 		var buf bytes.Buffer
@@ -1937,6 +2001,7 @@ func TestRunDoctor_SessionItems(t *testing.T) {
 	})
 
 	t.Run("healthy_session_all_three_pass", func(t *testing.T) {
+		isolateCodexHome(t)
 		storeRoot := t.TempDir()
 		projectRoot := t.TempDir()
 		canon, err := ident.Canonicalize(projectRoot)
@@ -1970,6 +2035,7 @@ func TestRunDoctor_SessionItems(t *testing.T) {
 	})
 
 	t.Run("recover_marker_present_counts_as_failure", func(t *testing.T) {
+		isolateCodexHome(t)
 		storeRoot := t.TempDir()
 		projectRoot := t.TempDir()
 		canon, err := ident.Canonicalize(projectRoot)
@@ -2003,6 +2069,7 @@ func TestRunDoctor_SessionItems(t *testing.T) {
 // [6] empty 카운트에서 제외(스펙 §0 상호작용 ①). 세션 2개(A=session_start 단독=empty,
 // B=session_start+subagent_start=non-empty) → "sessions=2 (empty=1)" 단정.
 func TestDoctorEmptyExcludesSubagentLifecycle(t *testing.T) {
+	isolateCodexHome(t)
 	storeRoot := t.TempDir()
 	projectRoot := t.TempDir()
 	canon, err := ident.Canonicalize(projectRoot)
@@ -3038,6 +3105,7 @@ func TestRunDoctorFixFlag(t *testing.T) {
 // TestDoctorShowsRunnerLine — [18] exec 러너 감지 라인(D58). 감지 결과는 환경 의존이라 접두만
 // 검증한다(exec는 opt-in 프로필이라 미검출이어도 실패 게이트가 아님 — err 무시).
 func TestDoctorShowsRunnerLine(t *testing.T) {
+	isolateCodexHome(t)
 	var buf bytes.Buffer
 	_ = runDoctor(context.Background(), &buf, t.TempDir(), t.TempDir(), "0.11.0", false)
 	if !strings.Contains(buf.String(), "[18] exec runners:") {
@@ -3048,6 +3116,7 @@ func TestDoctorShowsRunnerLine(t *testing.T) {
 // TestDoctorWarnMentionsHookOnly — [14] 경고 신문구가 --hook-only 선택 삭제를 안내하고 옛 문구
 // ('무구분')는 사라졌다(설계 §8 / D38 승격).
 func TestDoctorWarnMentionsHookOnly(t *testing.T) {
+	isolateCodexHome(t)
 	storeRoot, projectRoot := doctorSizeWarnSetup(t)
 	t.Setenv("CTR_STORE_WARN_BYTES", "5") // blob 10B > 5B → 발화
 	var buf bytes.Buffer
@@ -3324,6 +3393,7 @@ func TestDoctorPermissionLineOnCheckFailure(t *testing.T) {
 // TestDoctorIndexesRender — D73: 병기가 quick_check 뒤에 오고 기존 부분문자열 단정이 그대로
 // 통과한다(골든 갱신 없이 정보만 더한다).
 func TestDoctorIndexesRender(t *testing.T) {
+	isolateCodexHome(t)
 	// 전용 doctor 실행 헬퍼는 없다 — 기존 셋업 두 개로 조립해 runDoctor를 직접 부른다.
 	storeRoot, projectRoot, projDir := doctorShadowProjDir(t) // cli_test.go:545
 	seedShadowContentDB(t, projDir)                           // cli_test.go:411 — writable Open이라 여기서 색인이 생긴다
