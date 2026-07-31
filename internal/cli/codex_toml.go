@@ -465,6 +465,27 @@ func stripTrailingComment(s string) string {
 	return s
 }
 
+// codexValueText — **값 판독용 정규화**: 공백을 지우고(stripLine) 문자열 밖 주석을 잘라 낸다.
+// 주석은 TOML 데이터가 아니므로 값 판독이 그것을 지나 스캔하면 후행 주석에 적은 문자열이 값이
+// 된다 — 표식과 command가 그렇게 읽히면 주석 한 줄로 소유가 위조되고(그 값이 곧 소유 판정이다),
+// enabled_tools가 그렇게 읽히면 주석으로 꺼 둔 도구가 목록에 남아 D91의 부족 감지와 exec 노출
+// 안내가 함께 사실과 어긋난다. 판독 전용이다 — 되쓰기는 원문 바이트를 옮긴다(codexTableBody).
+func codexValueText(line []byte) string {
+	return stripTrailingComment(stripLine(line))
+}
+
+// codexEntryText — 논리 엔트리의 라인들을 값 판독용 정규화로 잇는다. **줄마다** 자르는 것이
+// 계약이다 — 주석은 그 물리 라인의 끝까지이므로, 이은 문자열에서 한 번만 자르면 여러 줄 배열의
+// 첫 주석 뒤에 있는 진짜 원소가 통째로 사라진다. 키·값을 읽는 네 자리가 이 하나를 공유한다 —
+// 갈리면 같은 파일을 여러 방식으로 읽는 셈이다.
+func codexEntryText(lines [][]byte, e [2]int) string {
+	joined := ""
+	for i := e[0]; i <= e[1]; i++ {
+		joined += codexValueText(lines[i])
+	}
+	return joined
+}
+
 // codexEscapedKeyInSpans — 우리 두 구간 안에 정규화 불가 키 표기가 있는가(D87).
 // **엔트리 단위로 본다.** codexEntries가 여러 줄 값을 한 엔트리로 묶고 그 엔트리에서 키는
 // 맨 앞 토큰뿐이므로, 문자열 값 안이나 후행 주석 안의 `"이름" = 값` 모양이 키로 오인되지
@@ -483,21 +504,17 @@ func codexEscapedKeyInSpans(lines [][]byte, sp codexSpans) bool {
 			continue
 		}
 		for _, e := range codexEntries(lines, span) {
-			joined := ""
-			for i := e[0]; i <= e[1]; i++ {
-				joined += stripLine(lines[i])
-			}
+			// 주석은 codexEntryText가 이미 잘라 냈다 — 주석 안의 키 모양까지 잡으면
+			// `env = { A = "1" } # TODO: , "C:\t" = 2` 같은 정상 파일이 이상이 된다.
+			joined := codexEntryText(lines, e)
 			if tomlKeyTokenHasEscape(joined) {
 				return true
 			}
 			if codexKeyName(joined) != "env" {
 				continue
 			}
-			// 인라인 키 토큰은 **후행 주석을 뺀** 부분에서만 본다 — 주석 안의 키 모양까지 잡으면
-			// `env = { A = "1" } # TODO: , "C:\t" = 2` 같은 정상 파일이 이상이 된다.
-			inline := stripTrailingComment(joined)
-			for j := 0; j < len(inline); j++ {
-				if (inline[j] == '{' || inline[j] == ',') && tomlKeyTokenHasEscape(inline[j+1:]) {
+			for j := 0; j < len(joined); j++ {
+				if (joined[j] == '{' || joined[j] == ',') && tomlKeyTokenHasEscape(joined[j+1:]) {
 					return true
 				}
 			}
@@ -826,8 +843,11 @@ func installCodexConfigBlock(existing []byte, req codexInstallRequest) codexInst
 		})
 	}
 	// D90 — 점 표기 env가 있고 표식을 새로 넣거나 갱신해야 하면 쓸 자리가 없다. 헤더를 붙이면
-	// 같은 논리 테이블이 두 번 정의되고, 점 표기로 쓰면 이전 릴리스 바이너리가 그 파일을 깬다.
+	// 같은 논리 테이블이 두 번 정의되고, 점 표기로 쓰면 이전 릴리스 바이너리가 그 파일을 깬다 —
+	// **기입 형태는 개정 뒤에도 점 표기가 아니다**(D90 개정은 판독만 통일한다).
 	// 표식이 이미 현재 값이면 이탈하지 않는다 — 고칠 것이 없는 파일에 사유를 내는 오경보다.
+	// 유효 입력에서는 marker가 곧 dottedMarker이므로 뒤의 두 항이 같은 것을 묻는다. 그래도 둘을
+	// 남긴다 — 두 형태를 함께 담은 **무효** 입력에서 marker는 헤더 구간 값이라 둘이 갈린다.
 	if view.dottedEnv && (!view.dottedMarkerFound || view.dottedMarker != req.Marker) && marker != req.Marker {
 		return codexInstallResult{
 			Out: existing, State: mcpMarkerAnomaly, TableFound: sp.table.found, Anomaly: anomalyDottedEnv, InputParses: inputParses,
@@ -1008,9 +1028,10 @@ type codexTableView struct {
 	// inlineEnv — 인라인 env 대입 줄 인덱스(-1이면 없음). 이 줄이 있으면 [mcp_servers.ctr.env]
 	// 헤더를 새로 붙이지 않는다(중복 정의 금지) — 표식은 그 줄 안에서 갈아 끼운다.
 	inlineEnv int
-	// dottedEnv — 구간 안에 점 표기 env.* 키가 있는가, 그중 표식 줄의 값은 무엇인가(D90).
-	// **정보 필드다** — 소유·표식·이상 판정은 이 값을 보지 않으므로 uninstall·probe·라벨의
-	// 동작이 불변이다. 소비자는 installCodexConfigBlock 하나다.
+	// dottedEnv — 구간 안에 점 표기 env.* 키가 있는가, 그중 표식 줄의 값은 무엇인가(D90 개정).
+	// dottedEnv는 install의 이탈 판정만 쓰지만, dottedMarker·dottedMarkerFound는 **표식 판독기
+	// codexMarkerValue가 셋째 형태로 읽는다** — 그래서 소유 판정·라벨·uninstall이 그 형태의
+	// 우리 등록물을 우리 것으로 본다. 판독기와 판정이 갈리면 정상 등록물에 잘못된 조치가 나간다.
 	dottedEnv         bool
 	dottedMarker      string
 	dottedMarkerFound bool
@@ -1026,10 +1047,7 @@ func codexReadTable(lines [][]byte, sp codexSpan) codexTableView {
 		return view
 	}
 	for _, e := range codexEntries(lines, sp) {
-		joined := ""
-		for i := e[0]; i <= e[1]; i++ {
-			joined += stripLine(lines[i])
-		}
+		joined := codexEntryText(lines, e)
 		values := []string(nil)
 		if eq := strings.Index(joined, "="); eq >= 0 {
 			values = tomlStringList(joined[eq+1:])
@@ -1066,7 +1084,8 @@ func codexReadTable(lines [][]byte, sp codexSpan) codexTableView {
 			view.dottedEnv = true
 			if rest == codexMarkerKey {
 				// 값은 위에서 이미 읽은 values를 그대로 쓴다 — 같은 엔트리를 두 기준으로 읽으면
-				// 그 둘이 갈린다. 문자열이 아닌 값은 ""로 남아 "현재 값이 아니다"로 읽힌다.
+				// 그 둘이 갈린다. 문자열이 아닌 값은 ""로 남아 "현재 값이 아니다"로 읽히고,
+				// 개정 뒤에는 그것이 곧 "소유가 아니다"다(codexMarkerValue가 이 값을 낸다).
 				view.dottedMarkerFound = true
 				if len(values) > 0 {
 					view.dottedMarker = values[0]
@@ -1127,16 +1146,25 @@ func tomlInlineValue(s, key string) (value string, found bool) {
 	return "", false
 }
 
-// codexMarkerValue — 소유 표식 값을 읽는다. [mcp_servers.ctr.env] 서브테이블과 관리 테이블
-// 안의 인라인 env 대입 **두 형태를 모두** 인식한다(D80). found는 키가 있는가이고, 소유
-// 판정은 값 기준(isOurMarkerValue)이라 키만 있고 값이 비면 소유가 아니다.
+// codexMarkerValue — 소유 표식 값을 읽는다. env 서브테이블을 정의하는 **세 형태를 모두**
+// 인식한다: [mcp_servers.ctr.env] 헤더 구간·관리 테이블 안의 인라인 env 대입(D80)·점 표기
+// env.CTR_MANAGED(D90 개정). found는 키가 있는가이고, 소유 판정은 값 기준(isOurMarkerValue)이라
+// 키만 있고 값이 비면 소유가 아니다.
+//
+// 점 표기를 여기서 읽는 것이 D90 개정의 본절이다. 판독기(codexReadTable)만 그 형태를 알고
+// 판정이 모르면 **정상 등록물**에 잘못된 조치가 나간다 — 호스트는 단일 키 서브테이블을 그
+// 형태로 접으므로 정상 설치 뒤 정상 사용으로 도달하는 상태다. 소유 판정·라벨·uninstall이
+// 이 한 함수를 지나므로 여기서 읽으면 셋이 함께 옳아진다(D89의 "판정원 하나"와 같은 주제).
+//
+// **셋의 순서는 유효 입력에서 관측되지 않는다.** 셋 다 같은 논리 테이블 mcp_servers.ctr.env를
+// **정의**하고 TOML은 한 테이블의 중복 정의를 금지하므로, Codex가 읽을 수 있는 파일에는
+// 많아야 하나가 있다(codexTOMLParses가 그 사실을 잰다 — 두 형태를 함께 담은 입력은 파스되지
+// 않는다). 그러므로 새 경로를 **맨 뒤에** 둔다: 기존 두 경로가 이미 다루던 모든 입력에서
+// 바이트 단위로 같은 답을 유지하는 배치이며, 순서로 무언가를 결정하지 않는다.
 func codexMarkerValue(lines [][]byte, sp codexSpans, view codexTableView) (string, bool) {
 	if sp.env.found {
 		for _, e := range codexEntries(lines, sp.env) {
-			joined := ""
-			for i := e[0]; i <= e[1]; i++ {
-				joined += stripLine(lines[i])
-			}
+			joined := codexEntryText(lines, e)
 			if codexKeyName(joined) != codexMarkerKey {
 				continue
 			}
@@ -1147,7 +1175,10 @@ func codexMarkerValue(lines [][]byte, sp codexSpans, view codexTableView) (strin
 		}
 	}
 	if view.inlineEnv >= 0 {
-		return tomlInlineValue(stripLine(lines[view.inlineEnv]), codexMarkerKey)
+		return tomlInlineValue(codexValueText(lines[view.inlineEnv]), codexMarkerKey)
+	}
+	if view.dottedMarkerFound {
+		return view.dottedMarker, true
 	}
 	return "", false
 }
@@ -1356,7 +1387,7 @@ func codexTableBody(lines [][]byte, sp codexSpan, view codexTableView, profiles 
 	}
 	for _, i := range keep {
 		if i == view.inlineEnv {
-			old, found := tomlInlineValue(stripLine(lines[i]), codexMarkerKey)
+			old, found := tomlInlineValue(codexValueText(lines[i]), codexMarkerKey)
 			b = append(b, setInlineEnvMarker(lines[i], old, found, marker, eol)...)
 			continue
 		}
@@ -1390,11 +1421,7 @@ func codexEnvBody(lines [][]byte, sp codexSpan, marker, eol string, dropBegin, d
 		if e[0] == dropBegin || e[0] == dropEnd {
 			continue
 		}
-		joined := ""
-		for i := e[0]; i <= e[1]; i++ {
-			joined += stripLine(lines[i])
-		}
-		if codexKeyName(joined) == codexMarkerKey {
+		if codexKeyName(codexEntryText(lines, e)) == codexMarkerKey {
 			continue
 		}
 		for i := e[0]; i <= e[1]; i++ {

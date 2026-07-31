@@ -1452,19 +1452,34 @@ func TestCodexDottedEnvQuotedSpaceIsNotEnv(t *testing.T) {
 	}
 }
 
-// TestCodexDottedEnvJudgmentUnchanged — D90은 **정보만 더한다**. 소유·표식·이상 판정을
-// 손대지 않으므로 uninstall과 probe의 동작이 불변이다.
-func TestCodexDottedEnvJudgmentUnchanged(t *testing.T) {
-	src := "[mcp_servers.ctr]\ncommand = \"context-router\"\nenv.CTR_MANAGED = \"context-router/0.15.0\"\n"
-	out, changed, anomaly := uninstallCodexConfigBlock([]byte(src))
+// TestCodexDottedEnvJudgmentUnified — D90 개정. 이 자리는 원래 "D90은 정보만 더한다 —
+// 판정을 흔들지 않는다"를 쟀고, 그 픽스처의 command가 우리 것이라 판독기를 되돌려도 물리지
+// 않았다. 전제가 뒤집혔다: 판독기와 판정이 갈리면 **정상 등록물**(호스트 재직렬화가 단일 키
+// 서브테이블을 점 표기로 접은 형태)이 남의 것으로 읽혀 제거가 무성으로 실패한다. 이제 판독기
+// 하나가 점 표기를 읽고 그 값이 곧 소유 판정이다.
+//
+// 그러므로 이 자리가 고정하는 것은 **바뀐 판정이 정확히 무엇인가**다. 픽스처의 command는
+// 우리 것이 아니다 — 표식만이 소유 근거인 형태라야 판독기를 되돌렸을 때 물린다.
+//   - 우리 표식이 박힌 점 표기 등록물은 uninstall이 제거한다(우리 것이므로 옳다).
+//   - 남의 값이 든 같은 이름의 키는 여전히 남의 것이다 — 소유는 키 이름이 아니라 값이 정한다.
+//   - 이상 판정(probe)은 불변이다 — 점 표기는 유효 TOML이라 사유가 아니다.
+func TestCodexDottedEnvJudgmentUnified(t *testing.T) {
+	ours := "[mcp_servers.ctr]\ncommand = \"/opt/bin/context-router\"\nenv.CTR_MANAGED = \"context-router/0.15.0\"\n"
+	out, changed, anomaly := uninstallCodexConfigBlock([]byte(ours))
 	if !changed || anomaly != anomalyNone {
-		t.Errorf("uninstall이 바뀌었다: changed=%v anomaly=%d", changed, anomaly)
+		t.Errorf("우리 표식이 박힌 등록물을 남겼다: changed=%v anomaly=%d", changed, anomaly)
 	}
 	if strings.Contains(string(out), "mcp_servers.ctr") {
 		t.Errorf("제거가 불완전하다:\n%s", out)
 	}
-	if _, a := probeCodexMCPBlock([]byte(src)); a != anomalyNone {
-		t.Errorf("probe가 바뀌었다: anomaly=%d", a)
+	theirs := "[mcp_servers.ctr]\ncommand = \"/opt/bin/other\"\nenv.CTR_MANAGED = \"someone-else/1.0\"\n"
+	if _, changed, anomaly := uninstallCodexConfigBlock([]byte(theirs)); changed || anomaly != anomalyNotOwned {
+		t.Errorf("남의 테이블을 건드렸다: changed=%v anomaly=%d", changed, anomaly)
+	}
+	for _, src := range []string{ours, theirs} {
+		if present, a := probeCodexMCPBlock([]byte(src)); !present || a != anomalyNone {
+			t.Errorf("probe가 바뀌었다: present=%v anomaly=%d", present, a)
+		}
 	}
 }
 
@@ -1495,5 +1510,129 @@ func TestCodexDottedHead(t *testing.T) {
 	esc := "[mcp_servers.ctr]\ncommand = \"context-router\"\n\"\\u0065nv\".CTR_MANAGED = \"x\"\n"
 	if res := installCodexConfigBlock([]byte(esc), codexInstallRequest{Marker: hookMarker("0.17.0")}); res.State != mcpOutputInvalid {
 		t.Errorf("state=%d want mcpOutputInvalid — 게이트가 받지 않으면 헤더 중복이 그대로 나간다", res.State)
+	}
+}
+
+// TestCodexDottedMarkerIsRead — D90 개정. 점 표기 `env.CTR_MANAGED`는 우리가 기입한 표식과
+// **같은 키**이고, 호스트가 단일 키 서브테이블을 그 형태로 접는 것은 정상 설치 뒤 정상 사용으로
+// 도달하는 상태다. 판독기 하나가 그것을 읽지 않으면 그 정상 등록물에 잘못된 조치가 나간다:
+// install이 "사용자 소유"로 물러나고, uninstall이 우리 등록물을 남긴 채 직접 정리하라 하며,
+// 버전 라벨이 표식 없는 것으로 굳는다.
+// **command가 우리 것이 아닌 행이 이 계약의 눈금이다** — 그 행에서는 표식만이 소유 근거이므로
+// 판독기를 되돌리면 반드시 물린다.
+func TestCodexDottedMarkerIsRead(t *testing.T) {
+	cur := hookMarker("0.17.0")
+	for _, command := range []string{"context-router", "/opt/bin/context-router"} {
+		src := "[mcp_servers.ctr]\ncommand = \"" + command + "\"\nenv.CTR_MANAGED = \"" + cur + "\"\n"
+		marker, gotCmd, found := codexConfigMarker([]byte(src))
+		if !found || marker != cur || gotCmd != command {
+			t.Errorf("[%s] codexConfigMarker = (%q,%q,%v), want (%q,%q,true)", command, marker, gotCmd, found, cur, command)
+		}
+		res := installCodexConfigBlock([]byte(src), codexInstallRequest{Marker: cur})
+		if res.State != mcpWritten {
+			t.Errorf("[%s] install state=%d want mcpWritten — 우리 표식이 박힌 등록물이다", command, res.State)
+		}
+		if strings.Contains(string(res.Out), "[mcp_servers.ctr.env]") {
+			t.Errorf("[%s] env 헤더를 덧붙였다 — 중복 정의:\n%s", command, res.Out)
+		}
+		if !codexTOMLParses(res.Out) {
+			t.Errorf("[%s] 산출물이 파스되지 않는다:\n%s", command, res.Out)
+		}
+		if again := installCodexConfigBlock(res.Out, codexInstallRequest{Marker: cur}); again.Changed {
+			t.Errorf("[%s] 2회차가 무변경이 아니다:\n%s", command, again.Out)
+		}
+		out, changed, anomaly := uninstallCodexConfigBlock([]byte(src))
+		if !changed || anomaly != anomalyNone {
+			t.Errorf("[%s] uninstall changed=%v anomaly=%d, want true/anomalyNone", command, changed, anomaly)
+		}
+		if strings.Contains(string(out), "mcp_servers.ctr") {
+			t.Errorf("[%s] 제거가 불완전하다:\n%s", command, out)
+		}
+	}
+	// 판독 순서의 근거 — 세 형태는 같은 논리 테이블 mcp_servers.ctr.env를 **정의**하므로 유효
+	// TOML에 공존할 수 없다. 공존할 수 있다면 codexMarkerValue의 배치(새 경로를 맨 뒤)가
+	// 관측 가능한 선택이 되고 "기존 두 경로의 답이 그대로다"라는 근거가 무너진다.
+	for _, src := range []string{
+		"[mcp_servers.ctr]\nenv.CTR_MANAGED = \"a\"\n[mcp_servers.ctr.env]\nCTR_MANAGED = \"b\"\n",
+		"[mcp_servers.ctr]\nenv = { CTR_MANAGED = \"a\" }\nenv.CTR_MANAGED = \"b\"\n",
+		"[mcp_servers.ctr]\nenv = { CTR_MANAGED = \"a\" }\n[mcp_servers.ctr.env]\nCTR_MANAGED = \"b\"\n",
+	} {
+		if codexTOMLParses([]byte(src)) {
+			t.Errorf("두 형태가 공존하는 입력이 파스된다 — 판독 순서가 관측 가능해진다:\n%s", src)
+		}
+	}
+}
+
+// TestCodexValueReadStopsAtComment — 값 판독은 **문자열 밖 '#'에서 멈춘다**. 주석은 TOML
+// 데이터가 아니므로 그것을 지나 스캔하면 후행 주석에 적은 문자열이 값으로 읽힌다. 표식과
+// command가 그렇게 읽히면 **후행 주석 한 줄로 소유를 위조**할 수 있고, 판독 통일이 그 값을
+// 소유 판정에 그대로 쓰므로 위조된 소유가 곧 남의 테이블을 되쓰는 권한이 된다.
+// 표식 판독 경로 셋(env 서브테이블·인라인 env·점 표기)을 모두 잰다 — 한 경로만 고치면 나머지
+// 둘이 같은 파일을 다른 방식으로 읽는다.
+func TestCodexValueReadStopsAtComment(t *testing.T) {
+	cur := hookMarker("0.17.0")
+	head := "[mcp_servers.ctr]\ncommand = \"/opt/bin/context-router\"\n"
+	cases := []struct{ name, src string }{
+		{"점 표기", head + "env.CTR_MANAGED = 1 # \"" + cur + "\"\n"},
+		{"env 서브테이블", head + "[mcp_servers.ctr.env]\nCTR_MANAGED = 1 # \"" + cur + "\"\n"},
+		{"인라인 env", head + "env = { FOO = \"1\" } # , CTR_MANAGED = \"" + cur + "\"\n"},
+		{"command", "[mcp_servers.ctr]\ncommand = 1 # \"context-router\"\n"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if !codexTOMLParses([]byte(c.src)) {
+				t.Fatalf("픽스처가 유효 TOML이 아니다 — 위조 경로를 재지 못한다:\n%s", c.src)
+			}
+			marker, command, _ := codexConfigMarker([]byte(c.src))
+			if marker == cur {
+				t.Errorf("표식 값을 후행 주석에서 읽었다: %q", marker)
+			}
+			if command == hookBinaryName {
+				t.Errorf("command 값을 후행 주석에서 읽었다: %q", command)
+			}
+			res := installCodexConfigBlock([]byte(c.src), codexInstallRequest{Marker: cur})
+			if res.State != mcpExistingHeader || res.Changed {
+				t.Errorf("남의 테이블을 소유로 읽었다: state=%d changed=%v", res.State, res.Changed)
+			}
+		})
+	}
+	// 점 표기 값 판독은 소유 판정에 얹기 전부터 install의 D90 이탈을 가르는 데 쓰였다 —
+	// 그 자리의 판독도 같은 기준이어야 한다.
+	lines := splitLinesKeepEnds([]byte(head + "env.CTR_MANAGED = 1 # \"" + cur + "\"\n"))
+	if v := codexReadTable(lines, codexManagedSpans(lines).table); v.dottedMarker == cur {
+		t.Errorf("점 표기 표식 값을 후행 주석에서 읽었다: %q", v.dottedMarker)
+	}
+}
+
+// TestCodexEnabledToolsStopsAtComment — 배열 안의 주석 처리된 원소는 값이 아니다(D91).
+// 엔트리 판독이 여러 줄을 이어 붙인 뒤 한 번에 훑으므로 '#'을 **줄 단위로** 자르지 않으면
+// 사용자가 꺼 둔 도구가 목록에 남는다: doctor는 부족을 알리지 않는데 Codex는 그 도구를 등록하지
+// 않고, 주석 처리한 exec 도구는 설치기에 "이미 노출됨"을 말하게 한다.
+// 이은 문자열에서 한 번만 자르면 반대 방향으로 틀린다 — 첫 주석 뒤의 **진짜 원소**가 사라진다.
+func TestCodexEnabledToolsStopsAtComment(t *testing.T) {
+	cur := hookMarker("0.17.0")
+	head := "[mcp_servers.ctr]\ncommand = \"context-router\"\nargs = [\"--enable\", \"ingest\"]\n"
+	tail := "[mcp_servers.ctr.env]\nCTR_MANAGED = \"" + cur + "\"\n"
+	req := codexInstallRequest{Marker: cur, MarkerOnly: true}
+
+	src := head + "enabled_tools = [\n  \"ctr_search\", \"ctr_fetch\", \"ctr_transform\",\n" +
+		"  \"ctr_record_event\", \"ctr_session_summary\", \"ctr_export_events\",\n" +
+		"  # \"ctr_index\",\n]\n" + tail
+	res := installCodexConfigBlock([]byte(src), req)
+	if slices.Contains(res.Tools, "ctr_index") {
+		t.Errorf("주석 처리한 도구가 목록에 들었다: %v", res.Tools)
+	}
+	if toolsCover(res.Tools, res.WantTools) {
+		t.Errorf("부족을 알리지 않는다: have=%v want=%v", res.Tools, res.WantTools)
+	}
+	// 주석 **뒤**의 원소는 살아 있어야 한다 — 줄 단위 절단의 눈금이다.
+	after := head + "enabled_tools = [\n  \"ctr_search\",\n  # \"ctr_index\",\n  \"ctr_fetch\",\n]\n" + tail
+	if got := installCodexConfigBlock([]byte(after), req).Tools; !slices.Equal(got, []string{"ctr_search", "ctr_fetch"}) {
+		t.Errorf("tools=%v, want [ctr_search ctr_fetch]", got)
+	}
+	// exec 노출 안내도 같은 목록을 본다.
+	execSrc := head + "enabled_tools = [\n  \"ctr_search\",\n  # \"ctr_execute\",\n]\n" + tail
+	if got := installCodexConfigBlock([]byte(execSrc), req); got.ExecExposed {
+		t.Errorf("주석 처리한 exec 도구를 노출로 읽었다: tools=%v", got.Tools)
 	}
 }
