@@ -609,6 +609,11 @@ type codexInstallResult struct {
 	// 그 둘이 갈리는 것이 이 릴리스가 닫는 어긋남이다. mcpWritten이면서 이 값이 거짓인 상태가
 	// "append하면 된다"이며, --fix는 등록을 만들지 않으므로 그 상태에서 기입하지 않는다.
 	TableFound bool
+	// Anomaly — 이 함수가 판정한 이탈 사유(D89 사유 전달 채널). 값이 있으면 호출자가
+	// probeCodexMCPBlock의 사유보다 **우선해서** 읽는다. install만 아는 이탈(게이트·점 표기)이
+	// 있고 사유를 인쇄하는 두 자리는 probe에서 사유를 받으므로, 이 필드가 없으면 그 이탈이
+	// 빈 사유로 나간다. anomalyNone이면 호출자가 종전대로 probe의 사유를 쓴다.
+	Anomaly codexAnomaly
 }
 
 // installCodexConfigBlock — 관리 테이블 병합(스펙 v0.15 §0 D80·D81·D84). 순수 변환: 파일 IO 없음.
@@ -620,7 +625,7 @@ func installCodexConfigBlock(existing []byte, req codexInstallRequest) codexInst
 	lines := splitLinesKeepEnds(existing)
 	sp := codexManagedSpans(lines)
 	if sp.anomaly != anomalyNone {
-		return codexInstallResult{Out: existing, State: mcpMarkerAnomaly, TableFound: sp.table.found}
+		return codexInstallResult{Out: existing, State: mcpMarkerAnomaly, TableFound: sp.table.found, Anomaly: sp.anomaly}
 	}
 	if scanOutsideSpans(lines, sp) {
 		return codexInstallResult{Out: existing, State: mcpConflict, TableFound: sp.table.found}

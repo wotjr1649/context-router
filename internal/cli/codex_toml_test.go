@@ -918,6 +918,33 @@ func TestCodexAnomalyReason(t *testing.T) {
 	}
 }
 
+// TestCodexInstallAnomalyChannel — D89 사유 전달 채널. install이 세운 사유는 probe가 세운
+// 사유보다 **우선한다**. 우선순위가 없으면 install만 아는 이탈 사유가 probe의 anomalyNone에
+// 덮여 빈 문자열로 인쇄된다.
+func TestCodexInstallAnomalyChannel(t *testing.T) {
+	// 구간 판정 이상이 있는 입력 — install이 sp.anomaly를 그대로 실어 낸다.
+	dup := "[mcp_servers.ctr]\ncommand = \"context-router\"\n\n[mcp_servers.ctr]\ncommand = \"x\"\n"
+	res := installCodexConfigBlock([]byte(dup), codexInstallRequest{Marker: hookMarker("0.17.0")})
+	if res.State != mcpMarkerAnomaly {
+		t.Fatalf("state=%d want mcpMarkerAnomaly", res.State)
+	}
+	if res.Anomaly != anomalyDupHeader {
+		t.Errorf("Anomaly=%d want anomalyDupHeader — 결과가 사유를 싣지 않으면 채널이 없다", res.Anomaly)
+	}
+	// 정상 입력에서는 사유가 없다.
+	ok := "[mcp_servers.ctr]\ncommand = \"context-router\"\n"
+	if r := installCodexConfigBlock([]byte(ok), codexInstallRequest{Marker: hookMarker("0.17.0")}); r.Anomaly != anomalyNone {
+		t.Errorf("정상 입력에 Anomaly=%d", r.Anomaly)
+	}
+	// 폴백 갈래 — install이 사유를 세우지 않는 구간 밖 충돌에서는 probe의 사유가 그대로 남아야
+	// 한다. 우선순위를 "결과만 본다"로 접으면 D85가 세운 사유 하나(구간 밖 충돌)가 판정값에서
+	// 사라지고, 그 사유는 install 쪽에 대응하는 값이 없어 어디서도 복원되지 않는다.
+	conflict := "mcp_servers = { ctr = { command = \"other\" } }\n" + ctrTableFixture
+	if v := codexRegistrationVerdict([]byte(conflict), "0.17.0"); v.State != mcpConflict || v.Anomaly != anomalyOutsideConflict {
+		t.Errorf("State=%d Anomaly=%d want mcpConflict/anomalyOutsideConflict — 폴백 갈래가 막혔다", v.State, v.Anomaly)
+	}
+}
+
 // TestCodexInstallMarkerOnly — D86(§2-3·§2-4·§2-5·§2-8). 표식 전용 갈래는 args·enabled_tools를
 // 원문으로 보존하고 표식과 command만 맞춘다. **args는 우리 형식이어야 한다** — 우리 형식이
 // 아니면 profilesFromArgs가 ok=false를 내 D81의 되읽기 실패 경로가 이미 두 값을 보존하므로,
