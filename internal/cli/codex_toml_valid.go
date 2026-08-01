@@ -1,8 +1,6 @@
 package cli
 
 import (
-	"bytes"
-
 	"github.com/pelletier/go-toml/v2"
 )
 
@@ -28,5 +26,5 @@ import (
 // 바이트와 달라진다.
 func codexTOMLParses(b []byte) bool {
 	var v any
-	return toml.Unmarshal(bytes.TrimPrefix(b, []byte("\xEF\xBB\xBF")), &v) == nil
+	return toml.Unmarshal(trimBOM(b), &v) == nil
 }

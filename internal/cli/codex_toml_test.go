@@ -1638,3 +1638,71 @@ func TestCodexEnabledToolsStopsAtComment(t *testing.T) {
 		t.Errorf("주석 처리한 exec 도구를 노출로 읽었다: tools=%v", got.Tools)
 	}
 }
+
+// TestCodexBOMOnManagedHeader — BOM이 **우리 테이블 헤더 줄**에 붙은 파일. `hook install --codex`가
+// 만드는 파일의 첫 줄이 그 헤더라 도달 가능하다. Go의 strings.Fields는 U+FEFF를 공백으로 보지
+// 않으므로 판정 정규화가 그 세 바이트를 통과시켰고, 그러면 우리 구간을 잃어 그 구간의 키가
+// "구간 밖 ctr 정의"로 잡혀 재등록이 충돌로 막혔다 — 우리가 만든 파일에 편집기가 세 바이트를
+// 붙였을 뿐인데.
+func TestCodexBOMOnManagedHeader(t *testing.T) {
+	src := codexBOM + ctrTableFixture
+	// 입력 자체는 우리 파서가 받는다(v0.17이 파스 판정 앞에서 BOM을 뗀다) — 그래서 이 픽스처가
+	// 재는 것은 파스 축이 아니라 **라인 정규화 축** 하나다. 파스 축이 대신 물면 무엇을 쟀는지
+	// 알 수 없어진다.
+	if !codexTOMLParses([]byte(src)) {
+		t.Fatalf("픽스처 입력이 파스되지 않는다 — 라인 정규화 축을 홀로 잴 수 없다")
+	}
+	sp := codexManagedSpans(splitLinesKeepEnds([]byte(src)))
+	if !sp.table.found || sp.table.start != 0 {
+		t.Fatalf("BOM 붙은 헤더를 구간으로 잡지 못했다: found=%v start=%d", sp.table.found, sp.table.start)
+	}
+	res := installCodexConfigBlock([]byte(src), codexInstallRequest{Marker: hookMarker("0.17.2")})
+	if res.State != mcpWritten || !res.TableFound {
+		t.Fatalf("state=%d tableFound=%v want mcpWritten/true", res.State, res.TableFound)
+	}
+	// **세 바이트가 살아남아야 한다.** 판정에서만 떼고 되쓰기는 헤더 라인을 원문 그대로
+	// 옮기므로, 이 단정이 깨지면 우리가 사용자 파일의 인코딩을 조용히 바꾼 것이다.
+	if !bytes.HasPrefix(res.Out, []byte(codexBOM)) {
+		t.Errorf("산출이 선두 BOM을 잃었다:\n%q", string(res.Out))
+	}
+	if !codexTOMLParses(res.Out) {
+		t.Errorf("산출이 파스되지 않는다:\n%s", res.Out)
+	}
+	// 멱등(스펙 §2.2) — D84의 단일 백업 슬롯이 2회차 무변경 위에 서 있다.
+	again := installCodexConfigBlock(res.Out, codexInstallRequest{Marker: hookMarker("0.17.2")})
+	if !bytes.Equal(again.Out, res.Out) {
+		t.Errorf("멱등이 아니다:\n1차:\n%s\n2차:\n%s", res.Out, again.Out)
+	}
+}
+
+// TestCodexBOMNotStrippedMidLine — BOM 제거는 **선두 한정**이다. 줄 안쪽의 U+FEFF까지 지우면
+// 사용자 값 안의 그 문자가 판정에서 사라져 다른 키·다른 이름으로 읽힌다.
+func TestCodexBOMNotStrippedMidLine(t *testing.T) {
+	if got := stripLine([]byte("[mcp_servers." + codexBOM + "ctr]\n")); got == "[mcp_servers.ctr]" {
+		t.Errorf("줄 안쪽 U+FEFF까지 지웠다: %q", got)
+	}
+}
+
+// TestCodexBlockOwnsTrailingComment — 구 블록의 소유 판정이 헤더를 정규화 문자열 == 로
+// 비교해, 헤더에 후행 주석이 붙은 파일에서 마이그레이션이 닫혔다. 방향은 fail-safe이지만
+// 그 파일은 영영 구형식으로 남는다 — 값 판독이 v0.17에서 주석을 인지하게 된 것과 같은 부류의
+// 자리이고, 헤더 이름 추출은 그때 함께 오지 않았다.
+func TestCodexBlockOwnsTrailingComment(t *testing.T) {
+	src := codexBlockBegin + "\n[mcp_servers.ctr] # 우리 등록물\ncommand = \"context-router\"\n" + codexBlockEnd + "\n"
+	class, begin, end := classifyMarkers(splitLinesKeepEnds([]byte(src)))
+	if class != classReplace {
+		t.Fatalf("class=%d begin=%d end=%d want classReplace — 헤더 후행 주석에서 소유 판정이 닫혔다", class, begin, end)
+	}
+}
+
+// TestCodexOldBlockBOMMigrates — 구 블록의 BEGIN 마커가 파일 첫 줄이면 BOM이 그 줄에 붙는다.
+// 마커 정확 매치가 그 세 바이트를 보면 분류가 classAppend로 떨어지고, install이 관리 테이블을
+// 새로 append해 같은 논리 테이블을 두 번 정의한다 — 게이트가 기입을 막지만 그 파일은 어떤
+// 명령으로도 풀리지 않는 막다른 갈래가 된다.
+func TestCodexOldBlockBOMMigrates(t *testing.T) {
+	src := codexBOM + codexBlockBegin + "\n[mcp_servers.ctr]\ncommand = \"context-router\"\n" + codexBlockEnd + "\n"
+	class, begin, _ := classifyMarkers(splitLinesKeepEnds([]byte(src)))
+	if class != classReplace || begin != 0 {
+		t.Fatalf("class=%d begin=%d want classReplace/0 — BOM이 마커 분류를 뒤집었다", class, begin)
+	}
+}
