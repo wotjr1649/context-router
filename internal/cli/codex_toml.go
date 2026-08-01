@@ -118,9 +118,37 @@ func trimEOL(line []byte) string {
 	return strings.TrimSuffix(s, "\r")
 }
 
-// stripLine — 소유·충돌 판정용 정규화: 종결자 포함 공백 전부 제거.
+// trimBOM — 선두 UTF-8 BOM 세 바이트를 뗀다. **판정 경로에서만 쓴다.**
+//
+// Windows 편집기(PowerShell 5.1의 `Out-File -Encoding utf8`, 구버전 메모장)가 파일 첫 줄에
+// 붙이는 바이트인데 U+FEFF는 Go의 `strings.Fields`가 보는 공백이 아니라 정규화가 그대로
+// 통과시킨다. 그러면 **파일 첫 줄이 우리 테이블 헤더일 때**(`hook install --codex`가 만드는
+// 파일이 그 형태다) 헤더로 인식되지 않아 우리 구간을 잃고, 그 구간의 키가 "구간 밖 ctr 정의"가
+// 되어 재등록이 충돌로 막힌다 — 우리가 만든 파일에 편집기가 세 바이트를 붙였을 뿐인데.
+// Codex 자신은 그 파일을 정상으로 읽으므로(v0.17 D89 개정 실측) 갈리는 것은 우리 판정뿐이다.
+//
+// **`trimEOL`에는 넣지 않는다.** 그 함수의 산출이 `setInlineEnvMarker`의 되쓰기 바이트가 되므로
+// 거기서 떼면 우리가 사용자 파일의 인코딩을 조용히 바꾼다. 판정에서만 떼고 되쓰기는 원문
+// 라인을 그대로 옮기는 것이 이 규칙의 형태다.
+func trimBOM(b []byte) []byte { return bytes.TrimPrefix(b, []byte("\xEF\xBB\xBF")) }
+
+// stripLine — 소유·충돌 판정용 정규화: 종결자 포함 공백 전부 제거. 선두 BOM도 뗀다(trimBOM).
 func stripLine(line []byte) string {
-	return strings.Join(strings.Fields(string(line)), "")
+	return strings.Join(strings.Fields(string(trimBOM(line))), "")
+}
+
+// tomlHeaderName — 정규화 라인이 단일 대괄호 테이블 헤더면 그 이름을, 아니면 빈 문자열을
+// 돌려준다. **헤더 이름을 읽는 자리가 이 하나여야 한다** — 정규화 문자열을 `==`로 비교하면
+// 후행 주석이 붙은 헤더에서 이름이 달라지고, 그 자리마다 갈린다(구 블록 소유 판정이 그래서
+// 주석 한 줄에 닫혔다). `[[배열 테이블]]`은 우리 이름이 될 수 없으므로 이름을 비운다.
+func tomlHeaderName(t string) string {
+	if !strings.HasPrefix(t, "[") || strings.HasPrefix(t, "[[") {
+		return ""
+	}
+	if i := strings.Index(t, "]"); i > 1 {
+		return t[1:i]
+	}
+	return ""
 }
 
 const (
@@ -156,12 +184,7 @@ func (s *tomlLineScanner) step(line []byte) (boundary bool, name string) {
 	if !s.open() {
 		t := stripLine(line)
 		if strings.HasPrefix(t, "[") {
-			boundary = true
-			if !strings.HasPrefix(t, "[[") {
-				if i := strings.Index(t, "]"); i > 1 {
-					name = t[1:i]
-				}
-			}
+			boundary, name = true, tomlHeaderName(t)
 		}
 	}
 	s.advance(string(line), boundary)
@@ -568,7 +591,10 @@ func classifyMarkers(lines [][]byte) (class markerClass, begin, end int) {
 		if inString {
 			continue
 		}
-		switch trimEOL(ln) {
+		// 선두 BOM은 판정에서 뗀다 — 구 블록의 BEGIN 마커가 파일 첫 줄이면 그 세 바이트가
+		// 거기 붙고, 마커가 인식되지 않으면 분류가 classAppend로 떨어져 install이 관리
+		// 테이블을 새로 append한다(같은 논리 테이블 두 번 정의 — 게이트가 막는 막다른 갈래).
+		switch trimEOL(trimBOM(ln)) {
 		case codexBlockBegin:
 			begins = append(begins, i)
 		case codexBlockEnd:
@@ -584,10 +610,12 @@ func classifyMarkers(lines [][]byte) (class markerClass, begin, end int) {
 	return classAnomaly, 0, 0
 }
 
-// blockOwns — 블록 내부에 정규화 "[mcp_servers.ctr]" 라인이 실존해야 소유(본문 검증=소유).
+// blockOwns — 블록 내부에 우리 관리 테이블 헤더가 실존해야 소유(본문 검증=소유).
+// 이름 추출은 tomlHeaderName이 소유한다 — 정규화 문자열을 `==`로 비교하면 헤더에 후행 주석이
+// 붙은 파일에서 소유가 서지 않아 그 파일의 마이그레이션이 영영 닫힌다.
 func blockOwns(lines [][]byte, begin, end int) bool {
 	for i := begin + 1; i < end; i++ {
-		if stripLine(lines[i]) == "[mcp_servers.ctr]" {
+		if tomlHeaderName(stripLine(lines[i])) == codexManagedTable {
 			return true
 		}
 	}

@@ -3492,6 +3492,25 @@ func TestDoctorCodexSingleVerdict(t *testing.T) {
 	}
 }
 
+// TestDoctorCodexBOMHeader — 문면 결속. BOM이 우리 헤더 줄에 붙은 파일을 doctor가
+// `테이블=이상` + "관리 테이블 밖에 ctr 관련 정의가 있습니다 — 수동으로 정리한 뒤 재실행하세요"로
+// 부르면, **우리가 만든 파일에 편집기가 세 바이트를 붙였을 뿐인 사용자에게 자기 파일을
+// 정리하라고 지시하는 것이다.** 결과 필드만 보면 라벨을 만드는 자리가 빠진 구현이 통과한다.
+func TestDoctorCodexBOMHeader(t *testing.T) {
+	home := isolateCodexHome(t)
+	writeCodexConfig(t, home, codexBOM+ctrTableFixture)
+	out, _ := doctorOut(t, t.TempDir(), false)
+	if !strings.Contains(out, "[16] codex: [mcp_servers.ctr] 테이블=존재") {
+		t.Errorf("[16]이 BOM 붙은 헤더의 테이블을 찾지 못한다:\n%s", out)
+	}
+	if strings.Contains(out, "codex=충돌") {
+		t.Errorf("우리 파일을 충돌로 불렀다:\n%s", out)
+	}
+	if strings.Contains(out, "수동으로 정리한 뒤") {
+		t.Errorf("멀쩡한 우리 파일에 수동 정리를 지시했다:\n%s", out)
+	}
+}
+
 // TestDoctorCodexUnownedTable — [16]의 미소유 갈래(신설). 소유를 구별하면 그 갈래의 문면이
 // 바뀌고 막다른 경로에 조치가 생긴다(스펙 §2.3·§1.4-마가 이 픽스처를 명시적으로 요구한다).
 func TestDoctorCodexUnownedTable(t *testing.T) {
