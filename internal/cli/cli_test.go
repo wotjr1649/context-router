@@ -3518,6 +3518,11 @@ func TestDoctorCodexToolsShort(t *testing.T) {
 		{"모자람", "enabled_tools = [\"ctr_search\"]\n", true},
 		{"정확히 프로필대로", "enabled_tools = [\"ctr_search\", \"ctr_fetch\", \"ctr_transform\", \"ctr_record_event\", \"ctr_session_summary\", \"ctr_export_events\", \"ctr_index\", \"ctr_fetch_and_index\"]\n", false},
 		{"사용자가 넓힘", "enabled_tools = [\"ctr_search\", \"ctr_fetch\", \"ctr_transform\", \"ctr_record_event\", \"ctr_session_summary\", \"ctr_export_events\", \"ctr_index\", \"ctr_fetch_and_index\", \"ctr_execute\"]\n", false},
+		// 빈 배열 — **부재와 반대 의미다.** 도구 0개 allowlist는 D91이 근거로 든 바로 그
+		// 형태이므로 부족으로 세야 한다. 이 행이 없으면 ToolsPresent를 물리 라인 존재가
+		// 아니라 값의 개수로 재는 회귀가 위 네 행 전부에서 같은 판정을 내 통과한다 —
+		// 그 회귀 뒤에는 이 파일에서 부족 경고가 조용히 사라진다.
+		{"빈 배열", "enabled_tools = []\n", true},
 		{"키 부재", "", false},
 	}
 	for _, c := range cases {
