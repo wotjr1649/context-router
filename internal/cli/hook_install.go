@@ -742,6 +742,18 @@ func runHookInstallCodex(user, noShadow, storeRootExplicit bool, storeRootRaw, p
 	if err := atomicWriteFile(path, merged); err != nil {
 		return errors.New("hook install: 설정 쓰기 실패")
 	}
+	// 등록 개수는 **파일에 실제로 남은 것**을 센다. 의도한 집합(등록 대상 + MCP 확정 시 가드)을
+	// 세면 미확정 실행에서 파일과 어긋난다: 설치 결합(D47·D32)은 **등록 방향에만** 걸려
+	// mergeCodexHooks가 withGuard=false에서 PreToolUse 키를 아예 건드리지 않으므로, 그 실행은
+	// 앞선 설치의 가드 그룹을 세지 않으면서 파일에는 남겨 둔다. 스캔이 실패하면 의도한 값으로
+	// 돌아간다 — 개수 하나 때문에 설치를 실패로 만들 이유가 없다.
+	registered := len(codexRegistrations)
+	if mcpConfirmed {
+		registered++
+	}
+	if n, _, sErr := scanCodexRegisteredHooks(path); sErr == nil {
+		registered = n
+	}
 	// 사유는 결과가 실은 것을 **우선**한다(D89) — install만 아는 이탈(게이트·점 표기)은
 	// probe가 알지 못하므로 probe의 사유로 덮으면 빈 문자열이 나간다. 결과가 사유를 싣지 않는
 	// 갈래에서만 probe를 읽는다: 구간 밖 충돌은 install이 상태만 내고 사유는 probe에만 있다.
@@ -750,7 +762,24 @@ func runHookInstallCodex(user, noShadow, storeRootExplicit bool, storeRootRaw, p
 	if cfgAnomaly == anomalyNone {
 		_, cfgAnomaly = probeCodexMCPBlock(cfgExisting)
 	}
+	// 입력이 파스되지 않으면 Codex는 그 파일의 **어떤** 설정도 읽지 못한다(D89 부수 결정 ②).
+	// 알리지 않으면 뒤따르는 "기입 완료 — Codex 재시작 시 반영"이 거짓이 된다: 기입은 실제로
+	// 일어나지만 반영은 파일을 고치기 전까지 일어나지 않는다. 지금까지 이 사실을 인쇄하는
+	// 자리는 doctor [16] 하나였는데 **파일을 바꾸는 것은 이 경로다.** 기입 정책은 바꾸지
+	// 않는다(설계 §1.2 — 이미 무효인 파일에 대한 정책은 무변경) — 알리기만 한다. 상태 보고
+	// **앞**에 두어 뒤따르는 문면 전체를 한정한다.
+	if !res.InputParses {
+		fmt.Fprintln(stdout, "hook install (codex): config.toml이 TOML로 파스되지 않습니다 — Codex가 이 파일의 모든 설정을 읽지 못하므로 아래 결과는 파일을 고치기 전까지 반영되지 않습니다")
+	}
 	reportCodexMCPState(stdout, res.State, cfgAnomaly)
+	// MCP 미확정인데 가드가 파일에 남아 있으면 위 "가드 등록 보류"만으로는 사용자가 거부 표면이
+	// 없다고 읽는다 — 이번 실행이 등록하지 않았다는 것과 앞선 등록이 그대로라는 것은 다른
+	// 사실이다. 판정은 개수로 한다: 미확정 실행의 병합은 codexRegistrations의 두 이벤트에만
+	// 우리 그룹 하나씩을 남기므로, 그보다 많으면 우리가 건드리지 않은 이벤트에 우리 그룹이
+	// 살아남은 것이고 install이 그 자리에 쓰는 이벤트는 가드뿐이다.
+	if !mcpConfirmed && registered > len(codexRegistrations) {
+		fmt.Fprintln(stdout, "hook install (codex): 다만 앞선 설치가 등록한 PreToolUse 가드 그룹은 hooks.json에 그대로 있습니다 — 이번 실행이 새로 등록하지 않았을 뿐 지우지도 않습니다(우리 그룹을 전부 지우려면 hook uninstall --codex)")
+	}
 	if res.State == mcpWritten {
 		// D81 — 승인 모드 키는 기입하지 않는다. 예전에는 관리 블록의 주석 한 줄로 권했으나
 		// 재직렬화가 주석을 지우므로(§3 표1) 파일에 남지 않는 안내는 안내가 아니다. 기입이
@@ -773,11 +802,7 @@ func runHookInstallCodex(user, noShadow, storeRootExplicit bool, storeRootRaw, p
 			fmt.Fprintln(stdout, "hook install (codex): 기존 args를 프로필로 해석하지 못해 args·enabled_tools를 그대로 두었습니다(command와 소유 표식만 갱신) — 프로필을 바꾸려면 --enable로 명시하세요")
 		}
 	}
-	n := len(codexRegistrations)
-	if mcpConfirmed {
-		n++
-	}
-	fmt.Fprintf(stdout, "hook install (codex): %d개 이벤트 등록 완료 — Codex에서 /hooks로 훅을 리뷰·신뢰해야 실행됩니다(정의 변경 시 재신뢰)\n", n)
+	fmt.Fprintf(stdout, "hook install (codex): %d개 이벤트 등록 완료 — Codex에서 /hooks로 훅을 리뷰·신뢰해야 실행됩니다(정의 변경 시 재신뢰)\n", registered)
 	return nil
 }
 

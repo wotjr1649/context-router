@@ -1589,3 +1589,108 @@ func TestHookInstallCodexGateReport(t *testing.T) {
 		t.Errorf("MCP 미확정인데 가드 그룹이 등록됐다:\n%s", hooks)
 	}
 }
+
+// TestHookInstallCodexUnparsableInput — 입력이 파스되지 않는 config.toml에 기입하면서 기입
+// 완료만 인쇄하면 그 문장이 거짓이다: Codex는 그 파일의 어떤 설정도 읽지 못하므로 재시작해도
+// 반영되지 않는다. 신호는 이미 결과에 실려 있고(D89 부수 결정 ②) 지금까지 doctor [16]만
+// 인쇄했는데, **파일을 실제로 바꾸는 것은 이 경로다.**
+func TestHookInstallCodexUnparsableInput(t *testing.T) {
+	home := isolateCodexHome(t)
+	// 같은 테이블 헤더 두 번 — 파서만 거부한다. codexManagedSpans는 우리 두 이름의 중복만
+	// 세므로 관리 테이블은 그대로 잡히고, 게이트는 계약상 !InputParses에서 작동하지 않는다.
+	src := "[a]\nx = 1\n\n[a]\ny = 2\n\n" + ctrTableFixture
+	writeCodexConfig(t, home, src)
+	// 픽스처가 실제로 그 갈래인지 먼저 못박는다 — 다른 상태로 흘러가면 아래 단정이 무엇을
+	// 쟀는지 알 수 없어진다(기입이 일어나지 않으면 거짓 문면 자체가 성립하지 않는다).
+	if v := codexRegistrationVerdict([]byte(src), "0.17.0"); v.InputParses || v.State != mcpWritten || !v.Changed {
+		t.Fatalf("픽스처가 '입력 무효 + 기입' 갈래가 아니다: inputParses=%v state=%d changed=%v",
+			v.InputParses, v.State, v.Changed)
+	}
+	var buf bytes.Buffer
+	if err := runHookInstallCodex(false, false, false, "", t.TempDir(), "0.17.0", nil, false, &buf); err != nil {
+		t.Fatalf("install 실패: %v", err)
+	}
+	out := buf.String()
+	if !strings.Contains(out, "TOML로 파스되지 않습니다") {
+		t.Errorf("입력 파스 실패를 알리지 않는다:\n%s", out)
+	}
+	// 기입 완료 문면과 **함께** 나가야 한다 — 신호를 내면서 기입 보고를 지우면 이 경로의
+	// 기입 정책이 바뀐 것이고 그것은 이 패치의 범위가 아니다(설계 §1.2 — 이미 무효인 파일에
+	// 대한 기입 정책은 무변경).
+	if !strings.Contains(out, "MCP 관리 테이블 기입 완료") {
+		t.Errorf("기입 보고가 사라졌다 — 이 패치는 기입 정책을 바꾸지 않는다:\n%s", out)
+	}
+}
+
+// TestHookInstallCodexParsableInputQuiet — 위 신호를 무조건 인쇄하는 구현은 정상 설치마다
+// 오보를 낸다. 긍정 단정만 두면 그 회귀가 조용히 통과한다.
+func TestHookInstallCodexParsableInputQuiet(t *testing.T) {
+	home := isolateCodexHome(t)
+	writeCodexConfig(t, home, ctrTableFixture)
+	var buf bytes.Buffer
+	if err := runHookInstallCodex(false, false, false, "", t.TempDir(), "0.17.0", nil, false, &buf); err != nil {
+		t.Fatalf("install 실패: %v", err)
+	}
+	if strings.Contains(buf.String(), "TOML로 파스되지 않습니다") {
+		t.Errorf("파스되는 입력에 파스 실패를 인쇄했다:\n%s", buf.String())
+	}
+}
+
+// TestHookInstallCodexUnconfirmedGuardStays — 설치 결합(D47·D32)은 **등록 방향에만** 걸린다:
+// MCP 미확정 실행은 가드를 새로 등록하지 않지만 앞선 설치가 등록한 가드 그룹을 지우지도
+// 않는다. 그 상태에서 "가드 등록 보류"와 **의도한** 등록 개수만 인쇄하면 문면이 파일과
+// 어긋나고, 사용자는 거부 표면이 없다고 읽는다. 형제 테스트(GateReport)는 갓 만든
+// hooks.json만 보므로 "보류"와 "그대로 둠"을 구별하지 못한다.
+func TestHookInstallCodexUnconfirmedGuardStays(t *testing.T) {
+	home := isolateCodexHome(t)
+	proj := t.TempDir()
+	writeCodexConfig(t, home, "")
+	var buf bytes.Buffer
+	if err := runHookInstallCodex(false, false, false, "", proj, "0.17.0", nil, false, &buf); err != nil {
+		t.Fatalf("1차 install 실패: %v", err)
+	}
+	path, pErr := codexHooksPath(false, proj)
+	if pErr != nil {
+		t.Fatalf("훅 경로 해석 실패: %v", pErr)
+	}
+	withGuard := len(codexRegistrations) + 1
+	if n, _, _ := scanCodexRegisteredHooks(path); n != withGuard {
+		t.Fatalf("1차가 가드를 등록하지 않았다 — 전제가 무너졌다: n=%d want %d", n, withGuard)
+	}
+	writeCodexConfig(t, home, codexGateFixture) // 게이트가 무는 형태 → mcpConfirmed=false
+	buf.Reset()
+	if err := runHookInstallCodex(false, false, false, "", proj, "0.17.0", nil, false, &buf); err != nil {
+		t.Fatalf("2차 install 실패: %v", err)
+	}
+	// **동작은 그대로다.** 이 패치가 고치는 것은 문면뿐이며, 가드를 지우는 방향은 정상
+	// 동작 중인 등록물에서 mcpConfirmed가 거짓이 되는 갈래(점 표기 이탈 등)의 보호를
+	// 조용히 끄므로 설계 결정이 필요하다.
+	if n, _, _ := scanCodexRegisteredHooks(path); n != withGuard {
+		t.Fatalf("가드가 사라졌다 — 이 패치는 동작을 바꾸지 않는다: n=%d want %d", n, withGuard)
+	}
+	out := buf.String()
+	if !strings.Contains(out, fmt.Sprintf("%d개 이벤트 등록 완료", withGuard)) {
+		t.Errorf("등록 개수가 파일에 남은 것과 어긋난다(want %d):\n%s", withGuard, out)
+	}
+	if !strings.Contains(out, "앞선 설치가 등록한 PreToolUse 가드 그룹") {
+		t.Errorf("남은 가드를 알리지 않는다:\n%s", out)
+	}
+}
+
+// TestHookInstallCodexUnconfirmedNoPriorGuard — 앞선 가드가 없으면 그 줄을 내지 않는다.
+// 긍정 단정만 두면 무조건 인쇄하는 구현이 통과하고, 가드가 없는 사용자에게 있다고 말한다.
+func TestHookInstallCodexUnconfirmedNoPriorGuard(t *testing.T) {
+	home := isolateCodexHome(t)
+	writeCodexConfig(t, home, codexGateFixture)
+	var buf bytes.Buffer
+	if err := runHookInstallCodex(false, false, false, "", t.TempDir(), "0.17.0", nil, false, &buf); err != nil {
+		t.Fatalf("install 실패: %v", err)
+	}
+	out := buf.String()
+	if strings.Contains(out, "앞선 설치가 등록한 PreToolUse 가드 그룹") {
+		t.Errorf("없는 가드를 남아 있다고 말했다:\n%s", out)
+	}
+	if !strings.Contains(out, fmt.Sprintf("%d개 이벤트 등록 완료", len(codexRegistrations))) {
+		t.Errorf("등록 개수가 파일에 남은 것과 어긋난다(want %d):\n%s", len(codexRegistrations), out)
+	}
+}
