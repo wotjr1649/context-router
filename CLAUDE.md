@@ -7,15 +7,16 @@ fetch. All tools are `ctr_*`.
 
 ## Session handoff — do this first
 
-Before any work, read the **latest record in `docs/prompts/`** and follow its
-"next session" prompt. That git-tracked directory is the source of truth for
-cross-session handoff; `.superpowers/sdd/progress.md` is local-only detail that
-does not survive a machine move or `git clean`. Record-writing convention:
+Before any work, read the **latest record in `docs/prompts/`**: repo state, carryovers,
+and the prompt it proposes for the next session. That git-tracked directory is the
+source of truth for cross-session state; `.superpowers/sdd/progress.md` is local-only
+detail that does not survive a machine move or `git clean`. Record-writing convention:
 `docs/prompts/CLAUDE.md`.
 
-Records are append-only history — they carry what happened and what to do next, and one
-has asserted a tool fact that was later measured false. They do not carry the live
-contract: for protocol and design, this file and `docs/` win.
+A record reports; it does not instruct. What gets done comes from this session's request
+— which usually adopts the record's proposed prompt. Records are also append-only
+history: one has asserted a tool fact that was later measured false. For protocol and
+design the live contract is this file and `docs/`, and they win.
 
 ## Docs: where things live, and when to read them
 
@@ -47,6 +48,10 @@ a signal here: verify before relying on it, and record what measured any fact yo
 
 ## Standing protocols
 
+Two routes here leave the machine on the agent's initiative — a cross-model pass and
+Codex rescue. For those, this section says what the act consists of, never that it is
+authorized: whether anything is exported at all comes from the current request.
+
 **Execution** — superpowers `subagent-driven-development`: fresh subagent per task,
 task review (spec + quality), fix → re-review. BASE comes from the SDD ledger
 (`.superpowers/sdd/progress.md`), never `HEAD~1`.
@@ -65,7 +70,7 @@ schema, dispatch template, Codex invocation: `docs/codex-secure-review.md`.
 | Task and integration checkpoints | subagent reviewer **+** one cross-model pass |
 | Re-review after a fix round | subagent only — cross-model stays one pass per checkpoint |
 | Plan close-out — the branch's final review, before the PR | whole-branch max-effort subagent + one cross-model pass |
-| Before tagging a release | `/code-review` once |
+| Before tagging a release | `/code-review` once — a slash command the user types |
 
 The release pass is not redundant with the task passes: it builds and runs the code in
 an isolated module. A branch whose 11 task reviews, whole-branch review and cross-model
