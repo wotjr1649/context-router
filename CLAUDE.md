@@ -13,6 +13,10 @@ cross-session handoff; `.superpowers/sdd/progress.md` is local-only detail that
 does not survive a machine move or `git clean`. Record-writing convention:
 `docs/prompts/CLAUDE.md`.
 
+Records are append-only history — they carry what happened and what to do next, and one
+has asserted a tool fact that was later measured false. They do not carry the live
+contract: for protocol and design, this file and `docs/` win.
+
 ## Docs: where things live, and when to read them
 
 Nothing here is auto-loaded — read on demand. Three tiers, matching the ADR/KEP/RFC
@@ -36,46 +40,59 @@ industry split; do not conflate them:
   one-off and auxiliary specs, implementation plans (lowercase paths).
 - `docs/prompts/` — session handoff records (own CLAUDE.md, append-only).
 
+**Writing into these docs.** Review findings in a spec's audit-record or threat-model
+section: record the decision and its disposition at concept level, and keep the vector
+list compressed — do not re-enumerate the originals. A claim without its measurement is
+a signal here: verify before relying on it, and record what measured any fact you write.
+
 ## Standing protocols
 
-- **Stuck** (implementer BLOCKED / unclear fix): the paths here are Codex rescue for
-  design and root-cause, context7 for library facts. A new topic starts a new thread.
-- **Reviews — task/integration/final (user directive 2026-07-18)**: every review
-  checkpoint runs a subagent reviewer **plus** one cross-model pass. Re-reviews after
-  fix rounds are subagent-only — Codex stays at max one pass per checkpoint.
-- **Codex invocation (measured, session-48/49)**: `review --base <ref>` is blocked on
-  this host — two sessions cancelled it at ~50 min. Use `task --background
-  "<prompt>"` instead: it returns a job id immediately, takes the prompt as a
-  positional argument (~32KB), and has no local file reader — point it at GitHub
-  blob URLs. That route returned zero false positives on the last plan review.
-- **Pre-release deep review (session-46 evidence)**: before tagging a release, run
-  `/code-review max` once. A branch that 11 per-task reviews, one whole-branch review
-  and one Codex pass had all judged clean still yielded five shipping-blocker
-  regressions and two config-corruption paths. The difference is agent count and
-  *execution* verification — that pass actually built and ran the code in an isolated
-  module. Task-level reviews being clean does not substitute for it.
-- **Cross-model review (controller-safe)**: the controller never reads the Codex
-  output directly. One opus subagent consumes it in its own context, checks it
-  against the diff, and integrates both reviews into a fixed JSON findings schema;
-  the controller reads only that low-density JSON and points the fix subagent at the
-  file. Neutral engineering wording throughout. Schema, dispatch template and why the
-  earlier hook approach was dropped: `docs/codex-secure-review.md`.
-- **Execution**: superpowers `subagent-driven-development` — fresh subagent per task,
-  task review (spec + quality), fix → re-review. BASE from the ledger, never `HEAD~1`.
-- **Plan close-out (branch to PR)**: when a plan's feat branch is done, run one final
-  whole-branch double review (max-effort subagent + one Codex pass), fix
-  the merged findings, and only then open the GitHub PR — the PR shows reviewed work.
-- **Subagent hygiene**: response-splitting discipline (no whole-file rewrites; build
-  long test data with `strings.Repeat`/testdata). Dense tasks get split (e.g. 7a/7b).
-  Go tests run with `-p 1`; respect the memory-capped test rule.
-- **Secret canaries in tests**: runtime split literals (`"xox"+"b-..."`) so the source
-  bytes never hold a contiguous token — avoids GitHub push-protection false positives.
-- **Model and response prose (user decision 2026-07-19)**: sessions here stay on Fable.
-  Keep security prose in responses minimal and abstract — discuss concepts and design
-  normally, but do not enumerate sensitive categories or concrete attack notation, and
-  do not repeatedly analyze or explain the safety layer itself (that re-analysis is
-  itself a trigger). When writing review findings into specs (audit-record or
-  threat-model sections), record the decision and disposition at concept level and
-  compress the vector list; never re-enumerate the original vectors. Fallback if it
-  still trips: put security-sensitive tasks on Opus
-  and return to Fable for docs/instrumentation tasks.
+**Execution** — superpowers `subagent-driven-development`: fresh subagent per task,
+task review (spec + quality), fix → re-review. BASE comes from the SDD ledger
+(`.superpowers/sdd/progress.md`), never `HEAD~1`.
+
+**Gates at the end of every task** — `go build` · `go vet` · the full test suite with
+`-count=1` · `gofumpt -l .` (no output) · `golangci-lint run`. Write all five into a
+plan's own verification steps: a reviewer reads the diff and is structurally blind to
+them, and omitting two of them once put two blockers into a release. Never drop one to
+make a task pass.
+
+**Review ladder.** Checkpoint procedure: the `cross-model-review` skill. Findings
+schema, dispatch template, Codex invocation: `docs/codex-secure-review.md`.
+
+| When | What runs |
+|---|---|
+| Task and integration checkpoints | subagent reviewer **+** one cross-model pass |
+| Re-review after a fix round | subagent only — cross-model stays one pass per checkpoint |
+| Plan close-out — the branch's final review, before the PR | whole-branch max-effort subagent + one cross-model pass |
+| Before tagging a release | `/code-review` once |
+
+The release pass is not redundant with the task passes: it builds and runs the code in
+an isolated module. A branch whose 11 task reviews, whole-branch review and cross-model
+pass had all been judged clean still yielded five shipping blockers and two
+config-corruption paths. Clean task reviews do not substitute for it.
+
+The controller never reads raw cross-model output: a subagent verifies each claim
+against the diff and returns the fixed JSON findings schema, and the controller drives
+fixes from that file.
+
+**Windows CI flakes are real** — clustered in `cmd/context-router`, `internal/exec`,
+`internal/hook` (time, locks, child processes); a docs-only commit has failed a windows
+run. Decision rule: a red windows run is a regression only if the failing package is one
+this change touched. The observed flake names live in the handoff records, not here —
+they change.
+
+**Stuck** (implementer BLOCKED / unclear fix):
+
+- design, root cause, or a completeness question ("the helper is fixed — what about its
+  callers?") → Codex rescue; a new topic starts a new thread.
+- library / API / flag facts → the installed version's own source first: `go doc <pkg>
+  <sym>`, then the module cache (`go env GOMODCACHE`); index it with this project's own
+  tools rather than reading a large dependency into context. Web only for what source
+  cannot answer — release notes, upstream issues.
+
+**Subagent hygiene** — no whole-file rewrites; build long test data with
+`strings.Repeat` or testdata; split dense tasks (7a/7b).
+
+**Secret canaries in tests** — runtime split literals (`"xox"+"b-..."`) so the source
+bytes never hold a contiguous token; avoids GitHub push-protection false positives.

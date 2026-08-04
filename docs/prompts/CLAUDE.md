@@ -17,7 +17,7 @@ finished**, so the next session resumes without context loss.
 
 ## Each record must contain
 
-1. Session number, span, model/effort.
+1. Session number, span.
 2. **Starting prompt (verbatim)** — keep the original language; do not translate a quote.
 3. **What was done** — commits / branches / PR / key decisions (Dnn).
 4. **Current repo state** — `main` HEAD, open PRs, active branch, base for next work.

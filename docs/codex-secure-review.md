@@ -105,9 +105,12 @@ prompt: |
   - Task brief (requirements): <brief path>
   - Diff package: <review-package path>
   - Codex review: run `node "<companion>" result <job-id>` to read it in YOUR
-    OWN context. If it answers "No job found", read the stored job record and its
-    log file directly — that fallback has worked when the registry lookup failed.
-    Judge liveness by the log file's mtime, not by `status`: a killed job can keep
+    OWN context. **A job that is still running also answers "No job found"** — that
+    is not a failure, so wait and retry before treating it as one (a short document
+    review finished in about two minutes, measured 2026-08-05). If it still answers
+    that once the job should have finished, read the stored job record and its log
+    file directly — that fallback has worked when the registry lookup failed. Judge
+    liveness by the log file's mtime, not by `status`: a killed job can keep
     reporting `running`.
 
   Do:
