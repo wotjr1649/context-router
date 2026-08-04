@@ -29,9 +29,23 @@ output is low-density by construction.
 
 ## The pattern (no hook, one review subagent)
 
-1. Controller starts Codex in the background from the main session:
-   `node "<companion>" review --background --base <BASE>` — returns a job id.
-   The controller never calls `result` itself.
+1. Controller starts Codex in the background from the main session.
+   **`review --base <ref>` is blocked on this host** — two sessions cancelled it at
+   ~50 min, and adding `--background` still streams in the foreground instead of
+   returning a job id. Use `task --background "<prompt>"`: it returns a job id
+   immediately and takes the prompt as a positional argument: the shell splits that
+   argument and the companion rejoins the tokens with single spaces, so whitespace
+   structure is not preserved and the command line caps near 32KB. **`--prompt-file`
+   is absent from the help text but IS registered in the parser** and reads the file
+   verbatim — use it when the prompt is large or its exact characters matter
+   (measured 2026-08-05 against companion 1.0.6, parser line 764).
+   **Launch it from the Bash tool** — the job registry depends on
+   `CLAUDE_PLUGIN_DATA`, which the PowerShell tool does not carry, and never pipe the
+   launcher into another command (that orphans the job). The controller never calls
+   `result` itself.
+   - The Codex side of `task` has **no local file reader**. Inline the code excerpts in
+     the prompt; past the command-line ceiling, point it at blob URLs of the public
+     repo instead. The last plan review ran that way with zero false positives.
 2. Controller dispatches **one review subagent (opus)**. It:
    - reviews the diff package itself, in neutral framing,
    - reads the Codex review in its own context (`result <job-id>`),
@@ -43,7 +57,9 @@ output is low-density by construction.
 3. Controller reads the JSON (low-density) and dispatches a fix subagent pointed
    at the JSON file as its spec ("fix every critical + important").
 4. Re-review after a fix round = the review subagent again (subagent-only; Codex
-   stays one pass per checkpoint — usage guard).
+   stays one pass per checkpoint — usage guard). **A pass that failed or was lost
+   does not count as the pass**: one such job turned out to be carrying a real
+   important finding.
 
 Fix / re-review subagents are opus and may read raw detail from files safely.
 
@@ -89,7 +105,10 @@ prompt: |
   - Task brief (requirements): <brief path>
   - Diff package: <review-package path>
   - Codex review: run `node "<companion>" result <job-id>` to read it in YOUR
-    OWN context. If not ready, poll `status <job-id>`, then result.
+    OWN context. If it answers "No job found", read the stored job record and its
+    log file directly — that fallback has worked when the registry lookup failed.
+    Judge liveness by the log file's mtime, not by `status`: a killed job can keep
+    reporting `running`.
 
   Do:
   1. Review the diff yourself against the brief.
@@ -111,13 +130,19 @@ prompt: |
 Prefer neutral `review` for routine checkpoints; avoid `adversarial-review`. If a
 focused check is genuinely needed, state the focus in neutral engineering terms
 (a contract to verify, an input class to exercise) — never an exploit narrative —
-and keep it in-diff (an out-of-sandbox focus has no turn-timeout and hangs; see
-global CLAUDE.md §5).
+and keep it in-diff: an out-of-sandbox focus has no turn-timeout and hangs the
+foreground. (The boundary question — whether a checkpoint may run at all — is in the
+host adapter and the `cross-model-review` skill, not here.)
 
 ## Toolchain notes
 
 - Companion: glob `~/.claude/plugins/cache/**/scripts/codex-companion.mjs`
-  (version dir changes on update).
+  (version dir changes on update). Measured against companion **1.0.6** / Codex CLI
+  **0.146.0** — `task`, `--background`, `status`, `result`, `cancel` are the
+  companion's surface, not the CLI's, so they move on plugin updates.
+- Teardown: `cancel` clears the ledger but leaves the process running, and the killed
+  job's record can keep showing `running`. Kill the tree separately with
+  `taskkill /PID <pid> /T /F` from PowerShell (Git Bash rewrites `/PID` as a path).
 - `review` / `result` / `adversarial-review` are `disable-model-invocation`-gated
   → run via Bash `node "<companion>" <subcmd>`, not the Skill tool.
 - **No PreToolUse guard is registered.** The protocol is prompt-and-schema
