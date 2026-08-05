@@ -1527,3 +1527,132 @@ func TestMCPProfileHelpers(t *testing.T) {
 		}
 	}
 }
+
+// mcpOriginal — 세 테스트가 공유하는 "사용자가 손으로 쓴 원본". 우리 항목이 없어야 install이
+// 실제로 바이트를 바꾼다.
+const mcpOriginal = "{\n  \"mcpServers\": {\n    \"other\": {\"command\": \"x\"}\n  }\n}\n"
+
+// TestMCPBackupSingleSlot — D95. 기입한 실행에만 .bak이 생기고, 2회차 무변경 install이
+// 그 슬롯을 소모하지 않는다. 긍정 단정만 두면 매 실행 백업하는 구현이 통과해 단일 슬롯이
+// 원본 대신 "직전에 우리가 쓴 것"으로 채워진다.
+func TestMCPBackupSingleSlot(t *testing.T) {
+	proj := t.TempDir()
+	mcpPath := mcpConfigPath(proj)
+	if err := os.WriteFile(mcpPath, []byte(mcpOriginal), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	// 실제 시그니처는 7인자다(hook_install.go:547). 기존 호출부와 같은 형태.
+	if err := runHookInstall(nil, t.TempDir(), "", false, proj, "0.18.0", &out); err != nil {
+		t.Fatalf("1차 install: %v", err)
+	}
+	bak, err := os.ReadFile(mcpPath + ".bak")
+	if err != nil {
+		t.Fatalf("1차 install이 백업을 남기지 않았다: %v", err)
+	}
+	if string(bak) != mcpOriginal {
+		t.Errorf("백업이 원본이 아니다:\n%s", bak)
+	}
+	after1, _ := os.ReadFile(mcpPath)
+	out.Reset()
+	if err := runHookInstall(nil, t.TempDir(), "", false, proj, "0.18.0", &out); err != nil {
+		t.Fatalf("2차 install: %v", err)
+	}
+	after2, _ := os.ReadFile(mcpPath)
+	if !bytes.Equal(after1, after2) {
+		t.Fatalf("2차 install이 파일을 바꿨다 — 멱등 전제가 무너졌다")
+	}
+	bak2, _ := os.ReadFile(mcpPath + ".bak")
+	if string(bak2) != mcpOriginal {
+		t.Errorf("2차 무변경 install이 백업 슬롯을 소모했다 — 원본을 잃는다:\n%s", bak2)
+	}
+}
+
+// TestMCPBackupDoctorFix — 기입 자리 둘째(cli.go). --fix도 같은 슬롯을 지나야 한다.
+// 여기가 빠지면 "우리 판정이 틀렸을 때의 복구 수단"이 --fix 경로에서만 없다.
+func TestMCPBackupDoctorFix(t *testing.T) {
+	isolateCodexHome(t) // config.toml 갈래가 호스트를 보지 않게 격리한다
+	proj := t.TempDir()
+	mcpPath := mcpConfigPath(proj)
+	// --fix는 등록을 만들지 않는다 — 우리 소유 표식이 있는 옛 버전 등록물이 있어야 기입한다.
+	original := "{\n  \"mcpServers\": {\n    \"" + ctrMCPServerName + "\": {\"command\": \"" +
+		hookBinaryName + "\", \"__ctrManaged\": \"" + hookMarker("0.17.0") + "\"}\n  }\n}\n"
+	if err := os.WriteFile(mcpPath, []byte(original), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := doctorOut(t, proj, true); err != nil {
+		t.Fatalf("doctor --fix: %v", err)
+	}
+	bak, err := os.ReadFile(mcpPath + ".bak")
+	if err != nil {
+		t.Fatalf("--fix가 백업을 남기지 않았다: %v", err)
+	}
+	if string(bak) != original {
+		t.Errorf("백업이 원본이 아니다:\n%s", bak)
+	}
+	after, _ := os.ReadFile(mcpPath)
+	if string(after) == original {
+		t.Errorf("--fix가 기입하지 않았다 — 이 픽스처가 기입 갈래를 타지 않는다:\n%s", after)
+	}
+}
+
+// TestMCPBackupFailureBlocksWrite — 백업이 실패하면 **기입하지 않는다**(config.toml 갈래와 같은
+// 순서). .bak 자리에 디렉터리를 놓아 atomicWriteFile을 실패시킨다 — 파일 권한은 Windows에서
+// 신뢰할 수 없지만 "같은 이름의 디렉터리"는 어느 OS에서도 쓰기가 실패한다.
+func TestMCPBackupFailureBlocksWrite(t *testing.T) {
+	proj := t.TempDir()
+	mcpPath := mcpConfigPath(proj)
+	if err := os.WriteFile(mcpPath, []byte(mcpOriginal), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(mcpPath+".bak", 0o700); err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	if err := runHookInstall(nil, t.TempDir(), "", false, proj, "0.18.0", &out); err != nil {
+		t.Fatalf("install: %v", err) // 백업 실패는 훅 설치를 중단시키지 않는다
+	}
+	after, _ := os.ReadFile(mcpPath)
+	if string(after) != mcpOriginal {
+		t.Errorf("백업이 실패했는데 기입했다:\n%s", after)
+	}
+	if !strings.Contains(out.String(), "백업") {
+		t.Errorf("백업 실패 사유를 내지 않았다:\n%s", out.String())
+	}
+}
+
+// TestMCPUninstallDoesNotBackup — 스펙 §0 D95: uninstall 자리는 백업 대상이 **아니다**
+// (제거는 되돌릴 대상이 아니라 되돌림 자체다). 대칭으로 오해해 여기에도 백업을 걸면 install이
+// 남긴 원본 슬롯을 제거가 덮어 원본을 잃는다 — 만들지도, 덮지도 않는다는 것을 양쪽으로 잰다.
+func TestMCPUninstallDoesNotBackup(t *testing.T) {
+	proj := t.TempDir()
+	mcpPath := mcpConfigPath(proj)
+	if err := os.WriteFile(mcpPath, []byte(mcpOriginal), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	if err := runHookInstall(nil, t.TempDir(), "", false, proj, "0.18.0", &out); err != nil {
+		t.Fatalf("install: %v", err)
+	}
+	bakBefore, err := os.ReadFile(mcpPath + ".bak")
+	if err != nil {
+		t.Fatalf("install이 백업을 남기지 않았다: %v", err)
+	}
+	out.Reset()
+	// runHookUninstall(args []string, projectRoot string, stdout io.Writer) error — 3인자다
+	// (hook_install.go). args는 그 함수가 직접 파싱하므로 nil이 기본 스코프다.
+	if err := runHookUninstall(nil, proj, &out); err != nil {
+		t.Fatalf("uninstall: %v", err)
+	}
+	after, _ := os.ReadFile(mcpPath)
+	if bytes.Contains(after, []byte(ctrMCPServerName)) {
+		t.Fatalf("uninstall이 우리 항목을 지우지 않았다 — 기입 갈래를 타지 않는다:\n%s", after)
+	}
+	bakAfter, err := os.ReadFile(mcpPath + ".bak")
+	if err != nil {
+		t.Fatalf("uninstall이 기존 .bak을 지웠다: %v", err)
+	}
+	if !bytes.Equal(bakAfter, bakBefore) {
+		t.Errorf("uninstall이 백업 슬롯을 덮었다 — 원본을 잃는다:\n%s", bakAfter)
+	}
+}

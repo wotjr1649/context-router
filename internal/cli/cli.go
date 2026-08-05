@@ -2272,6 +2272,10 @@ func doctorFixRegistrations(w io.Writer, projectRoot, version string) {
 			fmt.Fprintf(w, "[20] fix: %q 이름에 우리가 소유하지 않은 항목이 있어 .mcp.json을 그대로 두었습니다\n", ctrMCPServerName)
 		} else if bytes.Equal(data, merged) {
 			fmt.Fprintln(w, "[20] fix: .mcp.json은 이미 현재 버전입니다 — 무변경")
+		} else if bErr := backupConfigFile(mcpPath, data); bErr != nil {
+			// config.toml 갈래(아래)와 같은 순서다 — 무변경 판정 → 백업 → 기입. 백업이
+			// 실패하면 기입하지 않는다(D95).
+			fmt.Fprintln(w, "[20] fix: .mcp.json 백업 실패 — 기입하지 않았습니다")
 		} else if wErr := atomicWriteFile(mcpPath, merged); wErr != nil {
 			fmt.Fprintln(w, "[20] fix: .mcp.json 기록 실패")
 		} else {
@@ -2300,7 +2304,7 @@ func doctorFixRegistrations(w io.Writer, projectRoot, version string) {
 		case !v.Changed:
 			fmt.Fprintln(w, "[20] fix: config.toml은 이미 현재 형식·버전입니다 — 무변경")
 		default:
-			if bErr := backupCodexConfig(cfgPath, data); bErr != nil {
+			if bErr := backupConfigFile(cfgPath, data); bErr != nil {
 				fmt.Fprintln(w, "[20] fix: config.toml 백업 실패 — 기입하지 않았습니다")
 			} else if wErr := atomicWriteFile(cfgPath, v.Out); wErr != nil {
 				fmt.Fprintln(w, "[20] fix: config.toml 기록 실패")
