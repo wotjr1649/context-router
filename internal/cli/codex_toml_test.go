@@ -2305,3 +2305,140 @@ func TestCodexInlineMarkerSpliceCRLFPreserved(t *testing.T) {
 		})
 	}
 }
+
+// TestCodexInlineOneLineStringStaysInLine — 한 줄 문자열 토큰은 codexEntryRaw의 **조각 경계를
+// 넘지 못한다.** 넘게 두면 줄 끝까지 닫히지 않은 문자열이 다음 줄의 따옴표와 한 토큰으로
+// 융합되고, 그 값 구간을 스플라이스하면 **사이의 물리 라인이 통째로 지워진다.**
+// 실측(교차모델 C1): 아래 첫 픽스처에서 이 릴리스는 KEEPME 줄을 지웠고 base(128a727)는
+// 보존했다 — 이 릴리스가 들인 회귀다. D89 게이트는 구조적으로 못 잡는다: 입력이 무효 TOML이라
+// 비대칭 계약이 통과시키고 오히려 산출 쪽이 유효해진다.
+//
+// TOML은 한 줄 문자열 안의 줄바꿈을 금지하므로 그 융합은 언제나 오독이고, 열거가 실패하면
+// 소비자가 원문 바이트를 그대로 옮긴다. **여러 줄 문자열은 넘어도 된다** — 재기준선 행 6이
+// 여러 줄 값의 제자리 갱신을 요구하며 TestCodexMultilineInlineMarkerUpdates가 그것을 잡는다.
+func TestCodexInlineOneLineStringStaysInLine(t *testing.T) {
+	const head = "[mcp_servers.ctr]\ncommand = \"context-router\"\n"
+	for _, c := range []struct{ name, src string }{
+		{"값 자리 큰따옴표", head + "env = { CTR_MANAGED = \"old\nKEEPME\"\n}\n"},
+		{"값 자리 홑따옴표", head + "env = { CTR_MANAGED = 'old\nKEEPME'\n}\n"},
+		{"키 자리", head + "env = { \"old\nKEEPME\" = 1\n}\n"},
+		{"표식이 아닌 키", head + "env = { OTHER = \"old\nKEEPME\"\n}\n"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			in := []byte(c.src)
+			res := installCodexConfigBlock(in, codexInstallRequest{Marker: hookMarker("0.18.0")})
+			// 사용자 바이트가 하나도 바뀌지 않아야 한다 — 사라진 줄을 부분 검사로 찾으면
+			// "표식만 끼워 넣고 나머지는 그대로"인 회귀가 통과한다.
+			if !bytes.Equal(res.Out, in) {
+				t.Errorf("사용자 바이트가 바뀌었다:\n입력: %q\n산출: %q", in, res.Out)
+			}
+			// 무변경으로 굳는 이유를 사용자에게 알려야 한다(D85).
+			if res.Anomaly == anomalyNone {
+				t.Errorf("무변경인데 사유가 없다: state=%v", res.State)
+			}
+		})
+	}
+}
+
+// TestCodexEntryRawCutsCommentAfterMultilineClose — 여러 줄 문자열이 **닫히는 그 줄**의 후행
+// 주석은 진짜 주석이므로 잘라야 한다. 줄 머리 상태만 보면 그 주석이 joined에 남아 값 구간
+// 안으로 들어오고, 스플라이스가 그 주석과 뒤따르는 줄바꿈을 함께 먹는다.
+// 실측(교차모델 C2): 아래 픽스처는 **유효 TOML**이라 게이트 대상이 아니며, base(128a727)는
+// 그 줄을 원문 그대로 보존했다 — 이 릴리스가 들인 회귀다. codexEntryRaw의 종전 주석이 적던
+// "그 자리는 언제나 닫는 중괄호 뒤"라는 단정이 이 입력으로 반증된다.
+func TestCodexEntryRawCutsCommentAfterMultilineClose(t *testing.T) {
+	src := "[mcp_servers.ctr]\ncommand = \"context-router\"\nenv = { A = \"\"\"\nx\n\"\"\", CTR_MANAGED = \"old\" # keep\n}\n"
+	lines := splitLinesKeepEnds([]byte(src))
+	joined, _ := codexEntryRaw(lines, [2]int{2, 5})
+	if strings.Contains(joined, "# keep") {
+		t.Errorf("닫는 그 줄의 진짜 주석이 값으로 남았다: %q", joined)
+	}
+	if !strings.Contains(joined, "x") {
+		t.Errorf("여러 줄 문자열 내용이 사라졌다: %q", joined)
+	}
+	res := installCodexConfigBlock([]byte(src), codexInstallRequest{Marker: hookMarker("0.18.0")})
+	if !strings.Contains(string(res.Out), "# keep\n}") {
+		t.Errorf("주석과 그 줄의 줄바꿈이 지워졌다:\n%q", res.Out)
+	}
+	if !strings.Contains(string(res.Out), `CTR_MANAGED = "`+hookMarker("0.18.0")+`"`) {
+		t.Errorf("표식이 현재 값으로 갱신되지 않았다:\n%q", res.Out)
+	}
+	if !codexTOMLParses(res.Out) {
+		t.Errorf("산출이 파스되지 않는다:\n%s", res.Out)
+	}
+}
+
+// TestTomlUnquoteKeyOnePair — 키 표기의 따옴표는 **한 쌍만** 벗긴다. 양끝을 전부 벗기면
+// TOML이 별개 키로 읽는 표기가 우리 표식과 같아진다.
+func TestTomlUnquoteKeyOnePair(t *testing.T) {
+	for _, c := range []struct{ in, want string }{
+		{"CTR_MANAGED", "CTR_MANAGED"},
+		{`"CTR_MANAGED"`, "CTR_MANAGED"},
+		{`'CTR_MANAGED'`, "CTR_MANAGED"},
+		{`'"CTR_MANAGED"'`, `"CTR_MANAGED"`}, // 별개 키다 — 한 쌍만 벗긴다
+		{`"'CTR_MANAGED'"`, `'CTR_MANAGED'`},
+		{`""CTR_MANAGED""`, `"CTR_MANAGED"`},
+		{`"CTR_MANAGED'`, `"CTR_MANAGED'`}, // 짝이 다르면 벗기지 않는다
+		{`"`, `"`},
+		{"", ""},
+	} {
+		if got := tomlUnquoteKey(c.in); got != c.want {
+			t.Errorf("tomlUnquoteKey(%q)=%q want %q", c.in, got, c.want)
+		}
+	}
+}
+
+// TestCodexInlineDoubleQuotedKeyIsNotMarker — 단위 테스트만 두면 호출부가 strings.Trim에 남아
+// 있어도 초록이므로 **설치 수준**으로 결속한다. 홑따옴표 안의 큰따옴표 표기는 TOML에서
+// 따옴표까지 포함한 별개 키이고, 그것을 우리 표식으로 읽으면 사용자 값을 덮어쓴다.
+// 실측(교차모델 C3): HEAD는 userval을 표식으로 덮어썼고 base(128a727)는 표식을 따로 삽입하고
+// 값을 보존했다 — 새 호출부 둘이 들인 회귀다.
+func TestCodexInlineDoubleQuotedKeyIsNotMarker(t *testing.T) {
+	src := "[mcp_servers.ctr]\ncommand = \"context-router\"\nenv = { '\"CTR_MANAGED\"' = \"userval\" }\n"
+	res := installCodexConfigBlock([]byte(src), codexInstallRequest{Marker: hookMarker("0.18.0")})
+	if !strings.Contains(string(res.Out), `'"CTR_MANAGED"' = "userval"`) {
+		t.Errorf("사용자 값이 표식으로 덮어써졌다:\n%q", res.Out)
+	}
+	if !strings.Contains(string(res.Out), `CTR_MANAGED = "`+hookMarker("0.18.0")+`"`) {
+		t.Errorf("우리 표식이 따로 서지 않았다:\n%q", res.Out)
+	}
+	if !codexTOMLParses(res.Out) {
+		t.Errorf("산출이 파스되지 않는다:\n%s", res.Out)
+	}
+	again := installCodexConfigBlock(res.Out, codexInstallRequest{Marker: hookMarker("0.18.0")})
+	if !bytes.Equal(again.Out, res.Out) {
+		t.Errorf("2회차가 바이트 동일하지 않다:\n1: %q\n2: %q", res.Out, again.Out)
+	}
+}
+
+// TestCodexInlineValueSpanCommentIsRemoved — **계약 고정(회귀 방지가 아니라 표류 방지)**.
+// 표식 값이 여러 물리 라인에 걸치면 그 사이의 후행 주석은 값과 함께 사라진다. 소유자 판정:
+// 관리 키의 값에 붙은 주석이므로 D88이 이미 보존 대상에서 뺀 것과 같은 부류이고, 고치지
+// 않는다(스펙 §2.1 P3 예외 항 · codex_toml.go 파일 머리 주석).
+//
+// base(128a727)는 그 줄을 통째로 보존했으므로 이 픽스처는 base에서 적색이다 — 무는 단정이다.
+// **손실의 폭도 함께 못박는다**: 값 구간 밖의 주석(앞줄 독립 · 엔트리 뒤 후행)은 살아야 한다.
+// 그 둘이 없으면 "주석을 더 넓게 먹는" 회귀가 이 테스트를 통과한다.
+func TestCodexInlineValueSpanCommentIsRemoved(t *testing.T) {
+	src := "[mcp_servers.ctr]\ncommand = \"context-router\"\n# 앞줄\nenv = { CTR_MANAGED = [1, # note\n2] } # 뒤\n"
+	res := installCodexConfigBlock([]byte(src), codexInstallRequest{Marker: hookMarker("0.18.0")})
+	out := string(res.Out)
+	if strings.Contains(out, "# note") {
+		t.Errorf("값 구간 안의 주석이 남았다 — 계약이 바뀌었다면 스펙 §2.1 P3와 파일 머리 주석도 함께 고쳐라:\n%q", out)
+	}
+	for _, keep := range []string{"# 앞줄", "# 뒤"} {
+		if !strings.Contains(out, keep) {
+			t.Errorf("값 구간 **밖**의 주석 %q가 사라졌다 — 손실 폭이 넓어졌다:\n%q", keep, out)
+		}
+	}
+	if !strings.Contains(out, `CTR_MANAGED = "`+hookMarker("0.18.0")+`"`) {
+		t.Errorf("표식이 현재 값으로 갱신되지 않았다:\n%q", out)
+	}
+	if !codexTOMLParses(res.Out) {
+		t.Errorf("산출이 파스되지 않는다:\n%s", res.Out)
+	}
+	again := installCodexConfigBlock(res.Out, codexInstallRequest{Marker: hookMarker("0.18.0")})
+	if !bytes.Equal(again.Out, res.Out) {
+		t.Errorf("2회차가 바이트 동일하지 않다:\n1: %q\n2: %q", res.Out, again.Out)
+	}
+}
