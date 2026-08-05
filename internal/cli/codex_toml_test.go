@@ -1781,3 +1781,74 @@ func TestTomlScannerInlineOpenAtEOF(t *testing.T) {
 		t.Errorf("사유 문면이 인라인 테이블을 말하지 않는다: %q", r)
 	}
 }
+
+// TestCodexEntryRawRoundTrip — 되사상은 모든 줄 종결자 조합에서 옳아야 한다. 각 라인의
+// 보존 구간이 [0, 주석위치)라는 접두 슬라이스이므로 라인당 시작 오프셋 하나면 충분하고,
+// CRLF·마지막 줄 종결자 없음이 전부 접미 절단이라 자동으로 옳다(스펙 §0 D92 계약 2).
+// **픽스처는 전부 헤더 줄로 시작한다** — 생산 경로에서 codexEntries가 sp.start+1부터 세므로
+// 엔트리 첫 줄은 파일 0행이 될 수 없고, 그래서 codexEntryRaw가 접두를 떼지 않아도 옳다.
+// 선두 BOM 케이스가 그 사실을 잰다(BOM은 0행 선두에만 존재하고 그 줄은 헤더다).
+// 스펙 §1.3 선행 게이트 1이 요구하는 축이 이 표다: 줄 종결자 조합 · 선두 BOM 유무 ·
+// 들여쓰기 유무.
+func TestCodexEntryRawRoundTrip(t *testing.T) {
+	const head = "[mcp_servers.ctr]\n"
+	for _, c := range []struct{ name, src string }{
+		{"LF", head + "env = { A = \"a b\",\n  B = \"c\" }\n"},
+		{"CRLF", "[mcp_servers.ctr]\r\nenv = { A = \"a b\",\r\n  B = \"c\" }\r\n"},
+		{"마지막 줄 종결자 없음", head + "env = { A = \"a b\",\n  B = \"c\" }"},
+		{"후행 주석", head + "env = { A = \"a b\", # 메모\n  B = \"c\" } # 끝\n"},
+		{"선두 BOM", "\xEF\xBB\xBF" + head + "env = { A = \"a b\",\n  B = \"c\" }\n"},
+		{"들여쓰기", head + "  env = { A = \"a b\",\n\tB = \"c\" }\n"},
+		{"BOM + CRLF + 들여쓰기", "\xEF\xBB\xBF[mcp_servers.ctr]\r\n  env = { A = \"a b\",\r\n\tB = \"c\" }\r\n"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			lines := splitLinesKeepEnds([]byte(c.src))
+			e := [2]int{1, len(lines) - 1} // 0행은 헤더다 — 엔트리에 들지 않는다
+			joined, at := codexEntryRaw(lines, e)
+			if len(at) != e[1]-e[0]+1 {
+				t.Fatalf("at 길이=%d want %d", len(at), e[1]-e[0]+1)
+			}
+			// 되사상: joined의 각 오프셋이 원문의 그 바이트를 가리켜야 한다.
+			for off := 0; off < len(joined); off++ {
+				p := codexPointAt(e, at, len(joined), off)
+				if !p.valid() {
+					t.Fatalf("off=%d에서 무효 지점", off)
+				}
+				if got := lines[p.line][p.col]; got != joined[off] {
+					t.Fatalf("off=%d → (%d,%d): 원문 %q != joined %q", off, p.line, p.col, got, joined[off])
+				}
+			}
+			// 범위 밖 오프셋은 무효 지점이다 — 주석이 그렇게 적혀 있는데 상한 검사가 없으면
+			// 임의의 큰 오프셋이 유효 좌표가 되고 소비자가 그 값으로 스플라이스한다.
+			for _, bad := range []int{-1, len(joined) + 1, 9999} {
+				if p := codexPointAt(e, at, len(joined), bad); p.valid() {
+					t.Errorf("범위 밖 off=%d가 유효 좌표다: %+v", bad, p)
+				}
+			}
+			// 따옴표 안 공백이 살아 있어야 한다 — 잔여 ②가 닫히는 근거다.
+			if !strings.Contains(joined, "a b") {
+				t.Errorf("따옴표 안 공백이 지워졌다: %q", joined)
+			}
+			// 주석은 잘려야 한다.
+			if strings.Contains(joined, "메모") || strings.Contains(joined, "끝") {
+				t.Errorf("주석이 남았다: %q", joined)
+			}
+		})
+	}
+}
+
+// TestCodexEntryRawCarriesStringState — 주석 절단이 **여러 줄 문자열 상태를 이월**해야 한다
+// (스펙 §0 D92 계약 6). 무상태 stripTrailingComment를 라인마다 부르면 여러 줄 기본 문자열
+// 안의 '#'을 주석으로 잘라 그 뒤 바이트를 잃는다 — 실측: 아래 픽스처가 '# def'와 그 뒤를
+// 통째로 잃어 되사상이 그 자리에서 어긋난다.
+func TestCodexEntryRawCarriesStringState(t *testing.T) {
+	src := "[mcp_servers.ctr]\nenv = { A = \"\"\"\nabc # def\n\"\"\" }\n"
+	lines := splitLinesKeepEnds([]byte(src))
+	joined, _ := codexEntryRaw(lines, [2]int{1, 3})
+	if !strings.Contains(joined, "# def") {
+		t.Errorf("여러 줄 문자열 안의 주석 모양을 잘라 냈다: %q", joined)
+	}
+	if !strings.Contains(joined, `}`) {
+		t.Errorf("문자열 뒤 닫는 중괄호가 사라졌다: %q", joined)
+	}
+}
