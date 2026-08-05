@@ -1565,3 +1565,197 @@ type tomlInlineScan struct {
 	entries     []tomlInlineEntry
 	ok          bool
 }
+
+// tomlTripleLen — s의 맨 앞이 삼중 큰따옴표나 삼중 홑따옴표면 그 여러 줄 문자열 토큰
+// 전체의 길이, 아니면 0. 닫히지 않으면 len(s)다 — 호출자가 그 자리에서 fail로 빠진다.
+// 닫기 탐색의 이스케이프 기준은 tomlLineScanner.advance와 **같다**: strings.Index로 찾으면
+// 역슬래시로 이스케이프된 따옴표를 닫기로 오인한다.
+//
+// **문서 주석에 홑따옴표 두 개를 잇달아 적지 마라** — Go 1.19+ gofmt의 doc 주석 정규화가
+// 그것을 오른쪽 겹따옴표로 바꿔 `gofumpt -l .`이 적색이 된다(실측). 저장소가 이미 같은
+// 이유로 tomlLineScanner 주석에서 "삼중 홑따옴표"라고 풀어 쓴다(codex_toml.go:168).
+func tomlTripleLen(s string) int {
+	var q string
+	switch {
+	case strings.HasPrefix(s, `"""`):
+		q = `"""`
+	case strings.HasPrefix(s, "'''"):
+		q = "'''"
+	default:
+		return 0
+	}
+	for i := 3; i < len(s); {
+		if q == `"""` && s[i] == '\\' {
+			i += 2
+			continue
+		}
+		if strings.HasPrefix(s[i:], q) {
+			return i + 3
+		}
+		i++
+	}
+	return len(s)
+}
+
+// tomlSpanText — 구간의 원문 텍스트. joined·at은 codexEntryRaw가 낸 짝이고 e는 그 논리
+// 엔트리다. 지점이 무효이거나 범위 밖이면 ""다 — 같은 인덱스 식을 소비자마다 되풀이하면
+// 그중 하나만 경계 검사를 빠뜨려도 슬라이스 패닉이 되고 internal/cli에는 recover가 없다.
+func tomlSpanText(joined string, at []int, e [2]int, sp tomlSpan) string {
+	off := func(p tomlPoint) int {
+		k := p.line - e[0]
+		if !p.valid() || k < 0 || k >= len(at) {
+			return -1
+		}
+		return at[k] + p.col
+	}
+	s, x := off(sp.start), off(sp.end)
+	if s < 0 || x < s || x > len(joined) {
+		return ""
+	}
+	return joined[s:x]
+}
+
+// tomlScanInline — 논리 엔트리의 인라인 테이블을 **한 번** 훑어 깊이 1의 마디를 낸다(D92).
+// 입력은 codexEntryRaw가 낸 원문이고 출력 지점은 전부 파일 좌표다.
+//
+// **깊이 1만 낸다** — 중첩 인라인 테이블은 값으로 통째 잡히므로 안쪽 키가 바깥 마디로
+// 올라오지 않는다. 그것이 "중첩 안쪽 표식을 바깥 것으로 읽어 사용자 값을 덮어쓰는" 결함을
+// 구조적으로 막는 지점이다.
+// **점 표기 키는 중첩이 아니라 깊이 1 마디다**(TOML 명세의 `{ type.name = "pug" }`) — 그래서
+// 깊이 1 한정만으로는 부족하고 segs가 그 몫을 진다.
+// **부분 산출을 내지 않는다** — 미종료·짝 어긋남·close 부재 어느 경우든 entries를 비운다.
+// 절반만 열거된 결과는 삽입 소비자에게 "비어 있다"로 보이고 그것이 곧 중복 정의다.
+func tomlScanInline(lines [][]byte, e [2]int) tomlInlineScan {
+	fail := tomlInlineScan{open: tomlNoPoint(), close: tomlNoPoint()}
+	joined, at := codexEntryRaw(lines, e)
+	pt := func(off int) tomlPoint { return codexPointAt(e, at, len(joined), off) }
+
+	i := tomlTopLevelEq(joined)
+	if i < 0 {
+		return fail
+	}
+	i++
+	for i < len(joined) && (joined[i] == ' ' || joined[i] == '\t') {
+		i++
+	}
+	if i >= len(joined) || joined[i] != '{' {
+		return fail // 우변이 인라인 테이블이 아니다 — Task 9가 이 갈래를 소비한다
+	}
+	out := tomlInlineScan{open: pt(i), close: tomlNoPoint()}
+	stack := []byte{'{'}
+	i++
+
+	skipSpace := func() {
+		for i < len(joined) && (joined[i] == ' ' || joined[i] == '\t') {
+			i++
+		}
+	}
+	for {
+		skipSpace()
+		if i >= len(joined) {
+			return fail
+		}
+		if joined[i] == '}' { // 빈 테이블 또는 후행 쉼표 뒤 정상 종료
+			out.close, out.ok = pt(i), true
+			return out
+		}
+		// 키 자리에 구분자가 오면 구조가 확정되지 않은 것이다 — `{ A = "1",, B = "2" }`가
+		// 그 형태이고, 막지 않으면 ", B"가 키 구간이 되어 P0가 뒤늦게 문다.
+		if joined[i] == ',' || joined[i] == '=' {
+			return fail
+		}
+		// 키 토큰 — 따옴표 밖 '=' 앞까지가 경로 전체다.
+		keyStart := i
+		for i < len(joined) && joined[i] != '=' {
+			switch joined[i] {
+			case '"':
+				i += basicStringLen(joined[i:])
+			case '\'':
+				i += literalStringLen(joined[i:])
+			default:
+				i++
+			}
+		}
+		if i >= len(joined) {
+			return fail
+		}
+		keyEnd := i
+		for keyEnd > keyStart && (joined[keyEnd-1] == ' ' || joined[keyEnd-1] == '\t') {
+			keyEnd--
+		}
+		if keyEnd == keyStart {
+			return fail
+		}
+		keyText := joined[keyStart:keyEnd]
+		// escaped — **어느 마디든** 이스케이프를 담는가(계약 3). keyText 통째로 검사하면 점
+		// 표기에서 첫 마디 뒤 '.'에 걸려 늘 false다(실측: { "C:\t".sub = "x" } → false).
+		// v0.18은 이 값을 소비하지 않지만 D93이 읽으므로 판정원이 지금 옳아야 한다.
+		segs := tomlSplitDotted(keyText)
+		escaped := false
+		for _, seg := range segs {
+			if tomlKeyTokenHasEscape(seg + "=") {
+				escaped = true
+				break
+			}
+		}
+		i++ // '='
+		skipSpace()
+		// 값 토큰 — 깊이 1로 돌아올 때까지 스택으로 센다.
+		valStart := i
+		for i < len(joined) {
+			c := joined[i]
+			if len(stack) == 1 && (c == ',' || c == '}') {
+				break
+			}
+			// 여러 줄 문자열은 닫힘까지 통째로 건너뛴다 — 한 줄 문자열로 읽으면 값 안의
+			// '#'·','·'}'가 구조 문자로 잡힌다. 한 줄 갈래보다 **먼저** 본다.
+			if n := tomlTripleLen(joined[i:]); n > 0 {
+				i += n
+				continue
+			}
+			switch c {
+			case '"':
+				i += basicStringLen(joined[i:])
+			case '\'':
+				i += literalStringLen(joined[i:])
+			case '{', '[':
+				stack = append(stack, c)
+				i++
+			case '}', ']':
+				want := byte('{')
+				if c == ']' {
+					want = '['
+				}
+				if len(stack) < 2 || stack[len(stack)-1] != want {
+					return fail
+				}
+				stack = stack[:len(stack)-1]
+				i++
+			default:
+				i++
+			}
+		}
+		if i >= len(joined) {
+			return fail
+		}
+		valEnd := i
+		for valEnd > valStart && (joined[valEnd-1] == ' ' || joined[valEnd-1] == '\t') {
+			valEnd--
+		}
+		// 값 구간이 비면 구조가 확정되지 않은 것이다 — `{ A = }`가 그 형태다.
+		if valEnd == valStart {
+			return fail
+		}
+		out.entries = append(out.entries, tomlInlineEntry{
+			key:     tomlSpan{start: pt(keyStart), end: pt(keyEnd)},
+			value:   tomlSpan{start: pt(valStart), end: pt(valEnd)},
+			segs:    len(segs),
+			escaped: escaped,
+		})
+		if joined[i] == '}' {
+			out.close, out.ok = pt(i), true
+			return out
+		}
+		i++ // ','
+	}
+}
