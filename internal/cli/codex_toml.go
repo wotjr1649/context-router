@@ -954,6 +954,17 @@ func installCodexConfigBlock(existing []byte, req codexInstallRequest) codexInst
 			Tools: diag.Tools, ToolsPresent: diag.ToolsPresent, WantTools: diag.WantTools, ArgsReadable: diag.ArgsReadable,
 		}
 	}
+	// 인라인 env의 깊이 1 마디 중 **첫 마디가 표식 키인 점 표기**가 있으면 삽입은 중복 정의를
+	// 만들고, 표식으로 읽히지도 않아 갱신 갈래도 설 수 없다. 게이트가 그 산출을 거부하지만
+	// 그 문면은 "우리 결함이니 알려 주세요"라 사용자가 할 일이 없다 — 수행 가능한 안내로 바꾼다.
+	if view.inlineEnv >= 0 && codexInlineMarkerBlocked(lines, view.inlineEnvEntry) {
+		return codexInstallResult{
+			Out: existing, State: mcpMarkerAnomaly, TableFound: sp.table.found,
+			Anomaly: anomalyDottedEnv, InputParses: inputParses,
+			Tools: diag.Tools, ToolsPresent: diag.ToolsPresent,
+			WantTools: diag.WantTools, ArgsReadable: diag.ArgsReadable,
+		}
+	}
 	// 무변경 판정(D84): 우리 소유 키 넷의 값이 모두 같고, 새로 만들 테이블도 지울 마커 줄도
 	// 없으면 쓰기와 백업을 생략한다. **키 단위 동치는 바이트 동일을 포함**하므로 호스트가 우리
 	// 테이블을 다른 형태(키 순서·인용·공백·env 표기)로 되썼을 때에도 무변경 재실행마다 .bak이
@@ -1230,6 +1241,26 @@ func codexInlineMarker(lines [][]byte, e [2]int) (value string, found bool) {
 		return "", true // 문자열이 아닌 값 — 키는 있다(종전과 같은 계약)
 	}
 	return "", false
+}
+
+// codexInlineMarkerBlocked — 깊이 1 마디 중 첫 마디가 표식 키인 점 표기가 있는가.
+// tomlSplitDotted가 이미 따옴표 밖 '.'에서 가른다 — 새 함수는 없다.
+func codexInlineMarkerBlocked(lines [][]byte, e [2]int) bool {
+	sc := tomlScanInline(lines, e)
+	if !sc.ok {
+		return false
+	}
+	joined, at := codexEntryRaw(lines, e)
+	for _, en := range sc.entries {
+		if en.segs <= 1 {
+			continue
+		}
+		s := tomlSpanText(joined, at, e, en.key)
+		if segs := tomlSplitDotted(s); len(segs) > 0 && strings.Trim(segs[0], `"'`) == codexMarkerKey {
+			return true
+		}
+	}
+	return false
 }
 
 // codexMarkerValue — 소유 표식 값을 읽는다. env 서브테이블을 정의하는 **세 형태를 모두**

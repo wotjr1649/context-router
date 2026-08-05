@@ -1341,6 +1341,39 @@ func TestCodexNestedInlineNotOverwritten(t *testing.T) {
 	}
 }
 
+// TestCodexDottedInlineKeyExits — 스펙 §0 관측 ②. 인라인 테이블 안의 점 표기 키는 중첩이
+// 아니라 깊이 1 마디이므로 깊이 1 한정이 걸러 내지 못한다. 첫 마디가 표식 키면 삽입이 중복
+// 정의를 만들고, 표식으로 읽히지도 않아 갱신 갈래도 설 수 없다 — 무변경 + 수행 가능한 사유.
+func TestCodexDottedInlineKeyExits(t *testing.T) {
+	src := "[mcp_servers.ctr]\ncommand = \"context-router\"\nenv = { CTR_MANAGED.sub = \"x\" }\n"
+	res := installCodexConfigBlock([]byte(src), codexInstallRequest{Marker: hookMarker("0.18.0")})
+	if res.State != mcpMarkerAnomaly {
+		t.Fatalf("state=%d want mcpMarkerAnomaly", res.State)
+	}
+	if res.Anomaly != anomalyDottedEnv {
+		t.Errorf("anomaly=%d want anomalyDottedEnv", res.Anomaly)
+	}
+	if string(res.Out) != src {
+		t.Errorf("산출이 입력과 다르다 — 무변경 이탈이어야 한다:\n%s", res.Out)
+	}
+	if res.Changed {
+		t.Errorf("Changed가 참이다")
+	}
+}
+
+// TestCodexDottedInlineNonMarkerPasses — 표식과 무관한 점 표기 마디는 막지 않는다.
+// 무변경 집합을 불필요하게 넓히지 않는 것이 계약이다.
+func TestCodexDottedInlineNonMarkerPasses(t *testing.T) {
+	src := "[mcp_servers.ctr]\ncommand = \"context-router\"\nenv = { A.B = \"1\" }\n"
+	res := installCodexConfigBlock([]byte(src), codexInstallRequest{Marker: hookMarker("0.18.0")})
+	if res.State == mcpMarkerAnomaly {
+		t.Errorf("표식과 무관한 점 표기를 막았다: anomaly=%d", res.Anomaly)
+	}
+	if !codexTOMLParses(res.Out) {
+		t.Errorf("산출이 파스되지 않는다:\n%s", res.Out)
+	}
+}
+
 // TestCodexMultilineInlineMarkerUpdates — 여러 줄로 이어진 인라인 env에서도 표식이 현재
 // 값으로 갱신되고 재실행이 무변경이다. 한 줄 픽스처로는 물리 라인 한정 구현이 통과한다.
 func TestCodexMultilineInlineMarkerUpdates(t *testing.T) {
