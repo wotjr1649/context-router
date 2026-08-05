@@ -1915,3 +1915,113 @@ func TestCodexInlineQuotedSpaceKeyIsNotEnv(t *testing.T) {
 		t.Errorf("산출이 파스되지 않는다:\n%s", res.Out)
 	}
 }
+
+// TestTomlScanInline — 스펙 §0 D92 계약 1·4·5.
+// **키 텍스트와 segs만 단정하면 부족하다**: escaped·open·close와 값 구간이 상수이거나
+// 오프바이원이어도 통과한다(리뷰 실측). 그래서 열마다 기대값을 적고, P0 오라클을 케이스마다
+// 함께 건다.
+func TestTomlScanInline(t *testing.T) {
+	for _, c := range []struct {
+		name        string
+		src         string
+		wantOK      bool
+		wantKeys    []string // 깊이 1 마디의 키 텍스트(원문 그대로)
+		wantVals    []string // 같은 마디의 값 텍스트(원문 그대로)
+		wantSegs    []int
+		wantEscaped []bool
+	}{
+		{"단순", `env = { A = "1", B = "2" }`, true, []string{"A", "B"}, []string{`"1"`, `"2"`}, []int{1, 1}, []bool{false, false}},
+		{"중첩은 값으로 통째", `env = { A = { CTR_MANAGED = "in" }, B = "1" }`, true, []string{"A", "B"}, []string{`{ CTR_MANAGED = "in" }`, `"1"`}, []int{1, 1}, []bool{false, false}},
+		{"점 표기는 깊이 1", `env = { CTR_MANAGED.sub = "x" }`, true, []string{"CTR_MANAGED.sub"}, []string{`"x"`}, []int{2}, []bool{false}},
+		{"후행 쉼표에 유령 없음", `env = { A = "1", }`, true, []string{"A"}, []string{`"1"`}, []int{1}, []bool{false}},
+		{"빈 테이블", `env = {}`, true, nil, nil, nil, nil},
+		{"빈 테이블 + 공백", `env = {   }`, true, nil, nil, nil, nil},
+		{"값 안 쉼표", `env = { A = "x,y", B = "2" }`, true, []string{"A", "B"}, []string{`"x,y"`, `"2"`}, []int{1, 1}, []bool{false, false}},
+		{"값 안 중괄호", `env = { A = "}", B = "2" }`, true, []string{"A", "B"}, []string{`"}"`, `"2"`}, []int{1, 1}, []bool{false, false}},
+		{"값이 배열", `env = { A = ["x", "y"], B = "2" }`, true, []string{"A", "B"}, []string{`["x", "y"]`, `"2"`}, []int{1, 1}, []bool{false, false}},
+		{"값이 정수", `env = { A = 1, B = "2" }`, true, []string{"A", "B"}, []string{`1`, `"2"`}, []int{1, 1}, []bool{false, false}},
+		// escaped — 단순 키와 점 표기 키 각각 한 줄. **표시만 하고 소비하지 않는다**(계약 3).
+		{"이스케이프 단순 키", `env = { "C:\t" = "1" }`, true, []string{`"C:\t"`}, []string{`"1"`}, []int{1}, []bool{true}},
+		{"이스케이프 점 표기 키", `env = { "C:\t".sub = "x" }`, true, []string{`"C:\t".sub`}, []string{`"x"`}, []int{2}, []bool{true}},
+		{"이스케이프 없는 따옴표 키", `env = { "plain" = "1" }`, true, []string{`"plain"`}, []string{`"1"`}, []int{1}, []bool{false}},
+		// ok=false — 구조가 확정되지 않은 형태. entries가 **비어야** 한다(계약 4).
+		{"닫히지 않음", `env = { A = "1"`, false, nil, nil, nil, nil},
+		{"인라인 아님", `env = []`, false, nil, nil, nil, nil},
+		{"값이 빈 구간", `env = { A = }`, false, nil, nil, nil, nil},
+		{"쉼표 둘", `env = { A = "1",, B = "2" }`, false, nil, nil, nil, nil},
+		{"키가 빈 구간", `env = { = "1" }`, false, nil, nil, nil, nil},
+		{"짝 어긋난 괄호", `env = { A = [1} }`, false, nil, nil, nil, nil},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			lines := splitLinesKeepEnds([]byte("[mcp_servers.ctr]\n" + c.src + "\n"))
+			e := [2]int{1, len(lines) - 1} // 0행은 헤더 — 생산 경로와 같은 형태다
+			sc := tomlScanInline(lines, e)
+			if sc.ok != c.wantOK {
+				t.Fatalf("ok=%v want %v", sc.ok, c.wantOK)
+			}
+			assertInlineScanTiles(t, lines, e, sc)
+			if !c.wantOK {
+				if sc.open.valid() || sc.close.valid() {
+					t.Errorf("실패 결과가 유효 지점을 낸다: open=%+v close=%+v", sc.open, sc.close)
+				}
+				return
+			}
+			joined, at := codexEntryRaw(lines, e)
+			// open·close는 실제로 그 중괄호를 가리켜야 한다 — 상수여도 통과하지 않게 잰다.
+			if o := at[sc.open.line-e[0]] + sc.open.col; joined[o] != '{' {
+				t.Errorf("open이 %q를 가리킨다", joined[o])
+			}
+			if o := at[sc.close.line-e[0]] + sc.close.col; joined[o] != '}' {
+				t.Errorf("close가 %q를 가리킨다", joined[o])
+			}
+			if len(sc.entries) != len(c.wantKeys) {
+				t.Fatalf("마디 수=%d want %d", len(sc.entries), len(c.wantKeys))
+			}
+			for i, en := range sc.entries {
+				if got := tomlSpanText(joined, at, e, en.key); got != c.wantKeys[i] {
+					t.Errorf("마디[%d] 키=%q want %q", i, got, c.wantKeys[i])
+				}
+				if got := tomlSpanText(joined, at, e, en.value); got != c.wantVals[i] {
+					t.Errorf("마디[%d] 값=%q want %q", i, got, c.wantVals[i])
+				}
+				if en.segs != c.wantSegs[i] {
+					t.Errorf("마디[%d] segs=%d want %d", i, en.segs, c.wantSegs[i])
+				}
+				if en.escaped != c.wantEscaped[i] {
+					t.Errorf("마디[%d] escaped=%v want %v", i, en.escaped, c.wantEscaped[i])
+				}
+			}
+		})
+	}
+}
+
+// TestTomlScanInlineMultiline — 여러 줄 논리 엔트리에서도 구간이 파일 좌표로 옳고, 여러 줄
+// 기본 문자열 안의 '#'·','·'}'가 구조 문자로 잡히지 않는다(계약 6 + 상태 이월).
+func TestTomlScanInlineMultiline(t *testing.T) {
+	for _, c := range []struct {
+		name, src string
+		wantKeys  []string
+	}{
+		{"두 줄", "[mcp_servers.ctr]\nenv = { A = \"a\",\n  B = \"b\" }\n", []string{"A", "B"}},
+		{"여러 줄 기본 문자열 값", "[mcp_servers.ctr]\nenv = { A = \"\"\"\nx # y, z}\n\"\"\", B = \"b\" }\n", []string{"A", "B"}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			lines := splitLinesKeepEnds([]byte(c.src))
+			e := [2]int{1, len(lines) - 1}
+			sc := tomlScanInline(lines, e)
+			if !sc.ok {
+				t.Fatalf("ok=false — 여러 줄 엔트리를 열거하지 못했다")
+			}
+			assertInlineScanTiles(t, lines, e, sc)
+			joined, at := codexEntryRaw(lines, e)
+			if len(sc.entries) != len(c.wantKeys) {
+				t.Fatalf("마디 수=%d want %d", len(sc.entries), len(c.wantKeys))
+			}
+			for i, en := range sc.entries {
+				if got := tomlSpanText(joined, at, e, en.key); got != c.wantKeys[i] {
+					t.Errorf("마디[%d] 키=%q want %q", i, got, c.wantKeys[i])
+				}
+			}
+		})
+	}
+}
