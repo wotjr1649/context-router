@@ -3530,10 +3530,22 @@ func TestCodexEnvNotTableStopsInstall(t *testing.T) {
 		t.Errorf("무변경 이탈인데 config.toml이 바뀌었다:\n%s", got)
 	}
 	// ② 가드 미등록 — MCP가 확정되지 않았으므로 hooks.json에 우리 PreToolUse 그룹이 없다.
-	if hooks, hErr := os.ReadFile(filepath.Join(home, "hooks.json")); hErr == nil {
-		if bytes.Contains(hooks, []byte("PreToolUse")) {
-			t.Errorf("MCP 미확정인데 가드가 등록됐다:\n%s", hooks)
-		}
+	// 훅 파일 경로는 codexHooksPath로 얻는다(--user 없는 --codex 설치는 프로젝트 스코프라
+	// proj/.codex/hooks.json이지 CODEX_HOME(home)이 아니다 — 손으로 조립하면 어긋난다.
+	// TestHookInstallCodexGateReport와 같은 자리를 잰다). runHookInstallCodex는 MCP
+	// 미확정이어도 hooks.json 자체는 항상 쓴다(가드 그룹만 빠진다 — mergeCodexHooks의
+	// withGuard가 PreToolUse 유무만 가른다) — 그러므로 이 픽스처에서 파일 부재는 통과
+	// 조건이 아니다: 읽기 실패는 조용히 건너뛰지 않고 즉시 테스트를 실패시킨다.
+	hp, hpErr := codexHooksPath(false, proj)
+	if hpErr != nil {
+		t.Fatalf("훅 경로 해석 실패: %v", hpErr)
+	}
+	hooks, hErr := os.ReadFile(hp)
+	if hErr != nil {
+		t.Fatalf("hooks.json 읽기 실패: %v", hErr)
+	}
+	if bytes.Contains(hooks, []byte("PreToolUse")) {
+		t.Errorf("MCP 미확정인데 가드가 등록됐다:\n%s", hooks)
 	}
 	// ③ 설치 보고에 사유가 실린다.
 	if !strings.Contains(out.String(), anomalyEnvNotTable.reason()) {
