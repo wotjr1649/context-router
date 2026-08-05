@@ -1356,8 +1356,22 @@ func setInlineEnvMarker(lines [][]byte, e [2]int, marker string) []byte {
 // 엔트리 전체를 라인 종결자까지 원문 그대로 배출한다. 구간이 빈 지점이면 삽입이다.
 // **줄 종결자를 새로 만들지 않는다** — 원문 라인을 그대로 옮기므로 CRLF도 마지막 줄 종결자
 // 없음도 자동으로 옳다(v0.17 §1.4-라가 종결자 재생성에서 물린 자리다).
+//
+// **경계 검사는 모든 차원을 한 곳에서 본다** — 줄뿐 아니라 열, 그리고 시작≤끝 순서까지.
+// 줄만 보는 부분 검사로 두면 열이 줄 길이를 넘은 좌표가 그대로 슬라이스에 들어가고,
+// internal/cli에는 recover가 없으므로 그것은 **사용자 config를 쓰는 도중의 프로세스 종료**다
+// (실측: 열 999 → `slice bounds out of range`). 뒤집힌 같은 줄 구간은 패닉 대신 바이트를
+// 복제해 조용히 파일을 깨뜨린다. 형제 tomlSpanText가 같은 이유로 같은 검사를 하고
+// codexPointAt이 상한을 받는 이유도 같다.
+// **생산자 쪽 불변식에 기대지 않는다**: 지금의 두 생산자는 그런 좌표를 내지 않지만 이 원시는
+// 소비자가 더 붙는 자리다. 어느 차원으로든 범위 밖이면 갈아 끼우지 않고 엔트리 원문을 옮긴다.
+// 조건의 **순서가 계약이다** — '||'의 좌→우 단락 평가 덕에 줄 범위가 선 뒤에야
+// lines[...] 첨자가 평가된다. 줄 검사를 뒤로 옮기면 그 첨자가 먼저 터진다.
 func spliceInlineSpan(lines [][]byte, e [2]int, sp tomlSpan, repl string) []byte {
-	if !sp.start.valid() || !sp.end.valid() || sp.start.line < e[0] || sp.end.line > e[1] {
+	if !sp.start.valid() || !sp.end.valid() ||
+		sp.start.line < e[0] || sp.end.line > e[1] || sp.start.line > sp.end.line ||
+		sp.start.col > len(lines[sp.start.line]) || sp.end.col > len(lines[sp.end.line]) ||
+		(sp.start.line == sp.end.line && sp.start.col > sp.end.col) {
 		var b []byte
 		for i := e[0]; i <= e[1]; i++ {
 			b = append(b, lines[i]...)

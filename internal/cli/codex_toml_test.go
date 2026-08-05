@@ -746,10 +746,12 @@ func TestCodexTableBodyPreservesUnownedKeys(t *testing.T) {
 // A1(적대적 리뷰) — 인라인 env 대입이 표식 키의 여는 큰따옴표에서 끝나면 basicStringLen이
 // len(s)를 돌려주고 tomlInlineValue가 s[v+1:v+len-1]로 역순 슬라이스해 패닉했다. internal/cli에
 // recover가 없어 프로세스가 죽고, **읽기 전용인 doctor [20]까지 함께 죽었다.** 미종료 문자열은
-// 이미 무효 TOML이므로 tomlStringList·inlineMarkerSpan과 같은 "다루지 않는 형태"로 보낸다.
+// 이미 무효 TOML이므로 tomlStringList와 같은 "다루지 않는 형태"로 보낸다 — D92 전환 뒤에는
+// tomlScanInline이 그 판정을 내린다: 미종료 값은 닫는 중괄호를 만나지 못해 ok=false이고,
+// 계약 4대로 부분 산출 없이 entries가 빈 채로 돌아온다.
 func TestCodexUnterminatedInlineMarkerNoPanic(t *testing.T) {
 	cfg := []byte("[mcp_servers.ctr]\ncommand = \"context-router\"\nenv = { " + codexMarkerKey + " = \"\n")
-	// 세 진입점이 모두 tomlInlineValue를 탄다 — 하나라도 패닉하면 이 테스트가 죽는다.
+	// 세 진입점이 모두 codexInlineMarker → tomlScanInline을 탄다 — 하나라도 패닉하면 이 테스트가 죽는다.
 	res := installCodexConfigBlock(cfg, codexInstallRequest{
 		Profiles: defaultMCPProfiles, SetProfile: true, Marker: hookMarker("0.15.0"),
 	})
@@ -758,8 +760,10 @@ func TestCodexUnterminatedInlineMarkerNoPanic(t *testing.T) {
 	}
 	uninstallCodexConfigBlock(cfg)
 	probeCodexMCPBlock(cfg)
-	// 키는 있고 값이 다루지 않는 형태이면 ("", true)가 기존 계약이다(비문자열 표식과 같다) —
-	// 요점은 그 값이 소유로 읽히지 않는 것이다.
+	// 이 형태의 판독 계약은 D92 전환에서 좁아졌다: 종전에는 키를 텍스트로 찾아 ("", true)
+	// (키는 있다)였고, 지금은 열거가 ok=false로 빠져 ("", false)(키가 없다)다 — 구조가
+	// 확정되지 않은 입력에서 부분 산출을 내지 않는다는 계약 4의 귀결이다. 어느 쪽이든
+	// **요점은 같고 이 단정이 재는 것도 그것뿐이다**: 그 값이 소유로 읽히지 않는다.
 	if marker, _, found := codexConfigMarker(cfg); found && isOurMarkerValue(marker) {
 		t.Errorf("미종료 문자열을 우리 표식으로 읽었다: %q", marker)
 	}
@@ -1285,6 +1289,34 @@ func TestCodexInlineMarkerInsideStringValue(t *testing.T) {
 			again := installCodexConfigBlock(res.Out, codexInstallRequest{Marker: marker, MarkerOnly: true})
 			if again.Changed || !bytes.Equal(again.Out, res.Out) {
 				t.Errorf("2회차가 무변경이 아니다: changed=%v\n%s", again.Changed, again.Out)
+			}
+		})
+	}
+}
+
+// TestSpliceInlineSpanRejectsOutOfRangeSpan — 구간이 **어느 차원으로든** 범위 밖이면 갈아
+// 끼우지 않고 논리 엔트리 원문을 그대로 돌려준다. 줄만 검사하던 종전 가드에서 세 케이스가
+// 각각 이렇게 깨졌다(실측): 열이 줄 길이를 넘으면 slice bounds 패닉이고 — internal/cli에
+// recover가 없으므로 사용자 config를 쓰는 도중의 프로세스 종료다 — 같은 줄에서 시작이 끝보다
+// 뒤면 패닉 없이 바이트를 복제해 조용히 파일을 깨뜨린다.
+// 오늘의 두 생산자는 이런 좌표를 내지 않는다. 이 테스트가 재는 것은 **원시 자체의 전역성**이며,
+// 소비자가 더 붙을 때 그 불변식이 깨지는 것을 여기서 잡는다.
+func TestSpliceInlineSpanRejectsOutOfRangeSpan(t *testing.T) {
+	lines := splitLinesKeepEnds([]byte("[mcp_servers.ctr]\nenv = { A = \"1\" }\n"))
+	e := [2]int{1, 1}
+	want := string(lines[1])
+	pt := func(l, c int) tomlPoint { return tomlPoint{line: l, col: c} }
+	for _, c := range []struct {
+		name string
+		sp   tomlSpan
+	}{
+		{"두 열 모두 줄 길이를 넘음", tomlSpan{start: pt(1, 999), end: pt(1, 999)}},
+		{"끝 열만 줄 길이를 넘음", tomlSpan{start: pt(1, 8), end: pt(1, 999)}},
+		{"같은 줄에서 시작이 끝보다 뒤", tomlSpan{start: pt(1, 12), end: pt(1, 8)}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			if got := string(spliceInlineSpan(lines, e, c.sp, "REPL")); got != want {
+				t.Errorf("원문이 보존되지 않았다:\ngot =%q\nwant=%q", got, want)
 			}
 		})
 	}
