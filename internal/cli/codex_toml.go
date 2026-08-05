@@ -11,7 +11,7 @@ package cli
 // 키 단위 약속이고 관리 키 넷의 물리 라인은 통째로 재생성되므로 그 줄의 주석은 사라진다 —
 // keepArgs 갈래(D81 되읽기 실패·D86 표식 전용)에서는 args·enabled_tools가 재생성되지 않고
 // 보존 라인(keep)으로 원문 그대로(주석 포함) 옮겨진다(codexTableBody). 인라인 env 경로는
-// 별개 예외다 — inlineMarkerSpan·setInlineEnvMarker는 값 구간을 갱신하거나 표식을 삽입하며
+// 별개 예외다 — setInlineEnvMarker는 값 구간을 갱신하거나 표식을 삽입하며
 // 줄을 재생성하지 않으므로 그 줄의 주석이 남는다. 키별 값 스팬 판독기로 닫지 않는 이유는
 // 파서 비의존 원칙 아래에서 그 판독기의 정확성이 새 위험이 되기 때문이다.
 
@@ -367,7 +367,8 @@ func codexEntries(lines [][]byte, sp codexSpan) [][2]int {
 // 따옴표 키 안의 '='가 이름을 조기 절단해 사용자 키 `"args=x" = "y"`가 예약어 "args"로
 // 오분류되고, codexReadTable의 continue 세 곳과 codexEnvBody의 표식 건너뛰기가 그 줄을 보존
 // 목록에서 빼 재기입 때 조용히 지운다. basicStringLen·literalStringLen로 닫는 따옴표를 찾는다 —
-// tomlKeyLen과 같은 이스케이프 인지 기준을 공유한다. '='가 없거나 앞부분이 비면 ""(키 줄이
+// tomlScanInline의 키 토큰 건너뛰기와 같은 이스케이프 인지 기준을 공유한다. '='가 없거나
+// 앞부분이 비면 ""(키 줄이
 // 아니다). 주석 줄은 '#'로 시작하므로 우리 키 이름과 절대 같아지지 않는다 — 주석은 언제나
 // 보존 라인으로 간다.
 func codexKeyName(s string) string {
@@ -586,12 +587,12 @@ func codexPointAt(e [2]int, at []int, joinedLen, off int) tomlPoint {
 // 않는다 — codexReadTable이 키를 읽는 경로와 **같은 기준**이며, 두 경로가 다른 기준을 쓰면
 // 같은 파일을 두 방식으로 읽는 셈이다(라인을 문맥 없이 훑으면 여러 줄 문자열의 내용 줄·값 뒤
 // 후행 주석·홑따옴표 값 내부가 모두 오탐이 된다).
-// 인라인 테이블의 키 토큰은 **env 엔트리에서만** 본다 — tomlKeyLen·inlineMarkerSpan이 그 줄에만
-// 적용되는 것과 같은 한정이고, 그것이 없으면 다른 키의 값 안에 든 쉼표 뒤 텍스트가 키로 잡힌다.
+// 인라인 테이블의 키 토큰은 **env 엔트리에서만** 본다 — 판독·되쓰기가 그 엔트리에만 적용되는
+// 것과 같은 한정이고, 그것이 없으면 다른 키의 값 안에 든 쉼표 뒤 텍스트가 키로 잡힌다.
 // **알려진 한계**: env 인라인 값 안에 따옴표·역슬래시·등호를 함께 담은 문자열은 여전히 키로
-// 보인다. tomlInlineValue가 이미 같은 한계를 갖는 형태이며(인라인 테이블의 구조를 따라가지
-// 않는다) D80의 파서 비의존 원칙 아래에서는 그 한계가 계약이다. inlineMarkerSpan은 되쓰기라
-// 값 안을 치환하면 사용자 파일이 깨지므로 그쪽만 문자열 토큰을 건너뛴다.
+// 보인다. 이 검사는 라인을 훑을 뿐 인라인 테이블의 구조를 따라가지 않으며, D80의 파서 비의존
+// 원칙 아래에서는 그 한계가 계약이다. 판독·되쓰기 쪽은 tomlScanInline이 구조를 따라가므로 값
+// 안을 키로 잡지 않는다 — 그쪽에서 잘못 잡으면 사용자 파일이 깨진다.
 func codexEscapedKeyInSpans(lines [][]byte, sp codexSpans) bool {
 	for _, span := range []codexSpan{sp.table, sp.env} {
 		if !span.found {
@@ -1125,8 +1126,12 @@ type codexTableView struct {
 	args    []string // args 배열의 문자열 값. **부재와 [] 모두 nil**이다 — D80이 둘을 동치로 본다
 	tools   []string // enabled_tools 배열의 문자열 값
 	// inlineEnv — 인라인 env 대입 줄 인덱스(-1이면 없음). 이 줄이 있으면 [mcp_servers.ctr.env]
-	// 헤더를 새로 붙이지 않는다(중복 정의 금지) — 표식은 그 줄 안에서 갈아 끼운다.
+	// 헤더를 새로 붙이지 않는다(중복 정의 금지) — 표식은 그 대입 안에서 갈아 끼운다.
 	inlineEnv int
+	// inlineEnvEntry — 그 대입의 **논리 엔트리 구간**([첫 줄, 마지막 줄]). 없으면 (-1,-1)이다.
+	// 여러 줄로 이어진 인라인 테이블은 라인 하나로 열거할 수 없으므로 판독·되쓰기가 이 구간을
+	// 받는다. inlineEnv(첫 줄)는 보존 라인 판정에 계속 쓰이므로 남는다 — 둘의 역할이 다르다.
+	inlineEnvEntry [2]int
 	// dottedEnv — 구간 안에 점 표기 env.* 키가 있는가, 그중 표식 줄의 값은 무엇인가(D90 개정).
 	// dottedEnv는 install의 이탈 판정만 쓰지만, dottedMarker·dottedMarkerFound는 **표식 판독기
 	// codexMarkerValue가 셋째 형태로 읽는다** — 그래서 소유 판정·라벨·uninstall이 그 형태의
@@ -1141,7 +1146,7 @@ type codexTableView struct {
 
 // codexReadTable — 관리 테이블 구간을 훑어 소유 키 값과 보존 라인을 가른다.
 func codexReadTable(lines [][]byte, sp codexSpan) codexTableView {
-	view := codexTableView{inlineEnv: -1}
+	view := codexTableView{inlineEnv: -1, inlineEnvEntry: [2]int{-1, -1}}
 	if !sp.found {
 		return view
 	}
@@ -1173,7 +1178,7 @@ func codexReadTable(lines [][]byte, sp codexSpan) codexTableView {
 		case "env":
 			// 인라인 env 대입은 보존 라인으로 두고 표식만 갈아 끼운다 — 이 줄이 있는데
 			// [mcp_servers.ctr.env] 헤더를 새로 붙이면 중복 정의로 사용자 Codex가 깨진다.
-			view.inlineEnv = e[0]
+			view.inlineEnv, view.inlineEnvEntry = e[0], e
 		}
 		// D90 — 점 표기 `env.<이름>`도 TOML에서는 mcp_servers.ctr.env를 **정의**한다. 위 switch의
 		// 어느 case에도 걸리지 않으므로 이 줄은 그대로 아래 keep으로 떨어져야 한다 — 형제 case를
@@ -1199,49 +1204,30 @@ func codexReadTable(lines [][]byte, sp codexSpan) codexTableView {
 	return view
 }
 
-// tomlKeyLen — s의 맨 앞이 key인가. TOML은 `CTR_MANAGED`와 `"CTR_MANAGED"`·`'CTR_MANAGED'`를
-// **같은 키**로 읽으므로 세 표기를 모두 그 키로 본다 — 맨 키만 보면 따옴표 표기를 부재로 읽고
-// 표식을 한 번 더 넣어 같은 인라인 테이블에 중복 키가 생긴다(D80이 막으려는 파스 에러 방향).
-// 맞으면 그 키 표기의 길이(따옴표 포함), 아니면 -1이다. 서브테이블 경로의 codexKeyName이
-// 따옴표를 벗기는 것과 **같은 기준**이며, 두 경로가 다른 기준을 쓰면 같은 파일을 두 방식으로
-// 읽는 셈이다.
-func tomlKeyLen(s, key string) int {
-	for _, q := range []string{"", `"`, "'"} {
-		if strings.HasPrefix(s, q+key+q) {
-			return 2*len(q) + len(key)
-		}
+// codexInlineMarker — 인라인 env의 우리 표식 값(D92 소비자 1). 깊이 1 마디 중 segs==1이고
+// 이름이 표식 키인 것만 우리 표식이다 — 중첩 인라인 안쪽 마디는 값으로 통째 잡히므로 여기
+// 오르지 않는다. 그것이 관측 ①(사용자 값 조용한 덮어쓰기)이 닫히는 지점이다. 키 표기의
+// 따옴표를 벗기는 것은 TOML이 `CTR_MANAGED`와 `"CTR_MANAGED"`·홑따옴표 표기를 **같은 키**로
+// 읽기 때문이다 — 벗기지 않으면 따옴표 표기를 부재로 읽고 표식을 한 번 더 넣어 중복 키가 된다.
+//
+// **값 해석의 폭은 종전 라인 한정 판독기와 같다**: 값 구간이 완결된 큰따옴표 문자열일 때만
+// 값을 읽고, 그 밖(정수·불리언·홑따옴표·미종료)은 ("", true)다. strings.Trim(값, 따옴표)로
+// 넓히면 종전이 소유로 읽지 않던 값이 소유 표식이 되어 재기준선 밖의 판정이 바뀐다.
+func codexInlineMarker(lines [][]byte, e [2]int) (value string, found bool) {
+	sc := tomlScanInline(lines, e)
+	if !sc.ok {
+		return "", false
 	}
-	return -1
-}
-
-// tomlInlineValue — 인라인 테이블 대입 줄(정규화)에서 key의 문자열 값을 뽑는다. 키 경계는
-// '{' 또는 ',' 직후로 한정한다 — 부분 문자열로 찾으면 다른 키의 값 안에 든 같은 이름까지 잡는다.
-// 값은 '=' 바로 다음(정규화라 공백 없음)이 큰따옴표일 때만 읽는다 — inlineMarkerSpan과 같은
-// 기준이다(T3-F2). '=' 뒤 나머지 전체를 tomlStringList에 넘기면 값이 문자열이 아닐 때 스캔이
-// 다음 키의 문자열 값까지 집어삼켜 소유를 오판한다(예: `CTR_MANAGED = 0, X = "context-router/…"`
-// 를 CTR_MANAGED의 값으로 오독). found는 키가 텍스트로 있는가이고, 값이 문자열이 아니면
-// ("", true)다.
-func tomlInlineValue(s, key string) (value string, found bool) {
-	for i := 0; i < len(s); i++ {
-		if s[i] != '{' && s[i] != ',' {
+	joined, at := codexEntryRaw(lines, e)
+	for _, en := range sc.entries {
+		if en.segs != 1 || strings.Trim(tomlSpanText(joined, at, e, en.key), `"'`) != codexMarkerKey {
 			continue
 		}
-		n := tomlKeyLen(s[i+1:], key)
-		if n < 0 || i+1+n >= len(s) || s[i+1+n] != '=' {
-			continue
+		v := tomlSpanText(joined, at, e, en.value)
+		if n := basicStringLen(v); len(v) >= 2 && v[0] == '"' && n == len(v) && v[n-1] == '"' {
+			return v[1 : n-1], true
 		}
-		v := i + 2 + n
-		if v >= len(s) || s[v] != '"' {
-			return "", true
-		}
-		// 미종료 문자열이면 basicStringLen이 len(s[v:])를 돌려주므로 하한과 닫힘을 함께 본다 —
-		// 없으면 s[v+1:v+len-1]이 역순 슬라이스로 패닉하고 internal/cli에 recover가 없어
-		// 프로세스가 죽는다(적대적 리뷰 A1). 이미 무효 TOML이니 tomlStringList·inlineMarkerSpan과
-		// 같은 "다루지 않는 형태"로 뺀다.
-		if vl := basicStringLen(s[v:]); vl >= 2 && s[v+vl-1] == '"' {
-			return s[v+1 : v+vl-1], true
-		}
-		return "", true
+		return "", true // 문자열이 아닌 값 — 키는 있다(종전과 같은 계약)
 	}
 	return "", false
 }
@@ -1276,7 +1262,7 @@ func codexMarkerValue(lines [][]byte, sp codexSpans, view codexTableView) (strin
 		}
 	}
 	if view.inlineEnv >= 0 {
-		return tomlInlineValue(codexValueText(lines[view.inlineEnv]), codexMarkerKey)
+		return codexInlineMarker(lines, view.inlineEnvEntry)
 	}
 	if view.dottedMarkerFound {
 		return view.dottedMarker, true
@@ -1322,141 +1308,79 @@ func ensureEOL(b []byte, eol string) []byte {
 	return b
 }
 
-// inlineMarkerSpan — 인라인 env 대입 줄(**원문**)에서 key의 값 구간 [start,end)를 찾는다.
-// 키 경계는 '{' 또는 ',' 다음의 첫 비공백 토큰으로 한정하고 따옴표 표기도 같은 키로
-// 본다(tomlKeyLen) — 읽기(tomlInlineValue)와 되쓰기가 같은 키 기준을 써야 "부재로 읽고 다시
-// 넣는" 중복 키가 생기지 않는다. 부분 문자열로 찾으면 다른 키의 값 안에 든 같은 이름까지
-// 잡는다. **문자열 토큰은 통째로 건너뛴다**(stripTrailingComment·tomlInlineValueEnd와 같은
-// 기준) — 문자열 안의 쉼표는 키 경계가 아니므로, 건너뛰지 않으면 다른 키의 값 한가운데를
-// 표식 문자열로 치환해 큰따옴표 값에서는 그 줄이 파스되지 않고 홑따옴표 값에서는 사용자
-// 환경변수가 조용히 바뀐다. **값이 문자열이 아니어도 그 값 토큰의 구간을 돌려준다** — 이 키는
-// 우리 표식이므로 판독되지 않는 값은 드리프트이고, 그 자리를 표식 문자열로 치환하는 것이
-// 유일하게 중복 키를 만들지 않는 정리 경로다(tomlInlineValueEnd가 끝을 잡는다). 키가 없거나
-// 값 토큰의 끝을 그 줄에서 찾지 못하면(여러 줄 값 등) (-1,-1)이다. tomlInlineValue와 달리
-// 정규화 문자열이 아니라 원문을 받는다 — 되쓰기는 원문 바이트를 보존해야 하므로 stripLine이
-// 지운 공백 위치를 쓸 수 없다.
-func inlineMarkerSpan(s, key string) (start, end int) {
-	skipSpace := func(i int) int {
-		for i < len(s) && (s[i] == ' ' || s[i] == '\t') {
-			i++
-		}
-		return i
-	}
-	for i := 0; i < len(s); {
-		switch s[i] {
-		case '"':
-			i += basicStringLen(s[i:]) // 두 길이 함수 모두 최소 1을 돌려준다 — 전진이 보장된다
-			continue
-		case '\'':
-			i += literalStringLen(s[i:])
-			continue
-		case '{', ',':
-			i++
-		default:
-			i++
-			continue
-		}
-		j := skipSpace(i)
-		n := tomlKeyLen(s[j:], key)
-		if n < 0 {
-			continue
-		}
-		j = skipSpace(j + n)
-		if j >= len(s) || s[j] != '=' {
-			continue
-		}
-		j = skipSpace(j + 1)
-		if j >= len(s) || s[j] != '"' {
-			if e := tomlInlineValueEnd(s, j); e > j {
-				return j, e // 판독되지 않는 값 — 토큰째 표식 문자열로 갈아 끼운다
-			}
-			return -1, -1
-		}
-		return j, j + basicStringLen(s[j:])
-	}
-	return -1, -1
-}
-
-// tomlInlineValueEnd — 인라인 테이블 안에서 i부터 시작하는 값 토큰의 끝(다음 최상위 ',' 또는
-// '}' 앞, 후행 공백 제외). 따옴표 문자열과 중첩 배열·인라인 테이블 안의 그 문자는 종결자가
-// 아니다 — 건너뛰기 기준은 tomlLineScanner.advance·stripTrailingComment와 같다. 부분 문자열로
-// 끝을 찾으면 값 안에 쉼표·중괄호를 담은 사용자 인라인 테이블이 깨진다. 종결자를 그 줄에서
-// 찾지 못하면 -1이다: 값이 다음 줄로 이어지는 형태는 우리가 다루지 않으므로 호출자가 원문을
-// 그대로 둔다. 문자열 밖 '#'도 같은 취급이다 — 닫히지 않은 인라인 테이블이라는 뜻이다.
-func tomlInlineValueEnd(s string, i int) int {
-	depth := 0
-	for i < len(s) {
-		switch c := s[i]; c {
-		case '"':
-			i += basicStringLen(s[i:])
-		case '\'':
-			i += literalStringLen(s[i:])
-		case '[', '{':
-			depth++
-			i++
-		case ']':
-			depth--
-			i++
-		case ',', '}':
-			if depth == 0 {
-				for i > 0 && (s[i-1] == ' ' || s[i-1] == '\t') {
-					i--
-				}
-				return i
-			}
-			if c == '}' {
-				depth--
-			}
-			i++
-		case '#':
-			return -1
-		default:
-			i++
-		}
-	}
-	return -1
-}
-
-// setInlineEnvMarker — 인라인 env 대입 줄에 소유 표식을 심는다. 이미 있으면 **그 키의 값
-// 구간만** 바꾸고, 없으면 여는 중괄호 뒤에 더한다(내부가 비면 쉼표를 붙이지 않는다 — TOML은
-// 인라인 테이블의 후행 쉼표를 허용하지 않는다). 그 밖의 키는 원문 그대로 남는다. 값이
-// 문자열이 아니어도(정수·불리언·홑따옴표 등) 그 토큰을 표식 문자열로 갈아 끼운다 — 삽입이
-// 아니라 치환이라 중복 키가 생기지 않고, 그대로 두면 표식이 영영 현재 값이 되지 못해 doctor가
-// "경고 없는 표식없음"과 "무변경" 두 줄을 함께 내는 상태로 굳는다. **빈 문자열 값도 같다**:
-// 값 구간이 있으므로 제자리에서 현재 값으로 갱신한다. 값 토큰의 끝을 그 줄에서 찾지 못하는
-// 형태(여러 줄 값)와 여는 중괄호가 그 줄에 없는 형태만 원문을 그대로 둔다 — 그 판정은
-// inlineMarkerSpan이 돌려주는 (-1,-1)이 내린다.
+// setInlineEnvMarker — 인라인 env 대입에 소유 표식을 심는다(D92 소비자 2). 입력은 **논리
+// 엔트리**다 — 라인 하나로는 여러 줄 인라인 테이블을 열거할 수 없다.
+// 표식 마디가 이미 있으면 그 마디의 **값 구간만** 바꾼다. 값이 문자열이 아니어도(정수·불리언·
+// 홑따옴표 등) 그 토큰을 표식 문자열로 갈아 끼운다 — 삽입이 아니라 치환이라 중복 키가 생기지
+// 않고, 그대로 두면 표식이 영영 현재 값이 되지 못해 doctor가 "경고 없는 표식없음"과 "무변경"
+// 두 줄을 함께 내는 상태로 굳는다. **빈 문자열 값도 같다**: 값 구간이 있으므로 제자리에서
+// 현재 값으로 갱신한다.
 // 값으로 첫 일치를 치환하지 않는 이유: 표식과 **값이 같은** 사용자 키가 앞서 있으면 그 값이
 // 바뀌고 CTR_MANAGED는 옛 값으로 남는다 — 사용자 환경변수를 조용히 고치는 경로다.
-func setInlineEnvMarker(line []byte, old string, oldFound bool, marker, eol string) []byte {
-	s := trimEOL(line)
-	if oldFound {
-		if old == marker {
-			return line
+// 표식이 없으면 여는 중괄호 뒤에 더한다 — 내부가 비면 쉼표를 붙이지 않는다(TOML 1.0.0은
+// 인라인 테이블의 후행 쉼표를 금지한다). 삽입은 `open`·`close`가 **함께** 확정될 때만 서고
+// 빈 여부는 `len(sc.entries) == 0`이 정한다: 절반만 열거된 결과에 삽입하면 같은 인라인
+// 테이블에 키가 두 번 생긴다.
+// 구조가 확정되지 않으면 **엔트리 바이트를 그대로 옮긴다** — nil을 돌려주면 호출자의
+// append가 그 줄들을 산출에서 없애 사용자 값이 조용히 사라진다.
+func setInlineEnvMarker(lines [][]byte, e [2]int, marker string) []byte {
+	raw := func() []byte { // 원문 보존 — 실패 갈래는 엔트리 바이트를 그대로 옮긴다
+		var b []byte
+		for i := e[0]; i <= e[1]; i++ {
+			b = append(b, lines[i]...)
 		}
-		start, end := inlineMarkerSpan(s, codexMarkerKey)
-		if start < 0 {
-			return line
+		return b
+	}
+	sc := tomlScanInline(lines, e)
+	if !sc.ok || !sc.open.valid() || !sc.close.valid() {
+		return raw()
+	}
+	// 갱신 갈래 — segs==1이고 이름이 표식 키인 마디의 값 구간만 치환한다.
+	joined, at := codexEntryRaw(lines, e)
+	for _, en := range sc.entries {
+		if en.segs != 1 || strings.Trim(tomlSpanText(joined, at, e, en.key), `"'`) != codexMarkerKey {
+			continue
 		}
-		return []byte(s[:start] + `"` + marker + `"` + s[end:] + eol)
+		return spliceInlineSpan(lines, e, en.value, `"`+marker+`"`)
 	}
-	open := strings.Index(s, "{")
-	last := strings.LastIndex(s, "}")
-	if open < 0 || last < open {
-		return line // 여러 줄 인라인 등 우리가 다루지 않는 형태 — 원문 보존
-	}
-	// 빈 여부는 여는 중괄호 뒤 첫 비공백 토큰으로 판정한다(T3-F3) — LastIndex(s, "}")를 경계로
-	// 쓰면 후행 주석 안의 '}'(예: `env = {} # }`)를 닫는 중괄호로 오인해, 실제로는 빈 테이블인데
-	// 내용이 있다고 보고 쉼표를 붙인다 — `{ CTR_MANAGED = "…",}`는 TOML이 금지하는 후행 쉼표다.
+	// 삽입 갈래 — 여는 중괄호 **바로 뒤**에 ` KEY = "marker"<sep>`를 끼운다.
 	sep := ","
-	j := open + 1
-	for j < len(s) && (s[j] == ' ' || s[j] == '\t') {
-		j++
-	}
-	if j < len(s) && s[j] == '}' {
+	if len(sc.entries) == 0 {
 		sep = ""
 	}
-	return []byte(s[:open+1] + " " + codexMarkerKey + ` = "` + marker + `"` + sep + s[open+1:] + eol)
+	ins := tomlSpan{start: tomlPoint{line: sc.open.line, col: sc.open.col + 1}, end: tomlPoint{line: sc.open.line, col: sc.open.col + 1}}
+	return spliceInlineSpan(lines, e, ins, " "+codexMarkerKey+` = "`+marker+`"`+sep)
+}
+
+// spliceInlineSpan — 논리 엔트리의 [sp.start, sp.end) 파일 좌표 구간을 repl로 갈아 끼우고
+// 엔트리 전체를 라인 종결자까지 원문 그대로 배출한다. 구간이 빈 지점이면 삽입이다.
+// **줄 종결자를 새로 만들지 않는다** — 원문 라인을 그대로 옮기므로 CRLF도 마지막 줄 종결자
+// 없음도 자동으로 옳다(v0.17 §1.4-라가 종결자 재생성에서 물린 자리다).
+func spliceInlineSpan(lines [][]byte, e [2]int, sp tomlSpan, repl string) []byte {
+	if !sp.start.valid() || !sp.end.valid() || sp.start.line < e[0] || sp.end.line > e[1] {
+		var b []byte
+		for i := e[0]; i <= e[1]; i++ {
+			b = append(b, lines[i]...)
+		}
+		return b
+	}
+	var b []byte
+	for i := e[0]; i <= e[1]; i++ {
+		switch {
+		case i < sp.start.line || i > sp.end.line:
+			b = append(b, lines[i]...)
+		case i == sp.start.line:
+			b = append(b, lines[i][:sp.start.col]...)
+			b = append(b, repl...)
+			if i == sp.end.line {
+				b = append(b, lines[i][sp.end.col:]...)
+			}
+		case i == sp.end.line:
+			b = append(b, lines[i][sp.end.col:]...)
+		}
+		// 구간 안쪽 줄(start.line < i < end.line)은 통째로 사라진다 — 그것이 치환의 정의다.
+	}
+	return b
 }
 
 // codexTableBody — 관리 테이블 구간의 새 내용(소유 키 + 보존 라인). 기존 테이블이면 헤더
@@ -1486,10 +1410,16 @@ func codexTableBody(lines [][]byte, sp codexSpan, view codexTableView, profiles 
 		keep = append(append(append([]int{}, keep...), view.argsLines...), view.toolsLines...)
 		slices.Sort(keep)
 	}
+	// 인라인 env는 엔트리 **첫 줄**에서 엔트리 전체를 내보내고 나머지 줄을 건너뛴다 —
+	// 건너뛰지 않으면 여러 줄 엔트리의 뒷줄이 두 번 나간다(view.keep은 엔트리의 모든 줄을 담는다).
+	skipTo := -1
 	for _, i := range keep {
+		if i <= skipTo {
+			continue
+		}
 		if i == view.inlineEnv {
-			old, found := tomlInlineValue(codexValueText(lines[i]), codexMarkerKey)
-			b = append(b, setInlineEnvMarker(lines[i], old, found, marker, eol)...)
+			b = append(b, setInlineEnvMarker(lines, view.inlineEnvEntry, marker)...)
+			skipTo = view.inlineEnvEntry[1]
 			continue
 		}
 		b = append(b, lines[i]...)
