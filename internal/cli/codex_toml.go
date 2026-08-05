@@ -174,8 +174,14 @@ type tomlLineScanner struct {
 	depth     int  // 여러 줄 배열 [ ] · 인라인 테이블 { } 균형
 }
 
+// inString — 앞 줄에서 시작한 여러 줄 문자열 안인가. open()과 달리 괄호 깊이를 보지
+// 않는다 — 주석 절단을 결정하는 것은 문자열 상태뿐이고(D92 계약 6), 인라인 깊이가
+// depth에 든 뒤로 open()은 여러 줄 배열·인라인 테이블의 이어지는 줄에서도 참이다.
+// 그 줄의 후행 주석은 진짜 주석이므로 잘라야 한다.
+func (s *tomlLineScanner) inString() bool { return s.inBasic || s.inLiteral }
+
 // open — 이 줄이 앞 줄에서 시작한 여러 줄 값 안인가(헤더·키 판정을 하면 안 되는 상태).
-func (s *tomlLineScanner) open() bool { return s.inBasic || s.inLiteral || s.depth > 0 }
+func (s *tomlLineScanner) open() bool { return s.inString() || s.depth > 0 }
 
 // step — 라인 하나를 소비한다. boundary는 이 줄이 테이블 경계인지, name은 단일 대괄호
 // 헤더일 때의 정규화된 이름이다([[배열 테이블]]도 경계이지만 이름은 비운다 — 우리 이름이
@@ -507,6 +513,60 @@ func codexEntryText(lines [][]byte, e [2]int) string {
 		joined += codexValueText(lines[i])
 	}
 	return joined
+}
+
+// codexEntryRaw — 논리 엔트리를 **원문 바이트로** 잇고, 각 물리 라인 조각의 시작 오프셋을
+// 함께 낸다. `codexEntryText`와 달리 공백을 지우지 않는다 — 그 산출 위의 오프셋은 파일의
+// 어느 바이트도 가리키지 않으므로 되쓰기에 쓸 수 없고, 같은 정규화가 따옴표 안 공백을 지워
+// `"e n v"`를 `env`로 읽게 만든다(스펙 §1.2 잔여 ②).
+//
+// 자르는 것은 **문자열 밖 주석뿐**이며 물리 라인마다 자른다(codexEntryText와 같은 계약) —
+// 이은 문자열에서 한 번만 자르면 여러 줄 배열의 첫 주석 뒤에 있는 진짜 원소가 사라진다.
+// 종결자도 뗀다: 라인 조각은 `[0, 주석위치)`의 **접두 슬라이스**이므로 CRLF도 마지막 줄
+// 종결자 없음도 접미 절단으로 함께 처리된다.
+//
+// **접두는 떼지 않는다.** trimBOM은 접두 절단이라 되사상을 깨는데(실측: off=0 → (0,0)에서
+// 원문 0xEF와 joined 'e'가 어긋난다), 엔트리 첫 줄은 codexEntries가 sp.start+1부터 세므로
+// 파일 0행이 될 수 없고 BOM은 0행 선두에만 있다 — 뗄 이유가 없다.
+//
+// **주석 절단은 이월된 문자열 상태가 결정한다**(스펙 §0 D92 계약 6). 무상태
+// stripTrailingComment를 라인마다 부르면 여러 줄 기본 문자열 안의 '#'을 주석으로 잘라 그 뒤
+// 바이트를 잃는다(실측: env = { A = """\nabc # def\n""" }가 '# def'와 그 뒤를 잃는다).
+// tomlLineScanner가 이미 inBasic·inLiteral을 들고 있으므로 **그 걸음을 재사용한다** — 새
+// 상태 기계를 세우면 같은 파일을 두 방식으로 읽는 셈이다.
+// 알려진 한계: 상태는 **줄 머리에서만** 본다. 여러 줄 문자열이 닫히는 그 줄의 후행 주석은
+// 잘리지 않는다 — 그 자리는 언제나 닫는 중괄호 뒤이므로 열거형이 보는 구간 밖이다.
+func codexEntryRaw(lines [][]byte, e [2]int) (string, []int) {
+	var b strings.Builder
+	var sc tomlLineScanner // """·''' 열림을 라인 사이로 이월한다
+	at := make([]int, 0, e[1]-e[0]+1)
+	for i := e[0]; i <= e[1]; i++ {
+		at = append(at, b.Len())
+		s := trimEOL(lines[i])
+		if sc.inString() { // 여러 줄 문자열 안이면 이 줄에 주석이 없다
+			b.WriteString(s)
+		} else {
+			b.WriteString(stripTrailingComment(s))
+		}
+		sc.step(lines[i])
+	}
+	return b.String(), at
+}
+
+// codexPointAt — codexEntryRaw가 낸 오프셋을 파일 좌표로 되돌린다. 라인 조각이 접두
+// 슬라이스이므로 `col = off - at[k]`가 곧 그 줄 안의 바이트 오프셋이다.
+// 범위 밖 오프셋은 무효 지점이다 — 소비자가 그 값으로 스플라이스하지 않게 한다.
+// **상한을 joinedLen으로 받는다**: 하한만 보면 임의의 큰 오프셋이 유효 좌표가 되고(실측:
+// off=9999가 {line:0 col:9999} valid=true), 그 좌표로 스플라이스하면 패닉이다.
+func codexPointAt(e [2]int, at []int, joinedLen, off int) tomlPoint {
+	if off < 0 || off > joinedLen || len(at) == 0 || off < at[0] {
+		return tomlNoPoint()
+	}
+	k := len(at) - 1
+	for k > 0 && at[k] > off {
+		k--
+	}
+	return tomlPoint{line: e[0] + k, col: off - at[k]}
 }
 
 // codexEscapedKeyInSpans — 우리 두 구간 안에 정규화 불가 키 표기가 있는가(D87).
