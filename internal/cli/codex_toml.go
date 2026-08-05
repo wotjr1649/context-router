@@ -361,8 +361,9 @@ func codexEntries(lines [][]byte, sp codexSpan) [][2]int {
 	return out
 }
 
-// codexKeyName — 정규화 라인에서 대입 키 이름을 뽑는다(따옴표 키도 벗긴다). 따옴표로 시작하는
-// 키는 첫 '='가 아니라 **닫는 따옴표 뒤**에서 '='를 찾는다(T3-F1) — 첫 '=' 무조건 분리로는
+// codexKeyName — 대입 키 이름을 뽑는다(따옴표 키도 벗긴다). 문자열 밖 공백을 무시하므로
+// 정규화 입력에서의 답이 전과 같고, 원문 입력에서도 같다. 따옴표로 시작하는 키는 첫 '='가
+// 아니라 **닫는 따옴표 뒤**에서 '='를 찾는다(T3-F1) — 첫 '=' 무조건 분리로는
 // 따옴표 키 안의 '='가 이름을 조기 절단해 사용자 키 `"args=x" = "y"`가 예약어 "args"로
 // 오분류되고, codexReadTable의 continue 세 곳과 codexEnvBody의 표식 건너뛰기가 그 줄을 보존
 // 목록에서 빼 재기입 때 조용히 지운다. basicStringLen·literalStringLen로 닫는 따옴표를 찾는다 —
@@ -514,8 +515,9 @@ func codexValueText(line []byte) string {
 
 // codexEntryText — 논리 엔트리의 라인들을 값 판독용 정규화로 잇는다. **줄마다** 자르는 것이
 // 계약이다 — 주석은 그 물리 라인의 끝까지이므로, 이은 문자열에서 한 번만 자르면 여러 줄 배열의
-// 첫 주석 뒤에 있는 진짜 원소가 통째로 사라진다. 키·값을 읽는 네 자리가 이 하나를 공유한다 —
-// 갈리면 같은 파일을 여러 방식으로 읽는 셈이다.
+// 첫 주석 뒤에 있는 진짜 원소가 통째로 사라진다. **값 판독 전용 경로**다 — 남은 두 호출부
+// (codexReadTable·codexMarkerValue)가 값만 여기서 읽고, 키는 codexEntryRaw가 읽는다. 둘이
+// 갈리면 같은 엔트리를 두 기준으로 읽는 셈이다.
 func codexEntryText(lines [][]byte, e [2]int) string {
 	joined := ""
 	for i := e[0]; i <= e[1]; i++ {
