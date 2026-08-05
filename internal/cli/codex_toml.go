@@ -80,7 +80,7 @@ func (a codexAnomaly) reason() string {
 	case anomalyDupHeader:
 		return "관리 테이블 헤더가 둘 이상입니다(TOML 중복 정의) — 하나만 남기고 지우세요"
 	case anomalyScannerOpen:
-		return "파일 끝에서 여러 줄 문자열 또는 배열이 닫히지 않았습니다 — 닫은 뒤 재실행하세요"
+		return "파일 끝에서 여러 줄 문자열·배열 또는 인라인 테이블이 닫히지 않았습니다 — 닫은 뒤 재실행하세요"
 	case anomalyEscapedKey:
 		return "관리 테이블 안의 키가 이스케이프 표기로 적혀 있습니다 — 보통 표기(예: command)로 바꾸세요"
 	case anomalyOutsideConflict:
@@ -171,7 +171,7 @@ const (
 type tomlLineScanner struct {
 	inBasic   bool // """ 열림
 	inLiteral bool // ''' 열림
-	depth     int  // 여러 줄 배열 [ ] 균형
+	depth     int  // 여러 줄 배열 [ ] · 인라인 테이블 { } 균형
 }
 
 // open — 이 줄이 앞 줄에서 시작한 여러 줄 값 안인가(헤더·키 판정을 하면 안 되는 상태).
@@ -231,10 +231,10 @@ func (s *tomlLineScanner) advance(line string, header bool) {
 			i += basicStringLen(line[i:])
 		case line[i] == '\'':
 			i += literalStringLen(line[i:])
-		case line[i] == '[' && !header:
+		case (line[i] == '[' || line[i] == '{') && !header:
 			s.depth++
 			i++
-		case line[i] == ']' && !header:
+		case (line[i] == ']' || line[i] == '}') && !header:
 			if s.depth > 0 {
 				s.depth--
 			}
