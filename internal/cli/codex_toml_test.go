@@ -2124,3 +2124,106 @@ func TestTomlScanInlineMultiline(t *testing.T) {
 		})
 	}
 }
+
+// TestCodexInlineInsertMultiline — 여러 줄로 이어진 인라인 env에 표식이 **없으면** 여는
+// 중괄호 뒤에 삽입한다. 현행은 라인 하나만 받으므로 이 형태에서 여는 중괄호가 있는 줄만 보고
+// 나머지 줄을 잃거나(줄 단위 되쓰기) 원문 보존으로 빠져 표식이 영영 서지 않았다.
+func TestCodexInlineInsertMultiline(t *testing.T) {
+	src := "[mcp_servers.ctr]\ncommand = \"context-router\"\nenv = { A = \"1\",\n  B = \"2\" }\n"
+	res := installCodexConfigBlock([]byte(src), codexInstallRequest{Marker: hookMarker("0.18.0")})
+	if !strings.Contains(string(res.Out), hookMarker("0.18.0")) {
+		t.Errorf("표식이 삽입되지 않았다:\n%s", res.Out)
+	}
+	if strings.Count(string(res.Out), codexMarkerKey) != 1 {
+		t.Errorf("표식이 %d번 들어갔다:\n%s", strings.Count(string(res.Out), codexMarkerKey), res.Out)
+	}
+	for _, keep := range []string{`A = "1"`, `B = "2"`} {
+		if !strings.Contains(string(res.Out), keep) {
+			t.Errorf("사용자 값 %s가 사라졌다:\n%s", keep, res.Out)
+		}
+	}
+	if !codexTOMLParses(res.Out) {
+		t.Errorf("산출이 파스되지 않는다:\n%s", res.Out)
+	}
+	again := installCodexConfigBlock(res.Out, codexInstallRequest{Marker: hookMarker("0.18.0")})
+	if !bytes.Equal(again.Out, res.Out) {
+		t.Errorf("멱등이 아니다:\n1: %s\n2: %s", res.Out, again.Out)
+	}
+}
+
+// TestSetInlineEnvMarkerPreservesOnFail — 구조가 확정되지 않으면 **논리 엔트리 바이트를 그대로**
+// 돌려준다. nil을 돌려주면 호출자의 b = append(b, setInlineEnvMarker(...)...)가 그 줄들을
+// 산출에서 **없앤다** — 사용자 값이 조용히 사라지고 남은 파일은 파스되지 않는다.
+// 새 시그니처를 직접 부른다: install 경로로만 재면 앞선 이탈 갈래에 가려 이 계약이 안 보인다.
+func TestSetInlineEnvMarkerPreservesOnFail(t *testing.T) {
+	for _, c := range []struct{ name, src string }{
+		{"닫히지 않음", "[mcp_servers.ctr]\nenv = { A = \"1\"\n"},
+		{"인라인 아님", "[mcp_servers.ctr]\nenv = []\n"},
+		{"쉼표 둘", "[mcp_servers.ctr]\nenv = { A = \"1\",, B = \"2\" }\n"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			lines := splitLinesKeepEnds([]byte(c.src))
+			e := [2]int{1, len(lines) - 1}
+			var want []byte
+			for i := e[0]; i <= e[1]; i++ {
+				want = append(want, lines[i]...)
+			}
+			if got := setInlineEnvMarker(lines, e, hookMarker("0.18.0")); !bytes.Equal(got, want) {
+				t.Errorf("원문이 보존되지 않았다:\ngot =%q\nwant=%q", got, want)
+			}
+		})
+	}
+}
+
+// TestCodexInlineInsertEmptyNoComma — 빈 인라인 테이블에는 쉼표를 붙이지 않는다(TOML 1.0.0이
+// 후행 쉼표를 금지한다). 빈 여부를 이제 열거 결과가 정하므로, 종전 "여는 중괄호 뒤 첫 비공백
+// 토큰" 판정이 지키던 계약이 전환 뒤에도 서는지 확인하는 회귀다.
+func TestCodexInlineInsertEmptyNoComma(t *testing.T) {
+	for _, src := range []string{
+		"[mcp_servers.ctr]\ncommand = \"context-router\"\nenv = {}\n",
+		"[mcp_servers.ctr]\ncommand = \"context-router\"\nenv = {} # }\n",
+	} {
+		res := installCodexConfigBlock([]byte(src), codexInstallRequest{Marker: hookMarker("0.18.0")})
+		if !codexTOMLParses(res.Out) {
+			t.Errorf("산출이 파스되지 않는다:\n%s", res.Out)
+		}
+		if strings.Contains(string(res.Out), ",}") || strings.Contains(string(res.Out), ", }") {
+			t.Errorf("빈 테이블에 후행 쉼표를 붙였다:\n%s", res.Out)
+		}
+	}
+}
+
+// TestCodexInlineMarkerSpliceCRLFPreserved — CRLF 보존은 지금까지 codexEntryRaw 층
+// (TestCodexEntryRawRoundTrip)에서만 재고 있었다 — installCodexConfigBlock을 거치는 갱신·삽입
+// 두 갈래에는 결속이 없었다. spliceInlineSpan은 원문 라인을 종결자째 그대로 옮기므로("줄
+// 종결자를 새로 만들지 않는다") CRLF도 자동으로 옳아야 한다는 것이 계약이다. 종결자를 합성하는
+// 회귀가 들어오면 "\r\n" 쌍을 전부 지운 나머지에 홑 \n(합성된 개행) 또는 홑 \r(짝을 잃은 개행)이
+// 남는다 — 그 잔여로 계약 위반을 잡는다.
+func TestCodexInlineMarkerSpliceCRLFPreserved(t *testing.T) {
+	for _, c := range []struct{ name, src string }{
+		// 갱신 갈래 — 표식이 이미 있고 옛 버전이다. 값 구간만 갈아 끼운다(여러 줄 인라인).
+		{"갱신", "[mcp_servers.ctr]\r\ncommand = \"context-router\"\r\nenv = { A = \"1\",\r\n  CTR_MANAGED = \"context-router/0.17.0\" }\r\n"},
+		// 삽입 갈래 — 표식이 없다. 여는 중괄호 뒤에 끼운다(여러 줄 인라인).
+		{"삽입", "[mcp_servers.ctr]\r\ncommand = \"context-router\"\r\nenv = { A = \"1\",\r\n  B = \"2\" }\r\n"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			res := installCodexConfigBlock([]byte(c.src), codexInstallRequest{Marker: hookMarker("0.18.0")})
+			if !strings.Contains(string(res.Out), hookMarker("0.18.0")) {
+				t.Errorf("표식이 서지 않았다:\n%q", res.Out)
+			}
+			if !strings.Contains(string(res.Out), `A = "1"`) {
+				t.Errorf("사용자 값이 사라졌다:\n%q", res.Out)
+			}
+			if rest := bytes.ReplaceAll(res.Out, []byte("\r\n"), nil); bytes.ContainsAny(rest, "\r\n") {
+				t.Errorf("종결자가 CRLF로 통일되지 않았다(홑 \\n 또는 짝 없는 \\r):\n%q", res.Out)
+			}
+			if !codexTOMLParses(res.Out) {
+				t.Errorf("산출이 파스되지 않는다:\n%s", res.Out)
+			}
+			again := installCodexConfigBlock(res.Out, codexInstallRequest{Marker: hookMarker("0.18.0")})
+			if !bytes.Equal(again.Out, res.Out) {
+				t.Errorf("2회차가 바이트 동일하지 않다:\n1: %q\n2: %q", res.Out, again.Out)
+			}
+		})
+	}
+}
