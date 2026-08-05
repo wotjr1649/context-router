@@ -11,9 +11,15 @@ package cli
 // 키 단위 약속이고 관리 키 넷의 물리 라인은 통째로 재생성되므로 그 줄의 주석은 사라진다 —
 // keepArgs 갈래(D81 되읽기 실패·D86 표식 전용)에서는 args·enabled_tools가 재생성되지 않고
 // 보존 라인(keep)으로 원문 그대로(주석 포함) 옮겨진다(codexTableBody). 인라인 env 경로는
-// 별개 예외다 — setInlineEnvMarker는 값 구간을 갱신하거나 표식을 삽입하며
-// 줄을 재생성하지 않으므로 그 줄의 주석이 남는다. 키별 값 스팬 판독기로 닫지 않는 이유는
-// 파서 비의존 원칙 아래에서 그 판독기의 정확성이 새 위험이 되기 때문이다.
+// 별개 예외다 — setInlineEnvMarker는 값 구간을 갱신하거나 표식을 삽입하며 줄을 재생성하지
+// 않으므로 **치환 구간 밖**의 주석이 남는다.
+//
+// **구간 안의 주석은 함께 사라진다** — 표식의 값이 여러 물리 라인에 걸치고 그 사이에 후행
+// 주석이 있으면(env = { CTR_MANAGED = [1, # note / 다음 줄 2] }) 그 주석은 codexEntryRaw가
+// 이미 잘라 낸 자리라 joined에서 연속인 값 구간이 파일 좌표에서는 연속이 아니고,
+// spliceInlineSpan이 그 사이 바이트를 함께 먹는다. **관리 키의 값에 붙은 주석**이므로 D88이
+// 이미 보존 대상에서 뺀 것과 같은 부류다(스펙 §2.1 P3의 예외 항). 키별 값 스팬 판독기로
+// 닫지 않는 이유는 파서 비의존 원칙 아래에서 그 판독기의 정확성이 새 위험이 되기 때문이다.
 
 import (
 	"bytes"
@@ -203,9 +209,16 @@ func (s *tomlLineScanner) step(line []byte) (boundary bool, name string) {
 	return boundary, name
 }
 
-// advance — 라인 내용을 훑어 여러 줄 상태를 갱신한다. 헤더 줄은 자기완결이라 배열 균형을
-// 세지 않는다 — 헤더의 대괄호가 배열 열림으로 잡히면 그 뒤 파일 전체가 값 안으로 들어간다.
-func (s *tomlLineScanner) advance(line string, header bool) {
+// advance — 라인 내용을 훑어 여러 줄 상태를 갱신하고, 이 줄의 **문자열 밖 '#' 위치**를
+// 돌려준다(없으면 len(line)). 헤더 줄은 자기완결이라 배열·인라인 테이블 균형을 세지 않는다 —
+// 헤더의 대괄호가 배열 열림으로 잡히면 그 뒤 파일 전체가 값 안으로 들어간다.
+//
+// 주석 자리를 함께 내는 것은 codexEntryRaw가 **줄 안에서 갱신된** 문자열 상태로 주석을 잘라야
+// 하기 때문이다: 여러 줄 문자열이 닫히는 그 줄의 뒤쪽 '#'은 진짜 주석인데 줄 머리 상태만 보면
+// 그것이 값 구간에 들어와 되쓰기가 함께 먹는다(실측: base는 그 줄을 보존했다). 새 상태 기계를
+// 세우지 않고 **이 걸음이 이미 아는 자리**를 내보낸다 — 두 문법이 갈리면 같은 파일을 두
+// 방식으로 읽는 셈이다. 반환값은 header와 무관하다: 그 인자는 괄호 깊이만 가른다.
+func (s *tomlLineScanner) advance(line string, header bool) int {
 	for i := 0; i < len(line); {
 		switch {
 		case s.inBasic:
@@ -224,13 +237,13 @@ func (s *tomlLineScanner) advance(line string, header bool) {
 				j++
 			}
 			if j >= len(line) {
-				return
+				return len(line)
 			}
 			s.inBasic, i = false, j+3
 		case s.inLiteral:
 			j := strings.Index(line[i:], "'''")
 			if j < 0 {
-				return
+				return len(line)
 			}
 			s.inLiteral, i = false, i+j+3
 		case strings.HasPrefix(line[i:], `"""`):
@@ -238,7 +251,7 @@ func (s *tomlLineScanner) advance(line string, header bool) {
 		case strings.HasPrefix(line[i:], "'''"):
 			s.inLiteral, i = true, i+3
 		case line[i] == '#':
-			return // 문자열 밖 주석 — 줄의 나머지는 값이 아니다
+			return i // 문자열 밖 주석 — 줄의 나머지는 값이 아니다
 		case line[i] == '"':
 			i += basicStringLen(line[i:])
 		case line[i] == '\'':
@@ -255,6 +268,7 @@ func (s *tomlLineScanner) advance(line string, header bool) {
 			i++
 		}
 	}
+	return len(line)
 }
 
 // basicStringLen — s[0]이 여는 큰따옴표일 때 닫는 따옴표까지의 길이(백슬래시 이스케이프
@@ -367,6 +381,20 @@ func codexEntries(lines [][]byte, sp codexSpan) [][2]int {
 	return out
 }
 
+// tomlUnquoteKey — 키 토큰의 따옴표를 **정확히 한 쌍만** 벗긴다. TOML은 bare 키와 그것을 같은
+// 종류의 따옴표 한 쌍으로 감싼 표기를 **같은 키**로 읽으므로 벗기는 폭이 딱 그만큼이어야 한다.
+// strings.Trim(키, 따옴표 둘)은 양끝의 따옴표를 **전부** 벗기므로 TOML이 별개 키로 읽는
+// 홑따옴표 안의 큰따옴표 표기가 우리 표식과 같아지고, 그러면 setInlineEnvMarker가 그 사용자
+// 값을 표식으로 덮어쓴다(실측: base는 표식을 따로 삽입하고 사용자 값을 보존한다).
+// **키를 비교하는 세 자리가 모두 이 하나를 지난다** — 자리마다 벗기는 규칙이 갈리면 같은
+// 바이트를 다르게 읽는 셈이고, 그것이 D92가 닫으려는 뿌리다.
+func tomlUnquoteKey(s string) string {
+	if n := len(s); n >= 2 && (s[0] == '"' || s[0] == '\'') && s[n-1] == s[0] {
+		return s[1 : n-1]
+	}
+	return s
+}
+
 // codexKeyName — 대입 키 이름을 뽑는다(따옴표 키도 벗긴다). 문자열 밖 공백을 무시하므로
 // 정규화 입력에서의 답이 전과 같고, 원문 입력에서도 같다. 따옴표로 시작하는 키는 첫 '='가
 // 아니라 **닫는 따옴표 뒤**에서 '='를 찾는다(T3-F1) — 첫 '=' 무조건 분리로는
@@ -396,7 +424,7 @@ func codexKeyName(s string) string {
 	if i <= 0 || i >= len(t) || t[i] != '=' {
 		return ""
 	}
-	return strings.Trim(strings.TrimSpace(t[:i]), `"'`)
+	return tomlUnquoteKey(strings.TrimSpace(t[:i]))
 }
 
 // tomlDottedEnvKey — 원문 LHS가 `env.<둘째 마디>` 점 경로인가(D90). head는 첫 마디가 env일 때
@@ -552,8 +580,12 @@ func codexEntryText(lines [][]byte, e [2]int) string {
 // 바이트를 잃는다(실측: env = { A = """\nabc # def\n""" }가 '# def'와 그 뒤를 잃는다).
 // tomlLineScanner가 이미 inBasic·inLiteral을 들고 있으므로 **그 걸음을 재사용한다** — 새
 // 상태 기계를 세우면 같은 파일을 두 방식으로 읽는 셈이다.
-// 알려진 한계: 상태는 **줄 머리에서만** 본다. 여러 줄 문자열이 닫히는 그 줄의 후행 주석은
-// 잘리지 않는다 — 그 자리는 언제나 닫는 중괄호 뒤이므로 열거형이 보는 구간 밖이다.
+// **상태는 줄 머리가 아니라 줄 안에서 본다.** "닫는 그 줄의 후행 주석은 언제나 닫는 중괄호
+// 뒤"라는 종전 단정은 실측으로 반증됐다 — `env = { A = """`⏎`x`⏎`""", CTR_MANAGED = "old" # keep`
+// 에서 그 주석은 값 구간 **안**으로 들어오고, 되쓰기가 그 줄의 주석과 줄바꿈을 함께 지웠다
+// (base는 보존했다). 그래서 문자열 상태를 이월한 채 **그 줄을 끝까지 걸어** 주석 자리를 받는다:
+// tomlLineScanner.advance가 이미 그 자리를 알고 있으므로 걸음을 새로 세우지 않고, 상태를
+// 버리는 복사본에 돌려 자리만 받는다(반환값은 header 인자와 무관하다).
 func codexEntryRaw(lines [][]byte, e [2]int) (string, []int) {
 	var b strings.Builder
 	var sc tomlLineScanner // """·''' 열림을 라인 사이로 이월한다
@@ -561,11 +593,8 @@ func codexEntryRaw(lines [][]byte, e [2]int) (string, []int) {
 	for i := e[0]; i <= e[1]; i++ {
 		at = append(at, b.Len())
 		s := trimEOL(lines[i])
-		if sc.inString() { // 여러 줄 문자열 안이면 이 줄에 주석이 없다
-			b.WriteString(s)
-		} else {
-			b.WriteString(stripTrailingComment(s))
-		}
+		head := sc // 줄 머리 상태의 복사본 — 주석 자리만 받고 상태 갱신은 step이 한다
+		b.WriteString(s[:head.advance(s, false)])
 		sc.step(lines[i])
 	}
 	return b.String(), at
@@ -1033,6 +1062,10 @@ func installCodexConfigBlock(existing []byte, req codexInstallRequest) codexInst
 	// 인라인 env 대입이 여는 중괄호 없이 다음 줄로 이어지면 setInlineEnvMarker가 그 줄을
 	// 보존하므로 marker가 영영 req.Marker와 같아지지 않고, 그런 파일은 무변경 재실행마다
 	// .bak이 다시 생겨 단일 슬롯 계약이 무의미해진다.
+	//
+	// **그 근거 상태 자체는 v0.18에서 도달 불가다** — 위 anomalyEnvNotTable 게이트가 정확히
+	// 그 형태(open 무효)에서 먼저 반환한다. 근거를 지우지 않고 남기는 이유는 비교가 방어로서
+	// 옳기 때문이다: 참으로 고정하면 게이트가 좁아지는 순간 그 상태가 조용히 새어 나간다.
 	out := spliceCodexLines(lines, edits, drop)
 	return gateCodexOutput(existing, codexInstallResult{
 		Out: out, State: mcpWritten,
@@ -1250,7 +1283,7 @@ func codexInlineMarker(lines [][]byte, e [2]int) (value string, found bool) {
 	}
 	joined, at := codexEntryRaw(lines, e)
 	for _, en := range sc.entries {
-		if en.segs != 1 || strings.Trim(tomlSpanText(joined, at, e, en.key), `"'`) != codexMarkerKey {
+		if en.segs != 1 || tomlUnquoteKey(tomlSpanText(joined, at, e, en.key)) != codexMarkerKey {
 			continue
 		}
 		v := tomlSpanText(joined, at, e, en.value)
@@ -1382,13 +1415,17 @@ func setInlineEnvMarker(lines [][]byte, e [2]int, marker string) []byte {
 		return b
 	}
 	sc := tomlScanInline(lines, e)
+	// **이 갈래는 생산에서 도달 불가다** — `!sc.ok`이면 open도 무효이고(계약 4),
+	// installCodexConfigBlock의 anomalyEnvNotTable 게이트가 그 상태에서 먼저 무변경으로
+	// 반환한다. 방어로 남긴다: 이 원시는 소비자가 더 붙는 자리이고, nil을 돌려주면 호출자의
+	// append가 엔트리 줄들을 산출에서 없앤다. T7의 테스트가 단위 수준에서 계속 지킨다.
 	if !sc.ok || !sc.open.valid() || !sc.close.valid() {
 		return raw()
 	}
 	// 갱신 갈래 — segs==1이고 이름이 표식 키인 마디의 값 구간만 치환한다.
 	joined, at := codexEntryRaw(lines, e)
 	for _, en := range sc.entries {
-		if en.segs != 1 || strings.Trim(tomlSpanText(joined, at, e, en.key), `"'`) != codexMarkerKey {
+		if en.segs != 1 || tomlUnquoteKey(tomlSpanText(joined, at, e, en.key)) != codexMarkerKey {
 			continue
 		}
 		return spliceInlineSpan(lines, e, en.value, `"`+marker+`"`)
@@ -1624,6 +1661,30 @@ func tomlScanInline(lines [][]byte, e [2]int) tomlInlineScan {
 	joined, at := codexEntryRaw(lines, e)
 	pt := func(off int) tomlPoint { return codexPointAt(e, at, len(joined), off) }
 
+	// oneLineTok — joined[off]에서 시작하는 **한 줄** 문자열 토큰의 길이. 그 토큰이 조각
+	// 경계(at)를 넘으면 -1이고 호출자가 그 자리에서 fail로 빠진다.
+	//
+	// codexEntryRaw는 물리 라인 조각을 **경계 표시 없이** 잇는다. 그래서 줄 끝까지 닫히지 않은
+	// 한 줄 문자열이 다음 줄의 따옴표와 한 토큰으로 융합되고, 그 값 구간을 스플라이스하면 사이의
+	// 물리 라인이 통째로 지워진다(실측: `env = { CTR_MANAGED = "old` 다음 줄 `KEEPME"`에서
+	// base는 그 줄을 보존하고 HEAD는 지웠다). TOML은 한 줄 문자열의 줄바꿈을 금지하므로 그
+	// 융합은 언제나 오독이다 — fail로 빠지면 소비자가 원문 바이트를 그대로 옮긴다.
+	//
+	// **여러 줄 문자열은 넘어도 된다** — 그쪽은 값 스캔이 tomlTripleLen으로 먼저 걸러 여기
+	// 오지 않으며, 재기준선 행 6이 여러 줄 값의 갱신을 요구한다.
+	oneLineTok := func(off int) int {
+		n := literalStringLen(joined[off:])
+		if joined[off] == '"' {
+			n = basicStringLen(joined[off:])
+		}
+		for _, a := range at {
+			if a > off && a < off+n {
+				return -1
+			}
+		}
+		return n
+	}
+
 	i := tomlTopLevelEq(joined)
 	if i < 0 {
 		return fail
@@ -1662,10 +1723,12 @@ func tomlScanInline(lines [][]byte, e [2]int) tomlInlineScan {
 		keyStart := i
 		for i < len(joined) && joined[i] != '=' {
 			switch joined[i] {
-			case '"':
-				i += basicStringLen(joined[i:])
-			case '\'':
-				i += literalStringLen(joined[i:])
+			case '"', '\'':
+				n := oneLineTok(i)
+				if n < 0 {
+					return fail
+				}
+				i += n
 			default:
 				i++
 			}
@@ -1708,10 +1771,12 @@ func tomlScanInline(lines [][]byte, e [2]int) tomlInlineScan {
 				continue
 			}
 			switch c {
-			case '"':
-				i += basicStringLen(joined[i:])
-			case '\'':
-				i += literalStringLen(joined[i:])
+			case '"', '\'':
+				n := oneLineTok(i)
+				if n < 0 {
+					return fail
+				}
+				i += n
 			case '{', '[':
 				stack = append(stack, c)
 				i++
