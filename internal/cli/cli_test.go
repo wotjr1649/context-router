@@ -3506,6 +3506,49 @@ func TestDoctorCodexDottedInlineReason(t *testing.T) {
 	}
 }
 
+// TestCodexEnvNotTableStopsInstall — 재기준선 행 4. env 우변이 인라인 테이블이 아니면 넷이
+// **함께** 멈춘다: 상태·[16] 라벨·MCP 확정(가드 등록)·프로필 기입. 지금까지는 codexKeyName이
+// env를 읽어 정상 갈래로 흘러 command·args·enabled_tools가 실제로 기입되고 MCP가 확정돼
+// 가드까지 등록됐다 — 상태만 바꾸고 그 결합을 두면 사용자는 "무변경"과 "가드 등록됨"을
+// 동시에 본다.
+func TestCodexEnvNotTableStopsInstall(t *testing.T) {
+	home := isolateCodexHome(t)
+	src := "[mcp_servers.ctr]\ncommand = \"context-router\"\nenv = []\n"
+	writeCodexConfig(t, home, src)
+	proj := t.TempDir()
+
+	var out bytes.Buffer
+	if err := runHookInstall([]string{"--codex"}, t.TempDir(), "", false, proj, "0.18.0", &out); err != nil {
+		t.Fatalf("install: %v", err)
+	}
+	// ① 프로필 미기입 — config.toml이 바이트 동일해야 한다.
+	got, err := os.ReadFile(filepath.Join(home, "config.toml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != src {
+		t.Errorf("무변경 이탈인데 config.toml이 바뀌었다:\n%s", got)
+	}
+	// ② 가드 미등록 — MCP가 확정되지 않았으므로 hooks.json에 우리 PreToolUse 그룹이 없다.
+	if hooks, hErr := os.ReadFile(filepath.Join(home, "hooks.json")); hErr == nil {
+		if bytes.Contains(hooks, []byte("PreToolUse")) {
+			t.Errorf("MCP 미확정인데 가드가 등록됐다:\n%s", hooks)
+		}
+	}
+	// ③ 설치 보고에 사유가 실린다.
+	if !strings.Contains(out.String(), anomalyEnvNotTable.reason()) {
+		t.Errorf("설치 보고에 사유가 없다:\n%s", out.String())
+	}
+	// ④ [16] 라벨과 [20] 사유 — doctor가 같은 사유를 낸다.
+	dout, _ := doctorOut(t, proj, false)
+	if !strings.Contains(dout, "[16] warning: "+anomalyEnvNotTable.reason()) {
+		t.Errorf("[16] 사유 줄이 없다:\n%s", dout)
+	}
+	if !strings.Contains(dout, "[20] codex: "+anomalyEnvNotTable.reason()) {
+		t.Errorf("[20] 사유 줄이 없다:\n%s", dout)
+	}
+}
+
 // TestDoctorCodexBOMHeader — 문면 결속. BOM이 우리 헤더 줄에 붙은 파일을 doctor가
 // `테이블=이상` + "관리 테이블 밖에 ctr 관련 정의가 있습니다 — 수동으로 정리한 뒤 재실행하세요"로
 // 부르면, **우리가 만든 파일에 편집기가 세 바이트를 붙였을 뿐인 사용자에게 자기 파일을
