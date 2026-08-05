@@ -1852,3 +1852,66 @@ func TestCodexEntryRawCarriesStringState(t *testing.T) {
 		t.Errorf("문자열 뒤 닫는 중괄호가 사라졌다: %q", joined)
 	}
 }
+
+// TestCodexKeyNameIgnoresOutsideSpace — 키 추출은 문자열 밖 공백을 무시한다. 이 성질이
+// 없으면 원문 전환이 조용히 깨진다 — bare 키마다 후행 공백이 붙어 codexReadTable의 키
+// 분기가 전부 미스하고 codexEnvBody의 표식 줄 제외도 서지 않는다.
+func TestCodexKeyNameIgnoresOutsideSpace(t *testing.T) {
+	for _, c := range []struct{ in, want string }{
+		{`env = { A = "1" }`, "env"},
+		{`env={ A = "1" }`, "env"},
+		{`CTR_MANAGED = "x"`, "CTR_MANAGED"},
+		{`command = "ctr"`, "command"},
+		{`  args = ["x"]`, "args"},
+		{`"e n v" = { A = "1" }`, "e n v"}, // 따옴표 **안** 공백은 지우지 않는다(잔여 ②)
+		{`"args=x" = "y"`, "args=x"},       // 따옴표 키 안의 '='가 이름을 자르지 않는다
+		{`# 주석`, ""},
+		{`값만 있고 등호가 없다`, ""},
+	} {
+		if got := codexKeyName(c.in); got != c.want {
+			t.Errorf("codexKeyName(%q)=%q want %q", c.in, got, c.want)
+		}
+	}
+}
+
+// TestTomlKeyTokenHasEscapeIgnoresSpace — 이스케이프 키 검사도 같은 규칙을 쓴다.
+// 공백을 건너뛰지 않으면 D87의 이탈이 fail-open으로 뒤집혀, 정규화 불가 키를 담은 파일에
+// 우리가 기입하게 된다.
+func TestTomlKeyTokenHasEscapeIgnoresSpace(t *testing.T) {
+	for _, c := range []struct {
+		in   string
+		want bool
+	}{
+		{`"C:\t"=2`, true},
+		{`"C:\t" = 2`, true},  // 닫는 따옴표 **뒤** 공백
+		{` "C:\t" = 2`, true}, // **선행** 공백 — 원문 전환 뒤 인라인 마디는 ',' 다음에 공백이 온다
+		{"\t\"C:\\t\"\t=\t2", true},
+		{`"plain" = 2`, false},
+		{` bare = 2`, false},
+		{`  `, false},
+	} {
+		if got := tomlKeyTokenHasEscape(c.in); got != c.want {
+			t.Errorf("tomlKeyTokenHasEscape(%q)=%v want %v", c.in, got, c.want)
+		}
+	}
+}
+
+// TestCodexInlineQuotedSpaceKeyIsNotEnv — 재기준선 행 3의 **설치 수준** 결속. 헬퍼 단위
+// 테스트만 두면 호출부가 정규화에 남아 있어도 초록이라, 잔여 ②가 배송되지 않은 채 통과한다
+// (실측: 헬퍼만 고친 상태에서 아래 픽스처에 우리 표식이 기입된다). 점 표기 형태는
+// TestCodexDottedEnvQuotedSpaceIsNotEnv가 이미 잡지만 인라인 형태에는 결속이 없었다.
+func TestCodexInlineQuotedSpaceKeyIsNotEnv(t *testing.T) {
+	src := "[mcp_servers.ctr]\ncommand = \"context-router\"\n\"e n v\" = { A = \"1\" }\n"
+	res := installCodexConfigBlock([]byte(src), codexInstallRequest{Marker: hookMarker("0.18.0")})
+	// 그 줄이 **바이트 동일**하게 살아 있어야 한다 — 표식이 기입되면 줄이 길어져 물린다.
+	if !strings.Contains(string(res.Out), "\n\"e n v\" = { A = \"1\" }\n") {
+		t.Errorf("남의 테이블 대입이 원문 그대로가 아니다:\n%s", res.Out)
+	}
+	// 표식은 우리 env 서브테이블에 새로 서야 한다 — "아무것도 안 한다"로 접히지 않게 잡는다.
+	if !strings.Contains(string(res.Out), "["+codexManagedEnv+"]") {
+		t.Errorf("우리 env 서브테이블이 서지 않았다:\n%s", res.Out)
+	}
+	if !codexTOMLParses(res.Out) {
+		t.Errorf("산출이 파스되지 않는다:\n%s", res.Out)
+	}
+}

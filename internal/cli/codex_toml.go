@@ -370,20 +370,25 @@ func codexEntries(lines [][]byte, sp codexSpan) [][2]int {
 // 아니다). 주석 줄은 '#'로 시작하므로 우리 키 이름과 절대 같아지지 않는다 — 주석은 언제나
 // 보존 라인으로 간다.
 func codexKeyName(s string) string {
-	if s == "" {
+	t := strings.TrimLeft(s, " \t")
+	if t == "" {
 		return ""
 	}
-	i := strings.Index(s, "=")
-	switch s[0] {
+	i := strings.Index(t, "=")
+	switch t[0] {
 	case '"':
-		i = basicStringLen(s)
+		i = basicStringLen(t)
 	case '\'':
-		i = literalStringLen(s)
+		i = literalStringLen(t)
 	}
-	if i <= 0 || i >= len(s) || s[i] != '=' {
+	// 닫는 따옴표 뒤의 공백을 건너뛴 자리에 '='가 있어야 키 줄이다.
+	for i > 0 && i < len(t) && (t[i] == ' ' || t[i] == '\t') {
+		i++
+	}
+	if i <= 0 || i >= len(t) || t[i] != '=' {
 		return ""
 	}
-	return strings.Trim(s[:i], `"'`)
+	return strings.Trim(strings.TrimSpace(t[:i]), `"'`)
 }
 
 // tomlDottedEnvKey — 원문 LHS가 `env.<둘째 마디>` 점 경로인가(D90). head는 첫 마디가 env일 때
@@ -451,11 +456,12 @@ func tomlTopLevelEq(s string) int {
 	return -1
 }
 
-// tomlKeyTokenHasEscape — 정규화 문자열 s의 **맨 앞이 따옴표 키 표기**이고 그 안에 역슬래시가
-// 있는가(D87). TOML 기본 문자열 키는 이스케이프를 디코드하므로 그런 표기는 우리 키와 **같은
-// 키**가 될 수 있는데 codexKeyName은 이스케이프를 해석하지 않아 알아보지 못한다.
+// tomlKeyTokenHasEscape — 문자열 s의 **맨 앞이 따옴표 키 표기**이고 그 안에 역슬래시가
+// 있는가(D87). 문자열 밖 공백은 codexKeyName과 **같은 규칙**으로 무시한다 — 정규화가 하던
+// 일을 그 규칙이 그대로 하므로 정규화 입력에서의 답이 전과 같고, 원문 입력에서도 같다.
 // 홑따옴표(리터럴) 키에는 이스케이프가 없으므로 대상이 아니다.
 func tomlKeyTokenHasEscape(s string) bool {
+	s = strings.TrimLeft(s, " \t")
 	if s == "" || s[0] != '"' {
 		return false
 	}
@@ -463,14 +469,17 @@ func tomlKeyTokenHasEscape(s string) bool {
 	if n < 2 || s[n-1] != '"' {
 		return false // 미종료 문자열 — 우리가 다루지 않는 형태(다른 사유가 잡는다)
 	}
+	q := n // 닫는 따옴표 **뒤** 인덱스를 고정한다 — 마지막 슬라이스가 이 전제 위에 선다
+	for n < len(s) && (s[n] == ' ' || s[n] == '\t') {
+		n++
+	}
 	// 닫는 따옴표 뒤에 '='가 와야 **키**다. 이 검사가 없으면 값이 키로 오인된다 — 배열 원소의
 	// Windows 경로(args = ["--store-root", "C:\ctr"])가 대표 형태이고, 그러면 그 사용자의
-	// install·uninstall·--fix가 영구 무변경으로 굳는다. 정규화(stripLine)가 공백을 지우므로
-	// 키와 '=' 사이에 공백이 없다 — tomlKeyLen·tomlInlineValue가 쓰는 것과 같은 전제다.
+	// install·uninstall·--fix가 영구 무변경으로 굳는다.
 	if n >= len(s) || s[n] != '=' {
 		return false
 	}
-	return strings.Contains(s[1:n-1], `\`)
+	return strings.Contains(s[1:q-1], `\`)
 }
 
 // stripTrailingComment — 정규화 문자열에서 **문자열 밖** '#'부터를 잘라 낸다(D87 오탐 방지).
@@ -587,17 +596,17 @@ func codexEscapedKeyInSpans(lines [][]byte, sp codexSpans) bool {
 			continue
 		}
 		for _, e := range codexEntries(lines, span) {
-			// 주석은 codexEntryText가 이미 잘라 냈다 — 주석 안의 키 모양까지 잡으면
+			// 주석은 codexEntryRaw가 이미 잘라 냈다 — 주석 안의 키 모양까지 잡으면
 			// `env = { A = "1" } # TODO: , "C:\t" = 2` 같은 정상 파일이 이상이 된다.
-			joined := codexEntryText(lines, e)
-			if tomlKeyTokenHasEscape(joined) {
+			raw, _ := codexEntryRaw(lines, e)
+			if tomlKeyTokenHasEscape(raw) {
 				return true
 			}
-			if codexKeyName(joined) != "env" {
+			if codexKeyName(raw) != "env" {
 				continue
 			}
-			for j := 0; j < len(joined); j++ {
-				if (joined[j] == '{' || joined[j] == ',') && tomlKeyTokenHasEscape(joined[j+1:]) {
+			for j := 0; j < len(raw); j++ {
+				if (raw[j] == '{' || raw[j] == ',') && tomlKeyTokenHasEscape(raw[j+1:]) {
 					return true
 				}
 			}
@@ -1135,12 +1144,13 @@ func codexReadTable(lines [][]byte, sp codexSpan) codexTableView {
 		return view
 	}
 	for _, e := range codexEntries(lines, sp) {
+		raw, _ := codexEntryRaw(lines, e)
 		joined := codexEntryText(lines, e)
 		values := []string(nil)
-		if eq := strings.Index(joined, "="); eq >= 0 {
-			values = tomlStringList(joined[eq+1:])
+		if eq := tomlTopLevelEq(raw); eq >= 0 {
+			values = tomlStringList(joined[strings.Index(joined, "=")+1:])
 		}
-		switch codexKeyName(joined) {
+		switch codexKeyName(raw) {
 		case "command":
 			if len(values) > 0 {
 				view.command = values[0]
@@ -1252,10 +1262,11 @@ func tomlInlineValue(s, key string) (value string, found bool) {
 func codexMarkerValue(lines [][]byte, sp codexSpans, view codexTableView) (string, bool) {
 	if sp.env.found {
 		for _, e := range codexEntries(lines, sp.env) {
-			joined := codexEntryText(lines, e)
-			if codexKeyName(joined) != codexMarkerKey {
+			raw, _ := codexEntryRaw(lines, e)
+			if codexKeyName(raw) != codexMarkerKey {
 				continue
 			}
+			joined := codexEntryText(lines, e)
 			if v := tomlStringList(joined[strings.Index(joined, "=")+1:]); len(v) > 0 {
 				return v[0], true
 			}
@@ -1509,7 +1520,7 @@ func codexEnvBody(lines [][]byte, sp codexSpan, marker, eol string, dropBegin, d
 		if e[0] == dropBegin || e[0] == dropEnd {
 			continue
 		}
-		if codexKeyName(codexEntryText(lines, e)) == codexMarkerKey {
+		if r, _ := codexEntryRaw(lines, e); codexKeyName(r) == codexMarkerKey {
 			continue
 		}
 		for i := e[0]; i <= e[1]; i++ {
