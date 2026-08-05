@@ -66,6 +66,10 @@ const (
 	// 반대다: 나머지는 사용자 파일을 고치라는 지시이고 이것은 **우리 결함의 자수**다.
 	anomalyOutputInvalid
 	anomalyDottedEnv // env 키가 점 표기로 적혀 표식을 쓸 자리가 없다(D90)
+	// anomalyEnvNotTable — env 우변이 인라인 테이블이 아니다(D92). 헤더도 표식도 붙일 자리가
+	// 없어 무변경으로 굳는데 게이트는 구문만 보므로 잡지 않는다 — 사용자가 install이 왜
+	// 아무것도 하지 않는지 알 수 있어야 한다.
+	anomalyEnvNotTable
 	// anomalyNotOwned — 관리 테이블이 있으나 우리 소유가 아니다(**제거 경로 전용**). install은
 	// 같은 상태를 mcpExistingHeader로 보고하므로 거기서 세우면 그 갈래의 문면이 뒤바뀐다.
 	anomalyNotOwned
@@ -89,6 +93,8 @@ func (a codexAnomaly) reason() string {
 		return "이 도구가 만든 결과가 유효한 TOML이 아니어서 기입하지 않았습니다 — 제품 결함이니 파일 형태와 함께 알려 주세요"
 	case anomalyDottedEnv:
 		return "env 키가 점 표기(env.NAME)로 적혀 있습니다 — [mcp_servers.ctr.env] 테이블로 옮긴 뒤 재실행하세요"
+	case anomalyEnvNotTable:
+		return "env 값이 인라인 테이블({ … })이 아닙니다 — [mcp_servers.ctr.env] 테이블이나 env = { … } 형태로 바꾼 뒤 재실행하세요"
 	case anomalyNotOwned:
 		return "관리 테이블이 남아 있으나 표식도 command도 우리 것이 아닙니다 — 사용자 등록으로 보고 건드리지 않았습니다. 직접 정리하세요"
 	}
@@ -961,6 +967,19 @@ func installCodexConfigBlock(existing []byte, req codexInstallRequest) codexInst
 		return codexInstallResult{
 			Out: existing, State: mcpMarkerAnomaly, TableFound: sp.table.found,
 			Anomaly: anomalyDottedEnv, InputParses: inputParses,
+			Tools: diag.Tools, ToolsPresent: diag.ToolsPresent,
+			WantTools: diag.WantTools, ArgsReadable: diag.ArgsReadable,
+		}
+	}
+	// D92 — env 우변이 인라인 테이블이 아니면 헤더를 붙일 자리도 표식을 심을 자리도 없다.
+	// tomlScanInline은 우변이 '{'가 아닐 때뿐 아니라 중괄호는 있으나 구조가 깨진 형태(쉼표
+	// 둘·빈 키·빈 값·짝 어긋난 괄호)에서도 open을 무효로 낸다(계약 4) — 그래서 이 이탈은
+	// "인라인 테이블이 아니다"보다 넓다. 게이트는 구문만 보므로 이런 입력을 잡지 않았고,
+	// install은 무변경으로 굳는데 사유가 없었다.
+	if view.inlineEnv >= 0 && !tomlScanInline(lines, view.inlineEnvEntry).open.valid() {
+		return codexInstallResult{
+			Out: existing, State: mcpMarkerAnomaly, TableFound: sp.table.found,
+			Anomaly: anomalyEnvNotTable, InputParses: inputParses,
 			Tools: diag.Tools, ToolsPresent: diag.ToolsPresent,
 			WantTools: diag.WantTools, ArgsReadable: diag.ArgsReadable,
 		}

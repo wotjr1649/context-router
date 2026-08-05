@@ -967,7 +967,7 @@ func TestCodexAnomalyReason(t *testing.T) {
 	for _, a := range []codexAnomaly{
 		anomalyDupHeader, anomalyScannerOpen, anomalyEscapedKey,
 		anomalyOutsideConflict, anomalyOutputInvalid, anomalyDottedEnv,
-		anomalyNotOwned,
+		anomalyEnvNotTable, anomalyNotOwned,
 	} {
 		r := a.reason()
 		if r == "" {
@@ -1358,6 +1358,38 @@ func TestCodexDottedInlineKeyExits(t *testing.T) {
 	}
 	if res.Changed {
 		t.Errorf("Changed가 참이다")
+	}
+}
+
+// TestCodexEnvNotInlineTable — env 우변이 인라인 테이블이 아니면 헤더도 표식도 없이 무변경으로
+// 굳고 게이트도 잡지 않아, 사용자는 install이 왜 아무것도 하지 않는지 알 수 없었다.
+func TestCodexEnvNotInlineTable(t *testing.T) {
+	for _, rhs := range []string{`[]`, `"x"`, `1`} {
+		src := "[mcp_servers.ctr]\ncommand = \"context-router\"\nenv = " + rhs + "\n"
+		res := installCodexConfigBlock([]byte(src), codexInstallRequest{Marker: hookMarker("0.18.0")})
+		if res.State != mcpMarkerAnomaly || res.Anomaly != anomalyEnvNotTable {
+			t.Errorf("env = %s: state=%d anomaly=%d want mcpMarkerAnomaly/anomalyEnvNotTable", rhs, res.State, res.Anomaly)
+		}
+		if string(res.Out) != src {
+			t.Errorf("env = %s: 무변경 이탈이 아니다:\n%s", rhs, res.Out)
+		}
+	}
+}
+
+// TestAnomalyEnvNotTableReasonUnique — 사유 문면은 서로 달라야 한다. 같으면 사용자가
+// 무엇을 고쳐야 하는지 갈리지 않는다.
+func TestAnomalyEnvNotTableReasonUnique(t *testing.T) {
+	r := anomalyEnvNotTable.reason()
+	if r == "" {
+		t.Fatal("사유 문면이 비어 있다")
+	}
+	for _, other := range []codexAnomaly{
+		anomalyDupHeader, anomalyScannerOpen, anomalyEscapedKey,
+		anomalyOutsideConflict, anomalyOutputInvalid, anomalyDottedEnv, anomalyNotOwned,
+	} {
+		if other.reason() == r {
+			t.Errorf("사유가 %d와 같다: %q", other, r)
+		}
 	}
 }
 
