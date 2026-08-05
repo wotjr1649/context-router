@@ -1169,16 +1169,19 @@ func TestCodexInlineMarkerNonStringValue(t *testing.T) {
 	marker := hookMarker("0.16.0")
 	cases := []struct {
 		name, src, want string
+		wantState       codexMCPState
 	}{
 		{
 			"정수 값 — 표식 문자열로 교체",
 			head + "env = { " + codexMarkerKey + " = 0 }\n",
 			head + "env = { " + codexMarkerKey + " = \"" + marker + "\" }\n",
+			mcpWritten,
 		},
 		{
 			"뒤 키는 원문 그대로",
 			head + "env = { " + codexMarkerKey + " = 0, PATH = \"/x\" }\n",
 			head + "env = { " + codexMarkerKey + " = \"" + marker + "\", PATH = \"/x\" }\n",
+			mcpWritten,
 		},
 		{
 			// 값 안의 쉼표·중괄호는 종결자가 아니다 — 부분 문자열로 끝을 찾으면 여기서 사용자
@@ -1186,26 +1189,30 @@ func TestCodexInlineMarkerNonStringValue(t *testing.T) {
 			"홑따옴표 값 안의 쉼표·중괄호",
 			head + "env = { " + codexMarkerKey + " = 'a,b}', X = 1 }\n",
 			head + "env = { " + codexMarkerKey + " = \"" + marker + "\", X = 1 }\n",
+			mcpWritten,
 		},
 		{
 			"여러 줄 값 — 다루지 않는 형태(무변경)",
 			head + "env = { " + codexMarkerKey + " = [1,\n2] }\n",
 			head + "env = { " + codexMarkerKey + " = [1,\n2] }\n",
+			mcpWritten,
 		},
 		{
 			// 후행 주석 안의 쉼표는 값 토큰의 종결자가 아니다(tomlInlineValueEnd의 '#' 갈래).
 			// 그 갈래가 없으면 값 구간이 주석 안까지 늘어나 주석 절반이 표식 문자열로 갈린다.
-			// 닫는 중괄호가 주석에 먹혀 이미 무효 TOML인 줄이므로 무변경이 계약이다.
+			// 닫는 중괄호가 주석에 먹혀 이미 무효 TOML인 줄이므로 무변경이 계약이다. 여는
+			// 중괄호가 EOF까지 닫히지 않으므로(T2) 스캐너가 열린 채 끝나 anomalyScannerOpen이다.
 			"주석 안의 쉼표 — 종결자가 아니다(무변경)",
 			head + "env = { " + codexMarkerKey + " = 0 # a, b\n",
 			head + "env = { " + codexMarkerKey + " = 0 # a, b\n",
+			mcpMarkerAnomaly,
 		},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			res := installCodexConfigBlock([]byte(c.src), codexInstallRequest{Marker: marker, MarkerOnly: true})
-			if res.State != mcpWritten {
-				t.Fatalf("state=%d want mcpWritten", res.State)
+			if res.State != c.wantState {
+				t.Fatalf("state=%d want %d", res.State, c.wantState)
 			}
 			if string(res.Out) != c.want {
 				t.Fatalf("got=%q\nwant=%q", res.Out, c.want)
@@ -1732,5 +1739,45 @@ func TestTomlPointInvalid(t *testing.T) {
 	}
 	if sc.entries[0].key.start.valid() || sc.entries[0].value.end.valid() {
 		t.Errorf("무효 지점으로 세운 구간이 유효하다: %+v", sc.entries[0])
+	}
+}
+
+// TestCodexEntriesMultilineInline — 중괄호로 이어진 인라인 테이블은 한 논리 엔트리다.
+// 지정 파서가 그 형태를 받으므로(TOML 1.1.0) 게이트의 비대칭 계약이 성립하는 유효 입력이고,
+// 갈라 잡으면 그 뒤 모든 판독이 반쪽 문자열을 본다.
+func TestCodexEntriesMultilineInline(t *testing.T) {
+	src := "[mcp_servers.ctr]\nenv = { A = \"a\",\n  CTR_MANAGED = \"m\" }\ncommand = \"x\"\n"
+	if !codexTOMLParses([]byte(src)) {
+		t.Fatalf("픽스처가 파스되지 않는다 — 유효 입력에서 재는 축이 아니게 된다")
+	}
+	lines := splitLinesKeepEnds([]byte(src))
+	sp := codexManagedSpans(lines)
+	got := codexEntries(lines, sp.table)
+	want := [][2]int{{1, 2}, {3, 3}}
+	if len(got) != len(want) {
+		t.Fatalf("엔트리 수=%d want %d: %v", len(got), len(want), got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("엔트리[%d]=%v want %v", i, got[i], want[i])
+		}
+	}
+}
+
+// TestTomlScannerInlineOpenAtEOF — 닫히지 않은 인라인 테이블은 EOF에서 열림이며 사유
+// 문면이 그 형태를 말해야 한다. 문면이 "문자열 또는 배열"만 말하면 사용자가 자기 파일에서
+// 무엇을 고쳐야 하는지 알 수 없다.
+func TestTomlScannerInlineOpenAtEOF(t *testing.T) {
+	var sc tomlLineScanner
+	sc.step([]byte("env = { A = \"a\",\n"))
+	if !sc.open() {
+		t.Errorf("여는 중괄호 뒤에도 스캐너가 닫혀 있다")
+	}
+	sc.step([]byte("  B = \"b\" }\n"))
+	if sc.open() {
+		t.Errorf("닫는 중괄호 뒤에도 스캐너가 열려 있다")
+	}
+	if r := anomalyScannerOpen.reason(); !strings.Contains(r, "인라인 테이블") {
+		t.Errorf("사유 문면이 인라인 테이블을 말하지 않는다: %q", r)
 	}
 }
