@@ -1520,6 +1520,19 @@ func TestCodexInstallOutputAlwaysParses(t *testing.T) {
 		"[history]\nnotes = \"\"\"\n" + codexBlockBegin + "\n\"\"\"\n\n[mcp_servers.ctr]\ncommand = \"/opt/mine/my-wrapper\"\nargs = [\"--serve\"]\n" + codexBlockEnd + "\n",
 		// 우리 구간 안에 닫히지 않은 '[' — 무효 입력(A2)
 		"[mcp_servers.ctr.env]\nCTR_MANAGED = \"context-router/0.15.0\"\nLIST = [\n",
+		// ⑧ v0.18이 더한 형태 — D92 열거형이 갈래를 새로 가르는 자리(재기준선 1·2·4·6·7).
+		// 초록 스위트는 "우리가 픽스처로 고른 것"만 말하므로 새 갈래를 여기에 합류시켜야
+		// 오발화 축이 함께 넓어진다. 순서: 여러 줄 인라인 env(갱신 갈래 · 삽입 갈래) ·
+		// 중첩 인라인 env · 점 표기 표식 키 · env 우변 비-인라인 셋 ·
+		// 인라인 env + 여러 줄 기본 문자열 값.
+		"[mcp_servers.ctr]\ncommand = \"context-router\"\nenv = { A = \"a\",\n  CTR_MANAGED = \"context-router/0.15.0\" }\n",
+		"[mcp_servers.ctr]\ncommand = \"context-router\"\nenv = { A = \"1\",\n  B = \"2\" }\n",
+		"[mcp_servers.ctr]\ncommand = \"context-router\"\nenv = { A = { CTR_MANAGED = \"inner\" }, B = \"1\" }\n",
+		"[mcp_servers.ctr]\ncommand = \"context-router\"\nenv = { CTR_MANAGED.sub = \"x\" }\n",
+		"[mcp_servers.ctr]\ncommand = \"context-router\"\nenv = []\n",
+		"[mcp_servers.ctr]\ncommand = \"context-router\"\nenv = \"x\"\n",
+		"[mcp_servers.ctr]\ncommand = \"context-router\"\nenv = 1\n",
+		"[mcp_servers.ctr]\ncommand = \"context-router\"\nenv = { A = \"\"\"\nx # y, z}\n\"\"\", B = \"b\" }\n",
 	}
 	for i, src := range srcs {
 		res := installCodexConfigBlock([]byte(src), codexInstallRequest{Marker: hookMarker("0.17.0")})
