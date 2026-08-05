@@ -1162,8 +1162,10 @@ func TestCodexInstallMarkerOnlyRewritesCommand(t *testing.T) {
 // TestCodexInlineMarkerNonStringValue — 인라인 env의 표식 값이 문자열이 아니면 그 **값 토큰만**
 // 관리 표식 문자열로 갈아 끼운다(삽입이 아니라 치환이라 중복 키가 생기지 않는다). 종전에는
 // 원문을 그대로 두어 표식이 영영 현재 값이 되지 못했고, 그 상태가 doctor에서 "경고 없는
-// 표식없음 + 무변경 보고"라는 서로 모순된 두 줄로 새어 나왔다. 종결자를 그 줄에서 찾지 못하는
-// 형태(여러 줄 값)는 여전히 다루지 않는다 — 그 경계를 마지막 케이스가 잰다.
+// 표식없음 + 무변경 보고"라는 서로 모순된 두 줄로 새어 나왔다. **값이 물리 라인 둘에 걸쳐도
+// 같다**(재기준선 행 6) — 되쓰기가 논리 엔트리를 받고 spliceInlineSpan이 파일 좌표로 치환하므로
+// 값 구간이 줄을 넘어도 제자리다. 종전에는 그 형태에서 값 토큰의 끝을 그 줄에서 찾지 못해
+// 포기했다. 무변경으로 남는 것은 **구조가 확정되지 않는 형태**뿐이고 마지막 케이스가 그 경계다.
 func TestCodexInlineMarkerNonStringValue(t *testing.T) {
 	const head = "[mcp_servers.ctr]\ncommand = \"context-router\"\n"
 	marker := hookMarker("0.16.0")
@@ -1192,14 +1194,18 @@ func TestCodexInlineMarkerNonStringValue(t *testing.T) {
 			mcpWritten,
 		},
 		{
-			"여러 줄 값 — 다루지 않는 형태(무변경)",
+			// 재기준선 행 6. 값 구간이 물리 라인 둘에 걸쳐도 제자리에서 갈아 끼운다 — 되쓰기가
+			// 논리 엔트리를 받고 치환 지점이 파일 좌표(줄, 열)이기 때문이다. 값 구간이 사라지면서
+			// 두 물리 라인이 한 줄로 접히는 것은 치환의 정의다(구간 안쪽 줄은 통째로 사라진다).
+			"여러 줄에 걸친 값 — 제자리에서 표식 문자열로 교체",
 			head + "env = { " + codexMarkerKey + " = [1,\n2] }\n",
-			head + "env = { " + codexMarkerKey + " = [1,\n2] }\n",
+			head + "env = { " + codexMarkerKey + " = \"" + marker + "\" }\n",
 			mcpWritten,
 		},
 		{
-			// 후행 주석 안의 쉼표는 값 토큰의 종결자가 아니다(tomlInlineValueEnd의 '#' 갈래).
-			// 그 갈래가 없으면 값 구간이 주석 안까지 늘어나 주석 절반이 표식 문자열로 갈린다.
+			// 후행 주석 안의 쉼표는 값 토큰의 종결자가 아니다 — codexEntryRaw가 주석을 먼저
+			// 잘라 내므로 열거형이 그 쉼표를 보지 못한다. 잘리지 않으면 값 구간이 주석 안까지
+			// 늘어나 주석 절반이 표식 문자열로 갈린다.
 			// 닫는 중괄호가 주석에 먹혀 이미 무효 TOML인 줄이므로 무변경이 계약이다. 여는
 			// 중괄호가 EOF까지 닫히지 않으므로(T2) 스캐너가 열린 채 끝나 anomalyScannerOpen이다.
 			"주석 안의 쉼표 — 종결자가 아니다(무변경)",
@@ -1229,21 +1235,33 @@ func TestCodexInlineMarkerNonStringValue(t *testing.T) {
 }
 
 // TestCodexInlineMarkerInsideStringValue — 인라인 env의 **다른 키의 문자열 값 안**에 표식 키와
-// 같은 모양이 들어 있어도 그 자리는 값이지 키가 아니다. inlineMarkerSpan의 바깥 루프가 문자열
-// 토큰을 건너뛰지 않으면 값 안의 `, CTR_MANAGED = …`가 키 경계로 잡혀 사용자 값 한가운데를
-// 치환한다 — 큰따옴표 값 안이면 넣은 따옴표가 값을 조기에 닫아 그 줄이 파스되지 않고,
-// 홑따옴표 값 안이면 파스는 되지만 사용자 환경변수가 조용히 바뀐다. 둘 다 무변경이 계약이다.
+// 같은 모양이 들어 있어도 그 자리는 **값이지 키가 아니다**(재기준선 행 7). 그러므로 표식은
+// 부재이고 여는 중괄호 뒤에 삽입되며, 사용자 값 바이트는 하나도 바뀌지 않는다.
+//
+// 종전의 무변경은 안전이 아니라 **두 판독기가 같은 바이트를 다르게 본 결과**였다. 판독
+// (tomlInlineValue)은 문자열 토큰을 건너뛰지 않아 값 안의 `, CTR_MANAGED = …`를 키가 있는
+// 것으로 읽고, 되쓰기(inlineMarkerSpan)는 건너뛰므로 그 자리를 찾지 못해 포기했다 — 그래서
+// 이런 파일에는 표식이 **영영** 서지 않았고 doctor는 계속 표식없음을 냈다. 열거형은 문자열을
+// 값으로 통째 잡으므로 두 자리가 함께 "부재"로 옳아진다.
+//
+// 값 한가운데를 치환하는 오답도 여전히 배제한다: 큰따옴표 값 안이면 넣은 따옴표가 값을
+// 조기에 닫아 파스가 깨지고, 홑따옴표 값 안이면 파스는 되지만 사용자 환경변수가 조용히
+// 바뀐다 — 사용자 바이트 보존과 파스 단정이 그 둘을 함께 잡는다.
 func TestCodexInlineMarkerInsideStringValue(t *testing.T) {
 	const head = "[mcp_servers.ctr]\ncommand = \"context-router\"\n"
 	marker := hookMarker("0.16.0")
-	cases := []struct{ name, src string }{
+	// keep — 사용자가 쓴 바이트 그대로. 산출에 이 부분 문자열이 남아야 값 한가운데가 갈리지
+	// 않은 것이다.
+	cases := []struct{ name, src, keep string }{
 		{
-			"큰따옴표 값 안 — 치환하면 파스 불가",
+			"큰따옴표 값 안 — 값이지 키가 아니다",
 			head + "env = { A = \"x, " + codexMarkerKey + " = 0, y\", B = 1 }\n",
+			"A = \"x, " + codexMarkerKey + " = 0, y\", B = 1 }",
 		},
 		{
-			"홑따옴표 값 안 — 치환하면 사용자 값이 바뀐다",
+			"홑따옴표 값 안 — 값이지 키가 아니다",
 			head + "env = { A = 'x, " + codexMarkerKey + " = \"0\", y', B = 1 }\n",
+			"A = 'x, " + codexMarkerKey + " = \"0\", y', B = 1 }",
 		},
 	}
 	for _, c := range cases {
@@ -1252,10 +1270,59 @@ func TestCodexInlineMarkerInsideStringValue(t *testing.T) {
 			if res.State != mcpWritten {
 				t.Fatalf("state=%d want mcpWritten", res.State)
 			}
-			if string(res.Out) != c.src || res.Changed {
-				t.Fatalf("사용자 값을 건드렸다: changed=%v\ngot =%q\nwant=%q", res.Changed, res.Out, c.src)
+			if !strings.Contains(string(res.Out), c.keep) {
+				t.Fatalf("사용자 값 바이트가 갈렸다:\ngot =%q\nkeep=%q", res.Out, c.keep)
+			}
+			if !strings.Contains(string(res.Out), codexMarkerKey+` = "`+marker+`"`) {
+				t.Fatalf("표식이 삽입되지 않았다:\n%s", res.Out)
+			}
+			// 파스가 중복 키도 함께 잡는다 — 값 안의 모양을 키로 세어 한 번 더 넣었다면
+			// 같은 인라인 테이블에 CTR_MANAGED가 둘이 되어 지정 파서가 거부한다.
+			if !codexTOMLParses(res.Out) {
+				t.Fatalf("산출이 파스되지 않는다:\n%s", res.Out)
+			}
+			// 멱등 — 2회차가 또 바꾸면 D84 단일 백업 슬롯이 2회차에 원본을 잃는다.
+			again := installCodexConfigBlock(res.Out, codexInstallRequest{Marker: marker, MarkerOnly: true})
+			if again.Changed || !bytes.Equal(again.Out, res.Out) {
+				t.Errorf("2회차가 무변경이 아니다: changed=%v\n%s", again.Changed, again.Out)
 			}
 		})
+	}
+}
+
+// TestCodexNestedInlineNotOverwritten — 스펙 §0 관측 ①. 중첩 인라인 안쪽의 CTR_MANAGED는
+// 우리 표식이 아니다. 종전에는 그것을 바깥 표식으로 읽어 **사용자 값을 조용히 덮어썼고**
+// 산출이 유효 TOML이라 게이트도 통과했다.
+func TestCodexNestedInlineNotOverwritten(t *testing.T) {
+	src := "[mcp_servers.ctr]\ncommand = \"context-router\"\nenv = { A = { CTR_MANAGED = \"inner\" }, B = \"1\" }\n"
+	res := installCodexConfigBlock([]byte(src), codexInstallRequest{Marker: hookMarker("0.18.0")})
+	if !strings.Contains(string(res.Out), `"inner"`) {
+		t.Errorf("사용자 값 inner가 사라졌다:\n%s", res.Out)
+	}
+	if !codexTOMLParses(res.Out) {
+		t.Errorf("산출이 파스되지 않는다:\n%s", res.Out)
+	}
+	// 멱등(스펙 §2.1 P4)
+	again := installCodexConfigBlock(res.Out, codexInstallRequest{Marker: hookMarker("0.18.0")})
+	if !bytes.Equal(again.Out, res.Out) {
+		t.Errorf("멱등이 아니다:\n1: %s\n2: %s", res.Out, again.Out)
+	}
+}
+
+// TestCodexMultilineInlineMarkerUpdates — 여러 줄로 이어진 인라인 env에서도 표식이 현재
+// 값으로 갱신되고 재실행이 무변경이다. 한 줄 픽스처로는 물리 라인 한정 구현이 통과한다.
+func TestCodexMultilineInlineMarkerUpdates(t *testing.T) {
+	src := "[mcp_servers.ctr]\ncommand = \"context-router\"\nenv = { A = \"a\",\n  CTR_MANAGED = \"context-router/0.15.0\" }\n"
+	res := installCodexConfigBlock([]byte(src), codexInstallRequest{Marker: hookMarker("0.18.0")})
+	if !strings.Contains(string(res.Out), hookMarker("0.18.0")) {
+		t.Errorf("표식이 갱신되지 않았다:\n%s", res.Out)
+	}
+	if !strings.Contains(string(res.Out), `"a"`) {
+		t.Errorf("사용자 값 a가 사라졌다:\n%s", res.Out)
+	}
+	again := installCodexConfigBlock(res.Out, codexInstallRequest{Marker: hookMarker("0.18.0")})
+	if !bytes.Equal(again.Out, res.Out) {
+		t.Errorf("멱등이 아니다:\n1: %s\n2: %s", res.Out, again.Out)
 	}
 }
 
