@@ -1706,3 +1706,31 @@ func TestCodexOldBlockBOMMigrates(t *testing.T) {
 		t.Fatalf("class=%d begin=%d want classReplace/0 — BOM이 마커 분류를 뒤집었다", class, begin)
 	}
 }
+
+// TestTomlPointInvalid — 무효 지점은 (-1, -1)이다(스펙 §0 D92 계약 4). 0을 무효로 쓰면
+// "없다"와 "0행 0열이다"가 같은 값이 되고, v0.17 §1.4-라가 마커 인덱스에서 같은 이유로
+// (0,0)을 버렸다.
+func TestTomlPointInvalid(t *testing.T) {
+	if p := tomlNoPoint(); p.valid() {
+		t.Errorf("tomlNoPoint()가 유효하다: %+v", p)
+	}
+	if p := (tomlPoint{line: 0, col: 0}); !p.valid() {
+		t.Errorf("(0,0)이 무효로 판정된다 — 그것은 실재하는 지점이다")
+	}
+	if p := (tomlPoint{line: 3, col: 7}); !p.valid() {
+		t.Errorf("(3,7)이 무효로 판정된다")
+	}
+	// 세 타입에 소비자가 생기는 것은 T5이므로 이 블록이 없으면 T1~T4 구간 내내
+	// golangci-lint(unused)가 적색이다(리허설 실측: "type tomlSpan is unused" 외 2건, 3 issues).
+	// **복합 리터럴에 필드명을 적어야** 사용으로 센다 — 영값 tomlSpan{}으로 바꾸면
+	// "field start is unused"로 다시 걸린다.
+	zero := tomlSpan{start: tomlNoPoint(), end: tomlNoPoint()}
+	sc := tomlInlineScan{open: tomlNoPoint(), close: tomlNoPoint()}
+	sc.entries = append(sc.entries, tomlInlineEntry{key: zero, value: zero, segs: 1, escaped: false})
+	if sc.ok || len(sc.entries) != 1 || sc.entries[0].escaped {
+		t.Errorf("영값 열거 결과가 예상과 다르다: %+v", sc)
+	}
+	if sc.entries[0].key.start.valid() || sc.entries[0].value.end.valid() {
+		t.Errorf("무효 지점으로 세운 구간이 유효하다: %+v", sc.entries[0])
+	}
+}
