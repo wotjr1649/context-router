@@ -120,8 +120,15 @@ func assertInlineScanTiles(t *testing.T, lines [][]byte, e [2]int, sc tomlInline
 // tomlFlatten — 점 경로 → 잎 값의 정본 문자열. 헤더·점 표기·인라인 세 형태가 **같은 경로로
 // 접힌다** — 형태가 달라도 의미가 같다는 것을 재는 오라클이다. 지정 파서는 우리 판독기가
 // 아닌 독립 구현이라 차등 오라클로서 정당하고, D89가 검증 전용 사용을 이미 허용한다.
-// 값은 %v로 적는다: 표기 차이(1_000 vs 1000, 'x' vs "x")를 파서가 이미 흡수하므로 P1은
-// 의미만 보고, 표기는 P3가 원문 라인 생존으로 본다.
+//
+// 값은 **`%T:%v`**로 적는다 — 표기가 아니라 **타입과 값**이다. `%v`만 적으면 정수 1과
+// 문자열 "1"이 같은 `1`로 접혀 타입 변조가 P1을 통과하는데, 그 자리는 P3의 인라인 env
+// 예외 구간 안에서 **P1이 유일한 겹**이라 그물 전체에 구멍이 난다(리뷰 실측: 실제 격자
+// 산출의 `U = "1"`을 `U = 1`로 바꾸면 다섯 겹과 산출물 유효성 게이트를 모두 통과했다).
+// 같은 충돌이 `a=1`과 `a="1"`과 `a=1.0` 사이, `a=true`와 `a="true"` 사이에도 있었다.
+//
+// **표기는 여전히 P3의 몫이다**: 1_000과 1000은 둘 다 `int64:1000`, 'x'와 "x"는 둘 다
+// `string:x`로 접히므로 타입 구분만 더해질 뿐 표기 차이는 그대로 흡수된다.
 func tomlFlatten(b []byte) (map[string]string, error) {
 	var doc map[string]any
 	if err := toml.Unmarshal(trimBOM(b), &doc); err != nil {
@@ -132,11 +139,14 @@ func tomlFlatten(b []byte) (map[string]string, error) {
 	walk = func(prefix string, v any) {
 		m, ok := v.(map[string]any)
 		if !ok {
-			out[prefix] = fmt.Sprintf("%v", v)
+			out[prefix] = fmt.Sprintf("%T:%v", v, v)
 			return
 		}
 		if len(m) == 0 {
-			out[prefix] = "{}" // 빈 테이블도 실재하는 정의다 — 소실을 보려면 잎이어야 한다
+			// 빈 테이블도 실재하는 정의다 — 소실을 보려면 잎이어야 한다. 타입 접두를 잎과
+			// **같은 규칙**으로 붙인다: 맨 문자열 "{}"로 적으면 값이 문자열 "{}"인 키와
+			// 겹쳐 빈 테이블과 문자열 사이의 변조가 통과한다.
+			out[prefix] = fmt.Sprintf("%T:{}", v)
 			return
 		}
 		for k, sub := range m {
@@ -241,15 +251,23 @@ func assertCommentsPreserved(t *testing.T, in, out []byte, allowedLost ...string
 func assertLineSurvival(t *testing.T, in, out []byte, envEntry [2]int) {
 	t.Helper()
 	inLines, outLines := splitLinesKeepEnds(in), splitLinesKeepEnds(out)
-	managed := func(line []byte) bool {
-		switch codexKeyName(trimEOL(line)) {
-		case "command", "args", "enabled_tools", codexMarkerKey:
-			return true
+	// 키 이름 면제는 **우리 두 구간 안에서만** 준다. 파일 전역으로 주면 남의
+	// `[mcp_servers.other]`에 있는 command·args·enabled_tools·표식 키 줄이 바이트 생존
+	// 검사에서 통째로 빠진다 — 실제 Codex config는 등록물마다 command를 하나씩 가지므로
+	// 좁지만 실재하는 구멍이고, 격자는 둘째 테이블이 없어 이것을 구조적으로 못 본다.
+	sp := codexManagedSpans(inLines)
+	inSpan := func(s codexSpan, i int) bool { return s.found && i >= s.start && i <= s.end }
+	managed := func(i int, line []byte) bool {
+		if inSpan(sp.table, i) || inSpan(sp.env, i) {
+			switch codexKeyName(trimEOL(line)) {
+			case "command", "args", "enabled_tools", codexMarkerKey:
+				return true
+			}
 		}
 		return strings.HasPrefix(strings.TrimSpace(trimEOL(line)), "[") // 헤더는 재생성 대상이다
 	}
 	for i, line := range inLines {
-		if managed(line) {
+		if managed(i, line) {
 			continue
 		}
 		if envEntry[0] >= 0 && i >= envEntry[0] && i <= envEntry[1] {
@@ -350,6 +368,36 @@ func codexLattice() []string {
 func TestCodexLatticeSize(t *testing.T) {
 	if got, want := len(codexLattice()), 5*4*4*4*2*2*2*2; got != want {
 		t.Errorf("격자 케이스 수=%d want %d — 축이 줄었다", got, want)
+	}
+}
+
+// TestCodexInTableCommentsPreserved — P2를 **관리 테이블 안**의 주석에 건다. 격자는 이 자리를
+// 덮지 않는다(리뷰 실측): 격자의 독립 주석 cm[0]은 `[mcp_servers.ctr]` **앞**에 붙어 테이블
+// 안에 들어가지 않고, 테이블 안의 유일한 주석인 command 줄 후행은 D88 예외라 allowedLost에
+// 있다. 그래서 가장 위험한 자리 — keep 루프가 다시 잇는 구간 안의 주석 — 이 5120 케이스
+// 전부에서 비어 있었다.
+//
+// **격자에 축을 더하지 않는다**: 케이스 수가 바뀌면 폭 고정 단정(5120)이 무의미해진다.
+// 대신 그 자리만 겨냥한 픽스처를 둔다. allowedLost를 **비운다** — 여기 주석은 전부 사용자
+// 소유 라인에 있어 keep 루프가 원문 그대로 되돌려야 하고, 하나라도 잃으면 결함이다.
+func TestCodexInTableCommentsPreserved(t *testing.T) {
+	marker := hookMarker("0.18.0")
+	const head = "[mcp_servers.ctr]\ncommand = \"context-router\"\n"
+	const env = "env = { CTR_MANAGED = \"context-router/0.15.0\" }\n"
+	for _, c := range []struct{ name, src string }{
+		{"테이블 안 독립 주석", head + "# 테이블 안 독립 주석\nU1 = \"v\"\n" + env},
+		{"사용자 키의 후행 주석", head + "U1 = \"v\" # 사용자 키 후행\n" + env},
+		{"여러 줄 값의 이어지는 줄 주석", head + "V4 = [\n  \"p\", # 첫 원소\n  \"q\", # 둘째 원소\n]\n" + env},
+		{"셋 다", head + "# 독립\nU1 = \"v\" # 후행\nV4 = [\n  \"p\", # 이어지는 줄\n]\n" + env},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			in := []byte(c.src)
+			res := installCodexConfigBlock(in, codexInstallRequest{Marker: marker})
+			if res.State != mcpWritten {
+				t.Fatalf("픽스처가 기입 갈래로 가지 않는다: state=%v — 이 테스트는 되쓰기를 재려는 것이다", res.State)
+			}
+			assertCommentsPreserved(t, in, res.Out)
+		})
 	}
 }
 
