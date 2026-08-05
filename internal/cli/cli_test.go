@@ -3492,6 +3492,20 @@ func TestDoctorCodexSingleVerdict(t *testing.T) {
 	}
 }
 
+// TestDoctorCodexDottedInlineReason — 사유가 [16]·[20] 둘 다에 나가야 한다. 결과 필드만
+// 보면 사유를 만들고 인쇄를 빠뜨린 구현이 통과한다.
+func TestDoctorCodexDottedInlineReason(t *testing.T) {
+	home := isolateCodexHome(t)
+	writeCodexConfig(t, home, "[mcp_servers.ctr]\ncommand = \"context-router\"\nenv = { CTR_MANAGED.sub = \"x\" }\n")
+	out, _ := doctorOut(t, t.TempDir(), false)
+	if !strings.Contains(out, "[16] warning: "+anomalyDottedEnv.reason()) {
+		t.Errorf("[16] 사유 줄이 없다:\n%s", out)
+	}
+	if !strings.Contains(out, "[20] codex: "+anomalyDottedEnv.reason()) {
+		t.Errorf("[20] 사유 줄이 없다:\n%s", out)
+	}
+}
+
 // TestDoctorCodexBOMHeader — 문면 결속. BOM이 우리 헤더 줄에 붙은 파일을 doctor가
 // `테이블=이상` + "관리 테이블 밖에 ctr 관련 정의가 있습니다 — 수동으로 정리한 뒤 재실행하세요"로
 // 부르면, **우리가 만든 파일에 편집기가 세 바이트를 붙였을 뿐인 사용자에게 자기 파일을
