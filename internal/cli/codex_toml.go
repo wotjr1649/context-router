@@ -1458,3 +1458,37 @@ func codexEnvBody(lines [][]byte, sp codexSpan, marker, eol string, dropBegin, d
 	}
 	return b
 }
+
+// tomlPoint — 파일 좌표. line은 lines 슬라이스의 인덱스, col은 그 줄 안의 바이트 오프셋이다.
+// **무효값은 (-1, -1)이다** — 0을 무효로 쓰면 "없다"와 "맨 앞이다"가 같은 값이 되고, 그
+// 혼동이 v0.17 §1.4-라에서 구간 첫 줄을 지우는 결함을 만들었다.
+type tomlPoint struct{ line, col int }
+
+// tomlNoPoint — 무효 지점.
+func tomlNoPoint() tomlPoint { return tomlPoint{line: -1, col: -1} }
+
+// valid — 실재하는 지점인가.
+func (p tomlPoint) valid() bool { return p.line >= 0 && p.col >= 0 }
+
+// tomlSpan — [start, end) 반오픈 구간. 두 지점 모두 파일 좌표다.
+type tomlSpan struct{ start, end tomlPoint }
+
+// tomlInlineEntry — 인라인 테이블의 **깊이 1 마디** 하나.
+// key는 점 표기면 **경로 전체**의 구간이다(마디 하나가 아니다).
+// segs — 따옴표 밖 '.'로 가른 마디 수. 1이면 단순 키다. **소비한다**(스펙 §0 D92 계약 3).
+// escaped — 어느 마디든 역슬래시 이스케이프를 담는가. **표시만 하고 소비하지 않는다** —
+// 소비하면 무변경 집합이 넓어지고 그것이 D93이다.
+type tomlInlineEntry struct {
+	key     tomlSpan
+	value   tomlSpan
+	segs    int
+	escaped bool
+}
+
+// tomlInlineScan — 한 논리 엔트리의 인라인 테이블 열거 결과.
+// ok=false면 구조가 확정되지 않은 것이고 **entries는 비어 있다**(부분 산출 금지 — 계약 4).
+type tomlInlineScan struct {
+	open, close tomlPoint
+	entries     []tomlInlineEntry
+	ok          bool
+}
