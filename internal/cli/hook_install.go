@@ -623,6 +623,19 @@ func runHookInstall(args []string, storeRoot, storeRootRaw string, storeRootExpl
 			// 실패 사유는 둘뿐이다 — 우리 이름 자리에 우리 소유가 아닌 항목이 있거나(소유 관문),
 			// 파일이 해석되지 않거나. 어느 쪽이든 사용자가 손댈 대상을 알려야 조치할 수 있다.
 			fmt.Fprintf(stdout, "mcp: .mcp.json 병합을 멈췄습니다(훅 설치는 완료) — %q 이름에 우리가 소유하지 않은 항목이 있거나 파일을 해석할 수 없습니다. 그 항목을 정리하거나 파일을 고친 뒤 다시 실행하세요\n", ctrMCPServerName)
+		} else if bytes.Equal(existing, mcpMerged) {
+			// 무변경 — 기입도 백업도 하지 않는다. 단일 슬롯이 "2회차 무변경" 전제 위에 선다(D84).
+			// 이 자리에는 바이트 비교가 없었다(mergeMCPServers의 changed는 install에서 참으로
+			// 고정된다) — 비교 없이 백업만 걸면 2회차 install이 .bak을 설치 후 내용으로 덮어
+			// 원본을 잃는다. 그래서 비교가 백업의 선행 조건이다(D95).
+			// 문면은 성공 갈래와 **같다**: 2회차 install이 .mcp.json에 대해 아무 말도 하지 않는
+			// 상태를 만들지 않으면서, 하지 않은 일(기입·백업)을 말하지도 않는다.
+			mcpRegistered = true
+			fmt.Fprintf(stdout, "mcp: .mcp.json 병합 완료(서버 %s)\n", ctrMCPServerName)
+		} else if bErr := backupConfigFile(mcpPath, existing); bErr != nil {
+			// 백업 실패는 기입을 막는다 — config.toml 갈래와 같은 순서다(D95). 복구 수단 없이
+			// 사용자 파일을 덮지 않는다.
+			fmt.Fprintln(stdout, "mcp: .mcp.json 백업 실패 — 기입하지 않았습니다")
 		} else if writeErr := atomicWriteFile(mcpPath, mcpMerged); writeErr != nil {
 			fmt.Fprintln(stdout, "mcp: .mcp.json 기록 실패 — 훅 설치는 완료되었습니다")
 		} else {
@@ -685,12 +698,13 @@ func runHookInstall(args []string, storeRoot, storeRootRaw string, storeRootExpl
 	return nil
 }
 
-// backupCodexConfig — 내용을 바꾸기 직전 단일 슬롯 백업(D84). config.toml.bak을 **매번
-// 덮어쓰며 누적하지 않는다**. 호출자는 기입 바이트가 기존과 다를 때만 부른다 — 무변경
-// 재실행마다 .bak이 생기면 단일 슬롯 계약이 무의미해진다. 재직렬화는 호스트가 일으키므로
-// 우리 설계가 막을 수 없고, 이 백업은 **우리 쪽 판정이 틀렸을 때의 복구 수단**이다.
+// backupConfigFile — 내용을 바꾸기 직전 단일 슬롯 백업(D84·D95). 설정 파일 옆의 .bak을
+// **매번 덮어쓰며 누적하지 않는다**. config.toml과 .mcp.json이 함께 쓴다(D95). 호출자는 기입
+// 바이트가 기존과 다를 때만 부른다 — 무변경 재실행마다 .bak이 생기면 단일 슬롯 계약이
+// 무의미해진다. 재직렬화는 호스트가 일으키므로 우리 설계가 막을 수 없고, 이 백업은 **우리 쪽
+// 판정이 틀렸을 때의 복구 수단**이다.
 // 새로 만드는 파일(existing 없음)에는 되돌릴 내용이 없어 백업하지 않는다.
-func backupCodexConfig(path string, existing []byte) error {
+func backupConfigFile(path string, existing []byte) error {
 	if len(existing) == 0 {
 		return nil
 	}
@@ -713,7 +727,7 @@ func runHookInstallCodex(user, noShadow, storeRootExplicit bool, storeRootRaw, p
 		Profiles: profiles, SetProfile: setProfile, Marker: hookMarker(version),
 	})
 	if res.State == mcpWritten && res.Changed {
-		if bErr := backupCodexConfig(cfgPath, cfgExisting); bErr != nil {
+		if bErr := backupConfigFile(cfgPath, cfgExisting); bErr != nil {
 			return errors.New("hook install: config.toml 백업 실패")
 		}
 		if wErr := atomicWriteFile(cfgPath, res.Out); wErr != nil {
@@ -945,7 +959,7 @@ func runHookUninstallCodex(user bool, projectRoot string, stdout io.Writer) erro
 				// D84 — "내용을 바꾸기 직전 config.toml.bak 단일 슬롯"은 제거 경로에도 선다
 				// (리뷰 P1). install·doctor --fix와 같은 규칙이어야 잘못된 제거를 되돌릴 수 있고,
 				// changed 판정 뒤에 두므로 무변경 재실행이 단일 슬롯을 덮지 않는다.
-				if bErr := backupCodexConfig(cfgPath, cfgExisting); bErr != nil {
+				if bErr := backupConfigFile(cfgPath, cfgExisting); bErr != nil {
 					return errors.New("hook uninstall: config.toml 백업 실패")
 				}
 				if wErr := atomicWriteFile(cfgPath, cfgOut); wErr != nil {

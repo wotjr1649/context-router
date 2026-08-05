@@ -1472,7 +1472,7 @@ func TestRunHookInstallCodexMigratesOldFormat(t *testing.T) {
 	}
 
 	// 2회차 — 무변경이고 .bak은 1회차 이전 원본을 그대로 담는다.
-	// (backupCodexConfig는 단일 슬롯을 덮어쓰므로 ".bak이 다시 생기지 않는지"는 존재 검사로
+	// (backupConfigFile은 단일 슬롯을 덮어쓰므로 ".bak이 다시 생기지 않는지"는 존재 검사로
 	//  관측할 수 없다 — 바이트로 잰다. §2-5)
 	var out2 bytes.Buffer
 	if err := runHookInstallCodex(true, false, false, "", t.TempDir(), "0.16.0", nil, false, &out2); err != nil {
@@ -1570,7 +1570,7 @@ func TestHookInstallCodexGateReport(t *testing.T) {
 	}
 	// 소비자 1 — **쓰기 분기 자체가 실행되지 않았다**. 위 바이트 단정만으로는 이것을 재지
 	// 못한다: 게이트가 Out을 existing으로 되돌리므로 가드를 통째로 지워도 기입 바이트가 같다.
-	// 가드 안에는 backupCodexConfig가 함께 있고 그것은 되돌린 Out과 무관하게 파일을 새로
+	// 가드 안에는 backupConfigFile이 함께 있고 그것은 되돌린 Out과 무관하게 파일을 새로
 	// 만드므로, .bak의 부재가 그 분기가 돌지 않았다는 관측 가능한 증거다(D84 단일 슬롯).
 	if _, sErr := os.Stat(cfg + ".bak"); !os.IsNotExist(sErr) {
 		t.Errorf("쓰기 분기가 돌았다 — 기입을 건너뛰었는데 백업이 생겼다(stat err=%v)", sErr)
