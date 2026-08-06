@@ -412,8 +412,12 @@ func codexEntries(lines [][]byte, sp codexSpan) [][2]int {
 // strings.Trim(키, 따옴표 둘)은 양끝의 따옴표를 **전부** 벗기므로 TOML이 별개 키로 읽는
 // 홑따옴표 안의 큰따옴표 표기가 우리 표식과 같아지고, 그러면 setInlineEnvMarker가 그 사용자
 // 값을 표식으로 덮어쓴다(실측: base는 표식을 따로 삽입하고 사용자 값을 보존한다).
-// **키를 비교하는 세 자리가 모두 이 하나를 지난다** — 자리마다 벗기는 규칙이 갈리면 같은
-// 바이트를 다르게 읽는 셈이고, 그것이 D92가 닫으려는 뿌리다.
+// **키를 비교하는 자리는 모두 이 하나를 지난다** — codexKeyName · codexInlineMarker ·
+// setInlineEnvMarker · codexInlineMarkerBlocked · tomlDottedEnvKey(머리·꼬리 두 마디) 여섯이다.
+// 자리마다 벗기는 규칙이 갈리면 같은 바이트를 다르게 읽는 셈이고, 그것이 D92가 닫으려는 뿌리다.
+// 셋만 지난다고 적혀 있던 동안 실제로는 둘이 strings.Trim으로 남아 있었고, 그 둘이 같은
+// 릴리스 안에서 같은 바이트를 다르게 판정했다(실측: 점 있는 형태는 게이트가 물고 점 없는
+// 형태는 남의 키로 통과) — 목록을 세어 적는 이유가 그것이다.
 func tomlUnquoteKey(s string) string {
 	if n := len(s); n >= 2 && (s[0] == '"' || s[0] == '\'') && s[n-1] == s[0] {
 		return s[1 : n-1]
@@ -470,13 +474,17 @@ func tomlDottedEnvKey(s string) (head, rest string) {
 	// 이스케이프를 담으면 벗겨도 env와 같아지지 않아 아래 비교가 그대로 배제한다 — 이 술어는
 	// codexKeyName과 같이 이스케이프를 해석하지 않으며, 그 형태가 남기는 헤더 중복은 산출물
 	// 유효성 게이트(D89)가 무변경으로 받아 낸다 — TestCodexDottedHead가 그 둘을 고정한다.
-	if len(segs) < 2 || strings.Trim(segs[0], `"'`) != "env" {
+	// 벗기는 폭은 tomlUnquoteKey **한 자리**가 정한다. strings.Trim이면 양끝 따옴표를 전부
+	// 벗겨 `'"env"'.CTR_MANAGED`(TOML이 읽는 키 이름은 따옴표를 포함한 "env")가 우리 env로,
+	// `env.'"CTR_MANAGED"'`가 우리 표식으로 읽힌다 — 남의 키에 install이 얼어붙고 그 사용자
+	// 값이 소유 판정의 근거가 된다(실측: base·HEAD 둘 다 그랬다).
+	if len(segs) < 2 || tomlUnquoteKey(segs[0]) != "env" {
 		return "", ""
 	}
 	if len(segs) != 2 {
 		return "env", ""
 	}
-	return "env", strings.Trim(segs[1], `"'`)
+	return "env", tomlUnquoteKey(segs[1])
 }
 
 // tomlSplitDotted — LHS를 **따옴표 밖의 '.'**에서 마디로 가른다. 따옴표 안의 '.'는 이름의
@@ -967,6 +975,19 @@ func installCodexConfigBlock(existing []byte, req codexInstallRequest) codexInst
 	class, begin, end := classifyMarkers(lines)
 	inOldBlock := class == classReplace && sp.table.found && sp.table.start > begin && sp.table.start < end
 	if sp.table.found && !codexOwnership(marker, markerFound, view.command, inOldBlock) {
+		// 소유를 **모르는** 갈래를 먼저 가른다 — 인라인 env의 구조를 확정하지 못했으면 표식이
+		// 그 안에 있을 수도 있고, 그것을 "남의 것"으로 보고하면 우리 표식이 적힌 파일에
+		// mcpExistingHeader가 나가 install이 영구히 손대지 않는다. 사유는 아래 게이트와 같은
+		// anomalyEnvNotTable이다 — 같은 입력군에 이미 그 문면(인라인 테이블 형태를 고치라)이
+		// 나가고 있어 사유가 갈리지 않는다.
+		if codexMarkerUnknown(lines, view, markerFound) {
+			return codexInstallResult{
+				Out: existing, State: mcpMarkerAnomaly, TableFound: sp.table.found,
+				Anomaly: anomalyEnvNotTable, InputParses: inputParses,
+				Tools: diag.Tools, ToolsPresent: diag.ToolsPresent,
+				WantTools: diag.WantTools, ArgsReadable: diag.ArgsReadable,
+			}
+		}
 		// 판정 근거는 "블록 밖에 있음"이 아니라 "표식이 없고 명령도 우리 것이 아님"이다(D80).
 		return codexInstallResult{
 			Out: existing, State: mcpExistingHeader, TableFound: sp.table.found, InputParses: inputParses,
@@ -1183,6 +1204,13 @@ func uninstallCodexConfigBlock(existing []byte) (out []byte, changed bool, anoma
 	class, begin, end := classifyMarkers(lines)
 	inOldBlock := class == classReplace && sp.table.start > begin && sp.table.start < end
 	if !codexOwnership(marker, markerFound, view.command, inOldBlock) {
+		// 소유를 모르는 갈래는 install과 **같은 자리에서 같은 사유로** 가른다. 여기서 빼면
+		// 우리 표식이 적힌 파일에 anomalyNotOwned가 나가고, 그 문면은 "사용자 등록이니 직접
+		// 정리하라"라 사용자는 제거가 끝난 줄 안다 — 실제로는 우리 MCP 서버가 그대로 등록돼
+		// 있어 Codex가 계속 띄운다(실측: base는 이 파일에서 제거에 성공한다).
+		if codexMarkerUnknown(lines, view, markerFound) {
+			return existing, false, anomalyEnvNotTable
+		}
 		// 테이블 부재 갈래(위)와 **같은 반환값이면 호출자가 가르지 못한다** — 캐치올 분기를
 		// 두면 미설치 사용자의 흔한 실행에 잔존 문면이 나간다. 사유값으로 가른다.
 		return existing, false, anomalyNotOwned
@@ -1349,6 +1377,11 @@ func codexInlineMarker(lines [][]byte, e [2]int) (value string, found bool) {
 
 // codexInlineMarkerBlocked — 깊이 1 마디 중 첫 마디가 표식 키인 점 표기가 있는가.
 // tomlSplitDotted가 이미 따옴표 밖 '.'에서 가른다 — 새 함수는 없다.
+// 첫 마디의 따옴표는 **tomlUnquoteKey로** 벗긴다: strings.Trim이면 `'"CTR_MANAGED"'.x`처럼
+// TOML이 별개 키로 읽는 표기가 우리 표식 키와 같아져 게이트가 남의 파일에서 선다. 그러면
+// install은 사유만 내고 아무것도 쓰지 않아 MCP가 확정되지 않고 가드 등록도 빠지며, doctor는
+// 점 표기 env가 없는 파일에 그 진단을 낸다. 점 없는 형제 표기는 codexInlineMarker가 이미
+// 이 하나를 지나 남의 키로 보므로, 두 자리가 같은 바이트를 다르게 읽던 자리였다.
 func codexInlineMarkerBlocked(lines [][]byte, e [2]int) bool {
 	sc := tomlScanInline(lines, e)
 	if !sc.ok {
@@ -1360,7 +1393,7 @@ func codexInlineMarkerBlocked(lines [][]byte, e [2]int) bool {
 			continue
 		}
 		s := tomlSpanText(joined, at, e, en.key)
-		if segs := tomlSplitDotted(s); len(segs) > 0 && strings.Trim(segs[0], `"'`) == codexMarkerKey {
+		if segs := tomlSplitDotted(s); len(segs) > 0 && tomlUnquoteKey(segs[0]) == codexMarkerKey {
 			return true
 		}
 	}
@@ -1405,6 +1438,28 @@ func codexMarkerValue(lines [][]byte, sp codexSpans, view codexTableView) (strin
 	return "", false
 }
 
+// codexMarkerUnknown — 표식의 유무를 **모르는가**. codexInlineMarker는 tomlScanInline이
+// 구조를 확정하지 못하면 부재를 내는데, 열린 인라인 테이블 안에 우리 표식이 있어도 그렇다
+// (실측: `env = { CTR_MANAGED = "context-router/0.17.2", A = }` — 빈 값 하나가 스캔을
+// 무너뜨리고, command가 절대경로면 인수 절도 서지 않아 **우리 표식이 적힌 파일이 남의 것으로**
+// 내려온다. base는 이 파일을 되쓰고 지웠다). 모르는 것을 "아니다"로 보고하는 것이 결함이므로
+// 소유 판정이 부정으로 떨어지기 **직전에** 이 술어가 그 갈래를 사유 있는 무변경으로 돌린다.
+//
+// **표식을 다시 훑지 않는다** — 판독기는 여전히 tomlScanInline 하나이고, 이 술어는 그 판독기가
+// 자기 실패를 어떻게 분류했는지(braced)만 읽는다. 표식을 텍스트로 다시 찾는 둘째 판독기를
+// 두면 두 판독기가 같은 바이트를 다르게 읽는 결함이 그대로 돌아온다.
+//
+// braced=false(우변이 `{`가 아니다)는 여기 들지 않는다 — 마디가 있을 수 없으니 표식의 부재는
+// 아는 것이고, 그 형태의 남의 테이블은 계속 남의 테이블로 읽혀야 한다.
+// markerFound면 값을 읽은 것이므로 소유는 이미 아는 것이다 — 인라인이 깨져 있어도 그렇다.
+func codexMarkerUnknown(lines [][]byte, view codexTableView, markerFound bool) bool {
+	if markerFound || view.inlineEnv < 0 {
+		return false
+	}
+	sc := tomlScanInline(lines, view.inlineEnvEntry)
+	return !sc.ok && sc.braced
+}
+
 // codexOwnership — 관리 테이블의 소유 판정. D84가 **한 절로 격리**한 형태다:
 //
 //	소유 = env.CTR_MANAGED 값이 소유 기준을 만족(D82)
@@ -1415,6 +1470,10 @@ func codexMarkerValue(lines [][]byte, sp codexSpans, view codexTableView) (strin
 // 사용자 테이블까지 소유가 되고, 이름 한정 없는 명령 술어를 쓰면 [mcp_servers.ctr-exec]까지
 // 소유가 된다. 앞의 두 절은 제거 대상이 아니다 — 첫 절의 정확 일치는 D82의 영구 본절이고,
 // 둘째 절은 호스트 재직렬화가 표식을 다시 지울 때의 복귀 경로다.
+//
+// **판정은 세 값이 아니라 둘이다.** 모르는 상태는 이 함수에 들이지 않고 호출자가 앞에서
+// codexMarkerUnknown으로 가른다 — 세 값으로 넓히면 D84가 한 절로 격리한 형태가 풀리고,
+// 소비자 둘(install·uninstall)이 각자 그 셋째 값을 해석하게 된다.
 func codexOwnership(marker string, markerFound bool, command string, inOldBlock bool) bool {
 	if markerFound && isOurMarkerValue(marker) {
 		return true
@@ -1643,10 +1702,17 @@ type tomlInlineEntry struct {
 
 // tomlInlineScan — 한 논리 엔트리의 인라인 테이블 열거 결과.
 // ok=false면 구조가 확정되지 않은 것이고 **entries는 비어 있다**(부분 산출 금지 — 계약 4).
+//
+// braced는 그 ok=false를 둘로 가른다: 우변이 애초에 `{`로 열리지 않았는가(braced=false —
+// `env = []`·`env = "x"`처럼 마디가 **있을 수 없는** 형태라 표식의 부재를 아는 것이다), 아니면
+// 열리기는 했는데 그 안을 확정하지 못했는가(braced=true — 표식이 그 안에 있을 수도 있어
+// 부재를 **모르는** 것이다). 판정원 하나가 자기가 본 것을 말하는 자리이며, 이 구분이 없으면
+// 소유를 모르는 파일과 남의 파일이 같은 값으로 내려온다.
 type tomlInlineScan struct {
 	open, close tomlPoint
 	entries     []tomlInlineEntry
 	ok          bool
+	braced      bool
 }
 
 // tomlTripleLen — s의 맨 앞이 삼중 큰따옴표나 삼중 홑따옴표면 그 여러 줄 문자열 토큰
@@ -1753,7 +1819,9 @@ func tomlScanInline(lines [][]byte, e [2]int) tomlInlineScan {
 	if i >= len(joined) || joined[i] != '{' {
 		return fail // 우변이 인라인 테이블이 아니다 — Task 9가 이 갈래를 소비한다
 	}
-	out := tomlInlineScan{open: pt(i), close: tomlNoPoint()}
+	// 여기서부터의 실패는 "인라인 테이블이 아니다"가 아니라 "인라인 테이블인데 못 읽었다"다.
+	fail.braced = true
+	out := tomlInlineScan{open: pt(i), close: tomlNoPoint(), braced: true}
 	stack := []byte{'{'}
 	i++
 
