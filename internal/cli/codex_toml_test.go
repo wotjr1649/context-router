@@ -1406,6 +1406,102 @@ func TestCodexDottedInlineNonMarkerPasses(t *testing.T) {
 	}
 }
 
+// TestCodexUnquoteChokepointHoldsEverywhere — 키 비교는 tomlUnquoteKey **하나**를 지난다.
+// 이 자리는 그 계약이 실제로 지켜지는가를 판정 수준에서 잰다: 같은 릴리스 안에서 두 자리가
+// strings.Trim으로 남아 같은 바이트를 다르게 읽었고, 그 둘이 각각 다른 오판을 냈다.
+//
+//   - `'"CTR_MANAGED"'.x` — TOML이 읽는 키 이름은 따옴표를 **포함한** "CTR_MANAGED"라 우리
+//     표식 키가 아니다. codexInlineMarkerBlocked가 Trim으로 벗겨 게이트를 세우면 install이
+//     무변경 이상으로 이탈해 MCP가 확정되지 않고 가드 등록이 빠지며, doctor는 점 표기 env가
+//     없는 파일에 그 진단을 낸다. **점 없는 형제**는 codexInlineMarker가 이미 하나를 지나
+//     남의 키로 통과시킨다 — 두 자리의 답이 갈리지 않아야 한다는 것이 이 짝의 뜻이다.
+//   - `'"env"'.CTR_MANAGED` — 마찬가지로 우리 env가 아니다. tomlDottedEnvKey가 Trim으로
+//     벗기면 남의 키에 install이 얼어붙고, 그 사용자 값이 소유 판정의 근거가 되어 남의
+//     테이블을 되쓰고 지운다.
+//   - `env.'"CTR_MANAGED"'` — env는 맞지만 표식 이름이 아니다. 꼬리 마디도 같은 자리를 지나야
+//     그 사용자 값이 우리 표식으로 읽히지 않는다.
+func TestCodexUnquoteChokepointHoldsEverywhere(t *testing.T) {
+	cur := hookMarker("0.18.0")
+	const head = "[mcp_servers.ctr]\n"
+	ours := head + "command = \"context-router\"\n"
+	theirs := head + "command = \"/usr/bin/someone-else\"\n"
+
+	// 점 표기와 그 형제는 같은 답이어야 한다 — 둘 다 남의 키이므로 게이트가 서지 않는다.
+	for _, env := range []string{
+		"env = { '\"CTR_MANAGED\"'.x = 1, A = \"y\" }\n",
+		"env = { '\"CTR_MANAGED\"' = 1, A = \"y\" }\n",
+	} {
+		src := ours + env
+		res := installCodexConfigBlock([]byte(src), codexInstallRequest{Marker: cur})
+		if res.State != mcpWritten {
+			t.Errorf("%q: state=%d anomaly=%d want mcpWritten — 남의 키에 게이트가 섰다", env, res.State, res.Anomaly)
+		}
+		if !strings.Contains(string(res.Out), cur) {
+			t.Errorf("%q: 표식이 기입되지 않았다:\n%s", env, res.Out)
+		}
+		if !codexTOMLParses(res.Out) {
+			t.Errorf("%q: 산출이 파스되지 않는다:\n%s", env, res.Out)
+		}
+	}
+	// 점 표기 머리·꼬리 — 남의 키는 소유 근거가 아니다. command도 남의 것이라 표식만이
+	// 눈금이며, 되읽기가 그 값을 우리 표식으로 읽으면 install이 되쓰고 uninstall이 지운다.
+	for _, env := range []string{
+		"'\"env\"'.CTR_MANAGED = \"" + cur + "\"\n",
+		"env.'\"CTR_MANAGED\"' = \"" + cur + "\"\n",
+	} {
+		src := theirs + env
+		if m, _, _ := codexConfigMarker([]byte(src)); m != "" {
+			t.Errorf("%q: 남의 키를 표식으로 읽었다: %q", env, m)
+		}
+		if res := installCodexConfigBlock([]byte(src), codexInstallRequest{Marker: cur}); res.State != mcpExistingHeader {
+			t.Errorf("%q: install state=%d want mcpExistingHeader — 남의 테이블이다", env, res.State)
+		}
+		if out, changed, anomaly := uninstallCodexConfigBlock([]byte(src)); changed || anomaly != anomalyNotOwned {
+			t.Errorf("%q: 남의 테이블을 건드렸다: changed=%v anomaly=%d\n%s", env, changed, anomaly, out)
+		}
+	}
+}
+
+// TestCodexUnscannableInlineEnvIsUnknownNotForeign — 인라인 env의 구조를 확정하지 못하면
+// 소유는 **모르는** 것이지 "아니다"가 아니다. codexInlineMarker가 그 상태에서 부재를 내므로
+// 표식이 문자열 그대로 적힌 파일이 남의 것으로 내려왔다: install은 mcpExistingHeader로 물러나
+// 재실행으로도 고칠 수 없고, uninstall은 "사용자 등록이니 직접 정리하라"를 내며 종료코드 0으로
+// 끝나 사용자는 제거가 끝난 줄 아는데 Codex는 그 MCP 서버를 계속 띄운다.
+//
+// **표식을 텍스트로 다시 찾아 고치지 않는다** — 판독기 둘이 같은 바이트를 다르게 읽는 것이
+// 이 릴리스가 닫은 결함이다. 모른다는 것을 사유 있는 무변경으로 보고한다.
+func TestCodexUnscannableInlineEnvIsUnknownNotForeign(t *testing.T) {
+	// 절대경로 command라 인수 절(D80)이 서지 않는다 — 표식만이 소유 근거인 눈금이다.
+	src := "[mcp_servers.ctr]\ncommand = \"/opt/bin/context-router\"\n" +
+		"env = { CTR_MANAGED = \"context-router/0.17.2\", A = }\n"
+	res := installCodexConfigBlock([]byte(src), codexInstallRequest{Marker: hookMarker("0.18.0")})
+	if res.State != mcpMarkerAnomaly || res.Anomaly != anomalyEnvNotTable {
+		t.Errorf("install state=%d anomaly=%d want mcpMarkerAnomaly/anomalyEnvNotTable", res.State, res.Anomaly)
+	}
+	if string(res.Out) != src || res.Changed {
+		t.Errorf("무변경 이탈이 아니다: changed=%v\n%s", res.Changed, res.Out)
+	}
+	out, changed, anomaly := uninstallCodexConfigBlock([]byte(src))
+	if changed || anomaly != anomalyEnvNotTable {
+		t.Errorf("uninstall changed=%v anomaly=%d want false/anomalyEnvNotTable — anomalyNotOwned는 우리 표식이 적힌 파일에 나갈 문면이 아니다", changed, anomaly)
+	}
+	if string(out) != src {
+		t.Errorf("uninstall이 바이트를 바꿨다:\n%s", out)
+	}
+	// **남의 테이블은 여전히 남의 테이블이다.** 우변이 인라인 테이블이 아니면 마디가 있을 수
+	// 없으므로 표식의 부재는 아는 것이다 — 그 형태까지 이상으로 올리면 남의 등록물에 우리
+	// 파일을 고치라는 안내가 나간다.
+	for _, rhs := range []string{"[]", "\"x\"", "1"} {
+		foreign := "[mcp_servers.ctr]\ncommand = \"/usr/bin/someone-else\"\nenv = " + rhs + "\n"
+		if r := installCodexConfigBlock([]byte(foreign), codexInstallRequest{Marker: hookMarker("0.18.0")}); r.State != mcpExistingHeader {
+			t.Errorf("env = %s: install state=%d want mcpExistingHeader", rhs, r.State)
+		}
+		if _, ch, an := uninstallCodexConfigBlock([]byte(foreign)); ch || an != anomalyNotOwned {
+			t.Errorf("env = %s: uninstall changed=%v anomaly=%d want false/anomalyNotOwned", rhs, ch, an)
+		}
+	}
+}
+
 // TestCodexMultilineInlineMarkerUpdates — 여러 줄로 이어진 인라인 env에서도 표식이 현재
 // 값으로 갱신되고 재실행이 무변경이다. 한 줄 픽스처로는 물리 라인 한정 구현이 통과한다.
 func TestCodexMultilineInlineMarkerUpdates(t *testing.T) {
@@ -1676,10 +1772,16 @@ func TestCodexDottedHead(t *testing.T) {
 		{`env.FOO = "bar"`, "env", "FOO"},
 		{`env."CTR_MANAGED" = "x"`, "env", "CTR_MANAGED"},
 		{`"env".FOO = "bar"`, "env", "FOO"},
-		{`"env.FOO" = "bar"`, "", ""},   // 단일 키 — 점 경로가 아니다
-		{`"e n v".FOO = "bar"`, "", ""}, // 따옴표 안 공백은 이름의 일부다
-		{`env.A.B = 1`, "env", ""},      // 세 마디 — env 정의로는 세되 표식 자리가 아니다
+		{`'env'.FOO = "bar"`, "env", "FOO"},               // 홑따옴표 한 쌍도 같은 키다
+		{`env.'CTR_MANAGED' = "x"`, "env", "CTR_MANAGED"}, // 꼬리도 마찬가지
+		{`"env.FOO" = "bar"`, "", ""},                     // 단일 키 — 점 경로가 아니다
+		{`"e n v".FOO = "bar"`, "", ""},                   // 따옴표 안 공백은 이름의 일부다
+		{`env.A.B = 1`, "env", ""},                        // 세 마디 — env 정의로는 세되 표식 자리가 아니다
 		{`command = "x"`, "", ""},
+		// 따옴표를 **한 쌍만** 벗긴다(tomlUnquoteKey). 두 겹은 TOML이 별개 키로 읽으므로
+		// 우리 env도 우리 표식도 아니다 — strings.Trim이면 둘 다 우리 것으로 읽혔다.
+		{`'"env"'.CTR_MANAGED = "x"`, "", ""},
+		{`env.'"CTR_MANAGED"' = "x"`, "env", `"CTR_MANAGED"`},
 	}
 	for _, c := range cases {
 		head, rest := tomlDottedEnvKey(c.in)
