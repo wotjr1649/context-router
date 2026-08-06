@@ -2279,7 +2279,7 @@ func doctorFixRegistrations(w io.Writer, projectRoot, version string) {
 		} else if wErr := atomicWriteFile(mcpPath, merged); wErr != nil {
 			fmt.Fprintln(w, "[20] fix: .mcp.json 기록 실패")
 		} else {
-			fmt.Fprintf(w, "[20] fix: .mcp.json 표식을 %s로 다시 기입했습니다(프로필은 보존, 대체된 옛 이름의 항목이 있으면 함께 정리했습니다)\n", version)
+			fmt.Fprintf(w, "[20] fix: .mcp.json 표식을 %s로 다시 기입했습니다(프로필은 보존, 대체된 옛 이름의 항목이 있으면 함께 정리했습니다. 직전 내용은 .mcp.json.bak 한 슬롯 — 프로젝트 루트 파일이라 버전 관리에 딸려 들어가니 .gitignore에 넣어 두세요)\n", version)
 		}
 	}
 	cfgPath, cfgErr := codexConfigPath()
