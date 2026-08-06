@@ -2572,3 +2572,75 @@ func TestCodexInstallQuadQuoteInlineEnv(t *testing.T) {
 		})
 	}
 }
+
+// TestCodexInlineMarkerEndOnFragmentBoundary — **회귀 잠금**. 값 구간의 **배타적 끝**이 조각
+// 경계에 정확히 놓이면 되쓰기가 그 경계 앞의 물리 라인들을 통째로 먹었다 — 사용자의 주석
+// 줄과 줄바꿈이 사라진다(실측: 첫 픽스처가 `env = { CTR_MANAGED = "…/0.18.0"      , KEEP =
+// "keepme" }` 한 줄로 접혔고 state=mcpWritten·changed=true로 조용히 빠져나갔다). 네 픽스처는
+// 전부 **유효 TOML**이라 D89 게이트의 대상이 아니며, base(128a727)는 넷 모두 주석·빈 줄·줄
+// 종결자를 원문 그대로 보존했다 — 이 릴리스가 들인 회귀다.
+//
+// 기제: 값 끝이 후행 공백 절단으로 at[k]까지 당겨지면 codexPointAt이 그것을 "조각 k의 첫
+// 바이트"로 풀어 (k, 0)을 낸다. 배타적 끝은 "조각 k-1의 마지막 바이트 **바로 뒤**"라는 뜻
+// 이므로 앞 조각의 끝으로 풀어야 그 줄의 꼬리(잘린 주석 + 줄 종결자)가 남는다. 삽입 갈래는
+// open에서 산술로 구간을 세우므로 이 경로를 타지 않는다.
+//
+// 단정은 **엔트리 바이트 동일**이다 — 표식 값 하나만 바뀌고 나머지 바이트는 입력 그대로여야
+// 한다. 주석 문자열만 부분 검사하면 "주석은 남기고 줄바꿈은 먹는" 회귀가 통과한다.
+func TestCodexInlineMarkerEndOnFragmentBoundary(t *testing.T) {
+	const old, cur = "0.17.2", "0.18.0"
+	for _, c := range []struct{ name, mid, eol string }{
+		{"주석 줄", "# 살아남아야 하는 사용자 메모", "\n"},
+		{"빈 줄", "", "\n"},
+		{"주석 두 줄", "# 첫째 메모\n# 둘째 메모", "\n"},
+		{"CRLF", "# 살아남아야 하는 사용자 메모", "\r\n"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			mid := strings.ReplaceAll(c.mid, "\n", c.eol)
+			entry := func(v string) string {
+				return `env = { ` + codexMarkerKey + ` = "` + hookMarker(v) + `"` + c.eol +
+					mid + c.eol + `      , KEEP = "keepme" }` + c.eol
+			}
+			src := "[mcp_servers.ctr]" + c.eol + `command = "context-router"` + c.eol + entry(old)
+			if !codexTOMLParses([]byte(src)) {
+				t.Fatalf("픽스처가 파스되지 않는다 — 유효 입력에서 재는 축이 아니게 된다:\n%q", src)
+			}
+			res := installCodexConfigBlock([]byte(src), codexInstallRequest{Marker: hookMarker(cur)})
+			if res.State != mcpWritten || !res.Changed {
+				t.Fatalf("state=%d changed=%v 사유=%q — 표식만 갱신하면 되는 형태다",
+					res.State, res.Changed, res.Anomaly.reason())
+			}
+			if !strings.Contains(string(res.Out), entry(cur)) {
+				t.Errorf("엔트리 바이트가 보존되지 않았다(주석 줄·빈 줄·줄 종결자가 먹혔다):\n want %q\n got  %q",
+					entry(cur), res.Out)
+			}
+			if !codexTOMLParses(res.Out) {
+				t.Errorf("산출이 파스되지 않는다:\n%s", res.Out)
+			}
+			again := installCodexConfigBlock(res.Out, codexInstallRequest{Marker: hookMarker(cur)})
+			if !bytes.Equal(again.Out, res.Out) {
+				t.Errorf("2회차가 바이트 동일하지 않다:\n1: %q\n2: %q", res.Out, again.Out)
+			}
+			// **왕복은 흔들리지 않는다** — 두 해석 모두 at[k]+col로 같은 오프셋에 돌아오므로
+			// tomlSpanText와 타일링 오라클은 이 변경의 대상이 아니다. 그 사실을 이 픽스처
+			// 위에서 잰다: 오라클이 적색이 되면 오라클이 아니라 이 해석이 틀린 것이다.
+			lines := splitLinesKeepEnds([]byte(src))
+			e := [2]int{2, len(lines) - 1} // 0행 헤더 · 1행 command
+			sc := tomlScanInline(lines, e)
+			if !sc.ok {
+				t.Fatalf("열거가 실패했다 — 유효 인라인 테이블이다: %+v", sc)
+			}
+			assertInlineScanTiles(t, lines, e, sc)
+			joined, at := codexEntryRaw(lines, e)
+			wantVals := []string{`"` + hookMarker(old) + `"`, `"keepme"`}
+			if len(sc.entries) != len(wantVals) {
+				t.Fatalf("마디 수=%d want %d", len(sc.entries), len(wantVals))
+			}
+			for i, en := range sc.entries {
+				if got := tomlSpanText(joined, at, e, en.value); got != wantVals[i] {
+					t.Errorf("마디[%d] 값 왕복=%q want %q — 배타적 끝의 새 해석이 오프셋을 옮겼다", i, got, wantVals[i])
+				}
+			}
+		})
+	}
+}
