@@ -642,6 +642,32 @@ func codexPointAt(e [2]int, at []int, joinedLen, off int) tomlPoint {
 	return tomlPoint{line: e[0] + k, col: off - at[k]}
 }
 
+// codexEndPointAt — **배타적 끝** 오프셋을 파일 좌표로 되돌린다. codexPointAt과 갈리는 자리는
+// 조각 경계 하나뿐이다: `off == at[k]`는 "조각 k의 첫 바이트"가 아니라 "조각 k-1의 마지막
+// 바이트 **바로 뒤**"라는 뜻이다. 앞 조각의 끝으로 풀어야 그 줄의 꼬리 — codexEntryRaw가 잘라
+// 낸 주석과 줄 종결자 — 가 spliceInlineSpan의 `lines[end.line][end.col:]` 몫으로 남는다.
+// 뒤 조각의 시작으로 풀면 그 사이 물리 라인이 통째로 치환 구간에 들어가 **사용자의 주석 줄과
+// 빈 줄이 사라진다**(실측: 값 끝이 후행 공백 절단으로 경계에 놓이는 여러 줄 인라인 넷 전부 —
+// 주석 한 줄·빈 줄·주석 두 줄·CRLF. base(128a727)는 넷 다 보존했다).
+//
+// **바이트를 가리키는 지점은 여기 오지 않는다.** 구간의 시작과 open·close는 실재하는 바이트의
+// 자리이므로 codexPointAt이 그대로 낸다 — 같은 오프셋의 두 뜻은 호출부에서만 갈리고, 그래서
+// 짐작이 아니라 함수 선택으로 가른다.
+//
+// 되짚는 것은 `off-1`이 **든** 조각이다. 빈 조각이 여럿 이어져도(주석만 있는 줄, 빈 줄이
+// 길이 0 조각이 된다) 바이트를 담은 마지막 조각까지 한 번에 내려간다 — 한 칸만 물러나면
+// 그 빈 조각이 끝 줄이 되어 그 앞줄의 꼬리를 여전히 잃는다.
+func codexEndPointAt(e [2]int, at []int, joinedLen, off int) tomlPoint {
+	if off <= 0 || off > joinedLen { // 되짚을 바이트가 없다 — 범위 판정도 codexPointAt과 같아야 한다
+		return codexPointAt(e, at, joinedLen, off)
+	}
+	p := codexPointAt(e, at, joinedLen, off-1)
+	if !p.valid() {
+		return p
+	}
+	return tomlPoint{line: p.line, col: p.col + 1}
+}
+
 // codexEscapedKeyInSpans — 우리 두 구간 안에 정규화 불가 키 표기가 있는가(D87).
 // **엔트리 단위로 본다.** codexEntries가 여러 줄 값을 한 엔트리로 묶고 그 엔트리에서 키는
 // 맨 앞 토큰뿐이므로, 문자열 값 안이나 후행 주석 안의 `"이름" = 값` 모양이 키로 오인되지
@@ -1687,7 +1713,10 @@ func tomlSpanText(joined string, at []int, e [2]int, sp tomlSpan) string {
 func tomlScanInline(lines [][]byte, e [2]int) tomlInlineScan {
 	fail := tomlInlineScan{open: tomlNoPoint(), close: tomlNoPoint()}
 	joined, at := codexEntryRaw(lines, e)
+	// pt는 **바이트를 가리키는** 오프셋을(구간의 시작·open·close), ptEnd는 **배타적 끝**을 푼다.
+	// 조각 경계에 놓인 오프셋에서 둘이 갈리며, 뜻을 짐작할 수 없으므로 부르는 자리에서 가른다.
 	pt := func(off int) tomlPoint { return codexPointAt(e, at, len(joined), off) }
+	ptEnd := func(off int) tomlPoint { return codexEndPointAt(e, at, len(joined), off) }
 
 	// oneLineTok — joined[off]에서 시작하는 **한 줄** 문자열 토큰의 길이. 그 토큰이 조각
 	// 경계(at)를 넘으면 -1이고 호출자가 그 자리에서 fail로 빠진다.
@@ -1834,8 +1863,8 @@ func tomlScanInline(lines [][]byte, e [2]int) tomlInlineScan {
 			return fail
 		}
 		out.entries = append(out.entries, tomlInlineEntry{
-			key:     tomlSpan{start: pt(keyStart), end: pt(keyEnd)},
-			value:   tomlSpan{start: pt(valStart), end: pt(valEnd)},
+			key:     tomlSpan{start: pt(keyStart), end: ptEnd(keyEnd)},
+			value:   tomlSpan{start: pt(valStart), end: ptEnd(valEnd)},
 			segs:    len(segs),
 			escaped: escaped,
 		})
