@@ -209,6 +209,25 @@ func (s *tomlLineScanner) step(line []byte) (boundary bool, name string) {
 	return boundary, name
 }
 
+// tomlTripleCloses — s의 j 자리가 여러 줄 문자열을 **닫는** 삼중 따옴표인가. q는 큰따옴표나
+// 홑따옴표 한 바이트다.
+//
+// TOML은 여러 줄 문자열 안에 따옴표 한두 개를 그대로 허용하므로, 닫는 구분자는 "첫 삼중
+// 따옴표"가 아니라 **뒤에 같은 따옴표가 더 붙지 않은 첫 삼중 따옴표**다. 큰따옴표 넷은
+// 내용이 따옴표 하나인 8바이트 토큰이고 홑따옴표 갈래도 같다. 실행 길이로 보면 3은 정상
+// 닫기, 4는 따옴표 하나를 내용으로 남기고, 5는 둘을 남긴다.
+//
+// 첫 삼중에서 닫으면 따옴표 하나가 문자열 **밖**에 남아 한 줄 문자열을 새로 열고, 그 문자열이
+// 줄 뒤쪽을 통째로 삼킨다. 그 뒤쪽에 인라인 테이블의 닫는 중괄호가 있으면 depth가 풀리지 않아
+// 우리 구간이 EOF까지 늘어나고, uninstall이 그 뒤의 사용자 테이블을 함께 지웠다(실측:
+// base 128a727은 뒤 테이블을 보존, 이 릴리스는 빈 파일 · changed=true · 사유 없음).
+// 같은 뿌리가 tomlTripleLen에서는 토큰 길이를 짧게 내 유효한 파일을 anomalyEnvNotTable로
+// 되돌렸다 — 그래서 세 자리가 이 하나를 지난다.
+func tomlTripleCloses(s string, j int, q byte) bool {
+	return j+3 <= len(s) && s[j] == q && s[j+1] == q && s[j+2] == q &&
+		(j+3 == len(s) || s[j+3] != q)
+}
+
 // advance — 라인 내용을 훑어 여러 줄 상태를 갱신하고, 이 줄의 **문자열 밖 '#' 위치**를
 // 돌려준다(없으면 len(line)). 헤더 줄은 자기완결이라 배열·인라인 테이블 균형을 세지 않는다 —
 // 헤더의 대괄호가 배열 열림으로 잡히면 그 뒤 파일 전체가 값 안으로 들어간다.
@@ -225,13 +244,15 @@ func (s *tomlLineScanner) advance(line string, header bool) int {
 			// 닫기 탐색은 basicStringLen과 **같은 기준**으로 이스케이프를 인지한다 —
 			// strings.Index로 찾으면 \""" 를 닫기로 오인해 그 뒤 파일 전체의 열림 상태가
 			// 뒤집힌다. 두 자리가 다른 기준을 쓰면 같은 파일을 두 방식으로 읽는 셈이다.
+			// **이스케이프 건너뛰기가 닫기 판정보다 앞이다** — 그래야 역슬래시로 이스케이프된
+			// 따옴표가 구분자의 일부로 읽히지 않는다.
 			j := i
 			for j < len(line) {
 				if line[j] == '\\' {
 					j += 2
 					continue
 				}
-				if strings.HasPrefix(line[j:], `"""`) {
+				if tomlTripleCloses(line, j, '"') {
 					break
 				}
 				j++
@@ -241,11 +262,16 @@ func (s *tomlLineScanner) advance(line string, header bool) int {
 			}
 			s.inBasic, i = false, j+3
 		case s.inLiteral:
-			j := strings.Index(line[i:], "'''")
-			if j < 0 {
+			// 홑따옴표에는 이스케이프가 없지만 실행 길이 규칙은 같다 — strings.Index는 첫
+			// 삼중에서 닫으므로 쓸 수 없다(tomlTripleCloses의 주석).
+			j := i
+			for j < len(line) && !tomlTripleCloses(line, j, '\'') {
+				j++
+			}
+			if j >= len(line) {
 				return len(line)
 			}
-			s.inLiteral, i = false, i+j+3
+			s.inLiteral, i = false, j+3
 		case strings.HasPrefix(line[i:], `"""`):
 			s.inBasic, i = true, i+3
 		case strings.HasPrefix(line[i:], "'''"):
@@ -1599,28 +1625,30 @@ type tomlInlineScan struct {
 
 // tomlTripleLen — s의 맨 앞이 삼중 큰따옴표나 삼중 홑따옴표면 그 여러 줄 문자열 토큰
 // 전체의 길이, 아니면 0. 닫히지 않으면 len(s)다 — 호출자가 그 자리에서 fail로 빠진다.
-// 닫기 탐색의 이스케이프 기준은 tomlLineScanner.advance와 **같다**: strings.Index로 찾으면
-// 역슬래시로 이스케이프된 따옴표를 닫기로 오인한다.
+// 닫기 판정은 tomlLineScanner.advance와 **같은 기준**이다(tomlTripleCloses): 실행 길이 규칙과
+// 이스케이프 인지를 함께 쓴다. strings.Index로 찾으면 역슬래시로 이스케이프된 따옴표를 닫기로
+// 오인하고, 첫 삼중에서 닫으면 따옴표 넷으로 닫는 토큰의 길이를 하나 짧게 내 그 뒤 값 스캔이
+// 어긋난다 — 유효한 파일이 anomalyEnvNotTable로 되돌려진 자리가 그것이다.
 //
 // **문서 주석에 홑따옴표 두 개를 잇달아 적지 마라** — Go 1.19+ gofmt의 doc 주석 정규화가
 // 그것을 오른쪽 겹따옴표로 바꿔 `gofumpt -l .`이 적색이 된다(실측). 저장소가 이미 같은
 // 이유로 tomlLineScanner 주석에서 "삼중 홑따옴표"라고 풀어 쓴다(codex_toml.go:168).
 func tomlTripleLen(s string) int {
-	var q string
+	var q byte
 	switch {
 	case strings.HasPrefix(s, `"""`):
-		q = `"""`
+		q = '"'
 	case strings.HasPrefix(s, "'''"):
-		q = "'''"
+		q = '\''
 	default:
 		return 0
 	}
 	for i := 3; i < len(s); {
-		if q == `"""` && s[i] == '\\' {
+		if q == '"' && s[i] == '\\' {
 			i += 2
 			continue
 		}
-		if strings.HasPrefix(s[i:], q) {
+		if tomlTripleCloses(s, i, q) {
 			return i + 3
 		}
 		i++
