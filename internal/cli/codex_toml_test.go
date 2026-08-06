@@ -2442,3 +2442,133 @@ func TestCodexInlineValueSpanCommentIsRemoved(t *testing.T) {
 		t.Errorf("2회차가 바이트 동일하지 않다:\n1: %q\n2: %q", res.Out, again.Out)
 	}
 }
+
+// TestTomlTripleCloseRunLength — TOML의 실제 닫기 규칙을 실행 길이별로 잰다. 여러 줄 문자열을
+// 닫는 것은 "첫 삼중 따옴표"가 아니라 **뒤에 같은 따옴표가 더 붙지 않은 첫 삼중 따옴표**다:
+// 따옴표 넷은 내용이 따옴표 하나인 8바이트 토큰이고, 다섯이면 둘을 남긴다. 홑따옴표 갈래도 같다.
+//
+// 두 자리를 함께 잰다. `advance`는 **이어지는 줄에서** 닫는 갈래(inBasic·inLiteral)를 지나야
+// 이 규칙이 사는 분기에 닿으므로 스캐너를 열린 상태로 놓고 시작한다 — 한 줄 안에서 열고 닫는
+// 형태는 여는 갈래가 먼저 걸린다. 빈 여러 줄 문자열(따옴표 여섯)은 그 형태로만 표현되므로
+// 열림 없이 잰다. 관측점은 **닫기 뒤 바이트가 구조로 보이는가**다: 첫 삼중에서 닫으면 따옴표
+// 하나가 문자열 밖에 남아 한 줄 문자열을 열고 줄 뒤쪽을 삼켜, 닫는 중괄호도 후행 주석도
+// 값 안으로 들어간다.
+func TestTomlTripleCloseRunLength(t *testing.T) {
+	for _, c := range []struct {
+		name string
+		tok  string
+		want int
+	}{
+		{"큰따옴표 셋으로 닫기", `"""x"""`, 7},
+		{"큰따옴표 넷으로 닫기", `"""x""""`, 8},
+		{"큰따옴표 다섯으로 닫기", `"""x"""""`, 9},
+		{"빈 여러 줄 기본 문자열", `""""""`, 6},
+		{"홑따옴표 셋으로 닫기", "'''x'''", 7},
+		{"홑따옴표 넷으로 닫기", "'''x''''", 8},
+		{"홑따옴표 다섯으로 닫기", "'''x'''''", 9},
+		{"빈 여러 줄 리터럴 문자열", "''''''", 6},
+	} {
+		if got := tomlTripleLen(c.tok); got != c.want {
+			t.Errorf("%s: tomlTripleLen(%q)=%d want %d", c.name, c.tok, got, c.want)
+		}
+	}
+	for _, c := range []struct {
+		name        string
+		line        string
+		basic       bool // 줄 머리에서 여러 줄 기본 문자열이 열려 있는가
+		literal     bool // 줄 머리에서 여러 줄 리터럴 문자열이 열려 있는가
+		wantComment int
+	}{
+		{"셋으로 닫는 줄", `x""" } # c`, true, false, 7},
+		{"넷으로 닫는 줄", `x"""" } # c`, true, false, 8},
+		{"다섯으로 닫는 줄", `x""""" } # c`, true, false, 9},
+		{"한 줄 안의 빈 기본 문자열", `a = """""" } # c`, false, false, 13},
+		{"홑따옴표 셋으로 닫는 줄", "x''' } # c", false, true, 7},
+		{"홑따옴표 넷으로 닫는 줄", "x'''' } # c", false, true, 8},
+		{"홑따옴표 다섯으로 닫는 줄", "x''''' } # c", false, true, 9},
+		{"한 줄 안의 빈 리터럴 문자열", "a = '''''' } # c", false, false, 13},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			sc := tomlLineScanner{inBasic: c.basic, inLiteral: c.literal, depth: 1}
+			if got := sc.advance(c.line, false); got != c.wantComment {
+				t.Errorf("주석 자리=%d want %d — 닫기 뒤 바이트가 문자열로 먹혔다", got, c.wantComment)
+			}
+			if sc.open() {
+				t.Errorf("닫는 줄 뒤에도 스캐너가 열려 있다: inBasic=%v inLiteral=%v depth=%d",
+					sc.inBasic, sc.inLiteral, sc.depth)
+			}
+		})
+	}
+}
+
+// TestCodexUninstallQuadQuoteKeepsFollowingTable — **회귀 잠금**. 따옴표 넷으로 닫는 여러 줄
+// 문자열이 인라인 env 안에 있으면 uninstall이 사용자의 `config.toml`을 통째로 비웠다.
+//
+// 기제: 탐욕적 닫기가 남긴 따옴표 하나가 한 줄 문자열을 열어 인라인 테이블의 닫는 중괄호를
+// 삼키고, 그러면 depth가 1에 머물러 뒤따르는 `[other]`가 테이블 경계로 잡히지 않는다 — 우리
+// 구간이 EOF까지 늘어난다. 뒤쪽의 짝 없는 `}`가 depth를 도로 0으로 내리므로 EOF 열림
+// 백스톱(anomalyScannerOpen)도 서지 않아 **사유 없이 changed=true**로 빠져나갔다.
+// 실측: base(128a727)는 `[other]`를 그대로 돌려준다 — 이 단정의 기대값이 그 산출이다.
+func TestCodexUninstallQuadQuoteKeepsFollowingTable(t *testing.T) {
+	const tail = "[other]\ncommand = \"user-thing\"\nz = 1 }\n"
+	for _, c := range []struct{ name, env string }{
+		{"큰따옴표 넷", "env = { A = \"\"\"x\"\"\"\" }\n"},
+		{"홑따옴표 넷", "env = { A = '''x'''' }\n"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			src := "[mcp_servers.ctr]\ncommand = \"context-router\"\n" + c.env + tail
+			out, changed, an := uninstallCodexConfigBlock([]byte(src))
+			if !changed || an != anomalyNone {
+				t.Fatalf("changed=%v anomaly=%d — 우리 소유 테이블이므로 제거 대상이다", changed, an)
+			}
+			if string(out) != tail {
+				t.Errorf("사용자 테이블이 살아남지 않았다(base 128a727 산출과 다르다):\ngot  %q\nwant %q", out, tail)
+			}
+		})
+	}
+}
+
+// TestCodexInstallQuadQuoteInlineEnv — **회귀 잠금**. 따옴표 넷으로 닫는 여러 줄 문자열을 담은
+// 인라인 env는 유효 TOML인데(우리 게이트도 유효로 잰다) install이 `anomalyEnvNotTable`로
+// 이탈했다 — 인라인 테이블을 인라인 테이블로 바꾸라는 수행 불가능한 사유였고, MCP가 확정되지
+// 않아 가드 등록도 함께 빠졌다.
+//
+// 기제: `tomlTripleLen`이 토큰 길이를 하나 짧게 내 남은 따옴표가 값 스캔의 한 줄 문자열
+// 갈래로 흘러가고, 그 토큰이 조각 경계를 넘어 `tomlScanInline`이 fail로 빠진다.
+// 실측: base(128a727)는 이 파일을 기입했다. 상태·changed가 base와 같고, 표식이 서는 것은
+// 이 릴리스가 의도한 차이다(D92 — base는 같은 오독 때문에 표식을 넣지 못했다).
+func TestCodexInstallQuadQuoteInlineEnv(t *testing.T) {
+	marker := hookMarker("0.18.0")
+	for _, c := range []struct{ name, env, keepA, keepB string }{
+		{"큰따옴표 넷", "env = { A = \"\"\"x\"\"\"\",\n  B = \"1\" }\n", "A = \"\"\"x\"\"\"\"", "B = \"1\""},
+		{"홑따옴표 넷", "env = { A = '''x'''',\n  B = '1' }\n", "A = '''x''''", "B = '1'"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			src := "[mcp_servers.ctr]\ncommand = \"context-router\"\n" + c.env
+			if !codexTOMLParses([]byte(src)) {
+				t.Fatalf("픽스처가 파스되지 않는다 — 유효 입력에서 재는 축이 아니게 된다")
+			}
+			res := installCodexConfigBlock([]byte(src), codexInstallRequest{Marker: marker})
+			if res.State != mcpWritten || !res.Changed {
+				t.Fatalf("state=%d changed=%v 사유=%q — base(128a727)는 이 파일을 기입했다",
+					res.State, res.Changed, res.Anomaly.reason())
+			}
+			out := string(res.Out)
+			if !strings.Contains(out, codexMarkerKey+` = "`+marker+`"`) {
+				t.Errorf("표식이 서지 않았다:\n%q", out)
+			}
+			for _, keep := range []string{c.keepA, c.keepB} {
+				if !strings.Contains(out, keep) {
+					t.Errorf("사용자 값 %q가 바이트 그대로 남지 않았다:\n%q", keep, out)
+				}
+			}
+			if !codexTOMLParses(res.Out) {
+				t.Errorf("산출이 파스되지 않는다:\n%s", out)
+			}
+			again := installCodexConfigBlock(res.Out, codexInstallRequest{Marker: marker})
+			if !bytes.Equal(again.Out, res.Out) {
+				t.Errorf("2회차가 바이트 동일하지 않다:\n1: %q\n2: %q", res.Out, again.Out)
+			}
+		})
+	}
+}
