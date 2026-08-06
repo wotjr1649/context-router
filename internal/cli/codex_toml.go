@@ -102,14 +102,23 @@ func (a codexAnomaly) reason() string {
 	case anomalyOutputInvalid:
 		return "이 도구가 만든 결과가 유효한 TOML이 아니어서 기입하지 않았습니다 — 제품 결함이니 파일 형태와 함께 알려 주세요"
 	case anomalyDottedEnv:
-		// **두 형태가 이 사유에 닿는다** — 테이블 수준의 `env.NAME`과 인라인 테이블 안의
-		// `CTR_MANAGED.NAME`. 앞의 것만 대면 뒤의 사용자는 자기 env 키(이름이 그냥 env다)가
-		// 점 표기라는 거짓 진단을 듣고, `env.`을 찾아도 나오지 않아 무엇을 고쳤는지 확인할 수
-		// 없다 — 그 사이 install은 영구히 무변경이다. 조치 절은 두 형태에 다 맞으므로 진단
-		// 절만 고친다(사유값을 늘리는 것은 라벨 어휘 변경이고 스펙 §1.2의 비범위다).
-		return "env 쪽에 점 표기 키가 있어 표식을 쓸 자리가 없습니다(env.NAME 형태이거나 인라인 테이블 안의 CTR_MANAGED.NAME 형태입니다) — 그 키를 [mcp_servers.ctr.env] 테이블의 보통 키로 옮긴 뒤 재실행하세요"
+		// **세 형태가 이 사유에 닿는다** — 테이블 수준의 `env.NAME`, 인라인 env 안의
+		// `CTR_MANAGED.NAME`, 그리고 `[mcp_servers.ctr.env]` 테이블 안의 `CTR_MANAGED.NAME`.
+		// 셋째가 늦게 온 이유는 그 형태가 이 게이트에 닿지 못하고 "우리 결함" 문면으로 빠져
+		// 있었기 때문이고, 그것이 하필 **우리 설치기 자신이 만드는 형태**다. 대지 않은 형태의
+		// 사용자는 거짓 진단을 듣고 사유가 대는 문자열을 찾아도 나오지 않아 무엇을 고쳤는지
+		// 확인할 수 없다 — 그 사이 install은 영구히 무변경이다. 조치 절은 셋에 다 맞으므로
+		// 진단 절만 고친다(사유값을 늘리는 것은 라벨 어휘 변경이고 스펙 §1.2의 비범위다).
+		return "env 쪽에 점 표기 키가 있어 표식을 쓸 자리가 없습니다(env.NAME 형태이거나, 인라인 env·[mcp_servers.ctr.env] 테이블 안의 CTR_MANAGED.NAME 형태입니다) — 그 키를 [mcp_servers.ctr.env] 테이블의 점 없는 보통 키로 고쳐 적은 뒤 재실행하세요"
 	case anomalyEnvNotTable:
-		return "env 값이 인라인 테이블({ … })이 아닙니다 — [mcp_servers.ctr.env] 테이블이나 env = { … } 형태로 바꾼 뒤 재실행하세요"
+		// **두 부류가 이 사유에 닿는다** — 우변이 애초에 인라인 테이블이 아닌 형태(`env = []`)와,
+		// 중괄호는 열렸는데 그 안을 확정하지 못한 형태(`env = { A = }` · 쉼표 둘 · 빈 키 · 짝
+		// 어긋난 괄호)다. 뒤엣것이 계약 7의 **소유 미상**이 내려오는 자리이기도 하다
+		// (codexMarkerUnknown은 `braced && !ok`에서만 참이므로 그 갈래는 **언제나** 중괄호로
+		// 열린 파일이다). "인라인 테이블이 아니다"만 대면 그 사용자는 자기 파일이 이미
+		// `env = { … }` 형태인 것을 보고 고칠 것을 찾지 못한 채 제거가 끝난 줄 안다 — 그동안
+		// 우리 테이블은 그대로 남아 Codex가 서버를 계속 띄운다.
+		return "env 값이 인라인 테이블({ … })이 아니거나 그 안의 키·값 구조를 읽지 못했습니다 — [mcp_servers.ctr.env] 테이블이나 온전한 env = { … } 형태로 고친 뒤 재실행하세요"
 	case anomalyNotOwned:
 		return "관리 테이블이 남아 있으나 표식도 command도 우리 것이 아닙니다 — 사용자 등록으로 보고 건드리지 않았습니다. 직접 정리하세요"
 	}
@@ -1086,6 +1095,23 @@ func installCodexConfigBlock(existing []byte, req codexInstallRequest) codexInst
 	if req.MarkerOnly {
 		resultProfiles = nil
 	}
+	// env 서브테이블을 정의하는 구간에 **첫 마디가 표식 키인 점 표기**가 있으면 삽입은 중복
+	// 정의를 만들고, 표식으로 읽히지도 않아 갱신 갈래도 설 수 없다. 게이트가 그 산출을
+	// 거부하지만 그 문면은 "우리 결함이니 알려 주세요"라 사용자가 할 일이 없다 — 수행 가능한
+	// 안내로 바꾼다.
+	//
+	// **이탈이 첫 기입 갈래 앞에 선다.** 헤더 구간만 있고 관리 테이블이 없는 파일도 그 갈래에서
+	// codexEnvBody를 지나 같은 중복 정의를 내므로, 아래 `!sp.table.found` 뒤에 두면 그 형태가
+	// 계속 "우리 결함" 문면을 받는다. 소유 판정 **뒤**인 것은 종전 인라인 갈래와 같다 — 앞으로
+	// 옮기면 남의 테이블이 mcpExistingHeader 대신 이 사유를 받는다.
+	if codexDottedMarkerBlocked(lines, sp, view) {
+		return codexInstallResult{
+			Out: existing, State: mcpMarkerAnomaly, TableFound: sp.table.found,
+			Anomaly: anomalyDottedEnv, InputParses: inputParses,
+			Tools: diag.Tools, ToolsPresent: diag.ToolsPresent,
+			WantTools: diag.WantTools, ArgsReadable: diag.ArgsReadable,
+		}
+	}
 	crlf := bytes.Contains(existing, []byte("\r\n"))
 	eol := "\n"
 	if crlf {
@@ -1121,17 +1147,6 @@ func installCodexConfigBlock(existing []byte, req codexInstallRequest) codexInst
 		return codexInstallResult{
 			Out: existing, State: mcpMarkerAnomaly, TableFound: sp.table.found, Anomaly: anomalyDottedEnv, InputParses: inputParses,
 			Tools: diag.Tools, ToolsPresent: diag.ToolsPresent, WantTools: diag.WantTools, ArgsReadable: diag.ArgsReadable,
-		}
-	}
-	// 인라인 env의 깊이 1 마디 중 **첫 마디가 표식 키인 점 표기**가 있으면 삽입은 중복 정의를
-	// 만들고, 표식으로 읽히지도 않아 갱신 갈래도 설 수 없다. 게이트가 그 산출을 거부하지만
-	// 그 문면은 "우리 결함이니 알려 주세요"라 사용자가 할 일이 없다 — 수행 가능한 안내로 바꾼다.
-	if view.inlineEnv >= 0 && codexInlineMarkerBlocked(lines, view.inlineEnvEntry) {
-		return codexInstallResult{
-			Out: existing, State: mcpMarkerAnomaly, TableFound: sp.table.found,
-			Anomaly: anomalyDottedEnv, InputParses: inputParses,
-			Tools: diag.Tools, ToolsPresent: diag.ToolsPresent,
-			WantTools: diag.WantTools, ArgsReadable: diag.ArgsReadable,
 		}
 	}
 	// D92 — env 우변이 인라인 테이블이 아니면 헤더를 붙일 자리도 표식을 심을 자리도 없다.
@@ -1455,6 +1470,41 @@ func codexInlineMarkerBlocked(lines [][]byte, e [2]int) bool {
 		}
 		s := tomlSpanText(joined, at, e, en.key)
 		if segs := tomlSplitDotted(s); len(segs) > 0 && tomlUnquoteKey(segs[0]) == codexMarkerKey {
+			return true
+		}
+	}
+	return false
+}
+
+// codexDottedMarkerBlocked — env 서브테이블을 정의하는 **두 구간**(인라인 env 대입 ·
+// `[mcp_servers.ctr.env]` 헤더 구간) 중 하나에 첫 마디가 표식 키인 점 표기가 있는가. 있으면
+// 표식을 심을 자리가 없다: 두 조립기(setInlineEnvMarker·codexEnvBody) 어느 쪽도 그 키를 피해
+// 표식을 쓸 수 없고, 그대로 기입하면 같은 논리 경로가 문자열과 테이블로 두 번 정의된다.
+//
+// **두 형태를 한 술어가 답한다.** 종전에는 인라인 갈래만 이 판정에 닿아, 같은 모양의 파일이
+// 한쪽에서는 수행 가능한 사유를 받고 다른 쪽에서는 "우리 결함이니 알려 주세요"를 받았다 —
+// 그런데 뒤엣것이 **우리 설치기 자신이 기입하는 헤더 형태**다(실측: `[mcp_servers.ctr.env]` +
+// `CTR_MANAGED.sub = "x"`가 mcpOutputInvalid로 굳고 사용자가 할 일이 없었다). 뿌리는
+// codexEnvBody가 표식을 무조건 내보내면서 그 건너뛰기는 이름이 **정확히** 표식 키인 엔트리만
+// 빼는 것이다 — 점 표기 스펠링은 남아 산출에 같은 경로가 둘이 된다.
+//
+// 키 벗기기는 tomlSplitDotted + tomlUnquoteKey **한 자리**를 그대로 지난다. 원문 LHS를 쓰는
+// 것도 형제 술어와 같은 이유다: 정규화 라인에 걸면 따옴표 안 공백이 지워져 남의 키가 우리
+// 표식 키로 읽힌다.
+func codexDottedMarkerBlocked(lines [][]byte, sp codexSpans, view codexTableView) bool {
+	if view.inlineEnv >= 0 && codexInlineMarkerBlocked(lines, view.inlineEnvEntry) {
+		return true
+	}
+	if !sp.env.found {
+		return false
+	}
+	for _, e := range codexEntries(lines, sp.env) {
+		raw, _ := codexEntryRaw(lines, e)
+		i := tomlTopLevelEq(raw)
+		if i < 0 {
+			continue
+		}
+		if segs := tomlSplitDotted(raw[:i]); len(segs) > 1 && tomlUnquoteKey(segs[0]) == codexMarkerKey {
 			return true
 		}
 	}

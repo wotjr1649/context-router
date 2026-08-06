@@ -1361,17 +1361,22 @@ func TestCodexDottedInlineKeyExits(t *testing.T) {
 	}
 }
 
-// TestDottedEnvReasonNamesBothShapes — **사유는 파일에 실재하는 것을 대야 한다.**
-// anomalyDottedEnv에 닿는 입력은 두 형태다: 테이블 수준의 `env.NAME`과 인라인 테이블 안의
-// `CTR_MANAGED.NAME`. 사유가 앞의 것만 대면 뒤의 사용자는 자기 env 키(이름이 그냥 `env`다)가
-// 점 표기라는 **거짓 진단**을 듣고, `env.`을 찾아도 나오지 않아 무엇을 고쳤는지 확인할 수 없다
-// — 그 사이 install은 영구히 무변경이다. 조치 절은 두 형태에 다 맞으므로 진단 절만 고친다
+// TestDottedEnvReasonNamesEveryShape — **사유는 파일에 실재하는 것을 대야 한다.**
+// anomalyDottedEnv에 닿는 입력은 **셋**이다: 테이블 수준의 `env.NAME`, 인라인 env 안의
+// `CTR_MANAGED.NAME`, 그리고 `[mcp_servers.ctr.env]` 테이블 안의 `CTR_MANAGED.NAME`.
+// 사유가 대지 않는 형태의 사용자는 자기 env 키(이름이 그냥 `env`다)가 점 표기라는 **거짓
+// 진단**을 듣고, 사유가 대는 문자열을 찾아도 나오지 않아 무엇을 고쳤는지 확인할 수 없다
+// — 그 사이 install은 영구히 무변경이다. 조치 절은 셋에 다 맞으므로 진단 절만 고친다
 // (사유값을 늘리는 것은 라벨 어휘 변경이고 스펙 §1.2가 이 릴리스의 비범위로 둔다).
-func TestDottedEnvReasonNamesBothShapes(t *testing.T) {
+//
+// **셋째가 늦게 왔다**: 헤더 구간은 이 사유에 닿지 못하고 mcpOutputInvalid로 빠져 있었고,
+// 그것이 하필 우리 설치기 자신이 기입하는 형태다(TestCodexDottedMarkerInEnvHeaderExits).
+func TestDottedEnvReasonNamesEveryShape(t *testing.T) {
 	reason := anomalyDottedEnv.reason()
 	for _, c := range []struct{ name, src, want string }{
 		{"테이블 수준 점 표기", "[mcp_servers.ctr]\ncommand = \"context-router\"\nenv.FOO = \"bar\"\n", "env."},
 		{"인라인 안의 점 표기", "[mcp_servers.ctr]\ncommand = \"context-router\"\nenv = { CTR_MANAGED.sub = \"x\" }\n", codexMarkerKey + "."},
+		{"env 헤더 안의 점 표기", "[mcp_servers.ctr]\ncommand = \"context-router\"\n[" + codexManagedEnv + "]\nCTR_MANAGED.sub = \"x\"\n", codexManagedEnv},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			res := installCodexConfigBlock([]byte(c.src), codexInstallRequest{Marker: hookMarker("0.18.0")})
@@ -1430,6 +1435,137 @@ func TestCodexDottedInlineNonMarkerPasses(t *testing.T) {
 	}
 	if !codexTOMLParses(res.Out) {
 		t.Errorf("산출이 파스되지 않는다:\n%s", res.Out)
+	}
+}
+
+// TestCodexDottedMarkerInEnvHeaderExits — 점 표기 표식 키 차단은 인라인 대입만이 아니라
+// `[mcp_servers.ctr.env]` **헤더 구간**에도 걸린다. 종전에는 인라인 갈래만 이 게이트에 닿았고,
+// 헤더 형태는 mcpOutputInvalid로 굳었다(실측) — 그 문면은 "제품 결함이니 알려 주세요"라
+// 사용자가 할 일이 없는데, 하필 그것이 **우리 설치기 자신이 기입하는 형태**다.
+// 뿌리는 codexEnvBody가 표식을 무조건 내보내면서 그 건너뛰기는 이름이 **정확히** 표식 키인
+// 엔트리만 빼는 것이다 — `CTR_MANAGED.sub`는 남아 산출이 같은 경로를 문자열과 테이블로 두 번
+// 정의하고, 우리 게이트가 그것을 거부한다.
+// 관리 테이블 없이 헤더만 있는 파일도 첫 기입 갈래에서 같은 산출을 내므로 함께 잰다 — 이탈이
+// 그 갈래 **뒤**에 서면 그 형태만 조용히 옛 문면으로 남는다.
+func TestCodexDottedMarkerInEnvHeaderExits(t *testing.T) {
+	const head = "[mcp_servers.ctr]\ncommand = \"context-router\"\n"
+	const envHdr = "[" + codexManagedEnv + "]\n"
+	for _, c := range []struct{ name, src string }{
+		{"헤더 구간", head + envHdr + "CTR_MANAGED.sub = \"x\"\n"},
+		{"첫 마디가 따옴표 표기", head + envHdr + "\"CTR_MANAGED\".sub = \"x\"\n"},
+		{"마디 셋", head + envHdr + "CTR_MANAGED.a.b = \"x\"\n"},
+		{"관리 테이블 없이 헤더만", envHdr + "CTR_MANAGED.sub = \"x\"\n"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			res := installCodexConfigBlock([]byte(c.src), codexInstallRequest{Marker: hookMarker("0.18.0")})
+			if res.State != mcpMarkerAnomaly || res.Anomaly != anomalyDottedEnv {
+				t.Fatalf("state=%d anomaly=%d want mcpMarkerAnomaly/anomalyDottedEnv", res.State, res.Anomaly)
+			}
+			if res.Changed || string(res.Out) != c.src {
+				t.Errorf("무변경 이탈이 아니다: changed=%v\n%s", res.Changed, res.Out)
+			}
+		})
+	}
+}
+
+// TestCodexDottedNonMarkerInEnvHeaderPasses — 표식과 무관한 점 표기 키는 막지 않는다. 무변경
+// 집합을 필요 이상으로 넓히지 않는 것이 계약이고, 인라인 형제가 같은 규칙을 이미 잠근다
+// (TestCodexDottedInlineNonMarkerPasses). 사용자 키는 바이트 그대로 살아야 한다.
+func TestCodexDottedNonMarkerInEnvHeaderPasses(t *testing.T) {
+	src := "[mcp_servers.ctr]\ncommand = \"context-router\"\n[" + codexManagedEnv + "]\nOTHER.sub = \"x\"\n"
+	res := installCodexConfigBlock([]byte(src), codexInstallRequest{Marker: hookMarker("0.18.0")})
+	if res.State == mcpMarkerAnomaly {
+		t.Fatalf("표식과 무관한 점 표기를 막았다: anomaly=%d", res.Anomaly)
+	}
+	if !codexTOMLParses(res.Out) {
+		t.Errorf("산출이 파스되지 않는다:\n%s", res.Out)
+	}
+	if !strings.Contains(string(res.Out), "OTHER.sub = \"x\"") {
+		t.Errorf("사용자 키가 사라졌다:\n%s", res.Out)
+	}
+}
+
+// TestEnvNotTableReasonCoversBothClasses — **사유는 파일에 실재하는 것을 대야 한다.**
+// anomalyEnvNotTable에 닿는 입력은 두 부류다: 우변이 애초에 인라인 테이블이 아닌 형태와,
+// 중괄호는 열렸는데 그 안을 확정하지 못한 형태(빈 값·쉼표 둘·빈 키·짝 어긋난 괄호)다.
+//
+// 뒤엣것에는 계약 7의 **소유 미상** 갈래도 내려온다 — codexMarkerUnknown은 `braced && !ok`
+// 에서만 참이므로 그 갈래가 보는 파일은 **언제나** 중괄호로 열려 있다. 그런데 사유는
+// "인라인 테이블이 아니다"만 말했다: 사용자는 uninstall이 exit 0으로 낸 그 안내를 따라 파일을
+// 열고 이미 `env = { … }` 형태인 것을 보고 아무것도 고치지 않은 채 제거가 끝난 줄 아는데,
+// 우리 테이블은 그대로 남아 Codex가 서버를 계속 띄운다(실측).
+func TestEnvNotTableReasonCoversBothClasses(t *testing.T) {
+	reason := anomalyEnvNotTable.reason()
+	const ours = "[mcp_servers.ctr]\ncommand = \"context-router\"\n"
+	for _, c := range []struct{ name, src, want string }{
+		{"우변이 인라인 테이블이 아니다", ours + "env = []\n", "인라인 테이블({ … })"},
+		{"중괄호는 열렸으나 구조 미확정", ours + "env = { A = }\n", "구조를 읽지 못했"},
+		{"소유 미상 — 표식이 그 중괄호 안에 있다", "[mcp_servers.ctr]\ncommand = \"/opt/bin/context-router\"\nenv = { CTR_MANAGED = \"context-router/0.17.2\", A = }\n", "구조를 읽지 못했"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			res := installCodexConfigBlock([]byte(c.src), codexInstallRequest{Marker: hookMarker("0.18.0")})
+			if res.Anomaly != anomalyEnvNotTable {
+				t.Fatalf("anomaly=%d want anomalyEnvNotTable — 이 픽스처가 그 사유로 가지 않는다", res.Anomaly)
+			}
+			// 픽스처가 정말 그 부류인가 — 중괄호 유무로 가른다. 그래야 아래 단정이 사유의
+			// 어느 절을 요구하는지가 픽스처와 묶인다.
+			if braced := strings.Contains(c.src, "env = {"); braced != (c.want == "구조를 읽지 못했") {
+				t.Fatalf("픽스처의 부류와 요구하는 절이 어긋난다: braced=%v want=%q", braced, c.want)
+			}
+			if !strings.Contains(reason, c.want) {
+				t.Errorf("사유가 이 부류의 파일에 참인 절 %q를 담지 않는다: %q", c.want, reason)
+			}
+		})
+	}
+	// 소유 미상 갈래는 uninstall에도 같은 사유로 나간다 — 그쪽이 거짓 안내의 피해가 가장 큰
+	// 자리다(exit 0 + "형태를 바꾸라"인데 파일은 이미 그 형태다).
+	src := "[mcp_servers.ctr]\ncommand = \"/opt/bin/context-router\"\nenv = { CTR_MANAGED = \"context-router/0.17.2\", A = }\n"
+	out, changed, an := uninstallCodexConfigBlock([]byte(src))
+	if changed || an != anomalyEnvNotTable || string(out) != src {
+		t.Errorf("uninstall changed=%v anomaly=%d want false/anomalyEnvNotTable(무변경)", changed, an)
+	}
+}
+
+// TestCodexMarkerOwnsRegardlessOfPhysicalLine — 소유는 **표식 값**이 정하지 표식이 앉은 물리
+// 라인이 정하지 않는다. 계약은 D84의 세 절 disjunction이고 그 첫 절이 "env.CTR_MANAGED 값이
+// 소유 기준을 만족"이다(D82) — command 절은 그와 **또는**으로 묶이므로 command가 남의 것이어도
+// 첫 절 하나로 소유다.
+//
+// **base 128a727은 같은 계약 아래 두 픽스처를 다르게 판정했다**(실측): 표식이 엔트리 첫 물리
+// 라인에 있으면 mcpWritten·기입·uninstall 제거였고, 둘째 줄 이하에 있으면 mcpExistingHeader·
+// 무변경·anomalyNotOwned였다. 갈린 것은 계약이 아니라 **판독기의 물리 라인 한정**이며(스펙 §0
+// 소비자 표 행 1·2, 관측 ③), D92가 그것을 닫으면 둘이 같아진다. 이 테스트가 그 "같음"을
+// 잠근다 — 어느 한쪽만 옮기는 회귀를 문다.
+//
+// 표식 키를 따옴표 표기로 적는 이유: TOML은 `CTR_MANAGED`와 `"CTR_MANAGED"`를 **같은 키**로
+// 읽으므로 표식의 실재가 표기에 걸리지 않는다는 것까지 함께 잰다.
+func TestCodexMarkerOwnsRegardlessOfPhysicalLine(t *testing.T) {
+	marker := hookMarker("0.18.0")
+	const head = "[mcp_servers.ctr]\ncommand = \"other\"\nargs = [\"--enable\", \"net\"]\n"
+	const old = "\"" + codexMarkerKey + "\" = \"context-router/0.16.0\""
+	for _, c := range []struct{ name, src string }{
+		{"표식이 엔트리 첫 물리 라인", head + "env = { " + old + ", A = \"1\" }\n"},
+		{"표식이 둘째 줄 이하", head + "env = { A = \"1\",\n  # c\n  " + old + " }\n"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			in := []byte(c.src)
+			res := installCodexConfigBlock(in, codexInstallRequest{Marker: marker})
+			if res.State != mcpWritten || !res.Changed {
+				t.Fatalf("state=%d changed=%v want mcpWritten/true — 표식 값 하나가 소유를 정한다", res.State, res.Changed)
+			}
+			if !strings.Contains(string(res.Out), "command = \""+hookBinaryName+"\"") {
+				t.Errorf("command가 우리 것으로 서지 않았다:\n%s", res.Out)
+			}
+			if !strings.Contains(string(res.Out), marker) {
+				t.Errorf("표식이 현재 값으로 갱신되지 않았다:\n%s", res.Out)
+			}
+			if _, changed, an := uninstallCodexConfigBlock(in); !changed || an != anomalyNone {
+				t.Errorf("uninstall changed=%v anomaly=%d want true/anomalyNone", changed, an)
+			}
+			if !assertCodexOracles(t, marker, in) {
+				t.Error("기입 갈래를 타지 않았다 — 다섯 겹이 공회전한다")
+			}
+		})
 	}
 }
 
