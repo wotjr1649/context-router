@@ -98,7 +98,12 @@ func (a codexAnomaly) reason() string {
 	case anomalyOutputInvalid:
 		return "이 도구가 만든 결과가 유효한 TOML이 아니어서 기입하지 않았습니다 — 제품 결함이니 파일 형태와 함께 알려 주세요"
 	case anomalyDottedEnv:
-		return "env 키가 점 표기(env.NAME)로 적혀 있습니다 — [mcp_servers.ctr.env] 테이블로 옮긴 뒤 재실행하세요"
+		// **두 형태가 이 사유에 닿는다** — 테이블 수준의 `env.NAME`과 인라인 테이블 안의
+		// `CTR_MANAGED.NAME`. 앞의 것만 대면 뒤의 사용자는 자기 env 키(이름이 그냥 env다)가
+		// 점 표기라는 거짓 진단을 듣고, `env.`을 찾아도 나오지 않아 무엇을 고쳤는지 확인할 수
+		// 없다 — 그 사이 install은 영구히 무변경이다. 조치 절은 두 형태에 다 맞으므로 진단
+		// 절만 고친다(사유값을 늘리는 것은 라벨 어휘 변경이고 스펙 §1.2의 비범위다).
+		return "env 쪽에 점 표기 키가 있어 표식을 쓸 자리가 없습니다(env.NAME 형태이거나 인라인 테이블 안의 CTR_MANAGED.NAME 형태입니다) — 그 키를 [mcp_servers.ctr.env] 테이블의 보통 키로 옮긴 뒤 재실행하세요"
 	case anomalyEnvNotTable:
 		return "env 값이 인라인 테이블({ … })이 아닙니다 — [mcp_servers.ctr.env] 테이블이나 env = { … } 형태로 바꾼 뒤 재실행하세요"
 	case anomalyNotOwned:

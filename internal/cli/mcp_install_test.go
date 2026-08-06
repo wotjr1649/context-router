@@ -1656,3 +1656,92 @@ func TestMCPUninstallDoesNotBackup(t *testing.T) {
 		t.Errorf("uninstall이 백업 슬롯을 덮었다 — 원본을 잃는다:\n%s", bakAfter)
 	}
 }
+
+// mcpEmptyProfileOriginal — 프로필 없이 남은 우리 소유 등록물(v0.14 이전 형태). 무플래그
+// 재설치는 보존 규칙이 이겨 이 상태를 넓히지 않으므로(D81) 안내가 유일한 출구다.
+const mcpEmptyProfileOriginal = "{\n  \"mcpServers\": {\n    \"" + ctrMCPServerName +
+	"\": {\"command\": \"" + hookBinaryName + "\", \"args\": [], \"__ctrManaged\": \"" +
+	hookBinaryName + "/0.17.0\"}\n  }\n}\n"
+
+// TestMCPEmptyProfileHintSurvivesNoChangeRun — **정상 상태에서도 안내가 나와야 한다.**
+// D95가 세운 바이트 비교의 무변경 갈래는 등록을 확정하면서도 빈 프로필 안내를 내지 않았다:
+// 1회차만 바이트를 바꾸고 2회차부터는 영원히 무변경이므로, 정상 상태의 사용자는
+// ctr_index·ctr_fetch_and_index가 왜 꺼져 있는지 **다시는** 듣지 못한다. 이 릴리스 전에는
+// 기입이 무조건이라 매 실행 나왔다 — 조용한 후퇴다.
+func TestMCPEmptyProfileHintSurvivesNoChangeRun(t *testing.T) {
+	proj := t.TempDir()
+	mcpPath := mcpConfigPath(proj)
+	if err := os.WriteFile(mcpPath, []byte(mcpEmptyProfileOriginal), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	const hint = "ctr_index·ctr_fetch_and_index"
+	var out bytes.Buffer
+	if err := runHookInstall(nil, t.TempDir(), "", false, proj, "0.18.0", &out); err != nil {
+		t.Fatalf("1차 install: %v", err)
+	}
+	if !strings.Contains(out.String(), hint) {
+		t.Fatalf("1차(기입 갈래)가 빈 프로필 안내를 내지 않았다 — 픽스처가 그 조건에 있지 않다:\n%s", out.String())
+	}
+	after1, _ := os.ReadFile(mcpPath)
+	out.Reset()
+	if err := runHookInstall(nil, t.TempDir(), "", false, proj, "0.18.0", &out); err != nil {
+		t.Fatalf("2차 install: %v", err)
+	}
+	after2, _ := os.ReadFile(mcpPath)
+	if !bytes.Equal(after1, after2) {
+		t.Fatalf("2차가 파일을 바꿨다 — 무변경 갈래를 재는 테스트가 아니게 된다")
+	}
+	if !strings.Contains(out.String(), hint) {
+		t.Errorf("2차(무변경 갈래)가 빈 프로필 안내를 내지 않았다 — 정상 상태의 사용자는 두 도구가 꺼진 이유를 듣지 못한다:\n%s", out.String())
+	}
+}
+
+// TestMCPBackupSlotIsNamedToUser — **복구 수단은 이름을 알아야 쓸 수 있다.** D95가 세운
+// .mcp.json.bak을 어느 문면도 대지 않아 형제인 config.toml 갈래(".bak" 이름을 댄다)와
+// 어긋났고, 단일 슬롯이라 다음 변경이 덮으므로 뒤늦게 찾을 수도 없다.
+// **.gitignore 절도 함께 잰다**: .mcp.json은 프로젝트 루트에 있어 ~/.codex/config.toml과 달리
+// 백업이 버전 관리에 딸려 들어가고, `git add -A` 한 번이 그 파일의 env 값을 공유 저장소에
+// 커밋한다. 자리를 옮기는 것은 D95의 형제 슬롯 계약을 바꾸는 설계 변경이라 이 릴리스가 하지
+// 않는다(스펙 §4 이월) — 그래서 알리는 것이 이 릴리스의 답이다.
+// **찾는 문자열을 서브테스트 이름에 넣지 마라**: t.TempDir()이 테스트 이름을 경로에 넣고
+// doctor는 [2]·[11]에 경로를 인쇄하므로, 이름이 ".mcp.json.bak"이면 Contains가 문면과 무관하게
+// 참이 된다(실측: 그 형태로 쓴 첫 판이 HEAD에서 초록이었다).
+func TestMCPBackupSlotIsNamedToUser(t *testing.T) {
+	wants := []string{".mcp.json.bak", ".gitignore"}
+	check := func(t *testing.T, where, out string) {
+		t.Helper()
+		for _, want := range wants {
+			if !strings.Contains(out, want) {
+				t.Errorf("%s 문면이 %q를 대지 않는다:\n%s", where, want, out)
+			}
+		}
+	}
+	t.Run("install", func(t *testing.T) {
+		proj := t.TempDir()
+		if err := os.WriteFile(mcpConfigPath(proj), []byte(mcpOriginal), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		var out bytes.Buffer
+		if err := runHookInstall(nil, t.TempDir(), "", false, proj, "0.18.0", &out); err != nil {
+			t.Fatalf("install: %v", err)
+		}
+		check(t, "기입 갈래", out.String())
+	})
+	t.Run("fix", func(t *testing.T) {
+		isolateCodexHome(t)
+		proj := t.TempDir()
+		original := "{\n  \"mcpServers\": {\n    \"" + ctrMCPServerName + "\": {\"command\": \"" +
+			hookBinaryName + "\", \"__ctrManaged\": \"" + hookMarker("0.17.0") + "\"}\n  }\n}\n"
+		if err := os.WriteFile(mcpConfigPath(proj), []byte(original), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		out, err := doctorOut(t, proj, true)
+		if err != nil {
+			t.Fatalf("doctor --fix: %v", err)
+		}
+		if !strings.Contains(out, "[20] fix: .mcp.json 표식을") {
+			t.Fatalf("--fix가 기입 갈래를 타지 않았다 — 문면을 재는 테스트가 아니게 된다:\n%s", out)
+		}
+		check(t, "--fix 기입", out)
+	})
+}

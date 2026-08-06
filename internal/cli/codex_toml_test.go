@@ -1361,6 +1361,33 @@ func TestCodexDottedInlineKeyExits(t *testing.T) {
 	}
 }
 
+// TestDottedEnvReasonNamesBothShapes — **사유는 파일에 실재하는 것을 대야 한다.**
+// anomalyDottedEnv에 닿는 입력은 두 형태다: 테이블 수준의 `env.NAME`과 인라인 테이블 안의
+// `CTR_MANAGED.NAME`. 사유가 앞의 것만 대면 뒤의 사용자는 자기 env 키(이름이 그냥 `env`다)가
+// 점 표기라는 **거짓 진단**을 듣고, `env.`을 찾아도 나오지 않아 무엇을 고쳤는지 확인할 수 없다
+// — 그 사이 install은 영구히 무변경이다. 조치 절은 두 형태에 다 맞으므로 진단 절만 고친다
+// (사유값을 늘리는 것은 라벨 어휘 변경이고 스펙 §1.2가 이 릴리스의 비범위로 둔다).
+func TestDottedEnvReasonNamesBothShapes(t *testing.T) {
+	reason := anomalyDottedEnv.reason()
+	for _, c := range []struct{ name, src, want string }{
+		{"테이블 수준 점 표기", "[mcp_servers.ctr]\ncommand = \"context-router\"\nenv.FOO = \"bar\"\n", "env."},
+		{"인라인 안의 점 표기", "[mcp_servers.ctr]\ncommand = \"context-router\"\nenv = { CTR_MANAGED.sub = \"x\" }\n", codexMarkerKey + "."},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			res := installCodexConfigBlock([]byte(c.src), codexInstallRequest{Marker: hookMarker("0.18.0")})
+			if res.Anomaly != anomalyDottedEnv {
+				t.Fatalf("anomaly=%d want anomalyDottedEnv — 이 픽스처가 그 사유로 가지 않는다", res.Anomaly)
+			}
+			if !strings.Contains(c.src, c.want) {
+				t.Fatalf("픽스처에 %q가 없다 — 사유가 대야 할 것을 잘못 골랐다", c.want)
+			}
+			if !strings.Contains(reason, c.want) {
+				t.Errorf("사유가 이 파일에 실재하는 %q를 대지 않는다: %q", c.want, reason)
+			}
+		})
+	}
+}
+
 // TestCodexEnvNotInlineTable — env 우변이 인라인 테이블이 아니면 헤더도 표식도 없이 무변경으로
 // 굳고 게이트도 잡지 않아, 사용자는 install이 왜 아무것도 하지 않는지 알 수 없었다.
 func TestCodexEnvNotInlineTable(t *testing.T) {
@@ -2519,8 +2546,14 @@ func TestCodexInlineDoubleQuotedKeyIsNotMarker(t *testing.T) {
 // 않는다(스펙 §2.1 P3 예외 항 · codex_toml.go 파일 머리 주석).
 //
 // base(128a727)는 그 줄을 통째로 보존했으므로 이 픽스처는 base에서 적색이다 — 무는 단정이다.
-// **손실의 폭도 함께 못박는다**: 값 구간 밖의 주석(앞줄 독립 · 엔트리 뒤 후행)은 살아야 한다.
-// 그 둘이 없으면 "주석을 더 넓게 먹는" 회귀가 이 테스트를 통과한다.
+// 값 구간 밖의 주석(앞줄 독립 · 엔트리 뒤 후행)이 살아 있는지도 함께 본다.
+//
+// **다만 이 픽스처는 손실 폭의 상한이 아니다(정정).** 종전 주석은 "그 둘이 없으면 주석을 더
+// 넓게 먹는 회귀가 통과한다"고 적었으나, 실제로 더 넓게 먹는 회귀가 있었고 이 테스트는 내내
+// 초록이었다(실측: 회귀 상태 071fdc9에서 이 테스트·격자 5120·TestCodexInTableCommentsPreserved
+// 전부 PASS). 이 픽스처의 값 구간은 조각 경계에 닿지 않아 그 손실 경로를 지나지 않는다 —
+// 폭을 무는 것은 TestCodexInlineMarkerEndOnFragmentBoundary와
+// TestCodexValueEndOnFragmentBoundaryOracles다.
 func TestCodexInlineValueSpanCommentIsRemoved(t *testing.T) {
 	src := "[mcp_servers.ctr]\ncommand = \"context-router\"\n# 앞줄\nenv = { CTR_MANAGED = [1, # note\n2] } # 뒤\n"
 	res := installCodexConfigBlock([]byte(src), codexInstallRequest{Marker: hookMarker("0.18.0")})

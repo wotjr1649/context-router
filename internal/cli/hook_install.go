@@ -628,10 +628,12 @@ func runHookInstall(args []string, storeRoot, storeRootRaw string, storeRootExpl
 			// 이 자리에는 바이트 비교가 없었다(mergeMCPServers의 changed는 install에서 참으로
 			// 고정된다) — 비교 없이 백업만 걸면 2회차 install이 .bak을 설치 후 내용으로 덮어
 			// 원본을 잃는다. 그래서 비교가 백업의 선행 조건이다(D95).
-			// 문면은 성공 갈래와 **같다**: 2회차 install이 .mcp.json에 대해 아무 말도 하지 않는
-			// 상태를 만들지 않으면서, 하지 않은 일(기입·백업)을 말하지도 않는다.
+			// **문면은 성공 갈래와 백업 절 하나만 다르다.** 이 실행은 백업을 남기지 않았으므로
+			// .bak을 대면 사용자가 그 파일을 이번 실행의 원본으로 오인한다 — 하지 않은 일을
+			// 말하지 않는 절제이지, 등록 상태에 딸린 안내까지 빼는 근거가 아니다(아래 빈 프로필
+			// 안내가 두 갈래를 함께 지난다).
 			mcpRegistered = true
-			fmt.Fprintf(stdout, "mcp: .mcp.json 병합 완료(서버 %s)\n", ctrMCPServerName)
+			fmt.Fprintf(stdout, "mcp: .mcp.json 병합 완료(서버 %s) — 무변경이라 백업하지 않았습니다\n", ctrMCPServerName)
 		} else if bErr := backupConfigFile(mcpPath, existing); bErr != nil {
 			// 백업 실패는 기입을 막는다 — config.toml 갈래와 같은 순서다(D95). 복구 수단 없이
 			// 사용자 파일을 덮지 않는다.
@@ -639,13 +641,22 @@ func runHookInstall(args []string, storeRoot, storeRootRaw string, storeRootExpl
 		} else if writeErr := atomicWriteFile(mcpPath, mcpMerged); writeErr != nil {
 			fmt.Fprintln(stdout, "mcp: .mcp.json 기록 실패 — 훅 설치는 완료되었습니다")
 		} else {
+			// 백업 슬롯을 **이름으로** 댄다 — 형제인 config.toml 갈래가 이미 그렇게 하고,
+			// 이름을 모르는 복구 수단은 복구 수단이 아니다. 단일 슬롯이라 다음 변경이 덮는다는
+			// 것도 함께 말한다(D95). .gitignore 절은 자리 때문이다: .mcp.json은 프로젝트 루트에
+			// 있어 ~/.codex/config.toml과 달리 .bak이 버전 관리에 딸려 들어가고, `git add -A`
+			// 한 번이 그 파일의 env 값을 공유 저장소에 올린다. 자리를 옮기는 것은 D95의 형제
+			// 슬롯 계약을 바꾸는 설계 변경이라 이 릴리스가 하지 않는다.
 			mcpRegistered = true
-			fmt.Fprintf(stdout, "mcp: .mcp.json 병합 완료(서버 %s)\n", ctrMCPServerName)
-			// 빈 프로필로 남은 기존 등록물은 보존 규칙이 이겨 기본 프로필을 얻지 못한다(D81) —
-			// 명시 경로를 알려야 사용자가 D81의 동기였던 두 도구를 켤 수 있다(리뷰 P4).
-			if !setProfile && emptyProfileRegistration(existing, ctrMCPServerName) {
-				fmt.Fprintln(stdout, "mcp: 기존 등록물에 프로필이 없어 그대로 유지했습니다 — ctr_index·ctr_fetch_and_index가 필요하면 hook install --enable ingest,net으로 명시하세요(빈 프로필은 기본값으로 넓히지 않습니다)")
-			}
+			fmt.Fprintf(stdout, "mcp: .mcp.json 병합 완료(서버 %s) — 직전 내용은 .mcp.json.bak 한 슬롯에 남습니다(다음 변경이 덮습니다). 프로젝트 루트 파일이라 버전 관리에 딸려 들어가니 .gitignore에 넣어 두세요\n", ctrMCPServerName)
+		}
+		// 빈 프로필로 남은 기존 등록물은 보존 규칙이 이겨 기본 프로필을 얻지 못한다(D81) —
+		// 명시 경로를 알려야 사용자가 D81의 동기였던 두 도구를 켤 수 있다(리뷰 P4).
+		// **등록이 확정된 두 갈래 모두**에서 낸다. 기입 갈래에만 두면 1회차에 한 번 나오고
+		// 그 뒤로는 영원히 무변경이라 정상 상태의 사용자가 두 도구가 꺼진 이유를 다시 듣지
+		// 못한다 — D95가 바이트 비교를 세우기 전에는 기입이 무조건이라 매 실행 나왔다.
+		if mcpRegistered && !setProfile && emptyProfileRegistration(existing, ctrMCPServerName) {
+			fmt.Fprintln(stdout, "mcp: 기존 등록물에 프로필이 없어 그대로 유지했습니다 — ctr_index·ctr_fetch_and_index가 필요하면 hook install --enable ingest,net으로 명시하세요(빈 프로필은 기본값으로 넓히지 않습니다)")
 		}
 	}
 
