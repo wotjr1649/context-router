@@ -70,12 +70,22 @@ schema, dispatch template, Codex invocation: `docs/codex-secure-review.md`.
 | Task and integration checkpoints | subagent reviewer **+** one cross-model pass |
 | Re-review after a fix round | subagent only — cross-model stays one pass per checkpoint |
 | Plan close-out — the branch's final review, before the PR | whole-branch max-effort subagent + one cross-model pass |
-| Before tagging a release | `/code-review` once — a slash command the user types |
+| Before tagging a release | `/code-review` **once** — a slash command the user types |
 
 The release pass is not redundant with the task passes: it builds and runs the code in
 an isolated module. A branch whose 11 task reviews, whole-branch review and cross-model
 pass had all been judged clean still yielded five shipping blockers and two
 config-corruption paths. Clean task reviews do not substitute for it.
+
+**One release pass, and not at `max`.** The workflow-backed form fans out dozens of
+agents; measured on v0.18, two passes cost **4.29M and 4.86M subagent tokens** (42 and 46
+agents). That is the reason the row says *once*. Run it at **`xhigh` or `high`** — `max`
+buys breadth this repo's fix rounds have not needed, and a second workflow pass is not the
+answer to a first one that found things. When a pass yields findings, the loop is: fix →
+subagent re-review of the fix range → **one** more release pass only if the fixes changed
+the machinery the findings lived in. The v0.18 sequence (max, fix, max, fix, medium) is
+the shape to avoid, not to copy: its third pass was quiet, and the reason was that the
+verification net had been repaired — not that the third pass was worth its price.
 
 The controller never reads raw cross-model output: a subagent verifies each claim
 against the diff and returns the fixed JSON findings schema, and the controller drives
