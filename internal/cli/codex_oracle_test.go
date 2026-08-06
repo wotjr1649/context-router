@@ -387,9 +387,12 @@ func codexEntryHeaderLine(lines [][]byte, e [2]int) int {
 func TestLineSurvivalEntryExemptionStopsAtHeader(t *testing.T) {
 	in := []byte("[mcp_servers.ctr]\ncommand = \"context-router\"\n" +
 		"env = { " + codexMarkerKey + " = \"context-router/0.17.2\"\n\n[other]\nuKEY = \"uV\" }\n")
-	// 판독기가 인라인 테이블을 닫지 못해 논리 엔트리가 [2,5]로 잡히는 상태(실측).
-	if _, e := codexEnvEntryOf(in); e != [2]int{2, 5} {
-		t.Fatalf("논리 엔트리=%v want [2 5] — 픽스처가 재려는 상태가 아니다", e)
+	// **생산 쪽은 이제 이 형태를 아예 읽지 않는다**(session-54): 인라인 테이블이 열린 채
+	// 헤더 모양의 줄이 오면 구간의 끝을 확정할 수 없으므로 codexManagedSpans가 사유를 세우고
+	// 논리 엔트리가 서지 않는다. 그래도 이 겹의 좁힘은 **남긴다** — 면제가 헤더 앞에서 끊기지
+	// 않으면, 판독기가 다시 그런 엔트리를 내는 날 P3가 바로 그 손실에 눈을 감는다.
+	if _, e := codexEnvEntryOf(in); e != [2]int{-1, -1} {
+		t.Fatalf("논리 엔트리=%v want [-1 -1] — 구간을 확정할 수 없는 형태를 판독기가 다시 읽고 있다", e)
 	}
 	// 사용자 테이블을 통째로 잃은 산출. 면제가 엔트리 전체면 손실 0건이다.
 	out := []byte("[mcp_servers.ctr]\ncommand = \"context-router\"\n" +
@@ -719,6 +722,85 @@ func TestCodexMultilineStringCloseOracles(t *testing.T) {
 			}
 			if !assertCodexOracles(t, marker, in) {
 				t.Fatalf("픽스처가 기입 갈래로 가지 않는다 — 이 테스트는 되쓰기를 재려는 것이다")
+			}
+		})
+	}
+}
+
+// TestCodexHeaderInsideInlineEnvOracles — **회귀 잠금 + 오라클 픽스처.** 인라인 `env`가 닫히지
+// 않은 채 뒤따르는 `[other]` 헤더가 오는 형태. 그 헤더는 스캐너가 열려 있어 경계로 잡히지
+// 않으므로 우리 구간이 EOF까지 늘어나고, **헤더 자신의 대괄호가 깊이를 도로 맞춰** EOF 열림
+// 백스톱마저 서지 않았다 — 되쓰기가 사용자의 `[other]`와 그 키를 통째로 먹고(실측: `install`이
+// state=mcpWritten·changed=true·사유 없음), `uninstall`은 파일을 통째로 비웠다. base(128a727)는
+// 둘 다 보존한다.
+//
+// **이 형태는 앞 태스크가 고친 그물이 잡을 수 있게 된 바로 그 형태다** — P3의 인라인 env 면제가
+// 엔트리가 삼킨 첫 테이블 헤더 앞에서 끊기므로 라인 4·5의 소실이 손실 목록에 오른다. 그런데
+// 그 모양을 먹이는 픽스처가 커밋되어 있지 않아 그물은 초록이었다. 이 픽스처가 그 자리를 채운다:
+// 픽스 전에는 P3가 적색이고, 픽스 뒤에는 무변경이라 다섯 겹이 모두 성립한다.
+//
+// 계약은 **되쓰지 않는 것**이다. 구간의 끝을 확정할 수 없으면 사유 있는 무변경으로 빠진다 —
+// base처럼 원문을 보존하며 표식만 갱신하는 것이 아니라, 아예 손대지 않는다.
+func TestCodexHeaderInsideInlineEnvOracles(t *testing.T) {
+	marker := hookMarker("0.18.0")
+	const head = "[mcp_servers.ctr]\ncommand = \"context-router\"\n"
+	const tail = "[other]\nuKEY = \"uV\" }\n"
+	for _, c := range []struct{ name, src string }{
+		{"빈 줄 뒤 헤더", head + "env = { " + codexMarkerKey + " = \"context-router/0.17.2\"\n\n" + tail},
+		{"바로 다음 줄이 헤더", head + "env = { " + codexMarkerKey + " = \"context-router/0.17.2\",\n" + tail},
+		{"표식 없는 인라인 뒤 헤더", head + "env = { X = \"v\"\n\n" + tail},
+		{"배열 테이블 헤더", head + "env = { X = \"v\"\n[[a.b]]\nuKEY = \"uV\" }\n"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			in := []byte(c.src)
+			if assertCodexOracles(t, marker, in) {
+				t.Fatalf("구간의 끝을 확정할 수 없는 형태를 되썼다 — 무변경이 계약이다")
+			}
+			res := installCodexConfigBlock(in, codexInstallRequest{Marker: marker})
+			if res.State != mcpMarkerAnomaly || res.Anomaly != anomalyScannerOpen {
+				t.Errorf("install state=%d anomaly=%d want mcpMarkerAnomaly/anomalyScannerOpen", res.State, res.Anomaly)
+			}
+			// 사유가 그 파일에 대해 참이어야 한다 — 이 형태는 파일 **끝**이 아니라 다음 테이블
+			// 헤더 앞에서 닫히지 않았고, 문면이 둘을 함께 댄다.
+			if r := res.Anomaly.reason(); !strings.Contains(r, "다음 테이블 헤더 앞") {
+				t.Errorf("사유가 이 파일의 자리를 대지 않는다: %q", r)
+			}
+			out, changed, an := uninstallCodexConfigBlock(in)
+			if changed || an != anomalyScannerOpen || !bytes.Equal(out, in) {
+				t.Errorf("uninstall changed=%v anomaly=%d — 사용자 테이블을 지웠다:\n%q", changed, an, out)
+			}
+			if present, pan := probeCodexMCPBlock(in); present || pan != anomalyScannerOpen {
+				t.Errorf("probe present=%v anomaly=%d want false/anomalyScannerOpen", present, pan)
+			}
+		})
+	}
+}
+
+// TestCodexHeaderShapeInValueStillWrites — 위 좁힘의 **오경보 감시선**. "스캐너가 열렸는데 이 줄이
+// 헤더 모양"만 보면 여러 줄 값의 정상적인 이어지는 줄이 전부 걸린다: 배열 원소가 배열인 형태
+// (`args = [`⏎`  ["nested"],`⏎`]`)와 인라인 테이블 **안**의 중첩 배열, 그리고 여러 줄 문자열의
+// 내용 줄이 그것이다. 셋 다 유효 TOML이고 base·출하 HEAD가 모두 기입하던 파일이라, 여기서
+// 얼어붙으면 사유가 참이어도 새 결함이다. 좁힘의 근거는 "**열린 괄호가 전부 중괄호**일 때만"
+// 이고 이 셋은 열린 배열이나 문자열을 갖는다.
+func TestCodexHeaderShapeInValueStillWrites(t *testing.T) {
+	marker := hookMarker("0.18.0")
+	const head = "[mcp_servers.ctr]\ncommand = \"context-router\"\n"
+	const env = "env = { " + codexMarkerKey + " = \"context-router/0.17.2\" }\n"
+	for _, c := range []struct{ name, src string }{
+		{"배열 안의 배열 원소", head + "args = [\n  [\"nested\"],\n]\n" + env},
+		{"배열 마지막 원소가 배열(쉼표 없음)", head + "V4 = [\n  [\"a\"]\n]\n" + env},
+		{"인라인 테이블 안의 중첩 배열", head + "env = { " + codexMarkerKey + " = \"context-router/0.17.2\", A = [\n  [\"x\"]\n] }\n"},
+		{"인라인 테이블 안의 정수 배열", head + "env = { " + codexMarkerKey + " = \"context-router/0.17.2\", A = [\n  [1, 2]\n] }\n"},
+		{"여러 줄 문자열 내용이 헤더 모양", head + "env = { " + codexMarkerKey + " = \"context-router/0.17.2\", A = \"\"\"\n[not a header]\n\"\"\" }\n"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			in := []byte(c.src)
+			if !codexTOMLParses(in) {
+				t.Fatalf("픽스처가 파스되지 않는다 — 유효 입력에서 재는 축이 아니게 된다:\n%q", c.src)
+			}
+			if !assertCodexOracles(t, marker, in) {
+				t.Fatalf("정상 파일이 무변경으로 얼어붙었다: anomaly=%q",
+					installCodexConfigBlock(in, codexInstallRequest{Marker: marker}).Anomaly.reason())
 			}
 		})
 	}

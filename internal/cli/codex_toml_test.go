@@ -2603,7 +2603,7 @@ func TestTomlTripleCloseRunLength(t *testing.T) {
 		{"홑따옴표 다섯으로 닫기", "'''x'''''", 9},
 		{"빈 여러 줄 리터럴 문자열", "''''''", 6},
 	} {
-		if got := tomlTripleLen(c.tok); got != c.want {
+		if got := tomlTripleLen(c.tok, []int{0}, 0); got != c.want {
 			t.Errorf("%s: tomlTripleLen(%q)=%d want %d", c.name, c.tok, got, c.want)
 		}
 	}
@@ -2775,6 +2775,113 @@ func TestCodexInlineMarkerEndOnFragmentBoundary(t *testing.T) {
 				if got := tomlSpanText(joined, at, e, en.value); got != wantVals[i] {
 					t.Errorf("마디[%d] 값 왕복=%q want %q — 배타적 끝의 새 해석이 오프셋을 옮겼다", i, got, wantVals[i])
 				}
+			}
+		})
+	}
+}
+
+// TestTomlTripleLenRespectsFragments — **회귀 잠금**. `codexEntryRaw`는 물리 라인 조각을 구분자
+// 없이 잇는데 `tomlLineScanner.advance`는 조각마다 닫기를 찾는다. 이은 문자열 위에서 실행 길이를
+// 세면 **조각 경계에 걸친 따옴표 셋**이 파일에 없는 구분자가 되고, 그때부터 두 판독기가 같은
+// 바이트를 다르게 읽는다. 단위 수준에서 그 한 규칙을 잠근다 — 아래 install 픽스처는 그 어긋남의
+// 사용자 쪽 귀결을 잰다.
+func TestTomlTripleLenRespectsFragments(t *testing.T) {
+	// 조각 둘: `A = """ab""` + `"x""",` — 이으면 12번째 바이트에서 `"""`가 만들어지지만 그
+	// 셋 중 하나는 다음 조각의 것이다. advance는 그것으로 닫지 않는다.
+	const f0, f1 = `A = """ab""`, `"x""",`
+	at := []int{0, len(f0)}
+	joined := f0 + f1
+	if got, want := tomlTripleLen(joined, at, 4), len(joined)-1-4; got != want {
+		t.Errorf("토큰 길이=%d want %d — 조각 경계에 걸친 따옴표 셋으로 닫았다: %q", got, want, joined[4:4+got])
+	}
+	// 여는 구분자가 걸린 갈래도 같다 — `""` + `"x"""`는 여러 줄 문자열의 시작이 아니다.
+	g0, g1 := `A = ""`, `"x"""`
+	if got := tomlTripleLen(g0+g1, []int{0, len(g0)}, 4); got != 0 {
+		t.Errorf("여는 구분자가 조각 경계에 걸렸는데 토큰 길이=%d want 0", got)
+	}
+	// 조각 안에서 닫히면 종전대로 닫는다(따옴표 넷 규칙 포함) — 좁힘이 정상 형태를 막지 않는다.
+	h0, h1 := `A = """x`, `y"""",`
+	if got, want := tomlTripleLen(h0+h1, []int{0, len(h0)}, 4), len(h0+h1)-1-4; got != want {
+		t.Errorf("조각 안 닫기 토큰 길이=%d want %d", got, want)
+	}
+}
+
+// TestCodexInlineEnvMultilineStringEndingInQuote — **회귀 잠금**. 여러 줄 문자열의 **내용 줄이
+// 따옴표로 끝나는** 유효 TOML에서, 이은 문자열 위의 실행 길이 세기가 조각 경계에 걸친 따옴표
+// 셋을 닫는 구분자로 읽었다. 그러면 그 뒤 값 스캔이 어긋나 `tomlScanInline`이 fail로 빠지고,
+// install은 **인라인 테이블을 인라인 테이블로 바꾸라는** 수행 불가능한 사유를 내며 무변경으로
+// 굳는다(실측: state=mcpMarkerAnomaly·anomalyEnvNotTable). 표식은 옛 버전에 머물고, 표식이
+// 실재하는데 부재로 읽히며, MCP가 확정되지 않아 가드 등록도 함께 빠진다.
+// base(128a727)는 이 파일을 기입했다 — 이 릴리스가 들인 회귀다.
+func TestCodexInlineEnvMultilineStringEndingInQuote(t *testing.T) {
+	marker := hookMarker("0.18.0")
+	const head = "[mcp_servers.ctr]\ncommand = \"context-router\"\n"
+	for _, c := range []struct{ name, env, keep string }{
+		// 내용 줄이 따옴표 둘로 끝나고 다음 줄이 따옴표로 시작한다 — 이으면 `ab"""x`가 되어
+		// 파일에 없는 닫기가 생긴다.
+		{"내용 줄이 따옴표로 끝난다", "env = { A = \"\"\"ab\"\"\n\"x\"\"\", " + codexMarkerKey + " = \"context-router/0.16.0\" }\n", "A = \"\"\"ab\"\""},
+		{"홑따옴표 삼중", "env = { A = '''ab''\n'x''', " + codexMarkerKey + " = \"context-router/0.16.0\" }\n", "A = '''ab''"},
+		// 조각이 정확히 닫는 삼중으로 끝나는 갈래는 **유효 TOML로 만들 수 없다**(그 뒤에 쉼표
+		// 없이 줄이 바뀐다) — 그 규칙은 TestTomlTripleLenRespectsFragments가 단위로 잠근다.
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			in := []byte(head + c.env)
+			if !codexTOMLParses(in) {
+				t.Fatalf("픽스처가 파스되지 않는다 — 유효 입력에서 재는 축이 아니게 된다:\n%q", in)
+			}
+			res := installCodexConfigBlock(in, codexInstallRequest{Marker: marker})
+			if res.State != mcpWritten || !res.Changed {
+				t.Fatalf("state=%d changed=%v 사유=%q — base(128a727)는 이 파일을 기입했다",
+					res.State, res.Changed, res.Anomaly.reason())
+			}
+			out := string(res.Out)
+			if !strings.Contains(out, codexMarkerKey+` = "`+marker+`"`) {
+				t.Errorf("표식이 현재 값으로 서지 않았다:\n%q", out)
+			}
+			if !strings.Contains(out, c.keep) {
+				t.Errorf("사용자 값 %q가 바이트 그대로 남지 않았다:\n%q", c.keep, out)
+			}
+			// 다섯 겹을 함께 건다 — 되쓰기가 값 안의 바이트를 옮기면 P0·P1·P3가 문다.
+			if !assertCodexOracles(t, marker, in) {
+				t.Errorf("기입 갈래로 가지 않았다")
+			}
+		})
+	}
+}
+
+// TestCodexKeyCheckSkipsStringValues — **회귀 잠금**. D87의 이스케이프 키 검사가 원문 위로
+// 옮겨 오면서 **문자열 값 안**을 훑게 됐다. 원문은 주석을 **문자열 밖에서만** 자르므로 여러 줄
+// 문자열 안의 `# …, "C:\t" = 2` 같은 내용이 그대로 남고, 그것이 인라인 키 토큰으로 잡혔다.
+// 귀결: 우리 소유의 정상 등록물에서 install·uninstall·`--fix`가 **셋 다 영구 무변경**이 되고,
+// 인쇄되는 사유는 그 파일에 없는 키를 가리킨다. base(128a727)는 install·uninstall 둘 다 성공한다.
+// 키 토큰은 문자열 값 안에 살지 않으므로 걸음이 값을 통째로 건너뛰는 것이 뿌리 수정이다.
+func TestCodexKeyCheckSkipsStringValues(t *testing.T) {
+	marker := hookMarker("0.18.0")
+	const head = "[mcp_servers.ctr]\ncommand = \"context-router\"\n"
+	for _, c := range []struct{ name, env string }{
+		{"여러 줄 문자열 안의 주석 뒤 키 모양", "env = { A = \"\"\"\n# x, \"C:\\t\" = 2\n\"\"\", " + codexMarkerKey + " = \"context-router/0.16.0\" }\n"},
+		{"홑따옴표 값 안의 키 모양", "env = { A = ', \"C:\\t\" = 2', " + codexMarkerKey + " = \"context-router/0.16.0\" }\n"},
+		{"여러 줄 홑따옴표 값 안의 키 모양", "env = { A = '''\n, \"C:\\t\" = 2\n''', " + codexMarkerKey + " = \"context-router/0.16.0\" }\n"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			in := []byte(head + c.env)
+			if !codexTOMLParses(in) {
+				t.Fatalf("픽스처가 파스되지 않는다 — 유효 입력에서 재는 축이 아니게 된다:\n%q", in)
+			}
+			if sp := codexManagedSpans(splitLinesKeepEnds(in)); sp.anomaly != anomalyNone {
+				t.Fatalf("구간 사유=%d(%q) — 문자열 값 안을 키로 읽었다", sp.anomaly, sp.anomaly.reason())
+			}
+			res := installCodexConfigBlock(in, codexInstallRequest{Marker: marker})
+			if res.State != mcpWritten || !res.Changed {
+				t.Fatalf("install state=%d changed=%v 사유=%q", res.State, res.Changed, res.Anomaly.reason())
+			}
+			// uninstall도 함께 잰다 — 같은 검사가 제거 경로도 얼렸고, 그쪽은 사용자에게
+			// "제거했다"가 아니라 "고칠 수 없는 파일"로 보인다.
+			if out, changed, an := uninstallCodexConfigBlock(in); !changed || an != anomalyNone {
+				t.Errorf("uninstall changed=%v anomaly=%d — 우리 소유 등록물이다:\n%q", changed, an, out)
+			}
+			if !assertCodexOracles(t, marker, in) {
+				t.Errorf("기입 갈래로 가지 않았다")
 			}
 		})
 	}
