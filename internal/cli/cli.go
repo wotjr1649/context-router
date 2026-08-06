@@ -2272,14 +2272,12 @@ func doctorFixRegistrations(w io.Writer, projectRoot, version string) {
 			fmt.Fprintf(w, "[20] fix: %q 이름에 우리가 소유하지 않은 항목이 있어 .mcp.json을 그대로 두었습니다\n", ctrMCPServerName)
 		} else if bytes.Equal(data, merged) {
 			fmt.Fprintln(w, "[20] fix: .mcp.json은 이미 현재 버전입니다 — 무변경")
-		} else if bErr := backupConfigFile(mcpPath, data); bErr != nil {
-			// config.toml 갈래(아래)와 같은 순서다 — 무변경 판정 → 백업 → 기입. 백업이
-			// 실패하면 기입하지 않는다(D95).
-			fmt.Fprintln(w, "[20] fix: .mcp.json 백업 실패 — 기입하지 않았습니다")
 		} else if wErr := atomicWriteFile(mcpPath, merged); wErr != nil {
 			fmt.Fprintln(w, "[20] fix: .mcp.json 기록 실패")
 		} else {
-			fmt.Fprintf(w, "[20] fix: .mcp.json 표식을 %s로 다시 기입했습니다(프로필은 보존, 대체된 옛 이름의 항목이 있으면 함께 정리했습니다. 직전 내용은 .mcp.json.bak 한 슬롯 — 프로젝트 루트 파일이라 버전 관리에 딸려 들어가니 .gitignore에 넣어 두세요)\n", version)
+			// 이 갈래는 백업을 지나지 않는다 — config.toml 갈래(아래)와 다른 점이고 의도다
+			// (backupConfigFile 주석·설계서 §4).
+			fmt.Fprintf(w, "[20] fix: .mcp.json 표식을 %s로 다시 기입했습니다(프로필은 보존, 대체된 옛 이름의 항목이 있으면 함께 정리했습니다)\n", version)
 		}
 	}
 	cfgPath, cfgErr := codexConfigPath()
