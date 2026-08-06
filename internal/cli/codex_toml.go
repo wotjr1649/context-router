@@ -90,7 +90,11 @@ func (a codexAnomaly) reason() string {
 	case anomalyDupHeader:
 		return "관리 테이블 헤더가 둘 이상입니다(TOML 중복 정의) — 하나만 남기고 지우세요"
 	case anomalyScannerOpen:
-		return "파일 끝에서 여러 줄 문자열·배열 또는 인라인 테이블이 닫히지 않았습니다 — 닫은 뒤 재실행하세요"
+		// **두 자리가 이 사유에 닿는다** — 파일 끝과 **다음 테이블 헤더 앞**이다. 뒤엣것은
+		// 인라인 테이블이 열린 채 헤더 모양의 줄이 오는 형태인데, 그 헤더의 대괄호가 깊이를
+		// 도로 맞춰 EOF 백스톱이 서지 않는다(실측). "파일 끝에서"만 대면 그 사용자는 파일
+		// 끝을 아무리 보아도 닫히지 않은 것을 찾을 수 없다.
+		return "여러 줄 문자열·배열 또는 인라인 테이블이 닫히지 않았습니다(파일 끝 또는 다음 테이블 헤더 앞) — 닫은 뒤 재실행하세요"
 	case anomalyEscapedKey:
 		return "관리 테이블 안의 키가 이스케이프 표기로 적혀 있습니다 — 보통 표기(예: command)로 바꾸세요"
 	case anomalyOutsideConflict:
@@ -189,7 +193,25 @@ type tomlLineScanner struct {
 	inBasic   bool // """ 열림
 	inLiteral bool // ''' 열림
 	depth     int  // 여러 줄 배열 [ ] · 인라인 테이블 { } 균형
+	// tables — 그중 **인라인 테이블만** 센 균형. depth를 가르지 않고 곁에 두는 이유는
+	// depth의 닫기 규칙(어느 닫는 괄호든 하나 내린다)을 바꾸지 않기 위해서다 — open()이
+	// 그 위에 서 있고, 짝이 어긋난 입력에서 규칙을 바꾸면 무관한 판정이 함께 움직인다.
+	// depth == tables > 0이면 **열린 괄호가 전부 중괄호**다(열린 배열이 없다).
+	tables int
 }
+
+// inInlineTable — 이 줄이 인라인 테이블 **안**에서 시작하는가(열린 배열도 여러 줄 문자열도
+// 없이). TOML은 인라인 테이블 안의 줄바꿈을 값 안에서만 허용하므로, 이 상태에서 줄 머리에
+// 오는 여는 대괄호는 값의 일부일 수 없다 — 그 자리에서 우리는 구간의 끝을 확정할 수 없다.
+// 배열이 열려 있으면(depth != tables) 이어지는 줄이 `["nested"],`처럼 대괄호로 시작하는 것이
+// 정상이므로 들지 않는다.
+func (s *tomlLineScanner) inInlineTable() bool {
+	return !s.inString() && s.tables > 0 && s.depth == s.tables
+}
+
+// tomlHeaderShaped — 정규화 라인이 테이블 헤더 모양인가. **경계 판정과 미확정 판정이 같은
+// 자리를 지나게 하는 술어다** — 갈리면 한쪽이 헤더로 보는 줄을 다른 쪽이 값으로 본다.
+func tomlHeaderShaped(line []byte) bool { return strings.HasPrefix(stripLine(line), "[") }
 
 // inString — 앞 줄에서 시작한 여러 줄 문자열 안인가. open()과 달리 괄호 깊이를 보지
 // 않는다 — 주석 절단을 결정하는 것은 문자열 상태뿐이고(D92 계약 6), 인라인 깊이가
@@ -204,11 +226,8 @@ func (s *tomlLineScanner) open() bool { return s.inString() || s.depth > 0 }
 // 헤더일 때의 정규화된 이름이다([[배열 테이블]]도 경계이지만 이름은 비운다 — 우리 이름이
 // 될 수 없고, 경계로는 세야 앞 테이블의 구간이 거기서 끝난다).
 func (s *tomlLineScanner) step(line []byte) (boundary bool, name string) {
-	if !s.open() {
-		t := stripLine(line)
-		if strings.HasPrefix(t, "[") {
-			boundary, name = true, tomlHeaderName(t)
-		}
+	if !s.open() && tomlHeaderShaped(line) {
+		boundary, name = true, tomlHeaderName(stripLine(line))
 	}
 	s.advance(string(line), boundary)
 	return boundary, name
@@ -289,10 +308,16 @@ func (s *tomlLineScanner) advance(line string, header bool) int {
 			i += literalStringLen(line[i:])
 		case (line[i] == '[' || line[i] == '{') && !header:
 			s.depth++
+			if line[i] == '{' {
+				s.tables++
+			}
 			i++
 		case (line[i] == ']' || line[i] == '}') && !header:
 			if s.depth > 0 {
 				s.depth--
+			}
+			if line[i] == '}' && s.tables > 0 {
+				s.tables--
 			}
 			i++
 		default:
@@ -347,8 +372,18 @@ type codexSpans struct {
 func codexManagedSpans(lines [][]byte) codexSpans {
 	var out codexSpans
 	var sc tomlLineScanner
-	cur := -1 // 0=table, 1=env, -1=없음
+	cur := -1               // 0=table, 1=env, -1=없음
+	headerInInline := false // 인라인 테이블 안에서 헤더 모양의 줄을 만났는가
 	for i, ln := range lines {
+		// 인라인 테이블이 열린 채 헤더 모양의 줄이 오면 그 중괄호는 이 줄 앞에서 닫혔어야
+		// 한다 — 어느 쪽으로 읽든 **구간의 끝을 확정할 수 없다.** 그 줄은 경계로 잡히지 않아
+		// 구간이 EOF까지 늘어나는데, 헤더 자신의 대괄호가 깊이를 도로 맞춰 EOF 열림 백스톱마저
+		// 서지 않는다: 그 상태로 기입하면 되쓰기가 사용자의 테이블을 통째로 먹고 uninstall이
+		// 그것을 지운다(실측: base 128a727은 둘 다 보존한다). 확정할 수 없는 구간은 되쓰지
+		// 않는다는 것이 규칙이고, 무변경 + 사유가 그 규칙의 형태다.
+		if sc.inInlineTable() && tomlHeaderShaped(ln) {
+			headerInInline = true
+		}
 		boundary, name := sc.step(ln)
 		if !boundary {
 			continue
@@ -379,7 +414,7 @@ func codexManagedSpans(lines [][]byte) codexSpans {
 	// 단일 백업 슬롯이 2회차에 원본을 잃는다(적대적 리뷰 A2). 무변경 경로로 뺀다.
 	// 중복 헤더가 이미 잡혔으면 그 사유를 유지한다 — 구조적으로 더 근본이고, 사용자가 먼저
 	// 고쳐야 하는 것이 그쪽이다.
-	if sc.open() && out.anomaly == anomalyNone {
+	if (sc.open() || headerInInline) && out.anomaly == anomalyNone {
 		out.anomaly = anomalyScannerOpen
 	}
 	// 우리 구간 안의 정규화 불가 키(D87) — 구간이 확정된 뒤에 본다. 앞의 두 사유가 이미
@@ -689,10 +724,11 @@ func codexEndPointAt(e [2]int, at []int, joinedLen, off int) tomlPoint {
 // 후행 주석·홑따옴표 값 내부가 모두 오탐이 된다).
 // 인라인 테이블의 키 토큰은 **env 엔트리에서만** 본다 — 판독·되쓰기가 그 엔트리에만 적용되는
 // 것과 같은 한정이고, 그것이 없으면 다른 키의 값 안에 든 쉼표 뒤 텍스트가 키로 잡힌다.
-// **알려진 한계**: env 인라인 값 안에 따옴표·역슬래시·등호를 함께 담은 문자열은 여전히 키로
-// 보인다. 이 검사는 라인을 훑을 뿐 인라인 테이블의 구조를 따라가지 않으며, D80의 파서 비의존
-// 원칙 아래에서는 그 한계가 계약이다. 판독·되쓰기 쪽은 tomlScanInline이 구조를 따라가므로 값
-// 안을 키로 잡지 않는다 — 그쪽에서 잘못 잡으면 사용자 파일이 깨진다.
+// 그 엔트리 안에서는 **문자열 값을 건너뛰며** 구분자를 찾는다 — 키 토큰은 문자열 값 안에
+// 살지 않으므로 값 안의 `, "이름" = 값` 모양은 오탐이다(종전에는 한 줄·여러 줄 문자열 값 안이
+// 모두 그렇게 잡혔다). 인라인 테이블의 **구조**를 따라가는 것은 여전히 tomlScanInline뿐이며
+// 이 검사는 토큰 걸음만 공유한다 — 그쪽에서 잘못 잡으면 사용자 파일이 깨지고, 여기서 잘못
+// 잡으면 정상 파일이 얼어붙는다.
 func codexEscapedKeyInSpans(lines [][]byte, sp codexSpans) bool {
 	for _, span := range []codexSpan{sp.table, sp.env} {
 		if !span.found {
@@ -701,16 +737,36 @@ func codexEscapedKeyInSpans(lines [][]byte, sp codexSpans) bool {
 		for _, e := range codexEntries(lines, span) {
 			// 주석은 codexEntryRaw가 이미 잘라 냈다 — 주석 안의 키 모양까지 잡으면
 			// `env = { A = "1" } # TODO: , "C:\t" = 2` 같은 정상 파일이 이상이 된다.
-			raw, _ := codexEntryRaw(lines, e)
+			raw, at := codexEntryRaw(lines, e)
 			if tomlKeyTokenHasEscape(raw) {
 				return true
 			}
 			if codexKeyName(raw) != "env" {
 				continue
 			}
-			for j := 0; j < len(raw); j++ {
-				if (raw[j] == '{' || raw[j] == ',') && tomlKeyTokenHasEscape(raw[j+1:]) {
-					return true
+			// **문자열 값은 통째로 건너뛴다** — 키 토큰은 문자열 값 **안**에 살지 않는다.
+			// 건너뛰지 않으면 `A = """`⏎`# x, "C:\t" = 2`⏎`"""`처럼 값 안에 든 키 모양이
+			// 키로 잡혀, 그 파일의 install·uninstall·--fix가 영구 무변경으로 굳고 사유가
+			// 대는 키는 그 파일에 없다. 주석 절단이 **문자열 밖에서만** 일어나므로(계약 6)
+			// 여러 줄 문자열의 내용은 raw에 그대로 남아 있고, 그것이 이 걸음이 필요한
+			// 이유다. 걸음은 stripTrailingComment·tomlTopLevelEq와 **같은 기준**이다.
+			for j := 0; j < len(raw); {
+				if n := tomlTripleLen(raw, at, j); n > 0 {
+					j += n
+					continue
+				}
+				switch raw[j] {
+				case '"':
+					j += basicStringLen(raw[j:])
+				case '\'':
+					j += literalStringLen(raw[j:])
+				case '{', ',':
+					if tomlKeyTokenHasEscape(raw[j+1:]) {
+						return true
+					}
+					j++
+				default:
+					j++
 				}
 			}
 		}
@@ -1720,37 +1776,61 @@ type tomlInlineScan struct {
 	braced      bool
 }
 
-// tomlTripleLen — s의 맨 앞이 삼중 큰따옴표나 삼중 홑따옴표면 그 여러 줄 문자열 토큰
-// 전체의 길이, 아니면 0. 닫히지 않으면 len(s)다 — 호출자가 그 자리에서 fail로 빠진다.
+// tomlFragEnd — off이 든 물리 라인 조각의 끝(배타적). at은 codexEntryRaw가 낸 조각 시작
+// 오프셋이고 오름차순이다(주석만 있는 줄·빈 줄이 길이 0 조각이라 같은 값이 겹칠 수 있다).
+// **조각 경계를 읽는 자리는 모두 이 하나를 지난다** — 자리마다 부등호가 갈리면 같은 이음매를
+// 두 방식으로 읽는 셈이고, 그것이 D92가 닫으려는 뿌리다.
+func tomlFragEnd(at []int, n, off int) int {
+	for _, a := range at {
+		if a > off {
+			return a
+		}
+	}
+	return n
+}
+
+// tomlTripleLen — joined[off]에서 시작하는 여러 줄 문자열 토큰의 길이, 아니면 0.
+// 닫히지 않으면 len(joined)-off다 — 호출자가 그 자리에서 fail로 빠진다.
 // 닫기 판정은 tomlLineScanner.advance와 **같은 기준**이다(tomlTripleCloses): 실행 길이 규칙과
 // 이스케이프 인지를 함께 쓴다. strings.Index로 찾으면 역슬래시로 이스케이프된 따옴표를 닫기로
 // 오인하고, 첫 삼중에서 닫으면 따옴표 넷으로 닫는 토큰의 길이를 하나 짧게 내 그 뒤 값 스캔이
 // 어긋난다 — 유효한 파일이 anomalyEnvNotTable로 되돌려진 자리가 그것이다.
 //
+// **여는 구분자도 닫는 구분자도 물리 라인 조각 하나 안에 있어야 한다.** codexEntryRaw는
+// 조각을 **구분자 없이** 잇는데 advance는 조각마다 닫기를 찾으므로, 이은 문자열 위에서
+// 실행 길이를 세면 조각 경계에 걸친 따옴표 셋이 **파일에 없는 구분자**가 된다 — 같은
+// 바이트를 두 판독기가 다르게 읽는 자리이고, 유효한 파일(내용 줄이 따옴표로 끝나는 여러 줄
+// 문자열)에서 install이 영구 무변경 + 거짓 사유로 굳던 뿌리다. 조각 끝에서 끊는 것이 곧
+// advance의 라인 한정 판정이므로 `joined[:끝]`에 걸어 실행 길이 규칙까지 함께 맞춘다.
+//
 // **문서 주석에 홑따옴표 두 개를 잇달아 적지 마라** — Go 1.19+ gofmt의 doc 주석 정규화가
 // 그것을 오른쪽 겹따옴표로 바꿔 `gofumpt -l .`이 적색이 된다(실측). 저장소가 이미 같은
 // 이유로 tomlLineScanner 주석에서 "삼중 홑따옴표"라고 풀어 쓴다(codex_toml.go:168).
-func tomlTripleLen(s string) int {
+func tomlTripleLen(joined string, at []int, off int) int {
+	n := len(joined)
 	var q byte
 	switch {
-	case strings.HasPrefix(s, `"""`):
+	case strings.HasPrefix(joined[off:], `"""`):
 		q = '"'
-	case strings.HasPrefix(s, "'''"):
+	case strings.HasPrefix(joined[off:], "'''"):
 		q = '\''
 	default:
 		return 0
 	}
-	for i := 3; i < len(s); {
-		if q == '"' && s[i] == '\\' {
+	if off+3 > tomlFragEnd(at, n, off) {
+		return 0 // 여는 구분자가 조각 경계에 걸렸다 — 이 자리에 여러 줄 문자열은 없다
+	}
+	for i := off + 3; i < n; {
+		if q == '"' && joined[i] == '\\' {
 			i += 2
 			continue
 		}
-		if tomlTripleCloses(s, i, q) {
-			return i + 3
+		if e := tomlFragEnd(at, n, i); i+3 <= e && tomlTripleCloses(joined[:e], i, q) {
+			return i + 3 - off
 		}
 		i++
 	}
-	return len(s)
+	return n - off
 }
 
 // tomlSpanText — 구간의 원문 텍스트. joined·at은 codexEntryRaw가 낸 짝이고 e는 그 논리
@@ -1805,10 +1885,8 @@ func tomlScanInline(lines [][]byte, e [2]int) tomlInlineScan {
 		if joined[off] == '"' {
 			n = basicStringLen(joined[off:])
 		}
-		for _, a := range at {
-			if a > off && a < off+n {
-				return -1
-			}
+		if tomlFragEnd(at, len(joined), off) < off+n {
+			return -1
 		}
 		return n
 	}
@@ -1896,7 +1974,7 @@ func tomlScanInline(lines [][]byte, e [2]int) tomlInlineScan {
 			}
 			// 여러 줄 문자열은 닫힘까지 통째로 건너뛴다 — 한 줄 문자열로 읽으면 값 안의
 			// '#'·','·'}'가 구조 문자로 잡힌다. 한 줄 갈래보다 **먼저** 본다.
-			if n := tomlTripleLen(joined[i:]); n > 0 {
+			if n := tomlTripleLen(joined, at, i); n > 0 {
 				i += n
 				continue
 			}
