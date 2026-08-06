@@ -117,6 +117,11 @@ func assertInlineScanTiles(t *testing.T, lines [][]byte, e [2]int, sc tomlInline
 	gap("마지막 값과 닫는 중괄호 사이", prev, c, ',', 0, 1)
 }
 
+// tomlEmptyTableLeaf — tomlFlatten이 **빈 테이블**을 적는 잎 값. 문면을 두 자리에 적지 않는다:
+// assertCodexOracles가 "입력의 env가 빈 테이블인가"를 이 값으로 판정하므로, 문면이 갈리면 그
+// 판정이 조용히 거짓이 되고 빈 인라인 env가 다시 그물 밖으로 나간다.
+var tomlEmptyTableLeaf = fmt.Sprintf("%T:{}", map[string]any{})
+
 // tomlFlatten — 점 경로 → 잎 값의 정본 문자열. 헤더·점 표기·인라인 세 형태가 **같은 경로로
 // 접힌다** — 형태가 달라도 의미가 같다는 것을 재는 오라클이다. 지정 파서는 우리 판독기가
 // 아닌 독립 구현이라 차등 오라클로서 정당하고, D89가 검증 전용 사용을 이미 허용한다.
@@ -146,7 +151,7 @@ func tomlFlatten(b []byte) (map[string]string, error) {
 			// 빈 테이블도 실재하는 정의다 — 소실을 보려면 잎이어야 한다. 타입 접두를 잎과
 			// **같은 규칙**으로 붙인다: 맨 문자열 "{}"로 적으면 값이 문자열 "{}"인 키와
 			// 겹쳐 빈 테이블과 문자열 사이의 변조가 통과한다.
-			out[prefix] = fmt.Sprintf("%T:{}", v)
+			out[prefix] = tomlEmptyTableLeaf
 			return
 		}
 		for k, sub := range m {
@@ -200,20 +205,53 @@ func assertSemanticPreserved(t *testing.T, in, out []byte, allowed ...string) {
 // 술어는 open()이 아니라 **inString()**이다(스펙 §0 D92 계약 6, codexEntryRaw와 같은 기준) —
 // 인라인 깊이가 depth에 든 뒤로 open()은 여러 줄 배열·인라인 테이블의 이어지는 줄에서도
 // 참이고, 그 줄의 후행 주석은 진짜 주석이라 여기서 세어야 한다.
+//
+// **상태는 줄 머리가 아니라 줄 안에서 본다**(session-53 정정, codexEntryRaw와 같은 정정).
+// 종전은 `sc.inString()`을 **걸음 전에** 물어 참이면 그 물리 라인을 통째로 건너뛰었다 —
+// 여러 줄 문자열이 **닫히는 그 줄**은 줄 머리가 아직 문자열 안이므로 통째로 빠졌고, 그 줄의
+// 후행 주석이 입력에서도 산출에서도 세어지지 않았다. 실측: `env = { M = """`⏎`line`⏎
+// `""" } # keep this note`에서 P2는 주석 0개를 보고, 그 주석을 산출에서 지워도 여전히 0개다 —
+// 이 겹의 존재 이유인 손실이 이 겹에 보이지 않았다.
+//
+// 고치는 기제는 새로 세우지 않는다: `tomlLineScanner.advance`가 이미 **문자열 밖 '#' 자리**를
+// 돌려주므로(이 릴리스가 codexEntryRaw 때문에 들인 반환값), 상태를 버리는 복사본에 그 줄을
+// 걸려 자리만 받고 상태 갱신은 종전대로 step이 한다. 오라클이 판독기와 다른 문법을 갖지
+// 않는다는 이 파일의 기준이 그대로 유지된다.
 func tomlComments(b []byte) []string {
 	var out []string
 	var sc tomlLineScanner
 	for _, line := range splitLinesKeepEnds(b) {
 		s := trimEOL(line)
-		if !sc.inString() {
-			if cut := stripTrailingComment(s); len(cut) < len(s) {
-				out = append(out, s[len(cut):])
-			}
+		head := sc // 줄 머리 상태의 복사본 — 주석 자리만 받고 상태 갱신은 step이 한다
+		if at := head.advance(s, false); at < len(s) {
+			out = append(out, s[at:])
 		}
 		sc.step(line)
 	}
 	slices.Sort(out)
 	return out
+}
+
+// TestCommentsOnMultilineStringCloseLine — **P2 자신을 재는 자리.** 여러 줄 문자열이 닫히는
+// 물리 라인의 후행 주석을 이 겹이 세는가. 종전 판정(줄 머리 상태로 줄을 통째로 건너뜀)은 그
+// 주석을 입력에서도 산출에서도 세지 않아, 산출에서 지워져도 다중집합 차이가 0이었다 —
+// **주석 손실을 잡으라고 있는 겹이 바로 그 손실에 눈이 없었다**(session-53 실측).
+// 다른 네 겹도 이 손실에 눈이 없다: P1은 주석을 모델하지 않고, P0는 인라인 env 엔트리의
+// 구조만 보며, P3는 그 엔트리를 통째로 면제하고, P4는 주석이 빠진 산출 위에서도 성립한다.
+func TestCommentsOnMultilineStringCloseLine(t *testing.T) {
+	const note = "# keep this note"
+	in := []byte("[mcp_servers.ctr]\ncommand = \"context-router\"\n" +
+		"env = { " + codexMarkerKey + " = \"context-router/0.17.2\", M = \"\"\"\nline\n\"\"\" } " + note + "\n")
+	before := tomlComments(in)
+	if len(before) != 1 || before[0] != note {
+		t.Fatalf("닫는 줄의 후행 주석=%q want [%q] — 그 물리 라인이 통째로 건너뛰어졌다", before, note)
+	}
+	// 그 주석만 지운 산출 — P2가 이 차이를 보아야 한다(assertCommentsPreserved는 이 두
+	// 다중집합의 차집합을 그대로 읽는다).
+	after := tomlComments(bytes.ReplaceAll(in, []byte(" "+note), nil))
+	if len(after) != 0 {
+		t.Fatalf("주석을 지운 산출에서 %q가 여전히 세어진다", after)
+	}
 }
 
 // assertCommentsPreserved — P2. 주석 다중집합이 보존되는가. D88의 예외 하나만 허용한다:
@@ -273,7 +311,14 @@ func lineSurvivalLosses(in, out []byte, envEntry [2]int) []int {
 		if !inSpan(sp.table, i) && !inSpan(sp.env, i) {
 			return false
 		}
-		if strings.HasPrefix(strings.TrimSpace(trimEOL(line)), "[") {
+		// 헤더 면제는 **우리 이름의 헤더**에만 준다(session-53). 종전은 "구간 안에서 `[`로
+		// 시작하는 줄"이었는데, 우리 구간은 판독기가 인라인 테이블을 닫지 못하면 EOF까지
+		// 늘어나므로 그 넓힘이 **남의 `[other]` 헤더까지 재생성 대상으로 면제한다** —
+		// 바로 그 넓힘이 남의 테이블을 삼키는 결함의 형태이고, 이 겹이 그것을 못 보게 된다.
+		// 이름 판독은 codexManagedSpans가 쓰는 것과 **같은 자리**(stripLine 뒤 tomlHeaderName)다 —
+		// 갈리면 오라클과 판독기가 같은 파일을 두 기준으로 읽는다.
+		switch tomlHeaderName(stripLine(line)) {
+		case codexManagedTable, codexManagedEnv:
 			return true // 우리 구간의 헤더는 재생성 대상이다
 		}
 		switch codexKeyName(trimEOL(line)) {
@@ -282,12 +327,22 @@ func lineSurvivalLosses(in, out []byte, envEntry [2]int) []int {
 		}
 		return false
 	}
+	// 면제의 끝은 논리 엔트리의 끝이 아니라 **엔트리가 삼킨 첫 테이블 헤더의 앞**이다
+	// (session-53). 면제의 근거는 "표식 splice가 이 엔트리 안을 정당하게 되쓴다"인데, 테이블
+	// 헤더 줄을 담은 엔트리는 정당한 엔트리가 아니다 — 판독기가 인라인 테이블을 닫지 못해 그
+	// 뒤 사용자 테이블을 엔트리 안으로 끌어들인 상태이고, 면제가 그 사용자 라인까지 덮으면
+	// **바이트 손실을 잡으라고 있는 겹이 바로 그 손실에 침묵한다.** 실측: `env = { X = "v"`⏎⏎
+	// `[other]`⏎`uKEY = "uV" }`에서 산출이 `[other]`와 그 키를 통째로 잃는데 손실 목록이 비었다.
+	exemptEnd := envEntry[1]
+	if h := codexEntryHeaderLine(inLines, envEntry); h >= 0 {
+		exemptEnd = h - 1
+	}
 	var lost []int
 	for i, line := range inLines {
 		if managed(i, line) {
 			continue
 		}
-		if envEntry[0] >= 0 && i >= envEntry[0] && i <= envEntry[1] {
+		if envEntry[0] >= 0 && i >= envEntry[0] && i <= exemptEnd {
 			continue // 인라인 env 엔트리 — 치환 구간을 담으므로 바이트 동일을 요구하지 않는다
 		}
 		if avail[string(line)] == 0 {
@@ -297,6 +352,60 @@ func lineSurvivalLosses(in, out []byte, envEntry [2]int) []int {
 		avail[string(line)]--
 	}
 	return lost
+}
+
+// codexEntryHeaderLine — 논리 엔트리 [e0,e1]이 삼킨 **테이블 헤더 줄**의 첫 인덱스(없으면 -1).
+// 엔트리 **둘째 줄부터** 본다: 첫 줄은 `env = {` 대입 줄이고 그 앞의 헤더는 엔트리 밖이다.
+//
+// 판정은 "공백을 지운 줄이 `[`로 시작해 `]`로 끝난다"이다(후행 주석은 먼저 뗀다) — `[other]`도
+// `[[a.b]]`도 `[other] # 메모`도 물고, 인라인 값 안의 배열 이어지는 줄 `["a", "b"],`는 쉼표로
+// 끝나 물지 않는다. **`tomlScanInline`으로 판정하지 않는다**: 이 형태에서 그 열거기가 open을
+// 유효로 내는 것이 바로 다음 태스크가 고칠 결함이고, 판정을 거기 걸면 게이트와 오라클이 같은
+// 눈을 공유해 맹점이 동시에 꺼진다(이 파일이 P2에서 파서를 피하는 것과 같은 이유).
+//
+// ponytail: 값 하나가 통째로 `[1, 2]`인 줄이 엔트리 안에 홀로 놓이면 오경보다. env 값은
+// 환경변수 문자열이라 실재하지 않는 모양이고, 오경보는 적색 + 메시지로 드러난다 — 필요해지면
+// 그때 "헤더 이름이 정규화 가능한 키 경로인가"로 좁힌다.
+func codexEntryHeaderLine(lines [][]byte, e [2]int) int {
+	if e[0] < 0 {
+		return -1
+	}
+	for i := e[0] + 1; i <= e[1] && i < len(lines); i++ {
+		t := stripTrailingComment(stripLine(lines[i]))
+		if strings.HasPrefix(t, "[") && strings.HasSuffix(t, "]") {
+			return i
+		}
+	}
+	return -1
+}
+
+// TestLineSurvivalEntryExemptionStopsAtHeader — **P3 자신을 재는 자리.** 인라인 env 엔트리
+// 면제가 테이블 헤더 줄 앞에서 끊기는가. 입력·산출을 손으로 적어 두는 것은 `installCodexConfigBlock`
+// 을 부르지 않기 위해서다 — 이 테스트는 **오라클의 계약**을 잠그는 것이고, 다음 태스크가
+// 생산 코드에서 이 소실을 고쳐도 그대로 초록이어야 한다(형제인 TestLineSurvivalCountsDuplicates·
+// TestLineSurvivalHeaderExemptionIsScoped와 같은 형태).
+func TestLineSurvivalEntryExemptionStopsAtHeader(t *testing.T) {
+	in := []byte("[mcp_servers.ctr]\ncommand = \"context-router\"\n" +
+		"env = { " + codexMarkerKey + " = \"context-router/0.17.2\"\n\n[other]\nuKEY = \"uV\" }\n")
+	// 판독기가 인라인 테이블을 닫지 못해 논리 엔트리가 [2,5]로 잡히는 상태(실측).
+	if _, e := codexEnvEntryOf(in); e != [2]int{2, 5} {
+		t.Fatalf("논리 엔트리=%v want [2 5] — 픽스처가 재려는 상태가 아니다", e)
+	}
+	// 사용자 테이블을 통째로 잃은 산출. 면제가 엔트리 전체면 손실 0건이다.
+	out := []byte("[mcp_servers.ctr]\ncommand = \"context-router\"\n" +
+		"env = { " + codexMarkerKey + " = \"context-router/0.18.0\" }\n")
+	lost := lineSurvivalLosses(in, out, [2]int{2, 5})
+	if !slices.Equal(lost, []int{4, 5}) {
+		t.Errorf("잃은 라인=%v want [4 5] — 면제가 헤더 줄과 그 뒤까지 덮고 있다", lost)
+	}
+	// 반대쪽도 잰다: 헤더를 삼키지 않은 정상 엔트리의 면제는 그대로 남아야 한다.
+	ok := []byte("[mcp_servers.ctr]\ncommand = \"context-router\"\n" +
+		"env = { " + codexMarkerKey + " = \"context-router/0.17.2\",\n  U = \"1\" }\n")
+	okOut := []byte("[mcp_servers.ctr]\ncommand = \"context-router\"\n" +
+		"env = { " + codexMarkerKey + " = \"context-router/0.18.0\", U = \"1\" }\n")
+	if lost := lineSurvivalLosses(ok, okOut, [2]int{2, 3}); len(lost) != 0 {
+		t.Errorf("정상 엔트리의 면제가 사라졌다: %v", lost)
+	}
 }
 
 // assertLineSurvival — P3. 우리 관리 키가 아닌 물리 라인은 산출에 **바이트 동일**하게 있어야
@@ -445,6 +554,40 @@ func TestCodexLatticeSize(t *testing.T) {
 	}
 }
 
+// TestCodexLatticeWritingBranchCount — 격자의 **깊이**를 잰다. TestCodexLatticeSize가 5120이라는
+// 폭을 고정하는 것과 짝이며, 둘 다 있어야 그물이 실재한다.
+//
+// **폭만 고정하면 절반이 공회전해도 초록이다**(session-53 실측). HEAD에서 5120 중 3072만 기입
+// 갈래를 타고, 나머지 2048은 이상 판정으로 무변경으로 빠진다 — 점 표기 축 1024(anomalyDottedEnv)와
+// 우변 비-인라인 축 1024(anomalyEnvNotTable). 그 2048에서는 다섯 겹이 파일을 자기 자신과
+// 비교하므로 아무것도 검증하지 않는다: 스펙 §2.3이 세는 다섯 env 형태 중 **둘이 되쓰기를 한
+// 번도 지나지 않는다.**
+//
+// 개수를 고정하는 이유는 **집합 사이의 이주**다. 케이스별 "기입했거나, 아니면 바이트 동일"
+// (assertCodexOracles)은 필요조건일 뿐이다 — 이상 판정이 넓어져 **유효한** 케이스가 기입 집합에서
+// 공회전 집합으로 옮겨가도 그 단정은 그대로 통과하고 5120이라는 폭도 그대로다. 개수만이 그
+// 이주를 문다. 이 브랜치가 이미 그 실패를 냈다(과발화하는 이상 판정).
+//
+// **이 수는 현재 트리에 대한 진술이다.** 다음 태스크가 과발화하는 이상 판정을 고치면 케이스가
+// 기입 집합으로 **되돌아오므로 이 수는 올라간다** — 그때 값을 올리는 것은 예정된 작업이고
+// 단정을 느슨하게 하는 것이 아니다. 반대로 이 수가 **내려가면** 그것은 회귀다: 되쓰기를 지나던
+// 케이스가 무변경으로 빠졌다는 뜻이고, 그물이 그만큼 눈을 감았다는 뜻이다. 값을 고칠 때는
+// 무엇이 왜 옮겨갔는지를 함께 적어라.
+func TestCodexLatticeWritingBranchCount(t *testing.T) {
+	marker := hookMarker("0.18.0")
+	wrote := 0
+	for _, src := range codexLattice() {
+		if installCodexConfigBlock([]byte(src), codexInstallRequest{Marker: marker}).Changed {
+			wrote++
+		}
+	}
+	// 3072 = 5 형태 중 되쓰기를 지나는 셋 × 1024. 나머지 둘(점 표기 · 우변 비-인라인)이 2048이다.
+	if want := 3 * 1024; wrote != want {
+		t.Errorf("기입 갈래를 탄 격자 케이스=%d want %d(전체 %d) — 케이스가 기입 집합과 공회전 집합 사이를 옮겨 갔다",
+			wrote, want, len(codexLattice()))
+	}
+}
+
 // TestCodexInTableCommentsPreserved — P2를 **관리 테이블 안**의 주석에 건다. 격자는 이 자리를
 // 덮지 않는다(리뷰 실측): 격자의 독립 주석 cm[0]은 `[mcp_servers.ctr]` **앞**에 붙어 테이블
 // 안에 들어가지 않고, 테이블 안의 유일한 주석인 command 줄 후행은 D88 예외라 allowedLost에
@@ -479,9 +622,21 @@ func TestCodexInTableCommentsPreserved(t *testing.T) {
 // 픽스처가 **같은 그물**을 지나게 하는 단일 지점이다: 겹 목록을 두 자리에 적으면 겨냥
 // 픽스처만 한 겹 빠진 그물을 지나고, 그 빠짐은 초록으로 보인다.
 // allowedLostComments는 P2의 D88 예외(우리가 재생성하는 관리 키 줄의 후행 주석)다.
-func assertCodexOracles(t *testing.T, marker string, in []byte, allowedLostComments ...string) {
+//
+// **돌려주는 wrote는 "이 케이스가 기입 갈래를 탔는가"다**(session-53). 무변경으로 빠진 입력에서는
+// 다섯 겹이 전부 공회전한다 — P0는 같은 바이트를 두 번 훑고, P1·P2·P3는 파일을 자기 자신과
+// 비교하며, P4는 자명하게 성립한다. 그런 케이스가 몇 개인지 **호출자가 세지 않으면** 이상 판정이
+// 넓어져 유효 입력이 기입 집합에서 공회전 집합으로 옮겨가도 그물 전체가 초록으로 남는다.
+// 여기서는 "무변경이면 바이트 동일"만 잰다 — 필요조건이지 충분조건이 아니고, 개수는 호출자 몫이다.
+func assertCodexOracles(t *testing.T, marker string, in []byte, allowedLostComments ...string) (wrote bool) {
 	t.Helper()
 	res := installCodexConfigBlock(in, codexInstallRequest{Marker: marker})
+	// 기입 갈래를 타지 않았으면 산출은 입력과 **바이트 동일**해야 한다(D84·D85 무변경 계약).
+	// 이 단정 없이는 "Changed=false인데 산출이 다르다"가 다섯 겹 전부를 무의미하게 만든다.
+	if !res.Changed && !bytes.Equal(res.Out, in) {
+		t.Errorf("무변경 결과인데 산출이 입력과 다르다: state=%v anomaly=%v\n입력: %q\n산출: %q",
+			res.State, res.Anomaly, in, res.Out)
+	}
 	// P0 — 인라인 env 엔트리가 있으면 열거 결과가 그 엔트리를 구조 문자만 사이에 두고
 	// 덮는다. 입력과 산출 **양쪽**에 건다: 산출에만 걸면 우리가 만든 형태만 보고,
 	// 입력에만 걸면 우리 되쓰기가 만든 어긋남을 못 본다.
@@ -491,8 +646,21 @@ func assertCodexOracles(t *testing.T, marker string, in []byte, allowedLostComme
 		}
 	}
 	// P1 — 허용 경로는 우리가 기입하는 넷뿐이다.
-	assertSemanticPreserved(t, in, res.Out, "mcp_servers.ctr.env."+codexMarkerKey,
-		"mcp_servers.ctr.command", "mcp_servers.ctr.args", "mcp_servers.ctr.enabled_tools")
+	allowed := []string{
+		"mcp_servers.ctr.env." + codexMarkerKey,
+		"mcp_servers.ctr.command", "mcp_servers.ctr.args", "mcp_servers.ctr.enabled_tools",
+	}
+	// **빈 인라인 env는 부모 경로도 허용한다**(session-53). tomlFlatten은 빈 테이블을 그 경로의
+	// 잎으로 적으므로(소실을 보려면 잎이어야 한다) `env = {   }`에 표식을 채우면 잎 경로
+	// `mcp_servers.ctr.env`가 사라진 것으로 읽혀 P1이 **오경보**를 낸다. 그 결과 후행 쉼표 금지
+	// 때문에 전용 생산 로직을 가진 빈 인라인 갈래를 격자에도 어떤 오라클 픽스처에도 넣을 수
+	// 없었다 — 다섯 겹 전부에서 빠져 있었다.
+	// **입력의 그 경로가 실제로 빈 테이블일 때만** 허용한다: `env = []` 같은 비-테이블 우변도
+	// 같은 경로의 잎이라, 무조건 허용하면 그 값의 변조가 P1에 보이지 않게 된다.
+	if before, err := tomlFlatten(in); err == nil && before["mcp_servers.ctr.env"] == tomlEmptyTableLeaf {
+		allowed = append(allowed, "mcp_servers.ctr.env")
+	}
+	assertSemanticPreserved(t, in, res.Out, allowed...)
 	// P2 — 주석 다중집합. tomlComments가 '#'부터 잘라 내므로 앞 공백은 들어가지 않는다.
 	assertCommentsPreserved(t, in, res.Out, allowedLostComments...)
 	// P3 — 우리 관리 키가 아닌 물리 라인의 바이트 생존. 예외는 인라인 env 엔트리다.
@@ -503,12 +671,67 @@ func assertCodexOracles(t *testing.T, marker string, in []byte, allowedLostComme
 	if !bytes.Equal(again.Out, res.Out) {
 		t.Errorf("멱등이 아니다:\n입력: %q\n1: %s\n2: %s", in, res.Out, again.Out)
 	}
+	return res.Changed
+}
+
+// TestCodexEmptyInlineEnvOracles — 빈 인라인 `env`에 다섯 겹을 건다. **이 형태는 P1의 오경보
+// 때문에 그물 밖에 있었다**(session-53 실측: `env = {   }`가 `경로가 사라졌다:
+// mcp_servers.ctr.env`로 적색). 전용 생산 로직 — TOML의 후행 쉼표 금지 때문에 빈 테이블에는
+// 쉼표 없이 삽입해야 한다 — 이 다섯 겹 중 어디에도 걸리지 않던 자리다.
+// **격자에 축을 더하지 않는다**: 케이스 수가 바뀌면 폭 고정 단정(5120)이 무의미해진다.
+func TestCodexEmptyInlineEnvOracles(t *testing.T) {
+	marker := hookMarker("0.18.0")
+	const head = "[mcp_servers.ctr]\ncommand = \"context-router\"\n"
+	for _, c := range []struct{ name, src string }{
+		{"빈 인라인", head + "env = {}\n"},
+		{"공백만 담은 인라인", head + "env = {   }\n"},
+		{"닫는 중괄호 뒤 주석", head + "env = {} # 사용자 메모\n"},
+		{"사용자 키 뒤의 빈 인라인", head + "U1 = \"v\"\nenv = {  }\n"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			in := []byte(c.src)
+			if !codexTOMLParses(in) {
+				t.Fatalf("픽스처가 파스되지 않는다 — 유효 입력에서 재는 축이 아니게 된다:\n%q", c.src)
+			}
+			if !assertCodexOracles(t, marker, in) {
+				t.Fatalf("픽스처가 기입 갈래로 가지 않는다 — 이 테스트는 되쓰기를 재려는 것이다")
+			}
+		})
+	}
+}
+
+// TestCodexMultilineStringCloseOracles — 여러 줄 문자열이 인라인 `env` 안에서 닫히고 **그 물리
+// 라인에 후행 주석이 붙는** 형태에 다섯 겹을 건다. P2가 그 줄을 통째로 건너뛰던 동안(위
+// tomlComments의 정정) 이 자리의 주석 손실은 어느 겹에도 보이지 않았다.
+// **격자에 축을 더하지 않는다** — 형제 픽스처들과 같은 선택이다.
+func TestCodexMultilineStringCloseOracles(t *testing.T) {
+	marker := hookMarker("0.18.0")
+	const head = "[mcp_servers.ctr]\ncommand = \"context-router\"\n"
+	for _, c := range []struct{ name, src string }{
+		{"닫는 줄 후행 주석", head + "env = { " + codexMarkerKey + " = \"context-router/0.17.2\", M = \"\"\"\nline\n\"\"\" } # keep this note\n"},
+		{"닫는 줄 뒤 사용자 키", head + "env = { " + codexMarkerKey + " = \"context-router/0.17.2\", M = \"\"\"\nline\n\"\"\" } # note\nU1 = \"v\"\n"},
+		{"홑따옴표 삼중", head + "env = { " + codexMarkerKey + " = \"context-router/0.17.2\", M = '''\nline\n''' } # note\n"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			in := []byte(c.src)
+			if !codexTOMLParses(in) {
+				t.Fatalf("픽스처가 파스되지 않는다 — 유효 입력에서 재는 축이 아니게 된다:\n%q", c.src)
+			}
+			if !assertCodexOracles(t, marker, in) {
+				t.Fatalf("픽스처가 기입 갈래로 가지 않는다 — 이 테스트는 되쓰기를 재려는 것이다")
+			}
+		})
+	}
 }
 
 // TestCodexLatticeOracles — 격자의 모든 케이스에 다섯 겹을 건다. P0와 P3를 부르지 않으면 그 두
 // 겹이 격자 위에서 한 번도 실행되지 않는다(리뷰 실측). 입력이 파스되지 않으면 P1만 건너뛴다
 // (D89 비대칭). 실패 시 케이스 원문을 인쇄해 최소 재현을 즉시 얻는다.
 // 격자의 후행 주석은 command 줄에 붙어 있어 D88 예외다.
+//
+// **반환값을 여기서 세지 않는다** — `-run`으로 부분 집합만 돌리면 그 수가 틀려지므로 개수는
+// 자기 루프를 가진 TestCodexLatticeWritingBranchCount가 잰다. 여기서는 케이스마다 "기입했거나,
+// 아니면 바이트 동일"이 assertCodexOracles 안에서 걸린다.
 func TestCodexLatticeOracles(t *testing.T) {
 	marker := hookMarker("0.18.0")
 	for i, src := range codexLattice() {
@@ -552,7 +775,9 @@ func TestCodexValueEndOnFragmentBoundaryOracles(t *testing.T) {
 			if !codexTOMLParses([]byte(src)) {
 				t.Fatalf("픽스처가 파스되지 않는다 — 유효 입력에서 재는 축이 아니게 된다:\n%q", src)
 			}
-			assertCodexOracles(t, marker, []byte(src))
+			if !assertCodexOracles(t, marker, []byte(src)) {
+				t.Fatalf("픽스처가 기입 갈래로 가지 않는다 — 이 테스트는 되쓰기를 재려는 것이다")
+			}
 		})
 	}
 }
