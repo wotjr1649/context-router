@@ -2648,6 +2648,11 @@ func TestDoctorFix(t *testing.T) {
 	if !strings.Contains(string(mb), `"__ctrManaged": "context-router/0.15.0"`) {
 		t.Errorf(".mcp.json 표식이 고쳐지지 않았다:\n%s", mb)
 	}
+	// **.mcp.json 갈래는 백업을 지나지 않는다** — config.toml과 달리 프로젝트 루트에 있어
+	// 버전 관리 아래이고, 서버의 env 블록에 자격증명이 실리는 것이 흔하다(설계서 §4).
+	if _, err := os.Stat(mcpPath + ".bak"); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("--fix가 .mcp.json 옆에 백업을 남겼다(stat err=%v)", err)
+	}
 	cb, _ := os.ReadFile(cfgPath)
 	if !strings.Contains(string(cb), `CTR_MANAGED = "context-router/0.15.0"`) {
 		t.Errorf("config.toml 표식이 고쳐지지 않았다:\n%s", cb)

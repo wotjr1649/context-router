@@ -4,7 +4,6 @@
 ctr
 ctr.exe
 .mcp.json
-.mcp.json.bak
 
 # 호스트가 재작성하는 로컬 설정과 세션 산출물 — 저장소 사본은 현재 진실이 아니다
 .claude/

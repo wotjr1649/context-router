@@ -1528,32 +1528,39 @@ func TestMCPProfileHelpers(t *testing.T) {
 	}
 }
 
-// mcpOriginal — 세 테스트가 공유하는 "사용자가 손으로 쓴 원본". 우리 항목이 없어야 install이
-// 실제로 바이트를 바꾼다.
+// mcpOriginal — "사용자가 손으로 쓴 원본". 우리 항목이 없어야 install이 실제로 바이트를 바꾼다.
 const mcpOriginal = "{\n  \"mcpServers\": {\n    \"other\": {\"command\": \"x\"}\n  }\n}\n"
 
-// TestMCPBackupSingleSlot — D95. 기입한 실행에만 .bak이 생기고, 2회차 무변경 install이
-// 그 슬롯을 소모하지 않는다. 긍정 단정만 두면 매 실행 백업하는 구현이 통과해 단일 슬롯이
-// 원본 대신 "직전에 우리가 쓴 것"으로 채워진다.
-func TestMCPBackupSingleSlot(t *testing.T) {
+// TestMCPInstallWritesOnlyOnDrift — install 자리의 바이트 비교. 종전에는 이 비교가 없어
+// mergeMCPServers의 changed를 버리고 실행마다 무조건 되썼다(그 함수는 install에서 changed를
+// 참으로 고정하므로 그 플래그로는 판정할 수 없다) — 2회차가 내용이 같은 파일을 다시 썼다.
+//
+// **바이트로는 이것을 잴 수 없다**: 무조건 되쓰는 구현도 2회차에 같은 바이트를 낸다. 그래서
+// 갈래를 문면으로 가른다 — 무변경 갈래만 "무변경이라 기입하지 않았습니다"를 낸다.
+//
+// **백업 슬롯은 어느 실행에도 생기지 않는다.** `.mcp.json`은 프로젝트 루트에 있어 버전 관리
+// 아래이고 서버의 env 블록에 자격증명이 실리는 것이 흔하다 — 옆에 `.bak`을 떨구면 `git add -A`
+// 한 번이 그것을 공유 저장소에 올린다. 자리가 정해지기 전에는 슬롯을 두지 않는다(설계서 §4).
+func TestMCPInstallWritesOnlyOnDrift(t *testing.T) {
 	proj := t.TempDir()
 	mcpPath := mcpConfigPath(proj)
 	if err := os.WriteFile(mcpPath, []byte(mcpOriginal), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	const noChange = "무변경이라 기입하지 않았습니다"
 	var out bytes.Buffer
-	// 실제 시그니처는 7인자다(hook_install.go:547). 기존 호출부와 같은 형태.
+	// 실제 시그니처는 7인자다(hook_install.go). 기존 호출부와 같은 형태.
 	if err := runHookInstall(nil, t.TempDir(), "", false, proj, "0.18.0", &out); err != nil {
 		t.Fatalf("1차 install: %v", err)
 	}
-	bak, err := os.ReadFile(mcpPath + ".bak")
-	if err != nil {
-		t.Fatalf("1차 install이 백업을 남기지 않았다: %v", err)
-	}
-	if string(bak) != mcpOriginal {
-		t.Errorf("백업이 원본이 아니다:\n%s", bak)
-	}
 	after1, _ := os.ReadFile(mcpPath)
+	if string(after1) == mcpOriginal {
+		t.Fatalf("1차 install이 기입하지 않았다 — 기입 갈래를 타지 않는다:\n%s", after1)
+	}
+	if strings.Contains(out.String(), noChange) {
+		t.Errorf("바이트를 바꾼 실행이 무변경을 보고했다:\n%s", out.String())
+	}
+	assertNoMCPBackup(t, mcpPath, "1차 install")
 	out.Reset()
 	if err := runHookInstall(nil, t.TempDir(), "", false, proj, "0.18.0", &out); err != nil {
 		t.Fatalf("2차 install: %v", err)
@@ -1562,98 +1569,17 @@ func TestMCPBackupSingleSlot(t *testing.T) {
 	if !bytes.Equal(after1, after2) {
 		t.Fatalf("2차 install이 파일을 바꿨다 — 멱등 전제가 무너졌다")
 	}
-	bak2, _ := os.ReadFile(mcpPath + ".bak")
-	if string(bak2) != mcpOriginal {
-		t.Errorf("2차 무변경 install이 백업 슬롯을 소모했다 — 원본을 잃는다:\n%s", bak2)
+	if !strings.Contains(out.String(), noChange) {
+		t.Errorf("2차 install이 무변경 갈래를 타지 않았다 — 같은 바이트를 다시 쓰고 있다:\n%s", out.String())
 	}
+	assertNoMCPBackup(t, mcpPath, "2차 install")
 }
 
-// TestMCPBackupDoctorFix — 기입 자리 둘째(cli.go). --fix도 같은 슬롯을 지나야 한다.
-// 여기가 빠지면 "우리 판정이 틀렸을 때의 복구 수단"이 --fix 경로에서만 없다.
-func TestMCPBackupDoctorFix(t *testing.T) {
-	isolateCodexHome(t) // config.toml 갈래가 호스트를 보지 않게 격리한다
-	proj := t.TempDir()
-	mcpPath := mcpConfigPath(proj)
-	// --fix는 등록을 만들지 않는다 — 우리 소유 표식이 있는 옛 버전 등록물이 있어야 기입한다.
-	original := "{\n  \"mcpServers\": {\n    \"" + ctrMCPServerName + "\": {\"command\": \"" +
-		hookBinaryName + "\", \"__ctrManaged\": \"" + hookMarker("0.17.0") + "\"}\n  }\n}\n"
-	if err := os.WriteFile(mcpPath, []byte(original), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := doctorOut(t, proj, true); err != nil {
-		t.Fatalf("doctor --fix: %v", err)
-	}
-	bak, err := os.ReadFile(mcpPath + ".bak")
-	if err != nil {
-		t.Fatalf("--fix가 백업을 남기지 않았다: %v", err)
-	}
-	if string(bak) != original {
-		t.Errorf("백업이 원본이 아니다:\n%s", bak)
-	}
-	after, _ := os.ReadFile(mcpPath)
-	if string(after) == original {
-		t.Errorf("--fix가 기입하지 않았다 — 이 픽스처가 기입 갈래를 타지 않는다:\n%s", after)
-	}
-}
-
-// TestMCPBackupFailureBlocksWrite — 백업이 실패하면 **기입하지 않는다**(config.toml 갈래와 같은
-// 순서). .bak 자리에 디렉터리를 놓아 atomicWriteFile을 실패시킨다 — 파일 권한은 Windows에서
-// 신뢰할 수 없지만 "같은 이름의 디렉터리"는 어느 OS에서도 쓰기가 실패한다.
-func TestMCPBackupFailureBlocksWrite(t *testing.T) {
-	proj := t.TempDir()
-	mcpPath := mcpConfigPath(proj)
-	if err := os.WriteFile(mcpPath, []byte(mcpOriginal), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Mkdir(mcpPath+".bak", 0o700); err != nil {
-		t.Fatal(err)
-	}
-	var out bytes.Buffer
-	if err := runHookInstall(nil, t.TempDir(), "", false, proj, "0.18.0", &out); err != nil {
-		t.Fatalf("install: %v", err) // 백업 실패는 훅 설치를 중단시키지 않는다
-	}
-	after, _ := os.ReadFile(mcpPath)
-	if string(after) != mcpOriginal {
-		t.Errorf("백업이 실패했는데 기입했다:\n%s", after)
-	}
-	if !strings.Contains(out.String(), "백업") {
-		t.Errorf("백업 실패 사유를 내지 않았다:\n%s", out.String())
-	}
-}
-
-// TestMCPUninstallDoesNotBackup — 스펙 §0 D95: uninstall 자리는 백업 대상이 **아니다**
-// (제거는 되돌릴 대상이 아니라 되돌림 자체다). 대칭으로 오해해 여기에도 백업을 걸면 install이
-// 남긴 원본 슬롯을 제거가 덮어 원본을 잃는다 — 만들지도, 덮지도 않는다는 것을 양쪽으로 잰다.
-func TestMCPUninstallDoesNotBackup(t *testing.T) {
-	proj := t.TempDir()
-	mcpPath := mcpConfigPath(proj)
-	if err := os.WriteFile(mcpPath, []byte(mcpOriginal), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	var out bytes.Buffer
-	if err := runHookInstall(nil, t.TempDir(), "", false, proj, "0.18.0", &out); err != nil {
-		t.Fatalf("install: %v", err)
-	}
-	bakBefore, err := os.ReadFile(mcpPath + ".bak")
-	if err != nil {
-		t.Fatalf("install이 백업을 남기지 않았다: %v", err)
-	}
-	out.Reset()
-	// runHookUninstall(args []string, projectRoot string, stdout io.Writer) error — 3인자다
-	// (hook_install.go). args는 그 함수가 직접 파싱하므로 nil이 기본 스코프다.
-	if err := runHookUninstall(nil, proj, &out); err != nil {
-		t.Fatalf("uninstall: %v", err)
-	}
-	after, _ := os.ReadFile(mcpPath)
-	if bytes.Contains(after, []byte(ctrMCPServerName)) {
-		t.Fatalf("uninstall이 우리 항목을 지우지 않았다 — 기입 갈래를 타지 않는다:\n%s", after)
-	}
-	bakAfter, err := os.ReadFile(mcpPath + ".bak")
-	if err != nil {
-		t.Fatalf("uninstall이 기존 .bak을 지웠다: %v", err)
-	}
-	if !bytes.Equal(bakAfter, bakBefore) {
-		t.Errorf("uninstall이 백업 슬롯을 덮었다 — 원본을 잃는다:\n%s", bakAfter)
+// assertNoMCPBackup — .mcp.json 옆에 백업 슬롯이 없는가. 부재가 계약이므로 존재 검사로 잰다.
+func assertNoMCPBackup(t *testing.T, mcpPath, where string) {
+	t.Helper()
+	if _, err := os.Stat(mcpPath + ".bak"); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("%s가 .mcp.json 옆에 백업을 남겼다 — 버전 관리 아래라 자격증명이 딸려 올라간다(stat err=%v)", where, err)
 	}
 }
 
@@ -1664,7 +1590,7 @@ const mcpEmptyProfileOriginal = "{\n  \"mcpServers\": {\n    \"" + ctrMCPServerN
 	hookBinaryName + "/0.17.0\"}\n  }\n}\n"
 
 // TestMCPEmptyProfileHintSurvivesNoChangeRun — **정상 상태에서도 안내가 나와야 한다.**
-// D95가 세운 바이트 비교의 무변경 갈래는 등록을 확정하면서도 빈 프로필 안내를 내지 않았다:
+// install 자리에 선 바이트 비교의 무변경 갈래는 등록을 확정하면서도 빈 프로필 안내를 내지 않았다:
 // 1회차만 바이트를 바꾸고 2회차부터는 영원히 무변경이므로, 정상 상태의 사용자는
 // ctr_index·ctr_fetch_and_index가 왜 꺼져 있는지 **다시는** 듣지 못한다. 이 릴리스 전에는
 // 기입이 무조건이라 매 실행 나왔다 — 조용한 후퇴다.
@@ -1696,75 +1622,16 @@ func TestMCPEmptyProfileHintSurvivesNoChangeRun(t *testing.T) {
 	}
 }
 
-// TestMCPBackupSlotIsNamedToUser — **복구 수단은 이름을 알아야 쓸 수 있다.** D95가 세운
-// .mcp.json.bak을 어느 문면도 대지 않아 형제인 config.toml 갈래(".bak" 이름을 댄다)와
-// 어긋났고, 단일 슬롯이라 다음 변경이 덮으므로 뒤늦게 찾을 수도 없다.
-// **.gitignore 절도 함께 잰다**: .mcp.json은 프로젝트 루트에 있어 ~/.codex/config.toml과 달리
-// 백업이 버전 관리에 딸려 들어가고, `git add -A` 한 번이 그 파일의 env 값을 공유 저장소에
-// 커밋한다. 자리를 옮기는 것은 D95의 형제 슬롯 계약을 바꾸는 설계 변경이라 이 릴리스가 하지
-// 않는다(스펙 §4 이월) — 그래서 알리는 것이 이 릴리스의 답이다.
-// **찾는 문자열을 서브테스트 이름에 넣지 마라**: t.TempDir()이 테스트 이름을 경로에 넣고
-// doctor는 [2]·[11]에 경로를 인쇄하므로, 이름이 ".mcp.json.bak"이면 Contains가 문면과 무관하게
-// 참이 된다(실측: 그 형태로 쓴 첫 판이 HEAD에서 초록이었다).
-func TestMCPBackupSlotIsNamedToUser(t *testing.T) {
-	wants := []string{".mcp.json.bak", ".gitignore"}
-	check := func(t *testing.T, where, out string) {
-		t.Helper()
-		for _, want := range wants {
-			if !strings.Contains(out, want) {
-				t.Errorf("%s 문면이 %q를 대지 않는다:\n%s", where, want, out)
-			}
-		}
+// TestMCPInstallFreshTakesNoBackup — 첫 설치(파일 부재)도 백업 슬롯을 만들지 않는다.
+// 위 테스트는 픽스처를 미리 깔아 두므로 이 자리를 구조적으로 못 본다.
+func TestMCPInstallFreshTakesNoBackup(t *testing.T) {
+	proj := t.TempDir() // .mcp.json 없음
+	var out bytes.Buffer
+	if err := runHookInstall(nil, t.TempDir(), "", false, proj, "0.18.0", &out); err != nil {
+		t.Fatalf("install: %v", err)
 	}
-	t.Run("install", func(t *testing.T) {
-		proj := t.TempDir()
-		if err := os.WriteFile(mcpConfigPath(proj), []byte(mcpOriginal), 0o600); err != nil {
-			t.Fatal(err)
-		}
-		var out bytes.Buffer
-		if err := runHookInstall(nil, t.TempDir(), "", false, proj, "0.18.0", &out); err != nil {
-			t.Fatalf("install: %v", err)
-		}
-		check(t, "기입 갈래", out.String())
-	})
-	// **첫 설치는 백업 절을 내면 안 된다.** backupConfigFile은 되돌릴 내용이 없는 새 파일
-	// (existing 없음)에서 아무것도 쓰지 않고 nil을 돌려주는데, 기입 갈래는 "디스크와 다르면"
-	// 타므로 `.mcp.json`이 아예 없던 실행도 그 갈래에 온다 — 그러면 문면이 **없는 파일**을
-	// 가리킨다. 위 두 갈래는 픽스처를 미리 깔아 두므로 이 자리를 구조적으로 못 본다.
-	// `.gitignore` 권고도 같은 절에 붙는다: `.bak`을 실제로 만든 실행에서만 말한다.
-	t.Run("install-fresh", func(t *testing.T) {
-		proj := t.TempDir() // .mcp.json 없음
-		var out bytes.Buffer
-		if err := runHookInstall(nil, t.TempDir(), "", false, proj, "0.18.0", &out); err != nil {
-			t.Fatalf("install: %v", err)
-		}
-		if _, err := os.Stat(mcpConfigPath(proj)); err != nil {
-			t.Fatalf("첫 설치가 .mcp.json을 만들지 않았다 — 기입 갈래를 타지 않는다: %v", err)
-		}
-		if _, err := os.Stat(mcpConfigPath(proj) + ".bak"); !errors.Is(err, os.ErrNotExist) {
-			t.Fatalf("되돌릴 내용이 없는데 백업 슬롯이 생겼다(stat err=%v)", err)
-		}
-		for _, s := range wants {
-			if strings.Contains(out.String(), s) {
-				t.Errorf("첫 설치 문면이 실재하지 않는 파일을 가리킨다 — %q:\n%s", s, out.String())
-			}
-		}
-	})
-	t.Run("fix", func(t *testing.T) {
-		isolateCodexHome(t)
-		proj := t.TempDir()
-		original := "{\n  \"mcpServers\": {\n    \"" + ctrMCPServerName + "\": {\"command\": \"" +
-			hookBinaryName + "\", \"__ctrManaged\": \"" + hookMarker("0.17.0") + "\"}\n  }\n}\n"
-		if err := os.WriteFile(mcpConfigPath(proj), []byte(original), 0o600); err != nil {
-			t.Fatal(err)
-		}
-		out, err := doctorOut(t, proj, true)
-		if err != nil {
-			t.Fatalf("doctor --fix: %v", err)
-		}
-		if !strings.Contains(out, "[20] fix: .mcp.json 표식을") {
-			t.Fatalf("--fix가 기입 갈래를 타지 않았다 — 문면을 재는 테스트가 아니게 된다:\n%s", out)
-		}
-		check(t, "--fix 기입", out)
-	})
+	if _, err := os.Stat(mcpConfigPath(proj)); err != nil {
+		t.Fatalf("첫 설치가 .mcp.json을 만들지 않았다 — 기입 갈래를 타지 않는다: %v", err)
+	}
+	assertNoMCPBackup(t, mcpConfigPath(proj), "첫 설치")
 }

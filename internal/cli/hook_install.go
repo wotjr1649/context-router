@@ -624,47 +624,26 @@ func runHookInstall(args []string, storeRoot, storeRootRaw string, storeRootExpl
 			// 파일이 해석되지 않거나. 어느 쪽이든 사용자가 손댈 대상을 알려야 조치할 수 있다.
 			fmt.Fprintf(stdout, "mcp: .mcp.json 병합을 멈췄습니다(훅 설치는 완료) — %q 이름에 우리가 소유하지 않은 항목이 있거나 파일을 해석할 수 없습니다. 그 항목을 정리하거나 파일을 고친 뒤 다시 실행하세요\n", ctrMCPServerName)
 		} else if bytes.Equal(existing, mcpMerged) {
-			// 무변경 — 기입도 백업도 하지 않는다. 단일 슬롯이 "2회차 무변경" 전제 위에 선다(D84).
-			// 이 자리에는 바이트 비교가 없었다(mergeMCPServers의 changed는 install에서 참으로
-			// 고정된다) — 비교 없이 백업만 걸면 2회차 install이 .bak을 설치 후 내용으로 덮어
-			// 원본을 잃는다. 그래서 비교가 백업의 선행 조건이다(D95).
-			// **문면은 성공 갈래와 백업 절 하나만 다르다.** 이 실행은 백업을 남기지 않았으므로
-			// .bak을 대면 사용자가 그 파일을 이번 실행의 원본으로 오인한다 — 하지 않은 일을
-			// 말하지 않는 절제이지, 등록 상태에 딸린 안내까지 빼는 근거가 아니다(아래 빈 프로필
-			// 안내가 두 갈래를 함께 지난다).
+			// 무변경 — 기입하지 않는다. 이 자리에는 바이트 비교가 **없었다**: install은
+			// mergeMCPServers의 changed를 버리고 실행마다 무조건 되썼다(그 함수는 install에서
+			// changed를 참으로 고정하므로 그 플래그로는 판정할 수 없다). 그래서 2회차 install이
+			// 내용이 같은 파일의 mtime을 흔들었고, VCS로 추적하는 사용자에게는 그것이 변경으로
+			// 보였다. 이 비교가 2회차를 진짜 무동작으로 만든다.
+			// **백업은 어느 갈래에서도 하지 않는다** — backupConfigFile은 config.toml 전용이다
+			// (그 이유는 그 함수의 주석과 설계서 §4에 있다).
 			mcpRegistered = true
-			fmt.Fprintf(stdout, "mcp: .mcp.json 병합 완료(서버 %s) — 무변경이라 백업하지 않았습니다\n", ctrMCPServerName)
-		} else if bErr := backupConfigFile(mcpPath, existing); bErr != nil {
-			// 백업 실패는 기입을 막는다 — config.toml 갈래와 같은 순서다(D95). 복구 수단 없이
-			// 사용자 파일을 덮지 않는다.
-			fmt.Fprintln(stdout, "mcp: .mcp.json 백업 실패 — 기입하지 않았습니다")
+			fmt.Fprintf(stdout, "mcp: .mcp.json 병합 완료(서버 %s) — 무변경이라 기입하지 않았습니다\n", ctrMCPServerName)
 		} else if writeErr := atomicWriteFile(mcpPath, mcpMerged); writeErr != nil {
 			fmt.Fprintln(stdout, "mcp: .mcp.json 기록 실패 — 훅 설치는 완료되었습니다")
 		} else {
-			// 백업 슬롯을 **이름으로** 댄다 — 형제인 config.toml 갈래가 이미 그렇게 하고,
-			// 이름을 모르는 복구 수단은 복구 수단이 아니다. 단일 슬롯이라 다음 변경이 덮는다는
-			// 것도 함께 말한다(D95). .gitignore 절은 자리 때문이다: .mcp.json은 프로젝트 루트에
-			// 있어 ~/.codex/config.toml과 달리 .bak이 버전 관리에 딸려 들어가고, `git add -A`
-			// 한 번이 그 파일의 env 값을 공유 저장소에 올린다. 자리를 옮기는 것은 D95의 형제
-			// 슬롯 계약을 바꾸는 설계 변경이라 이 릴리스가 하지 않는다.
-			//
-			// **되돌릴 내용이 있었을 때만 그 절을 낸다.** 이 갈래의 조건은 "디스크와 다르다"라
-			// `.mcp.json`이 **아예 없던 첫 설치**도 여기 온다. backupConfigFile은 그 실행에서
-			// 아무것도 쓰지 않고 nil을 돌려주므로(새 파일에는 되돌릴 내용이 없다) 절을 무조건
-			// 내면 문면이 실재하지 않는 파일을 가리킨다 — 무변경 갈래에서 닫은 것과 같은 부류다.
-			// 조건은 backupConfigFile의 가드와 **같은 술어**다: 그쪽이 바뀌면 여기도 바뀌어야 한다.
-			backupNote := ""
-			if len(existing) > 0 {
-				backupNote = " — 직전 내용은 .mcp.json.bak 한 슬롯에 남습니다(다음 변경이 덮습니다). 프로젝트 루트 파일이라 버전 관리에 딸려 들어가니 .gitignore에 넣어 두세요"
-			}
 			mcpRegistered = true
-			fmt.Fprintf(stdout, "mcp: .mcp.json 병합 완료(서버 %s)%s\n", ctrMCPServerName, backupNote)
+			fmt.Fprintf(stdout, "mcp: .mcp.json 병합 완료(서버 %s)\n", ctrMCPServerName)
 		}
 		// 빈 프로필로 남은 기존 등록물은 보존 규칙이 이겨 기본 프로필을 얻지 못한다(D81) —
 		// 명시 경로를 알려야 사용자가 D81의 동기였던 두 도구를 켤 수 있다(리뷰 P4).
 		// **등록이 확정된 두 갈래 모두**에서 낸다. 기입 갈래에만 두면 1회차에 한 번 나오고
 		// 그 뒤로는 영원히 무변경이라 정상 상태의 사용자가 두 도구가 꺼진 이유를 다시 듣지
-		// 못한다 — D95가 바이트 비교를 세우기 전에는 기입이 무조건이라 매 실행 나왔다.
+		// 못한다 — 위 바이트 비교가 서기 전에는 기입이 무조건이라 매 실행 나왔다.
 		if mcpRegistered && !setProfile && emptyProfileRegistration(existing, ctrMCPServerName) {
 			fmt.Fprintln(stdout, "mcp: 기존 등록물에 프로필이 없어 그대로 유지했습니다 — ctr_index·ctr_fetch_and_index가 필요하면 hook install --enable ingest,net으로 명시하세요(빈 프로필은 기본값으로 넓히지 않습니다)")
 		}
@@ -719,12 +698,16 @@ func runHookInstall(args []string, storeRoot, storeRootRaw string, storeRootExpl
 	return nil
 }
 
-// backupConfigFile — 내용을 바꾸기 직전 단일 슬롯 백업(D84·D95). 설정 파일 옆의 .bak을
-// **매번 덮어쓰며 누적하지 않는다**. config.toml과 .mcp.json이 함께 쓴다(D95). 호출자는 기입
-// 바이트가 기존과 다를 때만 부른다 — 무변경 재실행마다 .bak이 생기면 단일 슬롯 계약이
-// 무의미해진다. 재직렬화는 호스트가 일으키므로 우리 설계가 막을 수 없고, 이 백업은 **우리 쪽
-// 판정이 틀렸을 때의 복구 수단**이다.
+// backupConfigFile — 내용을 바꾸기 직전 단일 슬롯 백업(D84). config.toml.bak을 **매번
+// 덮어쓰며 누적하지 않는다**. 호출자는 기입 바이트가 기존과 다를 때만 부른다 — 무변경
+// 재실행마다 .bak이 생기면 단일 슬롯 계약이 무의미해진다. 재직렬화는 호스트가 일으키므로
+// 우리 설계가 막을 수 없고, 이 백업은 **우리 쪽 판정이 틀렸을 때의 복구 수단**이다.
 // 새로 만드는 파일(existing 없음)에는 되돌릴 내용이 없어 백업하지 않는다.
+//
+// **`.mcp.json`은 이 함수를 부르지 않는다. 대칭으로 보고 붙이지 마라**(D95 미배송, 설계서
+// §4). 그 파일은 프로젝트 루트에 있어 버전 관리 아래이고 서버의 `env` 블록에 자격증명이
+// 실리는 것이 흔하다 — 옆에 `.bak`을 떨구면 대개 규칙이 없는 경로라 `git add -A` 한 번이
+// 그 값을 공유 저장소에 올린다. 슬롯의 **자리**가 먼저 정해져야 한다.
 func backupConfigFile(path string, existing []byte) error {
 	if len(existing) == 0 {
 		return nil
