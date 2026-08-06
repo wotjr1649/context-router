@@ -1727,6 +1727,29 @@ func TestMCPBackupSlotIsNamedToUser(t *testing.T) {
 		}
 		check(t, "기입 갈래", out.String())
 	})
+	// **첫 설치는 백업 절을 내면 안 된다.** backupConfigFile은 되돌릴 내용이 없는 새 파일
+	// (existing 없음)에서 아무것도 쓰지 않고 nil을 돌려주는데, 기입 갈래는 "디스크와 다르면"
+	// 타므로 `.mcp.json`이 아예 없던 실행도 그 갈래에 온다 — 그러면 문면이 **없는 파일**을
+	// 가리킨다. 위 두 갈래는 픽스처를 미리 깔아 두므로 이 자리를 구조적으로 못 본다.
+	// `.gitignore` 권고도 같은 절에 붙는다: `.bak`을 실제로 만든 실행에서만 말한다.
+	t.Run("install-fresh", func(t *testing.T) {
+		proj := t.TempDir() // .mcp.json 없음
+		var out bytes.Buffer
+		if err := runHookInstall(nil, t.TempDir(), "", false, proj, "0.18.0", &out); err != nil {
+			t.Fatalf("install: %v", err)
+		}
+		if _, err := os.Stat(mcpConfigPath(proj)); err != nil {
+			t.Fatalf("첫 설치가 .mcp.json을 만들지 않았다 — 기입 갈래를 타지 않는다: %v", err)
+		}
+		if _, err := os.Stat(mcpConfigPath(proj) + ".bak"); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("되돌릴 내용이 없는데 백업 슬롯이 생겼다(stat err=%v)", err)
+		}
+		for _, s := range wants {
+			if strings.Contains(out.String(), s) {
+				t.Errorf("첫 설치 문면이 실재하지 않는 파일을 가리킨다 — %q:\n%s", s, out.String())
+			}
+		}
+	})
 	t.Run("fix", func(t *testing.T) {
 		isolateCodexHome(t)
 		proj := t.TempDir()

@@ -647,8 +647,18 @@ func runHookInstall(args []string, storeRoot, storeRootRaw string, storeRootExpl
 			// 있어 ~/.codex/config.toml과 달리 .bak이 버전 관리에 딸려 들어가고, `git add -A`
 			// 한 번이 그 파일의 env 값을 공유 저장소에 올린다. 자리를 옮기는 것은 D95의 형제
 			// 슬롯 계약을 바꾸는 설계 변경이라 이 릴리스가 하지 않는다.
+			//
+			// **되돌릴 내용이 있었을 때만 그 절을 낸다.** 이 갈래의 조건은 "디스크와 다르다"라
+			// `.mcp.json`이 **아예 없던 첫 설치**도 여기 온다. backupConfigFile은 그 실행에서
+			// 아무것도 쓰지 않고 nil을 돌려주므로(새 파일에는 되돌릴 내용이 없다) 절을 무조건
+			// 내면 문면이 실재하지 않는 파일을 가리킨다 — 무변경 갈래에서 닫은 것과 같은 부류다.
+			// 조건은 backupConfigFile의 가드와 **같은 술어**다: 그쪽이 바뀌면 여기도 바뀌어야 한다.
+			backupNote := ""
+			if len(existing) > 0 {
+				backupNote = " — 직전 내용은 .mcp.json.bak 한 슬롯에 남습니다(다음 변경이 덮습니다). 프로젝트 루트 파일이라 버전 관리에 딸려 들어가니 .gitignore에 넣어 두세요"
+			}
 			mcpRegistered = true
-			fmt.Fprintf(stdout, "mcp: .mcp.json 병합 완료(서버 %s) — 직전 내용은 .mcp.json.bak 한 슬롯에 남습니다(다음 변경이 덮습니다). 프로젝트 루트 파일이라 버전 관리에 딸려 들어가니 .gitignore에 넣어 두세요\n", ctrMCPServerName)
+			fmt.Fprintf(stdout, "mcp: .mcp.json 병합 완료(서버 %s)%s\n", ctrMCPServerName, backupNote)
 		}
 		// 빈 프로필로 남은 기존 등록물은 보존 규칙이 이겨 기본 프로필을 얻지 못한다(D81) —
 		// 명시 경로를 알려야 사용자가 D81의 동기였던 두 도구를 켤 수 있다(리뷰 P4).
