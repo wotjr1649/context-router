@@ -72,7 +72,12 @@ func NewServer(cfg Config) (*mcp.Server, error) {
 	// 경로 허용(ingest root)·상대화(search/fetch relativize) 기준 = WorktreeRoot — linked git
 	// worktree에서 ProjectRoot(주 checkout)를 쓰면 현재 worktree 파일이 WORKSPACE_VIOLATION이
 	// 된다(저장소 디렉터리 명명 ProjectID는 ProjectRoot 기반 그대로, main.go 참조).
-	registerSearch(srv, cfg.Store, cfg.Canon.WorktreeRoot, cfg.Session)
+	// 지연 도구 색인(D99)은 **아래 게이트들이 실제로 등록한 것만** 담아야 하므로, 진입 도구
+	// 둘(ctr_search·ctr_index)의 등록을 이 함수 맨 끝으로 미룬다. 게이트를 위로 끌어올리는
+	// 반대 방향은 두지 않는다 — ProbeIsolation·sandbox.Probe는 fail-closed 관문이고 그 자리는
+	// 설명 문자열 하나 때문에 움직일 것이 아니다. tools/list는 이름순 정렬이라 등록 순서가
+	// 클라이언트가 보는 순서를 바꾸지 않는다(SDK featureSet).
+	deferred := []string{idxFetch} // ctr_fetch만 무조건 등록된다
 	registerFetch(srv, cfg.Store, cfg.Canon.WorktreeRoot)
 	// ProbeIsolation: OS 메모리 격리가 안 되는 환경에서는 ctr_transform 자체를 미등록한다
 	// (in-process fallback 금지, 설계 §4.3/§5.3) — 첫 실제 호출에서야 실패를 알리지 않는다.
@@ -80,12 +85,11 @@ func NewServer(cfg Config) (*mcp.Server, error) {
 		slog.Warn("mcp: transform 격리 프로브 실패 — ctr_transform 비활성화", "error", err)
 	} else {
 		registerTransform(srv, cfg.Store, cfg.SelfExe, cfg.TransformTimeout)
-	}
-	if slices.Contains(cfg.Enable, "ingest") {
-		registerIndex(srv, cfg.Store, cfg.Canon.WorktreeRoot, cfg.AllowPaths)
+		deferred = append(deferred, idxTransform)
 	}
 	if slices.Contains(cfg.Enable, "net") {
 		registerFetchAndIndex(srv, cfg.Store, cfg.NetAllowLocal, cfg.NetPorts)
+		deferred = append(deferred, idxFetchAndIndex)
 	}
 	// exec: 삼중 게이트 중 서버측 2개 — Enable "exec"(프로필) + sandbox.Probe(OS 격리 가능
 	// 여부, transform ProbeIsolation 선례와 동형). 프로브 실패 시 slog.Warn + 미등록(첫 실제
@@ -101,6 +105,12 @@ func NewServer(cfg Config) (*mcp.Server, error) {
 		registerRecordEvent(srv, cfg.Store, cfg.Session)
 		registerSessionSummary(srv, cfg.Store, cfg.Session)
 		registerExportEvents(srv, cfg.Store, cfg.Session)
+		deferred = append(deferred, idxRecordEvent, idxSessionSummary, idxExportEvents)
+	}
+	index := deferredToolIndex(deferred)
+	registerSearch(srv, cfg.Store, cfg.Canon.WorktreeRoot, cfg.Session, index)
+	if slices.Contains(cfg.Enable, "ingest") {
+		registerIndex(srv, cfg.Store, cfg.Canon.WorktreeRoot, cfg.AllowPaths, index)
 	}
 	return srv, nil
 }
@@ -325,25 +335,37 @@ func buildSearchOutput(queries []string, qrs []search.QueryResult, evs [][]event
 	return out
 }
 
-// deferredToolIndex: D99 — 지연 로드 여섯 도구(이름 + 한 줄 용도만, 호출 방법·인자·예시는 적지
-// 않는다 — D99 계약 2. 그건 각 도구 자신의 지연 스키마가 이미 담고 있다)를 진입 도구 둘
-// (ctr_search·ctr_index)의 Description 꼬리에 붙인다. 패키지 상수 하나를 두 도구가 함께
-// 참조한다 — 문면이 두 벌로 갈라지면 하나만 갱신되는 사고를 이 저장소의 D13 반파편화가 막는 형태다.
-const deferredToolIndex = "그 밖의 도구(필요 시 지연 로드): " +
-	"ctr_fetch(artifact 저장본을 선택자로 정확히 회수), " +
-	"ctr_transform(artifact 텍스트를 starlark 스크립트로 변환), " +
-	"ctr_record_event(세션 이벤트 1건 기록), " +
-	"ctr_session_summary(세션 이벤트를 타입별로 그룹핑해 요약), " +
-	"ctr_export_events(세션 이벤트를 페이지네이션으로 내보냄), " +
-	"ctr_fetch_and_index(URL을 가져와 색인에 등록)."
+// 지연 로드 도구의 색인 항목(이름 + 한 줄 용도만, 호출 방법·인자·예시는 적지 않는다 — D99
+// 계약 2. 그건 각 도구 자신의 지연 스키마가 이미 담고 있다). NewServer가 **실제로 등록한 것만**
+// 모아 진입 도구 둘(ctr_search·ctr_index)의 Description 꼬리에 붙인다 — 여섯 중 다섯은 조건부
+// 등록이라(ctr_fetch만 무조건) 고정 문면을 붙이면 `CTR_ENABLE=ingest`로 켠 서버가 없는
+// ctr_fetch_and_index를 이름으로 광고한다(최종 리뷰 S4에서 stdio로 실측). 항목 문자열은 각
+// 등록 갈래 옆에 한 벌씩만 두고 두 진입 도구가 같은 결과를 받는다(D13 반파편화).
+const (
+	idxFetch          = "ctr_fetch(artifact 저장본을 선택자로 정확히 회수)"
+	idxTransform      = "ctr_transform(artifact 텍스트를 starlark 스크립트로 변환)"
+	idxFetchAndIndex  = "ctr_fetch_and_index(URL을 가져와 색인에 등록)"
+	idxRecordEvent    = "ctr_record_event(세션 이벤트 1건 기록)"
+	idxSessionSummary = "ctr_session_summary(세션 이벤트를 타입별로 그룹핑해 요약)"
+	idxExportEvents   = "ctr_export_events(세션 이벤트를 페이지네이션으로 내보냄)"
+)
 
-func registerSearch(srv *mcp.Server, st *store.Store, worktreeRoot string, sess *session.DB) {
+// deferredToolIndex: 등록된 지연 도구 항목들을 진입 도구 Description 꼬리 한 문장으로 만든다.
+// 항목이 하나도 없으면 빈 문자열 — 꼬리 자체가 붙지 않는다.
+func deferredToolIndex(entries []string) string {
+	if len(entries) == 0 {
+		return ""
+	}
+	return "그 밖의 도구(필요 시 지연 로드): " + strings.Join(entries, ", ") + "."
+}
+
+func registerSearch(srv *mcp.Server, st *store.Store, worktreeRoot string, sess *session.DB, index string) {
 	mcp.AddTool(srv, &mcp.Tool{
 		Name: "ctr_search",
 		Description: "프로젝트 색인을 BM25+RRF로 검색해 스니펫을 반환한다 — 저장한 원문·대형 출력을 " +
 			"다시 읽기 전에 먼저 여기서 검색한다(질의로 필요한 조각만 회수). scope로 content(기본)/" +
 			"events/all을 선택한다 — events/all은 세션 이벤트도 함께 검색한다(세션 저장소 불용 시 STORAGE_UNAVAILABLE). " +
-			deferredToolIndex,
+			index,
 		// anthropic/alwaysLoad: Claude 한정 최적화(D99) — "anthropic/alwaysLoad"는 Anthropic
 		// 벤더 확장이고 [문서], [실측] Codex는 미지 매니페스트 필드를 조용히 버린다. Codex 쪽
 		// 등가 기제는 재지 않았다(§5-4). 진입 도구 둘(ctr_search·ctr_index)에만 달아 상시
@@ -679,11 +701,11 @@ func validateIndexInput(in IndexInput) error {
 	return nil
 }
 
-func registerIndex(srv *mcp.Server, st *store.Store, worktreeRoot string, allowPaths []string) {
+func registerIndex(srv *mcp.Server, st *store.Store, worktreeRoot string, allowPaths []string, index string) {
 	destructive := false
 	mcp.AddTool(srv, &mcp.Tool{
 		Name:        "ctr_index",
-		Description: "파일·디렉터리·인라인 텍스트를 색인에 등록한다. " + deferredToolIndex,
+		Description: "파일·디렉터리·인라인 텍스트를 색인에 등록한다. " + index,
 		// anthropic/alwaysLoad: registerSearch와 동일 근거(Claude 한정 최적화, D99·§5-4) —
 		// 설명 반복 생략.
 		Meta:        mcp.Meta{"anthropic/alwaysLoad": true},

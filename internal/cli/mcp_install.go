@@ -14,14 +14,18 @@ import (
 	"strings"
 )
 
-// ctrMCPServerName — .mcp.json에 등록하는 서버 이름. 설계 D63 ②가 단일 서버 등록을
-// 표준으로 고정했다. 이름이 바뀌면 permission 규칙 접두와 doctor 안내 문면이 함께
-// 움직이므로 이 상수 한 곳에서만 정한다.
+// ctrMCPServerName — **옛 설치기가 쓰던 서버 이름**. v0.19에는 이 이름으로 등록하는 코드가
+// 없다(D96 계약 1) — 남은 용도는 doctor [20]의 읽기 전용 감지기가 잔존물에서 찾을 이름
+// 하나다. 현재 살아 있는 서버 이름은 플러그인 매니페스트(`plugin/mcp.json`)의 `ctr`이고,
+// 도구 접두는 그 매니페스트에서 파생된 ctrToolPrefix가 든다(D98).
 const ctrMCPServerName = "ctr-exec"
 
-// supersededMCPServerNames — 단일 서버 등록(D63 ②)이 대체하는 과거 등록 이름. ctr의 6도구는
-// ctr-exec의 8도구에 완전히 포함되므로 둘을 함께 두면 6도구가 중복 노출된다. ctr-global은 다른
-// 프로필(global-search)이라 대체 대상이 아니었다 — 옛 설치기가 만들지도, 지우지도 않았다.
+// supersededMCPServerNames — doctor [20]이 함께 찾는 **더 옛 이름**. D63 ②의 단일 서버 등록이
+// 이 이름을 대체한 뒤로 옛 설치기는 이 이름을 만들지 않았다. 이름 `ctr` 자체는 플러그인
+// 매니페스트에서 다시 살아 있지만, 여기서 찾는 대상은 그 플러그인 서버가 아니라 옛 기입
+// 경로가 `.mcp.json`·`enabledMcpjsonServers`에 남긴 항목이다 — 플러그인 서버는 호스트가
+// 자기 상태에 들고 있어 이 파일들에 나타나지 않는다. ctr-global은 다른 프로필
+// (global-search)이라 대체 대상이 아니었다 — 옛 설치기가 만들지도, 지우지도 않았다.
 var supersededMCPServerNames = []string{"ctr"}
 
 // isOurMarkerValue — 소유 표식 값의 기준(D82·D84). **정확 일치 `context-router`**(무버전 —
@@ -38,6 +42,26 @@ func mcpConfigPath(projectRoot string) string {
 	return filepath.Join(projectRoot, ".mcp.json")
 }
 
+// mcpServersDoc — MCP 등록 파일에서 우리가 읽는 형태. 최상위 `mcpServers` 객체 하나이고
+// 프로젝트 `.mcp.json`과 사용자 스코프 `~/.claude.json` 최상위가 같은 모양이다(설계 v0.12의
+// 스코프 표). mcpManagedMarker와 mcpJSONParses가 **같은 타입**을 봐야 doctor [20]의 "파싱
+// 실패"와 "항목 없음"이 실제로 갈린다 — 형태가 두 벌로 갈라지면 한쪽만 받아들이는 파일에서
+// 두 판정이 서로 모순된다.
+type mcpServersDoc struct {
+	Servers map[string]struct {
+		Managed string `json:"__ctrManaged"`
+		Command string `json:"command"`
+	} `json:"mcpServers"`
+}
+
+// mcpJSONParses — 등록 파일이 mcpServersDoc 형태로 파스되는가. doctor [20]이 파싱 실패를
+// 조용히 "잔존물 없음"으로 읽지 않게 하는 판정원이다([16]의 codexTOMLParses와 같은 자리,
+// 최종 리뷰 S5) — 쉼표 하나가 남은 파일은 파싱만 실패하고 등록물은 그대로 살아 있다.
+func mcpJSONParses(data []byte) bool {
+	var doc mcpServersDoc
+	return json.Unmarshal(data, &doc) == nil
+}
+
 // mcpManagedMarker — .mcp.json에서 name 서버 항목의 __ctrManaged와 command를 읽는다(감지원).
 // 파싱 실패·그 이름의 항목 부재는 found=false다 — 파일 존재 여부는 호출자가 따로 본다.
 // command까지 돌려주는 이유: 표식이 없어도 command가 우리 것이면 우리가 남긴 등록물이므로
@@ -46,12 +70,7 @@ func mcpConfigPath(projectRoot string) string {
 // 옛 이름("ctr")도 같은 파일에서 확인해야 하고, 그 확인을 doctor 쪽에서 JSON 구조를 다시
 // 파싱해 중복 구현하지 않는다.
 func mcpManagedMarker(data []byte, name string) (marker, command string, found bool) {
-	var doc struct {
-		Servers map[string]struct {
-			Managed string `json:"__ctrManaged"`
-			Command string `json:"command"`
-		} `json:"mcpServers"`
-	}
+	var doc mcpServersDoc
 	if json.Unmarshal(data, &doc) != nil {
 		return "", "", false
 	}

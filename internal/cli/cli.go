@@ -1445,14 +1445,28 @@ const hostInstallSteps = `## 설치 절차 (D96·D97 — 등록은 호스트가 
 3. 확인 — 호스트마다 mcp list의 표시 형태가 다르다 [실측]:
    Claude Code: plugin:context-router:ctr … Connected 항목이 나열되는가.
    Codex: ctr … enabled 항목이 나열되는가.
+   [실측] claude plugin details는 이 확인에 쓸 수 없다 — 경로 문자열로 선언한 서버를
+   해석하지 않아 런타임이 붙어 있는데도 MCP servers (0)을 낸다.
+4. Codex에서 훅 신뢰를 준다 — Codex의 훅은 지속되는 신뢰를 요구한다
+   [문서: codex --help의 --dangerously-bypass-hook-trust]. 신뢰를 주지 않은 홈에서 돌린
+   프로브는 SessionStart를 포함해 훅이 하나도 발화하지 않았다 [실측]. 이 걸음을 건너뛰면
+   수동 포착(대형 도구 출력을 컨텍스트 밖으로 옮기는 그 동작)이 조용히 빠진다.
+   Claude Code는 플러그인 설치만으로 훅 여섯이 실린다 [실측].
 `
+
+// ctrToolPrefix — 플러그인이 등록한 서버의 도구 이름 접두(D98). 조각 둘이 매니페스트에서 온다:
+// 플러그인 이름(`.claude-plugin/plugin.json`의 `name`)과 MCP 서버 키(`plugin/mcp.json`의
+// `mcpServers` 유일 키). 호스트가 조합하는 형태는 `mcp__plugin_<플러그인>_<서버>__`다. 어느 쪽
+// 이름을 바꿔도 이 값이 함께 움직여야 doctor가 아무것도 매치하지 않는 접두를 안내하지 않는다 —
+// TestToolPrefixMatchesPluginManifests가 그 두 파일을 읽어 이 값을 유도한다(최종 리뷰 S6:
+// 이전 단정은 이 리터럴을 자기 자신으로 재고 있었다).
+const ctrToolPrefix = "mcp__plugin_context-router_ctr__"
 
 // hostSnippet: doctor 마지막에 출력하는 등록 안내(설계 §9, D96·D97·D98·D99·D101) — 등록은
 // 플러그인 설치 절차이고(hostInstallSteps), 프로필을 아무것도 지정하지 않았을 때의 기본값은
 // 서버 자신이 갖는다(D101 계약 2, v0.19 리뷰 C1 — plugin/mcp.json이 프로필을 고정하면
-// CTR_ENABLE이 모든 플러그인 설치에서 죽은 경로가 된다). 도구 접두는
-// mcp__plugin_context-router_ctr__다(D98) — alwaysLoad는 서버 단위 플래그가 폐기돼(D99)
-// 안내하지 않는다.
+// CTR_ENABLE이 모든 플러그인 설치에서 죽은 경로가 된다). 도구 접두는 ctrToolPrefix가 든다 —
+// alwaysLoad는 서버 단위 플래그가 폐기돼(D99) 안내하지 않는다.
 const hostSnippet = `--- host adapter snippets (설계 §9) ---
 
 ` + hostInstallSteps + `
@@ -1464,13 +1478,13 @@ const hostSnippet = `--- host adapter snippets (설계 §9) ---
 
 ## 도구 접두
 
-새 접두는 mcp__plugin_context-router_ctr__다. 손으로 넣어 둔 권한 규칙이 있으면 이 접두로
+새 접두는 ` + ctrToolPrefix + `다. 손으로 넣어 둔 권한 규칙이 있으면 이 접두로
 맞춰야 다시 매치한다.
 
 permissions (.claude/settings.json 예시 — ingest/net 도구에 ask를 건다):
 {
   "permissions": {
-    "ask": ["mcp__plugin_context-router_ctr__ctr_index", "mcp__plugin_context-router_ctr__ctr_fetch_and_index"]
+    "ask": ["` + ctrToolPrefix + `ctr_index", "` + ctrToolPrefix + `ctr_fetch_and_index"]
   }
 }
 # 이 두 도구 규칙은 그 프로필이 켜진 등록에서만 대상이 있다 — ctr_index는 ingest, ctr_fetch_and_index는
@@ -1697,9 +1711,9 @@ func runDoctor(ctx context.Context, w io.Writer, storeRoot, projectRoot, version
 	// hookSettingsPath 이음새로 도출한다(사용자 홈 = os.UserHomeDir).
 	//
 	// 이 줄이 세는 것은 **`.claude/settings.json`에 있는 우리 훅 그룹**이다. v0.19부터 훅 정의는
-	// 플러그인 매니페스트가 나르므로(D96) 여기 잡히는 그룹은 옛 설치기가 남긴 것이고, 그 그룹은
-	// 지워질 때까지 계속 발화한다 — 개수가 0이 아닌 것 자체는 정상 상태다. 버전 있는 마커는 D82
-	// 이전 설치본이라 다음 걸음을 함께 낸다(무버전 마커는 아래 marker=="" 갈래).
+	// 플러그인 매니페스트가 나르므로(D96) 여기 잡히는 그룹은 전부 옛 설치기가 남긴 것이고, 그
+	// 그룹은 지워질 때까지 계속 발화한다 — 플러그인 훅과 겹쳐 같은 포착이 두 번 일어나므로 마커
+	// 형태와 무관하게 제거 걸음을 낸다(무버전 = D82 이후 v0.15+ 설치본이 다수 코호트다).
 	hookScope := func(path string, pathErr error) string {
 		if pathErr != nil {
 			return "확인불가"
@@ -1709,11 +1723,16 @@ func runDoctor(ctx context.Context, w io.Writer, storeRoot, projectRoot, version
 		case err != nil:
 			return "파싱실패"
 		case n == 0:
-			return "미등록"
+			// "미등록"이 아니라 "옛 그룹 없음"이다 — 플러그인 매니페스트로만 설치한 사용자는 이
+			// 파일에 우리 그룹이 하나도 없는 것이 정상이고, 그때 "미등록"은 "훅이 꺼져 있다"로
+			// 읽힌다. 이 줄이 세는 대상은 옛 설치기가 남긴 그룹뿐이다.
+			return "옛 그룹 없음"
 		case marker == "":
-			// D82 — 훅 등록물은 무버전 마커를 쓴다. 존재·개수만 본다: 버전 비교는 [20]의 MCP
-			// 등록물 검사가 맡는다(여기서 비교하면 상시 불일치 경고가 된다).
-			return fmt.Sprintf("등록됨(%d개)", n)
+			// D82 — v0.15 이후 등록물은 무버전 마커를 쓴다. 버전 비교는 여기서 하지 않지만
+			// (상시 불일치 경고가 된다) 마이그레이션 걸음은 버전 있는 갈래와 똑같이 낸다:
+			// 플러그인 매니페스트가 같은 여섯 이벤트에 훅을 싣고 있어(D96), 옛 그룹을 남겨 두면
+			// 같은 포착이 두 벌 발화한다.
+			return fmt.Sprintf("등록됨(%d개 — hook uninstall로 옛 그룹을 지우세요. 플러그인이 같은 훅을 실으므로 두 벌이 함께 있으면 포착이 두 번 일어납니다)", n)
 		case marker != version:
 			return fmt.Sprintf("등록됨(%d개, marker %s≠%s — hook uninstall로 옛 그룹을 지우고 플러그인 설치로 옮기세요)", n, marker, version)
 		default:
@@ -1896,9 +1915,11 @@ func runDoctor(ctx context.Context, w io.Writer, storeRoot, projectRoot, version
 		case scanErr != nil:
 			return "파싱실패", false
 		case n == 0:
-			return "미등록", false
+			return "옛 그룹 없음", false // [9]와 같은 이유 — 플러그인만 쓰는 설치에서 정상 상태다
 		case marker == "":
-			return fmt.Sprintf("등록됨(%d개)", n), true
+			// [9]의 무버전 갈래와 같은 근거(D82 + D96 매니페스트 훅) — 옛 그룹을 남겨 두면
+			// 같은 포착이 두 벌 발화한다.
+			return fmt.Sprintf("등록됨(%d개 — hook uninstall --codex로 옛 그룹을 지우세요. 플러그인이 같은 훅을 실으므로 두 벌이 함께 있으면 포착이 두 번 일어납니다)", n), true
 		case marker != version:
 			return fmt.Sprintf("등록됨(%d개, marker %s≠%s — hook uninstall --codex로 옛 그룹을 지우고 플러그인 설치로 옮기세요)", n, marker, version), true
 		default:
@@ -2019,22 +2040,37 @@ func runDoctor(ctx context.Context, w io.Writer, storeRoot, projectRoot, version
 	// 아니다. markerDriftLabel은 doctor 어디서도 더는 부르지 않고 그 유일한 호출자였던
 	// TestMarkerDriftLabel과 함께 지웠다(재검토 리뷰 3 — 프로덕션 호출자를 잃고 자기 테스트
 	// 하나로만 살아있던 함수는, 그 테스트가 이 태스크 자신의 Files 안에 있는 한 orphan이다).
+	// 자리는 둘이다(최종 리뷰 S11): 프로젝트 스코프 `.mcp.json`과 사용자 스코프 `~/.claude.json`
+	// 최상위. 후자가 `claude mcp add --scope user`가 쓰는 자리이고 v0.18의 hostSnippet이 그
+	// 스코프를 권했으므로, 프로젝트 파일만 보면 그 코호트에게 doctor가 "정리할 것 없음"을
+	// 보고한다. 두 자리 모두 최상위 `mcpServers` 객체라 같은 판독기가 그대로 닿는다(설계 v0.12의
+	// 스코프 표). 같은 파일의 `projects.<경로>.mcpServers`(local 스코프)는 보지 않는다 — 호스트가
+	// 정규화해 둔 경로 키와 우리 projectRoot를 맞추는 일이 이 한 줄 진단보다 크다.
 	retiredServerNames := append([]string{ctrMCPServerName}, supersededMCPServerNames...)
-	mcpPath := mcpConfigPath(projectRoot)
-	mcpData, mcpReadErr := os.ReadFile(mcpPath)
-	switch {
-	case errors.Is(mcpReadErr, os.ErrNotExist):
-		// 없음 — 보고 없음.
-	case mcpReadErr != nil:
-		fmt.Fprintln(w, "[20] claude: .mcp.json 읽기 실패")
-	default:
-		for _, name := range retiredServerNames {
-			marker, command, found := mcpManagedMarker(mcpData, name)
-			if !ownedRegistration(marker, command, found) {
-				continue
+	mcpScanPaths := []string{mcpConfigPath(projectRoot)}
+	if home, homeErr := os.UserHomeDir(); homeErr == nil {
+		mcpScanPaths = append(mcpScanPaths, filepath.Join(home, ".claude.json"))
+	}
+	for _, mcpPath := range mcpScanPaths {
+		mcpData, mcpReadErr := os.ReadFile(mcpPath)
+		switch {
+		case errors.Is(mcpReadErr, os.ErrNotExist):
+			// 없음 — 보고 없음.
+		case mcpReadErr != nil:
+			fmt.Fprintf(w, "[20] claude: %s 읽기 실패\n", mcpPath)
+		case !mcpJSONParses(mcpData):
+			// [16]과 같은 원칙(cli.go의 codexServerHeaders 절) — 못 연 파일을 조용히 "깨끗함"으로
+			// 읽으면 안 된다. 쉼표 하나가 남은 파일은 파싱만 실패하고 등록물은 그대로 살아 있다.
+			fmt.Fprintf(w, "[20] claude: %s 파싱 실패 — 잔존 등록물 여부를 판정하지 못했다(파일을 직접 열어 확인하세요)\n", mcpPath)
+		default:
+			for _, name := range retiredServerNames {
+				marker, command, found := mcpManagedMarker(mcpData, name)
+				if !ownedRegistration(marker, command, found) {
+					continue
+				}
+				fmt.Fprintf(w, "[20] claude: 플러그인 이전 방식의 등록물이 남아 있다 — %s (%s)\n", mcpPath, name)
+				fmt.Fprintf(w, "[20] claude: 다음 걸음 — claude mcp remove %s 뒤 claude mcp list로 부재를 확인하세요\n", name)
 			}
-			fmt.Fprintf(w, "[20] claude: 플러그인 이전 방식의 등록물이 남아 있다 — %s (%s)\n", mcpPath, name)
-			fmt.Fprintf(w, "[20] claude: 다음 걸음 — claude mcp remove %s 뒤 claude mcp list로 부재를 확인하세요\n", name)
 		}
 	}
 

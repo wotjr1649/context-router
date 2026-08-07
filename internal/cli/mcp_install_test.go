@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -253,11 +254,48 @@ func TestHostSnippetUsesCurrentServerPrefix(t *testing.T) {
 		}
 	}
 	for _, want := range []string{
-		"mcp__plugin_context-router_ctr__ctr_index",
-		"mcp__plugin_context-router_ctr__ctr_fetch_and_index",
+		ctrToolPrefix + "ctr_index",
+		ctrToolPrefix + "ctr_fetch_and_index",
 	} {
 		if !strings.Contains(hostSnippet, want) {
 			t.Errorf("%q 규칙이 안내에서 사라졌다", want)
+		}
+	}
+}
+
+// TestToolPrefixMatchesPluginManifests — 최종 리뷰 S6. 도구 접두의 두 조각은 매니페스트에 산다:
+// 플러그인 이름(`.claude-plugin/plugin.json`의 `name`)과 MCP 서버 키(`plugin/mcp.json`의
+// `mcpServers` 유일 키). 어느 쪽 이름을 바꿔도 ctrToolPrefix가 따라 움직이지 않으면 doctor가
+// 아무것도 매치하지 않는 접두를 광고한다 — 위 TestHostSnippetUsesCurrentServerPrefix는 그
+// 리터럴을 자기 자신으로 재기 때문에 그 변경에 전부 초록이다. 조합 형태
+// `mcp__plugin_<플러그인>_<서버>__`는 플러그인이 제공한 서버가 실제 세션에서 갖는 이름에서
+// 왔다(설계 §5-12).
+func TestToolPrefixMatchesPluginManifests(t *testing.T) {
+	readJSON := func(rel string, v any) {
+		t.Helper()
+		b, err := os.ReadFile(filepath.Join("..", "..", filepath.FromSlash(rel)))
+		if err != nil {
+			t.Fatalf("%s 읽기 실패: %v", rel, err)
+		}
+		if err := json.Unmarshal(b, v); err != nil {
+			t.Fatalf("%s 파싱 실패: %v", rel, err)
+		}
+	}
+	var plugin struct {
+		Name string `json:"name"`
+	}
+	readJSON(".claude-plugin/plugin.json", &plugin)
+	var manifest struct {
+		Servers map[string]json.RawMessage `json:"mcpServers"`
+	}
+	readJSON("plugin/mcp.json", &manifest)
+	if len(manifest.Servers) != 1 {
+		t.Fatalf("plugin/mcp.json의 서버가 %d개다 — 접두 유도는 유일 서버를 전제한다", len(manifest.Servers))
+	}
+	for server := range manifest.Servers {
+		want := "mcp__plugin_" + plugin.Name + "_" + server + "__"
+		if ctrToolPrefix != want {
+			t.Fatalf("ctrToolPrefix=%q, 매니페스트에서 유도한 값=%q", ctrToolPrefix, want)
 		}
 	}
 }

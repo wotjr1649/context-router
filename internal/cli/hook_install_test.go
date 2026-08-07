@@ -386,7 +386,9 @@ func TestDoctor_HookItemsAndAscendingOrder(t *testing.T) {
 		}
 		out := buf.String()
 		for _, want := range []string{
-			"[9] hooks: project=미등록",
+			// 재기준선(최종 리뷰): 그룹이 없는 상태의 문면은 "미등록"이 아니라 "옛 그룹 없음"이다 —
+			// 플러그인 매니페스트로만 설치한 사용자에게 이것이 정상 상태이기 때문이다.
+			"[9] hooks: project=옛 그룹 없음",
 			"[10] context-router:",
 			"[11] store-root path:",
 			"[12] drops:",
@@ -504,8 +506,8 @@ func TestDoctor_UserScopeHookRegistration(t *testing.T) {
 	if !strings.Contains(out, "user=등록됨") {
 		t.Fatalf("doctor must report user-scope registration:\n%s", out)
 	}
-	if !strings.Contains(out, "project=미등록") {
-		t.Fatalf("doctor must report project scope as unregistered:\n%s", out)
+	if !strings.Contains(out, "project=옛 그룹 없음") {
+		t.Fatalf("doctor must report project scope as free of legacy groups:\n%s", out)
 	}
 	assertDoctorAscending(t, out)
 }
@@ -527,7 +529,7 @@ func TestDoctorVersionlessHookMarker(t *testing.T) {
 		t.Fatalf("runDoctor err=%v out=%s", err, buf.String())
 	}
 	out := buf.String()
-	if !strings.Contains(out, "project=등록됨(6개)") {
+	if !strings.Contains(out, "project=등록됨(6개 — hook uninstall로 옛 그룹을 지우세요") {
 		t.Fatalf("무버전 마커가 소유로 인식되지 않았다(개수 0이면 경고 없음도 공허하다):\n%s", out)
 	}
 	// '≠' 부재는 **훅 스코프 줄에 한정**해 본다 — [20]은 MCP 등록물의 버전을 비교하므로

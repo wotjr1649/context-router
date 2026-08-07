@@ -2913,8 +2913,8 @@ func TestDoctorCodexHooksScopePositive(t *testing.T) {
 	if !strings.Contains(out, "[16] codex hooks: project=등록됨(") {
 		t.Errorf("훅을 설치했는데 project 스코프가 등록됨으로 나오지 않는다:\n%s", out)
 	}
-	if strings.Contains(out, "[16] codex hooks: project=미등록") {
-		t.Errorf("등록된 훅이 미등록으로 보고됐다:\n%s", out)
+	if strings.Contains(out, "[16] codex hooks: project=옛 그룹 없음") {
+		t.Errorf("등록된 훅이 없는 것으로 보고됐다:\n%s", out)
 	}
 }
 
@@ -2972,8 +2972,46 @@ func TestDoctorMcpJsonUnreadable(t *testing.T) {
 		t.Fatalf("mkdir: %v", err)
 	}
 	out, _ := doctorOut(t, projectRoot)
-	if !strings.Contains(out, "[20] claude: .mcp.json 읽기 실패") {
+	if !strings.Contains(out, "[20] claude: "+mcpConfigPath(projectRoot)+" 읽기 실패") {
 		t.Errorf("읽기 실패가 조용히 삼켜졌다:\n%s", out)
+	}
+}
+
+// TestDoctorMcpJsonUnparseable — 최종 리뷰 S5. 쉼표 하나가 남은 `.mcp.json`은 파싱만 실패하고
+// 등록물은 그대로 살아 있다. [16]이 무효 TOML에서 침묵하지 않는 것과 같은 원칙으로, 이 파일도
+// 조용히 "깨끗함"으로 읽히면 안 된다 — 옛 [20]은 그 입력에서 아무 줄도 내지 않았다.
+func TestDoctorMcpJsonUnparseable(t *testing.T) {
+	isolateCodexHome(t)
+	projectRoot := t.TempDir()
+	// 우리 등록물 + 꼬리 쉼표 하나. 파싱만 실패하고 등록물은 파일 안에 살아 있다.
+	write(t, mcpConfigPath(projectRoot), []byte(`{"mcpServers":{"ctr-exec":{"command":"context-router",}}}`))
+	out, err := doctorOut(t, projectRoot)
+	if err != nil {
+		t.Errorf("이 보고는 실패 항목에 계상되면 안 된다 — err=%v", err)
+	}
+	if !strings.Contains(out, "[20] claude: "+mcpConfigPath(projectRoot)+" 파싱 실패") {
+		t.Errorf("파싱 실패가 조용히 깨끗함으로 읽혔다:\n%s", out)
+	}
+}
+
+// TestDoctorMcpJsonUserScopeLeftover — 최종 리뷰 S11. `claude mcp add --scope user`가 쓰는
+// 자리는 `~/.claude.json` 최상위 `mcpServers`이고(설계 v0.12의 스코프 표), v0.18의 hostSnippet이
+// 그 스코프를 권했다. 프로젝트 `.mcp.json`만 보면 그 코호트에게 doctor가 정리할 것 없음을
+// 보고한다. 홈은 TestMain이 이미 임시 디렉터리로 격리한다.
+func TestDoctorMcpJsonUserScopeLeftover(t *testing.T) {
+	isolateCodexHome(t)
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home) // Windows os.UserHomeDir 이음새
+	userConfig := filepath.Join(home, ".claude.json")
+	write(t, userConfig, []byte(`{"mcpServers":{"ctr-exec":{"command":"context-router"}}}`))
+
+	out, err := doctorOut(t, t.TempDir())
+	if err != nil {
+		t.Errorf("이 보고는 실패 항목에 계상되면 안 된다 — err=%v", err)
+	}
+	if !strings.Contains(out, "[20] claude: 플러그인 이전 방식의 등록물이 남아 있다 — "+userConfig+" ("+ctrMCPServerName+")\n") {
+		t.Errorf("사용자 스코프 잔존 등록물을 놓쳤다:\n%s", out)
 	}
 }
 

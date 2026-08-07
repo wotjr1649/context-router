@@ -277,11 +277,39 @@ func TestSchemaTokenBudget(t *testing.T) {
 	}
 }
 
-// deferredToolNames: D99가 색인하는 지연 로드 여섯의 정본 목록 — 아래 두 테스트가 공유한다
-// (하나로 유지, D13 반파편화와 동일 취지).
+// deferredToolNames: D99가 색인하는 지연 로드 여섯의 정본 목록(하나로 유지, D13 반파편화와
+// 동일 취지).
 var deferredToolNames = []string{
 	"ctr_fetch", "ctr_transform", "ctr_record_event",
 	"ctr_session_summary", "ctr_export_events", "ctr_fetch_and_index",
+}
+
+// assertDeferredIndexMatchesRegistration — 진입 도구 둘의 Description 꼬리 색인이 그 서버의
+// tools/list와 정확히 맞물리는지 확인한다: 등록된 지연 도구는 전부 이름이 있고, 등록되지 않은
+// 지연 도구는 하나도 없다. 기대값을 코드의 조건 분기에서 다시 적지 않고 tools/list 자신에서
+// 얻는다. 이름 뒤 `(`까지 보는 이유는 색인 항목이 `이름(한 줄 용도)` 형태이고, 그렇게 해야
+// `ctr_fetch`가 `ctr_fetch_and_index`의 부분 문자열로 잡히지 않기 때문이다.
+func assertDeferredIndexMatchesRegistration(t *testing.T, cs *mcp.ClientSession) {
+	t.Helper()
+	lt, err := cs.ListTools(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("list tools: %v", err)
+	}
+	registered, descByName := map[string]bool{}, map[string]string{}
+	for _, tl := range lt.Tools {
+		registered[tl.Name], descByName[tl.Name] = true, tl.Description
+	}
+	for _, entry := range []string{"ctr_search", "ctr_index"} {
+		desc, ok := descByName[entry]
+		if !ok {
+			t.Fatalf("%s not found in tools/list", entry)
+		}
+		for _, name := range deferredToolNames {
+			if indexed := strings.Contains(desc, name+"("); indexed != registered[name] {
+				t.Errorf("%s 설명의 %q 색인=%v, 실제 등록=%v:\n%s", entry, name, indexed, registered[name], desc)
+			}
+		}
+	}
 }
 
 // TestAlwaysLoadMetaExactlyEntryTools — D99 요구 1: Enable{"ingest","net"}+Session 있음(설치기가
@@ -310,29 +338,21 @@ func TestAlwaysLoadMetaExactlyEntryTools(t *testing.T) {
 	}
 }
 
-// TestEntryToolDescriptionsIndexDeferredTools — D99 요구 2: 진입 도구 둘(ctr_search·ctr_index)의
-// Description이 지연 여섯의 이름을 전부 담아야 한다(하나라도 빠지면 실패 — 루프 단정).
+// TestEntryToolDescriptionsIndexDeferredTools — D99 요구 2 + 최종 리뷰 S4 재기준선. 옛 형태는
+// 고정 문면(패키지 상수)이 지연 여섯의 이름을 전부 담는지만 봤고, 그래서 프로필을 좁힌 서버가
+// 등록하지도 않은 도구를 이름으로 광고해도 초록이었다 — `CTR_ENABLE=ingest`로 켠 서버가
+// `ctr_fetch_and_index`를 광고하는 것을 stdio로 실측한 것이 그 결함이다. 여섯 중 다섯이 조건부
+// 등록이므로 최대 프로필과 좁힌 프로필 양쪽에서 색인과 등록의 일치를 잰다.
 func TestEntryToolDescriptionsIndexDeferredTools(t *testing.T) {
-	cs, _ := newTestServer(t, []string{"ingest"})
-	lt, err := cs.ListTools(context.Background(), nil)
-	if err != nil {
-		t.Fatalf("list tools: %v", err)
-	}
-	descByName := map[string]string{}
-	for _, tl := range lt.Tools {
-		descByName[tl.Name] = tl.Description
-	}
-	for _, entry := range []string{"ctr_search", "ctr_index"} {
-		desc, ok := descByName[entry]
-		if !ok {
-			t.Fatalf("%s not found in tools/list", entry)
-		}
-		for _, name := range deferredToolNames {
-			if !strings.Contains(desc, name) {
-				t.Fatalf("%s description missing deferred tool name %q: %q", entry, name, desc)
-			}
-		}
-	}
+	t.Run("최대 프로필 — 여섯 전부", func(t *testing.T) {
+		cs, _, _, _ := newRecordEventTestServer(t, "ingest", "net", "exec")
+		assertDeferredIndexMatchesRegistration(t, cs)
+	})
+	t.Run("좁힌 프로필 — net·세션 없음", func(t *testing.T) {
+		// ingest만: ctr_fetch_and_index(net)도 세션 3종도 등록되지 않는다.
+		cs, _ := newTestServer(t, []string{"ingest"})
+		assertDeferredIndexMatchesRegistration(t, cs)
+	})
 }
 
 // TestToolDescriptionsAvoidHortatoryVocabulary — Global Constraints 어휘 규칙: 어느 도구

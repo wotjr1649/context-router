@@ -132,7 +132,7 @@ func codexHeaderName(line string) (string, bool) {
 //
 // 줄 끝까지 따옴표가 안 닫히면(닫는 따옴표를 빠뜨린 흔한 오타) 따옴표 추적을 포기하고 그
 // 줄의 마지막 ']'를 최선-노력으로 닫는 자리로 쓴다 — codexServerHeaders 세 번째 알려진
-// 한계가 이 대가를 적는다. ']' 자체가 줄에 없으면 그마저 없어 (0, false) — 여러 줄에 걸쳐
+// 한계가 이 대가를 적는다. ']' 자체가 줄에 없으면 그마저 없어 (-1, false) — 여러 줄에 걸쳐
 // 닫히는 실제 문자열은 애초에 이 함수의 대상이 아니다(codexServerHeaders 첫 번째 알려진
 // 한계).
 func codexHeaderClose(s string) (int, bool) {
