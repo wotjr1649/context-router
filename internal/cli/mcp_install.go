@@ -21,7 +21,7 @@ const ctrMCPServerName = "ctr-exec"
 
 // supersededMCPServerNames — 단일 서버 등록(D63 ②)이 대체하는 과거 등록 이름. ctr의 6도구는
 // ctr-exec의 8도구에 완전히 포함되므로 둘을 함께 두면 6도구가 중복 노출된다. ctr-global은 다른
-// 프로필(global-search)이라 대체 대상이 아니다 — 설치기가 만들지도, 지우지도 않는다.
+// 프로필(global-search)이라 대체 대상이 아니었다 — 옛 설치기가 만들지도, 지우지도 않았다.
 var supersededMCPServerNames = []string{"ctr"}
 
 // isOurMarkerValue — 소유 표식 값의 기준(D82·D84). **정확 일치 `context-router`**(무버전 —

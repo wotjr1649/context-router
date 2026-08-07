@@ -220,12 +220,14 @@ func isOurCodexGroup(raw json.RawMessage) bool {
 	return true
 }
 
-// codexHooksPath — 설치 대상 hooks.json 경로(§11.1 G3). 기본 프로젝트 `<root>/.codex/hooks.json`,
-// --user는 `$CODEX_HOME/hooks.json`(CODEX_HOME 미설정 시 `~/.codex/hooks.json`). Codex는 CODEX_HOME
+// codexHooksPath — hooks.json 경로(§11.1 G3). 소비처는 doctor [16]의 훅 스코프 보고와
+// runHookUninstallCodex 둘이다. 기본 프로젝트 `<root>/.codex/hooks.json`, --user는
+// `$CODEX_HOME/hooks.json`(CODEX_HOME 미설정 시 `~/.codex/hooks.json`). Codex는 CODEX_HOME
 // 환경변수로 상태 루트(config·auth·logs·sessions·skills, 기본 ~/.codex)를 재지정하고 hooks.json은 그
-// 활성 config 계층 옆에서 탐색되므로(공식 env-vars 문서), CODEX_HOME이 설정된 사용자에게 ~/.codex에
-// 쓰면 Codex가 읽지 않는 파일을 만드는 무성 오설치가 된다(최종 리뷰 Codex P2). 빈 문자열=미설정으로
-// 폴백. config.toml·[hooks.state]는 절대 건드리지 않는다(신뢰 승인 우회 금지).
+// 활성 config 계층 옆에서 탐색되므로 `[문서]`(공식 env-vars 문서), CODEX_HOME이 설정된 사용자에게
+// ~/.codex를 보면 옛 설치기는 Codex가 읽지 않는 파일을 만들었고(무성 오설치, 최종 리뷰 Codex P2)
+// 지금은 uninstall이 엉뚱한 파일을 뒤지고 doctor가 "미등록"을 오보한다. 빈 문자열=미설정으로
+// 폴백. config.toml·[hooks.state]는 이 경로가 건드리지 않는다(신뢰 승인 우회 금지).
 func codexHooksPath(user bool, projectRoot string) (string, error) {
 	if user {
 		if codexHome := os.Getenv("CODEX_HOME"); codexHome != "" {
@@ -430,9 +432,9 @@ func shadowOffGetenv(k string) string {
 //
 // **범위는 훅 그룹 하나다**(D96 계약 1의 유일한 예외). `.mcp.json` 항목과
 // enabledMcpjsonServers 승인 키 정리는 v0.19에서 함께 사라졌다 — 그 둘을 지우던 코드가
-// 기입 코드와 같은 병합기를 공유했고, 그 병합기가 파일 파괴 결함 다섯의 자리였다 `[문서]`.
-// 남은 잔존물은 doctor [20]이 두 절로 읽기 전용 보고하고 `claude mcp remove`가 등록물을
-// 지운다.
+// 기입 코드와 같은 병합기를 공유했고, 그 병합기가 파일 파괴 결함 다섯의 자리였다
+// `[문서]`(설계서 v0.18 §3.5·§3.7·§3.8). 남은 잔존물은 doctor [20]이 두 절로 읽기 전용
+// 보고하고 `claude mcp remove`가 등록물을 지운다.
 func runHookUninstall(args []string, projectRoot string, stdout io.Writer) error {
 	fs := flag.NewFlagSet("hook uninstall", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
@@ -503,7 +505,7 @@ func runHookUninstallCodex(user bool, projectRoot string, stdout io.Writer) erro
 
 // scanRegisteredHooks — path의 settings에서 자기 소유 훅 그룹 수와 마커 버전을 함께 수집한다
 // (doctor [9] 등록 상태 + 버전 불일치 감지). 마커 버전은 첫 자기 그룹의 __ctrManaged에서
-// hookMarkerPrefix 뒤 부분이다 — 한 번의 install이 6개 그룹을 동일 버전 마커로 쓰므로(§7) 어느
+// hookMarkerPrefix 뒤 부분이다 — 옛 설치기가 6개 그룹에 동일 버전 마커를 썼으므로(§7) 어느
 // 그룹에서 취하든 값이 같아 map 순회 순서와 무관하게 결정적이다. 파일 미존재·hooks 부재는 (0,""),
 // 파싱 실패만 오류.
 func scanRegisteredHooks(path string) (count int, marker string, err error) {
@@ -539,7 +541,7 @@ func scanRegisteredHooks(path string) (count int, marker string, err error) {
 				continue
 			}
 			count++
-			if marker == "" { // 첫 자기 그룹의 마커 버전만(모두 동일 — install 계약)
+			if marker == "" { // 첫 자기 그룹의 마커 버전만(옛 설치기가 모두 동일하게 썼다)
 				var p hookGroupProbe
 				if json.Unmarshal(g, &p) == nil {
 					marker = markerVersion(p.Managed)
@@ -588,7 +590,7 @@ func scanCodexRegisteredHooks(path string) (count int, marker string, err error)
 				continue
 			}
 			count++
-			if marker == "" { // 첫 자기 그룹의 마커만(install이 모든 그룹에 동일 버전 마커를 씀)
+			if marker == "" { // 첫 자기 그룹의 마커만(옛 설치기가 모든 그룹에 동일 버전 마커를 썼다)
 				var p codexGroupProbe
 				if json.Unmarshal(g, &p) == nil && len(p.Hooks) > 0 {
 					marker = markerVersion(p.Hooks[0].StatusMessage)

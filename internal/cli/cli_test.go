@@ -2779,6 +2779,27 @@ func TestDoctorCodexConfigUnreadable(t *testing.T) {
 	}
 }
 
+// TestDoctorCodexBackupLeftover — 옛 설치기의 config.toml.bak(D84 단일 슬롯)은 그것을 지우던
+// 경로가 없어 영구 잔존한다. doctor가 다른 잔존 부류를 전부 짚으므로 이것만 빠지면 마이그레이션을
+// 마친 사용자에게 아무도 언급하지 않는 파일이 남는다. **등록물 유무와 무관하게** 보고하는 것이
+// 계약이다 — 관리 블록을 이미 손으로 지운 사용자에게도 .bak은 남아 있다.
+func TestDoctorCodexBackupLeftover(t *testing.T) {
+	home := isolateCodexHome(t)
+	writeCodexConfig(t, home, "model = \"gpt-5\"\n") // 등록물 없음 — .bak만 남은 상태
+	bak := filepath.Join(home, "config.toml.bak")
+	if out, _ := doctorOut(t, t.TempDir()); strings.Contains(out, "config.toml 백업") {
+		t.Fatalf(".bak이 없는데 보고했다:\n%s", out)
+	}
+	write(t, bak, []byte("model = \"gpt-4\"\n"))
+	out, _ := doctorOut(t, t.TempDir())
+	if !strings.Contains(out, "옛 설치기가 남긴 config.toml 백업이 있다 — "+bak) {
+		t.Errorf(".bak 잔존을 보고하지 않았다:\n%s", out)
+	}
+	if b, err := os.ReadFile(bak); err != nil || string(b) != "model = \"gpt-4\"\n" {
+		t.Errorf("doctor가 .bak을 건드렸다: %q err=%v", b, err)
+	}
+}
+
 // TestDoctorWritesNothing — D96·D97: doctor는 읽기 전용이다. config.toml·.mcp.json·
 // .claude/settings.json 세 파일의 mtime과 바이트가 진단 전후 동일해야 한다. --fix가 지워졌으니
 // 이 계약을 깨는 유일한 경로는 회귀다(예: 실수로 남은 atomicWriteFile 호출).

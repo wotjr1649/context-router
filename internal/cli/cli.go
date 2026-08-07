@@ -1425,16 +1425,10 @@ func countShadowIndexes(ctx context.Context, db *sql.DB) int {
 	return n
 }
 
-// hostSnippet: doctor 마지막에 출력하는 등록 안내(설계 §9, D96·D97·D98·D99·D101) — 손편집
-// 등록 예시를 담지 않는다(우리는 어떤 호스트 설정 파일에도 쓰지 않는다, D96 계약 1). 등록은
-// 플러그인 설치 절차이고, 프로필을 아무것도 지정하지 않았을 때의 기본값은 서버 자신이
-// 갖는다(D101 계약 2, v0.19 리뷰 C1 — plugin/mcp.json이 프로필을 고정하면 CTR_ENABLE이 모든
-// 플러그인 설치에서 죽은 경로가 된다). 도구 접두는 mcp__plugin_context-router_ctr__다(D98) —
-// alwaysLoad는 서버 단위 플래그가 폐기돼(D99) 안내하지 않는다.
-// hostInstallSteps — 설치 절차 본문. **`hook install` 안내와 이 스니펫이 공유하는 단일
+// hostInstallSteps — 설치 절차 본문. **`hook install` 안내와 hostSnippet이 공유하는 단일
 // 원본이다**(Task 5) — 같은 절차를 두 자리에 따로 적으면 한쪽만 고쳐지고, 그 어긋남이 이
 // 릴리스가 닫는 형태다. 0번 걸음이 옛 등록물 제거인 것은 A⑧ 실측이 근거다.
-const hostInstallSteps = `## 설치 절차 (D96·D97 — 등록은 호스트가 하고, 우리는 어떤 설정 파일에도 쓰지 않는다)
+const hostInstallSteps = `## 설치 절차 (D96·D97 — 등록은 호스트가 한다)
 
 0. 옛 등록물을 먼저 지운다: claude mcp remove <이름> · codex mcp remove <이름>.
    [실측] 호스트는 command·args가 이미 등록된 서버와 같은 플러그인 서버를 경고 없이 버린다 —
@@ -1451,6 +1445,12 @@ const hostInstallSteps = `## 설치 절차 (D96·D97 — 등록은 호스트가 
    Codex: ctr … enabled 항목이 나열되는가.
 `
 
+// hostSnippet: doctor 마지막에 출력하는 등록 안내(설계 §9, D96·D97·D98·D99·D101) — 등록은
+// 플러그인 설치 절차이고(hostInstallSteps), 프로필을 아무것도 지정하지 않았을 때의 기본값은
+// 서버 자신이 갖는다(D101 계약 2, v0.19 리뷰 C1 — plugin/mcp.json이 프로필을 고정하면
+// CTR_ENABLE이 모든 플러그인 설치에서 죽은 경로가 된다). 도구 접두는
+// mcp__plugin_context-router_ctr__다(D98) — alwaysLoad는 서버 단위 플래그가 폐기돼(D99)
+// 안내하지 않는다.
 const hostSnippet = `--- host adapter snippets (설계 §9) ---
 
 ` + hostInstallSteps + `
@@ -1495,11 +1495,10 @@ permissions (.claude/settings.json 예시 — ingest/net 도구에 ask를 건다
 #   sh: 첫 줄 set -e — 네이티브 비 0 종료에서도 멈춘다.
 `
 
-// doctorCodexConfigPath — Codex config.toml 경로(codex_toml.go의 codexConfigPath와 같은 규칙 —
-// CODEX_HOME 우선, 없으면 ~/.codex/config.toml). doctor 전용으로 여기 따로 둔다: D97 계약 2로
-// doctor는 codex_toml.go를 전혀 부르지 않아야 한다(Task 5가 그 파일을 통째로 지울 때 doctor
-// 쪽은 손댈 필요가 없어야 한다는 것이 그 계약의 실무적 요구다) — 그래서 8줄짜리 경로 계산을
-// codex_toml.go에서 재사용하지 않고 복제한다.
+// doctorCodexConfigPath — Codex config.toml 경로(CODEX_HOME 우선, 없으면 ~/.codex/config.toml).
+// 기입 경로가 같은 규칙의 codexConfigPath를 codex_toml.go에 들고 있었고, doctor가 그 파일을
+// 부르지 않도록 Task 4가 여기 8줄을 복제했다(D97 계약 2). 그 판단이 값을 했다: Task 5가
+// codex_toml.go를 통째로 지웠고 이 함수는 손대지 않았다. 이제 유일한 자리다.
 func doctorCodexConfigPath() (string, error) {
 	if codexHome := os.Getenv("CODEX_HOME"); codexHome != "" {
 		return filepath.Join(codexHome, "config.toml"), nil
@@ -1961,6 +1960,13 @@ func runDoctor(ctx context.Context, w io.Writer, storeRoot, projectRoot, version
 			default:
 				fmt.Fprintln(w, "[16] codex: 다음 걸음 — 이 파일은 TOML로 파스되지 않아 codex mcp list·codex mcp remove가 닿지 못합니다. 위에서 짚은 줄을 직접 열어 정리하세요")
 			}
+		}
+		// 옛 설치기의 단일 슬롯 백업(D84). 그 슬롯을 만들던 경로도 그것을 지우던 경로도 없어서
+		// 사용자 디스크에 영구 잔존한다 — doctor가 다른 잔존 부류를 전부 짚는데 이것만 빠지면
+		// 마이그레이션을 마친 사용자에게 아무도 언급하지 않는 파일 하나가 남는다. 등록물 유무와
+		// 무관하게 본다: 관리 블록을 이미 손으로 지운 사용자에게도 .bak은 남아 있다.
+		if _, bakErr := os.Stat(codexCfgPath + ".bak"); bakErr == nil {
+			fmt.Fprintf(w, "[16] codex: 옛 설치기가 남긴 config.toml 백업이 있다 — %s.bak (되돌릴 내용이 필요 없으면 지우세요)\n", codexCfgPath)
 		}
 	}
 

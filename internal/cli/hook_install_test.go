@@ -258,13 +258,32 @@ func TestHookUninstall_SymmetricPreservesLookalikes(t *testing.T) {
 	}
 }
 
-// ⑤ 원자성 — 제거 후 임시 파일(.ctr-settings-*.tmp) 잔존물 부재.
+// ⑤ 원자성 — 제거 후 임시 파일(.ctr-settings-*.tmp) 잔존물 부재. 두 번째 실행으로 Claude
+// 갈래의 **바이트 멱등**도 함께 잰다(리뷰 I3): 이 단정이 없으면 재실행이 파일을 흔들어도
+// (키 정렬·빈 컨테이너 처리 drift) 스위트 전체가 통과한다 — Codex 형제
+// (TestRemoveCodexHooksIdempotentBytes)만 그것을 재고 있었다. 파일 수준에서 재는 이유는
+// runHookUninstall이 순수 함수가 아니라 읽기·병합·쓰기 셋을 엮기 때문이다.
 func TestHookUninstall_AtomicWriteNoTempLeftover(t *testing.T) {
 	projectRoot := t.TempDir()
 	writeSeedClaudeHooks(t, false, projectRoot, hookBinaryName)
+	path := filepath.Join(projectRoot, ".claude", "settings.json")
 	var out bytes.Buffer
 	if err := runHookUninstall(nil, projectRoot, &out); err != nil {
 		t.Fatalf("uninstall: %v", err)
+	}
+	once, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("1차 read: %v", err)
+	}
+	if err := runHookUninstall(nil, projectRoot, &out); err != nil {
+		t.Fatalf("2차 uninstall: %v", err)
+	}
+	twice, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("2차 read: %v", err)
+	}
+	if !bytes.Equal(once, twice) {
+		t.Fatalf("Claude 갈래 제거가 멱등이 아니다:\n1차=%s\n2차=%s", once, twice)
 	}
 	entries, err := os.ReadDir(filepath.Join(projectRoot, ".claude"))
 	if err != nil {
@@ -277,6 +296,62 @@ func TestHookUninstall_AtomicWriteNoTempLeftover(t *testing.T) {
 	}
 	if len(entries) != 1 || entries[0].Name() != "settings.json" {
 		t.Fatalf(".claude dir should hold only settings.json, got %v", entries)
+	}
+}
+
+// TestHookUninstall_NoFileCreatesNothing — D96 계약 1의 중심 주장: **이 프로그램은 호스트
+// 설정 파일을 만들지 않는다.** Codex 형제(TestRunHookUninstallCodexNoFile)가 그 갈래를
+// 지키고 있었고 Claude 갈래에는 단정이 없었다(리뷰 I1) — 그 자리를 채운다. 파일뿐 아니라
+// `.claude` 디렉터리 자체가 생기지 않는지도 본다: atomicWriteFile이 MkdirAll을 하므로
+// 조기 반환이 사라지면 빈 디렉터리부터 남는다.
+func TestHookUninstall_NoFileCreatesNothing(t *testing.T) {
+	projectRoot := t.TempDir()
+	var out bytes.Buffer
+	if err := runHookUninstall(nil, projectRoot, &out); err != nil {
+		t.Fatalf("uninstall: %v", err)
+	}
+	if !strings.Contains(out.String(), "설정 파일 없음") {
+		t.Fatalf("no-op 안내 누락: %q", out.String())
+	}
+	if _, statErr := os.Stat(filepath.Join(projectRoot, ".claude")); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("uninstall이 없던 .claude 디렉터리를 만들었다: %v", statErr)
+	}
+	entries, err := os.ReadDir(projectRoot)
+	if err != nil {
+		t.Fatalf("readdir: %v", err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("uninstall이 없던 파일을 만들었다: %v", entries)
+	}
+}
+
+// TestHookUninstall_UnparsableSettingsErrors — 해석되지 않는 settings.json에서 제거는 문면을
+// 내고 **오류를 반환한다**(리뷰 I2). 종료코드가 실패를 반영해야 사용자가 훅이 그대로 남은 것을
+// 안다 — 오류를 삼키고 exit 0을 내는 회귀는 이 단정 없이는 스위트 전체를 통과한다.
+// 파일이 손대지지 않은 것도 함께 본다: 해석하지 못한 파일에 쓰지 않는 것이 계약이다.
+func TestHookUninstall_UnparsableSettingsErrors(t *testing.T) {
+	projectRoot := t.TempDir()
+	path := filepath.Join(projectRoot, ".claude", "settings.json")
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	const broken = "{\"hooks\": {\n" // 닫히지 않은 JSON
+	if err := os.WriteFile(path, []byte(broken), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	if err := runHookUninstall(nil, projectRoot, &out); err == nil {
+		t.Fatalf("훅 설정 정리 실패가 오류로 반환되지 않았다 — 종료코드가 실패를 반영해야 한다: %q", out.String())
+	}
+	if !strings.Contains(out.String(), "훅 설정 정리 실패") {
+		t.Fatalf("실패 문면 누락: %q", out.String())
+	}
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if string(after) != broken {
+		t.Fatalf("해석하지 못한 파일을 고쳐 놓았다:\n%s", after)
 	}
 }
 
