@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "ctr": {
+      "type": "stdio",
+      "command": "context-router",
+      "args": ["--enable", "ingest,net"]
+    }
+  }
+}

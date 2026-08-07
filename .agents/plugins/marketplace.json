@@ -1,0 +1,20 @@
+{
+  "name": "context-router",
+  "interface": {
+    "displayName": "context-router"
+  },
+  "plugins": [
+    {
+      "name": "context-router",
+      "source": {
+        "source": "url",
+        "url": "./"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_USE"
+      },
+      "category": "Productivity"
+    }
+  ]
+}
