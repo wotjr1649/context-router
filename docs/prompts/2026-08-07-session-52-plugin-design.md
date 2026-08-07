@@ -5,8 +5,8 @@
 - **번호**: 52 (앞: session-51 = v0.18 구현·릴리스)
 - **기간**: 2026-08-07 (하루)
 - **모델/노력**: Opus 5 (1M context), ultrathink
-- **결과**: **코드 변경 0. 설계서 한 편(424줄)과 커밋 일곱.**
-  `docs/context-router-design-v0.19-ko.md` — **D96–D101**. **미푸시.**
+- **결과**: 설계서 한 편(**D96–D101**) · **게시된 플러그인 패키지** · 적대적 검토 둘.
+  **Go 코드 변경 0.** `main` 푸시 완료.
 - **성격**: 이 세션은 처음부터 끝까지 **실측**이었다. 문서 인용으로 세운 주장 셋이
   실측에 뒤집혔고(§3.5) 그중 둘은 내 것이었다.
 
@@ -128,47 +128,94 @@ b 등록 없음 / c 파일 하나 소유 / d 호스트 자기 CLI)을 주고 **"
 ⑧ 훅 거부 semantics ⑨ `userConfig` 스키마. **②와 ⑥은 대부분 `[문서]`였고 ②는 틀린 주장을
 냈다** — 실측을 요구한 브리프(③④⑤⑦⑧⑨)가 값을 냈다.
 
+## 3.8 ★ 게시 종단 검증 — 공개 원격에서 양쪽 설치 성공
+
+산출물을 `main`에 올리고 **공개 원격에서** 두 호스트에 설치했다.
+
+| 호스트 | 결과 |
+|---|---|
+| Claude | `plugin marketplace add <owner>/<repo>` → `plugin install` → `plugin:context-router:ctr … ✔ Connected` |
+| Codex | 같은 형태 → `ctr … enabled`, 버전 `0.19.0` |
+
+같은 저장소·같은 공유 `plugin/mcp.json`·같은 스킬. 사용자의 진짜 설정은 격리했다 — Claude는
+임시 `CLAUDE_CONFIG_DIR`, Codex는 임시 `CODEX_HOME`.
+
+**그 과정이 낳은 관측 넷** (설계서 A⑧·A⑨·§5-11·D98):
+
+1. **★ 같은 명령줄의 서버는 조용히 버려진다.** 처음 마운트 실패의 원인이었다 — 저장소 안
+   `ctr-exec`가 `--enable ingest,net`으로 완전히 같았다. **모든 마이그레이션 사용자가 만난다.**
+2. Codex는 두 마켓플레이스 파일이 함께 있으면 **`.agents/plugins/marketplace.json`**을 읽는다.
+3. 설치는 **저장소를 통째로 클론**한다 — 긴 경로에서 `Filename too long`으로 죽는다.
+4. Claude가 `mcpServers`를 **경로 문자열로도 받는다** — 루트 `.mcp.json` 자리를 안 쓰고도 한
+   파일이 양쪽을 섬긴다. `.gitignore`를 건드릴 필요가 없어졌다.
+
+## 3.9 ★★ 적대적 검토 둘 — 둘 다 승인하지 않았다
+
+**웹 대조**(공개 문서로 외부 사실 주장 여덟을 반증 시도): 우리 주장 넷을 정정했다 —
+마켓플레이스 형식 동일(**틀림**) · 거부 두 경로가 배타적 · `${user_config.*}`가 v2.1.207에서
+셸 형식에서 **파괴적으로 거부되도록 바뀜** · `outputSchema` 비적재는 **문서 근거 없음**.
+판정은 **"절반만 지금 하라"**.
+
+**교차 모델 한 패스**(`cross-model-review` 절차, 별칭·한 결정만 송신, 검증 서브가 대조):
+**`needs_changes`**, accept 2 · downgrade 3 · reject 1, **자체 발견 8**. 이 문서를 실제로 바꾼
+둘은 **§5-8**(게시 패키지에 훅이 없어 기입 경로를 지우면 수동 포착이 조용히 죽는다)과
+**§2**(제거가 0번 걸음이어야 한다)다.
+
+**소유자 판정**: 전환은 그대로 가되 **삭제에 순서를 강제한다** — D97의 배송 조건 셋.
+
 ## 4. 저장소 현재 상태
 
-- **`main` HEAD**: `61475b0` — **미푸시** (`cb9b1b7` 이후 문서 커밋 **9개**: 이 세션 7 + 앞선 2)
-- **코드 변경 0.** `git status` 클린. 게이트 미실행(코드를 안 만졌다)
-- **새 파일**: `docs/context-router-design-v0.19-ko.md` (424줄, D96–D101)
-- **`productVersion`**: `0.18.0` 그대로
+- **`main` HEAD**: `origin/main`과 동기 — `cb9b1b7` 이후 커밋 **11개**(이 세션 9 + 앞선 2)
+- **Go 코드 변경 0.** `git status` 클린. `go build`·`go vet`·`gofumpt` 무영향 확인
+- **새 파일**: `docs/context-router-design-v0.19-ko.md`(D96–D101) ·
+  `docs/prompts/2026-08-07-…md` · **플러그인 패키지 6파일**
+  (`.claude-plugin/{plugin,marketplace}.json` · `.agents/plugins/marketplace.json` ·
+  `.codex-plugin/plugin.json` · `plugin/mcp.json` · `skills/ctr-usage/SKILL.md`)
+- **`productVersion`**: `0.18.0` 그대로. 플러그인 매니페스트는 `0.19.0`
 - **태그·PR**: 없음
-- **미확정 표기**: 설계서에 **0**(범례 한 줄 제외)
-- **진짜 설정 홈 무손상 확인**: `~/.codex/config.toml` mtime이 8/6 14:00 그대로, `ctrprobe` 흔적
-  없음. `CODEX_HOME`은 프로세스·User·Machine 세 범위 모두 비어 있음
+- **진짜 설정 홈 무손상 확인**: `~/.claude/settings.json`에 `context-router` 없음 ·
+  `~/.codex/config.toml`의 마켓플레이스·플러그인 표가 세션 시작 스냅숏과 동일 ·
+  `CODEX_HOME`·`CLAUDE_CONFIG_DIR` 모두 User·Machine 범위 비어 있음
 
-### 4.1 켜진 채 남긴 것 — 스크래치패드뿐 (세션 범위, 저장소 밖)
+### 4.1 켜진 채 남긴 것
 
-`refs/`(참조 저장소 둘 클론) · `ctrplugin/`(프로브 플러그인 + 빌드한 22.6 MB 바이너리) ·
-`schemaprobe/` · `denyprobe/` · `plugincfg/` · `codexhome3`~`codexhome7`(임시 Codex 홈 다섯) ·
-`measure/` · 마커·커밋 메시지 파일. **전부 지워도 무방하다.**
+**스크래치패드**(세션 범위, 저장소 밖): `refs/`(참조 저장소 둘) · `ctrplugin/`(프로브 + 빌드한
+22.6 MB 바이너리) · `schemaprobe/` · `denyprobe/` · `plugincfg/` · `shareprobe*/` · `pubprobe*/` ·
+`context-router/`(프로브 사본) · `codexhome3`~`codexhome8` · `measure/` · 마커·커밋 메시지 파일.
+
+**스크래치패드 밖 넷** — 플러그인 설치가 저장소를 클론하는데 스크래치패드 경로가 너무 길어
+Windows 파일명 한계에 걸려서, 짧은 임시 경로를 썼다. **지워도 무방하다**:
+`C:\Users\js\AppData\Local\Temp\ctrch` · `ctrch2` · `ctrch3` · `ctrcc`.
 
 ## 5. 이월 사항
 
-### 5.1 다음 세션은 **구현**이다
+### 5.1 다음 세션은 **구현**이다 — 다만 순서가 정해져 있다
 
-설계서 §1~§3이 무엇을 짓는지, §D96~D101이 계약을, §4가 무엇이 사라지는지 적는다.
-**시작 전에 §5를 읽어라 — 아홉 항목이 전부 닫혀 있고 그 자체가 구현 순서의 근거다.**
+설계서 §1~§3이 무엇을 짓는지, D96~D101이 계약을, §4가 무엇이 사라지는지, **§8이 왜 서두르지
+않는지**를 적는다. **시작 전에 §5(열세 항목)와 D97의 배송 조건 셋을 읽어라.**
 
-작업 덩어리 넷:
+**플러그인 패키지는 이미 게시돼 있다**(§3.8) — 짓는 것이 아니라 **완성**하는 것이다.
 
-1. **플러그인 산출물** — `.claude-plugin/{plugin,marketplace}.json` · `.codex-plugin/plugin.json` ·
-   `.mcp.json` · `hooks/hooks.json` · `skills/`. `.gitignore`의 `.mcp.json`·`.codex/` 항목 은퇴.
+1. **★ D97 배송 조건 셋을 먼저 닫는다. 이것이 전제다.**
+   ① **훅 파일을 매니페스트에 싣는다**(§5-8) — 안 하면 지금 도는 수동 포착이 조용히 죽는다.
+   ② **install → uninstall → reinstall 왕복 바이트 비교**(§5-10) — `add` 한 방향만 쟀다.
+   ③ **`doctor` 감지원 결정**(§5-13) — `codex mcp get`은 무효 TOML에서 실패하고 `--json`은
+      `env`를 평문으로 낸다. **`doctor`는 `--json`을 부르지 않는다.**
 2. **도구 단위 상시 로드**(D99) — `mcp.Tool`의 `Meta`에 `"anthropic/alwaysLoad"`, 진입은
-   `ctr_search`+`ctr_index`, 나머지 여섯은 진입 도구 설명 꼬리에 이름+한 줄로 색인.
-3. **기입 경로 은퇴**(D97) — `codex_toml.go` 전부, `hook_install.go`·`mcp_install.go`의 기입·병합부.
-   읽기(감지원)와 훅 그룹 **제거** 한 방향은 남긴다. `doctor`는 읽기 전용 진단으로 축소.
-4. **훅 형태 이관** — `command`+`args` 배열, 결정은 JSON. `commandWindows`와 `SessionStart`
-   `matcher`를 갖춰 한 파일로 양쪽을 섬긴다.
+   `ctr_search` + `ctr_index`, 나머지 여섯은 진입 도구 설명 꼬리에 이름 + 한 줄로 색인.
+   **Claude 한정 최적화로 표기하라**(§5-4).
+3. **훅 형태 이관** — `command` + `args` **배열**, 결정은 **`exit 0` + JSON**
+   (`exit 2`는 stdout을 버린다). `commandWindows`와 `SessionStart` `matcher`를 갖춰 한 파일로
+   양쪽을 섬긴다. **양쪽에서 한 번 발화를 재고 나서** 계약으로 굳혀라(§5-1).
+4. **기입 경로 은퇴**(D97) — **1이 닫힌 뒤에만.** `codex_toml.go` 전부,
+   `hook_install.go`·`mcp_install.go`의 기입·병합부. 읽기(감지원)와 훅 그룹 **제거** 한 방향은
+   남긴다. `hostSnippet` 갱신도 여기 든다(§5-12) — 지금도 옛 접두 규칙을 안내한다.
 
-### 5.2 남은 검증 하나 — 설계 위험이 아니다
+### 5.2 게시는 끝났다 — 남은 위험은 종류가 다르다
 
-**게시 시점 연기 시험**: 저장소를 실제로 게시해 `claude plugin marketplace add <owner>/<repo>` +
-`codex plugin marketplace add <owner>/<repo>`로 양쪽에서 한 번 설치해 본다. 로컬 경로로는 양쪽
-다 됐고 원격 git은 두 호스트의 1급 소스다. 소유자 판정: **이것이 초록이어도 1.0.0은 아직이다** —
-그 뒤 내부 도구 개선·수정을 한 차례 거친다.
+§3.8이 종단 검증을 닫았다. 남은 것은 **설계 위험이 아니라 시간**이다(설계서 §8) — 플러그인
+표면이 움직인다. 소유자 판정은 폴백 영구화가 아니라 **삭제 순서 강제**였다.
+**1.0.0은 여전히 대기다** — 내부 도구 개선·수정을 한 차례 거친 뒤 판정한다.
 
 ### 5.3 이 설계가 없애는 v0.19 대상
 
@@ -208,32 +255,45 @@ session-51 §5.4 그대로. 이 세션은 코드를 안 만졌고 테스트를 �
 ```
 docs/prompts/2026-08-07-session-52-plugin-design.md 를 읽고 이어서 작업한다.
 
-**이번 세션은 구현이다.** 설계는 끝났다 — `docs/context-router-design-v0.19-ko.md`가
-D96–D101로 계약을 적고, 그 §5의 아홉 항목이 **전부 실측으로 닫혀 있다.** 미확정 표기는
-범례 한 줄뿐이다. 설계 논쟁을 다시 열지 마라. 계약과 어긋나면 스펙이 이긴다.
+**이번 세션은 구현이다.** 설계는 `docs/context-router-design-v0.19-ko.md`가 D96–D101로 적는다.
+**설계 논쟁을 다시 열지 마라** — 적대적 검토 둘을 이미 받았고(스펙 §8) 소유자가 판정했다.
+계약과 어긋나면 스펙이 이긴다.
 
-**배송 버전은 0.19.0이다.** 1.0.0은 게시 검증 + 내부 개선 뒤로 소유자가 미뤘다.
+**플러그인 패키지는 이미 게시돼 있고 양쪽 호스트에서 설치·연결까지 검증됐다**(레코드 §3.8).
+짓는 것이 아니라 **완성**하는 것이다.
 
-## 짓는 것 넷 (설계서 §D98 배치도를 축자로 따라라)
+**배송 버전은 0.19.0이다.** 1.0.0은 내부 개선·수정 뒤로 소유자가 미뤘다.
 
-1. **플러그인 산출물** — `.claude-plugin/{plugin,marketplace}.json` · `.codex-plugin/plugin.json`
-   · `.mcp.json` · `hooks/hooks.json` · `skills/`. 공유 넷 + `plugin.json` 둘이다.
-   `.claude-plugin/plugin.json`에 **`hooks` 키를 쓰지 마라**(중복 로드 오류). `.gitignore`의
-   `.mcp.json`·`.codex/` 항목은 은퇴시킨다. `command`는 PATH의 bare `context-router`.
+**스펙 §5는 열세 항목이고 전부 닫히지 않았다.** 셋이 열려 있으며 그것이 **D97의 배송 조건**이다.
+
+## 순서가 정해져 있다 — 1번이 전제다
+
+1. **★ D97 배송 조건 셋을 먼저 닫는다.**
+   ① **훅 파일을 매니페스트에 싣는다**(§5-8). 게시된 패키지에 훅이 없어서, 이걸 안 하고 기입
+      경로를 지우면 **지금 도는 PostToolUse 수동 포착이 조용히 죽는다.**
+   ② **install → uninstall → reinstall 왕복 바이트 비교**(§5-10). A⑦은 `add` 한 방향만 쟀다.
+   ③ **`doctor` 감지원 결정**(§5-13). `codex mcp get`은 무효 TOML에서 실패하고 `--json`은
+      `env`를 평문으로 낸다 — **`doctor`는 `--json`을 부르지 않는다.**
 2. **도구 단위 상시 로드**(D99) — `mcp.Tool`의 `Meta`에 `"anthropic/alwaysLoad"`. 진입은
    **`ctr_search` + `ctr_index`** 둘. 나머지 여섯은 진입 도구 **설명 꼬리에 이름 + 한 줄**로
-   색인한다. `outputSchema`는 건드리지 마라 — 프롬프트 비용이 0임이 실측됐다.
-3. **기입 경로 은퇴**(D97) — `codex_toml.go` 전부, `hook_install.go`·`mcp_install.go`의
-   기입·병합부. **읽기(감지원)와 훅 그룹 제거 한 방향은 남긴다.** `doctor`는 읽기 전용 진단으로
-   축소하고 "옛 방식 등록물이 남아 있다"를 알린다 — 문면은 D100 계약 2의 어휘 규칙을 따른다
-   (`MANDATORY`·`BLOCKED`·`Do NOT`·이모지 금지, 부정으로 해명하지 않기).
-4. **훅 형태 이관** — `command`+`args` **배열**, 결정은 **JSON**. `SessionStart`에도 `matcher`,
-   Windows용 `commandWindows`. 종료 코드 1·3은 거부가 아니므로 **훅을 보안 게이트로 쓰지 마라.**
+   색인한다. `outputSchema`는 건드리지 마라 — 프롬프트 비용 0이 실측됐다.
+   **Claude 한정 최적화로 표기하라**(§5-4) — Codex 등가는 미측정이다.
+3. **훅 형태 이관** — `command` + `args` **배열**, 결정은 **`exit 0` + JSON**
+   (`exit 2`는 stdout을 버린다 — 두 경로는 배타적이다). `SessionStart`에도 `matcher`, Windows용
+   `commandWindows`. **종료 코드 1·3은 거부가 아니므로 훅을 보안 게이트로 쓰지 마라.**
+   **양쪽에서 한 번 발화를 재고 나서** 계약으로 굳혀라(§5-1).
+4. **기입 경로 은퇴**(D97) — **1이 닫힌 뒤에만.** `codex_toml.go` 전부,
+   `hook_install.go`·`mcp_install.go`의 기입·병합부. **읽기(감지원)와 훅 그룹 제거 한 방향은
+   남긴다.** `doctor`는 읽기 전용 진단으로 축소하고 "옛 방식 등록물이 남아 있다"를 알린다 —
+   문면은 D100 계약 2의 어휘 규칙을 따른다(`MANDATORY`·`BLOCKED`·`Do NOT`·이모지 금지, 부정으로
+   해명하지 않기). **`hostSnippet` 갱신이 여기 든다**(§5-12) — 지금도 옛 접두 규칙을 안내한다.
 
-## 먼저 할 것
+## 안전 규칙 하나 — 문서·안내에 반드시 넣어라
 
-**게시 연기 시험**(§5.2)을 이르게 하라 — 산출물이 서면 저장소를 게시해 양쪽에서
-`plugin marketplace add <owner>/<repo>` + install을 한 번 돌려 본다. 그것만이 남은 미검증이다.
+**옛 등록물 제거가 설치의 0번 걸음이다**(스펙 A⑧·§2). 플러그인이 선언한 서버의 `command`+`args`가
+이미 등록된 서버와 같으면 **호스트가 경고 없이 버린다.** 마이그레이션하는 모든 사용자가 여기
+걸리고 증상은 "깔았는데 아무 일도 안 일어난다"다. 제거 확인은 **종료 코드가 아니라 `mcp list`로**
+한다 — `codex mcp remove`는 없는 이름에도 exit 0을 낸다.
 
 ## 진행 방식
 
