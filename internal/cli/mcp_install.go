@@ -82,11 +82,14 @@ func mcpConfigPath(projectRoot string) string {
 	return filepath.Join(projectRoot, ".mcp.json")
 }
 
-// mcpManagedMarker — .mcp.json에서 우리 항목의 __ctrManaged와 command를 읽는다(D83 감지원).
-// 파싱 실패·우리 항목 부재는 found=false다 — 파일 존재 여부는 호출자가 따로 본다(--fix의
-// no-create). command까지 돌려주는 이유: 표식이 없어도 command가 우리 것이면 D80의 인수
-// 대상이라 install도 --fix도 표식을 채운다. 그 상태를 "미등록"으로 접으면 감지와 고침이 어긋난다.
-func mcpManagedMarker(data []byte) (marker, command string, found bool) {
+// mcpManagedMarker — .mcp.json에서 name 서버 항목의 __ctrManaged와 command를 읽는다(D83
+// 감지원). 파싱 실패·그 이름의 항목 부재는 found=false다 — 파일 존재 여부는 호출자가 따로
+// 본다(--fix의 no-create). command까지 돌려주는 이유: 표식이 없어도 command가 우리 것이면
+// D80의 인수 대상이라 install도 --fix도 표식을 채운다. 그 상태를 "미등록"으로 접으면 감지와
+// 고침이 어긋난다. name을 매개변수로 받는다(재검토 리뷰 4) — 유일한 호출자(doctor [20])가
+// 현재 이름(ctrMCPServerName)뿐 아니라 D63 ②가 대체한 옛 이름("ctr")도 같은 파일에서 확인해야
+// 하고, 그 확인을 doctor 쪽에서 JSON 구조를 다시 파싱해 중복 구현하지 않는다.
+func mcpManagedMarker(data []byte, name string) (marker, command string, found bool) {
 	var doc struct {
 		Servers map[string]struct {
 			Managed string `json:"__ctrManaged"`
@@ -96,7 +99,7 @@ func mcpManagedMarker(data []byte) (marker, command string, found bool) {
 	if json.Unmarshal(data, &doc) != nil {
 		return "", "", false
 	}
-	e, ok := doc.Servers[ctrMCPServerName]
+	e, ok := doc.Servers[name]
 	if !ok {
 		return "", "", false
 	}

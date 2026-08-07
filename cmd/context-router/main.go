@@ -85,15 +85,27 @@ func parseFlags(args []string) (serverFlags, error) {
 	// 여는 프로필이라 이것은 문서화되지 않은 맨 실행의 자세(posture) 변화다 — 이미 문서화된 설치
 	// 절차는 전부 ingest,net을 명시로 전달하므로 그 경로는 영향이 없다(v0.19 리뷰 C1, 소유자
 	// 결정).
-	if enable == "" {
-		enable = os.Getenv("CTR_ENABLE")
-	}
-	if enable == "" {
-		enable = defaultEnableProfile
-	}
+	// 재검토 리뷰 2: 공백뿐이거나 쉼표뿐인 값(예: CTR_ENABLE="   "나 ",")은 원본 문자열이
+	// 비어 있지 않아 위 "빈 문자열일 때만" 이관·기본값 대체 둘 다 건너뛰지만, parseEnableList가
+	// 그런 값을 오류 없이 빈 슬라이스로 돌려주므로(항목별 트림 뒤 전부 공백이라 스킵) 결과가
+	// 조용히 "프로필 0개"가 된다 — parseEnableList 자신의 doc 주석이 막으려는 바로 그 조용한
+	// 오설정이다. 그래서 각 단계를 "원본이 비었는가"가 아니라 "파싱 결과가 비었는가"로 넘긴다:
+	// 플래그가 쓸모없으면(빈 값이든 공백/쉼표뿐이든) 환경 변수로, 환경 변수도 쓸모없으면
+	// 기본값으로. 오류(모르는 이름)는 그 자리에서 바로 반환하고 다음 단계로 넘기지 않는다 —
+	// 오탈자를 조용히 삼키면 안 된다는 것은 기존 계약 그대로다.
 	enableList, err := parseEnableList(enable)
 	if err != nil {
 		return serverFlags{}, err
+	}
+	if len(enableList) == 0 {
+		if enableList, err = parseEnableList(os.Getenv("CTR_ENABLE")); err != nil {
+			return serverFlags{}, err
+		}
+	}
+	if len(enableList) == 0 {
+		if enableList, err = parseEnableList(defaultEnableProfile); err != nil {
+			return serverFlags{}, err // 상수라 사실상 도달하지 않는다
+		}
 	}
 	f.Enable = enableList
 	for _, p := range strings.Split(projects, ",") {

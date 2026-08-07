@@ -74,7 +74,7 @@ func TestIsolateCodexHome(t *testing.T) {
 	}
 	writeCodexConfig(t, home, "[mcp_servers.ctr]\ncommand = \"context-router\"\n")
 	out, _ := doctorOut(t, t.TempDir())
-	if !strings.Contains(out, "옛 방식으로 손편집된 등록물이 남아 있다 — "+want+":1") {
+	if !strings.Contains(out, "플러그인 이전 방식의 등록물이 남아 있다 — "+want+":1") {
 		t.Errorf("doctor가 격리된 홈의 픽스처를 파일:줄로 짚지 않았다:\n%s", out)
 	}
 }
@@ -2507,21 +2507,6 @@ func TestCodexRegistrationVerdict(t *testing.T) {
 	}
 }
 
-// TestMarkerDriftLabel — 라벨 문법의 소유자를 하나로 둔다. 문법이 여러 자리에 복제돼 있으면
-// 한 자리만 고친 변경이 표면상 어긋난 두 줄을 만든다.
-func TestMarkerDriftLabel(t *testing.T) {
-	cases := []struct{ marker, version, want string }{
-		{"context-router/0.16.0", "0.17.0", "marker 0.16.0≠0.17.0"},
-		{"context-router", "0.17.0", "marker 버전미상≠0.17.0"},
-		{"context-router/0.17.0", "0.17.0", "marker 0.17.0"},
-	}
-	for _, c := range cases {
-		if got := markerDriftLabel(c.marker, c.version); got != c.want {
-			t.Errorf("markerDriftLabel(%q,%q) = %q, want %q", c.marker, c.version, got, c.want)
-		}
-	}
-}
-
 // TestRunDoctorFixFlag — D97 계약 1. doctor --fix는 더는 받아들여지지 않는다 — 플래그 자체가
 // 지워졌다(무동작으로 남기지 않는다는 것이 D96 요구다). 인자를 하나라도 주면 거부한다.
 func TestRunDoctorFixFlag(t *testing.T) {
@@ -2868,11 +2853,12 @@ func TestDoctorCodexHandEditDetection(t *testing.T) {
 		name       string
 		cfg        string // "" = config.toml을 만들지 않는다
 		wantReport bool
+		wantParses bool // wantReport일 때만 의미 — 다음 걸음이 codex mcp list/remove 안내인지(true), "직접 열어 정리" 안내인지(false, 재검토 리뷰 6)
 	}{
-		{"등록물 있음", "[mcp_servers.ctr]\ncommand = \"context-router\"\n", true},
-		{"등록물 없음 — 무관 설정만", "[model]\nname = \"gpt\"\n", false},
-		{"파일 자체가 없음", "", false},
-		{"무효 TOML이어도 헤더는 잡힌다(닫히지 않은 배열)", "[mcp_servers.ctr]\ncommand = \"context-router\"\nbad = [1, 2,\n", true},
+		{"등록물 있음", "[mcp_servers.ctr]\ncommand = \"context-router\"\n", true, true},
+		{"등록물 없음 — 무관 설정만", "[model]\nname = \"gpt\"\n", false, false},
+		{"파일 자체가 없음", "", false, false},
+		{"무효 TOML이어도 헤더는 잡힌다(닫히지 않은 배열)", "[mcp_servers.ctr]\ncommand = \"context-router\"\nbad = [1, 2,\n", true, false},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -2881,7 +2867,7 @@ func TestDoctorCodexHandEditDetection(t *testing.T) {
 				writeCodexConfig(t, home, c.cfg)
 			}
 			out, err := doctorOut(t, t.TempDir())
-			got := strings.Contains(out, "옛 방식으로 손편집된 등록물이 남아 있다")
+			got := strings.Contains(out, "플러그인 이전 방식의 등록물이 남아 있다")
 			if got != c.wantReport {
 				t.Errorf("report=%v want %v:\n%s", got, c.wantReport, out)
 			}
@@ -2892,11 +2878,23 @@ func TestDoctorCodexHandEditDetection(t *testing.T) {
 				return
 			}
 			wantPath := filepath.Join(home, "config.toml")
-			if !strings.Contains(out, "옛 방식으로 손편집된 등록물이 남아 있다 — "+wantPath+":1\n") {
+			if !strings.Contains(out, "플러그인 이전 방식의 등록물이 남아 있다 — "+wantPath+":1\n") {
 				t.Errorf("파일:줄 형식이 없다 — want 접미 %q:\n%s", wantPath+":1", out)
 			}
 			if !strings.Contains(out, "다음 걸음") || !strings.Contains(out, "codex mcp remove") || !strings.Contains(out, "codex mcp list") {
 				t.Errorf("다음 걸음 안내(codex mcp remove/list)가 없다:\n%s", out)
+			}
+			// 재검토 리뷰 6: 위 검사는 두 갈래 메시지 모두에 "codex mcp remove"·"codex mcp
+			// list" 부분 문자열이 들어 있어(하나는 실행을 권하고 하나는 닿지 못한다고 말한다)
+			// 갈래를 가르지 못한다 — 갈래별 실제 문구로 가른다.
+			if c.wantParses {
+				if !strings.Contains(out, "다음 걸음 — codex mcp list로 등록된 이름을 확인한 뒤 codex mcp remove") {
+					t.Errorf("TOML이 파스되는데 codex mcp list/remove 실행 안내가 아니다:\n%s", out)
+				}
+			} else {
+				if !strings.Contains(out, "다음 걸음 — 이 파일은 TOML로 파스되지 않아") {
+					t.Errorf("TOML이 파스되지 않는데 '직접 열어 정리' 안내가 아니다:\n%s", out)
+				}
 			}
 		})
 	}
@@ -2916,7 +2914,7 @@ func TestDoctorCodexConfigUnreadable(t *testing.T) {
 	if !strings.Contains(out, "[16] codex: config.toml 읽기 실패") {
 		t.Errorf("읽기 실패가 조용히 삼켜졌다(등록물 없음으로 오판):\n%s", out)
 	}
-	if strings.Contains(out, "옛 방식으로 손편집된 등록물이 남아 있다") {
+	if strings.Contains(out, "플러그인 이전 방식의 등록물이 남아 있다") {
 		t.Errorf("읽지 못한 파일에서 손편집 등록물을 찾았다고 보고했다:\n%s", out)
 	}
 }
@@ -3060,7 +3058,7 @@ func TestDoctorMcpJsonHandEditDetection(t *testing.T) {
 				write(t, mcpConfigPath(projectRoot), []byte(c.body))
 			}
 			out, err := doctorOut(t, projectRoot)
-			got := strings.Contains(out, "[20] claude: 옛 방식으로 손편집된 등록물이 남아 있다")
+			got := strings.Contains(out, "[20] claude: 플러그인 이전 방식의 등록물이 남아 있다")
 			if got != c.wantReport {
 				t.Errorf("report=%v want %v:\n%s", got, c.wantReport, out)
 			}
@@ -3071,7 +3069,7 @@ func TestDoctorMcpJsonHandEditDetection(t *testing.T) {
 				return
 			}
 			wantPath := mcpConfigPath(projectRoot)
-			if !strings.Contains(out, "[20] claude: 옛 방식으로 손편집된 등록물이 남아 있다 — "+wantPath+"\n") {
+			if !strings.Contains(out, "[20] claude: 플러그인 이전 방식의 등록물이 남아 있다 — "+wantPath+" ("+ctrMCPServerName+")\n") {
 				t.Errorf("파일 경로가 없다 — want %q:\n%s", wantPath, out)
 			}
 			if !strings.Contains(out, "[20] claude: 다음 걸음 — claude mcp remove "+ctrMCPServerName) {

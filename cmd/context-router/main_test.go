@@ -152,10 +152,13 @@ func TestParseFlags_CTR_ENABLE(t *testing.T) {
 	})
 }
 
-// TestParseFlags_EnablePrecedence — v0.19 리뷰 C1. 세 값의 우선순위(--enable > CTR_ENABLE >
-// defaultEnableProfile)를 한 표에서 잰다. C1 이전에는 셋째 갈래(둘 다 없음)가 빈 값으로
-// 떨어져 plugin/mcp.json의 고정 args가 CTR_ENABLE을 항상 이겼다 — 그 표를 D101 계약 2가
-// 요구하는 기본값으로 뒤집는 것이 이 테스트의 대상이다.
+// TestParseFlags_EnablePrecedence — v0.19 리뷰 C1·재검토 리뷰 2. 세 값의 우선순위(--enable >
+// CTR_ENABLE > defaultEnableProfile)를 한 표에서 잰다. C1 이전에는 셋째 갈래(둘 다 없음)가 빈
+// 값으로 떨어져 plugin/mcp.json의 고정 args가 CTR_ENABLE을 항상 이겼다 — 그 표를 D101 계약
+// 2가 요구하는 기본값으로 뒤집는 것이 이 테스트의 대상이다. 마지막 두 행은 재검토 리뷰 2 —
+// 공백뿐이거나 쉼표뿐인 값은 원본 문자열이 비어 있지 않아도 파싱하면 이름이 하나도 안 남는다
+// (parseEnableList가 그런 값을 오류 없이 빈 슬라이스로 돌려준다) — 그 상태가 "그 단계는
+// 쓸모없다"로 다음 단계에 넘어가는지를 각각 env·flag 자리에서 확인한다.
 func TestParseFlags_EnablePrecedence(t *testing.T) {
 	cases := []struct {
 		name    string
@@ -167,6 +170,8 @@ func TestParseFlags_EnablePrecedence(t *testing.T) {
 		{"env만 있음 → env", "", "exec", []string{"exec"}},
 		{"flag만 있음 → flag", "ingest", "", []string{"ingest"}},
 		{"둘 다 있음 → flag가 이긴다", "exec", "ingest,net", []string{"exec"}},
+		{"env가 공백/쉼표뿐 → 기본값", "", "  , , ", []string{"ingest", "net"}},
+		{"flag가 쉼표뿐 → env로 폴백", ",", "exec", []string{"exec"}},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

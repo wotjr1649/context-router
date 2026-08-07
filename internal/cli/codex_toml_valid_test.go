@@ -140,7 +140,7 @@ func TestDoctorCodexBOMNoFalseAlarm(t *testing.T) {
 	home := isolateCodexHome(t)
 	writeCodexConfig(t, home, codexBOM+"model = \"gpt-5\"\n\n[mcp_servers.ctr]\ncommand = \"context-router\"\n")
 	out, _ := doctorOut(t, t.TempDir())
-	if !strings.Contains(out, "옛 방식으로 손편집된 등록물이 남아 있다") {
+	if !strings.Contains(out, "플러그인 이전 방식의 등록물이 남아 있다") {
 		t.Fatalf("BOM 파일의 등록물을 doctor가 놓쳤다:\n%s", out)
 	}
 	if !strings.Contains(out, ":3\n") {
