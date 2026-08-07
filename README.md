@@ -37,28 +37,62 @@ separately in `docs/oracle-mapping-ko.md`.
 
 ## Install & host registration
 
-No tagged release yet — install from source with `go install`, which places
-the binary in `$(go env GOPATH)/bin` (add that to `PATH`, or reference it by
-absolute path):
+`context-router` installs as a Claude Code / Codex plugin — the host reads
+the plugin manifest and registers the MCP server itself. This program does
+not write to `.mcp.json`, `settings.json`, or `config.toml`.
+
+**0. Remove any existing hand-written registration.** Both hosts silently
+discard a plugin-declared MCP server when its `command` + `args` already
+match a registered one — no warning, no error; the symptom is that the
+plugin appears to do nothing. Remove old registrations (from a prior
+version of this tool, or a manual `mcp add`) first:
+
+```sh
+claude mcp remove <name>
+codex mcp remove <name>
+```
+
+`codex mcp remove` exits 0 even when `<name>` does not exist, so the exit
+code cannot confirm removal — check with `mcp list` that the entry is
+actually gone.
+
+**1. Get the binary:**
 
 ```sh
 go install github.com/wotjr1649/context-router/cmd/context-router@latest
 ```
 
-Or build locally and run it by path:
+or build locally with `go build -o context-router ./cmd/context-router`. The
+plugin manifest launches the bare `context-router` command, so the binary
+needs to resolve on `PATH`.
+
+**2. Install the plugin:**
 
 ```sh
-go build -o context-router ./cmd/context-router
-./context-router doctor
+# Claude Code
+claude plugin marketplace add wotjr1649/context-router
+claude plugin install context-router --scope <user|project|local>
+
+# Codex
+codex plugin marketplace add wotjr1649/context-router
+codex plugin add context-router
 ```
 
-`doctor` diagnoses the store root, DB, and FTS5 setup for the current
-project, and prints ready-to-use host registration snippets (e.g. for Claude
-Code's `.mcp.json` / `claude mcp add`, or Codex's `~/.codex/config.toml`),
-including recommended default permission rules (`ctr_index` /
-`ctr_fetch_and_index` and any `global-search`-profile tool default to "ask").
-If `context-router` is not on `PATH`, use the absolute path to the binary in
-the registration snippet the host config expects.
+**3. Verify.** `mcp list` shows the server, in each host's own format:
+Claude Code as `plugin:context-router:ctr … Connected`, Codex as
+`ctr … enabled`.
+
+`ingest` and `net` are enabled by default; set `CTR_ENABLE` to a
+comma-separated list of `ingest` / `net` / `exec` to change that (e.g.
+`CTR_ENABLE=ingest,net,exec`) — the plugin manifest passes no `--enable`
+flag, so this environment variable is what a plugin-managed install reads.
+A `--enable` flag, if you invoke the binary directly, always wins over
+`CTR_ENABLE`.
+
+`context-router doctor` diagnoses the store root, DB, and FTS5 setup for the
+current project, and prints the steps above together with the current tool
+prefix (`mcp__plugin_context-router_ctr__`) and a sample permission rule for
+`ctr_index` / `ctr_fetch_and_index` (both default to "ask").
 
 ## CLI
 

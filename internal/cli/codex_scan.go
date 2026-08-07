@@ -19,7 +19,8 @@ import (
 //
 // Windows 편집기(PowerShell 5.1의 `Out-File -Encoding utf8`, 구버전 메모장)가 파일 첫 줄에
 // 붙이는 바이트인데 U+FEFF는 이 파일의 정규화(`strings.TrimSpace`, codexHeaderName)가 보는
-// 공백이 아니라 그대로 통과한다 `[문서]`(unicode.IsSpace가 U+FEFF를 포함하지 않는다).
+// 공백이 아니라 그대로 통과한다 `[실측]`(설치된 Go의 unicode/tables.go를 직접 열어 확인 —
+// _White_Space 레인지 테이블에 U+FEFF가 없다).
 // 떼지 않으면 파일 첫 줄이 테이블 헤더일 때 그 헤더가 인식되지 않는다. Codex 자신은 BOM이
 // 붙은 config.toml을 정상으로 읽으므로 `[실측]` 갈리는 것은 우리 판정뿐이고, 그래서 doctor가
 // 멀쩡한 파일에 오보를 내지 않으려면 판정 전에 떼야 한다.

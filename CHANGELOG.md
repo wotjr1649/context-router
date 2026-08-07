@@ -8,6 +8,50 @@
 [Semantic Versioning](https://semver.org/lang/ko/)을 따른다. 각 항목의 D 번호는
 그 결정의 근거가 있는 설계 문서 절을 가리킨다.
 
+## [0.19.0] — 2026-08-08
+
+호스트 설정 파일에 등록물을 손으로 써 넣는 일을 그만둔다(D96–D101). Claude Code와 Codex가
+플러그인 매니페스트를 읽어 MCP 서버를 스스로 등록하고, 이 프로그램은 어떤 호스트 설정
+파일에도 쓰지 않는다. 열여덟 릴리스에 걸쳐 손편집 등록이 낸 파일 파괴 결함 다섯이 그 기입
+경로와 함께 사라진다(v0.18 §3.5·§3.7·§3.8).
+
+### Added
+
+- **`CTR_ENABLE` 환경 변수**(D101) — `--enable`과 같은 쉼표 목록(`ingest`/`net`/`exec`)을
+  받는다. 우선순위는 `--enable` 플래그 > `CTR_ENABLE` > 내장 기본값 `ingest,net` 순이다.
+  플러그인 매니페스트는 `args`를 고정하지 않으므로, 플러그인으로 설치한 서버의 프로필을
+  바꾸는 방법은 이 환경 변수뿐이다.
+- **`doctor`가 옛 등록물을 순수 줄 스캐너로 찾는다**(`internal/cli/codex_scan.go`) —
+  `codex mcp get`은 무효 TOML에서 실패하고 `--json`은 자격증명을 평문으로 내므로 둘 다
+  쓰지 않는다(설계서 §5-13).
+
+### Changed — 사용자 관측 가능한 동작 변경
+
+- **도구 이름 접두가 `mcp__ctr-exec__`에서 `mcp__plugin_context-router_ctr__`로 바뀐다**
+  (D98). 손으로 붙여 넣은 권한 규칙(`.claude/settings.json`의 `permissions.ask`/`allow`)은
+  옛 접두를 참조하므로 더는 매치하지 않는다 — 이 프로그램은 그 파일을 고치지 않으므로
+  (D96 계약 1) 새 접두로 직접 옮겨야 한다.
+- **`hook uninstall`의 범위가 훅 그룹 제거 하나로 좁아진다** — `.claude/settings.json`과
+  Codex `hooks.json`의 우리 훅 그룹만 지운다. `.mcp.json` 항목·MCP 승인 키·`config.toml`
+  관리 블록 제거는 더 이상 하지 않는다 — 그 자리는 호스트 자신의 `mcp remove`가 맡는다.
+- **Claude Code의 플러그인 설치·삭제는 `settings.json`을 통째로 재직렬화한다** — 사용자
+  값은 보존되지만 들여쓰기·줄바꿈·키 순서가 바뀌고, `plugin uninstall`은 빈
+  `"enabledPlugins": {}`를 남겨 왕복이 원래 바이트로 돌아오지 않는다. `settings.json`에
+  주석이 있으면 `plugin marketplace add`가 `Invalid JSON syntax`로 실패하고 파일은 손대지
+  않는다 — Claude의 설정 파일은 JSONC가 아니라 엄격 JSON이다. Codex의 같은 왕복은
+  `config.toml`을 원본과 바이트 단위로 동일하게 되돌린다(설계서 §5-10).
+- **인자·환경 변수 없이 맨 `context-router`를 실행하면 기본 프로필 `ingest,net`이 켜진다**
+  (D101) — 이전에는 `--enable`/`CTR_ENABLE` 없이는 `ctr_index`·`ctr_fetch_and_index` 둘 다
+  꺼져 있었다. `net`은 아웃바운드 HTTP를 여는 프로필이다. 플러그인 매니페스트도 `args`를
+  넘기지 않으므로, 플러그인으로 설치한 서버가 켜는 프로필이 바로 이 기본값이다.
+
+### Removed
+
+- **`hook install`이 사라진다.** 실행하면 파일을 하나도 만들지 않고 플러그인 설치 절차를
+  안내한 뒤 종료 코드 1로 끝난다. 등록은 `claude plugin install` / `codex plugin add`가
+  한다(D96·D97). `.mcp.json`·`config.toml` 기입 코드 전부(`codex_toml.go` 포함)가 함께
+  사라진다.
+
 ## [0.18.0] — 2026-08-06
 
 v0.17이 "뿌리 A"라 부른 것 — **판독기들이 같은 바이트를 서로 다르게 본다는 사실 자체** —
@@ -674,6 +718,7 @@ v0.18 설계로 넘겼다(§4). **동작 변경은 없다 — 보고가 파일�
 - **doctor 호스트 스니펫이 권한 모드를 기준으로 안내한다** (D64). 승인 강도가
   호스트 권한 모드와 규칙 평가 순서에 따라 달라지는 점을 문면에 반영했다.
 
+[0.19.0]: https://github.com/wotjr1649/context-router/compare/v0.18.0...v0.19.0
 [0.18.0]: https://github.com/wotjr1649/context-router/compare/v0.17.2...v0.18.0
 [0.17.2]: https://github.com/wotjr1649/context-router/compare/v0.17.1...v0.17.2
 [0.17.1]: https://github.com/wotjr1649/context-router/compare/v0.17.0...v0.17.1

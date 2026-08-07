@@ -583,22 +583,60 @@ v0.18 핸드오프 §5.2의 목록은 **거의 전부 기입 경로의 부산물
    `codex features list`가 `hooks` · `plugins` · `plugin_sharing` · `skill_search`를 전부
    `stable / true`로 낸다. `plugin_hooks`는 `removed / false`다 — 참조 구현 README가 요구하는
    그 키는 낡았다. **사용자가 설정 파일에 한 줄도 칠 필요가 없다.**
-10. **설치의 왕복 바이트 영향** `[미실측]`. A⑦은 `plugin add` **한 방향만** 쟀다. 제거·업그레이드·
-    재설치가 `config.toml`에 무엇을 하는지는 모른다. §4가 "uninstall이 파일을 비우는 형태"를
-    폐기 처리하면서 그 쓰기 주체를 호스트로 옮겼을 뿐이므로, **기록기를 지우기 전에
-    install → uninstall → reinstall 왕복의 바이트 비교를 하라.**
+10. **설치의 왕복 바이트 영향** — **닫혔다.** `[실측]` 호스트별로 결과가 갈린다.
+    - **Codex**: 왕복 전체(`plugin marketplace add` → `plugin add` → `plugin remove` →
+      `plugin add` → `plugin remove` → `plugin marketplace remove`)가 `config.toml`을
+      시작 상태와 **바이트 그대로** 되돌린다(SHA-256 앞자리 `C02D634F`, 277바이트, 무변경).
+      단계마다 순수 추가이거나 순수 제거다 — `marketplace add`는 4줄 `[marketplaces.<이름>]`
+      블록을, `plugin add`는 3줄 `[plugins."<이름>@<마켓플레이스>"] enabled = true` 블록을
+      넣고, 각 제거는 자기가 넣은 것만 그대로 되가져간다. 머리 주석·넓은 공백과 작은따옴표와
+      꼬리 주석이 붙은 `model` 줄·미지 키·미지 테이블·헤더 바로 위 주석·`args = []`·인라인
+      `env = { … }`·EOF 주석을 담은 씨앗 파일이 전 과정을 무변경으로 통과했다.
+    - **Claude**: 사용자 데이터는 살아남지만 `settings.json`이 **통째로 재직렬화**된다 —
+      4칸 들여쓰기가 2칸이 되고, 인라인 객체·배열이 여러 줄로 펼쳐지며, 키 순서가 바뀐다.
+      `plugin uninstall`은 빈 `"enabledPlugins": {}`를 남겨 왕복이 시작 바이트로 돌아오지
+      않는다. 사용자 키·값은 전부 보존된다.
+    - **Claude, `settings.json`에 주석이 있으면**: `plugin marketplace add`가
+      `Invalid JSON syntax in settings file`로 exit 1이 되고 **파일은 손대지 않는다.**
+      Claude의 설정 파일은 JSONC가 아니라 엄격 JSON이다. Fail-closed.
+
+    A⑦이 잰 것은 `add` 한 방향뿐이었다 — 이제 전 왕복이 닫혀 D97의 배송 조건(§0) 중 하나가
+    채워졌다.
 11. **긴 경로 클론 실패** `[실측]`. 플러그인 설치는 **저장소를 통째로 클론한다.** 설정 홈 경로가
     길면 Windows 파일명 길이 한계로 `fatal: failed to unlink … Filename too long`이 나고 설치가
     죽는다(짧은 경로에서는 성공). **이 코호트는 무효 TOML 코호트보다 크다.** 완화 후보는
     `--sparse`(양쪽 CLI에 있다)이고, 재지 않았다.
-12. **옛 접두 권한 규칙** `[미해결]`. 도구 접두가 바뀌면 사용자가 자기 `settings.json`에
-    붙여넣은 `mcp__ctr-exec__*` 규칙이 무효가 되는데, D96 계약 1이 우리가 그 파일을 고치는 것을
-    금한다. `hostSnippet`(`internal/cli/cli.go`)은 **지금도 옛 규칙을 붙여넣도록 안내한다.**
-    → `hostSnippet`을 갱신하고, `doctor`가 옛 접두 규칙의 잔존을 **읽기 전용으로** 알린다.
-13. **`doctor`의 감지원** `[미해결]`. §3이 감지를 `codex mcp get`으로 갈음할 수 있는지 묻는데,
-    그 명령은 **무효 TOML에서 실패하고** `--json`은 `env` 값을 평문으로 낸다(§6). 그러면 D97
-    계약 2의 "어느 줄인지 짚는다"를 지킬 수 없다. → 최소한의 줄 위치 탐지기를 남기거나 그
-    약속을 철회하라. **어느 쪽이든 `doctor`는 `--json`을 호출하지 않는다.**
+12. **옛 접두 권한 규칙** — **닫혔다.** `[실측]` 새 접두는 `mcp__plugin_context-router_ctr__`다
+    (D98). 사용자가 자기 `settings.json`에 붙여넣은 `mcp__ctr-exec__*` 권한 규칙은 더 이상
+    매치하지 않는데, D96 계약 1이 우리가 그 파일을 고치는 것을 금하므로 그 규칙은 사용자가
+    직접 옮겨야 한다. `hostSnippet`의 권한 규칙 예시가 새 접두로 다시 쓰였다 — 옛 접두
+    부재·새 접두 존재를 `TestHostSnippetUsesCurrentServerPrefix`가 잰다. 읽기 전용으로
+    남는 보고는 **등록물 잔존**([20]) 쪽이다 — 옛 서버 이름(`ctr-exec`·`ctr`)의 `.mcp.json`·
+    `enabledMcpjsonServers` 잔존을 파일과 다음 걸음으로 알린다. 사용자의 `permissions.ask`/
+    `allow` 배열에 남은 옛 접두 규칙 **문자열 자체**를 doctor가 따로 짚어 주지는 않는다 —
+    그 규칙은 D96 계약 1 아래 사용자가 직접 찾아 고쳐야 한다.
+13. **`doctor`의 감지원** — **닫혔다.** `[실측]` 결정: `codex mcp get`도 어떤 `--json` 형태도
+    쓰지 않는다. 이유 둘 — `codex mcp get`은 무효 `config.toml`에서 실패하는데 그것이 정확히
+    진단이 필요한 코호트이고, `--json`은 `env` 값을 평문으로 내 우리 출력에 자격증명을 싣게
+    된다. 대신 순수 줄 스캐너(`internal/cli/codex_scan.go`)가 TOML 파서 없이
+    `[mcp_servers.<이름>]` 헤더와 1-기반 줄 번호를 찾는다 — 파서라면 거부할 파일에서도
+    동작하는 것이 존재 이유다. 문서화된 한계 셋: 여러 줄 문자열 안에서 헤더 모양인 줄은
+    오탐한다 · 안 닫힌 따옴표는 최선-노력으로 지저분한 이름을 낸다 · 닫는 대괄호 뒤의
+    비-주석 내용은 매치하지 않는다. 대가는 의도된 선택이다 — 오탐의 비용은 쓸모없는 줄
+    번호 하나이고, 반대로 그냥 넘기면 사용자가 자기 파일이 깨끗하다고 잘못 믿는다.
+14. **훅 등록물의 릴리스 간 바이트 동일성 — 속성은 옮겨갔고 새 집은 아직 무주장이다.**
+    D82는 서로 다른 두 버전이 훅 등록물을 바이트 그대로 같게 조립한다고 결정했다. 그 핵심
+    단정(`TestHookRegistrationBytesVersionIndependent`, 4단정)은 조립기(**쓰기 경로**)가
+    있어야 성립했고, 넷 중 셋이 그 조립기를 요구했다 — 이번 릴리스가 조립기를 지웠다(D97
+    계약 1). 살아남은 것은 **표식 인식**뿐이다: `scanRegisteredHooks`가 무버전 마커
+    (`context-router`)와 구버전 마커(`context-router/0.14.0`)를 똑같이 우리 것으로 읽고
+    대칭 제거한다는 단정은 여전히 돈다(`TestLegacyVersionedMarkerStillOwned`). **바이트
+    동일성 자체의 새 자리는 정적 매니페스트(`hooks/hooks.json`)다** — 그 파일이 릴리스마다
+    같은 바이트여야 그 속성을 물려받는데, 지금은 아무것도 그것을 확인하지 않는다. →
+    매니페스트가 쓸 훅 표식이 `isOurHookGroup`/`scanRegisteredHooks`가 받아들이는
+    **무버전** 형태(`context-router`)인지 확인하는 단정이 필요하다. 버전 붙은 표식을
+    쓰면 `hookScope`의 `marker != version` 분기(`cli.go` [9]·[16])가 매 릴리스 마이그레이션
+    경고를 낸다 — D82가 막으려던 바로 그 증상이다. §5-8과 같은 매니페스트를 겨눈 항목이다.
 
 ## 6. 기록 정정
 
@@ -619,6 +657,11 @@ v0.18 핸드오프 §5.2의 목록은 **거의 전부 기입 경로의 부산물
 - **자격증명 경로 하나** `[실측]`: `codex mcp list`(표)는 `env` 값을 `*****`로 가리는데
   **`--json`은 평문으로 낸다.** `mcp get --json`도 같다. 문서와 `doctor` 안내가 그 명령을
   권할 때 걸린다. D95가 `.mcp.json` 백업에서 본 것과 같은 부류다.
+- **`hookRegistrations`·`codexRegistrations`(`internal/cli/hook_install.go`)는 냉동된
+  역사적 상수다.** 옛 설치기가 남긴 이벤트 이름 목록이고, 지금은 `hook uninstall`의 제거
+  쪽만 읽는다(D96 계약 1의 유일한 예외). 플러그인 매니페스트(`hooks/hooks.json`)와는
+  **아무것도 묶여 있지 않고, 묶여서도 안 된다** — 존재 이유는 제거기가 옛 설치기의
+  산출물을 알아보게 하는 것이지, 매니페스트가 선언할 이벤트 집합을 정하는 것이 아니다.
 
 ## 7. 참조 구현이 우리 대신 치른 값 (증거이지 지시가 아니다 — S1)
 
