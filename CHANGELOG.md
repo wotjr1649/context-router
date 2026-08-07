@@ -53,7 +53,10 @@
   안내한 뒤 종료 코드 1로 끝난다. 등록은 `claude plugin install` / `codex plugin add`가
   한다(D96·D97). `.mcp.json`·`config.toml` 기입 코드 전부(`codex_toml.go` 포함)가 함께
   사라진다. 훅 정의 자체는 플러그인 매니페스트(`hooks/hooks.json` ·
-  `hooks/codex-hooks.json`)가 나르므로 수동 포착은 그대로 돈다. 옛 설치기가 남긴 훅 그룹은
+  `hooks/codex-hooks.json`)가 나르므로 수동 포착은 Claude Code에서 플러그인 설치만으로 그대로
+  돈다. **Codex에서는 훅 신뢰를 준 뒤부터다** — Codex의 훅은 지속되는 신뢰를 요구하고
+  (`codex --help`의 `--dangerously-bypass-hook-trust`), 신뢰를 주지 않은 홈에서 돌린 프로브는
+  `SessionStart`를 포함해 훅이 하나도 발화하지 않았다(설계서 §5-8). 옛 설치기가 남긴 훅 그룹은
   `hook uninstall`로 지운다 — 매니페스트 훅과 겹쳐 두면 같은 포착이 두 번 일어나고,
   `doctor [9]`·`[16]`이 그 잔존을 짚는다.
 

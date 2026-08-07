@@ -351,11 +351,8 @@ const (
 )
 
 // deferredToolIndex: 등록된 지연 도구 항목들을 진입 도구 Description 꼬리 한 문장으로 만든다.
-// 항목이 하나도 없으면 빈 문자열 — 꼬리 자체가 붙지 않는다.
+// entries는 최소 하나다 — registerFetch가 무조건 등록이라 NewServer가 idxFetch로 시작한다.
 func deferredToolIndex(entries []string) string {
-	if len(entries) == 0 {
-		return ""
-	}
 	return "그 밖의 도구(필요 시 지연 로드): " + strings.Join(entries, ", ") + "."
 }
 

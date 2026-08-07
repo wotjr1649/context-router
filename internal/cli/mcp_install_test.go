@@ -267,9 +267,10 @@ func TestHostSnippetUsesCurrentServerPrefix(t *testing.T) {
 // 플러그인 이름(`.claude-plugin/plugin.json`의 `name`)과 MCP 서버 키(`plugin/mcp.json`의
 // `mcpServers` 유일 키). 어느 쪽 이름을 바꿔도 ctrToolPrefix가 따라 움직이지 않으면 doctor가
 // 아무것도 매치하지 않는 접두를 광고한다 — 위 TestHostSnippetUsesCurrentServerPrefix는 그
-// 리터럴을 자기 자신으로 재기 때문에 그 변경에 전부 초록이다. 조합 형태
-// `mcp__plugin_<플러그인>_<서버>__`는 플러그인이 제공한 서버가 실제 세션에서 갖는 이름에서
-// 왔다(설계 §5-12).
+// 리터럴을 자기 자신으로 재기 때문에 그 변경에 전부 초록이다.
+// 조합 형태 `mcp__plugin_<플러그인>_<서버>__`의 출처는 **호스트 관측**이다: 플러그인이 제공한
+// MCP 서버가 실제 세션의 도구 이름 공간에서 그 형태로 잡힌다(최종 리뷰가 자기 세션에서 확인).
+// 설계 §5-12는 이 형태의 근거가 아니다 — 그 절이 인용하는 것은 우리 상수를 재는 단정이다.
 func TestToolPrefixMatchesPluginManifests(t *testing.T) {
 	readJSON := func(rel string, v any) {
 		t.Helper()

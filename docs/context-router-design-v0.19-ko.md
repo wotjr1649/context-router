@@ -689,13 +689,25 @@ v0.18 핸드오프 §5.2의 목록은 **거의 전부 기입 경로의 부산물
 12. **옛 접두 권한 규칙** — **`hostSnippet`은 닫혔다. 권한 규칙 문자열 잔존 보고는 만들지
     않는다(범위 판단).**
     - **`hostSnippet`** `[실측]`: 새 접두는 `mcp__plugin_context-router_ctr__`다(D98).
-      권한 규칙 예시가 새 접두로 다시 쓰였다 — 옛 접두 부재·새 접두 존재를
-      `TestHostSnippetUsesCurrentServerPrefix`가 잰다. 사용자가 자기 `settings.json`에
-      붙여넣은 `mcp__ctr-exec__*` 권한 규칙은 더 이상 매치하지 않는데, D96 계약 1이 우리가
-      그 파일을 고치는 것을 금하므로 그 규칙은 사용자가 직접 옮겨야 한다.
+      **이 등급의 근거는 호스트 관측이다**(2026-08-08 정정) — 플러그인이 제공한 MCP 서버가
+      실제 세션의 도구 이름 공간에서 `mcp__plugin_<플러그인>_<서버>__` 형태로 잡히는 것을
+      최종 검토가 자기 세션에서 확인했다. 옛 문면은 `TestHostSnippetUsesCurrentServerPrefix`를
+      근거로 들었는데 그것은 **우리 상수를 우리 상수로 재는 단위 테스트**라 호스트 동작의
+      증거가 아니다. 그 단정의 자리는 따로 있다: `TestToolPrefixMatchesPluginManifests`가
+      `.claude-plugin/plugin.json`의 `name`과 `plugin/mcp.json`의 서버 키에서 접두를 유도해
+      `ctrToolPrefix`와 대조하므로, 위 형태를 전제로 두 이름 중 하나가 바뀌면 테스트가 깨진다
+      (최종 리뷰 S6). 사용자가 자기 `settings.json`에 붙여넣은 `mcp__ctr-exec__*` 권한 규칙은
+      더 이상 매치하지 않는데, D96 계약 1이 우리가 그 파일을 고치는 것을 금하므로 그 규칙은
+      사용자가 직접 옮겨야 한다.
     - **읽기 전용으로 실재하는 것은 등록물 잔존 보고([20])다** `[실측]` — 옛 서버 이름
       (`ctr-exec`·`ctr`)의 `.mcp.json`·`enabledMcpjsonServers` 잔존을 파일과 다음 걸음으로
-      알린다.
+      알린다. **범위 판단 하나가 여기 붙는다**(최종 리뷰 S11, 2026-08-08): `[20]`은 프로젝트
+      `.mcp.json`과 **사용자 스코프 `~/.claude.json` 최상위**를 보고, 같은 파일의 **local 스코프
+      (`projects.<경로>.mcpServers`)는 보지 않는다.** local이 `claude mcp add`의 기본 스코프라
+      코호트는 더 큰데, 호스트가 정규화해 둔 경로 키를 우리 `projectRoot`와 맞추는 일
+      (구분자·대소문자·Windows 심볼릭 링크)이 이 한 줄 진단보다 크다는 판단이다. 스코프 표는
+      설계 v0.12에 있다 — 그 표를 다시 유도하는 세션이 이 제외를 모르고 결함으로 읽지 않도록
+      여기 적는다.
     - **★ 남은 것 — 사용자의 `permissions.ask`/`allow` 배열에 남은 옛 접두 규칙 문자열 자체는
       doctor가 짚지 않는다.** `[실측: internal/cli 전체를 뒤져도 그런 스캐너가 없다]`. 이
       범위는 넓히지 않는다 — D96 계약 1이 그 파일을 고치는 것을 금해 스캐너를 만들어도 할 수

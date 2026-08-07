@@ -1454,6 +1454,16 @@ const hostInstallSteps = `## 설치 절차 (D96·D97 — 등록은 호스트가 
    Claude Code는 플러그인 설치만으로 훅 여섯이 실린다 [실측].
 `
 
+// hookMigrationHint — [9]·[16]이 옛 훅 그룹을 발견했을 때 내는 다음 걸음. 마커 형태와 무관하게
+// 한 문면이다(최종 리뷰): 무버전(D82 이후 v0.15+)이든 버전 있는(그 이전) 등록물이든 사용자가
+// 처한 상황은 같다 — 옛 그룹은 지워질 때까지 발화하고, 플러그인 매니페스트가 같은 이벤트에 훅을
+// 실으므로(D96) 두 벌이 함께 있으면 같은 포착이 두 번 일어난다. 목적지(플러그인 설치)를 함께
+// 적는 이유는 제거만 안내하면 훅을 통째로 잃는 걸음으로 읽히기 때문이다. uninstallCmd로 호스트를
+// 가른다(Claude `hook uninstall` · Codex `hook uninstall --codex`).
+func hookMigrationHint(uninstallCmd string) string {
+	return uninstallCmd + "로 옛 그룹을 지우고 플러그인 설치로 옮기세요 — 두 벌이 함께 있으면 같은 포착이 두 번 일어납니다"
+}
+
 // ctrToolPrefix — 플러그인이 등록한 서버의 도구 이름 접두(D98). 조각 둘이 매니페스트에서 온다:
 // 플러그인 이름(`.claude-plugin/plugin.json`의 `name`)과 MCP 서버 키(`plugin/mcp.json`의
 // `mcpServers` 유일 키). 호스트가 조합하는 형태는 `mcp__plugin_<플러그인>_<서버>__`다. 어느 쪽
@@ -1729,12 +1739,11 @@ func runDoctor(ctx context.Context, w io.Writer, storeRoot, projectRoot, version
 			return "옛 그룹 없음"
 		case marker == "":
 			// D82 — v0.15 이후 등록물은 무버전 마커를 쓴다. 버전 비교는 여기서 하지 않지만
-			// (상시 불일치 경고가 된다) 마이그레이션 걸음은 버전 있는 갈래와 똑같이 낸다:
-			// 플러그인 매니페스트가 같은 여섯 이벤트에 훅을 싣고 있어(D96), 옛 그룹을 남겨 두면
-			// 같은 포착이 두 벌 발화한다.
-			return fmt.Sprintf("등록됨(%d개 — hook uninstall로 옛 그룹을 지우세요. 플러그인이 같은 훅을 실으므로 두 벌이 함께 있으면 포착이 두 번 일어납니다)", n)
+			// (상시 불일치 경고가 된다) 마이그레이션 걸음은 버전 있는 갈래와 **같은 문면으로**
+			// 낸다 — 두 코호트가 처한 상황이 같기 때문이다.
+			return fmt.Sprintf("등록됨(%d개 — %s)", n, hookMigrationHint("hook uninstall"))
 		case marker != version:
-			return fmt.Sprintf("등록됨(%d개, marker %s≠%s — hook uninstall로 옛 그룹을 지우고 플러그인 설치로 옮기세요)", n, marker, version)
+			return fmt.Sprintf("등록됨(%d개, marker %s≠%s — %s)", n, marker, version, hookMigrationHint("hook uninstall"))
 		default:
 			return fmt.Sprintf("등록됨(%d개, marker %s)", n, marker)
 		}
@@ -1917,11 +1926,10 @@ func runDoctor(ctx context.Context, w io.Writer, storeRoot, projectRoot, version
 		case n == 0:
 			return "옛 그룹 없음", false // [9]와 같은 이유 — 플러그인만 쓰는 설치에서 정상 상태다
 		case marker == "":
-			// [9]의 무버전 갈래와 같은 근거(D82 + D96 매니페스트 훅) — 옛 그룹을 남겨 두면
-			// 같은 포착이 두 벌 발화한다.
-			return fmt.Sprintf("등록됨(%d개 — hook uninstall --codex로 옛 그룹을 지우세요. 플러그인이 같은 훅을 실으므로 두 벌이 함께 있으면 포착이 두 번 일어납니다)", n), true
+			// [9]의 무버전 갈래와 같은 근거(D82 + D96 매니페스트 훅).
+			return fmt.Sprintf("등록됨(%d개 — %s)", n, hookMigrationHint("hook uninstall --codex")), true
 		case marker != version:
-			return fmt.Sprintf("등록됨(%d개, marker %s≠%s — hook uninstall --codex로 옛 그룹을 지우고 플러그인 설치로 옮기세요)", n, marker, version), true
+			return fmt.Sprintf("등록됨(%d개, marker %s≠%s — %s)", n, marker, version, hookMigrationHint("hook uninstall --codex")), true
 		default:
 			return fmt.Sprintf("등록됨(%d개, marker %s)", n, marker), true
 		}

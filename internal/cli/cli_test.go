@@ -2801,12 +2801,21 @@ func TestDoctorCodexBackupLeftover(t *testing.T) {
 }
 
 // TestDoctorWritesNothing — D96·D97: doctor는 읽기 전용이다. config.toml·.mcp.json·
-// .claude/settings.json 세 파일의 mtime과 바이트가 진단 전후 동일해야 한다. --fix가 지워졌으니
-// 이 계약을 깨는 유일한 경로는 회귀다(예: 실수로 남은 atomicWriteFile 호출).
+// .claude/settings.json·~/.claude.json 네 파일의 mtime과 바이트가 진단 전후 동일해야 한다.
+// --fix가 지워졌으니 이 계약을 깨는 유일한 경로는 회귀다(예: 실수로 남은 atomicWriteFile 호출).
+// ~/.claude.json은 [20]의 사용자 스코프 절이 읽는 자리다(최종 리뷰 S11) — 호스트의 주 상태
+// 저장소라 이 계약이 깨졌을 때 값이 가장 크고, 목록에 없으면 그 경로의 읽기 전용 성질이
+// 코드 검토에만 기대게 된다.
 func TestDoctorWritesNothing(t *testing.T) {
 	home := isolateCodexHome(t)
 	writeCodexConfig(t, home, "[mcp_servers.ctr]\ncommand = \"context-router\"\n\n[mcp_servers.ctr.env]\nCTR_MANAGED = \"context-router/0.1.0\"\n")
 	cfgPath := filepath.Join(home, "config.toml")
+
+	userHome := t.TempDir()
+	t.Setenv("HOME", userHome)
+	t.Setenv("USERPROFILE", userHome) // Windows os.UserHomeDir 이음새
+	userMCPPath := filepath.Join(userHome, ".claude.json")
+	write(t, userMCPPath, []byte(`{"mcpServers":{"ctr-exec":{"command":"context-router","__ctrManaged":"context-router/0.1.0"}}}`))
 
 	projectRoot := t.TempDir()
 	mcpPath := mcpConfigPath(projectRoot)
@@ -2834,7 +2843,7 @@ func TestDoctorWritesNothing(t *testing.T) {
 		return fileSnap{fi.ModTime(), data}
 	}
 
-	targets := []string{cfgPath, mcpPath, settingsPath}
+	targets := []string{cfgPath, mcpPath, settingsPath, userMCPPath}
 	before := make(map[string]fileSnap, len(targets))
 	for _, p := range targets {
 		before[p] = snapshot(p)
@@ -2915,6 +2924,13 @@ func TestDoctorCodexHooksScopePositive(t *testing.T) {
 	}
 	if strings.Contains(out, "[16] codex hooks: project=옛 그룹 없음") {
 		t.Errorf("등록된 훅이 없는 것으로 보고됐다:\n%s", out)
+	}
+	// 이 픽스처의 마커는 무버전(hookBinaryName)이라 marker=="" 갈래를 탄다. 그 갈래의 다음
+	// 걸음이 [9] 쪽에만 단정돼 있으면 여기 문면은 통째로 지워도 초록이다 — [16]의 짝을 함께
+	// 잰다(최종 재검토). 호스트 구분(--codex)까지 본다: 플래그가 빠지면 사용자가 Claude 쪽
+	// 그룹을 지우려 든다.
+	if !strings.Contains(out, "[16] codex hooks: project=등록됨(3개 — hook uninstall --codex로 옛 그룹을 지우고 플러그인 설치로 옮기세요 — 두 벌이 함께 있으면 같은 포착이 두 번 일어납니다)") {
+		t.Errorf("[16]의 무버전 갈래가 마이그레이션 걸음을 내지 않는다:\n%s", out)
 	}
 }
 
