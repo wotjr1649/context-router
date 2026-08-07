@@ -1,0 +1,43 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "context-router codex-hook",
+            "commandWindows": "context-router codex-hook",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "context-router codex-hook",
+            "commandWindows": "context-router codex-hook",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "context-router codex-hook",
+            "commandWindows": "context-router codex-hook",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}

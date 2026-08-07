@@ -19,6 +19,7 @@
   ],
   "mcpServers": "./plugin/mcp.json",
   "skills": "./skills/",
+  "hooks": "./hooks/codex-hooks.json",
   "interface": {
     "displayName": "context-router",
     "shortDescription": "Keeps large tool output out of context — store, search, byte-exact fetch",
