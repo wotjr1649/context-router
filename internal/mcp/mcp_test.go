@@ -242,11 +242,15 @@ func TestNewServerProfileGating(t *testing.T) {
 // 물리지 않는 검사였다. tools/list 결과 JSON 직렬화 바이트 상한이며 설명 문구 비대화 회귀의
 // 조기 감지용이다. D62부터의 규칙 그대로 **실측 + 최소 여유**로 잡는다(과대 상향 금지 —
 // 여유가 100B 이상이면 "설명에 100바이트를 덧붙이면 넘긴다"는 감시선이 죽는다).
-// 실측 14853B(10-도구)를 100의 배수로 올려 14900(여유 47B). 이 값은 **단일 서버**의 tools/list
-// 표면이다 — 클라이언트가 ctr·ctr-exec를 함께 등록하면 상주 총량은 두 서버 합집합이라 다르다
-// (폐기된 이전 값: exec 8-도구 12914→13000, 6-도구 10024×1.2=12029).
+// [실측] D99(진입 도구 ctr_search·ctr_index 상시 로드 + Description 꼬리에 지연 여섯을 색인,
+// 이 파일의 deferredToolIndex)가 표면을 14853B→15795B로 키웠다(+942B: deferredToolIndex
+// 432B가 두 도구 Description에 각각 붙어 864B, `"_meta":{"anthropic/alwaysLoad":true}`가
+// 그 두 도구에만 38B씩 76B — 합 940B, 나머지 2B는 JSON 콤마 재배치). 100의 배수로 올려 15800
+// (여유 5B — 위 규칙대로 의도적으로 빡빡하게 유지, 폐기된 이전 값 14900). 이 값은 **단일 서버**의
+// tools/list 표면이다 — 클라이언트가 ctr·ctr-exec를 함께 등록하면 상주 총량은 두 서버 합집합이라
+// 다르다(더 오래된 폐기 값: exec 8-도구 12914→13000, 6-도구 10024×1.2=12029).
 // 실측값·근거는 docs/gates-v0.0.1-ko.md 게이트 11 항목 참조(정식 갱신은 게이트 문서 마일스톤에서).
-const maxToolSchemaBytes = 14900
+const maxToolSchemaBytes = 15800
 
 // TestSchemaTokenBudget: tools/list 결과(ListToolsResult 전체 — 실제 클라이언트가 받는
 // JSON 그대로) 직렬화 바이트가 maxToolSchemaBytes를 넘지 않는지 확인한다(게이트 11). 근사
@@ -270,6 +274,83 @@ func TestSchemaTokenBudget(t *testing.T) {
 	t.Logf("tools/list schema: %d bytes (~%d tokens approx, %d tools)", len(b), approxTokens, len(lt.Tools))
 	if len(b) > maxToolSchemaBytes {
 		t.Fatalf("tools/list schema=%d bytes exceeds budget %d bytes (게이트 11, 설계 §2.3)", len(b), maxToolSchemaBytes)
+	}
+}
+
+// deferredToolNames: D99가 색인하는 지연 로드 여섯의 정본 목록 — 아래 두 테스트가 공유한다
+// (하나로 유지, D13 반파편화와 동일 취지).
+var deferredToolNames = []string{
+	"ctr_fetch", "ctr_transform", "ctr_record_event",
+	"ctr_session_summary", "ctr_export_events", "ctr_fetch_and_index",
+}
+
+// TestAlwaysLoadMetaExactlyEntryTools — D99 요구 1: Enable{"ingest","net"}+Session 있음(설치기가
+// 만들 수 있는 프로필)에서 tools/list의 _meta.anthropic/alwaysLoad=true인 도구 이름 집합이
+// 정확히 {ctr_search, ctr_index}여야 한다 — 다른 어떤 도구에도 새지 않는지까지 함께 확인한다.
+func TestAlwaysLoadMetaExactlyEntryTools(t *testing.T) {
+	cs, _, _, _ := newRecordEventTestServer(t, "ingest", "net")
+	lt, err := cs.ListTools(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("list tools: %v", err)
+	}
+	got := map[string]bool{}
+	for _, tl := range lt.Tools {
+		if v, _ := tl.Meta["anthropic/alwaysLoad"].(bool); v {
+			got[tl.Name] = true
+		}
+	}
+	want := map[string]bool{"ctr_search": true, "ctr_index": true}
+	if len(got) != len(want) {
+		t.Fatalf("alwaysLoad tools=%v want exactly %v", got, want)
+	}
+	for name := range want {
+		if !got[name] {
+			t.Fatalf("alwaysLoad tools=%v missing %q", got, name)
+		}
+	}
+}
+
+// TestEntryToolDescriptionsIndexDeferredTools — D99 요구 2: 진입 도구 둘(ctr_search·ctr_index)의
+// Description이 지연 여섯의 이름을 전부 담아야 한다(하나라도 빠지면 실패 — 루프 단정).
+func TestEntryToolDescriptionsIndexDeferredTools(t *testing.T) {
+	cs, _ := newTestServer(t, []string{"ingest"})
+	lt, err := cs.ListTools(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("list tools: %v", err)
+	}
+	descByName := map[string]string{}
+	for _, tl := range lt.Tools {
+		descByName[tl.Name] = tl.Description
+	}
+	for _, entry := range []string{"ctr_search", "ctr_index"} {
+		desc, ok := descByName[entry]
+		if !ok {
+			t.Fatalf("%s not found in tools/list", entry)
+		}
+		for _, name := range deferredToolNames {
+			if !strings.Contains(desc, name) {
+				t.Fatalf("%s description missing deferred tool name %q: %q", entry, name, desc)
+			}
+		}
+	}
+}
+
+// TestToolDescriptionsAvoidHortatoryVocabulary — Global Constraints 어휘 규칙: 어느 도구
+// 설명에도 금지 어휘가 없어야 한다. 최대 프로필(10-도구)로 D99 신규 문면(deferredToolIndex)까지
+// 전수 검사한다.
+func TestToolDescriptionsAvoidHortatoryVocabulary(t *testing.T) {
+	cs, _, _, _ := newRecordEventTestServer(t, "ingest", "net", "exec")
+	lt, err := cs.ListTools(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("list tools: %v", err)
+	}
+	banned := []string{"MANDATORY", "BLOCKED", "Do NOT", "Never", "PREFER"}
+	for _, tl := range lt.Tools {
+		for _, word := range banned {
+			if strings.Contains(tl.Description, word) {
+				t.Fatalf("%s description contains banned vocabulary %q: %q", tl.Name, word, tl.Description)
+			}
+		}
 	}
 }
 

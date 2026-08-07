@@ -325,12 +325,30 @@ func buildSearchOutput(queries []string, qrs []search.QueryResult, evs [][]event
 	return out
 }
 
+// deferredToolIndex: D99 — 지연 로드 여섯 도구(이름 + 한 줄 용도만, 호출 방법·인자·예시는 적지
+// 않는다 — D99 계약 2. 그건 각 도구 자신의 지연 스키마가 이미 담고 있다)를 진입 도구 둘
+// (ctr_search·ctr_index)의 Description 꼬리에 붙인다. 패키지 상수 하나를 두 도구가 함께
+// 참조한다 — 문면이 두 벌로 갈라지면 하나만 갱신되는 사고를 이 저장소의 D13 반파편화가 막는 형태다.
+const deferredToolIndex = "그 밖의 도구(필요 시 지연 로드): " +
+	"ctr_fetch(artifact 저장본을 선택자로 정확히 회수), " +
+	"ctr_transform(artifact 텍스트를 starlark 스크립트로 변환), " +
+	"ctr_record_event(세션 이벤트 1건 기록), " +
+	"ctr_session_summary(세션 이벤트를 타입별로 그룹핑해 요약), " +
+	"ctr_export_events(세션 이벤트를 페이지네이션으로 내보냄), " +
+	"ctr_fetch_and_index(URL을 가져와 색인에 등록)."
+
 func registerSearch(srv *mcp.Server, st *store.Store, worktreeRoot string, sess *session.DB) {
 	mcp.AddTool(srv, &mcp.Tool{
 		Name: "ctr_search",
 		Description: "프로젝트 색인을 BM25+RRF로 검색해 스니펫을 반환한다 — 저장한 원문·대형 출력을 " +
 			"다시 읽기 전에 먼저 여기서 검색한다(질의로 필요한 조각만 회수). scope로 content(기본)/" +
-			"events/all을 선택한다 — events/all은 세션 이벤트도 함께 검색한다(세션 저장소 불용 시 STORAGE_UNAVAILABLE).",
+			"events/all을 선택한다 — events/all은 세션 이벤트도 함께 검색한다(세션 저장소 불용 시 STORAGE_UNAVAILABLE). " +
+			deferredToolIndex,
+		// anthropic/alwaysLoad: Claude 한정 최적화(D99) — "anthropic/alwaysLoad"는 Anthropic
+		// 벤더 확장이고 [문서], [실측] Codex는 미지 매니페스트 필드를 조용히 버린다. Codex 쪽
+		// 등가 기제는 재지 않았다(§5-4). 진입 도구 둘(ctr_search·ctr_index)에만 달아 상시
+		// 로드한다 — 지연 여섯의 존재는 위 deferredToolIndex로 이 Description 꼬리에서 알린다.
+		Meta:        mcp.Meta{"anthropic/alwaysLoad": true},
 		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true},
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, in SearchInput) (*mcp.CallToolResult, SearchOutput, error) {
 		start := time.Now()
@@ -665,7 +683,10 @@ func registerIndex(srv *mcp.Server, st *store.Store, worktreeRoot string, allowP
 	destructive := false
 	mcp.AddTool(srv, &mcp.Tool{
 		Name:        "ctr_index",
-		Description: "파일·디렉터리·인라인 텍스트를 색인에 등록한다.",
+		Description: "파일·디렉터리·인라인 텍스트를 색인에 등록한다. " + deferredToolIndex,
+		// anthropic/alwaysLoad: registerSearch와 동일 근거(Claude 한정 최적화, D99·§5-4) —
+		// 설명 반복 생략.
+		Meta:        mcp.Meta{"anthropic/alwaysLoad": true},
 		Annotations: &mcp.ToolAnnotations{DestructiveHint: &destructive},
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, in IndexInput) (*mcp.CallToolResult, IndexOutput, error) {
 		start := time.Now()
