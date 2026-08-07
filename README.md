@@ -39,7 +39,11 @@ separately in `docs/oracle-mapping-ko.md`.
 
 `context-router` installs as a Claude Code / Codex plugin — the host reads
 the plugin manifest and registers the MCP server itself. This program does
-not write to `.mcp.json`, `settings.json`, or `config.toml`.
+not write to `.mcp.json`, `settings.json`, or `config.toml`, with a single
+exception: `context-router hook uninstall` removes this tool's own hook
+groups from `.claude/settings.json` (with `--codex`, from the Codex
+`hooks.json`). That is how an install from before v0.19 is cleaned up; the
+plugin manifest carries the hook definitions from v0.19 on.
 
 **0. Remove any existing hand-written registration.** On Claude Code, the
 host silently discards a plugin-declared MCP server when its `command` +
@@ -84,7 +88,15 @@ codex plugin add context-router
 
 **3. Verify.** `mcp list` shows the server, in each host's own format:
 Claude Code as `plugin:context-router:ctr … Connected`, Codex as
-`ctr … enabled`.
+`ctr … enabled`. `mcp list` is the command that sees it: `claude plugin
+details` leaves an `mcpServers` declared as a path string unresolved and
+reports `MCP servers (0)` while the runtime is connected.
+
+**4. On Codex, grant hook trust.** Codex requires persisted hook trust
+before it runs a plugin's hooks; without it nothing fires, `SessionStart`
+included. Skipping this leaves the capture that moves large tool output out
+of the context window switched off, silently. On Claude Code the plugin
+install carries the six hooks on its own.
 
 `ingest` and `net` are enabled by default; set `CTR_ENABLE` to a
 comma-separated list of `ingest` / `net` / `exec` to change that (e.g.
@@ -95,8 +107,11 @@ A `--enable` flag, if you invoke the binary directly, always wins over
 
 `context-router doctor` diagnoses the store root, DB, and FTS5 setup for the
 current project, and prints the steps above together with the current tool
-prefix (`mcp__plugin_context-router_ctr__`) and a sample permission rule for
-`ctr_index` / `ctr_fetch_and_index` (both default to "ask").
+prefix (`mcp__plugin_context-router_ctr__`) and a sample permission rule you
+can copy into `.claude/settings.json` to put `ctr_index` /
+`ctr_fetch_and_index` behind a prompt. Approval strength otherwise comes
+from the host's own permission mode — this program writes no permission
+rules.
 
 ## CLI
 

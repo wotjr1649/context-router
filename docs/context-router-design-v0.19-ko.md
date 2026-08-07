@@ -249,9 +249,23 @@ ADR-0002가 38시행 A/B로 금지 토큰표를 세웠다 — `MANDATORY:`, `BLO
 삭제의 순서를 강제한다.** 아래 셋이 닫히기 전에는 기입 경로를 지우지 않는다.
 
 1. **훅 파일이 매니페스트에 실린다**(§5-8) — 안 실으면 지금 도는 수동 포착이 조용히 죽는다.
+   **닫혔다** `[실측, 2026-08-08]`. 추적 파일만 담은 깨끗한 클론 — 원격에서 설치하는 사용자가
+   받는 것과 같은 내용 — 에 `claude plugin install`을 걸면 `plugin details`가
+   `Hooks (6) SessionStart, PreToolUse, PostToolUse, PostToolUseFailure, SubagentStart,
+   SubagentStop (harness-only — no model context cost)`과 상시 비용 `~54 tok`을 보고하고
+   `Duplicate hooks file detected`는 나오지 않는다 — D98의 규칙(Claude는 관례 경로
+   `hooks/hooks.json`을 스스로 로드하므로 매니페스트가 그 경로를 또 선언하지 않는다)이 그대로
+   확인된다. 같은 설치에서 런타임 `claude mcp list`가
+   `plugin:context-router:ctr: context-router - ✔ Connected`를 낸다.
 2. **install → uninstall → reinstall 왕복의 바이트 비교**(§5-10) — A⑦은 `add` 한 방향만 쟀다.
 3. **`doctor`의 감지원이 정해진다**(§5-13) — `codex mcp get`은 무효 TOML에서 실패하고
    `--json`은 `env`를 평문으로 낸다.
+
+**검증 걸음 하나가 거짓 음성을 낸다** `[실측, 2026-08-08]`. 같은 깨끗한 설치에서
+`plugin details`는 `MCP servers (0)`을 보고하는데 런타임은 그 서버에 붙는다. 정적 인벤토리
+명령이 **경로 문자열로 선언한 `mcpServers`를 해석하지 않고**(D98이 쓰는 형태다) 런타임만
+해석한다. `plugin details`를 배송 검증 걸음으로 쓰면 이 자리에서 없는 결함을 본다 — 확인은
+런타임 `mcp list`로 한다.
 
 셋이 닫히면 `codex_toml.go`를 통째로 지운다. §8이 든 시간적 위험(표면이 움직인다)은 **폴백을
 영구화하는 대신 순서로 흡수한다** — 결함 표면을 영구히 남기는 값이 그 위험보다 크다는 판정이다.
@@ -281,13 +295,27 @@ context-router/
                                    · interface
   plugin/mcp.json                  ★ 공유 — 두 매니페스트가 경로 문자열로 가리킨다
   skills/<이름>/SKILL.md           ★ 공유
-  hooks/hooks.json                 ★ 공유 — **아직 미배송**, §5-8이 릴리스 조건으로 건다
+  hooks/hooks.json                 Claude — 관례 경로, 선언하지 않는다. 배송됨(ee03cd3)
+  hooks/codex-hooks.json           Codex — .codex-plugin/plugin.json이 선언한다. 배송됨
 ```
 
+**훅 파일은 한 벌이 아니라 두 벌이다** — 이 배치표의 초안이 적은 "★ 공유 한 벌"을 철회한다.
+갈라지는 이유 둘: 러닝 서브커맨드가 호스트마다 다르고(`hook` 대 `codex-hook`), 이벤트 집합도
+다르다(Codex 바이너리에 `PostToolUseFailure`가 없다 `[실측: 바이너리 문자열]`). 한 벌로 두면
+한 호스트가 다른 호스트의 서브커맨드를 실행한다. §5-2가 이 정정을 자세히 적는다.
+
 **루트 `.mcp.json`을 쓰지 않는다** `[실측]`. Claude의 `plugin.json`이 `mcpServers`를 **경로
-문자열로도 받는다**는 것을 쟀다 — `./plugin/mcp.json`에서 서버가 실제로 떴다. 그래서 루트 관례
-자리를 비워 두고 로컬 개발 설치본(`.gitignore`된 `.mcp.json`)과 충돌하지 않는다.
+문자열로도 받는다**는 것을 쟀다 — `./plugin/mcp.json`에서 서버가 실제로 떴다.
 **`.gitignore`는 그대로 둔다** — 초안의 "그 항목을 은퇴시킨다"를 철회한다.
+
+**★ 정정 `[실측, 2026-08-08]` — 루트 자리를 비워 둔다고 로컬 개발 설치본과의 충돌이 사라지지는
+않는다.** 위 문단의 그 근거만 틀렸고 결론(경로 문자열을 쓴다)은 그대로다. 로컬 디렉터리 설치는
+호스트마다 다르게 재료를 모은다: **Codex의 설치 캐시는 온전한 git 클론이라**(`.git`이 들어 있다)
+커밋된 내용만 실린다. **Claude는 작업 트리를 그대로 복사하고 거기에는 gitignore된 파일도
+포함된다** — 이 저장소의 gitignore된 루트 `.mcp.json`이 캐시에 실렸고, Claude가 선언된
+`./plugin/mcp.json` 대신 **그것을** 읽어 로컬 개발 서버 이름을 보고했다. **루트 관례가 선언된
+경로를 이긴다.** 원격에서 설치할 때는 그 파일이 gitignore돼 애초에 없으므로 이 경로는 원격
+설치에 영향을 주지 않는다 — 영향받는 것은 로컬 디렉터리로 설치해 배송을 검증하려는 우리 쪽이다.
 
 **마켓플레이스 매니페스트는 두 벌이다** `[실측 + 문서]`. 경로도 스키마도 다르고, Codex는 둘이
 함께 있으면 `.agents/` 쪽을 읽는다. Codex가 Claude 형식도 받아들이기는 하지만 정본은 `.agents/`다.
@@ -469,10 +497,16 @@ manifest field`) — 에러가 아니라 침묵이라 더 나쁘다. `userConfig
 1. 바이너리 확보 — 릴리스 산출물 또는 `go install`. **지금과 같다.**
 2. `claude plugin marketplace add <owner>/<repo>` → `claude plugin install <name> --scope <user|project|local>`
 3. `codex plugin marketplace add <owner>/<repo>` → `codex plugin add <name>`
-4. **확인**: `mcp list`에 `plugin:<플러그인>:<서버>` 형태로 뜨는가.
+4. **확인**: `mcp list`에 `plugin:<플러그인>:<서버>` 형태로 뜨는가. **`plugin details`로 하지
+   마라** — 경로 문자열로 선언한 `mcpServers`를 그 명령이 해석하지 않아 `MCP servers (0)`을
+   낸다(§0 `[실측]`).
+5. **Codex에서 훅 신뢰를 준다.** 신뢰를 주지 않은 홈에서는 `SessionStart`를 포함해 훅이 하나도
+   발화하지 않았다 `[실측]`. 이 걸음을 건너뛴 사용자는 수동 포착을 조용히 잃는다 — 근거와
+   등급은 §5-8에 있다.
 
 **우리도 사용자도 설정 파일을 편집하는 걸음이 없다** — §5-9가 Codex의 `hooks` 기능이 기본으로
-켜져 있음을 실측했고, A⑦이 설치가 기존 설정을 훼손하지 않음을 실측했다.
+켜져 있음을 실측했고, A⑦이 설치가 기존 설정을 훼손하지 않음을 실측했다. 훅 신뢰는 설정 편집이
+아니라 Codex 자신이 묻는 승인이다.
 
 프로필과 `--store-root`를 무엇으로 받을지는 §5-5에 남아 있다.
 
@@ -525,6 +559,18 @@ v0.18 핸드오프 §5.2의 목록은 **거의 전부 기입 경로의 부산물
      **Claude에서만** 쟀다. Codex가 같은 규약인지는 재지 않았다.
    - **배열 형태는 Claude에서만 쟀다.** `command` + `args` 배열로 exit 2·JSON 두 경로 모두
      거부가 성립했다. **`commandWindows`와의 공존**과 **Codex에서의 배열 형태 발화**는 미확정.
+   - **★ 배송한 파일로 다시 쟀다 — 결론은 호스트별로 갈린다**(2026-08-08, ee03cd3 이후).
+     - **Claude, 배열 형태** `[실측]`: `hooks/hooks.json`이 배송하는 `command` + `args` 형태로
+       `SessionStart`·`PreToolUse`·`PostToolUse`가 이 Windows에서 발화한다. 이 저장소를
+       `--plugin-dir`로 올린 세션이 `cc:` 접두 세션과 `Glob`·`Read`의 `tool_call` 이벤트
+       8건을 남겼고 drops는 0이었다. `commandWindows` 없이 성립한다.
+     - **Codex, 우리 훅 파일의 발화는 `[미실측]`이다.** 신뢰 게이트에서 막혔다(아래 §5-8 밑의
+       위험 항목). 배송한 문자열 `command` 형태는 **정황 증거로 고른 것**이다: 이 머신에 설치된
+       Codex 플러그인 둘이 전부 문자열 형태이고 `args` 배열을 쓰는 실물이 없으며, 바이너리에
+       `commandWindows`는 있고 `argsWindows`는 없다. **이 등급을 올리지 마라** — 배송된 형태가
+       Codex에서 실제로 도는 것은 아직 아무도 보지 않았다. D100 계약 3이 배열을 명하는 근거인
+       MSYS 인자 변환 함정은 슬래시·백슬래시가 붙은 인자에서 생기는데 이 명령은 맨 토큰
+       둘이라 변환될 것이 없다 — 근거이지 측정이 아니다.
    - **부수 확정 — Codex의 플러그인 환경 변수 둘**: `PLUGIN_ROOT`(경로 치환)와
      **`PLUGIN_DATA`(플러그인 전용 쓰기 가능 디렉터리)**. 우리 훅이 상태를 둘 자리가 여기다.
    - *그 미해결 관측도 닫혔다* `[실측]`: Windows에서 훅 `command` **문자열**은 Git Bash가
@@ -533,11 +579,19 @@ v0.18 핸드오프 §5.2의 목록은 **거의 전부 기입 경로의 부산물
      실행돼 훅이 2로 끝난다. 차이를 만든 것은 마커도 부수 효과도 아니고 그것뿐이었다.
      기제는 D100 계약 3에 있다. (내 원래 측정에서 마커가 의도한 경로에 남은 것은 리다이렉트
      대상에 **슬래시 경로**를 써서 bash의 백슬래시 이스케이프를 피했기 때문이다.)
-2. **훅 파일 하나로 양쪽을 섬길 수 있는가** — **닫혔다. 된다** `[실측]`. 설치된 한 플러그인의
-   `.claude-plugin/plugin.json`과 `.codex-plugin/plugin.json`이 **같은 파일**
-   (`./hooks/claude-codex-hooks.json`)을 가리키고, 진짜 `config.toml`에 그 파일의 항목별 신뢰
-   해시가 있으며(Codex가 소비했다는 뜻), 같은 플러그인이 Claude 세션에서도 돈다.
-   **조건 둘**: `SessionStart`에도 `matcher`를 달 것, Windows용 **`commandWindows`**를 함께 담을 것.
+2. **훅 파일 하나로 양쪽을 섬길 수 있는가** — **닫혔다. 구조적으로는 되지만 우리는 두 벌로
+   배송한다.** 원래 관측 `[실측]`은 그대로다: 설치된 한 플러그인의 `.claude-plugin/plugin.json`과
+   `.codex-plugin/plugin.json`이 **같은 파일**(`./hooks/claude-codex-hooks.json`)을 가리키고,
+   진짜 `config.toml`에 그 파일의 항목별 신뢰 해시가 있으며(Codex가 소비했다는 뜻), 같은
+   플러그인이 Claude 세션에서도 돈다. **조건 둘**: `SessionStart`에도 `matcher`를 달 것,
+   Windows용 **`commandWindows`**를 함께 담을 것.
+   **★ 우리 내용은 공유될 수 없다**(2026-08-08, ee03cd3의 판정). 한 벌이 성립하려면 두 호스트가
+   같은 명령과 같은 이벤트 집합을 받아야 하는데 우리는 둘 다 다르다 — 러닝 서브커맨드가
+   `hook` 대 `codex-hook`이고, Codex 바이너리에는 `PostToolUseFailure`가 아예 없다
+   `[실측: 바이너리 문자열]`. 그래서 `hooks/hooks.json`(Claude, 6이벤트, 배열 형태)과
+   `hooks/codex-hooks.json`(Codex, 3이벤트, 문자열 형태 + `commandWindows`) 두 벌이다. 이
+   머신에 설치된 Codex 플러그인 둘이 정확히 같은 두 파일 구조다 `[실측]`. D98의 배치표에서
+   `hooks/`의 ★ 공유 표시를 철회한 것이 이 항목이다.
 3. **`outputSchema`가 모델 컨텍스트에 실리는가** — **닫혔다. 실리지 않는다**(B①). D99 계약 4가
    그 결론이다.
 4. **진입 도구 집합** — **닫혔다.** 소유자 판정으로 `ctr_search` + `ctr_index`(D99 계약 1).
@@ -555,7 +609,18 @@ v0.18 핸드오프 §5.2의 목록은 **거의 전부 기입 경로의 부산물
    **★ 단 이 표현 수단은 Claude 한정이다.** `_meta`의 `"anthropic/alwaysLoad"`는 Anthropic
    벤더 확장이고 `[문서]`, Codex가 그것을 어떻게 다루는지는 **재지 않았다** — D101이 실측한
    대로 Codex는 미지 필드를 조용히 버린다. **D99는 Claude 한정 최적화로 읽어라.** Codex 쪽
-   등가 기제가 있는지는 별도로 재야 한다. 게시된 `plugin/mcp.json`에는 아직 진입 도구 표시가 없다.
+   등가 기제가 있는지는 별도로 재야 한다.
+   **★ 마지막 미결이 닫혔다**(2026-08-08). 옛 문면은 *"게시된 `plugin/mcp.json`에는 아직 진입
+   도구 표시가 없다"*였다 — 그 파일에는 표시가 들어갈 자리가 없는 것이 D99의 결론이다. 표시는
+   서버가 `tools/list`에서 도구별 `_meta`로 내고(`TestAlwaysLoadMetaExactlyEntryTools`가 정확히
+   `{ctr_search, ctr_index}`임을 잰다), 매니페스트는 그 서버를 띄우기만 한다. 깨끗한 클론
+   설치에서 그 서버가 실제로 붙는 것도 §0에서 실측했다.
+   **꼬리 색인은 등록 집합을 따라 움직인다**(최종 리뷰 S4, 2026-08-08 `[실측: stdio]`). 색인이
+   부르는 여섯 중 다섯이 조건부 등록이라 고정 문면은 프로필을 좁힌 서버에서 없는 도구를
+   광고했다 — `CTR_ENABLE=ingest`가 `ctr_fetch_and_index`를 이름으로 남기면서 등록하지 않았다.
+   `NewServer`가 등록한 것만 모아 색인을 만들고, 진입 도구 둘의 등록을 그 뒤로 미룬다 —
+   fail-closed 관문(`transform.ProbeIsolation`·`sandbox.Probe`)은 자리를 지킨다. 최대 프로필의
+   `tools/list` 바이트는 15,795로 그대로다(게이트 11 무변).
 5. **`userConfig` 스키마** — **닫혔다** `[실측: 설치된 바이너리의 zod 정의 + `plugin validate
    --strict` 탐침]`. 스키마 전문과 양쪽 대조는 **D101**에 있다. 요점 셋: Claude에만 있고 ·
    열거형이 없어 프로필 이름을 스키마로 강제할 수 없으며 · Codex는 미지 필드를 조용히 버린다.
@@ -573,14 +638,27 @@ v0.18 핸드오프 §5.2의 목록은 **거의 전부 기입 경로의 부산물
    `1.0.0`은 (a) 저장소를 실제로 게시해 양쪽에서 설치되는 것을 확인하고, (b) 그 뒤 내부 도구
    개선·수정을 한 차례 거친 다음에 판정한다 — **정식 릴리스는 대기다.** 델타 체인 파일명과
    문서 규약은 그대로 이어진다.
-8. **수동 포착** — **★ 정정: 가만두면 사라진다.** 이미 배송된 동작이고 저장 전에 리댁션을
-   지나지만(D100 계약 4), 그 포착을 실어 나르는 것은 **설치기가 등록하는 `PostToolUse` 훅**이다.
-   D97이 설치기를 지우는데 **게시된 패키지에는 훅이 없다**(`hooks/` 부재, 두 매니페스트에
-   `hooks` 키 없음). 그대로 이관하면 수동 포착이 **조용히 죽는다.**
-   → **훅 파일을 매니페스트에 싣는 것을 D97의 릴리스 조건으로 올린다.** 그 전에는 기입 경로를
-   지우지 않는다. 남는 물음("패턴 리댁션이 Bash 출력에 충분한가")은 설계 §5.1의 알려진 한계다.
+8. **수동 포착** — **닫혔다. 훅이 실린다**(2026-08-08, ee03cd3). 원래 관측은 이랬다:
+   *"가만두면 사라진다"* — 포착을 실어 나르는 것이 설치기가 등록하는 `PostToolUse` 훅인데
+   D97이 설치기를 지우고 게시된 패키지에는 `hooks/`가 없었다. 그래서 훅 파일을 매니페스트에
+   싣는 것이 D97의 릴리스 조건이 됐고(§0 조건 1), 그 조건이 §0에 적은 실측으로 닫혔다 —
+   깨끗한 클론 설치의 `plugin details`가 여섯 이벤트를 `Hooks (6)`으로 보고한다.
    *이 항목은 교차 모델 검토의 검증 서브가 잡았다 — 앞선 판정 "이 릴리스는 그 동작을 바꾸지
-   않는다"는 틀렸다.*
+   않는다"는 틀렸다.* 남는 물음("패턴 리댁션이 Bash 출력에 충분한가")은 설계 §5.1의 알려진
+   한계다.
+   **★ 같은 실패 형태가 Codex 쪽에 다른 문으로 남아 있다 — 릴리스 관련 위험이다.**
+   Codex의 훅은 **지속되는 신뢰(persisted hook trust)** 를 요구한다: `codex --help`가
+   `--dangerously-bypass-hook-trust`를 *"Run enabled hooks without requiring persisted hook
+   trust for this invocation"* 으로 적는다 `[문서]`. 진짜 Codex 홈에서 돌린 프로브는 빈
+   store로 끝났다 — **훅이 하나도 발화하지 않았고 `SessionStart`조차 돌지 않았다** `[실측]`.
+   그 프로브는 `config.toml`에 아무 흔적도 남기지 않았다(마켓플레이스·플러그인·`hooks.state`
+   항목 전부 없음, 기존 신뢰 항목 열다섯은 그대로) `[실측]`. **플러그인을 설치하고 훅 신뢰를
+   주지 않은 Codex 사용자는 수동 포착을 조용히 잃는다.** 사용자 안내가 이 걸음을 말해야 한다
+   (§2 설치 절차와 `hostSnippet`).
+   **부수 실측 — 커밋되지 않은 파일은 설치본에 실리지 않는다** `[실측, 2026-08-08]`. 설치는
+   커밋된 내용에서 재료를 모으므로(Codex는 git 클론, 원격 설치는 원격의 커밋), 매니페스트
+   파일이 커밋돼 있지 않으면 설치된 플러그인에 그 파일이 없다. ee03cd3 이전에 Codex 훅 프로브를
+   돌렸다면 그 이유만으로 거짓 음성이 나왔을 것이다 — 소유자가 프로브 전에 이것을 짚었다.
 9. **`[features] hooks`** — **닫혔다** `[실측]`. `config.toml`이 **아예 없는** 새 `CODEX_HOME`에서
    `codex features list`가 `hooks` · `plugins` · `plugin_sharing` · `skill_search`를 전부
    `stable / true`로 낸다. `plugin_hooks`는 `removed / false`다 — 참조 구현 README가 요구하는
