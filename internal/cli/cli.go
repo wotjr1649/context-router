@@ -1430,9 +1430,11 @@ func countShadowIndexes(ctx context.Context, db *sql.DB) int {
 // 릴리스가 닫는 형태다. 0번 걸음이 옛 등록물 제거인 것은 A⑧ 실측이 근거다.
 const hostInstallSteps = `## 설치 절차 (D96·D97 — 등록은 호스트가 한다)
 
-0. 옛 등록물을 먼저 지운다: claude mcp remove <이름> · codex mcp remove <이름>.
-   [실측] 호스트는 command·args가 이미 등록된 서버와 같은 플러그인 서버를 경고 없이 버린다 —
-   이 걸음을 건너뛴 사용자는 "설치했는데 아무 일도 안 일어난다"를 겪는다.
+0. 옛 등록물을 먼저 지운다: claude mcp remove <이름> · codex mcp remove <이름>. 옛 등록물은
+   플러그인과 같은 바이너리를 가리키는 중복이라 어느 호스트든 먼저 지운다.
+   Claude Code: [실측] command·args가 이미 등록된 서버와 같은 플러그인 서버를 경고 없이
+   버린다 — 이 걸음을 건너뛴 사용자는 "설치했는데 아무 일도 안 일어난다"를 겪는다.
+   Codex: [미실측] 같은 메커니즘인지는 재지 않았다 — 지우는 이유는 위와 같다.
    [실측] codex mcp remove는 없는 이름에도 exit 0을 반환한다 — 부재 확인은 mcp list로 한다.
 1. Claude Code:
    claude plugin marketplace add wotjr1649/context-router

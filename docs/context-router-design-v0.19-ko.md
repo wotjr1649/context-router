@@ -606,15 +606,22 @@ v0.18 핸드오프 §5.2의 목록은 **거의 전부 기입 경로의 부산물
     길면 Windows 파일명 길이 한계로 `fatal: failed to unlink … Filename too long`이 나고 설치가
     죽는다(짧은 경로에서는 성공). **이 코호트는 무효 TOML 코호트보다 크다.** 완화 후보는
     `--sparse`(양쪽 CLI에 있다)이고, 재지 않았다.
-12. **옛 접두 권한 규칙** — **닫혔다.** `[실측]` 새 접두는 `mcp__plugin_context-router_ctr__`다
-    (D98). 사용자가 자기 `settings.json`에 붙여넣은 `mcp__ctr-exec__*` 권한 규칙은 더 이상
-    매치하지 않는데, D96 계약 1이 우리가 그 파일을 고치는 것을 금하므로 그 규칙은 사용자가
-    직접 옮겨야 한다. `hostSnippet`의 권한 규칙 예시가 새 접두로 다시 쓰였다 — 옛 접두
-    부재·새 접두 존재를 `TestHostSnippetUsesCurrentServerPrefix`가 잰다. 읽기 전용으로
-    남는 보고는 **등록물 잔존**([20]) 쪽이다 — 옛 서버 이름(`ctr-exec`·`ctr`)의 `.mcp.json`·
-    `enabledMcpjsonServers` 잔존을 파일과 다음 걸음으로 알린다. 사용자의 `permissions.ask`/
-    `allow` 배열에 남은 옛 접두 규칙 **문자열 자체**를 doctor가 따로 짚어 주지는 않는다 —
-    그 규칙은 D96 계약 1 아래 사용자가 직접 찾아 고쳐야 한다.
+12. **옛 접두 권한 규칙** — **`hostSnippet`은 닫혔다. 권한 규칙 문자열 잔존 보고는 만들지
+    않는다(범위 판단).**
+    - **`hostSnippet`** `[실측]`: 새 접두는 `mcp__plugin_context-router_ctr__`다(D98).
+      권한 규칙 예시가 새 접두로 다시 쓰였다 — 옛 접두 부재·새 접두 존재를
+      `TestHostSnippetUsesCurrentServerPrefix`가 잰다. 사용자가 자기 `settings.json`에
+      붙여넣은 `mcp__ctr-exec__*` 권한 규칙은 더 이상 매치하지 않는데, D96 계약 1이 우리가
+      그 파일을 고치는 것을 금하므로 그 규칙은 사용자가 직접 옮겨야 한다.
+    - **읽기 전용으로 실재하는 것은 등록물 잔존 보고([20])다** `[실측]` — 옛 서버 이름
+      (`ctr-exec`·`ctr`)의 `.mcp.json`·`enabledMcpjsonServers` 잔존을 파일과 다음 걸음으로
+      알린다.
+    - **★ 남은 것 — 사용자의 `permissions.ask`/`allow` 배열에 남은 옛 접두 규칙 문자열 자체는
+      doctor가 짚지 않는다.** `[실측: internal/cli 전체를 뒤져도 그런 스캐너가 없다]`. 이
+      범위는 넓히지 않는다 — D96 계약 1이 그 파일을 고치는 것을 금해 스캐너를 만들어도 할 수
+      있는 일은 등록물 잔존 보고와 같은 읽기 전용 한 줄뿐이고, 같은 사용자는 이미 그 보고로
+      제거·재설치 경로에 서며 그 경로의 `hostSnippet`이 올바른 접두를 보여 준다. 문자열
+      스캐너가 여전히 값이 있다고 보면 그 판단은 별도 세션의 몫이다.
 13. **`doctor`의 감지원** — **닫혔다.** `[실측]` 결정: `codex mcp get`도 어떤 `--json` 형태도
     쓰지 않는다. 이유 둘 — `codex mcp get`은 무효 `config.toml`에서 실패하는데 그것이 정확히
     진단이 필요한 코호트이고, `--json`은 `env` 값을 평문으로 내 우리 출력에 자격증명을 싣게

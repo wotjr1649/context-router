@@ -41,11 +41,15 @@ separately in `docs/oracle-mapping-ko.md`.
 the plugin manifest and registers the MCP server itself. This program does
 not write to `.mcp.json`, `settings.json`, or `config.toml`.
 
-**0. Remove any existing hand-written registration.** Both hosts silently
-discard a plugin-declared MCP server when its `command` + `args` already
-match a registered one — no warning, no error; the symptom is that the
-plugin appears to do nothing. Remove old registrations (from a prior
-version of this tool, or a manual `mcp add`) first:
+**0. Remove any existing hand-written registration.** On Claude Code, the
+host silently discards a plugin-declared MCP server when its `command` +
+`args` already match a registered one — no warning, no error; the symptom
+is that the plugin appears to do nothing. The same mechanism on Codex has
+not been measured, but an old registration is a duplicate pointing at the
+same binary either way, so removing it first is sound on both hosts
+regardless of which one this was measured against. Remove old
+registrations (from a prior version of this tool, or a manual `mcp add`)
+first:
 
 ```sh
 claude mcp remove <name>
@@ -115,7 +119,7 @@ non-TTY (automation) context it refuses unless `--force` is passed.
 | `--root <path>` | cwd | project root |
 | `--store-root <path>` | OS-default store dir | override storage location (env `CTR_STORE_ROOT`) |
 | `--profile <list>` | `search,fetch,transform` | v0.0.1 accepts only the default 3-tool profile or `global-search` alone — arbitrary subsets are rejected at startup (tool gating by profile is reserved for a later version) |
-| `--enable <list>` | (none) | opt-in extra capabilities: `ingest`, `net` |
+| `--enable <list>` | `ingest,net` | opt-in capabilities: `ingest` / `net` / `exec` (env `CTR_ENABLE`, same comma-separated syntax — `--enable` wins over `CTR_ENABLE`, which wins over this default) |
 | `--allow-path <path>` | (none) | extra `ctr_index` allowed root (repeatable) |
 | `--projects <list>` | (none) | project allowlist, required with `--profile global-search` |
 | `--net-allow-local` | off | allow `127.0.0.1`/`::1` destinations for `ctr_fetch_and_index` |
