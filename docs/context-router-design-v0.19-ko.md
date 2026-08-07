@@ -92,8 +92,34 @@ Codex의 `ctr-exec`는 `--enable exec`, Claude의 `ctr-exec`는 `--enable ingest
 - 인라인 `env`가 하위 테이블로 전개되지 않고, 작은따옴표도 `args = []`도 그대로다.
 
 **즉 `codex plugin add`는 `codex mcp add`가 쓰는 직렬화기를 타지 않는다**(§6의 대조 참조).
-플러그인 경로로 옮기는 것이 사용자의 기존 설정에 **부수 피해를 주지 않는다**는 뜻이고,
-이것이 D96을 지지하는 마지막 조각이다.
+플러그인 경로로 옮기는 것이 사용자의 기존 설정에 **부수 피해를 주지 않는다**는 뜻이다.
+**단 이것은 `add` 경로 한정 측정이다** — 제거·업그레이드·재설치의 바이트 영향은 §5-10.
+
+#### A⑧ ★ 같은 명령줄의 서버는 **조용히 버려진다** `[실측]`
+
+한 변수만 바꾼 차등으로 잡았다. 플러그인이 선언한 서버를 `--enable ingest` → `--enable
+ingest,net`으로 바꾸자 마운트가 사라졌고, `mcp list`에서 그 서버가 **목록에 아예 없었다**
+(연결 실패가 아니라 미등록). 같은 목록에 `ctr-exec: context-router --enable ingest,net -
+✔ Connected`가 있었다 — 프로젝트 `.mcp.json`의 옛 등록물이고 **명령줄이 완전히 같다.**
+저장소 밖 작업 디렉터리에서 같은 플러그인을 올리자 정상 연결됐다.
+
+> **호스트는 `command`+`args`가 이미 등록된 서버와 같은 플러그인 서버를 경고 없이 버린다.**
+> 옛 등록물과 새 플러그인이 동시에 살아 있는 **모든 마이그레이션 사용자가 여기 걸린다.**
+> 증상은 "플러그인을 깔았는데 아무 일도 안 일어난다"이고 어디에도 사유가 안 나온다.
+> §2가 그래서 제거를 0번 걸음으로 둔다.
+
+#### A⑨ 게시 종단 검증 — 공개 원격에서 양쪽 설치 성공 `[실측]`
+
+산출물을 공개 저장소에 게시하고 **원격에서** 설치했다.
+
+| 호스트 | 결과 |
+|---|---|
+| Claude | `plugin marketplace add <owner>/<repo>` → `plugin install` → `plugin:context-router:ctr … ✔ Connected` |
+| Codex | `plugin marketplace add <owner>/<repo>` → `plugin add` → `ctr … enabled`, 버전 `0.19.0` |
+
+같은 저장소·같은 공유 서버 선언 파일·같은 스킬. 부수로 둘: **Codex는 두 마켓플레이스 파일이
+함께 있으면 `.agents/plugins/marketplace.json`을 읽는다**(그래서 둘 다 싣는다) ·
+**설치는 저장소를 통째로 클론한다**(§5-11).
 
 ### B. 가시성·채택층
 
@@ -234,20 +260,29 @@ ADR-0002가 38시행 A/B로 금지 토큰표를 세웠다 — `MANDATORY:`, `BLO
 
 ```
 context-router/
-  .claude-plugin/plugin.json      name·version·skills — hooks 키를 쓰지 않는다(아래)
-  .claude-plugin/marketplace.json 자기 자신이 마켓플레이스 (source "./") — 양쪽 공용
-  .codex-plugin/plugin.json       mcpServers→"./.mcp.json" · hooks→"./hooks/hooks.json"
-                                  · skills→"./skills/"
-  .mcp.json                       ★ 공유 (Claude는 루트 관례로, Codex는 위 경로 문자열로)
-  hooks/hooks.json                ★ 공유 (§5-2)
-  skills/<이름>/SKILL.md          ★ 공유
+  .claude-plugin/plugin.json       mcpServers→"./plugin/mcp.json" · skills→"./skills/"
+  .claude-plugin/marketplace.json  Claude 정본 마켓플레이스 (source "./")
+  .agents/plugins/marketplace.json Codex 정본 마켓플레이스 — 스키마가 다르다
+                                   (source 객체 · policy · interface, owner 없음)
+  .codex-plugin/plugin.json        mcpServers→"./plugin/mcp.json" · skills→"./skills/"
+                                   · interface
+  plugin/mcp.json                  ★ 공유 — 두 매니페스트가 경로 문자열로 가리킨다
+  skills/<이름>/SKILL.md           ★ 공유
+  hooks/hooks.json                 ★ 공유 — **아직 미배송**, §5-8이 릴리스 조건으로 건다
 ```
 
-**`.claude-plugin/plugin.json`에 `hooks` 키를 쓰지 마라** `[실측]`. Claude는 `hooks/hooks.json`을
-관례로 **이미** 로드하므로 같은 경로를 매니페스트에도 적으면 `Duplicate hooks file detected`가
-나고 그 플러그인이 `hook-load-failed`로 표시된다(훅 자체는 그래도 발화했으나 상태가 오염된다).
-Codex에는 그 관례가 없어 `.codex-plugin/plugin.json`은 **반드시** 선언해야 한다 —
-**이 비대칭이 `plugin.json` 둘을 나누는 실질적 이유 중 하나다.**
+**루트 `.mcp.json`을 쓰지 않는다** `[실측]`. Claude의 `plugin.json`이 `mcpServers`를 **경로
+문자열로도 받는다**는 것을 쟀다 — `./plugin/mcp.json`에서 서버가 실제로 떴다. 그래서 루트 관례
+자리를 비워 두고 로컬 개발 설치본(`.gitignore`된 `.mcp.json`)과 충돌하지 않는다.
+**`.gitignore`는 그대로 둔다** — 초안의 "그 항목을 은퇴시킨다"를 철회한다.
+
+**마켓플레이스 매니페스트는 두 벌이다** `[실측 + 문서]`. 경로도 스키마도 다르고, Codex는 둘이
+함께 있으면 `.agents/` 쪽을 읽는다. Codex가 Claude 형식도 받아들이기는 하지만 정본은 `.agents/`다.
+
+**`hooks` 키는 호스트마다 다르게 다룬다** `[실측]`. Claude는 `hooks/hooks.json`을 관례로 **이미**
+로드하므로 그 **관례 경로를** 매니페스트에 또 적으면 `Duplicate hooks file detected`가 나고
+플러그인이 `hook-load-failed`로 표시된다. 관례 밖 경로를 선언하는 것은 문제없다. Codex에는
+관례가 없어 `.codex-plugin/plugin.json`은 **반드시** 선언해야 한다.
 
 **이름**: 플러그인 `context-router`, MCP 서버 `ctr`. 도구 접두는
 **`mcp__plugin_context-router_ctr__`**가 되고 도구 이름은 `ctr_search`처럼 그대로다.
@@ -338,7 +373,11 @@ Search가 우리 도구 전체에 대해 무력화된다. 이것은 비용이 �
      **Git Bash가 실행하고**(측정: `$0 = /usr/bin/bash`, `$BASH_VERSION = 5.3.15`) MSYS 인자
      변환이 Windows 셸 문법을 **조용히** 망가뜨린다. 배열 형태는 셸을 거치지 않아 종료 코드가
      그대로 온다. 자립 바이너리인 우리에게 자연스러운 형태다.
-   - **결정은 JSON으로 낸다** — 사유를 실을 수 있고 종료 코드 전달에 의존하지 않는다.
+   - **두 경로는 배타적이다** `[문서]`. `exit 0`이어야 stdout의 JSON이 파싱되고, `exit 2`는
+     **stdout을 통째로 무시하고** stderr를 사유로 쓴다. 사유 문자열을 실으려면 **`exit 0` +
+     JSON**을 쓴다 — "exit 2 + JSON"은 JSON이 버려진다.
+   - `permissionDecision`의 값은 셋이 아니라 **넷**이다 — `allow` · `deny` · `ask` · `defer`
+     `[문서]`.
 
    ★ **현행 코드가 문자열 형태다** `[실측: `buildHookCommand`가 문자열을 조립하고 `hookCmd`에
    `args` 필드가 없다]`. 이관하면서 배열 형태로 바꾼다.
@@ -408,11 +447,16 @@ manifest field`) — 에러가 아니라 침묵이라 더 나쁘다. `userConfig
 | 지침·발견 | **없다** | 짧은 스킬 한 벌, 양쪽 공통 |
 | 채택 | **기제 없음 — 모델의 선택에 전적으로 의존** | 가시성 + 좁은 강제 + (후보) 수동 포착 |
 
-## 2. 설치 절차
+## 2. 설치 절차 — **옛 등록물 제거가 0번 걸음이다**
 
+0. **옛 등록물을 먼저 지운다.** A⑧ 때문이다 — 안 지우면 플러그인 서버가 조용히 버려진다.
+   `claude mcp remove <이름>` · `codex mcp remove <이름>`.
+   **검증을 종료 코드로 하지 마라** — `codex mcp remove`는 없는 이름에도 exit 0을 낸다(§6).
+   `mcp list`로 **부재를 눈으로 확인**한다.
 1. 바이너리 확보 — 릴리스 산출물 또는 `go install`. **지금과 같다.**
 2. `claude plugin marketplace add <owner>/<repo>` → `claude plugin install <name> --scope <user|project|local>`
 3. `codex plugin marketplace add <owner>/<repo>` → `codex plugin add <name>`
+4. **확인**: `mcp list`에 `plugin:<플러그인>:<서버>` 형태로 뜨는가.
 
 **우리도 사용자도 설정 파일을 편집하는 걸음이 없다** — §5-9가 Codex의 `hooks` 기능이 기본으로
 켜져 있음을 실측했고, A⑦이 설치가 기존 설정을 훼손하지 않음을 실측했다.
@@ -452,7 +496,7 @@ v0.18 핸드오프 §5.2의 목록은 **거의 전부 기입 경로의 부산물
 이 저장소는 측정 없는 주장을 신뢰 불가 신호로 다룬다. 아래를 재기 전에 그 부분의 구현을
 시작하지 마라.
 
-1. **훅이 실제로 발화하는가** — **양쪽 다 닫혔다** `[실측]`.
+1. **훅이 실제로 발화하는가** — **발화는 양쪽 다 닫혔다. 거부 의미는 Claude만 닫혔다.**
    - **Claude**: 플러그인이 선언한 `PreToolUse` 훅이 이 Windows에서 발화하고(마커 파일이
      기록됨) exit 2가 거부로 존중된다(읽기가 실제로 차단됨).
    - **Codex**: 격리 홈에서는 인증이 없어 401이 세션을 끊는 바람에 직접 재지 못했다. 대신
@@ -462,7 +506,12 @@ v0.18 핸드오프 §5.2의 목록은 **거의 전부 기입 경로의 부산물
      `~/.codex/plugins/data/<plugin>-<marketplace>/`에 실재하므로 **`PLUGIN_DATA`가 설정된
      프로세스 — 즉 Codex가 띄운 플러그인 훅 — 만이 그것을 쓸 수 있었다.** 사용자 설정을 한
      바이트도 건드리지 않고 얻은 증명이다. 보강 증거로 `config.toml`에 플러그인 범위 훅 신뢰
-     항목 여덟이 있다.
+     항목 여덟이 있다. **등급은 인과 논증이지 직접 측정이 아니다** — 그렇게 읽어라.
+   - **★ 남은 것 — Codex의 거부 의미는 미확정.** 위 증명이 말하는 것은 훅이 **발화한다**는
+     것뿐이고, D100 계약 3이 의존하는 **거부 규칙**(exit 2 / `permissionDecision` JSON)은
+     **Claude에서만** 쟀다. Codex가 같은 규약인지는 재지 않았다.
+   - **배열 형태는 Claude에서만 쟀다.** `command` + `args` 배열로 exit 2·JSON 두 경로 모두
+     거부가 성립했다. **`commandWindows`와의 공존**과 **Codex에서의 배열 형태 발화**는 미확정.
    - **부수 확정 — Codex의 플러그인 환경 변수 둘**: `PLUGIN_ROOT`(경로 치환)와
      **`PLUGIN_DATA`(플러그인 전용 쓰기 가능 디렉터리)**. 우리 훅이 상태를 둘 자리가 여기다.
    - *그 미해결 관측도 닫혔다* `[실측]`: Windows에서 훅 `command` **문자열**은 Git Bash가
@@ -490,6 +539,10 @@ v0.18 핸드오프 §5.2의 목록은 **거의 전부 기입 경로의 부산물
 
    **차이는 세션당 약 1,140토큰이고, 그와 별개로 지연 로드 기능이 사용자에게 돌아온다**
    (D99 근거 ②). 강등 규칙(계약 3)의 임계는 배송 후 실제 사용률로 정한다.
+   **★ 단 이 표현 수단은 Claude 한정이다.** `_meta`의 `"anthropic/alwaysLoad"`는 Anthropic
+   벤더 확장이고 `[문서]`, Codex가 그것을 어떻게 다루는지는 **재지 않았다** — D101이 실측한
+   대로 Codex는 미지 필드를 조용히 버린다. **D99는 Claude 한정 최적화로 읽어라.** Codex 쪽
+   등가 기제가 있는지는 별도로 재야 한다. 게시된 `plugin/mcp.json`에는 아직 진입 도구 표시가 없다.
 5. **`userConfig` 스키마** — **닫혔다** `[실측: 설치된 바이너리의 zod 정의 + `plugin validate
    --strict` 탐침]`. 스키마 전문과 양쪽 대조는 **D101**에 있다. 요점 셋: Claude에만 있고 ·
    열거형이 없어 프로필 이름을 스키마로 강제할 수 없으며 · Codex는 미지 필드를 조용히 버린다.
@@ -500,21 +553,41 @@ v0.18 핸드오프 §5.2의 목록은 **거의 전부 기입 경로의 부산물
    or SSH Git URL"*), 양쪽이 `.claude-plugin/marketplace.json`을 읽으며(Codex가 설치된 플러그인
    하나에 대해 그 경로를 그대로 인쇄한다), `"source": "./"` 자기 호스팅 형태가 양쪽에서
    수용된다(내 프로브가 Codex에서, 설치된 플러그인이 Claude에서). `claude plugin validate`도 통과.
-   **남은 것은 설계 위험이 아니라 게시 시점 연기 시험 하나** — 저장소를 실제로 게시해 양쪽에서
-   한 번 설치해 볼 것. 부수: Codex의 `--sparse`가 git 마켓플레이스의 부분 체크아웃을 지원한다 —
-   저장소가 커질 때의 수단이다.
+   **그리고 게시 연기 시험도 닫혔다 — A⑨.** 공개 원격에서 양쪽 다 설치·연결까지 성공했다.
+   정정 하나: 마켓플레이스 매니페스트는 **한 벌이 아니라 두 벌**이다(D98). Codex는 둘이 함께
+   있으면 `.agents/` 쪽을 읽는다. 부수: `--sparse`가 양쪽에 있고 §5-11의 완화 후보다.
 7. **버전 번호** — **판정됐다**(소유자, 2026-08-07): **이 작업은 `0.19.0`으로 배송한다.**
    `1.0.0`은 (a) 저장소를 실제로 게시해 양쪽에서 설치되는 것을 확인하고, (b) 그 뒤 내부 도구
    개선·수정을 한 차례 거친 다음에 판정한다 — **정식 릴리스는 대기다.** 델타 체인 파일명과
    문서 규약은 그대로 이어진다.
-8. **수동 포착** — **닫혔다: 도입 여부의 문제가 아니었다.** 이미 배송된 동작이고 저장 전에
-   리댁션을 지난다(D100 계약 4가 필터 사슬 전문을 적는다). 남는 것은 "패턴 리댁션이 Bash
-   출력에 충분한가"이며, 그것은 이 설계의 범위 밖이고 설계 §5.1의 알려진 한계로 이미 추적된다.
-   **이 릴리스는 그 동작을 바꾸지 않는다.**
+8. **수동 포착** — **★ 정정: 가만두면 사라진다.** 이미 배송된 동작이고 저장 전에 리댁션을
+   지나지만(D100 계약 4), 그 포착을 실어 나르는 것은 **설치기가 등록하는 `PostToolUse` 훅**이다.
+   D97이 설치기를 지우는데 **게시된 패키지에는 훅이 없다**(`hooks/` 부재, 두 매니페스트에
+   `hooks` 키 없음). 그대로 이관하면 수동 포착이 **조용히 죽는다.**
+   → **훅 파일을 매니페스트에 싣는 것을 D97의 릴리스 조건으로 올린다.** 그 전에는 기입 경로를
+   지우지 않는다. 남는 물음("패턴 리댁션이 Bash 출력에 충분한가")은 설계 §5.1의 알려진 한계다.
+   *이 항목은 교차 모델 검토의 검증 서브가 잡았다 — 앞선 판정 "이 릴리스는 그 동작을 바꾸지
+   않는다"는 틀렸다.*
 9. **`[features] hooks`** — **닫혔다** `[실측]`. `config.toml`이 **아예 없는** 새 `CODEX_HOME`에서
    `codex features list`가 `hooks` · `plugins` · `plugin_sharing` · `skill_search`를 전부
    `stable / true`로 낸다. `plugin_hooks`는 `removed / false`다 — 참조 구현 README가 요구하는
    그 키는 낡았다. **사용자가 설정 파일에 한 줄도 칠 필요가 없다.**
+10. **설치의 왕복 바이트 영향** `[미실측]`. A⑦은 `plugin add` **한 방향만** 쟀다. 제거·업그레이드·
+    재설치가 `config.toml`에 무엇을 하는지는 모른다. §4가 "uninstall이 파일을 비우는 형태"를
+    폐기 처리하면서 그 쓰기 주체를 호스트로 옮겼을 뿐이므로, **기록기를 지우기 전에
+    install → uninstall → reinstall 왕복의 바이트 비교를 하라.**
+11. **긴 경로 클론 실패** `[실측]`. 플러그인 설치는 **저장소를 통째로 클론한다.** 설정 홈 경로가
+    길면 Windows 파일명 길이 한계로 `fatal: failed to unlink … Filename too long`이 나고 설치가
+    죽는다(짧은 경로에서는 성공). **이 코호트는 무효 TOML 코호트보다 크다.** 완화 후보는
+    `--sparse`(양쪽 CLI에 있다)이고, 재지 않았다.
+12. **옛 접두 권한 규칙** `[미해결]`. 도구 접두가 바뀌면 사용자가 자기 `settings.json`에
+    붙여넣은 `mcp__ctr-exec__*` 규칙이 무효가 되는데, D96 계약 1이 우리가 그 파일을 고치는 것을
+    금한다. `hostSnippet`(`internal/cli/cli.go`)은 **지금도 옛 규칙을 붙여넣도록 안내한다.**
+    → `hostSnippet`을 갱신하고, `doctor`가 옛 접두 규칙의 잔존을 **읽기 전용으로** 알린다.
+13. **`doctor`의 감지원** `[미해결]`. §3이 감지를 `codex mcp get`으로 갈음할 수 있는지 묻는데,
+    그 명령은 **무효 TOML에서 실패하고** `--json`은 `env` 값을 평문으로 낸다(§6). 그러면 D97
+    계약 2의 "어느 줄인지 짚는다"를 지킬 수 없다. → 최소한의 줄 위치 탐지기를 남기거나 그
+    약속을 철회하라. **어느 쪽이든 `doctor`는 `--json`을 호출하지 않는다.**
 
 ## 6. 기록 정정
 
@@ -553,3 +626,49 @@ v0.18 핸드오프 §5.2의 목록은 **거의 전부 기입 경로의 부산물
 > a good search index over session history plus a prompt that makes the model write scripts —
 > R1 doubles down on the part that is real (the index) and **removes dependence on the part
 > that is not (voluntary adoption).**
+
+## 8. 적대적 검토 (2026-08-07) — 둘 다 승인하지 않았다
+
+두 갈래를 돌렸다: 공개 문서 대조와 교차 모델 한 패스(다른 제공자, `cross-model-review` 절차,
+식별자 별칭·한 결정만 송신). 결과를 있는 그대로 적는다.
+
+### 8.1 검토가 정정한 우리 주장 넷
+
+| 우리가 적었던 것 | 정정 |
+|---|---|
+| 양쪽이 같은 마켓플레이스 형식을 받는다 | **틀림.** 경로도 스키마도 다르다(D98이 반영) |
+| 거부는 exit 2 **또는** JSON | **부분 정정.** 배타적이다 — `exit 2`는 stdout을 무시한다. `permissionDecision`은 넷이다 |
+| `${user_config.*}`가 훅 명령에 치환된다 | **부분 정정.** 셸 형식에서는 **v2.1.207에서 거부되도록 파괴적으로 바뀌었다.** monitor는 환경 변수조차 못 받는다 |
+| `outputSchema`는 프롬프트에 안 실린다 | **문서 근거 없음.** 우리 측정은 유효하나 **문서화된 계약이 아니라 구현 특성**이다 — MCP 명세는 오히려 LLM 전달을 이점으로 서술한다 |
+
+### 8.2 우리가 몰랐던 비용·제약 `[문서]`
+
+- **Tool Search는 베타 API 헤더 위에 선다.** 해제 조건이 여섯이고(환경 변수 둘 · 비-1st-party
+  엔드포인트 · 특정 클라우드 배포 · 모델 세대), `CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS`는
+  **재정의 불가**로 끈다. D99의 전제가 이 헤더 위에 있다.
+- **`alwaysLoad: true`는 세션 시작을 최대 5초 붙잡는다** — 서버가 뜰 때까지 기다린다.
+  토큰 비용만 있는 게 아니었다.
+- **이름은 사실상 불변이다** — 마켓플레이스 항목 `name` 변경에는 별도 `renames` 맵이 필요하다.
+  **지금 잘못 고르면 되돌리는 값이 영구적이다**(D98의 이름 판정이 그만큼 무겁다).
+- **`version`이 없으면 커밋 SHA가 버전이 된다** — 매 커밋이 새 버전으로 읽힌다.
+- **관리자가 배포 경로를 통째로 막을 수 있다** — `strictKnownMarketplaces`·`blockedMarketplaces`.
+- **민감 `userConfig`는 OAuth 토큰과 키체인 2KB를 공유한다.**
+- **워크스페이스 신뢰 장벽**: 클론한 저장소는 자기 `.mcp.json` 서버를 스스로 승인하지 못한다.
+  (플러그인 선언 서버는 이 관문을 지나지 않았다 — 실측)
+
+### 8.3 판정과 대조
+
+**웹 대조: "절반만 지금 하라."** MCP 계층은 문서로 뒷받침되나 **플러그인 배포 계층에 설치 경로
+전체를 거는 것은 시기상조**이며 플러그인을 보조 경로로 두라는 것. 근거는 최근 릴리스 열 중
+아홉이 플러그인 기제를 건드렸고 `${user_config.*}` 규칙이 이미 한 번 파괴적으로 바뀌었다는 것.
+
+**교차 모델: `needs_changes`.** 검증 서브가 그 주장을 accept 2 · downgrade 3 · reject 1로
+가른 뒤 **자체로 여덟을 더 찾았고**, 그중 §5-8(수동 포착 소멸)과 §2(제거가 0번 걸음)가 이
+문서를 실제로 바꿨다. 기각 하나는 "설치 전 preflight"였다 — D96 아래 실행 지점이 없다
+(설치를 호스트 CLI가 하고 우리 바이너리는 그 경로에 없다).
+
+**우리 실측이 이미 닫은 것**: 게시 종단 검증(A⑨) · 설치의 무해성(A⑦) · 기능 플래그 기본값
+(§5-9) · 훅 발화(§5-1) · 중복 제거 함정(A⑧, 검토가 물은 마이그레이션 질문의 답).
+
+**닫지 못한 것은 표면의 시간적 안정성**이고 그것은 측정으로 닫히지 않는다 — 관측 기간이 필요하다.
+전면 전환이냐 헤지냐는 그러므로 **측정이 아니라 소유자 판정**이다.
