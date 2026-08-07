@@ -29,6 +29,9 @@ import (
 )
 
 func TestParseFlags(t *testing.T) {
+	// CTR_ENABLE(D101)이 이 함수를 환경에 민감하게 만들었다 — 이 테스트가 단정하는 Enable
+	// 필드가 우연한 ambient CTR_ENABLE에 흔들리지 않게 빈 값으로 고정한다.
+	t.Setenv("CTR_ENABLE", "")
 	tests := []struct {
 		name    string
 		args    []string
@@ -64,6 +67,82 @@ func TestParseFlags_RejectsPositionalArgs(t *testing.T) {
 	if _, err := parseFlags([]string{"--store-root", "X", "doctor"}); err == nil {
 		t.Fatal("want error for trailing positional arg, got nil")
 	}
+}
+
+// TestParseFlags_CTR_ENABLE — D101: --enable이 빈 문자열일 때만(부재·"--enable=" 둘 다 —
+// flag 패키지로는 구분 불가) CTR_ENABLE을 대신 읽고, 값이 있으면 플래그가 이긴다. 문법은
+// --enable과 같고(쉼표 구분·항목별 트림·빈 항목 무시) 모르는 이름은 두 입구 모두 오류다
+// (§6 — 오류 문면에 입력 원문 미포함). storeRootFor·CTR_STORE_ROOT의 t.Setenv 관례와
+// 동형(TestStoreRootFor).
+func TestParseFlags_CTR_ENABLE(t *testing.T) {
+	t.Run("env_fills_when_flag_absent", func(t *testing.T) {
+		t.Setenv("CTR_ENABLE", "ingest,net")
+		got, err := parseFlags(nil)
+		if err != nil {
+			t.Fatalf("err=%v", err)
+		}
+		want := []string{"ingest", "net"}
+		if strings.Join(got.Enable, ",") != strings.Join(want, ",") {
+			t.Fatalf("Enable=%v want %v", got.Enable, want)
+		}
+	})
+
+	t.Run("flag_wins_over_env", func(t *testing.T) {
+		t.Setenv("CTR_ENABLE", "ingest")
+		got, err := parseFlags([]string{"--enable", "exec"})
+		if err != nil {
+			t.Fatalf("err=%v", err)
+		}
+		want := []string{"exec"}
+		if strings.Join(got.Enable, ",") != strings.Join(want, ",") {
+			t.Fatalf("Enable=%v want %v (flag must win over CTR_ENABLE)", got.Enable, want)
+		}
+	})
+
+	t.Run("empty_env_keeps_current_default", func(t *testing.T) {
+		t.Setenv("CTR_ENABLE", "")
+		got, err := parseFlags(nil)
+		if err != nil {
+			t.Fatalf("err=%v", err)
+		}
+		if len(got.Enable) != 0 {
+			t.Fatalf("Enable=%v want empty (no --enable, CTR_ENABLE=\"\")", got.Enable)
+		}
+	})
+
+	t.Run("whitespace_normalized", func(t *testing.T) {
+		t.Setenv("CTR_ENABLE", " ingest , net ")
+		got, err := parseFlags(nil)
+		if err != nil {
+			t.Fatalf("err=%v", err)
+		}
+		want := []string{"ingest", "net"}
+		if strings.Join(got.Enable, ",") != strings.Join(want, ",") {
+			t.Fatalf("Enable=%v want %v", got.Enable, want)
+		}
+	})
+
+	t.Run("unknown_name_in_env_rejected_without_echo", func(t *testing.T) {
+		t.Setenv("CTR_ENABLE", "bogus")
+		_, err := parseFlags(nil)
+		if err == nil {
+			t.Fatal("want error for unknown CTR_ENABLE profile name, got nil")
+		}
+		if strings.Contains(err.Error(), "bogus") {
+			t.Fatalf("error echoes user input(규약 §6 위반): %v", err)
+		}
+	})
+
+	t.Run("unknown_name_in_flag_rejected_without_echo", func(t *testing.T) {
+		t.Setenv("CTR_ENABLE", "")
+		_, err := parseFlags([]string{"--enable", "bogus"})
+		if err == nil {
+			t.Fatal("want error for unknown --enable profile name, got nil")
+		}
+		if strings.Contains(err.Error(), "bogus") {
+			t.Fatalf("error echoes user input(규약 §6 위반): %v", err)
+		}
+	})
 }
 
 func TestParseFlagsNet(t *testing.T) {

@@ -71,8 +71,19 @@ func parseFlags(args []string) (serverFlags, error) {
 		return serverFlags{}, fmt.Errorf("ctr: 위치 인자는 허용되지 않습니다 (받은 개수: %d)", n)
 	}
 	f.Profile = strings.Split(profile, ",")
+	// D101 계약 1: --enable이 빈 문자열일 때만(미지정·"--enable="로 명시한 빈 값 둘 다 — flag
+	// 패키지에는 그 둘을 구분할 수단이 없다) CTR_ENABLE을 대신 읽는다. 플래그가 주어지면
+	// 플래그가 이긴다. storeRootFor의 CTR_STORE_ROOT 관례(직접 os.Getenv, 테스트는 t.Setenv)를
+	// 그대로 따른다 — 이 패키지에 이미 있는 관례라 별도 getenv 파라미터를 두지 않는다.
+	if enable == "" {
+		enable = os.Getenv("CTR_ENABLE")
+	}
 	if enable != "" {
-		f.Enable = strings.Split(enable, ",")
+		enableList, err := parseEnableList(enable)
+		if err != nil {
+			return serverFlags{}, err
+		}
+		f.Enable = enableList
 	}
 	for _, p := range strings.Split(projects, ",") {
 		if p = strings.TrimSpace(p); p != "" {
@@ -94,6 +105,33 @@ func parseFlags(args []string) (serverFlags, error) {
 	}
 	f.RetentionEvents = d
 	return f, nil
+}
+
+// enableProfileNames — --enable·CTR_ENABLE이 받는 프로필 이름 집합(D101). internal/cli도 같은
+// 이름 셋을 mcpProfileNames로 독립적으로 든다(hook install 전용) — Task5가 그 기입 경로를
+// 통째로 지울 예정이라 여기서 import하거나 공유하지 않는다(의도적 비공유, D13 반파편화
+// 예외 대상 아님).
+var enableProfileNames = []string{"ingest", "net", "exec"}
+
+// parseEnableList — --enable/CTR_ENABLE 공통 문법(쉼표 구분·항목별 공백 트림·빈 항목 무시)을
+// 판다. 모르는 이름은 오류로 거부한다: mcp.NewServer(internal/mcp/mcp.go)는 cfg.Enable에
+// slices.Contains(…, "ingest"/"net"/"exec")로만 반응하므로 그 셋에 없는 이름은 오류도 경고도
+// 없이 그냥 아무 도구도 켜지 않는다 — CTR_ENABLE은 플래그보다 오타가 눈에 덜 띄어 그 침묵이
+// "프로필이 켜졌다"는 오인으로 이어지기 쉽다. 오류 문면에 입력 원문을 담지 않는다(규약 §6
+// 사용자 입력 에코 금지) — 허용 이름만 나열한다.
+func parseEnableList(raw string) ([]string, error) {
+	var out []string
+	for _, name := range strings.Split(raw, ",") {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			continue
+		}
+		if !slices.Contains(enableProfileNames, name) {
+			return nil, fmt.Errorf("ctr: --enable/CTR_ENABLE에 모르는 프로필 이름이 있습니다(가능: %s)", strings.Join(enableProfileNames, ","))
+		}
+		out = append(out, name)
+	}
+	return out, nil
 }
 
 // parseRetentionEventsFlag — --retention-events 값을 검증한다(설계 §5, D17). 빈 문자열(플래그
