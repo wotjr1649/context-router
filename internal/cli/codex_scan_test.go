@@ -95,6 +95,44 @@ func TestCodexServerHeaders(t *testing.T) {
 				{Name: "ctr-exec.env", Line: 8},
 			},
 		},
+		{
+			"닫는 대괄호 뒤 주석 — # 앞에 공백 하나",
+			"[mcp_servers.ctr] # hand-added 2026-05\n",
+			[]codexHeaderHit{{Name: "ctr", Line: 1}},
+		},
+		{
+			"닫는 대괄호 뒤 주석 — # 뒤에 공백 없음",
+			"[mcp_servers.ctr]  #comment with no space\n",
+			[]codexHeaderHit{{Name: "ctr", Line: 1}},
+		},
+		{
+			"닫는 대괄호 뒤 주석 — 주석 안에 #과 ]가 또 있다",
+			"[mcp_servers.ctr] # see #2 and [docs]\n",
+			[]codexHeaderHit{{Name: "ctr", Line: 1}},
+		},
+		{
+			"따옴표 안의 # — 주석 시작이 아니라 이름의 일부",
+			`[mcp_servers."a#b"]` + "\n",
+			[]codexHeaderHit{{Name: "a#b", Line: 1}},
+		},
+		{
+			"따옴표 안의 ] — 닫는 대괄호로 오인하지 않는다",
+			`[mcp_servers."a]b"]` + "\n",
+			[]codexHeaderHit{{Name: "a]b", Line: 1}},
+		},
+		{
+			// codexHeaderClose의 이스케이프 건너뛰기 회귀 방지 — \"가 문자열을 조기 종료하면
+			// 진짜 닫는 대괄호를 못 찾아 줄 전체를 놓친다. 이스케이프 자체는 해석하지 않으므로
+			// (unquoteHeaderName과 같은 비범위) 이름에는 \" 두 글자가 그대로 남는다.
+			"따옴표 안의 이스케이프된 큰따옴표 — 조기 종료로 줄 전체를 놓치지 않는다",
+			`[mcp_servers."a\"b"]` + "\n",
+			[]codexHeaderHit{{Name: `a\"b`, Line: 1}},
+		},
+		{
+			"대괄호 뒤가 주석도 빈 것도 아니면 잡지 않는다(두 번째 알려진 한계)",
+			"[mcp_servers.ctr] not a comment\n",
+			nil,
+		},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
