@@ -234,18 +234,20 @@ ADR-0002가 38시행 A/B로 금지 토큰표를 세웠다 — `MANDATORY:`, `BLO
 
 ```
 context-router/
-  .claude-plugin/plugin.json      name·version·skills  (mcpServers는 루트 .mcp.json 관례)
+  .claude-plugin/plugin.json      name·version·skills — hooks 키를 쓰지 않는다(아래)
   .claude-plugin/marketplace.json 자기 자신이 마켓플레이스 (source "./") — 양쪽 공용
-  .codex-plugin/plugin.json       mcpServers→"./.mcp.json" · hooks→"./hooks/codex.json"
+  .codex-plugin/plugin.json       mcpServers→"./.mcp.json" · hooks→"./hooks/hooks.json"
                                   · skills→"./skills/"
-  .mcp.json                       ★ 공유
-  hooks/claude.json               Claude 매처
-  hooks/codex.json                Codex 매처(`is_exact_matcher`라 `mcp__` 대신 `mcp__.*`)
+  .mcp.json                       ★ 공유 (Claude는 루트 관례로, Codex는 위 경로 문자열로)
+  hooks/hooks.json                ★ 공유 (§5-2)
   skills/<이름>/SKILL.md          ★ 공유
 ```
 
-훅 파일을 하나로 합칠 수 있는지는 §5의 미확정 항목이다 — 정규식 매처를 양쪽 안전하게 쓰면
-가능해 보이나 재지 않았다.
+**`.claude-plugin/plugin.json`에 `hooks` 키를 쓰지 마라** `[실측]`. Claude는 `hooks/hooks.json`을
+관례로 **이미** 로드하므로 같은 경로를 매니페스트에도 적으면 `Duplicate hooks file detected`가
+나고 그 플러그인이 `hook-load-failed`로 표시된다(훅 자체는 그래도 발화했으나 상태가 오염된다).
+Codex에는 그 관례가 없어 `.codex-plugin/plugin.json`은 **반드시** 선언해야 한다 —
+**이 비대칭이 `plugin.json` 둘을 나누는 실질적 이유 중 하나다.**
 
 **이름**: 플러그인 이름과 서버 이름이 곱해져 도구 접두가 된다
 (`mcp__plugin_<플러그인>_<서버>__`). **이름을 정하기 전에는 문서에 접두를 박지 마라.**
@@ -269,8 +271,10 @@ Search가 우리 도구 전체에 대해 무력화된다. 이것은 비용이 �
 
 **계약 넷**:
 
-1. **진입 도구는 최소로.** 후보는 `ctr_search`(저장된 것으로 들어가는 유일한 문)와
-   `ctr_index`(넣는 문). 확정은 §5.
+1. **진입 도구는 `ctr_search` + `ctr_index` 둘이다** (소유자 판정, 2026-08-07). 나오는 문과
+   들어가는 문. 프롬프트에 실리는 몫이 1,159자 ≈ 390토큰이고, 현행 8도구 4,571자 ≈ 1,530토큰
+   대비 **세션당 약 1,140토큰**을 던다. 지연되는 여섯: `ctr_fetch` · `ctr_transform` ·
+   `ctr_record_event` · `ctr_session_summary` · `ctr_export_events` · `ctr_fetch_and_index`.
 2. **나머지는 진입 도구 설명의 꼬리에 색인한다** — 이름 + 한 줄. 호출 방법은 적지 않는다.
 3. **강등 규칙을 함께 정한다.** 참조 구현이 `post-install execCallBasis < 15% → demote to
    deferred`라는 수치 기준을 걸었다. 우리도 기준 없이 상시를 유지하지 않는다.
@@ -311,9 +315,24 @@ Search가 우리 도구 전체에 대해 무력화된다. 이것은 비용이 �
 2. **훈계 어휘 금지.** `MANDATORY` · `BLOCKED` · `Do NOT` · `Never` · `PREFER X OVER Y` ·
    ✅/❌ 불릿을 도구 설명·훅 사유·`doctor` 문면에 쓰지 않는다. **부정으로 해명하지 않는다**
    (부정이 그 프레임을 점화한다 — B④). 리다이렉트는 HTTP 301처럼 **대체 목적지만** 말한다.
-3. **강제는 좁게, fail-open으로.** 겨눌 후보는 "이미 저장소에 색인된 바이트를 다시 읽는 것"과
-   "임계값을 넘는 전체 읽기" 둘이다. 참조 구현의 적대적 리뷰가 100 KB 범위를 기각하고 1 MiB로
-   좁힌 이력을 그대로 받는다 — 오탐이 편집 워크플로를 깨기 때문이다. 모든 갈래는 실패 시 통과.
+3. **강제는 좁게, 그리고 fail-open은 선택이 아니라 사실이다.** 겨눌 후보는 "이미 저장소에
+   색인된 바이트를 다시 읽는 것"과 "임계값을 넘는 전체 읽기" 둘이다. 참조 구현의 적대적 리뷰가
+   100 KB 범위를 기각하고 1 MiB로 좁힌 이력을 그대로 받는다 — 오탐이 편집 워크플로를 깨기
+   때문이다.
+
+   **거부의 기제는 실측으로 확정됐다** `[실측]`:
+   - 거부가 성립하는 것은 **훅이 종료 코드 2로 끝날 때**(스트림 내용 무관), 또는 **종료 코드 0 +
+     stdout의 `permissionDecision:"deny"` JSON**일 때뿐이다.
+   - **종료 코드 1·3은 거부가 아니다.** 훅이 오류로 죽으면 도구 호출이 그대로 통과한다 —
+     **`PreToolUse` 훅은 보안 게이트가 될 수 없다.** 우리 선택이 아니라 호스트의 성질이다.
+   - **`command` 문자열 대신 `command` + `args` 배열 형태를 쓴다.** Windows에서 문자열 형태는
+     **Git Bash가 실행하고**(측정: `$0 = /usr/bin/bash`, `$BASH_VERSION = 5.3.15`) MSYS 인자
+     변환이 Windows 셸 문법을 **조용히** 망가뜨린다. 배열 형태는 셸을 거치지 않아 종료 코드가
+     그대로 온다. 자립 바이너리인 우리에게 자연스러운 형태다.
+   - **결정은 JSON으로 낸다** — 사유를 실을 수 있고 종료 코드 전달에 의존하지 않는다.
+
+   ★ **현행 코드가 문자열 형태다** `[실측: `buildHookCommand`가 문자열을 조립하고 `hookCmd`에
+   `args` 필드가 없다]`. 이관하면서 배열 형태로 바꾼다.
 4. **수동 포착은 후보가 아니라 이미 배송돼 있다 — 그리고 우리 방어가 참조 구현보다 두껍다.**
    `[실측: internal/hook/shadow.go · internal/ingest/ingest.go]` PostToolUse가 **전 도구**에 대해
    (등록 매처가 빈 문자열) 성공 응답을 포착하고, 필터 사슬은 이렇다:
@@ -437,8 +456,12 @@ v0.18 핸드오프 §5.2의 목록은 **거의 전부 기입 경로의 부산물
      항목 여덟이 있다.
    - **부수 확정 — Codex의 플러그인 환경 변수 둘**: `PLUGIN_ROOT`(경로 치환)와
      **`PLUGIN_DATA`(플러그인 전용 쓰기 가능 디렉터리)**. 우리 훅이 상태를 둘 자리가 여기다.
-   - *미해결 관측 하나*: `cmd /c exit 2`만 둔 훅은 차단하지 못했고, 같은 exit 코드에 앞선 명령을
-     더한 형태는 차단했다. 원인 불명 — 거부를 설계에 쓰기 전에 확인하라.
+   - *그 미해결 관측도 닫혔다* `[실측]`: Windows에서 훅 `command` **문자열**은 Git Bash가
+     실행하고, MSYS 인자 변환이 `cmd /c`의 `/c`를 경로로 바꿔 버려 `exit 2`가 **아예 실행되지
+     않는다**(cmd가 대화형으로 뜬다). `… & exit 2` 형태에서는 `exit 2`가 **bash 자신의 내장**으로
+     실행돼 훅이 2로 끝난다. 차이를 만든 것은 마커도 부수 효과도 아니고 그것뿐이었다.
+     기제는 D100 계약 3에 있다. (내 원래 측정에서 마커가 의도한 경로에 남은 것은 리다이렉트
+     대상에 **슬래시 경로**를 써서 bash의 백슬래시 이스케이프를 피했기 때문이다.)
 2. **훅 파일 하나로 양쪽을 섬길 수 있는가** — **닫혔다. 된다** `[실측]`. 설치된 한 플러그인의
    `.claude-plugin/plugin.json`과 `.codex-plugin/plugin.json`이 **같은 파일**
    (`./hooks/claude-codex-hooks.json`)을 가리키고, 진짜 `config.toml`에 그 파일의 항목별 신뢰
@@ -446,7 +469,7 @@ v0.18 핸드오프 §5.2의 목록은 **거의 전부 기입 경로의 부산물
    **조건 둘**: `SessionStart`에도 `matcher`를 달 것, Windows용 **`commandWindows`**를 함께 담을 것.
 3. **`outputSchema`가 모델 컨텍스트에 실리는가** — **닫혔다. 실리지 않는다**(B①). D99 계약 4가
    그 결론이다.
-4. **진입 도구 집합** — **표현 수단과 숫자는 확정, 집합 자체만 소유자 판정으로 남는다.**
+4. **진입 도구 집합** — **닫혔다.** 소유자 판정으로 `ctr_search` + `ctr_index`(D99 계약 1).
    표현 수단 `[실측: go doc]`: 설치된 SDK의 `mcp.Tool`이 ``Meta `json:"_meta,omitempty"` ``를
    담는다. 참조 구현이 쓰는 키는 `"anthropic/alwaysLoad"`다.
    숫자 `[계산: D99 측정표의 도구별 내역 × B①의 밀도]` — **프롬프트에 실리는 것만** 센다:
@@ -457,7 +480,7 @@ v0.18 핸드오프 §5.2의 목록은 **거의 전부 기입 경로의 부산물
    | 현행 전체 8도구 (`ingest,net`) | 4,571자 | 약 1,530 |
 
    **차이는 세션당 약 1,140토큰이고, 그와 별개로 지연 로드 기능이 사용자에게 돌아온다**
-   (D99 근거 ②). 집합은 계약 3의 강등 규칙과 한 쌍으로 정한다.
+   (D99 근거 ②). 강등 규칙(계약 3)의 임계는 배송 후 실제 사용률로 정한다.
 5. **`userConfig` 스키마** — **닫혔다** `[실측: 설치된 바이너리의 zod 정의 + `plugin validate
    --strict` 탐침]`. 스키마 전문과 양쪽 대조는 **D101**에 있다. 요점 셋: Claude에만 있고 ·
    열거형이 없어 프로필 이름을 스키마로 강제할 수 없으며 · Codex는 미지 필드를 조용히 버린다.
