@@ -38,7 +38,7 @@ func TestParseFlags(t *testing.T) {
 		want    serverFlags
 		wantErr bool
 	}{
-		{"defaults", nil, serverFlags{Profile: []string{"search", "fetch", "transform"}, LogLevel: "info"}, false},
+		{"defaults", nil, serverFlags{Profile: []string{"search", "fetch", "transform"}, Enable: []string{"ingest", "net"}, LogLevel: "info"}, false},
 		{"enable", []string{"--enable", "ingest,net"}, serverFlags{Profile: []string{"search", "fetch", "transform"}, Enable: []string{"ingest", "net"}, LogLevel: "info"}, false},
 		{"unknown", []string{"--bogus"}, serverFlags{}, true},
 	}
@@ -73,7 +73,9 @@ func TestParseFlags_RejectsPositionalArgs(t *testing.T) {
 // flag 패키지로는 구분 불가) CTR_ENABLE을 대신 읽고, 값이 있으면 플래그가 이긴다. 문법은
 // --enable과 같고(쉼표 구분·항목별 트림·빈 항목 무시) 모르는 이름은 두 입구 모두 오류다
 // (§6 — 오류 문면에 입력 원문 미포함). storeRootFor·CTR_STORE_ROOT의 t.Setenv 관례와
-// 동형(TestStoreRootFor).
+// 동형(TestStoreRootFor). 둘 다 없으면 D101 계약 2의 기본 프로필(ingest,net)로 돈다(v0.19
+// 리뷰 C1) — 세 갈래(플래그 > 환경 변수 > 기본값) 우선순위 전체는 별도 표
+// TestParseFlags_EnablePrecedence가 한 곳에서 잰다.
 func TestParseFlags_CTR_ENABLE(t *testing.T) {
 	t.Run("env_fills_when_flag_absent", func(t *testing.T) {
 		t.Setenv("CTR_ENABLE", "ingest,net")
@@ -99,14 +101,19 @@ func TestParseFlags_CTR_ENABLE(t *testing.T) {
 		}
 	})
 
-	t.Run("empty_env_keeps_current_default", func(t *testing.T) {
+	// v0.19 리뷰 C1(소유자 결정)이 이름과 기대값을 뒤집었다: 둘 다 없으면 이제 빈 값이 아니라
+	// D101 계약 2의 기본 프로필(ingest,net)로 돈다 — plugin/mcp.json이 더는 args를 고정하지
+	// 않으므로 서버 자신이 그 기본값을 갖지 않으면 CTR_ENABLE이 모든 플러그인 설치에서 죽은
+	// 경로가 된다(그 근거가 C1 자체다).
+	t.Run("empty_env_falls_back_to_default_profile", func(t *testing.T) {
 		t.Setenv("CTR_ENABLE", "")
 		got, err := parseFlags(nil)
 		if err != nil {
 			t.Fatalf("err=%v", err)
 		}
-		if len(got.Enable) != 0 {
-			t.Fatalf("Enable=%v want empty (no --enable, CTR_ENABLE=\"\")", got.Enable)
+		want := []string{"ingest", "net"}
+		if strings.Join(got.Enable, ",") != strings.Join(want, ",") {
+			t.Fatalf("Enable=%v want %v (no --enable, CTR_ENABLE=\"\" → D101 계약 2 기본값)", got.Enable, want)
 		}
 	})
 
@@ -143,6 +150,40 @@ func TestParseFlags_CTR_ENABLE(t *testing.T) {
 			t.Fatalf("error echoes user input(규약 §6 위반): %v", err)
 		}
 	})
+}
+
+// TestParseFlags_EnablePrecedence — v0.19 리뷰 C1. 세 값의 우선순위(--enable > CTR_ENABLE >
+// defaultEnableProfile)를 한 표에서 잰다. C1 이전에는 셋째 갈래(둘 다 없음)가 빈 값으로
+// 떨어져 plugin/mcp.json의 고정 args가 CTR_ENABLE을 항상 이겼다 — 그 표를 D101 계약 2가
+// 요구하는 기본값으로 뒤집는 것이 이 테스트의 대상이다.
+func TestParseFlags_EnablePrecedence(t *testing.T) {
+	cases := []struct {
+		name    string
+		flag    string
+		env     string
+		wantOut []string
+	}{
+		{"둘 다 없음 → 기본값", "", "", []string{"ingest", "net"}},
+		{"env만 있음 → env", "", "exec", []string{"exec"}},
+		{"flag만 있음 → flag", "ingest", "", []string{"ingest"}},
+		{"둘 다 있음 → flag가 이긴다", "exec", "ingest,net", []string{"exec"}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			t.Setenv("CTR_ENABLE", c.env)
+			var args []string
+			if c.flag != "" {
+				args = []string{"--enable", c.flag}
+			}
+			got, err := parseFlags(args)
+			if err != nil {
+				t.Fatalf("err=%v", err)
+			}
+			if strings.Join(got.Enable, ",") != strings.Join(c.wantOut, ",") {
+				t.Fatalf("Enable=%v want %v", got.Enable, c.wantOut)
+			}
+		})
+	}
 }
 
 func TestParseFlagsNet(t *testing.T) {

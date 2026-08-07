@@ -143,7 +143,7 @@ func TestDoctorCodexBOMNoFalseAlarm(t *testing.T) {
 	if !strings.Contains(out, "옛 방식으로 손편집된 등록물이 남아 있다") {
 		t.Fatalf("BOM 파일의 등록물을 doctor가 놓쳤다:\n%s", out)
 	}
-	if !strings.Contains(out, ":3 (ctr)") {
+	if !strings.Contains(out, ":3\n") {
 		t.Errorf("BOM이 줄 번호를 밀어냈다 — 헤더는 3번째 줄이어야 한다:\n%s", out)
 	}
 }

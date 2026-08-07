@@ -80,8 +80,12 @@ func Run(ctx context.Context, sub string, args []string, storeRoot, projectRoot,
 	case "doctor":
 		// D96·D97 — doctor는 읽기 전용이다. --fix(D83 이음새 ①)는 기입 경로였으므로 플래그째
 		// 지웠다(무동작으로 남기지 않는다 — 무동작 플래그는 거짓말이다). 남은 플래그가 없으므로
-		// version 서브커맨드와 같은 형태로 인자만 거부한다.
+		// version 서브커맨드와 같은 형태로 인자만 거부한다. --fix만 자기 사유를 낸다(리뷰 M1) —
+		// 그 자리를 대신하는 것이 무엇인지 없으면 마이그레이션하는 사용자가 아무것도 배우지 못한다.
 		if len(args) > 0 {
+			if args[0] == "--fix" {
+				return errors.New("cli: doctor: --fix는 더는 없습니다 — 등록물 재기입은 각 호스트 CLI(codex mcp remove·claude mcp remove 등)의 몫입니다. doctor는 옛 등록물 잔존을 읽기 전용으로 알립니다")
+			}
 			return fmt.Errorf("cli: doctor: 예상치 않은 인자 %d개", len(args))
 		}
 		return runDoctor(ctx, stdout, storeRoot, projectRoot, version)
@@ -1421,9 +1425,10 @@ func countShadowIndexes(ctx context.Context, db *sql.DB) int {
 
 // hostSnippet: doctor 마지막에 출력하는 등록 안내(설계 §9, D96·D97·D98·D99·D101) — 손편집
 // 등록 예시를 담지 않는다(우리는 어떤 호스트 설정 파일에도 쓰지 않는다, D96 계약 1). 등록은
-// 플러그인 설치 절차이고 프로필 조정은 CTR_ENABLE 환경 변수다(D101). 도구 접두는
-// mcp__plugin_context-router_ctr__다(D98) — alwaysLoad는 서버 단위 플래그가 폐기돼(D99)
-// 안내하지 않는다.
+// 플러그인 설치 절차이고, 프로필을 아무것도 지정하지 않았을 때의 기본값은 서버 자신이
+// 갖는다(D101 계약 2, v0.19 리뷰 C1 — plugin/mcp.json이 프로필을 고정하면 CTR_ENABLE이 모든
+// 플러그인 설치에서 죽은 경로가 된다). 도구 접두는 mcp__plugin_context-router_ctr__다(D98) —
+// alwaysLoad는 서버 단위 플래그가 폐기돼(D99) 안내하지 않는다.
 const hostSnippet = `--- host adapter snippets (설계 §9) ---
 
 ## 설치 절차 (D96·D97 — 등록은 호스트가 하고, 우리는 어떤 설정 파일에도 쓰지 않는다)
@@ -1438,12 +1443,15 @@ const hostSnippet = `--- host adapter snippets (설계 §9) ---
 2. Codex:
    codex plugin marketplace add wotjr1649/context-router
    codex plugin add context-router
-3. 확인: mcp list에 plugin:context-router:ctr 형태로 등록됐는가.
+3. 확인 — 호스트마다 mcp list의 표시 형태가 다르다 [실측]:
+   Claude Code: plugin:context-router:ctr 항목이 나열되는가.
+   Codex: ctr … enabled 항목이 나열되는가.
 
 ## 프로필
 
-기본은 ingest,net다(플러그인이 고정한다). 바꾸려면 CTR_ENABLE 환경 변수를 쓴다 — 값은 --enable과
-같은 쉼표 목록이다(예: CTR_ENABLE=ingest,net,exec).
+기본값은 서버가 갖는다 — --enable도 CTR_ENABLE도 지정하지 않으면 ingest,net으로 켜진다
+(플러그인은 프로필을 고정하지 않는다). 바꾸려면 CTR_ENABLE 환경 변수를 쓴다 — 값은 --enable과
+같은 쉼표 목록이다(예: CTR_ENABLE=ingest,net,exec). --enable을 직접 넘기면 그 값이 항상 이긴다.
 
 ## 도구 접두
 
@@ -1457,15 +1465,14 @@ permissions (.claude/settings.json 예시 — ingest/net 도구에 ask를 건다
   }
 }
 # 이 두 도구 규칙은 그 프로필이 켜진 등록에서만 대상이 있다 — ctr_index는 ingest, ctr_fetch_and_index는
-# net에서만 등록된다. 플러그인 기본값(ingest,net)은 둘 다 켜므로 위 규칙이 그대로 매치한다.
+# net에서만 등록된다. 기본 프로필(ingest,net)은 둘 다 켜므로 위 규칙이 그대로 매치한다.
 # exec까지 함께 쓰려면 CTR_ENABLE=ingest,net,exec로 프로필을 넓힌다.
-# exec 2종(ctr_execute·ctr_execute_file)은 ask에 넣지 않는다 — 승인 강도는 호스트 권한 모드가
-# 정한다. default 모드에서는 MCP 기본 프롬프트가 그대로 작동하고, 무프롬프트 모드이거나 그
-# 도구를 덮는 allow 규칙(프롬프트의 '다시 묻지 않기'·--allowedTools가 남기는 항목)이 있으면
-# 프롬프트 없이 실행된다 — 기존 ask를 지우면 그동안 가려져 있던 allow가 유효해진다(실측: ask
-# 2종이 allow 1종을 무력화). ask 규칙을 넣으면 두 경우 모두 프롬프트가 강제된다: 무프롬프트
-# 모드에서도 ask는 프롬프트를 띄우고, 평가 순서(deny→ask→allow) 때문에 더 구체적인 allow도
-# ask를 이기지 못한다.
+# exec 2종(ctr_execute·ctr_execute_file)의 승인 강도는 호스트 권한 모드가 정한다. default
+# 모드에서는 MCP 기본 프롬프트가 그대로 작동하고, 무프롬프트 모드이거나 그 도구를 덮는 allow
+# 규칙(프롬프트의 '다시 묻지 않기'·--allowedTools가 남기는 항목)이 있으면 프롬프트 없이
+# 실행된다 — 기존 ask를 지우면 그동안 가려져 있던 allow가 유효해진다(실측: ask 2종이 allow
+# 1종을 무력화). ask 규칙을 넣으면 두 경우 모두 프롬프트가 강제된다: 무프롬프트 모드에서도
+# ask는 프롬프트를 띄우고, 평가 순서(deny→ask→allow)가 ask를 allow보다 먼저 적용한다.
 # 이중 동의는 유지된다: ① CTR_ENABLE에 exec를 포함한 프로필(기동 시) ② 호스트 권한 모델(모드와
 # 규칙에 따름 — 무프롬프트 모드이거나 덮는 allow 규칙이 있으면 이 층은 프롬프트를 만들지 않는다).
 
@@ -1495,18 +1502,6 @@ func doctorCodexConfigPath() (string, error) {
 		return "", errors.New("codex: 홈 디렉터리 해석 실패")
 	}
 	return filepath.Join(home, ".codex", "config.toml"), nil
-}
-
-// codexHeaderServerName — codexHeaderHit.Name을 서버 이름으로 좁힌다(codex_scan.go의
-// codexServerHeaders 소비처). Name은 세그먼트를 나누지 않은 원문이라 [mcp_servers.ctr.env]는
-// "ctr.env"로 온다 — TOML 점 표기에서 "mcp_servers." 다음 첫 세그먼트가 곧 그 아래 테이블의
-// 실제 부모([mcp_servers.ctr.env]는 mcp_servers → ctr → env로 중첩)이므로, 첫 점 앞을 자르면
-// 항상 실제 서버 이름과 일치한다. "ctr.env" 자체를 서버 이름으로 부르지 않는다.
-func codexHeaderServerName(name string) string {
-	if i := strings.IndexByte(name, '.'); i >= 0 {
-		return name[:i]
-	}
-	return name
 }
 
 // runDoctor: 5항목 진단(저장 루트/프로젝트 식별/content.db/FTS5/ledger.db) + 호스트 등록
@@ -1910,24 +1905,39 @@ func runDoctor(ctx context.Context, w io.Writer, storeRoot, projectRoot, version
 	userScope, _ := codexHooksScope(userCodexHooks, userCodexHooksErr)
 	fmt.Fprintf(w, "[16] codex hooks: project=%s user=%s\n", projScope, userScope)
 
-	// 무효 TOML에서도 동작하는 것이 codexServerHeaders의 존재 이유다(D97 "알고 받는 대가") —
-	// 줄 단위 스캔이라 Codex 자신도 못 읽는 파일에서도 어느 줄인지 짚을 수 있다. 읽기 실패
-	// (파일 없음 포함)는 조용히 건너뛴다 — 등록물이 없으면 보고도 없다.
+	// 손편집 등록물 감지 — 무효 TOML에서도 동작하는 것이 codexServerHeaders의 존재 이유다(D97
+	// "알고 받는 대가") — 줄 단위 스캔이라 Codex 자신도 못 읽는 파일에서도 어느 줄인지 짚을 수
+	// 있다. 파일 부재는 조용히 건너뛴다(등록물이 없으면 보고도 없다) — 그러나 존재하는데 못
+	// 읽는 경우(권한 등)는 [19]와 같은 원칙으로 "읽기 실패"를 보고한다(리뷰 I3) — 못 연 파일을
+	// 조용히 "깨끗함"으로 읽으면 안 된다.
+	//
+	// 헤더 이름(hit.Name)은 인쇄하지 않는다(리뷰 I2) — codexServerHeaders는 세그먼트를 나누지
+	// 않은 원문을 낸다. [mcp_servers.ctr.env]처럼 인용 없이 점이 이어지면 첫 점 앞이 실제 서버
+	// 이름과 일치하지만, [mcp_servers."my.server"]처럼 이름 자체에 점이 있는 인용 헤더에서는
+	// unquoteHeaderName이 인용부호만 벗기고 그 점을 그대로 남겨 hit.Name이 "my.server"가 되고,
+	// 첫 점 앞을 자르면 "my"라는 틀린 이름이 나온다 — 이 둘을 hit.Name만으로는 구분할 수 없다.
+	// 틀린 이름을 codex mcp remove에 넘기면 그 명령은 없는 이름에도 exit 0을 내므로 "지웠다"는
+	// 착각을 남길 수 있다. 그래서 이름을 추정해 제시하지 않는다 — 사용자가 codex mcp list로
+	// 직접 확인한다.
 	codexCfgPath, codexCfgPathErr := doctorCodexConfigPath()
-	if codexCfgPathErr != nil {
+	switch {
+	case codexCfgPathErr != nil:
 		fmt.Fprintln(w, "[16] codex: config.toml 경로 확인불가")
-	} else if data, readErr := os.ReadFile(codexCfgPath); readErr == nil {
-		hits := codexServerHeaders(data)
-		for _, hit := range hits {
-			// hit.Name은 세그먼트를 나누지 않은 원문이다(codexServerHeaders 주석 —
-			// [mcp_servers.ctr.env]는 "ctr.env"). TOML 점 표기에서 mcp_servers. 다음 첫
-			// 세그먼트가 곧 그 아래 테이블의 실제 부모이므로 첫 점 앞을 서버 이름으로 쓴다 —
-			// "ctr.env" 자체를 서버 이름이라 부르지 않는다.
-			fmt.Fprintf(w, "[16] codex: 옛 방식으로 손편집된 등록물이 남아 있다 — %s:%d (%s)\n",
-				codexCfgPath, hit.Line, codexHeaderServerName(hit.Name))
-		}
-		if len(hits) > 0 {
-			fmt.Fprintln(w, "[16] codex: 다음 걸음 — codex mcp remove <이름> 뒤 codex mcp list로 부재를 확인하세요(그 명령은 없는 이름에도 exit 0을 반환합니다)")
+	default:
+		data, readErr := os.ReadFile(codexCfgPath)
+		switch {
+		case errors.Is(readErr, os.ErrNotExist):
+			// 등록물이 없다 — 보고 없음.
+		case readErr != nil:
+			fmt.Fprintln(w, "[16] codex: config.toml 읽기 실패")
+		default:
+			hits := codexServerHeaders(data)
+			for _, hit := range hits {
+				fmt.Fprintf(w, "[16] codex: 옛 방식으로 손편집된 등록물이 남아 있다 — %s:%d\n", codexCfgPath, hit.Line)
+			}
+			if len(hits) > 0 {
+				fmt.Fprintln(w, "[16] codex: 다음 걸음 — codex mcp list로 등록된 이름을 확인한 뒤 codex mcp remove <이름>으로 지우고 다시 codex mcp list로 부재를 확인하세요(그 명령은 없는 이름에도 exit 0을 반환합니다)")
+			}
 		}
 	}
 
@@ -1967,42 +1977,58 @@ func runDoctor(ctx context.Context, w io.Writer, storeRoot, projectRoot, version
 		fmt.Fprintln(w, "[19] permissions: ask/allow 충돌 없음")
 	}
 
-	// [20] .mcp.json 마커(D82) — 존재·버전만 본다(정보성, no-fix: --fix가 없으므로 드리프트를
-	// 경고로 올리지 않는다 — 표식 값 자체가 "marker 0.14.0≠0.19.0"처럼 드리프트를 그대로
-	// 보여준다). Codex 쪽 등록물 진단은 [16]로 옮겼다(D97 계약 2) — 이 절은 mcp_install.go·
-	// hook_install.go의 .mcp.json 전용 헬퍼만 쓰고 codex_toml.go는 건드리지 않는다.
-	mcpData, mcpReadErr := os.ReadFile(mcpConfigPath(projectRoot))
-	var mcpLabel string
+	// [20] .mcp.json 손편집 등록물 잔존 — [16]과 같은 모양(파일 + 다음 걸음)으로 보고한다(리뷰
+	// I4b). 옛 [20]은 라벨(존재·미등록·표식없음·버전)만 보여줬는데, 그 라벨은 마이그레이션에
+	// 쓸모가 없다 — A⑧의 위험(호스트가 command·args 일치 서버를 경고 없이 버린다)이 .mcp.json
+	// 쪽에도 그대로 있고, 옛 등록물이 정확히 그 모양(command="context-router")이다.
+	// mcpManagedMarker·ownedRegistration은 이 절에서 계속 쓰이므로(존재·소유 판정) orphan이
+	// 아니다. markerDriftLabel은 더는 doctor가 부르지 않는다 — TestMarkerDriftLabel이 순수
+	// 함수로 계속 테스트한다(codexRegistrationVerdict·toolsCover와 같은 처지).
+	mcpPath := mcpConfigPath(projectRoot)
+	mcpData, mcpReadErr := os.ReadFile(mcpPath)
 	switch {
 	case errors.Is(mcpReadErr, os.ErrNotExist):
-		mcpLabel = "없음"
+		// 없음 — 보고 없음.
 	case mcpReadErr != nil:
-		mcpLabel = "읽기실패"
+		fmt.Fprintln(w, "[20] claude: .mcp.json 읽기 실패")
 	default:
 		marker, command, found := mcpManagedMarker(mcpData)
-		switch {
-		case !ownedRegistration(marker, command, found):
-			mcpLabel = "미등록"
-		case !isOurMarkerValue(marker):
-			mcpLabel = "표식없음"
-		default:
-			mcpLabel = markerDriftLabel(marker, version)
+		if ownedRegistration(marker, command, found) {
+			fmt.Fprintf(w, "[20] claude: 옛 방식으로 손편집된 등록물이 남아 있다 — %s\n", mcpPath)
+			fmt.Fprintf(w, "[20] claude: 다음 걸음 — claude mcp remove %s 뒤 claude mcp list로 부재를 확인하세요\n", ctrMCPServerName)
 		}
 	}
-	fmt.Fprintf(w, "[20] mcp markers: .mcp.json=%s\n", mcpLabel)
 
 	// [20]의 두 번째 절 — enabledMcpjsonServers 잔존(소유자 판정 추가 항목, D97 인접). 다음
 	// 태스크가 이 키를 정리하던 우리 쓰기 코드를 지운다(D96 계약 1 — 쓰지 않는다). 호스트
 	// CLI(claude mcp remove)는 이 키를 건드리지 않으므로, 옛 등록물만 지운 사용자는 더는
-	// 존재하지 않는 이름을 승인 목록에 남긴 채로 남는다. 읽기+문자열 확인 하나로 그 잔존을
-	// 알린다 — projPath는 [9]가 이미 구한 프로젝트 스코프 .claude/settings.json 경로다(다시
-	// 구하지 않는다).
-	if data, err := os.ReadFile(projPath); err == nil {
+	// 존재하지 않는 이름을 승인 목록에 남긴 채로 남는다. 세 스코프(local·project·user) 모두
+	// 확인한다(리뷰 I5) — 이 키는 스코프 간 병합되지 않고 각 스코프의 최상위 정의가 그 스코프
+	// 안에서 유효하므로(enabledServersScope의 관례, mcp_install.go), 한 스코프만 보면 다른
+	// 스코프의 잔존을 놓친다. 이름도 둘 다 본다 — 현재 이름(ctrMCPServerName)과 그보다 더 옛
+	// 이름(supersededMCPServerNames, D63 ②가 대체한 "ctr").
+	localSettingsPath := filepath.Join(projectRoot, ".claude", "settings.local.json")
+	userSettingsPath, userSettingsErr := hookSettingsPath(true, projectRoot)
+	enabledScopePaths := []string{localSettingsPath, projPath} // projPath: [9]가 이미 구한 프로젝트 스코프
+	if userSettingsErr == nil {
+		enabledScopePaths = append(enabledScopePaths, userSettingsPath)
+	}
+	retiredServerNames := append([]string{ctrMCPServerName}, supersededMCPServerNames...)
+	for _, p := range enabledScopePaths {
+		data, err := os.ReadFile(p)
+		if err != nil {
+			continue // 부재·읽기 실패는 조용히 건너뛴다 — 이 절은 그 스코프의 다른 문제를 진단하지 않는다
+		}
 		var enabledDoc struct {
 			Enabled []string `json:"enabledMcpjsonServers"`
 		}
-		if json.Unmarshal(data, &enabledDoc) == nil && slices.Contains(enabledDoc.Enabled, ctrMCPServerName) {
-			fmt.Fprintf(w, "[20] claude: %s의 enabledMcpjsonServers에 옛 서버 이름 %q가 남아 있다 — 배열에서 지우세요\n", projPath, ctrMCPServerName)
+		if json.Unmarshal(data, &enabledDoc) != nil {
+			continue
+		}
+		for _, name := range retiredServerNames {
+			if slices.Contains(enabledDoc.Enabled, name) {
+				fmt.Fprintf(w, "[20] claude: %s의 enabledMcpjsonServers에 옛 서버 이름 %q가 남아 있다 — 배열에서 지우세요\n", p, name)
+			}
 		}
 	}
 
@@ -2015,11 +2041,12 @@ func runDoctor(ctx context.Context, w io.Writer, storeRoot, projectRoot, version
 	return nil
 }
 
-// markerDriftLabel — 표식 값과 현재 버전으로 [20]의 두 갈래가 함께 쓰는 라벨 조각을 만든다.
-// **문자열 조립만 공유한다** — 판정(무엇을 드리프트로 볼지)은 각 자리가 그대로 갖는다.
-// D85가 .mcp.json 갈래를 클로저에 남긴 분리를 되돌리지 않기 위해서다.
-// 무버전 표식이 "버전미상≠"으로 나가는 이유는 markerDrift가 그것을 드리프트로 보는 것과
-// 같다 — 표식은 있고 버전만 모르는 상태이며 --fix가 현재 버전으로 채운다(D80).
+// markerDriftLabel — 표식 값과 현재 버전으로 드리프트 여부를 하나의 라벨 문자열("marker
+// X≠Y"·"marker 버전미상≠Y"·"marker Y")로 조립한다. 원래는 doctor [20]의 두 갈래(Codex·
+// .mcp.json)가 함께 썼다. 리뷰 I4b로 [20]의 Codex 갈래는 [16]으로 옮겨갔고 .mcp.json 갈래도
+// "손편집 등록물 존재 여부"만 보고하도록 바뀌면서 doctor는 이 함수를 더는 부르지 않는다 —
+// codexRegistrationVerdict·toolsCover와 같은 처지로, TestMarkerDriftLabel이 순수 라벨 조립
+// 로직을 계속 재므로 남긴다.
 func markerDriftLabel(marker, version string) string {
 	v := markerVersion(marker)
 	if v == "" {

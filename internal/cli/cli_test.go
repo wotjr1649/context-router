@@ -2859,6 +2859,10 @@ func TestCodexEnvNotTableStopsInstall(t *testing.T) {
 // 있어도) · 파일 자체 없음(보고 없음). 네 번째 갈래(무효 TOML에서도 보고)가 D97이 codex_toml.go의
 // 정교한 스캐너를 버리고 줄 단위 스캐너로 갈아 끼우면서 "알고 받은 대가"의 완화 지점이다 —
 // 이 갈래가 깨지면 그 대가를 실제로 못 받고 있다는 뜻이다.
+// 이름은 더는 인쇄하지 않는다(리뷰 I2) — 인용된 헤더 이름에 점이 있으면 첫 점 자르기가 틀린
+// 이름을 낼 수 있고, 그 값을 codex mcp remove에 넘기면 없는 이름에도 exit 0이 나 "지웠다"는
+// 착각을 남긴다. "등록물 있음" 갈래에서 종료코드도 함께 잰다(리뷰 M6) — 이 보고가 failed에
+// 계상되지 않는다는 것을 discard하지 않고 확인한다.
 func TestDoctorCodexHandEditDetection(t *testing.T) {
 	cases := []struct {
 		name       string
@@ -2876,22 +2880,44 @@ func TestDoctorCodexHandEditDetection(t *testing.T) {
 			if c.cfg != "" {
 				writeCodexConfig(t, home, c.cfg)
 			}
-			out, _ := doctorOut(t, t.TempDir())
+			out, err := doctorOut(t, t.TempDir())
 			got := strings.Contains(out, "옛 방식으로 손편집된 등록물이 남아 있다")
 			if got != c.wantReport {
 				t.Errorf("report=%v want %v:\n%s", got, c.wantReport, out)
+			}
+			if err != nil {
+				t.Errorf("이 보고는 실패 항목에 계상되면 안 된다(리뷰 M6) — err=%v:\n%s", err, out)
 			}
 			if !c.wantReport {
 				return
 			}
 			wantPath := filepath.Join(home, "config.toml")
-			if !strings.Contains(out, wantPath+":1 (ctr)") {
-				t.Errorf("파일:줄(서버 이름) 형식이 없다 — want 접미 %q:\n%s", wantPath+":1 (ctr)", out)
+			if !strings.Contains(out, "옛 방식으로 손편집된 등록물이 남아 있다 — "+wantPath+":1\n") {
+				t.Errorf("파일:줄 형식이 없다 — want 접미 %q:\n%s", wantPath+":1", out)
 			}
 			if !strings.Contains(out, "다음 걸음") || !strings.Contains(out, "codex mcp remove") || !strings.Contains(out, "codex mcp list") {
 				t.Errorf("다음 걸음 안내(codex mcp remove/list)가 없다:\n%s", out)
 			}
 		})
+	}
+}
+
+// TestDoctorCodexConfigUnreadable — 리뷰 I3. config.toml이 존재하지만 읽을 수 없으면(예:
+// 그 경로가 디렉터리) doctor는 조용히 "등록물 없음"으로 읽으면 안 된다 — [19]가 이미 세운
+// "판정 못 한 것을 판정했다고 말하지 않는다"는 원칙을 [16]에도 그대로 적용한다. 디렉터리를
+// 파일 자리에 둬 os.ReadFile이 부재가 아닌 오류(디렉터리)를 내게 만든다
+// (TestDoctorIndeterminateOnUnreadableScope와 같은 기법).
+func TestDoctorCodexConfigUnreadable(t *testing.T) {
+	home := isolateCodexHome(t)
+	if err := os.MkdirAll(filepath.Join(home, "config.toml"), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	out, _ := doctorOut(t, t.TempDir())
+	if !strings.Contains(out, "[16] codex: config.toml 읽기 실패") {
+		t.Errorf("읽기 실패가 조용히 삼켜졌다(등록물 없음으로 오판):\n%s", out)
+	}
+	if strings.Contains(out, "옛 방식으로 손편집된 등록물이 남아 있다") {
+		t.Errorf("읽지 못한 파일에서 손편집 등록물을 찾았다고 보고했다:\n%s", out)
 	}
 }
 
@@ -2950,51 +2976,179 @@ func TestDoctorWritesNothing(t *testing.T) {
 	}
 }
 
-// TestHostSnippetNoHortatoryVocabulary — D100 계약 2 어휘 규칙. doctor 문면·hostSnippet에
-// 훈계 어휘를 쓰지 않는다: MANDATORY·BLOCKED·Do NOT·Never·PREFER X OVER Y·체크/크로스 불릿·
-// 이모지.
+// bannedHortatoryVocab — D100 계약 2 금지 어휘: MANDATORY·BLOCKED·Do NOT·Never·PREFER X OVER Y·
+// 체크/크로스 불릿·이모지. hostSnippet과 doctor 자신의 출력 문면 양쪽이 이 목록을 공유한다
+// (리뷰 M4 — 어휘 규칙은 둘에 똑같이 걸린다).
+var bannedHortatoryVocab = []string{
+	"MANDATORY", "BLOCKED", "Do NOT", "DO NOT", "Never", "NEVER", "PREFER ",
+	"✅", "❌", "☑", "✓", "✗", "👍", "👎", "⚠️", "🚫",
+}
+
+// TestHostSnippetNoHortatoryVocabulary — D100 계약 2 어휘 규칙, hostSnippet 쪽.
 func TestHostSnippetNoHortatoryVocabulary(t *testing.T) {
-	banned := []string{
-		"MANDATORY", "BLOCKED", "Do NOT", "DO NOT", "Never", "NEVER", "PREFER ",
-		"✅", "❌", "☑", "✓", "✗", "👍", "👎", "⚠️", "🚫",
-	}
-	for _, b := range banned {
+	for _, b := range bannedHortatoryVocab {
 		if strings.Contains(hostSnippet, b) {
 			t.Errorf("hostSnippet에 금지 어휘 %q가 있다", b)
 		}
 	}
 }
 
-// TestDoctorEnabledMcpjsonServersLeftover — task-4 브리프의 추가 요구(D97 인접, 소유자 판정).
-// 다음 태스크가 enabledMcpjsonServers를 정리하던 우리 쓰기 코드를 지운다(D96 계약 1) — 호스트
-// CLI(claude mcp remove)는 이 키를 건드리지 않으므로, 옛 등록물만 지운 사용자는 존재하지 않는
-// 서버 이름을 승인 목록에 남긴 채로 남는다. JSON 읽기 + 문자열 확인 하나로 그 잔존을 [20]이
-// 알리는지 잰다.
-func TestDoctorEnabledMcpjsonServersLeftover(t *testing.T) {
+// TestDoctorOutputNoHortatoryVocabulary — D100 계약 2 어휘 규칙, doctor 자신의 출력 쪽(리뷰
+// M4). hostSnippet만 재면 doctor가 조립하는 진단 문면(경고·다음 걸음 안내 등)은 규칙 밖에
+// 남는다 — 소스 그레핑 대신 실제 실행 출력을 재는 이유는 fmt 포맷 문자열이 아니라 사용자가
+// 보는 최종 텍스트가 계약의 대상이기 때문이다. 갈래를 여럿 동시에 트리거해([16]의 손편집
+// 감지·[20]의 두 절 모두) 가능한 한 많은 줄을 노출시킨다.
+func TestDoctorOutputNoHortatoryVocabulary(t *testing.T) {
+	home := isolateCodexHome(t)
+	writeCodexConfig(t, home, "[mcp_servers.ctr]\ncommand = \"context-router\"\n")
+	proj := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(proj, ".claude"), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	write(t, filepath.Join(proj, ".claude", "settings.json"), []byte(`{"enabledMcpjsonServers":["`+ctrMCPServerName+`"]}`))
+	write(t, mcpConfigPath(proj), []byte(`{"mcpServers":{"ctr-exec":{"command":"context-router","__ctrManaged":"context-router/0.1.0"}}}`))
+	out, _ := doctorOut(t, proj)
+	for _, b := range bannedHortatoryVocab {
+		if strings.Contains(out, b) {
+			t.Errorf("doctor 출력에 금지 어휘 %q가 있다:\n%s", b, out)
+		}
+	}
+}
+
+// TestDoctorCodexHooksScopePositive — 리뷰 I4a. [16] codex hooks: 줄의 유일한 긍정 커버리지는
+// 삭제된 TestDoctorCodexMCPLine 케이스 4였다 — 남은 참조(hook_install_test.go의
+// TestDoctorVersionlessHookMarker)는 "≠ 없음"을 재는 부정 필터라 그 줄이 통째로 사라져도
+// 공허하게 통과한다. 실제로 Codex 훅을 설치해 "미등록"이 아닌 값이 찍히는지 직접 잰다.
+func TestDoctorCodexHooksScopePositive(t *testing.T) {
+	codexHome := t.TempDir()
+	t.Setenv("CODEX_HOME", codexHome)
+	projectRoot := t.TempDir()
+	var iout bytes.Buffer
+	if err := runHookInstall([]string{"--codex"}, t.TempDir(), "", false, projectRoot, "0.17.0", &iout); err != nil {
+		t.Fatalf("install --codex: %v", err)
+	}
+	out, _ := doctorOut(t, projectRoot)
+	if !strings.Contains(out, "[16] codex hooks: project=등록됨(") {
+		t.Errorf("훅을 설치했는데 project 스코프가 등록됨으로 나오지 않는다:\n%s", out)
+	}
+	if strings.Contains(out, "[16] codex hooks: project=미등록") {
+		t.Errorf("등록된 훅이 미등록으로 보고됐다:\n%s", out)
+	}
+}
+
+// TestDoctorMcpJsonHandEditDetection — 리뷰 I4b. [20]의 .mcp.json 절이 [16]과 같은 모양(파일 +
+// 다음 걸음)으로 보고하는지 표로 잰다. 옛 [20]은 라벨(존재·미등록·표식없음)만 보여줬는데 그
+// 라벨에는 경로도 다음 걸음도 없었다 — A⑧의 위험(호스트가 command·args 일치 서버를 경고 없이
+// 버린다)이 .mcp.json 쪽에도 그대로 있으므로 [16]과 같은 조치 가능한 보고가 필요하다.
+func TestDoctorMcpJsonHandEditDetection(t *testing.T) {
 	isolateCodexHome(t)
 	cases := []struct {
-		name string
-		body string // "" = settings.json 자체를 만들지 않는다
-		want bool
+		name       string
+		body       string // "" = .mcp.json을 만들지 않는다
+		wantReport bool
 	}{
-		{"옛 이름 잔존", `{"enabledMcpjsonServers":["` + ctrMCPServerName + `","other"]}`, true},
-		{"옛 이름 없음 — 다른 이름만", `{"enabledMcpjsonServers":["other"]}`, false},
-		{"키 자체 없음", `{}`, false},
-		{"파일 없음", "", false},
+		{"소유 등록물 있음(마커)", `{"mcpServers":{"ctr-exec":{"command":"context-router","__ctrManaged":"context-router/0.1.0"}}}`, true},
+		{"소유 등록물 있음(command만, 표식 없음)", `{"mcpServers":{"ctr-exec":{"command":"context-router"}}}`, true},
+		{"우리 이름이 없음", `{"mcpServers":{"other":{"command":"other-tool"}}}`, false},
+		{"우리 이름은 있으나 소유 아님", `{"mcpServers":{"ctr-exec":{"command":"other-tool"}}}`, false},
+		{"파일 자체가 없음", "", false},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			projectRoot := t.TempDir()
 			if c.body != "" {
-				if err := os.MkdirAll(filepath.Join(projectRoot, ".claude"), 0o755); err != nil {
-					t.Fatalf("mkdir .claude: %v", err)
+				write(t, mcpConfigPath(projectRoot), []byte(c.body))
+			}
+			out, err := doctorOut(t, projectRoot)
+			got := strings.Contains(out, "[20] claude: 옛 방식으로 손편집된 등록물이 남아 있다")
+			if got != c.wantReport {
+				t.Errorf("report=%v want %v:\n%s", got, c.wantReport, out)
+			}
+			if err != nil {
+				t.Errorf("이 보고는 실패 항목에 계상되면 안 된다(리뷰 M6) — err=%v", err)
+			}
+			if !c.wantReport {
+				return
+			}
+			wantPath := mcpConfigPath(projectRoot)
+			if !strings.Contains(out, "[20] claude: 옛 방식으로 손편집된 등록물이 남아 있다 — "+wantPath+"\n") {
+				t.Errorf("파일 경로가 없다 — want %q:\n%s", wantPath, out)
+			}
+			if !strings.Contains(out, "[20] claude: 다음 걸음 — claude mcp remove "+ctrMCPServerName) {
+				t.Errorf("다음 걸음(claude mcp remove)이 없다:\n%s", out)
+			}
+		})
+	}
+}
+
+// TestDoctorMcpJsonUnreadable — .mcp.json 쪽도 [16]과 같은 원칙을 진다(리뷰 I4b "같은 모양"의
+// 연장): 존재하지만 못 읽으면 조용히 "없음"으로 읽으면 안 된다.
+func TestDoctorMcpJsonUnreadable(t *testing.T) {
+	isolateCodexHome(t)
+	projectRoot := t.TempDir()
+	if err := os.MkdirAll(mcpConfigPath(projectRoot), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	out, _ := doctorOut(t, projectRoot)
+	if !strings.Contains(out, "[20] claude: .mcp.json 읽기 실패") {
+		t.Errorf("읽기 실패가 조용히 삼켜졌다:\n%s", out)
+	}
+}
+
+// TestDoctorEnabledMcpjsonServersLeftover — task-4 브리프의 추가 요구(D97 인접, 소유자 판정) +
+// 리뷰 I5 재기준선. 세 스코프(local·project·user)와 두 이름(현재 ctr-exec·옛 ctr)을 함께 잰다 —
+// enabledMcpjsonServers는 스코프 간 병합되지 않고 각 스코프의 정의가 그 스코프 안에서
+// 유효하므로, 한 스코프만 보면 다른 스코프의 잔존을 놓친다(옛 구현이 project 하나·현재 이름
+// 하나만 봤다). user 스코프를 확인하려면 HOME·USERPROFILE을 이 테스트 전용 임시 홈으로
+// 돌려야 한다(TestMain의 전역 격리 위에 이 서브테스트만의 값을 덮어써 알려진 파일을 그
+// 자리에 둔다).
+func TestDoctorEnabledMcpjsonServersLeftover(t *testing.T) {
+	isolateCodexHome(t)
+	cases := []struct {
+		name     string
+		scope    string // "local"|"project"|"user"|"" (파일 자체를 안 씀)
+		body     string
+		wantName string // "" = 보고 없음
+	}{
+		{"project 스코프 — 현재 이름", "project", `{"enabledMcpjsonServers":["` + ctrMCPServerName + `","other"]}`, ctrMCPServerName},
+		{"local 스코프 — 현재 이름", "local", `{"enabledMcpjsonServers":["` + ctrMCPServerName + `"]}`, ctrMCPServerName},
+		{"user 스코프 — 현재 이름", "user", `{"enabledMcpjsonServers":["` + ctrMCPServerName + `"]}`, ctrMCPServerName},
+		{"project 스코프 — 옛 이름(ctr)", "project", `{"enabledMcpjsonServers":["ctr"]}`, "ctr"},
+		{"옛 이름 없음 — 다른 이름만", "project", `{"enabledMcpjsonServers":["other"]}`, ""},
+		{"키 자체 없음", "project", `{}`, ""},
+		{"파일 없음", "", "", ""},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			home := t.TempDir()
+			t.Setenv("HOME", home)        // unix
+			t.Setenv("USERPROFILE", home) // windows
+			projectRoot := t.TempDir()
+			if c.scope != "" {
+				var target string
+				switch c.scope {
+				case "project":
+					target = filepath.Join(projectRoot, ".claude", "settings.json")
+				case "local":
+					target = filepath.Join(projectRoot, ".claude", "settings.local.json")
+				case "user":
+					target = filepath.Join(home, ".claude", "settings.json")
 				}
-				write(t, filepath.Join(projectRoot, ".claude", "settings.json"), []byte(c.body))
+				if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+					t.Fatalf("mkdir: %v", err)
+				}
+				write(t, target, []byte(c.body))
 			}
 			out, _ := doctorOut(t, projectRoot)
-			got := strings.Contains(out, "enabledMcpjsonServers에 옛 서버 이름 \""+ctrMCPServerName+"\"")
-			if got != c.want {
-				t.Errorf("report=%v want %v:\n%s", got, c.want, out)
+			if c.wantName == "" {
+				if strings.Contains(out, "enabledMcpjsonServers에 옛 서버 이름") {
+					t.Errorf("보고가 없어야 하는데 나왔다:\n%s", out)
+				}
+				return
+			}
+			want := fmt.Sprintf("enabledMcpjsonServers에 옛 서버 이름 %q가 남아 있다", c.wantName)
+			if !strings.Contains(out, want) {
+				t.Errorf("%q 없음:\n%s", want, out)
 			}
 		})
 	}

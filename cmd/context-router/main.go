@@ -75,16 +75,27 @@ func parseFlags(args []string) (serverFlags, error) {
 	// 패키지에는 그 둘을 구분할 수단이 없다) CTR_ENABLE을 대신 읽는다. 플래그가 주어지면
 	// 플래그가 이긴다. storeRootFor의 CTR_STORE_ROOT 관례(직접 os.Getenv, 테스트는 t.Setenv)를
 	// 그대로 따른다 — 이 패키지에 이미 있는 관례라 별도 getenv 파라미터를 두지 않는다.
+	// D101 계약 2(설계 v0.19): "기본값은 서버가 갖는다. 환경 변수가 없으면 현행 기본 프로필로
+	// 돈다 — Codex 사용자가 아무것도 안 해도 동작해야 한다." 플러그인의 plugin/mcp.json은
+	// args를 고정하지 않으므로(옛 --enable ingest,net 고정이 CTR_ENABLE을 영구히 이겨 그 환경
+	// 변수를 무의미하게 만들었다 — v0.19 리뷰 C1) 서버 자신이 이 기본값을 갖는다. 둘 다 없을
+	// 때만 적용되고, --enable·CTR_ENABLE 어느 쪽이든 있으면 그 값이 그대로 이긴다(우선순위
+	// 불변). 이 변경으로 인자 없는 맨 context-router 실행이 이제 ctr_index·ctr_fetch_and_index를
+	// 등록한다 — 이전에는 --enable/CTR_ENABLE 없이는 둘 다 꺼져 있었다. net은 아웃바운드 HTTP를
+	// 여는 프로필이라 이것은 문서화되지 않은 맨 실행의 자세(posture) 변화다 — 이미 문서화된 설치
+	// 절차는 전부 ingest,net을 명시로 전달하므로 그 경로는 영향이 없다(v0.19 리뷰 C1, 소유자
+	// 결정).
 	if enable == "" {
 		enable = os.Getenv("CTR_ENABLE")
 	}
-	if enable != "" {
-		enableList, err := parseEnableList(enable)
-		if err != nil {
-			return serverFlags{}, err
-		}
-		f.Enable = enableList
+	if enable == "" {
+		enable = defaultEnableProfile
 	}
+	enableList, err := parseEnableList(enable)
+	if err != nil {
+		return serverFlags{}, err
+	}
+	f.Enable = enableList
 	for _, p := range strings.Split(projects, ",") {
 		if p = strings.TrimSpace(p); p != "" {
 			f.Projects = append(f.Projects, p)
@@ -112,6 +123,11 @@ func parseFlags(args []string) (serverFlags, error) {
 // 통째로 지울 예정이라 여기서 import하거나 공유하지 않는다(의도적 비공유, D13 반파편화
 // 예외 대상 아님).
 var enableProfileNames = []string{"ingest", "net", "exec"}
+
+// defaultEnableProfile — --enable도 CTR_ENABLE도 없을 때 서버가 갖는 기본값(D101 계약 2,
+// v0.19 리뷰 C1). exec는 여전히 opt-in이다 — 이 기본값이 켜는 것은 실행 도구가 아니라
+// 색인·네트워크뿐이다.
+const defaultEnableProfile = "ingest,net"
 
 // parseEnableList — --enable/CTR_ENABLE 공통 문법(쉼표 구분·항목별 공백 트림·빈 항목 무시)을
 // 판다. 모르는 이름은 오류로 거부한다: mcp.NewServer(internal/mcp/mcp.go)는 cfg.Enable에
