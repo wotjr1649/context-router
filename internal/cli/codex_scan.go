@@ -45,6 +45,15 @@ type codexHeaderHit struct {
 // 아니고, 뒷내용을 검사 없이 다 통과시키면 대괄호 뒤에 우연히 다른 무효 조각이 붙은 줄까지
 // 헤더로 잘못 보고해 doctor 출력의 신뢰도를 깎는다. 대괄호 자체는 따옴표 안쪽을 피해서
 // 찾으므로(codexHeaderClose) 이름 안의 `#`·`]`는 주석이나 종료로 오인되지 않는다.
+//
+// 세 번째 한계 — 줄 끝까지 따옴표가 안 닫히면(닫는 따옴표를 빠뜨린 흔한 오타, 예:
+// `[mcp_servers."my-server]`) codexHeaderClose가 따옴표 추적을 포기하고 그 줄의 마지막
+// `]`를 최선-노력으로 닫는 자리로 쓴다 — 헤더로 잡는다는 판정은 살리고 이름만 보장하지
+// 않는다(안 닫힌 따옴표가 unquoteHeaderName의 양끝 짝 조건을 못 채워 그대로 이름에 남을 수
+// 있다). 이 순서를 고르는 이유는 첫 번째 한계와 같은 비대칭이다: 오타 줄을 조용히 넘기면
+// 오검출은 없지만 그 줄이 정확히 이 스캐너가 찾아야 하는 손편집 오타이고, 그러면 사용자는
+// 자기 파일이 깨끗하다고 믿는다 — 지저분한 이름이라도 줄 번호가 doctor 출력에 뜨는 값이
+// 조용한 통과보다 크다.
 func codexServerHeaders(b []byte) []codexHeaderHit {
 	b = trimBOM(b)
 	var hits []codexHeaderHit
@@ -63,9 +72,10 @@ func codexServerHeaders(b []byte) []codexHeaderHit {
 // 닫는 대괄호는 codexHeaderClose가 따옴표 밖에서 찾으므로 이름 안의 `#`·`]`는 종료로 오인되지
 // 않는다(`[mcp_servers."a#b"]`·`[mcp_servers."a]b"]` 모두 이름을 그대로 잡는다). 그 대괄호
 // 뒤는 비어 있거나 `#` 주석이어야 헤더로 인정한다 — 대가는 codexServerHeaders의 두 번째
-// 알려진 한계에 적는다. [[mcp_servers.foo]](배열 테이블)는 안쪽에 대괄호가 그대로 남아
-// "mcp_servers" 접두 매치가 실패하므로 별도 분기 없이 걸러진다. 하위 이름이 없는
-// [mcp_servers] 자체도 마침표가 없어 같은 이유로 걸러진다.
+// 알려진 한계에 적는다. [[mcp_servers.foo]](배열 테이블)는 codexHeaderClose가 이중
+// 대괄호의 첫 ']'에서 멈추므로 둘째 ']'가 대괄호 뒤에 남아 그 규칙에 걸려 걸러진다(별도
+// 분기 없음). 하위 이름이 없는 [mcp_servers] 자체는 대괄호 뒤가 비어 그 규칙은 통과하지만
+// "mcp_servers." 뒤에 와야 할 마침표가 없어 다음 단계에서 걸러진다.
 func codexHeaderName(line string) (string, bool) {
 	s := strings.TrimSpace(line)
 	if !strings.HasPrefix(s, "[") {
@@ -100,8 +110,13 @@ func codexHeaderName(line string) (string, bool) {
 // 큰따옴표 안에서는 `\`가 다음 한 글자를 이스케이프로 건너뛴다(`\"`에 문자열이 조기 종료되지
 // 않도록) — 그 한 글자만 건너뛸 뿐 TOML 이스케이프를 실제로 해석하지는 않는다
 // (unquoteHeaderName과 같은 이유). 작은따옴표(TOML 리터럴 문자열)는 이스케이프가 없어 그대로
-// 토글한다. 찾지 못하면 (0, false) — 이 줄 안에서는 안 닫힌다는 뜻이고, 여러 줄에 걸쳐 닫히는
-// 실제 문자열은 애초에 이 함수의 대상이 아니다(codexServerHeaders 첫 번째 알려진 한계).
+// 토글한다.
+//
+// 줄 끝까지 따옴표가 안 닫히면(닫는 따옴표를 빠뜨린 흔한 오타) 따옴표 추적을 포기하고 그
+// 줄의 마지막 ']'를 최선-노력으로 닫는 자리로 쓴다 — codexServerHeaders 세 번째 알려진
+// 한계가 이 대가를 적는다. ']' 자체가 줄에 없으면 그마저 없어 (0, false) — 여러 줄에 걸쳐
+// 닫히는 실제 문자열은 애초에 이 함수의 대상이 아니다(codexServerHeaders 첫 번째 알려진
+// 한계).
 func codexHeaderClose(s string) (int, bool) {
 	var quote byte
 	for i := 1; i < len(s); i++ {
@@ -119,7 +134,8 @@ func codexHeaderClose(s string) (int, bool) {
 			return i, true
 		}
 	}
-	return 0, false
+	i := strings.LastIndexByte(s, ']')
+	return i, i >= 0
 }
 
 // unquoteHeaderName — 양끝이 같은 따옴표(" 또는 ')로 둘러싸여 있으면 그 한 겹만 벗긴다. TOML

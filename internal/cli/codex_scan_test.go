@@ -133,6 +133,19 @@ func TestCodexServerHeaders(t *testing.T) {
 			"[mcp_servers.ctr] not a comment\n",
 			nil,
 		},
+		{
+			// 안 닫힌 큰따옴표(닫는 따옴표를 빠뜨린 오타) — codexHeaderClose가 최선-노력으로
+			// 마지막 ']'를 닫는 자리로 쓴다(세 번째 알려진 한계). 판정은 살고 이름만
+			// 지저분하다 — unquoteHeaderName이 양끝 짝을 못 채워 앞 따옴표가 그대로 남는다.
+			"안 닫힌 큰따옴표 — 헤더로는 잡히고 이름만 지저분하다",
+			`[mcp_servers."my-server]` + "\n",
+			[]codexHeaderHit{{Name: `"my-server`, Line: 1}},
+		},
+		{
+			"안 닫힌 작은따옴표 — 헤더로는 잡히고 이름만 지저분하다",
+			`[mcp_servers.'my-server]` + "\n",
+			[]codexHeaderHit{{Name: `'my-server`, Line: 1}},
+		},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
