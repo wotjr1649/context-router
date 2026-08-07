@@ -1024,34 +1024,36 @@ func TestHookInstallAcceptsExecWithCodex(t *testing.T) {
 	}
 }
 
-// TestHostSnippetSingleServerRegistration: 안내의 .mcp.json 예시가 단일 서버다. 설치기가
-// ctr을 은퇴시키는데 안내가 3개를 계속 제시하면 사용자가 이중 등록을 되살린다(D63 ②).
+// TestHostSnippetSingleServerRegistration — D96·D97·D98 재기준선(Task 4). 손편집 .mcp.json
+// 예시는 더는 싣지 않는다(등록은 이제 플러그인 설치 절차이고, 우리는 어떤 호스트 설정
+// 파일에도 쓰지 않는다 — D96 계약 1). 이 테스트가 지키던 "이중 등록 방지"라는 목적은 살아
+// 있다 — 옛 JSON 예시가 그 자리였고, 지금은 설치 절차의 0번 걸음(옛 등록물 제거)이 같은
+// 목적을 진다(A⑧ — 호스트가 command·args 일치 서버를 경고 없이 버린다).
 func TestHostSnippetSingleServerRegistration(t *testing.T) {
-	if strings.Contains(hostSnippet, `"ctr": {`) {
-		t.Errorf("대체된 ctr 등록 예시가 남아 있다:\n%s", hostSnippet)
+	for _, retired := range []string{`"ctr": {`, `"` + ctrMCPServerName + `": {`} {
+		if strings.Contains(hostSnippet, retired) {
+			t.Errorf("손편집 .mcp.json 등록 예시가 남아 있다(D96 계약 1 — 그 경로를 더는 안내하지 않는다): %q\n%s", retired, hostSnippet)
+		}
 	}
-	if !strings.Contains(hostSnippet, `"`+ctrMCPServerName+`": {`) {
-		t.Errorf("단일 서버 등록 예시가 없다:\n%s", hostSnippet)
-	}
-	// 전 프로젝트 사용의 공식 경로는 사용자 스코프 등록이다 — 그쪽은 승인 키가 필요 없으므로
-	// --user 설치가 승인 키를 건너뛴 사용자가 갈 곳이 안내에 있어야 한다(리뷰 T6-1).
-	if !strings.Contains(hostSnippet, "claude mcp add --scope user") {
-		t.Errorf("사용자 스코프 등록 안내가 없다:\n%s", hostSnippet)
+	if !strings.Contains(hostSnippet, "옛 등록물을 먼저 지운다") {
+		t.Errorf("이중 등록을 막는 0번 걸음 안내가 없다:\n%s", hostSnippet)
 	}
 }
 
-// TestHostSnippetUsesCurrentServerPrefix: permission 예시가 은퇴한 서버 이름을 가리키지 않는다.
-// 단일 서버 표준(D63 ②)에서 ingest 2종은 ctr-exec 아래 노출되므로, mcp__ctr__ 접두 규칙을 그대로
-// 복사한 사용자는 아무것도 매칭하지 않는 ask 규칙을 갖게 되고 ingest가 무보호로 남는다.
-// ctr-global은 설치기가 만들지도 지우지도 않는 별개 프로필이라 그 접두는 유효하다.
+// TestHostSnippetUsesCurrentServerPrefix — D98 재기준선(Task 4). permission 예시가 은퇴한
+// 도구 접두를 가리키지 않는다. 도구 접두가 mcp__<서버>__에서 mcp__plugin_<플러그인>_<서버>__로
+// 옮겨갔으므로(D96 "사용자에게 보이는 변화"), 옛 mcp__ctr-exec__ 규칙을 그대로 복사한 사용자는
+// 아무것도 매칭하지 않는 ask 규칙을 갖게 되고 ingest/net이 무보호로 남는다. ctr-global은
+// 손편집 프로필 예시 자체가 D96 아래 안내 대상에서 빠졌으므로 그 접두도 함께 지운다.
 func TestHostSnippetUsesCurrentServerPrefix(t *testing.T) {
-	if strings.Contains(hostSnippet, "mcp__ctr__") {
-		t.Errorf("은퇴한 ctr 서버 접두가 남아 있다:\n%s", hostSnippet)
+	for _, retired := range []string{"mcp__ctr__", "mcp__ctr-exec__", "mcp__ctr-global__"} {
+		if strings.Contains(hostSnippet, retired) {
+			t.Errorf("은퇴한 서버 접두가 남아 있다: %q\n%s", retired, hostSnippet)
+		}
 	}
 	for _, want := range []string{
-		"mcp__" + ctrMCPServerName + "__ctr_index",
-		"mcp__" + ctrMCPServerName + "__ctr_fetch_and_index",
-		"mcp__ctr-global__*",
+		"mcp__plugin_context-router_ctr__ctr_index",
+		"mcp__plugin_context-router_ctr__ctr_fetch_and_index",
 	} {
 		if !strings.Contains(hostSnippet, want) {
 			t.Errorf("%q 규칙이 안내에서 사라졌다", want)

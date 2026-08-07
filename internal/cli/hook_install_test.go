@@ -472,7 +472,7 @@ func TestDoctor_HookItemsAndAscendingOrder(t *testing.T) {
 		storeRoot := t.TempDir()
 		projectRoot := t.TempDir()
 		var buf bytes.Buffer
-		if err := runDoctor(context.Background(), &buf, storeRoot, projectRoot, "0.1.0", false); err != nil {
+		if err := runDoctor(context.Background(), &buf, storeRoot, projectRoot, "0.1.0"); err != nil {
 			t.Fatalf("runDoctor err=%v out=%s", err, buf.String())
 		}
 		out := buf.String()
@@ -516,7 +516,7 @@ func TestDoctor_HookItemsAndAscendingOrder(t *testing.T) {
 		}
 
 		var buf bytes.Buffer
-		if err := runDoctor(context.Background(), &buf, storeRoot, projectRoot, "0.1.0", false); err != nil {
+		if err := runDoctor(context.Background(), &buf, storeRoot, projectRoot, "0.1.0"); err != nil {
 			t.Fatalf("runDoctor err=%v out=%s", err, buf.String())
 		}
 		out := buf.String()
@@ -593,7 +593,7 @@ func TestDoctor_UserScopeHookRegistration(t *testing.T) {
 	}
 
 	var buf bytes.Buffer
-	if err := runDoctor(context.Background(), &buf, storeRoot, projectRoot, "0.1.0", false); err != nil {
+	if err := runDoctor(context.Background(), &buf, storeRoot, projectRoot, "0.1.0"); err != nil {
 		t.Fatalf("runDoctor err=%v out=%s", err, buf.String())
 	}
 	out := buf.String()
@@ -610,8 +610,10 @@ func TestDoctor_UserScopeHookRegistration(t *testing.T) {
 // 훅 스코프는 버전 불일치 경고를 내지 **않는다**. 같은 픽스처에서 그 훅 등록이 **소유로
 // 인식되는지**를 등록 개수로 함께 단정한다 — 경고만 보면 무버전 마커가 소유 판정에서 아예
 // 탈락해 개수가 0이 된 경우도 "경고 없음"으로 통과한다.
-// 불일치 부재는 **훅 스코프 줄([9]·[16])에 한정**한다 — D83의 [20]은 MCP 등록물의 버전을
-// 비교하는 자리라 같은 픽스처에서 '≠'를 정당하게 인쇄한다.
+// 불일치 부재는 **훅 스코프 줄([9]·[16] codex hooks:)에 한정**한다 — D83의 [20]은 MCP 등록물의
+// 버전을 비교하는 자리라 같은 픽스처에서 '≠'를 정당하게 인쇄한다. [16]의 접두는 Task 4에서
+// "[16] codex:"(등록물 판정)에서 "[16] codex hooks:"(훅 스코프 전용)로 갈렸다 — 등록물 판정은
+// [16]의 별개 줄(옛 손편집 감지, D97 계약 2)로 옮겨갔고 그 줄은 이 테스트의 관심사가 아니다.
 func TestDoctorVersionlessHookMarker(t *testing.T) {
 	isolateCodexHome(t)
 	storeRoot := t.TempDir()
@@ -622,7 +624,7 @@ func TestDoctorVersionlessHookMarker(t *testing.T) {
 	}
 	// 설치 버전과 다른 버전으로 doctor를 돌려도 훅 스코프는 흔들리지 않는다.
 	var buf bytes.Buffer
-	if err := runDoctor(context.Background(), &buf, storeRoot, projectRoot, "0.16.0", false); err != nil {
+	if err := runDoctor(context.Background(), &buf, storeRoot, projectRoot, "0.16.0"); err != nil {
 		t.Fatalf("runDoctor err=%v out=%s", err, buf.String())
 	}
 	out := buf.String()
@@ -633,7 +635,7 @@ func TestDoctorVersionlessHookMarker(t *testing.T) {
 	// 버전을 비교하므로 같은 픽스처(설치 0.15.0 · doctor 0.16.0)에서 정당하게 '≠'를
 	// 인쇄한다. 출력 전체를 보면 그 줄이 이 단정을 깨뜨린다.
 	for _, line := range strings.Split(out, "\n") {
-		if !strings.HasPrefix(line, "[9] hooks:") && !strings.HasPrefix(line, "[16] codex:") {
+		if !strings.HasPrefix(line, "[9] hooks:") && !strings.HasPrefix(line, "[16] codex hooks:") {
 			continue
 		}
 		if strings.Contains(line, "≠") {

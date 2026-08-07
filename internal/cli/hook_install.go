@@ -88,13 +88,6 @@ func markerVersion(marker string) string {
 	return ""
 }
 
-// markerDrift — MCP 등록물 표식이 현재 버전과 어긋나는가(D83). 우리 표식이 아니면 고칠 대상이
-// 아니다. **무버전 표식(context-router)은 "표식 있음·버전 미상"이라 드리프트로 본다** —
-// hostSnippet이 인쇄하는 값이 그 형태이고, --fix가 현재 버전 값으로 채운다(D80).
-func markerDrift(marker, version string) bool {
-	return isOurMarkerValue(marker) && markerVersion(marker) != version
-}
-
 // ownedRegistration — 등록물이 우리 소유인가(D83 --fix의 대상 조건). 표식 값이 소유 기준을
 // 만족하거나 command가 hookBinaryName이면 참이다 — D80의 인수 절과 같은 기준이다.
 // 거짓이면 --fix는 병합하지 않고 hook install만 안내한다: 부재 파일뿐 아니라 **부재 등록물도

@@ -130,18 +130,20 @@ func TestCodexInstallBOMRoundTrip(t *testing.T) {
 	}
 }
 
-// TestDoctorCodexBOMNoFalseAlarm — [16]의 입력 파스 실패 줄은 정보 줄이라 종료코드를 바꾸지
-// 않지만, 멀쩡한 파일에 나오면 사용자가 자기 config.toml을 깨진 것으로 읽는다.
-// 긍정 단정을 함께 둔다 — 부정 단정만으로는 [16]이 그 절에 닿지 못해도(경로 확인불가·읽기
-// 실패) 통과해 아무것도 물지 않는다.
+// TestDoctorCodexBOMNoFalseAlarm — D97 계약 2 재기준선(Task 4가 doctor의 [16]을 codex_toml.go
+// 판정에서 codexServerHeaders 줄 스캔으로 갈아 끼웠다). BOM은 codexServerHeaders가 trimBOM으로
+// 먼저 벗기므로 줄 번호를 밀어내지 않는다 — codex_scan_test.go의 "BOM이 붙은 입력" 케이스가
+// 탐지기 자체를 이미 재지만, 이 테스트는 doctor 배선(os.ReadFile → codexServerHeaders → 보고
+// 줄)이 그 값을 그대로 실어 나르는지를 잰다 — 배선이 깨지면 탐지기가 맞아도 doctor 출력이
+// 틀릴 수 있다.
 func TestDoctorCodexBOMNoFalseAlarm(t *testing.T) {
 	home := isolateCodexHome(t)
 	writeCodexConfig(t, home, codexBOM+"model = \"gpt-5\"\n\n[mcp_servers.ctr]\ncommand = \"context-router\"\n")
-	out, _ := doctorOut(t, t.TempDir(), false)
-	if !strings.Contains(out, "[16] codex: [mcp_servers.ctr] 테이블=존재") {
-		t.Fatalf("픽스처가 정상 등록으로 읽히지 않는다 — 오보 부재를 잴 수 없다:\n%s", out)
+	out, _ := doctorOut(t, t.TempDir())
+	if !strings.Contains(out, "옛 방식으로 손편집된 등록물이 남아 있다") {
+		t.Fatalf("BOM 파일의 등록물을 doctor가 놓쳤다:\n%s", out)
 	}
-	if strings.Contains(out, "TOML로 파스되지 않습니다") {
-		t.Errorf("멀쩡한 BOM 파일에 파스 실패 정보 줄이 나온다:\n%s", out)
+	if !strings.Contains(out, ":3 (ctr)") {
+		t.Errorf("BOM이 줄 번호를 밀어냈다 — 헤더는 3번째 줄이어야 한다:\n%s", out)
 	}
 }
