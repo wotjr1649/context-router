@@ -54,21 +54,15 @@ func doctorOut(t *testing.T, projectRoot string) (string, error) {
 	return buf.String(), err
 }
 
-// TestIsolateCodexHome — 격리 헬퍼가 실제로 codexConfigPath·doctorCodexConfigPath 둘 다를
-// 돌리는가. 이 파일의 doctor 단정이 전부 이 헬퍼 위에 서므로, 헬퍼가 조용히 망가지면 그
-// 단정들이 공유 임시 홈을 보게 되고 무엇을 단정했는지 알 수 없어진다. 둘 다 확인하는 이유는
-// doctorCodexConfigPath가 codex_toml.go의 codexConfigPath를 doctor 쪽에서 복제한 것이라서다
-// (D97 계약 2 — doctor는 codex_toml.go를 부르지 않는다, Task 4) — 규칙이 갈리면 hook install
-// --codex가 쓰는 파일과 doctor가 읽는 파일이 어긋난다. 긍정형으로 둔다 — 경로 자체를
-// 단정하면 픽스처가 바꾸는 문면뿐 아니라 홈이 어디로 떨어지는지까지 잡는다(반환 디렉터리
-// 아래인지, 거기 쓴 픽스처를 doctor가 실제로 읽는지). 후반부는 D97 계약 2의 신규 감지원
-// (codexServerHeaders)이 파일:줄을 실제로 보고하는지도 함께 검증한다.
+// TestIsolateCodexHome — 격리 헬퍼가 실제로 doctorCodexConfigPath를 돌리는가. 이 파일의
+// doctor 단정이 전부 이 헬퍼 위에 서므로, 헬퍼가 조용히 망가지면 그 단정들이 공유 임시 홈을
+// 보게 되고 무엇을 단정했는지 알 수 없어진다. 긍정형으로 둔다 — 경로 자체를 단정하면 픽스처가
+// 바꾸는 문면뿐 아니라 홈이 어디로 떨어지는지까지 잡는다(반환 디렉터리 아래인지, 거기 쓴
+// 픽스처를 doctor가 실제로 읽는지). 후반부는 D97 계약 2의 감지원(codexServerHeaders)이
+// 파일:줄을 실제로 보고하는지도 함께 검증한다.
 func TestIsolateCodexHome(t *testing.T) {
 	home := isolateCodexHome(t)
 	want := filepath.Join(home, "config.toml")
-	if got, err := codexConfigPath(); err != nil || got != want {
-		t.Fatalf("codexConfigPath = %q err=%v, want %q", got, err, want)
-	}
 	if got, err := doctorCodexConfigPath(); err != nil || got != want {
 		t.Fatalf("doctorCodexConfigPath = %q err=%v, want %q", got, err, want)
 	}
@@ -82,14 +76,14 @@ func TestIsolateCodexHome(t *testing.T) {
 // D56 — version 서브커맨드: ProductVersion 1줄만 출력(CI 추출 표면, 스펙 §0).
 func TestRunVersionSubcommand(t *testing.T) {
 	var out, errOut bytes.Buffer
-	err := Run(context.Background(), "version", nil, t.TempDir(), t.TempDir(), "9.9.9-test", false, "", &out, &errOut)
+	err := Run(context.Background(), "version", nil, t.TempDir(), t.TempDir(), "9.9.9-test", &out, &errOut)
 	if err != nil {
 		t.Fatalf("err=%v", err)
 	}
 	if out.String() != "9.9.9-test\n" {
 		t.Fatalf("out=%q want %q", out.String(), "9.9.9-test\n")
 	}
-	if err := Run(context.Background(), "version", []string{"x"}, t.TempDir(), t.TempDir(), "v", false, "", &out, &errOut); err == nil {
+	if err := Run(context.Background(), "version", []string{"x"}, t.TempDir(), t.TempDir(), "v", &out, &errOut); err == nil {
 		t.Fatal("잉여 인자 미거부")
 	}
 }
@@ -719,7 +713,7 @@ func TestDoctorShadowOwnedNoSessionDecomp(t *testing.T) {
 // 이를 통해 미지 단어를 MCP 플래그로 잘못 흡수하지 않도록 한다(설계 §7).
 func TestRun_UnknownSub(t *testing.T) {
 	var out, errOut bytes.Buffer
-	err := Run(context.Background(), "bogus", nil, t.TempDir(), t.TempDir(), "0.0.1-dev", false, "", &out, &errOut)
+	err := Run(context.Background(), "bogus", nil, t.TempDir(), t.TempDir(), "0.0.1-dev", &out, &errOut)
 	if err == nil {
 		t.Fatal("want error for unknown subcommand, got nil")
 	}
@@ -734,7 +728,7 @@ func TestRunPurge_ExactlyOneSelector(t *testing.T) {
 		{"--project", "x", "--all"}, // 둘 다 있음
 	} {
 		var out, errOut bytes.Buffer
-		err := Run(context.Background(), "purge", args, t.TempDir(), t.TempDir(), "0.0.1-dev", false, "", &out, &errOut)
+		err := Run(context.Background(), "purge", args, t.TempDir(), t.TempDir(), "0.0.1-dev", &out, &errOut)
 		if err == nil {
 			t.Fatalf("args=%v: want selector 오류, got nil", args)
 		}
@@ -1273,7 +1267,7 @@ func TestRunPurge_E2E_GCOnlyNoConfirm(t *testing.T) {
 	var out, errOut bytes.Buffer
 	// --force도 --older-than도 없다 — gc 단독이 확인을 생략하고도 성공해야 한다.
 	args := []string{"--project", projectRoot, "--gc"}
-	if err := Run(context.Background(), "purge", args, storeRoot, projectRoot, "0.0.1-dev", false, "", &out, &errOut); err != nil {
+	if err := Run(context.Background(), "purge", args, storeRoot, projectRoot, "0.0.1-dev", &out, &errOut); err != nil {
 		t.Fatalf("Run purge --gc err=%v out=%s", err, out.String())
 	}
 
@@ -1604,7 +1598,7 @@ func TestRunStats_Local(t *testing.T) {
 	}
 
 	var out, errOut bytes.Buffer
-	if err := Run(context.Background(), "stats", nil, storeRoot, projectRoot, "0.0.1-dev", false, "", &out, &errOut); err != nil {
+	if err := Run(context.Background(), "stats", nil, storeRoot, projectRoot, "0.0.1-dev", &out, &errOut); err != nil {
 		t.Fatalf("Run stats err=%v out=%s", err, out.String())
 	}
 	got := out.String()
@@ -1625,7 +1619,7 @@ func TestRunStats_Local(t *testing.T) {
 // 계약이 cli까지 그대로 이어지는지 확인한다.
 func TestRunStats_Local_NoLedger(t *testing.T) {
 	var out, errOut bytes.Buffer
-	if err := Run(context.Background(), "stats", nil, t.TempDir(), t.TempDir(), "0.0.1-dev", false, "", &out, &errOut); err != nil {
+	if err := Run(context.Background(), "stats", nil, t.TempDir(), t.TempDir(), "0.0.1-dev", &out, &errOut); err != nil {
 		t.Fatalf("Run stats err=%v out=%s", err, out.String())
 	}
 	got := out.String()
@@ -1655,7 +1649,7 @@ func TestRunStats_Provider(t *testing.T) {
 
 	var out, errOut bytes.Buffer
 	args := []string{"--provider", path}
-	if err := Run(context.Background(), "stats", args, t.TempDir(), t.TempDir(), "0.0.1-dev", false, "", &out, &errOut); err != nil {
+	if err := Run(context.Background(), "stats", args, t.TempDir(), t.TempDir(), "0.0.1-dev", &out, &errOut); err != nil {
 		t.Fatalf("Run stats --provider err=%v out=%s", err, out.String())
 	}
 	got := out.String()
@@ -1677,7 +1671,7 @@ func TestRunStats_Provider_FileMissing(t *testing.T) {
 	var out, errOut bytes.Buffer
 	missing := filepath.Join(t.TempDir(), "missing.jsonl")
 	args := []string{"--provider", missing}
-	err := Run(context.Background(), "stats", args, t.TempDir(), t.TempDir(), "0.0.1-dev", false, "", &out, &errOut)
+	err := Run(context.Background(), "stats", args, t.TempDir(), t.TempDir(), "0.0.1-dev", &out, &errOut)
 	if err == nil {
 		t.Fatal("want error for missing --provider file, got nil")
 	}
@@ -1694,7 +1688,7 @@ func TestRunStats_Local_ProjectIdentifyFailure(t *testing.T) {
 	missingProject := filepath.Join(t.TempDir(), "does-not-exist")
 
 	var out, errOut bytes.Buffer
-	err := Run(context.Background(), "stats", nil, storeRoot, missingProject, "0.0.1-dev", false, "", &out, &errOut)
+	err := Run(context.Background(), "stats", nil, storeRoot, missingProject, "0.0.1-dev", &out, &errOut)
 	if err == nil {
 		t.Fatal("want error for nonexistent project root, got nil")
 	}
@@ -1722,7 +1716,7 @@ func TestRunStats_Provider_OversizedLine(t *testing.T) {
 
 	var out, errOut bytes.Buffer
 	args := []string{"--provider", path}
-	if err := Run(context.Background(), "stats", args, t.TempDir(), t.TempDir(), "0.0.1-dev", false, "", &out, &errOut); err != nil {
+	if err := Run(context.Background(), "stats", args, t.TempDir(), t.TempDir(), "0.0.1-dev", &out, &errOut); err != nil {
 		t.Fatalf("Run stats --provider err=%v out=%s", err, out.String())
 	}
 	got := out.String()
@@ -1739,7 +1733,7 @@ func TestRunStats_Provider_OversizedLine(t *testing.T) {
 // 그대로 에코되면 안 된다(규약 §6, 리뷰 Fix Round 3 item 5 — 개수만 밝힌다).
 func TestRunDoctor_UnexpectedArgs(t *testing.T) {
 	var out, errOut bytes.Buffer
-	err := Run(context.Background(), "doctor", []string{"--bogus"}, t.TempDir(), t.TempDir(), "0.0.1-dev", false, "", &out, &errOut)
+	err := Run(context.Background(), "doctor", []string{"--bogus"}, t.TempDir(), t.TempDir(), "0.0.1-dev", &out, &errOut)
 	if err == nil {
 		t.Fatal("want error for unexpected doctor args, got nil")
 	}
@@ -1750,7 +1744,7 @@ func TestRunDoctor_UnexpectedArgs(t *testing.T) {
 
 func TestRunUpgrade_UnexpectedArgs(t *testing.T) {
 	var out, errOut bytes.Buffer
-	err := Run(context.Background(), "upgrade", []string{"--bogus"}, t.TempDir(), t.TempDir(), "0.0.1-dev", false, "", &out, &errOut)
+	err := Run(context.Background(), "upgrade", []string{"--bogus"}, t.TempDir(), t.TempDir(), "0.0.1-dev", &out, &errOut)
 	if err == nil {
 		t.Fatal("want error for unexpected upgrade args, got nil")
 	}
@@ -1763,7 +1757,7 @@ func TestRunUpgrade_UnexpectedArgs(t *testing.T) {
 // 없이 그냥 파일명만 넘긴 경우)를 침묵 수용하면 안 된다(리뷰 Fix Round 3, item 4).
 func TestRunStats_UnexpectedPositionalArg(t *testing.T) {
 	var out, errOut bytes.Buffer
-	err := Run(context.Background(), "stats", []string{"provider.jsonl"}, t.TempDir(), t.TempDir(), "0.0.1-dev", false, "", &out, &errOut)
+	err := Run(context.Background(), "stats", []string{"provider.jsonl"}, t.TempDir(), t.TempDir(), "0.0.1-dev", &out, &errOut)
 	if err == nil {
 		t.Fatal("want error for unexpected positional arg, got nil")
 	}
@@ -1787,7 +1781,7 @@ func TestRunStats_Provider_ContextCanceled(t *testing.T) {
 	cancel()
 
 	var out, errOut bytes.Buffer
-	err := Run(ctx, "stats", []string{"--provider", path}, t.TempDir(), t.TempDir(), "0.0.1-dev", false, "", &out, &errOut)
+	err := Run(ctx, "stats", []string{"--provider", path}, t.TempDir(), t.TempDir(), "0.0.1-dev", &out, &errOut)
 	if err == nil {
 		t.Fatal("want error for canceled context, got nil")
 	}
@@ -1896,7 +1890,7 @@ func TestRunSessionExport_JSONLRoundTrip(t *testing.T) {
 
 	var out, errOut bytes.Buffer
 	args := []string{"export", "--project", projectRoot, "--worktree", canon.WorktreeID}
-	if err := Run(context.Background(), "session", args, storeRoot, projectRoot, "0.0.1-dev", false, "", &out, &errOut); err != nil {
+	if err := Run(context.Background(), "session", args, storeRoot, projectRoot, "0.0.1-dev", &out, &errOut); err != nil {
 		t.Fatalf("Run session export err=%v stderr=%s", err, errOut.String())
 	}
 
@@ -1950,7 +1944,7 @@ func TestRunSessionExport_WorktreeContract(t *testing.T) {
 
 		var out, errOut bytes.Buffer
 		args := []string{"export", "--project", projectRoot}
-		if err := Run(context.Background(), "session", args, storeRoot, projectRoot, "0.0.1-dev", false, "", &out, &errOut); err == nil {
+		if err := Run(context.Background(), "session", args, storeRoot, projectRoot, "0.0.1-dev", &out, &errOut); err == nil {
 			t.Fatalf("want error for ambiguous worktree, got nil (out=%s)", out.String())
 		}
 		for _, wid := range []string{"wt-a", "wt-b"} {
@@ -1978,7 +1972,7 @@ func TestRunSessionExport_WorktreeContract(t *testing.T) {
 
 		var out, errOut bytes.Buffer
 		args := []string{"export", "--project", projectRoot}
-		if err := Run(context.Background(), "session", args, storeRoot, projectRoot, "0.0.1-dev", false, "", &out, &errOut); err != nil {
+		if err := Run(context.Background(), "session", args, storeRoot, projectRoot, "0.0.1-dev", &out, &errOut); err != nil {
 			t.Fatalf("Run session export(single worktree, no --worktree) err=%v stderr=%s", err, errOut.String())
 		}
 	})
@@ -2174,7 +2168,7 @@ func TestRunSessionRecover_HappyPath(t *testing.T) {
 
 	var out, errOut bytes.Buffer
 	args := []string{"recover", "--project", projectRoot, "--worktree", canon.WorktreeID}
-	if err := Run(context.Background(), "session", args, storeRoot, projectRoot, "0.0.1-dev", false, "", &out, &errOut); err != nil {
+	if err := Run(context.Background(), "session", args, storeRoot, projectRoot, "0.0.1-dev", &out, &errOut); err != nil {
 		t.Fatalf("Run session recover err=%v stderr=%s", err, errOut.String())
 	}
 	if out.Len() != 0 {
@@ -2206,7 +2200,7 @@ func TestRunSessionRecover_ServerRunning_RejectsImmediately(t *testing.T) {
 
 	var out, errOut bytes.Buffer
 	args := []string{"recover", "--project", projectRoot, "--worktree", canon.WorktreeID}
-	err = Run(context.Background(), "session", args, storeRoot, projectRoot, "0.0.1-dev", false, "", &out, &errOut)
+	err = Run(context.Background(), "session", args, storeRoot, projectRoot, "0.0.1-dev", &out, &errOut)
 	if !errors.Is(err, session.ErrLeaseHeld) {
 		t.Fatalf("err=%v want session.ErrLeaseHeld (out=%s stderr=%s)", err, out.String(), errOut.String())
 	}
@@ -2262,7 +2256,7 @@ func TestRunSessionRecover_PublishInterrupted_DelegatesDespiteMissingDB(t *testi
 	// 3) CLI recover — session.db 부재에도 위임·완료해야 한다.
 	var out, errOut bytes.Buffer
 	args := []string{"recover", "--project", projectRoot, "--worktree", canon.WorktreeID}
-	if err := Run(context.Background(), "session", args, storeRoot, projectRoot, "0.0.1-dev", false, "", &out, &errOut); err != nil {
+	if err := Run(context.Background(), "session", args, storeRoot, projectRoot, "0.0.1-dev", &out, &errOut); err != nil {
 		t.Fatalf("Run session recover err=%v stderr=%s", err, errOut.String())
 	}
 	if !strings.Contains(errOut.String(), "인양 완료") {
@@ -2303,7 +2297,7 @@ func TestRecover_UnknownWorktreeListsCandidates(t *testing.T) {
 
 	var out, errOut bytes.Buffer
 	args := []string{"recover", "--project", projectRoot, "--worktree", "nonexistent-wid"}
-	err = Run(context.Background(), "session", args, storeRoot, projectRoot, "0.0.1-dev", false, "", &out, &errOut)
+	err = Run(context.Background(), "session", args, storeRoot, projectRoot, "0.0.1-dev", &out, &errOut)
 	if err == nil {
 		t.Fatal("want error for nonexistent worktree id")
 	}
@@ -2410,100 +2404,11 @@ func TestPurgeHookOnlyComboRejected(t *testing.T) {
 // 단정한다. 버전은 runDoctor에 넘긴 ver로 스레딩하고 픽스처 marker도 같은 ver로 조립해([9]식
 // marker≠version 불일치 문구 회피) 0.9.0 하드코딩 없이 범프 후에도 유효하게 유지한다.
 // write — 픽스처 파일 기록 테스트 헬퍼. 원래 TestDoctorCodexMCPLine의 지역 클로저였고,
-// D83의 [20]·--fix 테스트가 같은 것을 필요로 해 파일 수준으로 올렸다.
+// [20]의 잔존 감지 테스트가 같은 것을 필요로 해 파일 수준으로 올렸다.
 func write(t *testing.T, path string, data []byte) {
 	t.Helper()
 	if err := os.WriteFile(path, data, 0o600); err != nil {
 		t.Fatalf("write %s: %v", filepath.Base(path), err)
-	}
-}
-
-// TestCodexRegistrationVerdict — D85(§2-2). 감지와 고침이 같은 판정원을 쓰는지 본다. 권고
-// 술어는 --fix가 실제로 기입하는 조건 전체다: mcpWritten AND 테이블 실존 AND Changed.
-// Changed 하나로 줄이면 "파일은 있고 관리 테이블만 없는" 상태에서 install이 append 경로로
-// Changed=true를 내는데 --fix는 no-create로 거절하므로 오권고가 된다.
-func TestCodexRegistrationVerdict(t *testing.T) {
-	const ver = "0.16.0"
-	ours := "[mcp_servers.ctr]\ncommand = \"context-router\"\nargs = [\"--enable\", \"ingest,net\"]\n" +
-		"enabled_tools = [\"ctr_search\", \"ctr_index\", \"ctr_fetch_and_index\"]\n" +
-		"[mcp_servers.ctr.env]\n" + codexMarkerKey + " = \"context-router/"
-	cases := []struct {
-		name      string
-		cfg       string
-		wantFix   bool
-		wantState codexMCPState
-		wantTable bool
-	}{
-		{
-			name:      "관리 테이블 없음(파일은 있다) — 권고하지 않는다",
-			cfg:       "model = \"gpt\"\n",
-			wantFix:   false,
-			wantState: mcpWritten,
-			wantTable: false,
-		},
-		{
-			name:      "현재 버전 — 권고하지 않는다",
-			cfg:       ours + ver + "\"\n",
-			wantFix:   false,
-			wantState: mcpWritten,
-			wantTable: true,
-		},
-		{
-			name:      "구 버전 표식 — 권고한다",
-			cfg:       ours + "0.15.0\"\n",
-			wantFix:   true,
-			wantState: mcpWritten,
-			wantTable: true,
-		},
-		{
-			name:      "남의 테이블 — 권고하지 않는다",
-			cfg:       "[mcp_servers.ctr]\ncommand = \"other\"\n[mcp_servers.ctr.env]\n" + codexMarkerKey + " = \"other-tool/1.0\"\n",
-			wantFix:   false,
-			wantState: mcpExistingHeader,
-			wantTable: true,
-		},
-		{
-			// 두 케이스의 wantTable은 **true**다(실측). 구간 판정이 실패했거나 충돌이어도
-			// codexManagedSpans가 헤더 자체는 찾았기 때문이다. 구속력 있는 단정은 shouldFix()가
-			// 거짓이라는 것이며, 권고 술어가 State를 먼저 보므로 그 두 상태에서 TableFound가
-			// 무엇이든 권고하지 않는다.
-			name:      "구간 밖 충돌 — 권고하지 않는다",
-			cfg:       ours + "0.15.0\"\n[mcp_servers.ctr.tools.ctr_execute]\napproval_mode = \"never\"\n",
-			wantFix:   false,
-			wantState: mcpConflict,
-			wantTable: true,
-		},
-		{
-			name:      "구간 판정 불가 — 권고하지 않는다",
-			cfg:       "[mcp_servers.ctr]\n[x]\n[mcp_servers.ctr]\n",
-			wantFix:   false,
-			wantState: mcpMarkerAnomaly,
-			wantTable: true,
-		},
-		{
-			name: "사용자가 넓힌 enabled_tools + 현재 버전 — 권고하지 않는다",
-			cfg: "[mcp_servers.ctr]\ncommand = \"context-router\"\nargs = [\"--enable\", \"ingest\"]\n" +
-				"enabled_tools = [\"ctr_search\", \"ctr_index\", \"ctr_execute\"]\n" +
-				"[mcp_servers.ctr.env]\n" + codexMarkerKey + " = \"context-router/" + ver + "\"\n",
-			wantFix:   false,
-			wantState: mcpWritten,
-			wantTable: true,
-		},
-	}
-	for _, c := range cases {
-		t.Run(c.name, func(t *testing.T) {
-			v := codexRegistrationVerdict([]byte(c.cfg), ver)
-			if v.State != c.wantState {
-				t.Errorf("State=%d want %d", v.State, c.wantState)
-			}
-			if v.TableFound != c.wantTable {
-				t.Errorf("TableFound=%v want %v", v.TableFound, c.wantTable)
-			}
-			if v.shouldFix() != c.wantFix {
-				t.Errorf("shouldFix=%v want %v (State=%d TableFound=%v Changed=%v)",
-					v.shouldFix(), c.wantFix, v.State, v.TableFound, v.Changed)
-			}
-		})
 	}
 }
 
@@ -2512,13 +2417,13 @@ func TestCodexRegistrationVerdict(t *testing.T) {
 func TestRunDoctorFixFlag(t *testing.T) {
 	t.Setenv("CODEX_HOME", t.TempDir())
 	var out, errOut bytes.Buffer
-	if err := Run(context.Background(), "doctor", []string{"--fix"}, t.TempDir(), t.TempDir(), "0.19.0", false, "", &out, &errOut); err == nil {
+	if err := Run(context.Background(), "doctor", []string{"--fix"}, t.TempDir(), t.TempDir(), "0.19.0", &out, &errOut); err == nil {
 		t.Fatalf("--fix가 더는 존재하지 않는데 doctor가 받아들였다: %s", out.String())
 	}
 	// 인자 없는 정상 실행은 여전히 받아들인다 — 위 단정만 있으면 doctor가 인자를 통째로
 	// 거부하도록 망가져도(과잉 거부) 이 테스트가 통과해버린다.
 	var out2, errOut2 bytes.Buffer
-	if err := Run(context.Background(), "doctor", nil, t.TempDir(), t.TempDir(), "0.19.0", false, "", &out2, &errOut2); err != nil {
+	if err := Run(context.Background(), "doctor", nil, t.TempDir(), t.TempDir(), "0.19.0", &out2, &errOut2); err != nil {
 		t.Fatalf("인자 없는 doctor 실행이 거부됐다: %v out=%s", err, out2.String())
 	}
 }
@@ -2792,51 +2697,6 @@ func TestDoctorIndexesRender(t *testing.T) {
 }
 
 // TestCodexEnvNotTableStopsInstall — 재기준선 행 4. env 우변이 인라인 테이블이 아니면 넷이
-// **함께** 멈춘다: 상태·[16] 라벨·MCP 확정(가드 등록)·프로필 기입. 지금까지는 codexKeyName이
-// env를 읽어 정상 갈래로 흘러 command·args·enabled_tools가 실제로 기입되고 MCP가 확정돼
-// 가드까지 등록됐다 — 상태만 바꾸고 그 결합을 두면 사용자는 "무변경"과 "가드 등록됨"을
-// 동시에 본다.
-func TestCodexEnvNotTableStopsInstall(t *testing.T) {
-	home := isolateCodexHome(t)
-	src := "[mcp_servers.ctr]\ncommand = \"context-router\"\nenv = []\n"
-	writeCodexConfig(t, home, src)
-	proj := t.TempDir()
-
-	var out bytes.Buffer
-	if err := runHookInstall([]string{"--codex"}, t.TempDir(), "", false, proj, "0.18.0", &out); err != nil {
-		t.Fatalf("install: %v", err)
-	}
-	// ① 프로필 미기입 — config.toml이 바이트 동일해야 한다.
-	got, err := os.ReadFile(filepath.Join(home, "config.toml"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(got) != src {
-		t.Errorf("무변경 이탈인데 config.toml이 바뀌었다:\n%s", got)
-	}
-	// ② 가드 미등록 — MCP가 확정되지 않았으므로 hooks.json에 우리 PreToolUse 그룹이 없다.
-	// 훅 파일 경로는 codexHooksPath로 얻는다(--user 없는 --codex 설치는 프로젝트 스코프라
-	// proj/.codex/hooks.json이지 CODEX_HOME(home)이 아니다 — 손으로 조립하면 어긋난다.
-	// TestHookInstallCodexGateReport와 같은 자리를 잰다). runHookInstallCodex는 MCP
-	// 미확정이어도 hooks.json 자체는 항상 쓴다(가드 그룹만 빠진다 — mergeCodexHooks의
-	// withGuard가 PreToolUse 유무만 가른다) — 그러므로 이 픽스처에서 파일 부재는 통과
-	// 조건이 아니다: 읽기 실패는 조용히 건너뛰지 않고 즉시 테스트를 실패시킨다.
-	hp, hpErr := codexHooksPath(false, proj)
-	if hpErr != nil {
-		t.Fatalf("훅 경로 해석 실패: %v", hpErr)
-	}
-	hooks, hErr := os.ReadFile(hp)
-	if hErr != nil {
-		t.Fatalf("hooks.json 읽기 실패: %v", hErr)
-	}
-	if bytes.Contains(hooks, []byte("PreToolUse")) {
-		t.Errorf("MCP 미확정인데 가드가 등록됐다:\n%s", hooks)
-	}
-	// ③ 설치 보고에 사유가 실린다.
-	if !strings.Contains(out.String(), anomalyEnvNotTable.reason()) {
-		t.Errorf("설치 보고에 사유가 없다:\n%s", out.String())
-	}
-}
 
 // TestDoctorCodexHandEditDetection — D97 계약 2 핵심 표. doctor의 새 [16] 감지원
 // (codexServerHeaders, codex_scan.go)이 codex_toml.go를 전혀 거치지 않고 세 갈래를 옳게
@@ -2921,7 +2781,7 @@ func TestDoctorCodexConfigUnreadable(t *testing.T) {
 
 // TestDoctorWritesNothing — D96·D97: doctor는 읽기 전용이다. config.toml·.mcp.json·
 // .claude/settings.json 세 파일의 mtime과 바이트가 진단 전후 동일해야 한다. --fix가 지워졌으니
-// 이 계약을 깨는 유일한 경로는 회귀다(예: 실수로 남은 atomicWriteFile·backupConfigFile 호출).
+// 이 계약을 깨는 유일한 경로는 회귀다(예: 실수로 남은 atomicWriteFile 호출).
 func TestDoctorWritesNothing(t *testing.T) {
 	home := isolateCodexHome(t)
 	writeCodexConfig(t, home, "[mcp_servers.ctr]\ncommand = \"context-router\"\n\n[mcp_servers.ctr.env]\nCTR_MANAGED = \"context-router/0.1.0\"\n")
@@ -3016,14 +2876,17 @@ func TestDoctorOutputNoHortatoryVocabulary(t *testing.T) {
 // TestDoctorCodexHooksScopePositive — 리뷰 I4a. [16] codex hooks: 줄의 유일한 긍정 커버리지는
 // 삭제된 TestDoctorCodexMCPLine 케이스 4였다 — 남은 참조(hook_install_test.go의
 // TestDoctorVersionlessHookMarker)는 "≠ 없음"을 재는 부정 필터라 그 줄이 통째로 사라져도
-// 공허하게 통과한다. 실제로 Codex 훅을 설치해 "미등록"이 아닌 값이 찍히는지 직접 잰다.
+// 공허하게 통과한다. 실제 Codex 훅 등록물을 놓고 "미등록"이 아닌 값이 찍히는지 직접 잰다.
 func TestDoctorCodexHooksScopePositive(t *testing.T) {
 	codexHome := t.TempDir()
 	t.Setenv("CODEX_HOME", codexHome)
 	projectRoot := t.TempDir()
-	var iout bytes.Buffer
-	if err := runHookInstall([]string{"--codex"}, t.TempDir(), "", false, projectRoot, "0.17.0", &iout); err != nil {
-		t.Fatalf("install --codex: %v", err)
+	hp, err := codexHooksPath(false, projectRoot)
+	if err != nil {
+		t.Fatalf("codexHooksPath: %v", err)
+	}
+	if err := atomicWriteFile(hp, seedCodexHooks(hookBinaryName, true)); err != nil {
+		t.Fatalf("seed: %v", err)
 	}
 	out, _ := doctorOut(t, projectRoot)
 	if !strings.Contains(out, "[16] codex hooks: project=등록됨(") {

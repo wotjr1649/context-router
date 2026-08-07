@@ -1,7 +1,6 @@
 package cli
 
 import (
-	"bytes"
 	"strings"
 	"testing"
 )
@@ -81,52 +80,6 @@ func TestCodexTOMLParsesLeadingBOM(t *testing.T) {
 	// 사용자 바이트라 우리가 해석을 바꿀 자리가 아니다.
 	if codexTOMLParses([]byte("[a]\n" + codexBOM + "x = 1\n")) {
 		t.Errorf("선두가 아닌 BOM까지 떼어 무효를 유효로 읽는다")
-	}
-}
-
-// codexBOMGateFixture — 선두 BOM이 붙은 **유효** 입력이면서 우리 산출물이 무효가 되는 형태.
-// 첫 줄을 우리 테이블 헤더로 두지 않는다: 그래야 BOM이 헤더 판정을 가리지 않아 우리 구간이
-// 정상으로 잡히고, 이 픽스처가 재는 축이 "입력 파스 판정" 하나로 좁혀진다.
-// 이스케이프를 담은 점 표기 마디는 tomlDottedEnvKey가 인식하지 못해 install이
-// [mcp_servers.ctr.env] 헤더를 덧붙이고, 그러면 파서가 보는 같은 서브테이블이 두 번 정의된다 —
-// TestCodexDottedHead가 게이트로 받아야 한다고 단정하는 바로 그 입력이다.
-const codexBOMGateFixture = codexBOM + "model = \"gpt-5\"\n\n[mcp_servers.ctr]\ncommand = \"context-router\"\n\"\\u0065nv\".CTR_MANAGED = \"x\"\n"
-
-// TestCodexInstallGateWithLeadingBOM — 선두 BOM이 붙어도 게이트가 실제로 작동한다. 판정이 BOM을
-// 거부하면 이 입력은 !InputParses로 조기 반환돼 **검증되지 않은 산출물이 그대로 기입된다** —
-// 게이트가 꺼지는 조건이 하필 Windows 편집기가 만진 파일이라는 것이 이 결함의 무게다.
-func TestCodexInstallGateWithLeadingBOM(t *testing.T) {
-	// 대조 — BOM 한 조각만 다른 같은 입력에서 게이트가 물린다. 이것이 없으면 픽스처가 다른
-	// 이유로 이탈해도(이상 갈래 등) 단정이 통과한다.
-	plain := strings.TrimPrefix(codexBOMGateFixture, codexBOM)
-	if res := installCodexConfigBlock([]byte(plain), codexInstallRequest{Marker: hookMarker("0.17.0")}); res.State != mcpOutputInvalid {
-		t.Fatalf("BOM 없는 대조군 state=%d want mcpOutputInvalid — 픽스처가 게이트를 재지 못한다", res.State)
-	}
-	res := installCodexConfigBlock([]byte(codexBOMGateFixture), codexInstallRequest{Marker: hookMarker("0.17.0")})
-	if !res.InputParses {
-		t.Errorf("선두 BOM 입력을 무효로 판정했다 — 비대칭 절이 게이트를 통째로 끈다")
-	}
-	if res.State != mcpOutputInvalid {
-		t.Errorf("state=%d want mcpOutputInvalid", res.State)
-	}
-	if res.Changed || string(res.Out) != codexBOMGateFixture {
-		t.Errorf("무변경 이탈이 아니다: changed=%v\n%s", res.Changed, res.Out)
-	}
-}
-
-// TestCodexInstallBOMRoundTrip — 왕복. 원문 줄을 보존하므로 입력의 선두 BOM은 산출물에 그대로
-// 남고, 그 산출물이 **같은 판정 함수**를 다시 지난다. 판정이 BOM을 거부하면 우리가 만든 멀쩡한
-// 바이트가 "무효 산출물"로 잡혀 게이트가 정상 기입을 되돌린다 — 그 갈래가 서지 않는지 잰다.
-func TestCodexInstallBOMRoundTrip(t *testing.T) {
-	res := installCodexConfigBlock([]byte(codexBOM+"model = \"gpt-5\"\n"), codexInstallRequest{Marker: hookMarker("0.17.0")})
-	if res.State != mcpWritten || !res.Changed {
-		t.Fatalf("state=%d changed=%v — 첫 기입 갈래가 아니다", res.State, res.Changed)
-	}
-	if !bytes.HasPrefix(res.Out, []byte(codexBOM)) {
-		t.Errorf("산출물이 선두 BOM을 잃었다 — 원문 보존 계약이 깨졌다")
-	}
-	if !codexTOMLParses(res.Out) {
-		t.Errorf("우리 산출물이 판정을 통과하지 못한다:\n%s", res.Out)
 	}
 }
 

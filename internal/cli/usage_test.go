@@ -38,7 +38,7 @@ func TestRunUsage_PerSessionSums(t *testing.T) {
 	})
 
 	var out, errOut bytes.Buffer
-	if err := Run(context.Background(), "usage", []string{"--transcripts", tdir}, t.TempDir(), t.TempDir(), "0.0.1-dev", false, "", &out, &errOut); err != nil {
+	if err := Run(context.Background(), "usage", []string{"--transcripts", tdir}, t.TempDir(), t.TempDir(), "0.0.1-dev", &out, &errOut); err != nil {
 		t.Fatalf("Run usage err=%v out=%s", err, out.String())
 	}
 	got := out.String()
@@ -83,7 +83,7 @@ func TestRunUsage_HooksOnWhenCCSeeded(t *testing.T) {
 	})
 
 	var out, errOut bytes.Buffer
-	if err := Run(context.Background(), "usage", []string{"--transcripts", tdir}, storeRoot, projectRoot, "0.0.1-dev", false, "", &out, &errOut); err != nil {
+	if err := Run(context.Background(), "usage", []string{"--transcripts", tdir}, storeRoot, projectRoot, "0.0.1-dev", &out, &errOut); err != nil {
 		t.Fatalf("Run usage err=%v out=%s", err, out.String())
 	}
 	got := out.String()
@@ -107,7 +107,7 @@ func TestRunUsage_HooksOffWhenNoSession(t *testing.T) {
 	})
 
 	var out, errOut bytes.Buffer
-	if err := Run(context.Background(), "usage", []string{"--transcripts", tdir}, t.TempDir(), t.TempDir(), "0.0.1-dev", false, "", &out, &errOut); err != nil {
+	if err := Run(context.Background(), "usage", []string{"--transcripts", tdir}, t.TempDir(), t.TempDir(), "0.0.1-dev", &out, &errOut); err != nil {
 		t.Fatalf("Run usage err=%v out=%s", err, out.String())
 	}
 	got := out.String()
@@ -133,7 +133,7 @@ func TestRunUsage_CorruptLineSkipped(t *testing.T) {
 	})
 
 	var out, errOut bytes.Buffer
-	if err := Run(context.Background(), "usage", []string{"--transcripts", tdir}, t.TempDir(), t.TempDir(), "0.0.1-dev", false, "", &out, &errOut); err != nil {
+	if err := Run(context.Background(), "usage", []string{"--transcripts", tdir}, t.TempDir(), t.TempDir(), "0.0.1-dev", &out, &errOut); err != nil {
 		t.Fatalf("corrupt line must not abort: err=%v out=%s", err, out.String())
 	}
 	got := out.String()
@@ -149,7 +149,7 @@ func TestRunUsage_CorruptLineSkipped(t *testing.T) {
 func TestRunUsage_MissingDirError(t *testing.T) {
 	missing := filepath.Join(t.TempDir(), "no-such-transcripts-dir")
 	var out, errOut bytes.Buffer
-	err := Run(context.Background(), "usage", []string{"--transcripts", missing}, t.TempDir(), t.TempDir(), "0.0.1-dev", false, "", &out, &errOut)
+	err := Run(context.Background(), "usage", []string{"--transcripts", missing}, t.TempDir(), t.TempDir(), "0.0.1-dev", &out, &errOut)
 	if err == nil {
 		t.Fatal("want error for missing transcripts dir, got nil")
 	}
@@ -212,7 +212,7 @@ func runUsageString(t *testing.T, storeRoot, projectRoot, tdir string, extra ...
 	t.Helper()
 	args := append([]string{"--transcripts", tdir}, extra...)
 	var out, errOut bytes.Buffer
-	if err := Run(context.Background(), "usage", args, storeRoot, projectRoot, "0.0.1-dev", false, "", &out, &errOut); err != nil {
+	if err := Run(context.Background(), "usage", args, storeRoot, projectRoot, "0.0.1-dev", &out, &errOut); err != nil {
 		t.Fatalf("Run usage err=%v out=%s", err, out.String())
 	}
 	return out.String()

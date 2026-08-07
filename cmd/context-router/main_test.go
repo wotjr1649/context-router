@@ -737,73 +737,39 @@ func TestMainDispatch_Hook_AbsorbsPreprocError(t *testing.T) {
 	})
 }
 
-// TestMainDispatch_HookInstall_ExplicitStoreRoot: 브리프 ⑧ — main dispatch가 `--store-root`
-// 명시 여부(storeRootExplicit)와 원시값(storeRootRaw)을 cli.Run에 전달해, 명시된 경우에만 훅
-// 명령 args에 `--store-root <원시값>`이 주입되는지 실경로로 확인한다. prescanRootFlags가
-// 토큰을 소비하므로 이 전달이 없으면 cli.Run은 명시/기본을 구분할 수 없다(리뷰 반영).
-func TestMainDispatch_HookInstall_ExplicitStoreRoot(t *testing.T) {
-	readCommand := func(t *testing.T, proj string) string {
-		t.Helper()
-		data, err := os.ReadFile(filepath.Join(proj, ".claude", "settings.json"))
-		if err != nil {
-			t.Fatalf("read settings: %v", err)
-		}
-		var s struct {
-			Hooks map[string][]struct {
-				Hooks []struct {
-					Command string `json:"command"`
-				} `json:"hooks"`
-			} `json:"hooks"`
-		}
-		if err := json.Unmarshal(data, &s); err != nil {
-			t.Fatalf("parse: %v\n%s", err, data)
-		}
-		g := s.Hooks["SessionStart"]
-		if len(g) == 0 || len(g[0].Hooks) == 0 {
-			t.Fatalf("no SessionStart command: %s", data)
-		}
-		return g[0].Hooks[0].Command
-	}
-
-	t.Run("explicit_injects_raw_store_root", func(t *testing.T) {
+// TestMainDispatch_HookInstall_GuidanceOnly: D96·D97 — 실경로(dispatchCLI)에서 `hook install`이
+// 안내를 내고 비-0으로 끝나며 **프로젝트에 아무 파일도 만들지 않는다**. 옛 플래그(--store-root
+// 등)가 붙어도 같다 — 그 값들을 나르던 배선이 지워졌으므로 여기서 갈릴 자리가 없다.
+func TestMainDispatch_HookInstall_GuidanceOnly(t *testing.T) {
+	for _, args := range [][]string{
+		nil,
+		{"--store-root", filepath.Join(t.TempDir(), "storeroot")},
+		{"--codex", "--user"},
+	} {
 		proj := t.TempDir()
-		storeRoot := filepath.Join(t.TempDir(), "storeroot")
+		argv := append([]string{"context-router", "hook", "install", "--root", proj}, args...)
 		var handled bool
 		var derr error
-		captureStdout(t, func() {
-			handled, derr = dispatchCLI(context.Background(), []string{
-				"context-router", "hook", "install", "--root", proj, "--store-root", storeRoot,
-			})
+		out := captureStdout(t, func() {
+			handled, derr = dispatchCLI(context.Background(), argv)
 		})
 		if !handled {
-			t.Fatal("want handled=true")
+			t.Fatalf("args=%v want handled=true", args)
 		}
-		if derr != nil {
-			t.Fatalf("hook install dispatch err=%v", derr)
+		if derr == nil {
+			t.Fatalf("args=%v: hook install이 비-0으로 끝나지 않았다", args)
 		}
-		cmd := readCommand(t, proj)
-		if !strings.Contains(cmd, "--store-root") || !strings.Contains(cmd, storeRoot) {
-			t.Fatalf("cmd=%q must inject explicit --store-root %q", cmd, storeRoot)
+		if !strings.Contains(out, "옛 등록물을 먼저 지운다") {
+			t.Errorf("args=%v: 0번 걸음 안내가 없다:\n%s", args, out)
 		}
-	})
-
-	t.Run("default_omits_store_root", func(t *testing.T) {
-		proj := t.TempDir()
-		var handled bool
-		var derr error
-		captureStdout(t, func() {
-			handled, derr = dispatchCLI(context.Background(), []string{
-				"context-router", "hook", "install", "--root", proj,
-			})
-		})
-		if !handled || derr != nil {
-			t.Fatalf("handled=%v err=%v", handled, derr)
+		entries, err := os.ReadDir(proj)
+		if err != nil {
+			t.Fatalf("readdir: %v", err)
 		}
-		cmd := readCommand(t, proj)
-		if strings.Contains(cmd, "--store-root") {
-			t.Fatalf("cmd=%q must not inject store-root when not explicitly given", cmd)
+		if len(entries) != 0 {
+			t.Errorf("args=%v: hook install이 프로젝트에 파일을 만들었다: %v", args, entries)
 		}
-	})
+	}
 }
 
 // TestMainDispatch_Stats_Provider: 실제 dispatchCLI 경로로 `stats --provider <jsonl>`이

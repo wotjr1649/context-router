@@ -64,10 +64,12 @@ func contentFileWarnBytes(getenv func(string) string) int64 {
 // session·hook·usage·codex-hook·version) 중 하나임을 이미 확인했다. args는 doctor·upgrade에서 미사용, stats가 --provider
 // 고유 플래그 파싱에 쓴다(전용 flag.NewFlagSet, 설계 §7 — main의 serverFlags와 별개). stderr는
 // session export의 worktree 후보 목록·진단 안내 전용(태스크9, §7 stdout purity 게이트 선례 —
-// 그 외 서브커맨드는 여전히 미사용). storeRootExplicit/storeRootRaw는 hook install이 --store-root를
-// 명시된 경우에만 훅 명령 args에 주입하기 위한 것이다(prescanRootFlags가 토큰을 소비해 cli는
-// 명시/기본을 구분할 수 없으므로 main이 전달, 설계 §7).
-func Run(ctx context.Context, sub string, args []string, storeRoot, projectRoot, version string, storeRootExplicit bool, storeRootRaw string, stdout, stderr io.Writer) error {
+// 그 외 서브커맨드는 여전히 미사용).
+//
+// storeRootExplicit/storeRootRaw 두 매개변수는 v0.19에서 사라졌다 — 그 값을 읽던 유일한
+// 소비처가 `hook install`이 훅 명령에 --store-root를 주입하는 자리였고, 등록이 플러그인
+// 매니페스트로 옮겨가면서 함께 사라졌다(D96).
+func Run(ctx context.Context, sub string, args []string, storeRoot, projectRoot, version string, stdout, stderr io.Writer) error {
 	switch sub {
 	case "version":
 		// D56 — ProductVersion 1줄(CI 태그 검증·사용자 확인용 추출 표면). 부가 정보 없음 —
@@ -112,9 +114,9 @@ func Run(ctx context.Context, sub string, args []string, storeRoot, projectRoot,
 	case "session":
 		return runSession(ctx, stdout, stderr, args, storeRoot)
 	case "hook":
-		// install/uninstall + 러닝 훅(무인자/--no-shadow) 디스패치는 runHook이 소유한다(설계 §7,
-		// hook_install.go). 러닝 훅은 항상 exit 0(fail-open §2.3).
-		return runHook(ctx, args, storeRoot, storeRootRaw, storeRootExplicit, projectRoot, version, stdout)
+		// install 안내 + uninstall + 러닝 훅(무인자/--no-shadow) 디스패치는 runHook이
+		// 소유한다(설계 §7, hook_install.go). 러닝 훅은 항상 exit 0(fail-open §2.3).
+		return runHook(ctx, args, storeRoot, projectRoot, version, stdout)
 	case "codex-hook":
 		// Codex 러닝 훅(설계 v0.4 §2 D35) — 항상 exit 0(fail-open §2.3). 전용 서브커맨드 =
 		// 구버전 바이너리 오귀속 차단 게이트(§11.2 F3).
@@ -563,7 +565,7 @@ func runUsageAdoption(ctx context.Context, w io.Writer, storeRoot, projectRoot s
 	}
 	sessDir := filepath.Join(storeRoot, "projects", canon.ProjectID, "worktrees", canon.WorktreeID)
 	if fi, statErr := os.Stat(filepath.Join(sessDir, "session.db")); statErr != nil || fi.IsDir() {
-		fmt.Fprintln(w, "# 세션 이벤트가 아직 없습니다(훅 미설치 또는 첫 세션 전) — hook install 후 다시 실행하세요")
+		fmt.Fprintln(w, "# 세션 이벤트가 아직 없습니다(훅 미등록 또는 첫 세션 전) — 플러그인 설치 뒤 세션을 한 번 돌리고 다시 실행하세요")
 		return nil
 	}
 	db, err := openSessionDBReadOnly(storeRoot, projectRoot) // loadCCSessions의 열기 관례 재사용
@@ -1429,9 +1431,10 @@ func countShadowIndexes(ctx context.Context, db *sql.DB) int {
 // 갖는다(D101 계약 2, v0.19 리뷰 C1 — plugin/mcp.json이 프로필을 고정하면 CTR_ENABLE이 모든
 // 플러그인 설치에서 죽은 경로가 된다). 도구 접두는 mcp__plugin_context-router_ctr__다(D98) —
 // alwaysLoad는 서버 단위 플래그가 폐기돼(D99) 안내하지 않는다.
-const hostSnippet = `--- host adapter snippets (설계 §9) ---
-
-## 설치 절차 (D96·D97 — 등록은 호스트가 하고, 우리는 어떤 설정 파일에도 쓰지 않는다)
+// hostInstallSteps — 설치 절차 본문. **`hook install` 안내와 이 스니펫이 공유하는 단일
+// 원본이다**(Task 5) — 같은 절차를 두 자리에 따로 적으면 한쪽만 고쳐지고, 그 어긋남이 이
+// 릴리스가 닫는 형태다. 0번 걸음이 옛 등록물 제거인 것은 A⑧ 실측이 근거다.
+const hostInstallSteps = `## 설치 절차 (D96·D97 — 등록은 호스트가 하고, 우리는 어떤 설정 파일에도 쓰지 않는다)
 
 0. 옛 등록물을 먼저 지운다: claude mcp remove <이름> · codex mcp remove <이름>.
    [실측] 호스트는 command·args가 이미 등록된 서버와 같은 플러그인 서버를 경고 없이 버린다 —
@@ -1446,7 +1449,11 @@ const hostSnippet = `--- host adapter snippets (설계 §9) ---
 3. 확인 — 호스트마다 mcp list의 표시 형태가 다르다 [실측]:
    Claude Code: plugin:context-router:ctr … Connected 항목이 나열되는가.
    Codex: ctr … enabled 항목이 나열되는가.
+`
 
+const hostSnippet = `--- host adapter snippets (설계 §9) ---
+
+` + hostInstallSteps + `
 ## 프로필
 
 기본값은 서버가 갖는다 — --enable도 CTR_ENABLE도 지정하지 않으면 ingest,net으로 켜진다
@@ -1684,12 +1691,14 @@ func runDoctor(ctx context.Context, w io.Writer, storeRoot, projectRoot, version
 
 	// [9]-[13] 훅/사이드카 진단(설계 §7·§9 확장). 전부 정보성 — 미설치·미해석·drops 존재는
 	// 정상 상태라 실패로 세지 않는다(진단 본문에는 절대경로 허용, §12 canary는 반환 오류 전용).
-	// [9] 훅 등록 상태 — 프로젝트 + 사용자(~/.claude) 범위 양쪽 검사(F5: `hook install --user`
-	// 등록을 프로젝트-only 검사가 놓쳐 "미등록" 오보하던 문제). 두 경로 모두 install/uninstall과
-	// 동일한 hookSettingsPath 이음새로 도출한다(사용자 홈 = os.UserHomeDir).
-	// 마커 버전(install이 기입한 __ctrManaged 버전)을 바이너리 version과 대조해 불일치 시
-	// 재설치를 안내한다(설계 v0.3 §5·D33a — 훅 계약이 바뀐 구버전 마커가 남아 있으면 러닝 훅이
-	// 신 계약과 어긋난다).
+	// [9] 훅 등록 상태 — 프로젝트 + 사용자(~/.claude) 범위 양쪽 검사(F5: 사용자 스코프 등록을
+	// 프로젝트-only 검사가 놓쳐 "미등록" 오보하던 문제). 두 경로 모두 uninstall과 동일한
+	// hookSettingsPath 이음새로 도출한다(사용자 홈 = os.UserHomeDir).
+	//
+	// 이 줄이 세는 것은 **`.claude/settings.json`에 있는 우리 훅 그룹**이다. v0.19부터 훅 정의는
+	// 플러그인 매니페스트가 나르므로(D96) 여기 잡히는 그룹은 옛 설치기가 남긴 것이고, 그 그룹은
+	// 지워질 때까지 계속 발화한다 — 개수가 0이 아닌 것 자체는 정상 상태다. 버전 있는 마커는 D82
+	// 이전 설치본이라 다음 걸음을 함께 낸다(무버전 마커는 아래 marker=="" 갈래).
 	hookScope := func(path string, pathErr error) string {
 		if pathErr != nil {
 			return "확인불가"
@@ -1705,14 +1714,14 @@ func runDoctor(ctx context.Context, w io.Writer, storeRoot, projectRoot, version
 			// 등록물 검사가 맡는다(여기서 비교하면 상시 불일치 경고가 된다).
 			return fmt.Sprintf("등록됨(%d개)", n)
 		case marker != version:
-			return fmt.Sprintf("등록됨(%d개, marker %s≠%s — hook install 재실행)", n, marker, version)
+			return fmt.Sprintf("등록됨(%d개, marker %s≠%s — hook uninstall로 옛 그룹을 지우고 플러그인 설치로 옮기세요)", n, marker, version)
 		default:
 			return fmt.Sprintf("등록됨(%d개, marker %s)", n, marker)
 		}
 	}
 	projPath, _ := hookSettingsPath(false, projectRoot) // 프로젝트 경로는 오류를 내지 않는다
 	userPath, userPathErr := hookSettingsPath(true, projectRoot)
-	fmt.Fprintf(w, "[9] hooks: project=%s user=%s (context-router hook install)\n",
+	fmt.Fprintf(w, "[9] hooks: project=%s user=%s (.claude/settings.json의 우리 훅 그룹)\n",
 		hookScope(projPath, nil), hookScope(userPath, userPathErr))
 
 	if p, lookErr := exec.LookPath(hookBinaryName); lookErr != nil {
@@ -1874,13 +1883,9 @@ func runDoctor(ctx context.Context, w io.Writer, storeRoot, projectRoot, version
 			ownedBytes, ownedHashes, ccB, cxB, sharedB, unattrB, suffix)
 	}
 
-	// [16] codex 등록 상태 — 훅(D35 PreToolUse) 스코프는 그대로 보고한다(Codex 등록물 진단과는
-	// 무관한 별개 기제, codex_toml.go 비의존). 손편집 MCP 등록물 잔존은 Task 3의 순수 스캐너
-	// (codexServerHeaders, codex_scan.go)로 갈아 끼운다(D97 계약 2) — codex_toml.go의 판정·
-	// 마커·드리프트·verdict 경로(codexRegistrationVerdict 등)에는 더는 의존하지 않는다. 그
-	// 경로 자체는 codex_toml_test.go·hook_install_test.go가 여전히 쓰므로 남기지만(아래
-	// codexVerdict 주석 참고), doctor는 더 이상 부르지 않는다 — Task 5가 codex_toml.go를
-	// 통째로 지울 때 이 파일은 손댈 필요가 없다.
+	// [16] codex 등록 상태 — 훅 스코프(D35)는 그대로 보고한다(Codex 등록물 진단과는 무관한
+	// 별개 기제). 등록물 잔존은 순수 스캐너(codexServerHeaders, codex_scan.go)가 찾는다(D97
+	// 계약 2). 옛 판정·마커·드리프트·verdict 경로(codex_toml.go)는 기입 경로와 함께 지워졌다.
 	codexHooksScope := func(path string, pathErr error) (string, bool) { // (표시, 등록 존재)
 		if pathErr != nil {
 			return "확인불가", false
@@ -1894,7 +1899,7 @@ func runDoctor(ctx context.Context, w io.Writer, storeRoot, projectRoot, version
 		case marker == "":
 			return fmt.Sprintf("등록됨(%d개)", n), true
 		case marker != version:
-			return fmt.Sprintf("등록됨(%d개, marker %s≠%s — hook install --codex 재실행)", n, marker, version), true
+			return fmt.Sprintf("등록됨(%d개, marker %s≠%s — hook uninstall --codex로 옛 그룹을 지우고 플러그인 설치로 옮기세요)", n, marker, version), true
 		default:
 			return fmt.Sprintf("등록됨(%d개, marker %s)", n, marker), true
 		}
@@ -1925,7 +1930,7 @@ func runDoctor(ctx context.Context, w io.Writer, storeRoot, projectRoot, version
 	// 직접 확인한다.
 	//
 	// 다음 걸음은 파일이 TOML로 파스되는지에 따라 갈린다(재검토 리뷰 6). codexTOMLParses는
-	// codex_toml_valid.go 소유이며 codex_toml.go가 아니다(D97 계약 2가 금하는 판정·마커·
+	// codex_toml_valid.go 소유다(D97 계약 2가 금하는 판정·마커·
 	// 드리프트 경로 밖) — 이 패키지에서 실제 TOML 파서를 부르는 유일한 자리이고 값을 읽지
 	// 않고 파스 성패만 본다(D80 "파서 비의존"은 판정·기입 이관을 금하지 검증 전용 사용까지
 	// 막지 않는다). 파스되면 codex mcp list·codex mcp remove가 그 파일에 닿으므로 그 경로를
@@ -2026,11 +2031,11 @@ func runDoctor(ctx context.Context, w io.Writer, storeRoot, projectRoot, version
 	}
 
 	// [20]의 두 번째 절 — enabledMcpjsonServers 잔존(소유자 판정 추가 항목, D97 인접). 다음
-	// 태스크가 이 키를 정리하던 우리 쓰기 코드를 지운다(D96 계약 1 — 쓰지 않는다). 호스트
+	// 이 키를 정리하던 우리 쓰기 코드는 v0.19에서 지워졌다(D96 계약 1 — 쓰지 않는다). 호스트
 	// CLI(claude mcp remove)는 이 키를 건드리지 않으므로, 옛 등록물만 지운 사용자는 더는
 	// 존재하지 않는 이름을 승인 목록에 남긴 채로 남는다. 세 스코프(local·project·user) 모두
 	// 확인한다(리뷰 I5) — 이 키는 스코프 간 병합되지 않고 각 스코프의 최상위 정의가 그 스코프
-	// 안에서 유효하므로(enabledServersScope의 관례, mcp_install.go), 한 스코프만 보면 다른
+	// 안에서 유효하므로, 한 스코프만 보면 다른
 	// 스코프의 잔존을 놓친다. 이름은 위에서 이미 구한 retiredServerNames를 그대로 쓴다.
 	localSettingsPath := filepath.Join(projectRoot, ".claude", "settings.local.json")
 	userSettingsPath, userSettingsErr := hookSettingsPath(true, projectRoot)
@@ -2066,82 +2071,6 @@ func runDoctor(ctx context.Context, w io.Writer, storeRoot, projectRoot, version
 		return fmt.Errorf("doctor: 진단 실패 항목 %d개", len(failed))
 	}
 	return nil
-}
-
-// codexVerdict — config.toml 등록물의 판정(D85). 원래는 doctor의 감지([20])와 고침(--fix)이
-// 이 한 값을 공유했다. D97 계약 2로 doctor는 이 경로를 더는 부르지 않지만(Task 4), 함수 자체는
-// codex_toml_test.go·hook_install_test.go가 installCodexConfigBlock의 판정을 편하게 확인하는
-// 테스트 유틸로 계속 쓰므로 남긴다.
-type codexVerdict struct {
-	State      codexMCPState
-	Anomaly    codexAnomaly
-	TableFound bool
-	Changed    bool
-	Marker     string
-	Command    string
-	// Out — 기입할 산출 바이트. 기입 갈래가 이 값을 쓰므로 **요청 조립 지점이 한 곳으로
-	// 묶인다** — 기입 쪽에서 요청을 다시 조립하면 그 두 조립이 갈릴 수 있고, 그것이 이
-	// 릴리스가 닫는 어긋남과 같은 형태다. 진단 경로는 이 필드를 쓰지 않고 무시한다.
-	Out []byte
-	// InputParses — 입력 config.toml이 TOML로 파스되는가(D89 부수 결정 ②). 라벨 전용이며 권고를
-	// 가르지 않는다 — shouldFix()가 보지 않는 것이 그 계약이다.
-	InputParses bool
-	// D91 진단 필드 넷 — codexInstallResult와 **같은 이름·같은 타입**으로 나른다. [20]은
-	// codexVerdict만 읽으므로 두 구조체를 모두 지나야 그 절에 값이 닿는다.
-	Tools        []string
-	ToolsPresent bool
-	WantTools    []string
-	ArgsReadable bool
-}
-
-// codexRegistrationVerdict — 감지와 고침이 공유하는 판정(D85). **요청 조립이 이 함수 안에만
-// 있다** — "같은 인자로 부른다"를 호출자의 규율로 두면 다음 변경에서 한쪽이 빠지고, 그러면
-// 요청 필드 축으로 감지와 고침이 다시 갈린다(D86의 MarkerOnly가 그 축이다).
-// 이 함수는 그 자체로 판정하지 않는다 — **권고에 쓰이는 State·TableFound·Changed·Out은
-// installCodexConfigBlock 하나에서 오고**, 라벨 전용 Marker·Command는 같은 바이트를 다시 읽는
-// 순수 판독기(codexConfigMarker)에서 온다. 라벨 전용 Anomaly는 결과가 실은 사유를 **우선**하고
-// 그것이 없을 때만 probeCodexMCPBlock을 읽는다(D89) — install만 아는 이탈은 probe가 알지 못하고
-// 구간 밖 충돌은 반대로 probe에만 사유가 있어, 한쪽만 읽으면 사유 하나가 판정값에서 사라진다.
-// 셋 모두 같은
-// 바이트에서 codexManagedSpans를 다시 도출하므로 값은 일치한다. installCodexConfigBlock이
-// 순수 변환(파일 IO 없음)이라는 것이 읽기 전용 경로에서 부를 수 있는 근거이며, 스펙 §1.3
-// 게이트 1이 그것을 확인한다.
-func codexRegistrationVerdict(data []byte, version string) codexVerdict {
-	res := installCodexConfigBlock(data, codexInstallRequest{
-		Marker: hookMarker(version), MarkerOnly: true,
-	})
-	anomaly := res.Anomaly
-	if anomaly == anomalyNone {
-		_, anomaly = probeCodexMCPBlock(data)
-	}
-	marker, command, _ := codexConfigMarker(data)
-	return codexVerdict{
-		State: res.State, Anomaly: anomaly, TableFound: res.TableFound,
-		Changed: res.Changed, Marker: marker, Command: command, Out: res.Out,
-		InputParses: res.InputParses,
-		Tools:       res.Tools, ToolsPresent: res.ToolsPresent,
-		WantTools: res.WantTools, ArgsReadable: res.ArgsReadable,
-	}
-}
-
-// shouldFix — config.toml의 관리 테이블이 install 재실행으로 실제 기입될 조건 전체(D85, 옛
-// doctor --fix와 동일 조건이었다 — 그 플래그는 D97로 지워졌다, Task 4). 셋의 논리곱이며
-// Changed 하나로 줄이면 "파일은 있고 관리 테이블만 없는" 상태에서 install이 append 경로로
-// Changed=true를 내는데 이 조건은 등록을 만드는 것을 권하지 않으므로 오권고가 된다.
-// 새 상태 mcpOutputInvalid는 이 술어의 첫 항에서 거짓이 되어 권고가 서지 않는다(D89).
-func (v codexVerdict) shouldFix() bool {
-	return v.State == mcpWritten && v.TableFound && v.Changed
-}
-
-// toolsCover — have가 want를 전부 담는가(D91). 순서·중복은 보지 않는다 — 사용자가 넓힌
-// 목록은 상위집합이므로 통과해야 한다.
-func toolsCover(have, want []string) bool {
-	for _, w := range want {
-		if !slices.Contains(have, w) {
-			return false
-		}
-	}
-	return true
 }
 
 // formatBuildLine — doctor [17] build 라인 순수 포매터(D56 — 테스트 주입점, 검수 반영). bi가

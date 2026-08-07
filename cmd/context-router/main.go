@@ -130,10 +130,8 @@ func parseFlags(args []string) (serverFlags, error) {
 	return f, nil
 }
 
-// enableProfileNames — --enable·CTR_ENABLE이 받는 프로필 이름 집합(D101). internal/cli도 같은
-// 이름 셋을 mcpProfileNames로 독립적으로 든다(hook install 전용) — Task5가 그 기입 경로를
-// 통째로 지울 예정이라 여기서 import하거나 공유하지 않는다(의도적 비공유, D13 반파편화
-// 예외 대상 아님).
+// enableProfileNames — --enable·CTR_ENABLE이 받는 프로필 이름 집합(D101). internal/cli가 들던
+// 같은 이름 셋(mcpProfileNames)은 기입 경로와 함께 지워졌으므로 이제 이 목록이 유일한 자리다.
 var enableProfileNames = []string{"ingest", "net", "exec"}
 
 // defaultEnableProfile — --enable도 CTR_ENABLE도 없을 때 서버가 갖는 기본값(D101 계약 2,
@@ -788,7 +786,7 @@ func dispatchCLI(ctx context.Context, args []string) (handled bool, err error) {
 	// 출력해야 한다. cli.Run "version" 케이스는 storeRoot/projDir을 쓰지 않으므로(내부: len(args)
 	// 검증 + version 1줄 출력뿐) 빈 값을 넘겨 출력·잉여 인자 검증을 단일 소스로 재사용한다.
 	if sub == "version" {
-		return true, cli.Run(ctx, sub, args[2:], "", "", version, false, "", os.Stdout, os.Stderr)
+		return true, cli.Run(ctx, sub, args[2:], "", "", version, os.Stdout, os.Stderr)
 	}
 	subArgs := args[2:]
 
@@ -812,11 +810,10 @@ func dispatchCLI(ctx context.Context, args []string) (handled bool, err error) {
 	if err != nil {
 		return true, absorbHookPreprocErr(sub, rest, err)
 	}
-	// storeRootExplicit: prescanRootFlags가 --store-root 토큰을 소비하므로 cli는 명시/기본을
-	// 구분할 수 없다 — 여기서 판별해(원시값 비어있지 않음) 넘긴다. hook install이 명시된 경우에만
-	// 훅 명령 args에 --store-root <원시값>을 주입한다(설계 §7).
-	storeRootExplicit := storeRootRaw != ""
-	return true, cli.Run(ctx, sub, rest, storeRoot, root, version, storeRootExplicit, storeRootRaw, os.Stdout, os.Stderr)
+	// storeRootRaw는 여기서 끝난다 — 명시 여부와 원시값을 cli까지 나르던 이유가 `hook install`의
+	// 훅 명령 --store-root 주입 하나였고, 그 등록 경로가 v0.19에서 사라졌다(D96). 정규화된
+	// storeRoot만 넘긴다.
+	return true, cli.Run(ctx, sub, rest, storeRoot, root, version, os.Stdout, os.Stderr)
 }
 
 func main() {

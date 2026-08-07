@@ -9,7 +9,23 @@
 // 유효 입력에서 사용자 파일을 다섯 번 파괴한 원인이었다([문서] — D97 근거).
 package cli
 
-import "strings"
+import (
+	"bytes"
+	"strings"
+)
+
+// trimBOM — 선두 UTF-8 BOM 세 바이트를 뗀다. **읽기 전용 판정 경로 전용이다** — 되쓰기
+// 바이트를 만드는 자리에서 부르면 우리가 사용자 파일의 인코딩을 조용히 바꾼다.
+//
+// Windows 편집기(PowerShell 5.1의 `Out-File -Encoding utf8`, 구버전 메모장)가 파일 첫 줄에
+// 붙이는 바이트인데 U+FEFF는 Go의 `strings.Fields`가 보는 공백이 아니라 정규화가 그대로
+// 통과시킨다 `[실측]`. 떼지 않으면 파일 첫 줄이 테이블 헤더일 때 그 헤더가 인식되지 않는다.
+// Codex 자신은 BOM이 붙은 config.toml을 정상으로 읽으므로 `[실측]` 갈리는 것은 우리 판정뿐이고,
+// 그래서 doctor가 멀쩡한 파일에 오보를 내지 않으려면 판정 전에 떼야 한다.
+//
+// 이 자리에 사는 이유: 소비처 둘(codexServerHeaders·codexTOMLParses)이 모두 읽기 전용
+// 스캐너이고, 원 소유자였던 codex_toml.go는 기입 경로와 함께 지워졌다(D97 계약 1).
+func trimBOM(b []byte) []byte { return bytes.TrimPrefix(b, []byte("\xEF\xBB\xBF")) }
 
 // codexHeaderHit — 감지된 [mcp_servers.<이름>] 테이블 헤더 한 줄. Line은 1-기반이다 — 사용자가
 // 에디터에서 그대로 찾아갈 줄 번호이지 배열 인덱스가 아니다.
