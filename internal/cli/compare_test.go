@@ -138,12 +138,12 @@ func TestCompare_CLIWiring(t *testing.T) {
 	}
 	// --totals와 상호 배타(§3).
 	var buf, errOut bytes.Buffer
-	err := Run(context.Background(), "usage", []string{"--transcripts", tdir, "--compare", "--totals"}, storeRoot, projectRoot, "0.0.1-dev", false, "", &buf, &errOut)
+	err := Run(context.Background(), "usage", []string{"--transcripts", tdir, "--compare", "--totals"}, storeRoot, projectRoot, "0.0.1-dev", &buf, &errOut)
 	if err == nil || !strings.Contains(err.Error(), "--compare") {
 		t.Fatalf("배타 검사 미동작: %v", err)
 	}
 	// --min-records·--rollouts는 --compare 전용.
-	err = Run(context.Background(), "usage", []string{"--transcripts", tdir, "--min-records", "2"}, storeRoot, projectRoot, "0.0.1-dev", false, "", &buf, &errOut)
+	err = Run(context.Background(), "usage", []string{"--transcripts", tdir, "--min-records", "2"}, storeRoot, projectRoot, "0.0.1-dev", &buf, &errOut)
 	if err == nil {
 		t.Fatal("--compare 없는 --min-records가 통과")
 	}

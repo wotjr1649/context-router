@@ -47,7 +47,7 @@ func parseFlags(args []string) (serverFlags, error) {
 	fs.StringVar(&f.Root, "root", "", "project root (default: cwd)")
 	fs.StringVar(&f.StoreRoot, "store-root", "", "store root override")
 	fs.StringVar(&profile, "profile", "search,fetch,transform", "tool profile")
-	fs.StringVar(&enable, "enable", "", "opt-in profiles: ingest,net,exec")
+	fs.StringVar(&enable, "enable", "", "opt-in profiles: ingest,net,exec; none = zero profiles")
 	fs.StringVar(&f.LogLevel, "log-level", "info", "log level")
 	fs.Func("allow-path", "extra ingest root (repeatable)", func(v string) error {
 		f.AllowPaths = append(f.AllowPaths, v)
@@ -71,9 +71,51 @@ func parseFlags(args []string) (serverFlags, error) {
 		return serverFlags{}, fmt.Errorf("ctr: 위치 인자는 허용되지 않습니다 (받은 개수: %d)", n)
 	}
 	f.Profile = strings.Split(profile, ",")
-	if enable != "" {
-		f.Enable = strings.Split(enable, ",")
+	// D101 계약 1: --enable이 빈 문자열일 때만(미지정·"--enable="로 명시한 빈 값 둘 다 — flag
+	// 패키지에는 그 둘을 구분할 수단이 없다) CTR_ENABLE을 대신 읽는다. 플래그가 주어지면
+	// 플래그가 이긴다. storeRootFor의 CTR_STORE_ROOT 관례(직접 os.Getenv, 테스트는 t.Setenv)를
+	// 그대로 따른다 — 이 패키지에 이미 있는 관례라 별도 getenv 파라미터를 두지 않는다.
+	// D101 계약 2(설계 v0.19): "기본값은 서버가 갖는다. 환경 변수가 없으면 현행 기본 프로필로
+	// 돈다 — Codex 사용자가 아무것도 안 해도 동작해야 한다." 플러그인의 plugin/mcp.json은
+	// args를 고정하지 않으므로(옛 --enable ingest,net 고정이 CTR_ENABLE을 영구히 이겨 그 환경
+	// 변수를 무의미하게 만들었다 — v0.19 리뷰 C1) 서버 자신이 이 기본값을 갖는다. 둘 다 없을
+	// 때만 적용되고, --enable·CTR_ENABLE 어느 쪽이든 있으면 그 값이 그대로 이긴다(우선순위
+	// 불변). 이 변경으로 인자 없는 맨 context-router 실행이 이제 ctr_index·ctr_fetch_and_index를
+	// 등록한다 — 이전에는 --enable/CTR_ENABLE 없이는 둘 다 꺼져 있었다. net은 아웃바운드 HTTP를
+	// 여는 프로필이라 이것은 문서화되지 않은 맨 실행의 자세(posture) 변화다 — 이미 문서화된 설치
+	// 절차는 전부 ingest,net을 명시로 전달하므로 그 경로는 영향이 없다(v0.19 리뷰 C1, 소유자
+	// 결정).
+	// 재검토 리뷰 2: 공백뿐이거나 쉼표뿐인 값(예: CTR_ENABLE="   "나 ",")은 원본 문자열이
+	// 비어 있지 않아 위 "빈 문자열일 때만" 이관·기본값 대체 둘 다 건너뛰지만, parseEnableList가
+	// 그런 값을 오류 없이 빈 슬라이스로 돌려주므로(항목별 트림 뒤 전부 공백이라 스킵) 결과가
+	// 조용히 "프로필 0개"가 된다 — parseEnableList 자신의 doc 주석이 막으려는 바로 그 조용한
+	// 오설정이다. 그래서 각 단계를 "원본이 비었는가"가 아니라 "파싱 결과가 비었는가"로 넘긴다:
+	// 플래그가 쓸모없으면(빈 값이든 공백/쉼표뿐이든) 환경 변수로, 환경 변수도 쓸모없으면
+	// 기본값으로. 오류(모르는 이름)는 그 자리에서 바로 반환하고 다음 단계로 넘기지 않는다 —
+	// 오탈자를 조용히 삼키면 안 된다는 것은 기존 계약 그대로다.
+	// 릴리스 리뷰 F2: 그 "파싱 결과가 비었는가" 판정은 프로필 0개를 요청할 자리를 남기지
+	// 않았다 — `--enable=`도 `CTR_ENABLE=""`도 "이 단계는 아무것도 안 줬다"로 읽혀 기본값
+	// ingest,net으로 떨어졌고, 아웃바운드 HTTP를 여는 net이 명시 지시와 반대 방향으로 켜진 채
+	// 그 사실을 알리는 곳도 없었다. 그래서 각 단계의 반환을 (목록, 값을 주었는가) 둘로 나눠
+	// "0개 요청"과 "무입력"이 서로 다른 모양이 되게 하고, 0개는 이름 none으로만 표현한다.
+	// 판정을 빈 문자열 유무로 되돌리는 방향(fs.Visit·os.LookupEnv)은 두지 않는다: 미설정 변수를
+	// 빈 값으로 펼치는 셸이 opt-in 전부를 조용히 끄게 되고, 우발적 빈 값이 의도적 빈 값보다
+	// 훨씬 흔하다. 이름은 우발적으로 도착하지 않는다.
+	enableList, supplied, err := parseEnableList(enable)
+	if err != nil {
+		return serverFlags{}, err
 	}
+	if !supplied {
+		if enableList, supplied, err = parseEnableList(os.Getenv("CTR_ENABLE")); err != nil {
+			return serverFlags{}, err
+		}
+	}
+	if !supplied {
+		if enableList, _, err = parseEnableList(defaultEnableProfile); err != nil {
+			return serverFlags{}, err // 상수라 사실상 도달하지 않는다
+		}
+	}
+	f.Enable = enableList
 	for _, p := range strings.Split(projects, ",") {
 		if p = strings.TrimSpace(p); p != "" {
 			f.Projects = append(f.Projects, p)
@@ -94,6 +136,59 @@ func parseFlags(args []string) (serverFlags, error) {
 	}
 	f.RetentionEvents = d
 	return f, nil
+}
+
+// enableProfileNames — --enable·CTR_ENABLE이 받는 프로필 이름 집합(D101). internal/cli가 들던
+// 같은 이름 셋(mcpProfileNames)은 기입 경로와 함께 지워졌으므로 이제 이 목록이 유일한 자리다.
+var enableProfileNames = []string{"ingest", "net", "exec"}
+
+// enableProfileNone — 빈 집합을 뜻하는 이름(릴리스 리뷰 F2). 값 전체일 때만 유효하다: 다른
+// 이름과 섞이면 두 해석(0개 / 그 이름만)이 다 말이 되므로 오류로 돌린다. 이 이름 하나가
+// v0.19 이전 자세(search/fetch/transform만, 색인 쓰기도 아웃바운드 HTTP도 없음)를 되돌리는
+// 유일한 표현이다.
+const enableProfileNone = "none"
+
+// enableNamesMsg — 두 오류 문면이 나열하는 허용 값 목록. 한 벌만 두어 이름이 늘 때 한쪽만
+// 갱신되는 일을 없앤다(D13 반파편화).
+var enableNamesMsg = strings.Join(enableProfileNames, ",") + "," + enableProfileNone
+
+// defaultEnableProfile — --enable도 CTR_ENABLE도 없을 때 서버가 갖는 기본값(D101 계약 2,
+// v0.19 리뷰 C1). exec는 여전히 opt-in이다 — 이 기본값이 켜는 것은 실행 도구가 아니라
+// 색인·네트워크뿐이다.
+const defaultEnableProfile = "ingest,net"
+
+// parseEnableList — --enable/CTR_ENABLE 공통 문법(쉼표 구분·항목별 공백 트림·빈 항목 무시)을
+// 판다. 모르는 이름은 오류로 거부한다: mcp.NewServer(internal/mcp/mcp.go)는 cfg.Enable에
+// slices.Contains(…, "ingest"/"net"/"exec")로만 반응하므로 그 셋에 없는 이름은 오류도 경고도
+// 없이 그냥 아무 도구도 켜지 않는다 — CTR_ENABLE은 플래그보다 오타가 눈에 덜 띄어 그 침묵이
+// "프로필이 켜졌다"는 오인으로 이어지기 쉽다. 오류 문면에 입력 원문을 담지 않는다(규약 §6
+// 사용자 입력 에코 금지) — 허용 이름만 나열한다.
+// supplied(릴리스 리뷰 F2): 이 단계가 값을 주었는지. 이름 하나라도 남으면 true이고, none
+// 단독도 true다(빈 목록을 명시로 요청한 것이라 다음 단계로 넘어가지 않는다). 빈 문자열·공백
+// 뿐·쉼표뿐은 false라 호출자가 다음 단계로 넘긴다 — 그 갈래는 종전 그대로다.
+func parseEnableList(raw string) (out []string, supplied bool, err error) {
+	sawNone := false
+	for _, name := range strings.Split(raw, ",") {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			continue
+		}
+		if name == enableProfileNone {
+			sawNone = true
+			continue
+		}
+		if !slices.Contains(enableProfileNames, name) {
+			return nil, false, fmt.Errorf("ctr: --enable/CTR_ENABLE에 모르는 프로필 이름이 있습니다(가능: %s)", enableNamesMsg)
+		}
+		out = append(out, name)
+	}
+	if sawNone {
+		if len(out) > 0 {
+			return nil, false, fmt.Errorf("ctr: --enable/CTR_ENABLE의 %s은 값 전체일 때만 유효합니다(가능: %s)", enableProfileNone, enableNamesMsg)
+		}
+		return nil, true, nil // 빈 집합을 명시로 요청 — 다음 단계(환경 변수·기본값)로 넘기지 않는다
+	}
+	return out, len(out) > 0, nil
 }
 
 // parseRetentionEventsFlag — --retention-events 값을 검증한다(설계 §5, D17). 빈 문자열(플래그
@@ -722,7 +817,7 @@ func dispatchCLI(ctx context.Context, args []string) (handled bool, err error) {
 	// 출력해야 한다. cli.Run "version" 케이스는 storeRoot/projDir을 쓰지 않으므로(내부: len(args)
 	// 검증 + version 1줄 출력뿐) 빈 값을 넘겨 출력·잉여 인자 검증을 단일 소스로 재사용한다.
 	if sub == "version" {
-		return true, cli.Run(ctx, sub, args[2:], "", "", version, false, "", os.Stdout, os.Stderr)
+		return true, cli.Run(ctx, sub, args[2:], "", "", version, os.Stdout, os.Stderr)
 	}
 	subArgs := args[2:]
 
@@ -746,11 +841,10 @@ func dispatchCLI(ctx context.Context, args []string) (handled bool, err error) {
 	if err != nil {
 		return true, absorbHookPreprocErr(sub, rest, err)
 	}
-	// storeRootExplicit: prescanRootFlags가 --store-root 토큰을 소비하므로 cli는 명시/기본을
-	// 구분할 수 없다 — 여기서 판별해(원시값 비어있지 않음) 넘긴다. hook install이 명시된 경우에만
-	// 훅 명령 args에 --store-root <원시값>을 주입한다(설계 §7).
-	storeRootExplicit := storeRootRaw != ""
-	return true, cli.Run(ctx, sub, rest, storeRoot, root, version, storeRootExplicit, storeRootRaw, os.Stdout, os.Stderr)
+	// storeRootRaw는 여기서 끝난다 — 명시 여부와 원시값을 cli까지 나르던 이유가 `hook install`의
+	// 훅 명령 --store-root 주입 하나였고, 그 등록 경로가 v0.19에서 사라졌다(D96). 정규화된
+	// storeRoot만 넘긴다.
+	return true, cli.Run(ctx, sub, rest, storeRoot, root, version, os.Stdout, os.Stderr)
 }
 
 func main() {

@@ -16,6 +16,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -29,13 +30,16 @@ import (
 )
 
 func TestParseFlags(t *testing.T) {
+	// CTR_ENABLE(D101)이 이 함수를 환경에 민감하게 만들었다 — 이 테스트가 단정하는 Enable
+	// 필드가 우연한 ambient CTR_ENABLE에 흔들리지 않게 빈 값으로 고정한다.
+	t.Setenv("CTR_ENABLE", "")
 	tests := []struct {
 		name    string
 		args    []string
 		want    serverFlags
 		wantErr bool
 	}{
-		{"defaults", nil, serverFlags{Profile: []string{"search", "fetch", "transform"}, LogLevel: "info"}, false},
+		{"defaults", nil, serverFlags{Profile: []string{"search", "fetch", "transform"}, Enable: []string{"ingest", "net"}, LogLevel: "info"}, false},
 		{"enable", []string{"--enable", "ingest,net"}, serverFlags{Profile: []string{"search", "fetch", "transform"}, Enable: []string{"ingest", "net"}, LogLevel: "info"}, false},
 		{"unknown", []string{"--bogus"}, serverFlags{}, true},
 	}
@@ -63,6 +67,182 @@ func TestParseFlags(t *testing.T) {
 func TestParseFlags_RejectsPositionalArgs(t *testing.T) {
 	if _, err := parseFlags([]string{"--store-root", "X", "doctor"}); err == nil {
 		t.Fatal("want error for trailing positional arg, got nil")
+	}
+}
+
+// TestParseFlags_CTR_ENABLE — D101: --enable이 빈 문자열일 때만(부재·"--enable=" 둘 다 —
+// flag 패키지로는 구분 불가) CTR_ENABLE을 대신 읽고, 값이 있으면 플래그가 이긴다. 문법은
+// --enable과 같고(쉼표 구분·항목별 트림·빈 항목 무시) 모르는 이름은 두 입구 모두 오류다
+// (§6 — 오류 문면에 입력 원문 미포함). storeRootFor·CTR_STORE_ROOT의 t.Setenv 관례와
+// 동형(TestStoreRootFor). 둘 다 없으면 D101 계약 2의 기본 프로필(ingest,net)로 돈다(v0.19
+// 리뷰 C1) — 세 갈래(플래그 > 환경 변수 > 기본값) 우선순위 전체는 별도 표
+// TestParseFlags_EnablePrecedence가 한 곳에서 잰다.
+func TestParseFlags_CTR_ENABLE(t *testing.T) {
+	t.Run("env_fills_when_flag_absent", func(t *testing.T) {
+		t.Setenv("CTR_ENABLE", "ingest,net")
+		got, err := parseFlags(nil)
+		if err != nil {
+			t.Fatalf("err=%v", err)
+		}
+		want := []string{"ingest", "net"}
+		if strings.Join(got.Enable, ",") != strings.Join(want, ",") {
+			t.Fatalf("Enable=%v want %v", got.Enable, want)
+		}
+	})
+
+	t.Run("flag_wins_over_env", func(t *testing.T) {
+		t.Setenv("CTR_ENABLE", "ingest")
+		got, err := parseFlags([]string{"--enable", "exec"})
+		if err != nil {
+			t.Fatalf("err=%v", err)
+		}
+		want := []string{"exec"}
+		if strings.Join(got.Enable, ",") != strings.Join(want, ",") {
+			t.Fatalf("Enable=%v want %v (flag must win over CTR_ENABLE)", got.Enable, want)
+		}
+	})
+
+	// v0.19 리뷰 C1(소유자 결정)이 이름과 기대값을 뒤집었다: 둘 다 없으면 이제 빈 값이 아니라
+	// D101 계약 2의 기본 프로필(ingest,net)로 돈다 — plugin/mcp.json이 더는 args를 고정하지
+	// 않으므로 서버 자신이 그 기본값을 갖지 않으면 CTR_ENABLE이 모든 플러그인 설치에서 죽은
+	// 경로가 된다(그 근거가 C1 자체다).
+	t.Run("empty_env_falls_back_to_default_profile", func(t *testing.T) {
+		t.Setenv("CTR_ENABLE", "")
+		got, err := parseFlags(nil)
+		if err != nil {
+			t.Fatalf("err=%v", err)
+		}
+		want := []string{"ingest", "net"}
+		if strings.Join(got.Enable, ",") != strings.Join(want, ",") {
+			t.Fatalf("Enable=%v want %v (no --enable, CTR_ENABLE=\"\" → D101 계약 2 기본값)", got.Enable, want)
+		}
+	})
+
+	t.Run("whitespace_normalized", func(t *testing.T) {
+		t.Setenv("CTR_ENABLE", " ingest , net ")
+		got, err := parseFlags(nil)
+		if err != nil {
+			t.Fatalf("err=%v", err)
+		}
+		want := []string{"ingest", "net"}
+		if strings.Join(got.Enable, ",") != strings.Join(want, ",") {
+			t.Fatalf("Enable=%v want %v", got.Enable, want)
+		}
+	})
+
+	t.Run("unknown_name_in_env_rejected_without_echo", func(t *testing.T) {
+		t.Setenv("CTR_ENABLE", "bogus")
+		_, err := parseFlags(nil)
+		if err == nil {
+			t.Fatal("want error for unknown CTR_ENABLE profile name, got nil")
+		}
+		if strings.Contains(err.Error(), "bogus") {
+			t.Fatalf("error echoes user input(규약 §6 위반): %v", err)
+		}
+	})
+
+	t.Run("unknown_name_in_flag_rejected_without_echo", func(t *testing.T) {
+		t.Setenv("CTR_ENABLE", "")
+		_, err := parseFlags([]string{"--enable", "bogus"})
+		if err == nil {
+			t.Fatal("want error for unknown --enable profile name, got nil")
+		}
+		if strings.Contains(err.Error(), "bogus") {
+			t.Fatalf("error echoes user input(규약 §6 위반): %v", err)
+		}
+	})
+}
+
+// TestParseFlags_EnablePrecedence — v0.19 리뷰 C1·재검토 리뷰 2. 세 값의 우선순위(--enable >
+// CTR_ENABLE > defaultEnableProfile)를 한 표에서 잰다. C1 이전에는 셋째 갈래(둘 다 없음)가 빈
+// 값으로 떨어져 plugin/mcp.json의 고정 args가 CTR_ENABLE을 항상 이겼다 — 그 표를 D101 계약
+// 2가 요구하는 기본값으로 뒤집는 것이 이 테스트의 대상이다. 마지막 두 행은 재검토 리뷰 2 —
+// 공백뿐이거나 쉼표뿐인 값은 원본 문자열이 비어 있지 않아도 파싱하면 이름이 하나도 안 남는다
+// (parseEnableList가 그런 값을 오류 없이 빈 슬라이스로 돌려준다) — 그 상태가 "그 단계는
+// 쓸모없다"로 다음 단계에 넘어가는지를 각각 env·flag 자리에서 확인한다.
+func TestParseFlags_EnablePrecedence(t *testing.T) {
+	cases := []struct {
+		name    string
+		flag    string
+		env     string
+		wantOut []string
+	}{
+		{"둘 다 없음 → 기본값", "", "", []string{"ingest", "net"}},
+		{"env만 있음 → env", "", "exec", []string{"exec"}},
+		{"flag만 있음 → flag", "ingest", "", []string{"ingest"}},
+		{"둘 다 있음 → flag가 이긴다", "exec", "ingest,net", []string{"exec"}},
+		{"env가 공백/쉼표뿐 → 기본값", "", "  , , ", []string{"ingest", "net"}},
+		{"flag가 쉼표뿐 → env로 폴백", ",", "exec", []string{"exec"}},
+		// 릴리스 리뷰 F2: none은 값을 준 단계다 — 다음 단계로 넘어가지 않는다. 마지막 두 행이
+		// 우선순위 표의 그 갈래다(flag none이 값 있는 env를 이기고, env none이 기본값을 이긴다).
+		{"flag가 none → 프로필 0개", "none", "ingest,net", nil},
+		{"env가 none → 프로필 0개", "", "none", nil},
+		{"none 좌우 공백도 같다", " none ", "ingest", nil},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			t.Setenv("CTR_ENABLE", c.env)
+			var args []string
+			if c.flag != "" {
+				args = []string{"--enable", c.flag}
+			}
+			got, err := parseFlags(args)
+			if err != nil {
+				t.Fatalf("err=%v", err)
+			}
+			if strings.Join(got.Enable, ",") != strings.Join(c.wantOut, ",") {
+				t.Fatalf("Enable=%v want %v", got.Enable, c.wantOut)
+			}
+		})
+	}
+}
+
+// TestParseFlags_EnableNone — 릴리스 리뷰 F2. `--enable=`·`CTR_ENABLE=""`는 "이 단계는 값을
+// 주지 않았다"라서 기본값 ingest,net으로 떨어지고, 그래서 v0.19 이전 자세(색인 쓰기도
+// 아웃바운드 HTTP도 없음)를 요청할 자리가 없었다 — 이름 none이 그 자리다. 다른 이름과 섞인
+// 값은 오류이고(두 해석이 다 성립한다), 문면은 허용 값만 나열한다(규약 §6 입력 원문 에코
+// 금지). 우선순위 자체는 TestParseFlags_EnablePrecedence의 표가 잰다.
+func TestParseFlags_EnableNone(t *testing.T) {
+	t.Run("배너가 전부 off로 읽힌다", func(t *testing.T) {
+		t.Setenv("CTR_ENABLE", "ingest,net")
+		got, err := parseFlags([]string{"--enable", "none"})
+		if err != nil {
+			t.Fatalf("err=%v", err)
+		}
+		if len(got.Enable) != 0 {
+			t.Fatalf("Enable=%v want 빈 목록", got.Enable)
+		}
+		line := banner(got, "/p")
+		if !strings.Contains(line, "ingest=off net=off") {
+			t.Fatalf("banner=%q want ingest=off net=off", line)
+		}
+	})
+
+	for _, c := range []struct{ name, flag, env string }{
+		{"flag에서 none과 다른 이름 혼합", "none,ingest", ""},
+		{"flag에서 순서를 바꿔도 같다", "ingest,none", ""},
+		{"env에서 none과 다른 이름 혼합", "", "net,none"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			t.Setenv("CTR_ENABLE", c.env)
+			var args []string
+			if c.flag != "" {
+				args = []string{"--enable", c.flag}
+			}
+			_, err := parseFlags(args)
+			if err == nil {
+				t.Fatal("want error for none mixed with another profile name, got nil")
+			}
+			raw := c.flag + c.env
+			if strings.Contains(err.Error(), raw) {
+				t.Fatalf("error echoes user input(규약 §6 위반): %v", err)
+			}
+			for _, name := range append(slices.Clone(enableProfileNames), enableProfileNone) {
+				if !strings.Contains(err.Error(), name) {
+					t.Fatalf("error=%q missing allowed value %q", err, name)
+				}
+			}
+		})
 	}
 }
 
@@ -612,73 +792,39 @@ func TestMainDispatch_Hook_AbsorbsPreprocError(t *testing.T) {
 	})
 }
 
-// TestMainDispatch_HookInstall_ExplicitStoreRoot: 브리프 ⑧ — main dispatch가 `--store-root`
-// 명시 여부(storeRootExplicit)와 원시값(storeRootRaw)을 cli.Run에 전달해, 명시된 경우에만 훅
-// 명령 args에 `--store-root <원시값>`이 주입되는지 실경로로 확인한다. prescanRootFlags가
-// 토큰을 소비하므로 이 전달이 없으면 cli.Run은 명시/기본을 구분할 수 없다(리뷰 반영).
-func TestMainDispatch_HookInstall_ExplicitStoreRoot(t *testing.T) {
-	readCommand := func(t *testing.T, proj string) string {
-		t.Helper()
-		data, err := os.ReadFile(filepath.Join(proj, ".claude", "settings.json"))
-		if err != nil {
-			t.Fatalf("read settings: %v", err)
-		}
-		var s struct {
-			Hooks map[string][]struct {
-				Hooks []struct {
-					Command string `json:"command"`
-				} `json:"hooks"`
-			} `json:"hooks"`
-		}
-		if err := json.Unmarshal(data, &s); err != nil {
-			t.Fatalf("parse: %v\n%s", err, data)
-		}
-		g := s.Hooks["SessionStart"]
-		if len(g) == 0 || len(g[0].Hooks) == 0 {
-			t.Fatalf("no SessionStart command: %s", data)
-		}
-		return g[0].Hooks[0].Command
-	}
-
-	t.Run("explicit_injects_raw_store_root", func(t *testing.T) {
+// TestMainDispatch_HookInstall_GuidanceOnly: D96·D97 — 실경로(dispatchCLI)에서 `hook install`이
+// 안내를 내고 비-0으로 끝나며 **프로젝트에 아무 파일도 만들지 않는다**. 옛 플래그(--store-root
+// 등)가 붙어도 같다 — 그 값들을 나르던 배선이 지워졌으므로 여기서 갈릴 자리가 없다.
+func TestMainDispatch_HookInstall_GuidanceOnly(t *testing.T) {
+	for _, args := range [][]string{
+		nil,
+		{"--store-root", filepath.Join(t.TempDir(), "storeroot")},
+		{"--codex", "--user"},
+	} {
 		proj := t.TempDir()
-		storeRoot := filepath.Join(t.TempDir(), "storeroot")
+		argv := append([]string{"context-router", "hook", "install", "--root", proj}, args...)
 		var handled bool
 		var derr error
-		captureStdout(t, func() {
-			handled, derr = dispatchCLI(context.Background(), []string{
-				"context-router", "hook", "install", "--root", proj, "--store-root", storeRoot,
-			})
+		out := captureStdout(t, func() {
+			handled, derr = dispatchCLI(context.Background(), argv)
 		})
 		if !handled {
-			t.Fatal("want handled=true")
+			t.Fatalf("args=%v want handled=true", args)
 		}
-		if derr != nil {
-			t.Fatalf("hook install dispatch err=%v", derr)
+		if derr == nil {
+			t.Fatalf("args=%v: hook install이 비-0으로 끝나지 않았다", args)
 		}
-		cmd := readCommand(t, proj)
-		if !strings.Contains(cmd, "--store-root") || !strings.Contains(cmd, storeRoot) {
-			t.Fatalf("cmd=%q must inject explicit --store-root %q", cmd, storeRoot)
+		if !strings.Contains(out, "옛 등록물을 먼저 지운다") {
+			t.Errorf("args=%v: 0번 걸음 안내가 없다:\n%s", args, out)
 		}
-	})
-
-	t.Run("default_omits_store_root", func(t *testing.T) {
-		proj := t.TempDir()
-		var handled bool
-		var derr error
-		captureStdout(t, func() {
-			handled, derr = dispatchCLI(context.Background(), []string{
-				"context-router", "hook", "install", "--root", proj,
-			})
-		})
-		if !handled || derr != nil {
-			t.Fatalf("handled=%v err=%v", handled, derr)
+		entries, err := os.ReadDir(proj)
+		if err != nil {
+			t.Fatalf("readdir: %v", err)
 		}
-		cmd := readCommand(t, proj)
-		if strings.Contains(cmd, "--store-root") {
-			t.Fatalf("cmd=%q must not inject store-root when not explicitly given", cmd)
+		if len(entries) != 0 {
+			t.Errorf("args=%v: hook install이 프로젝트에 파일을 만들었다: %v", args, entries)
 		}
-	})
+	}
 }
 
 // TestMainDispatch_Stats_Provider: 실제 dispatchCLI 경로로 `stats --provider <jsonl>`이

@@ -242,11 +242,20 @@ func TestNewServerProfileGating(t *testing.T) {
 // 물리지 않는 검사였다. tools/list 결과 JSON 직렬화 바이트 상한이며 설명 문구 비대화 회귀의
 // 조기 감지용이다. D62부터의 규칙 그대로 **실측 + 최소 여유**로 잡는다(과대 상향 금지 —
 // 여유가 100B 이상이면 "설명에 100바이트를 덧붙이면 넘긴다"는 감시선이 죽는다).
-// 실측 14853B(10-도구)를 100의 배수로 올려 14900(여유 47B). 이 값은 **단일 서버**의 tools/list
-// 표면이다 — 클라이언트가 ctr·ctr-exec를 함께 등록하면 상주 총량은 두 서버 합집합이라 다르다
-// (폐기된 이전 값: exec 8-도구 12914→13000, 6-도구 10024×1.2=12029).
+// [실측] D99(진입 도구 ctr_search·ctr_index 상시 로드 + Description 꼬리에 지연 여섯을 색인,
+// 이 파일의 deferredToolIndex)가 표면을 14853B→15795B로 키웠다(+942B: deferredToolIndex
+// 432B가 두 도구 Description에 각각 붙어 864B, `"_meta":{"anthropic/alwaysLoad":true}`가
+// 그 두 도구에만 38B씩 76B — 합 940B, 나머지 2B는 JSON 콤마 재배치). 100의 배수로 올려 15800
+// (여유 5B — 위 규칙대로 의도적으로 빡빡하게 유지, 폐기된 이전 값 14900). 이 값은 **단일 서버**의
+// tools/list 표면이다 — 클라이언트가 ctr·ctr-exec를 함께 등록하면 상주 총량은 두 서버 합집합이라
+// 다르다(더 오래된 폐기 값: exec 8-도구 12914→13000, 6-도구 10024×1.2=12029).
+// [실측] 릴리스 리뷰 F1(2026-08-08, 이 머신)이 exec 둘을 색인에 넣어 15795B→16067B가 됐다
+// (+272B: idxExecute 65B + idxExecuteFile 67B + 구분자 ", " 둘 4B = 136B가 진입 도구 둘의
+// Description에 각각 붙는다). 위 규칙대로 100의 배수로 올려 16100(여유 33B, 폐기된 이전 값
+// 15800). 이 증가분은 D99 설계가 값을 치르기로 한 자리다 — 색인에 없는 지연 도구는 모델이
+// 호출하지 않는다는 것이 이 색인의 근거이고, F1은 그 상태를 exec 프로필에서 실측한 것이다.
 // 실측값·근거는 docs/gates-v0.0.1-ko.md 게이트 11 항목 참조(정식 갱신은 게이트 문서 마일스톤에서).
-const maxToolSchemaBytes = 14900
+const maxToolSchemaBytes = 16100
 
 // TestSchemaTokenBudget: tools/list 결과(ListToolsResult 전체 — 실제 클라이언트가 받는
 // JSON 그대로) 직렬화 바이트가 maxToolSchemaBytes를 넘지 않는지 확인한다(게이트 11). 근사
@@ -270,6 +279,132 @@ func TestSchemaTokenBudget(t *testing.T) {
 	t.Logf("tools/list schema: %d bytes (~%d tokens approx, %d tools)", len(b), approxTokens, len(lt.Tools))
 	if len(b) > maxToolSchemaBytes {
 		t.Fatalf("tools/list schema=%d bytes exceeds budget %d bytes (게이트 11, 설계 §2.3)", len(b), maxToolSchemaBytes)
+	}
+}
+
+// assertDeferredIndexMatchesRegistration — 진입 도구의 Description 꼬리 색인이 그 서버의
+// tools/list와 정확히 맞물리는지 확인한다: 등록된 지연 도구는 전부 색인에 이름이 있고, 색인이
+// 든 이름은 전부 등록돼 있다(양방향).
+//
+// **후보 집합도 서버에서 얻는다** `[실측]`(재검토 리뷰, 이 머신). 옛 형태는 진리를
+// tools/list에서 얻으면서 후보는 손으로 유지하는 이름 목록에서 훑었고, 그래서 mcp.go의
+// deferred에 든 도구가 그 목록에서 빠지면 기대값이 검사 대상과 같은 누락에서 파생돼 결함이
+// 초록으로 통과했다 — 릴리스 리뷰 F1의 exec 둘이 정확히 그 형태였다(`CTR_ENABLE=…,exec`로
+// 켠 서버가 ctr_execute를 등록하고도 색인 문장에서 이름을 뺐다). 이제 후보는 tools/list에서
+// `anthropic/alwaysLoad`가 달린 진입 도구를 뺀 나머지라, 지연 도구가 아홉째로 늘어도 이
+// 단정이 손질 없이 함께 는다. 진입 도구가 정확히 어느 둘인지는
+// TestAlwaysLoadMetaExactlyEntryTools가 따로 잰다.
+//
+// 색인 문장의 머리말과 항목 구분자는 deferredToolIndex 자신에서 유도한다 — 문면이 바뀌면 이
+// 단정이 따라간다. 항목에서 이름을 `(` 앞까지로 끊는 이유는 항목이 `이름(한 줄 용도)` 형태라
+// `ctr_fetch`가 `ctr_fetch_and_index`의 부분 문자열로 잡히지 않게 하기 위해서다.
+func assertDeferredIndexMatchesRegistration(t *testing.T, cs *mcp.ClientSession) {
+	t.Helper()
+	lt, err := cs.ListTools(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("list tools: %v", err)
+	}
+	var entryTools []string
+	deferredNames, descByName := map[string]bool{}, map[string]string{}
+	for _, tl := range lt.Tools {
+		if v, _ := tl.Meta["anthropic/alwaysLoad"].(bool); v {
+			entryTools = append(entryTools, tl.Name)
+			descByName[tl.Name] = tl.Description
+			continue
+		}
+		deferredNames[tl.Name] = true
+	}
+	if len(entryTools) == 0 {
+		// 진입 도구가 하나도 없으면 아래 루프가 통째로 돌지 않아 이 단정이 공회전한다.
+		t.Fatalf("alwaysLoad 도구가 tools/list에 없다 — 색인을 실을 자리가 없다: %d개 도구", len(lt.Tools))
+	}
+	indexLead, _, _ := strings.Cut(deferredToolIndex([]string{"\x00"}), "\x00")
+	for _, entry := range entryTools {
+		_, tail, found := strings.Cut(descByName[entry], indexLead)
+		if !found {
+			t.Errorf("%s 설명에 지연 도구 색인 문장이 없다:\n%s", entry, descByName[entry])
+			continue
+		}
+		var order []string
+		indexed := map[string]bool{}
+		for _, item := range strings.Split(strings.TrimSuffix(tail, "."), ", ") {
+			name, _, _ := strings.Cut(item, "(")
+			order = append(order, name)
+			indexed[name] = true
+		}
+		for _, tl := range lt.Tools { // tools/list 순서로 — 보고가 결정적이다
+			if deferredNames[tl.Name] && !indexed[tl.Name] {
+				t.Errorf("%s 설명의 색인이 등록된 지연 도구 %q를 빠뜨렸다:\n%s", entry, tl.Name, descByName[entry])
+			}
+		}
+		for _, name := range order {
+			if !deferredNames[name] {
+				t.Errorf("%s 설명의 색인이 등록되지 않은 %q를 광고한다:\n%s", entry, name, descByName[entry])
+			}
+		}
+	}
+}
+
+// TestAlwaysLoadMetaExactlyEntryTools — D99 요구 1: Enable{"ingest","net"}+Session 있음(설치기가
+// 만들 수 있는 프로필)에서 tools/list의 _meta.anthropic/alwaysLoad=true인 도구 이름 집합이
+// 정확히 {ctr_search, ctr_index}여야 한다 — 다른 어떤 도구에도 새지 않는지까지 함께 확인한다.
+func TestAlwaysLoadMetaExactlyEntryTools(t *testing.T) {
+	cs, _, _, _ := newRecordEventTestServer(t, "ingest", "net")
+	lt, err := cs.ListTools(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("list tools: %v", err)
+	}
+	got := map[string]bool{}
+	for _, tl := range lt.Tools {
+		if v, _ := tl.Meta["anthropic/alwaysLoad"].(bool); v {
+			got[tl.Name] = true
+		}
+	}
+	want := map[string]bool{"ctr_search": true, "ctr_index": true}
+	if len(got) != len(want) {
+		t.Fatalf("alwaysLoad tools=%v want exactly %v", got, want)
+	}
+	for name := range want {
+		if !got[name] {
+			t.Fatalf("alwaysLoad tools=%v missing %q", got, name)
+		}
+	}
+}
+
+// TestEntryToolDescriptionsIndexDeferredTools — D99 요구 2 + 최종 리뷰 S4 재기준선. 옛 형태는
+// 고정 문면(패키지 상수)이 지연 여섯의 이름을 전부 담는지만 봤고, 그래서 프로필을 좁힌 서버가
+// 등록하지도 않은 도구를 이름으로 광고해도 초록이었다 — `CTR_ENABLE=ingest`로 켠 서버가
+// `ctr_fetch_and_index`를 광고하는 것을 stdio로 실측한 것이 그 결함이다. 여덟 중 일곱이 조건부
+// 등록이므로 최대 프로필과 좁힌 프로필 양쪽에서 색인과 등록의 일치를 잰다. 반대 방향(등록했는데
+// 색인에 없음)도 같은 단정이 잡는다 — 릴리스 리뷰 F1의 exec 둘이 그 방향이었다.
+func TestEntryToolDescriptionsIndexDeferredTools(t *testing.T) {
+	t.Run("최대 프로필 — 여덟 전부", func(t *testing.T) {
+		cs, _, _, _ := newRecordEventTestServer(t, "ingest", "net", "exec")
+		assertDeferredIndexMatchesRegistration(t, cs)
+	})
+	t.Run("좁힌 프로필 — net·세션 없음", func(t *testing.T) {
+		// ingest만: ctr_fetch_and_index(net)도 세션 3종도 등록되지 않는다.
+		cs, _ := newTestServer(t, []string{"ingest"})
+		assertDeferredIndexMatchesRegistration(t, cs)
+	})
+}
+
+// TestToolDescriptionsAvoidHortatoryVocabulary — Global Constraints 어휘 규칙: 어느 도구
+// 설명에도 금지 어휘가 없어야 한다. 최대 프로필(10-도구)로 D99 신규 문면(deferredToolIndex)까지
+// 전수 검사한다.
+func TestToolDescriptionsAvoidHortatoryVocabulary(t *testing.T) {
+	cs, _, _, _ := newRecordEventTestServer(t, "ingest", "net", "exec")
+	lt, err := cs.ListTools(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("list tools: %v", err)
+	}
+	banned := []string{"MANDATORY", "BLOCKED", "Do NOT", "Never", "PREFER"}
+	for _, tl := range lt.Tools {
+		for _, word := range banned {
+			if strings.Contains(tl.Description, word) {
+				t.Fatalf("%s description contains banned vocabulary %q: %q", tl.Name, word, tl.Description)
+			}
+		}
 	}
 }
 

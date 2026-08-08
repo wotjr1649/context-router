@@ -47,45 +47,43 @@ func writeCodexConfig(t *testing.T, home, src string) {
 
 // doctorOut — doctor를 돌려 출력과 오류를 돌려준다. runDoctor의 시그니처를 한 자리에만 두어
 // 뒤 태스크가 인자 순서를 되풀이하지 않게 한다.
-func doctorOut(t *testing.T, projectRoot string, fix bool) (string, error) {
+func doctorOut(t *testing.T, projectRoot string) (string, error) {
 	t.Helper()
 	var buf bytes.Buffer
-	err := runDoctor(context.Background(), &buf, t.TempDir(), projectRoot, "0.17.0", fix)
+	err := runDoctor(context.Background(), &buf, t.TempDir(), projectRoot, "0.17.0")
 	return buf.String(), err
 }
 
-// TestIsolateCodexHome — 격리 헬퍼가 실제로 codexConfigPath를 돌리는가. 뒤 태스크의 doctor
-// 단정이 전부 이 헬퍼 위에 서므로, 헬퍼가 조용히 망가지면 그 단정들이 공유 임시 홈을 보게
-// 되고 무엇을 단정했는지 알 수 없어진다. 긍정형으로 둔다 — 경로 자체를 단정하면 픽스처가
+// TestIsolateCodexHome — 격리 헬퍼가 실제로 doctorCodexConfigPath를 돌리는가. 이 파일의
+// doctor 단정이 전부 이 헬퍼 위에 서므로, 헬퍼가 조용히 망가지면 그 단정들이 공유 임시 홈을
+// 보게 되고 무엇을 단정했는지 알 수 없어진다. 긍정형으로 둔다 — 경로 자체를 단정하면 픽스처가
 // 바꾸는 문면뿐 아니라 홈이 어디로 떨어지는지까지 잡는다(반환 디렉터리 아래인지, 거기 쓴
-// 픽스처를 doctor가 실제로 읽는지).
+// 픽스처를 doctor가 실제로 읽는지). 후반부는 D97 계약 2의 감지원(codexServerHeaders)이
+// 파일:줄을 실제로 보고하는지도 함께 검증한다.
 func TestIsolateCodexHome(t *testing.T) {
 	home := isolateCodexHome(t)
-	got, err := codexConfigPath()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if want := filepath.Join(home, "config.toml"); got != want {
-		t.Fatalf("codexConfigPath = %q, want %q", got, want)
+	want := filepath.Join(home, "config.toml")
+	if got, err := doctorCodexConfigPath(); err != nil || got != want {
+		t.Fatalf("doctorCodexConfigPath = %q err=%v, want %q", got, err, want)
 	}
 	writeCodexConfig(t, home, "[mcp_servers.ctr]\ncommand = \"context-router\"\n")
-	out, _ := doctorOut(t, t.TempDir(), false)
-	if !strings.Contains(out, "[16] codex: [mcp_servers.ctr] 테이블=존재") {
-		t.Errorf("doctor가 격리된 홈의 픽스처를 읽지 않았다:\n%s", out)
+	out, _ := doctorOut(t, t.TempDir())
+	if !strings.Contains(out, "플러그인 이전 방식의 등록물이 남아 있다 — "+want+":1") {
+		t.Errorf("doctor가 격리된 홈의 픽스처를 파일:줄로 짚지 않았다:\n%s", out)
 	}
 }
 
 // D56 — version 서브커맨드: ProductVersion 1줄만 출력(CI 추출 표면, 스펙 §0).
 func TestRunVersionSubcommand(t *testing.T) {
 	var out, errOut bytes.Buffer
-	err := Run(context.Background(), "version", nil, t.TempDir(), t.TempDir(), "9.9.9-test", false, "", &out, &errOut)
+	err := Run(context.Background(), "version", nil, t.TempDir(), t.TempDir(), "9.9.9-test", &out, &errOut)
 	if err != nil {
 		t.Fatalf("err=%v", err)
 	}
 	if out.String() != "9.9.9-test\n" {
 		t.Fatalf("out=%q want %q", out.String(), "9.9.9-test\n")
 	}
-	if err := Run(context.Background(), "version", []string{"x"}, t.TempDir(), t.TempDir(), "v", false, "", &out, &errOut); err == nil {
+	if err := Run(context.Background(), "version", []string{"x"}, t.TempDir(), t.TempDir(), "v", &out, &errOut); err == nil {
 		t.Fatal("잉여 인자 미거부")
 	}
 }
@@ -216,7 +214,7 @@ func TestRunDoctor_Smoke(t *testing.T) {
 	}
 
 	var buf bytes.Buffer
-	if err := runDoctor(context.Background(), &buf, storeRoot, projectRoot, "0.0.1-dev", false); err != nil {
+	if err := runDoctor(context.Background(), &buf, storeRoot, projectRoot, "0.0.1-dev"); err != nil {
 		t.Fatalf("runDoctor err=%v out=%s", err, buf.String())
 	}
 	out := buf.String()
@@ -226,8 +224,8 @@ func TestRunDoctor_Smoke(t *testing.T) {
 	if !strings.Contains(out, "not initialized") {
 		t.Fatalf("out missing 'not initialized': %s", out)
 	}
-	if !strings.Contains(out, ".mcp.json") {
-		t.Fatalf("out missing '.mcp.json' snippet marker: %s", out)
+	if !strings.Contains(out, "claude plugin marketplace add") {
+		t.Fatalf("out missing plugin install snippet marker: %s", out)
 	}
 
 	if _, err := os.Stat(storeRoot); !os.IsNotExist(err) {
@@ -265,7 +263,7 @@ func TestRunDoctor_InitializedStore(t *testing.T) {
 	}
 
 	var buf bytes.Buffer
-	if err := runDoctor(context.Background(), &buf, storeRoot, projectRoot, "0.0.1-dev", false); err != nil {
+	if err := runDoctor(context.Background(), &buf, storeRoot, projectRoot, "0.0.1-dev"); err != nil {
 		t.Fatalf("runDoctor err=%v out=%s", err, buf.String())
 	}
 	out := buf.String()
@@ -312,7 +310,7 @@ func TestRunDoctor_ContentDBSize(t *testing.T) {
 	}
 
 	var buf bytes.Buffer
-	if err := runDoctor(context.Background(), &buf, storeRoot, projectRoot, "0.0.1-dev", false); err != nil {
+	if err := runDoctor(context.Background(), &buf, storeRoot, projectRoot, "0.0.1-dev"); err != nil {
 		t.Fatalf("runDoctor err=%v out=%s", err, buf.String())
 	}
 	if !strings.Contains(buf.String(), "[14] content.db: sources=2 artifacts=2 blob=45B") {
@@ -386,7 +384,7 @@ func TestRunDoctor_StoreSizeWarn(t *testing.T) {
 	storeRoot, projectRoot := doctorSizeWarnSetup(t)
 	t.Setenv("CTR_STORE_WARN_BYTES", "5") // blob 10B > 5B → 발화
 	var buf bytes.Buffer
-	if err := runDoctor(context.Background(), &buf, storeRoot, projectRoot, "0.0.1-dev", false); err != nil {
+	if err := runDoctor(context.Background(), &buf, storeRoot, projectRoot, "0.0.1-dev"); err != nil {
 		t.Fatalf("runDoctor err=%v out=%s", err, buf.String())
 	}
 	for _, want := range []string{"[14] warning:", "purge", "--hook-only"} {
@@ -400,7 +398,7 @@ func TestRunDoctor_StoreSizeWarnSilentUnderThreshold(t *testing.T) {
 	isolateCodexHome(t)
 	storeRoot, projectRoot := doctorSizeWarnSetup(t) // 임계 미설정 — 기본 100MiB
 	var buf bytes.Buffer
-	if err := runDoctor(context.Background(), &buf, storeRoot, projectRoot, "0.0.1-dev", false); err != nil {
+	if err := runDoctor(context.Background(), &buf, storeRoot, projectRoot, "0.0.1-dev"); err != nil {
 		t.Fatalf("runDoctor err=%v out=%s", err, buf.String())
 	}
 	if !strings.Contains(buf.String(), "[14] content.db: sources=1 artifacts=1 blob=10B") {
@@ -419,7 +417,7 @@ func TestRunDoctor_ContentFileWarn(t *testing.T) {
 	storeRoot, projectRoot := doctorSizeWarnSetup(t)
 	t.Setenv("CTR_CONTENT_FILE_WARN_BYTES", "1")
 	var buf bytes.Buffer
-	if err := runDoctor(context.Background(), &buf, storeRoot, projectRoot, "0.0.1-dev", false); err != nil {
+	if err := runDoctor(context.Background(), &buf, storeRoot, projectRoot, "0.0.1-dev"); err != nil {
 		t.Fatalf("runDoctor err=%v out=%s", err, buf.String())
 	}
 	out := buf.String()
@@ -438,7 +436,7 @@ func TestRunDoctor_ContentFileWarnAxisIndependent(t *testing.T) {
 	storeRoot, projectRoot := doctorSizeWarnSetup(t)
 	t.Setenv("CTR_STORE_WARN_BYTES", "1")
 	var buf bytes.Buffer
-	if err := runDoctor(context.Background(), &buf, storeRoot, projectRoot, "0.0.1-dev", false); err != nil {
+	if err := runDoctor(context.Background(), &buf, storeRoot, projectRoot, "0.0.1-dev"); err != nil {
 		t.Fatalf("runDoctor err=%v out=%s", err, buf.String())
 	}
 	out := buf.String()
@@ -543,7 +541,7 @@ func TestDoctorShadowOwnedLine(t *testing.T) {
 	})
 
 	var buf bytes.Buffer
-	if err := runDoctor(context.Background(), &buf, storeRoot, projectRoot, "0.0.1-dev", false); err != nil {
+	if err := runDoctor(context.Background(), &buf, storeRoot, projectRoot, "0.0.1-dev"); err != nil {
 		t.Fatalf("runDoctor err=%v out=%s", err, buf.String())
 	}
 	out := buf.String()
@@ -588,7 +586,7 @@ func TestDoctorShadowOwnedIncomplete(t *testing.T) {
 	}
 
 	var buf bytes.Buffer
-	if err := runDoctor(context.Background(), &buf, storeRoot, projectRoot, "0.0.1-dev", false); err != nil {
+	if err := runDoctor(context.Background(), &buf, storeRoot, projectRoot, "0.0.1-dev"); err != nil {
 		t.Fatalf("runDoctor err=%v ([15] 실패가 전역 failed로 새면 안 됨) out=%s", err, buf.String())
 	}
 	out := buf.String()
@@ -627,7 +625,7 @@ func TestDoctorShadowOwnedShared(t *testing.T) {
 	seedShadowWorktree(t, wt, cxSid, []string{"artifact://" + cxSid + "/sha256-" + ownedHash})
 
 	var buf bytes.Buffer
-	if err := runDoctor(context.Background(), &buf, storeRoot, projectRoot, "0.0.1-dev", false); err != nil {
+	if err := runDoctor(context.Background(), &buf, storeRoot, projectRoot, "0.0.1-dev"); err != nil {
 		t.Fatalf("runDoctor err=%v out=%s", err, buf.String())
 	}
 	out := buf.String()
@@ -653,7 +651,7 @@ func TestDoctorShadowOwnedUnattributed(t *testing.T) {
 	seedShadowWorktree(t, wt, sid, []string{"artifact://" + sid + "/sha256-" + strings.Repeat("d", 64)}) // 비귀속 hash
 
 	var buf bytes.Buffer
-	if err := runDoctor(context.Background(), &buf, storeRoot, projectRoot, "0.0.1-dev", false); err != nil {
+	if err := runDoctor(context.Background(), &buf, storeRoot, projectRoot, "0.0.1-dev"); err != nil {
 		t.Fatalf("runDoctor err=%v out=%s", err, buf.String())
 	}
 	out := buf.String()
@@ -679,7 +677,7 @@ func TestDoctorShadowOwnedMultiWorktree(t *testing.T) {
 	seedShadowWorktree(t, filepath.Join(projDir, "worktrees", "wt2"), cxSid, []string{"artifact://" + cxSid + "/sha256-" + ownedHash})
 
 	var buf bytes.Buffer
-	if err := runDoctor(context.Background(), &buf, storeRoot, projectRoot, "0.0.1-dev", false); err != nil {
+	if err := runDoctor(context.Background(), &buf, storeRoot, projectRoot, "0.0.1-dev"); err != nil {
 		t.Fatalf("runDoctor err=%v out=%s", err, buf.String())
 	}
 	out := buf.String()
@@ -699,7 +697,7 @@ func TestDoctorShadowOwnedNoSessionDecomp(t *testing.T) {
 	seedShadowContentDB(t, projDir) // worktrees 디렉터리 미생성 → usable=0
 
 	var buf bytes.Buffer
-	if err := runDoctor(context.Background(), &buf, storeRoot, projectRoot, "0.0.1-dev", false); err != nil {
+	if err := runDoctor(context.Background(), &buf, storeRoot, projectRoot, "0.0.1-dev"); err != nil {
 		t.Fatalf("runDoctor err=%v out=%s", err, buf.String())
 	}
 	out := buf.String()
@@ -715,7 +713,7 @@ func TestDoctorShadowOwnedNoSessionDecomp(t *testing.T) {
 // 이를 통해 미지 단어를 MCP 플래그로 잘못 흡수하지 않도록 한다(설계 §7).
 func TestRun_UnknownSub(t *testing.T) {
 	var out, errOut bytes.Buffer
-	err := Run(context.Background(), "bogus", nil, t.TempDir(), t.TempDir(), "0.0.1-dev", false, "", &out, &errOut)
+	err := Run(context.Background(), "bogus", nil, t.TempDir(), t.TempDir(), "0.0.1-dev", &out, &errOut)
 	if err == nil {
 		t.Fatal("want error for unknown subcommand, got nil")
 	}
@@ -730,7 +728,7 @@ func TestRunPurge_ExactlyOneSelector(t *testing.T) {
 		{"--project", "x", "--all"}, // 둘 다 있음
 	} {
 		var out, errOut bytes.Buffer
-		err := Run(context.Background(), "purge", args, t.TempDir(), t.TempDir(), "0.0.1-dev", false, "", &out, &errOut)
+		err := Run(context.Background(), "purge", args, t.TempDir(), t.TempDir(), "0.0.1-dev", &out, &errOut)
 		if err == nil {
 			t.Fatalf("args=%v: want selector 오류, got nil", args)
 		}
@@ -1269,7 +1267,7 @@ func TestRunPurge_E2E_GCOnlyNoConfirm(t *testing.T) {
 	var out, errOut bytes.Buffer
 	// --force도 --older-than도 없다 — gc 단독이 확인을 생략하고도 성공해야 한다.
 	args := []string{"--project", projectRoot, "--gc"}
-	if err := Run(context.Background(), "purge", args, storeRoot, projectRoot, "0.0.1-dev", false, "", &out, &errOut); err != nil {
+	if err := Run(context.Background(), "purge", args, storeRoot, projectRoot, "0.0.1-dev", &out, &errOut); err != nil {
 		t.Fatalf("Run purge --gc err=%v out=%s", err, out.String())
 	}
 
@@ -1600,7 +1598,7 @@ func TestRunStats_Local(t *testing.T) {
 	}
 
 	var out, errOut bytes.Buffer
-	if err := Run(context.Background(), "stats", nil, storeRoot, projectRoot, "0.0.1-dev", false, "", &out, &errOut); err != nil {
+	if err := Run(context.Background(), "stats", nil, storeRoot, projectRoot, "0.0.1-dev", &out, &errOut); err != nil {
 		t.Fatalf("Run stats err=%v out=%s", err, out.String())
 	}
 	got := out.String()
@@ -1621,7 +1619,7 @@ func TestRunStats_Local(t *testing.T) {
 // 계약이 cli까지 그대로 이어지는지 확인한다.
 func TestRunStats_Local_NoLedger(t *testing.T) {
 	var out, errOut bytes.Buffer
-	if err := Run(context.Background(), "stats", nil, t.TempDir(), t.TempDir(), "0.0.1-dev", false, "", &out, &errOut); err != nil {
+	if err := Run(context.Background(), "stats", nil, t.TempDir(), t.TempDir(), "0.0.1-dev", &out, &errOut); err != nil {
 		t.Fatalf("Run stats err=%v out=%s", err, out.String())
 	}
 	got := out.String()
@@ -1651,7 +1649,7 @@ func TestRunStats_Provider(t *testing.T) {
 
 	var out, errOut bytes.Buffer
 	args := []string{"--provider", path}
-	if err := Run(context.Background(), "stats", args, t.TempDir(), t.TempDir(), "0.0.1-dev", false, "", &out, &errOut); err != nil {
+	if err := Run(context.Background(), "stats", args, t.TempDir(), t.TempDir(), "0.0.1-dev", &out, &errOut); err != nil {
 		t.Fatalf("Run stats --provider err=%v out=%s", err, out.String())
 	}
 	got := out.String()
@@ -1673,7 +1671,7 @@ func TestRunStats_Provider_FileMissing(t *testing.T) {
 	var out, errOut bytes.Buffer
 	missing := filepath.Join(t.TempDir(), "missing.jsonl")
 	args := []string{"--provider", missing}
-	err := Run(context.Background(), "stats", args, t.TempDir(), t.TempDir(), "0.0.1-dev", false, "", &out, &errOut)
+	err := Run(context.Background(), "stats", args, t.TempDir(), t.TempDir(), "0.0.1-dev", &out, &errOut)
 	if err == nil {
 		t.Fatal("want error for missing --provider file, got nil")
 	}
@@ -1690,7 +1688,7 @@ func TestRunStats_Local_ProjectIdentifyFailure(t *testing.T) {
 	missingProject := filepath.Join(t.TempDir(), "does-not-exist")
 
 	var out, errOut bytes.Buffer
-	err := Run(context.Background(), "stats", nil, storeRoot, missingProject, "0.0.1-dev", false, "", &out, &errOut)
+	err := Run(context.Background(), "stats", nil, storeRoot, missingProject, "0.0.1-dev", &out, &errOut)
 	if err == nil {
 		t.Fatal("want error for nonexistent project root, got nil")
 	}
@@ -1718,7 +1716,7 @@ func TestRunStats_Provider_OversizedLine(t *testing.T) {
 
 	var out, errOut bytes.Buffer
 	args := []string{"--provider", path}
-	if err := Run(context.Background(), "stats", args, t.TempDir(), t.TempDir(), "0.0.1-dev", false, "", &out, &errOut); err != nil {
+	if err := Run(context.Background(), "stats", args, t.TempDir(), t.TempDir(), "0.0.1-dev", &out, &errOut); err != nil {
 		t.Fatalf("Run stats --provider err=%v out=%s", err, out.String())
 	}
 	got := out.String()
@@ -1735,7 +1733,7 @@ func TestRunStats_Provider_OversizedLine(t *testing.T) {
 // 그대로 에코되면 안 된다(규약 §6, 리뷰 Fix Round 3 item 5 — 개수만 밝힌다).
 func TestRunDoctor_UnexpectedArgs(t *testing.T) {
 	var out, errOut bytes.Buffer
-	err := Run(context.Background(), "doctor", []string{"--bogus"}, t.TempDir(), t.TempDir(), "0.0.1-dev", false, "", &out, &errOut)
+	err := Run(context.Background(), "doctor", []string{"--bogus"}, t.TempDir(), t.TempDir(), "0.0.1-dev", &out, &errOut)
 	if err == nil {
 		t.Fatal("want error for unexpected doctor args, got nil")
 	}
@@ -1746,7 +1744,7 @@ func TestRunDoctor_UnexpectedArgs(t *testing.T) {
 
 func TestRunUpgrade_UnexpectedArgs(t *testing.T) {
 	var out, errOut bytes.Buffer
-	err := Run(context.Background(), "upgrade", []string{"--bogus"}, t.TempDir(), t.TempDir(), "0.0.1-dev", false, "", &out, &errOut)
+	err := Run(context.Background(), "upgrade", []string{"--bogus"}, t.TempDir(), t.TempDir(), "0.0.1-dev", &out, &errOut)
 	if err == nil {
 		t.Fatal("want error for unexpected upgrade args, got nil")
 	}
@@ -1759,7 +1757,7 @@ func TestRunUpgrade_UnexpectedArgs(t *testing.T) {
 // 없이 그냥 파일명만 넘긴 경우)를 침묵 수용하면 안 된다(리뷰 Fix Round 3, item 4).
 func TestRunStats_UnexpectedPositionalArg(t *testing.T) {
 	var out, errOut bytes.Buffer
-	err := Run(context.Background(), "stats", []string{"provider.jsonl"}, t.TempDir(), t.TempDir(), "0.0.1-dev", false, "", &out, &errOut)
+	err := Run(context.Background(), "stats", []string{"provider.jsonl"}, t.TempDir(), t.TempDir(), "0.0.1-dev", &out, &errOut)
 	if err == nil {
 		t.Fatal("want error for unexpected positional arg, got nil")
 	}
@@ -1783,7 +1781,7 @@ func TestRunStats_Provider_ContextCanceled(t *testing.T) {
 	cancel()
 
 	var out, errOut bytes.Buffer
-	err := Run(ctx, "stats", []string{"--provider", path}, t.TempDir(), t.TempDir(), "0.0.1-dev", false, "", &out, &errOut)
+	err := Run(ctx, "stats", []string{"--provider", path}, t.TempDir(), t.TempDir(), "0.0.1-dev", &out, &errOut)
 	if err == nil {
 		t.Fatal("want error for canceled context, got nil")
 	}
@@ -1800,7 +1798,7 @@ func TestRunDoctor_StoreRootDeepMissingParents_Writable(t *testing.T) {
 	projectRoot := t.TempDir()
 
 	var buf bytes.Buffer
-	if err := runDoctor(context.Background(), &buf, storeRoot, projectRoot, "0.0.1-dev", false); err != nil {
+	if err := runDoctor(context.Background(), &buf, storeRoot, projectRoot, "0.0.1-dev"); err != nil {
 		t.Fatalf("runDoctor err=%v out=%s", err, buf.String())
 	}
 	if !strings.Contains(buf.String(), "[1] store-root: exists=false writable=true") {
@@ -1829,7 +1827,7 @@ func TestRunDoctor_StoreRootAncestorIsFile_Rejected(t *testing.T) {
 	projectRoot := t.TempDir()
 
 	var buf bytes.Buffer
-	err := runDoctor(context.Background(), &buf, storeRoot, projectRoot, "0.0.1-dev", false)
+	err := runDoctor(context.Background(), &buf, storeRoot, projectRoot, "0.0.1-dev")
 	if err == nil {
 		t.Fatal("want error — store-root의 중간 조상이 비디렉터리 파일")
 	}
@@ -1851,7 +1849,7 @@ func TestRunDoctor_StoreRootIsFile_Rejected(t *testing.T) {
 	projectRoot := t.TempDir()
 
 	var buf bytes.Buffer
-	err := runDoctor(context.Background(), &buf, storeRoot, projectRoot, "0.0.1-dev", false)
+	err := runDoctor(context.Background(), &buf, storeRoot, projectRoot, "0.0.1-dev")
 	if err == nil {
 		t.Fatal("want error — store-root path is an existing non-directory file")
 	}
@@ -1892,7 +1890,7 @@ func TestRunSessionExport_JSONLRoundTrip(t *testing.T) {
 
 	var out, errOut bytes.Buffer
 	args := []string{"export", "--project", projectRoot, "--worktree", canon.WorktreeID}
-	if err := Run(context.Background(), "session", args, storeRoot, projectRoot, "0.0.1-dev", false, "", &out, &errOut); err != nil {
+	if err := Run(context.Background(), "session", args, storeRoot, projectRoot, "0.0.1-dev", &out, &errOut); err != nil {
 		t.Fatalf("Run session export err=%v stderr=%s", err, errOut.String())
 	}
 
@@ -1946,7 +1944,7 @@ func TestRunSessionExport_WorktreeContract(t *testing.T) {
 
 		var out, errOut bytes.Buffer
 		args := []string{"export", "--project", projectRoot}
-		if err := Run(context.Background(), "session", args, storeRoot, projectRoot, "0.0.1-dev", false, "", &out, &errOut); err == nil {
+		if err := Run(context.Background(), "session", args, storeRoot, projectRoot, "0.0.1-dev", &out, &errOut); err == nil {
 			t.Fatalf("want error for ambiguous worktree, got nil (out=%s)", out.String())
 		}
 		for _, wid := range []string{"wt-a", "wt-b"} {
@@ -1974,7 +1972,7 @@ func TestRunSessionExport_WorktreeContract(t *testing.T) {
 
 		var out, errOut bytes.Buffer
 		args := []string{"export", "--project", projectRoot}
-		if err := Run(context.Background(), "session", args, storeRoot, projectRoot, "0.0.1-dev", false, "", &out, &errOut); err != nil {
+		if err := Run(context.Background(), "session", args, storeRoot, projectRoot, "0.0.1-dev", &out, &errOut); err != nil {
 			t.Fatalf("Run session export(single worktree, no --worktree) err=%v stderr=%s", err, errOut.String())
 		}
 	})
@@ -1988,7 +1986,7 @@ func TestRunDoctor_SessionItems(t *testing.T) {
 		storeRoot := t.TempDir()
 		projectRoot := t.TempDir()
 		var buf bytes.Buffer
-		if err := runDoctor(context.Background(), &buf, storeRoot, projectRoot, "0.0.1-dev", false); err != nil {
+		if err := runDoctor(context.Background(), &buf, storeRoot, projectRoot, "0.0.1-dev"); err != nil {
 			t.Fatalf("runDoctor err=%v out=%s", err, buf.String())
 		}
 		out := buf.String()
@@ -2021,7 +2019,7 @@ func TestRunDoctor_SessionItems(t *testing.T) {
 		}
 
 		var buf bytes.Buffer
-		if err := runDoctor(context.Background(), &buf, storeRoot, projectRoot, "0.0.1-dev", false); err != nil {
+		if err := runDoctor(context.Background(), &buf, storeRoot, projectRoot, "0.0.1-dev"); err != nil {
 			t.Fatalf("runDoctor err=%v out=%s", err, buf.String())
 		}
 		out := buf.String()
@@ -2058,7 +2056,7 @@ func TestRunDoctor_SessionItems(t *testing.T) {
 		}
 
 		var buf bytes.Buffer
-		err = runDoctor(context.Background(), &buf, storeRoot, projectRoot, "0.0.1-dev", false)
+		err = runDoctor(context.Background(), &buf, storeRoot, projectRoot, "0.0.1-dev")
 		if err == nil {
 			t.Fatalf("want error(진단 실패 항목 존재), got nil: %s", buf.String())
 		}
@@ -2102,7 +2100,7 @@ func TestDoctorEmptyExcludesSubagentLifecycle(t *testing.T) {
 	}
 
 	var buf bytes.Buffer
-	if err := runDoctor(context.Background(), &buf, storeRoot, projectRoot, "0.0.1-dev", false); err != nil {
+	if err := runDoctor(context.Background(), &buf, storeRoot, projectRoot, "0.0.1-dev"); err != nil {
 		t.Fatalf("runDoctor err=%v out=%s", err, buf.String())
 	}
 	if !strings.Contains(buf.String(), "sessions=2 (empty=1)") {
@@ -2170,7 +2168,7 @@ func TestRunSessionRecover_HappyPath(t *testing.T) {
 
 	var out, errOut bytes.Buffer
 	args := []string{"recover", "--project", projectRoot, "--worktree", canon.WorktreeID}
-	if err := Run(context.Background(), "session", args, storeRoot, projectRoot, "0.0.1-dev", false, "", &out, &errOut); err != nil {
+	if err := Run(context.Background(), "session", args, storeRoot, projectRoot, "0.0.1-dev", &out, &errOut); err != nil {
 		t.Fatalf("Run session recover err=%v stderr=%s", err, errOut.String())
 	}
 	if out.Len() != 0 {
@@ -2202,7 +2200,7 @@ func TestRunSessionRecover_ServerRunning_RejectsImmediately(t *testing.T) {
 
 	var out, errOut bytes.Buffer
 	args := []string{"recover", "--project", projectRoot, "--worktree", canon.WorktreeID}
-	err = Run(context.Background(), "session", args, storeRoot, projectRoot, "0.0.1-dev", false, "", &out, &errOut)
+	err = Run(context.Background(), "session", args, storeRoot, projectRoot, "0.0.1-dev", &out, &errOut)
 	if !errors.Is(err, session.ErrLeaseHeld) {
 		t.Fatalf("err=%v want session.ErrLeaseHeld (out=%s stderr=%s)", err, out.String(), errOut.String())
 	}
@@ -2258,7 +2256,7 @@ func TestRunSessionRecover_PublishInterrupted_DelegatesDespiteMissingDB(t *testi
 	// 3) CLI recover — session.db 부재에도 위임·완료해야 한다.
 	var out, errOut bytes.Buffer
 	args := []string{"recover", "--project", projectRoot, "--worktree", canon.WorktreeID}
-	if err := Run(context.Background(), "session", args, storeRoot, projectRoot, "0.0.1-dev", false, "", &out, &errOut); err != nil {
+	if err := Run(context.Background(), "session", args, storeRoot, projectRoot, "0.0.1-dev", &out, &errOut); err != nil {
 		t.Fatalf("Run session recover err=%v stderr=%s", err, errOut.String())
 	}
 	if !strings.Contains(errOut.String(), "인양 완료") {
@@ -2299,7 +2297,7 @@ func TestRecover_UnknownWorktreeListsCandidates(t *testing.T) {
 
 	var out, errOut bytes.Buffer
 	args := []string{"recover", "--project", projectRoot, "--worktree", "nonexistent-wid"}
-	err = Run(context.Background(), "session", args, storeRoot, projectRoot, "0.0.1-dev", false, "", &out, &errOut)
+	err = Run(context.Background(), "session", args, storeRoot, projectRoot, "0.0.1-dev", &out, &errOut)
 	if err == nil {
 		t.Fatal("want error for nonexistent worktree id")
 	}
@@ -2406,7 +2404,7 @@ func TestPurgeHookOnlyComboRejected(t *testing.T) {
 // 단정한다. 버전은 runDoctor에 넘긴 ver로 스레딩하고 픽스처 marker도 같은 ver로 조립해([9]식
 // marker≠version 불일치 문구 회피) 0.9.0 하드코딩 없이 범프 후에도 유효하게 유지한다.
 // write — 픽스처 파일 기록 테스트 헬퍼. 원래 TestDoctorCodexMCPLine의 지역 클로저였고,
-// D83의 [20]·--fix 테스트가 같은 것을 필요로 해 파일 수준으로 올렸다.
+// [20]의 잔존 감지 테스트가 같은 것을 필요로 해 파일 수준으로 올렸다.
 func write(t *testing.T, path string, data []byte) {
 	t.Helper()
 	if err := os.WriteFile(path, data, 0o600); err != nil {
@@ -2414,714 +2412,40 @@ func write(t *testing.T, path string, data []byte) {
 	}
 }
 
-func TestDoctorCodexMCPLine(t *testing.T) {
-	const ver = "9.9.9-test" // 바이너리 기본 version과 무관한 합성값 — doctor가 인자 version을 쓰는지 검증
-	selfHooks, err := mergeCodexHooks(nil, buildCodexHookCommand(false, "", false), hookMarker(ver), true, true)
-	if err != nil {
-		t.Fatalf("selfHooks 조립: %v", err)
-	}
-	cases := []struct {
-		name        string
-		setup       func(t *testing.T, codexHome, projectRoot string)
-		wantContain []string
-		wantAbsent  []string
-	}{
-		{
-			name:        "① config.toml 부재 → 미사용/미설치",
-			setup:       func(t *testing.T, codexHome, projectRoot string) {},
-			wantContain: []string{"[16] codex: config.toml 없음 — 미사용/미설치"},
-			wantAbsent:  []string{"[16] warning:"},
-		},
-		{
-			name: "② marker 존재 + 테이블 부재 → 소멸 시그니처 경고",
-			setup: func(t *testing.T, codexHome, projectRoot string) {
-				write(t, filepath.Join(codexHome, "config.toml"), []byte("[model]\nname = \"gpt\"\n"))
-				write(t, filepath.Join(codexHome, "hooks.json"), selfHooks)
-			},
-			wantContain: []string{"[16] warning:", "hook install --codex"},
-		},
-		{
-			name: "③ 테이블 부재·marker 부재 → 정보 라인",
-			setup: func(t *testing.T, codexHome, projectRoot string) {
-				write(t, filepath.Join(codexHome, "config.toml"), []byte("[model]\nname = \"gpt\"\n"))
-			},
-			wantContain: []string{"hook install --codex"},
-			wantAbsent:  []string{"[16] warning:"},
-		},
-		{
-			name: "④ 테이블 존재 + marker 존재(user) → 테이블=존재·project 미등록",
-			setup: func(t *testing.T, codexHome, projectRoot string) {
-				write(t, filepath.Join(codexHome, "config.toml"), []byte(ctrTableFixture))
-				write(t, filepath.Join(codexHome, "hooks.json"), selfHooks) // user 레벨만 등록
-			},
-			wantContain: []string{"테이블=존재", "등록됨(", "project=미등록"},
-			wantAbsent:  []string{"[16] warning:"},
-		},
-		{
-			name: "⑤ 관리 테이블 중복 정의 → 수동 확인 경고",
-			setup: func(t *testing.T, codexHome, projectRoot string) {
-				write(t, filepath.Join(codexHome, "config.toml"),
-					[]byte("[mcp_servers.ctr]\n[x]\n[mcp_servers.ctr]\n"))
-			},
-			wantContain: []string{"[16] warning:", "수동 확인"},
-		},
-		// 아래 셋은 D85의 **사유 인쇄** 감시선이다. ⑤는 "수동 확인"만 보므로 사유가 실리지 않는
-		// 옛 문면에서도 통과한다 — 사유마다 필요한 조치가 다르다는 것이 D85의 요구다.
-		{
-			name: "⑥ 이상 — 중복 헤더 사유",
-			setup: func(t *testing.T, codexHome, projectRoot string) {
-				write(t, filepath.Join(codexHome, "config.toml"), []byte("[mcp_servers.ctr]\n[x]\n[mcp_servers.ctr]\n"))
-			},
-			wantContain: []string{"테이블=이상", "헤더가 둘 이상"},
-		},
-		{
-			name: "⑦ 이상 — 정규화 불가 키 사유",
-			setup: func(t *testing.T, codexHome, projectRoot string) {
-				write(t, filepath.Join(codexHome, "config.toml"), []byte("[mcp_servers.ctr]\n\"comm\\u0061nd\" = \"x\"\n"))
-			},
-			wantContain: []string{"테이블=이상", "이스케이프 표기"},
-		},
-		{
-			// wantAbsent가 F6의 감시선이다 — 이 파일은 헤더가 **하나뿐**이므로 "하나만 남기고
-			// 지우세요"는 존재하지 않는 조치를 지시한다. 구간 밖 충돌을 중복 헤더로 접으면 물린다.
-			name: "⑧ 구간 밖 충돌 — 그 상태에 맞는 사유",
-			setup: func(t *testing.T, codexHome, projectRoot string) {
-				write(t, filepath.Join(codexHome, "config.toml"),
-					[]byte("[mcp_servers.ctr]\ncommand = \"context-router\"\n[mcp_servers.ctr.tools.ctr_execute]\napproval_mode = \"never\"\n"))
-			},
-			wantContain: []string{"테이블=이상", "관리 테이블 밖에"},
-			wantAbsent:  []string{"헤더가 둘 이상"},
-		},
-	}
-	for _, c := range cases {
-		t.Run(c.name, func(t *testing.T) {
-			codexHome := t.TempDir()
-			t.Setenv("CODEX_HOME", codexHome)
-			storeRoot := t.TempDir()
-			projectRoot := t.TempDir()
-			c.setup(t, codexHome, projectRoot)
-			var buf bytes.Buffer
-			if err := runDoctor(context.Background(), &buf, storeRoot, projectRoot, ver, false); err != nil {
-				t.Fatalf("runDoctor err=%v out=%s", err, buf.String())
-			}
-			out := buf.String()
-			for _, want := range c.wantContain {
-				if !strings.Contains(out, want) {
-					t.Errorf("출력에 %q 없음:\n%s", want, out)
-				}
-			}
-			for _, absent := range c.wantAbsent {
-				if strings.Contains(out, absent) {
-					t.Errorf("출력에 %q 있으면 안 됨:\n%s", absent, out)
-				}
-			}
-			if !strings.Contains(out, "[17] build: ") { // D56 — [16] 직후 build 라인(ver 하류)
-				t.Errorf("[17] build 라인 없음:\n%s", out)
-			}
-		})
-	}
-}
-
-// TestDoctorMCPMarkerLine — D83 신설 검사(§2-13). 감지원이 **먼저** 물려야 --fix가 고칠
-// 대상을 안다: [9]는 .claude/settings.json의 훅 그룹만 읽고, [16]의 버전 비교는 hooks.json에서
-// 뽑은 값이며, config.toml은 존재·부재·이상만 읽는다. .mcp.json을 읽는 doctor 항목은 없었다.
-// D82가 버전을 MCP 등록물로 옮겼으므로 이 검사가 없으면 --fix에 감지원이 하나도 남지 않는다.
-func TestDoctorMCPMarkerLine(t *testing.T) {
-	cases := []struct {
-		name        string
-		setup       func(t *testing.T, codexHome, projectRoot string)
-		wantContain []string
-		wantAbsent  []string
-	}{
-		{
-			name:        "① 두 등록물 모두 부재",
-			setup:       func(t *testing.T, codexHome, projectRoot string) {},
-			wantContain: []string{"[20] mcp markers: .mcp.json=없음 codex=없음"},
-			wantAbsent:  []string{"[20] warning:"},
-		},
-		{
-			name: "② 두 등록물 모두 현재 버전 — 경고 없음",
-			setup: func(t *testing.T, codexHome, projectRoot string) {
-				var out bytes.Buffer
-				if err := runHookInstall(nil, t.TempDir(), "", false, projectRoot, "0.15.0", &out); err != nil {
-					t.Fatal(err)
-				}
-				if err := runHookInstall([]string{"--codex", "--user"}, "", "", false, projectRoot, "0.15.0", &out); err != nil {
-					t.Fatal(err)
-				}
-			},
-			wantContain: []string{"[20] mcp markers: .mcp.json=marker 0.15.0 codex=marker 0.15.0"},
-			wantAbsent:  []string{"[20] warning:"},
-		},
-		{
-			name: "③ 구 버전 표식 — 드리프트 경고",
-			setup: func(t *testing.T, codexHome, projectRoot string) {
-				var out bytes.Buffer
-				if err := runHookInstall(nil, t.TempDir(), "", false, projectRoot, "0.14.0", &out); err != nil {
-					t.Fatal(err)
-				}
-			},
-			wantContain: []string{"marker 0.14.0", "≠0.15.0", "[20] warning:", "doctor --fix"},
-		},
-		{
-			name: "④ 무버전 표식 — 버전 미상도 드리프트다(hostSnippet 붙여넣기 경로)",
-			setup: func(t *testing.T, codexHome, projectRoot string) {
-				write(t, filepath.Join(codexHome, "config.toml"),
-					[]byte("[mcp_servers.ctr]\ncommand = \"context-router\"\n[mcp_servers.ctr.env]\nCTR_MANAGED = \"context-router\"\n"))
-			},
-			wantContain: []string{"codex=marker 버전미상", "[20] warning:"},
-		},
-		{
-			name: "⑤ 우리 표식이 아니면 고칠 대상이 아니다",
-			setup: func(t *testing.T, codexHome, projectRoot string) {
-				write(t, filepath.Join(codexHome, "config.toml"),
-					[]byte("[mcp_servers.ctr]\ncommand = \"other\"\n[mcp_servers.ctr.env]\nCTR_MANAGED = \"other-tool/1.0\"\n"))
-			},
-			wantContain: []string{"codex=미등록"},
-			wantAbsent:  []string{"[20] warning:"},
-		},
-		{
-			// 표식은 없지만 command가 우리 것인 테이블은 D80의 **인수 대상**이라 install도
-			// --fix도 표식을 채운다. 그것을 "미등록"으로 보고하면 감지와 고침이 어긋난다 —
-			// 검사가 고칠 것이 없다고 말한 자리에서 --fix가 파일을 바꾸게 된다.
-			name: "⑥ 표식 없는 우리 테이블 — 인수 대상이므로 드리프트다",
-			setup: func(t *testing.T, codexHome, projectRoot string) {
-				write(t, filepath.Join(codexHome, "config.toml"),
-					[]byte("[mcp_servers.ctr]\ncommand = \"context-router\"\nargs = []\n"))
-			},
-			wantContain: []string{"codex=표식없음", "[20] warning:", "doctor --fix"},
-		},
-	}
-	for _, c := range cases {
-		t.Run(c.name, func(t *testing.T) {
-			codexHome := t.TempDir()
-			t.Setenv("CODEX_HOME", codexHome)
-			projectRoot := t.TempDir()
-			c.setup(t, codexHome, projectRoot)
-			var buf bytes.Buffer
-			if err := runDoctor(context.Background(), &buf, t.TempDir(), projectRoot, "0.15.0", false); err != nil {
-				t.Fatalf("runDoctor err=%v out=%s", err, buf.String())
-			}
-			out := buf.String()
-			for _, want := range c.wantContain {
-				if !strings.Contains(out, want) {
-					t.Errorf("출력에 %q 없음:\n%s", want, out)
-				}
-			}
-			for _, absent := range c.wantAbsent {
-				if strings.Contains(out, absent) {
-					t.Errorf("출력에 %q 있으면 안 됨:\n%s", absent, out)
-				}
-			}
-			// 항목 번호는 [20]이다 — 기존 번호를 밀지 않는다([16]·[17] 문면에 묶인 테스트가 있다).
-			if !strings.Contains(out, "[19] permissions:") || !strings.Contains(out, "[20] mcp markers:") {
-				t.Errorf("[19] 뒤에 [20]이 오지 않는다:\n%s", out)
-			}
-		})
-	}
-}
-
-// TestDoctorFix — D83 --fix(§2-13). 드리프트를 해소하고, 드리프트 없는 픽스처에서는 무변경이며,
-// 파일이 없으면 만들지 않고 안내만 낸다(doctor no-create). **파일이 있어도 우리 소유로 확인된
-// 등록물이 없으면 만들지 않는다** — no-create의 범위가 파일이 아니라 등록물이라는 것이 D83이고,
-// 그래야 [20]이 "미등록"으로 보고하는 상태와 --fix의 대상이 일치한다. 종료코드 계약도 바뀌지
-// 않는다 — 마커 드리프트와 그 고침은 실패 항목 수 계산에 들어가지 않는다([16] 경고와 같은 취급).
-func TestDoctorFix(t *testing.T) {
-	codexHome := t.TempDir()
-	t.Setenv("CODEX_HOME", codexHome)
-	projectRoot := t.TempDir()
-	var iout bytes.Buffer
-	if err := runHookInstall(nil, t.TempDir(), "", false, projectRoot, "0.14.0", &iout); err != nil {
-		t.Fatal(err)
-	}
-	if err := runHookInstall([]string{"--codex", "--user"}, "", "", false, projectRoot, "0.14.0", &iout); err != nil {
-		t.Fatal(err)
-	}
-	mcpPath := mcpConfigPath(projectRoot)
-	cfgPath := filepath.Join(codexHome, "config.toml")
-
-	var buf bytes.Buffer
-	if err := runDoctor(context.Background(), &buf, t.TempDir(), projectRoot, "0.15.0", true); err != nil {
-		t.Fatalf("runDoctor --fix err=%v out=%s", err, buf.String())
-	}
-	mb, _ := os.ReadFile(mcpPath)
-	if !strings.Contains(string(mb), `"__ctrManaged": "context-router/0.15.0"`) {
-		t.Errorf(".mcp.json 표식이 고쳐지지 않았다:\n%s", mb)
-	}
-	// **.mcp.json 갈래는 백업을 지나지 않는다** — config.toml과 달리 프로젝트 루트에 있어
-	// 버전 관리 아래이고, 서버의 env 블록에 자격증명이 실리는 것이 흔하다(설계서 §4).
-	if _, err := os.Stat(mcpPath + ".bak"); !errors.Is(err, os.ErrNotExist) {
-		t.Errorf("--fix가 .mcp.json 옆에 백업을 남겼다(stat err=%v)", err)
-	}
-	cb, _ := os.ReadFile(cfgPath)
-	if !strings.Contains(string(cb), `CTR_MANAGED = "context-router/0.15.0"`) {
-		t.Errorf("config.toml 표식이 고쳐지지 않았다:\n%s", cb)
-	}
-	if _, err := os.Stat(cfgPath + ".bak"); err != nil {
-		t.Errorf("--fix가 백업을 남기지 않았다: %v", err)
-	}
-
-	// 드리프트 없는 상태의 재실행은 무변경이다.
-	mb2Before, _ := os.ReadFile(mcpPath)
-	cb2Before, _ := os.ReadFile(cfgPath)
-	var buf2 bytes.Buffer
-	if err := runDoctor(context.Background(), &buf2, t.TempDir(), projectRoot, "0.15.0", true); err != nil {
-		t.Fatalf("runDoctor --fix 2: %v", err)
-	}
-	mb2After, _ := os.ReadFile(mcpPath)
-	cb2After, _ := os.ReadFile(cfgPath)
-	if !bytes.Equal(mb2Before, mb2After) || !bytes.Equal(cb2Before, cb2After) {
-		t.Errorf("드리프트 없는 --fix가 파일을 바꿨다")
-	}
-
-	// no-create: 파일이 없으면 만들지 않고 안내만 낸다.
-	emptyHome := t.TempDir()
-	t.Setenv("CODEX_HOME", emptyHome)
-	emptyProj := t.TempDir()
-	var buf3 bytes.Buffer
-	if err := runDoctor(context.Background(), &buf3, t.TempDir(), emptyProj, "0.15.0", true); err != nil {
-		t.Fatalf("runDoctor --fix(no file): %v", err)
-	}
-	if _, err := os.Stat(mcpConfigPath(emptyProj)); !errors.Is(err, os.ErrNotExist) {
-		t.Errorf("--fix가 없던 .mcp.json을 만들었다")
-	}
-	if _, err := os.Stat(filepath.Join(emptyHome, "config.toml")); !errors.Is(err, os.ErrNotExist) {
-		t.Errorf("--fix가 없던 config.toml을 만들었다")
-	}
-	if !strings.Contains(buf3.String(), "[20] fix: 대상 파일이 없어") {
-		t.Errorf("no-create 안내가 없다:\n%s", buf3.String())
-	}
-
-	// no-create의 범위는 파일이 아니라 **등록물**이다(D83): 파일은 있어도 우리 소유로
-	// 확인된 등록물이 없으면 만들지 않고 hook install을 안내한다. 이 상태를 [20]은
-	// "미등록"으로 보고하므로 감지와 고침의 대상이 정확히 일치한다.
-	otherHome := t.TempDir()
-	t.Setenv("CODEX_HOME", otherHome)
-	otherProj := t.TempDir()
-	otherCfg := filepath.Join(otherHome, "config.toml")
-	write(t, otherCfg, []byte("[model]\nname = \"gpt\"\n"))
-	otherMCP := mcpConfigPath(otherProj)
-	write(t, otherMCP, []byte("{\n  \"mcpServers\": {}\n}\n"))
-	var buf4 bytes.Buffer
-	if err := runDoctor(context.Background(), &buf4, t.TempDir(), otherProj, "0.15.0", true); err != nil {
-		t.Fatalf("runDoctor --fix(미등록): %v", err)
-	}
-	if cb4, _ := os.ReadFile(otherCfg); strings.Contains(string(cb4), "[mcp_servers.ctr]") {
-		t.Errorf("--fix가 없던 관리 테이블을 만들었다:\n%s", cb4)
-	}
-	if mb4, _ := os.ReadFile(otherMCP); strings.Contains(string(mb4), ctrMCPServerName) {
-		t.Errorf("--fix가 없던 .mcp.json 항목을 만들었다:\n%s", mb4)
-	}
-	if !strings.Contains(buf4.String(), "hook install") {
-		t.Errorf("미등록 안내가 없다:\n%s", buf4.String())
-	}
-}
-
-// TestCodexRegistrationVerdict — D85(§2-2). 감지와 고침이 같은 판정원을 쓰는지 본다. 권고
-// 술어는 --fix가 실제로 기입하는 조건 전체다: mcpWritten AND 테이블 실존 AND Changed.
-// Changed 하나로 줄이면 "파일은 있고 관리 테이블만 없는" 상태에서 install이 append 경로로
-// Changed=true를 내는데 --fix는 no-create로 거절하므로 오권고가 된다.
-func TestCodexRegistrationVerdict(t *testing.T) {
-	const ver = "0.16.0"
-	ours := "[mcp_servers.ctr]\ncommand = \"context-router\"\nargs = [\"--enable\", \"ingest,net\"]\n" +
-		"enabled_tools = [\"ctr_search\", \"ctr_index\", \"ctr_fetch_and_index\"]\n" +
-		"[mcp_servers.ctr.env]\n" + codexMarkerKey + " = \"context-router/"
-	cases := []struct {
-		name      string
-		cfg       string
-		wantFix   bool
-		wantState codexMCPState
-		wantTable bool
-	}{
-		{
-			name:      "관리 테이블 없음(파일은 있다) — 권고하지 않는다",
-			cfg:       "model = \"gpt\"\n",
-			wantFix:   false,
-			wantState: mcpWritten,
-			wantTable: false,
-		},
-		{
-			name:      "현재 버전 — 권고하지 않는다",
-			cfg:       ours + ver + "\"\n",
-			wantFix:   false,
-			wantState: mcpWritten,
-			wantTable: true,
-		},
-		{
-			name:      "구 버전 표식 — 권고한다",
-			cfg:       ours + "0.15.0\"\n",
-			wantFix:   true,
-			wantState: mcpWritten,
-			wantTable: true,
-		},
-		{
-			name:      "남의 테이블 — 권고하지 않는다",
-			cfg:       "[mcp_servers.ctr]\ncommand = \"other\"\n[mcp_servers.ctr.env]\n" + codexMarkerKey + " = \"other-tool/1.0\"\n",
-			wantFix:   false,
-			wantState: mcpExistingHeader,
-			wantTable: true,
-		},
-		{
-			// 두 케이스의 wantTable은 **true**다(실측). 구간 판정이 실패했거나 충돌이어도
-			// codexManagedSpans가 헤더 자체는 찾았기 때문이다. 구속력 있는 단정은 shouldFix()가
-			// 거짓이라는 것이며, 권고 술어가 State를 먼저 보므로 그 두 상태에서 TableFound가
-			// 무엇이든 권고하지 않는다.
-			name:      "구간 밖 충돌 — 권고하지 않는다",
-			cfg:       ours + "0.15.0\"\n[mcp_servers.ctr.tools.ctr_execute]\napproval_mode = \"never\"\n",
-			wantFix:   false,
-			wantState: mcpConflict,
-			wantTable: true,
-		},
-		{
-			name:      "구간 판정 불가 — 권고하지 않는다",
-			cfg:       "[mcp_servers.ctr]\n[x]\n[mcp_servers.ctr]\n",
-			wantFix:   false,
-			wantState: mcpMarkerAnomaly,
-			wantTable: true,
-		},
-		{
-			name: "사용자가 넓힌 enabled_tools + 현재 버전 — 권고하지 않는다",
-			cfg: "[mcp_servers.ctr]\ncommand = \"context-router\"\nargs = [\"--enable\", \"ingest\"]\n" +
-				"enabled_tools = [\"ctr_search\", \"ctr_index\", \"ctr_execute\"]\n" +
-				"[mcp_servers.ctr.env]\n" + codexMarkerKey + " = \"context-router/" + ver + "\"\n",
-			wantFix:   false,
-			wantState: mcpWritten,
-			wantTable: true,
-		},
-	}
-	for _, c := range cases {
-		t.Run(c.name, func(t *testing.T) {
-			v := codexRegistrationVerdict([]byte(c.cfg), ver)
-			if v.State != c.wantState {
-				t.Errorf("State=%d want %d", v.State, c.wantState)
-			}
-			if v.TableFound != c.wantTable {
-				t.Errorf("TableFound=%v want %v", v.TableFound, c.wantTable)
-			}
-			if v.shouldFix() != c.wantFix {
-				t.Errorf("shouldFix=%v want %v (State=%d TableFound=%v Changed=%v)",
-					v.shouldFix(), c.wantFix, v.State, v.TableFound, v.Changed)
-			}
-		})
-	}
-}
-
-// TestMarkerDriftLabel — 라벨 문법의 소유자를 하나로 둔다. 문법이 여러 자리에 복제돼 있으면
-// 한 자리만 고친 변경이 표면상 어긋난 두 줄을 만든다.
-func TestMarkerDriftLabel(t *testing.T) {
-	cases := []struct{ marker, version, want string }{
-		{"context-router/0.16.0", "0.17.0", "marker 0.16.0≠0.17.0"},
-		{"context-router", "0.17.0", "marker 버전미상≠0.17.0"},
-		{"context-router/0.17.0", "0.17.0", "marker 0.17.0"},
-	}
-	for _, c := range cases {
-		if got := markerDriftLabel(c.marker, c.version); got != c.want {
-			t.Errorf("markerDriftLabel(%q,%q) = %q, want %q", c.marker, c.version, got, c.want)
-		}
-	}
-}
-
-// TestDoctorDetectFixEquivalence — D85(§2-1·§2-2). 감지와 고침을 한 표에서 함께 단정한다.
-// 경고가 --fix를 권한 모든 상태에서 --fix가 config.toml을 바꾸고, 권하지 않은 모든 상태에서
-// 바꾸지 않는다. **표가 세우는 픽스처는 Codex 갈래 한정**이다(.mcp.json을 만들지 않는다) —
-// 그쪽의 같은 등가는 TestDoctorMcpRetire* 둘이 잰다.
-func TestDoctorDetectFixEquivalence(t *testing.T) {
-	const ver = "0.16.0"
-	ours := "[mcp_servers.ctr]\ncommand = \"context-router\"\nargs = [\"--enable\", \"ingest,net\"]\n" +
-		"enabled_tools = [\"ctr_search\", \"ctr_index\", \"ctr_fetch_and_index\"]\n" +
-		"[mcp_servers.ctr.env]\n" + codexMarkerKey + " = \"context-router/"
-	cases := []struct {
-		name      string
-		cfg       string // "" = config.toml을 만들지 않는다
-		wantLabel string // [20] 라벨에 포함될 문자열
-		wantWarn  bool   // [20] warning 유무 = --fix가 바꾸는가
-	}{
-		{name: "① 파일 부재", cfg: "", wantLabel: "codex=없음", wantWarn: false},
-		{name: "② 현재 버전", cfg: ours + ver + "\"\n", wantLabel: "codex=marker " + ver, wantWarn: false},
-		{name: "③ 구 버전 표식", cfg: ours + "0.15.0\"\n", wantLabel: "≠" + ver, wantWarn: true},
-		{name: "④ 무버전 표식", cfg: "[mcp_servers.ctr]\ncommand = \"context-router\"\n[mcp_servers.ctr.env]\n" + codexMarkerKey + " = \"context-router\"\n", wantLabel: "버전미상", wantWarn: true},
-		{name: "⑤ 남의 테이블", cfg: "[mcp_servers.ctr]\ncommand = \"other\"\n[mcp_servers.ctr.env]\n" + codexMarkerKey + " = \"other-tool/1.0\"\n", wantLabel: "codex=미등록", wantWarn: false},
-		{name: "⑥ 표식 없는 우리 테이블", cfg: "[mcp_servers.ctr]\ncommand = \"context-router\"\nargs = []\n", wantLabel: "codex=표식없음", wantWarn: true},
-		{name: "⑦ 파일 존재·관리 테이블 부재", cfg: "model = \"gpt\"\n", wantLabel: "codex=미등록", wantWarn: false},
-		{name: "⑧ 구 블록 + 비표준 command", cfg: codexBlockBegin + "\n[mcp_servers.ctr]\ncommand = \"C:\\\\bin\\\\ctr.exe\"\n" + codexBlockEnd + "\n", wantLabel: "codex=구형식", wantWarn: true},
-		{name: "⑨ 구간 밖 충돌", cfg: ours + "0.15.0\"\n[mcp_servers.ctr.tools.ctr_execute]\napproval_mode = \"never\"\n", wantLabel: "codex=충돌", wantWarn: false},
-		{name: "⑩ 중복 헤더", cfg: "[mcp_servers.ctr]\n[x]\n[mcp_servers.ctr]\n", wantLabel: "codex=이상", wantWarn: false},
-		{name: "⑪ EOF 스캐너 열림", cfg: "[mcp_servers.ctr]\nk = \"\"\"\nunclosed\n", wantLabel: "codex=이상", wantWarn: false},
-		{name: "⑫ 정규화 불가 키", cfg: "[mcp_servers.ctr]\n\"comm\\u0061nd\" = \"x\"\n", wantLabel: "codex=이상", wantWarn: false},
-		{
-			name: "⑬ 사용자가 넓힌 enabled_tools",
-			cfg: "[mcp_servers.ctr]\ncommand = \"context-router\"\nargs = [\"--enable\", \"ingest\"]\n" +
-				"enabled_tools = [\"ctr_search\", \"ctr_index\", \"ctr_execute\"]\n" +
-				"[mcp_servers.ctr.env]\n" + codexMarkerKey + " = \"context-router/" + ver + "\"\n",
-			wantLabel: "codex=marker " + ver, wantWarn: false,
-		},
-		{
-			// 스펙 §2-6이 정규화 불가 키의 **두 형태**를 요구한다. ⑫는 서브테이블 형태이므로
-			// 인라인 형태를 배선 수준에서 함께 잰다 — 그 형태는 키 토큰이 env라 서브테이블
-			// 검사에 걸리지 않는 별개 경로다.
-			name:      "⑭ 정규화 불가 키(인라인 env 형태)",
-			cfg:       "[mcp_servers.ctr]\ncommand = \"context-router\"\nenv = { \"CTR_MAN\\u0041GED\" = \"context-router\" }\n",
-			wantLabel: "codex=이상", wantWarn: false,
-		},
-		{
-			// 표식은 **현재 버전**인데 형식(구 BEGIN/END 블록)이 어긋나 --fix가 파일을 바꾸는
-			// 상태다. 이 행이 두 가지를 함께 잡는다: ① 버전 접미를 shouldFix로 붙이면 같은
-			// 버전을 좌우에 둔 "0.16.0≠0.16.0"이 나온다는 것(그래서 codexVerdictLabel이 버전
-			// **비교**로 붙인다), ② 그 상태를 형식 접미로 구별한다는 것. 이 행이 없으면 두
-			// 규칙 모두 어떤 단정에도 걸리지 않는다(실측).
-			name: "⑮ 구 블록 + 현재 버전 표식 — 형식 드리프트",
-			cfg: codexBlockBegin + "\n[mcp_servers.ctr]\ncommand = \"context-router\"\n" +
-				"[mcp_servers.ctr.env]\n" + codexMarkerKey + " = \"context-router/" + ver + "\"\n" +
-				codexBlockEnd + "\n",
-			wantLabel: "codex=marker " + ver + "(형식)", wantWarn: true,
-		},
-	}
-	for _, c := range cases {
-		t.Run(c.name, func(t *testing.T) {
-			codexHome := t.TempDir()
-			t.Setenv("CODEX_HOME", codexHome)
-			cfgPath := filepath.Join(codexHome, "config.toml")
-			if c.cfg != "" {
-				write(t, cfgPath, []byte(c.cfg))
-			}
-			projectRoot := t.TempDir()
-
-			// 감지 — [20] 라벨과 경고
-			var buf bytes.Buffer
-			if err := runDoctor(context.Background(), &buf, t.TempDir(), projectRoot, ver, false); err != nil {
-				t.Fatalf("runDoctor: %v out=%s", err, buf.String())
-			}
-			out := buf.String()
-			if !strings.Contains(out, c.wantLabel) {
-				t.Errorf("라벨 %q 없음:\n%s", c.wantLabel, out)
-			}
-			// 경고는 Codex 갈래가 유일한 원인이어야 한다 — .mcp.json은 만들지 않았으므로 그쪽
-			// 라벨은 "없음"이고 경고를 내지 않는다.
-			gotWarn := strings.Contains(out, "[20] warning:")
-			if gotWarn != c.wantWarn {
-				t.Errorf("warning=%v want %v:\n%s", gotWarn, c.wantWarn, out)
-			}
-			// 이상 라벨은 세 사유를 한 값으로 묶으므로 [20]이 사유 줄을 함께 낸다(§2-7).
-			// 사유가 없으면 사용자는 install이 영구히 무변경인 이유를 알 수 없다.
-			if strings.Contains(c.wantLabel, "이상") && !strings.Contains(out, "[20] codex: ") {
-				t.Errorf("이상 라벨인데 사유 줄이 없다:\n%s", out)
-			}
-
-			// 고침 — --fix가 파일을 바꾸는가
-			if c.cfg == "" {
-				return // 부재 파일은 만들지 않는다(다른 테스트가 단정한다)
-			}
-			var fixBuf bytes.Buffer
-			if err := runDoctor(context.Background(), &fixBuf, t.TempDir(), projectRoot, ver, true); err != nil {
-				t.Fatalf("runDoctor --fix: %v out=%s", err, fixBuf.String())
-			}
-			after, rErr := os.ReadFile(cfgPath)
-			if rErr != nil {
-				t.Fatal(rErr)
-			}
-			changed := string(after) != c.cfg
-			if changed != c.wantWarn {
-				t.Errorf("--fix changed=%v인데 경고는 %v였다 — 감지와 고침이 어긋난다\n%s", changed, c.wantWarn, fixBuf.String())
-			}
-		})
-	}
-}
-
-// doctorWarningLine — [20] 경고 줄만 뽑는다(문면 단정용). 없으면 ""다.
-func doctorWarningLine(out string) string {
-	for _, ln := range strings.Split(out, "\n") {
-		if strings.HasPrefix(ln, "[20] warning:") {
-			return ln
-		}
-	}
-	return ""
-}
-
-// TestDoctorWarningAnnouncesCommandRewrite — [20] 경고는 --fix가 **command를 다시 쓴다는
-// 것**을 예고해야 한다. 경고 조건이 "표식 버전 불일치"에서 "--fix가 파일을 바꾸는가"로
-// 넓어지면서(D85) command만 고쳐 둔 등록물이 처음으로 이 권고의 대상이 됐다 — 권고를 따르면
-// 그 값이 우리 이름으로 되돌아가고, PATH에 그 이름이 없는 호스트에서는 Codex가 그 서버를
-// 기동하지 못한다. 문면이 보존되는 것(args·enabled_tools)만 열거하면 사용자는 그 손실을
-// 예상할 수 없다. 같은 테스트에서 --fix의 실제 행동을 함께 재 문면이 사실인지 확인한다.
-// t.Setenv 사용 → t.Parallel 금지.
-func TestDoctorWarningAnnouncesCommandRewrite(t *testing.T) {
-	const ver = "0.16.0"
-	codexHome := t.TempDir()
-	t.Setenv("CODEX_HOME", codexHome)
-	cfgPath := filepath.Join(codexHome, "config.toml")
-	// 표식은 현재 버전이고 command만 사용자가 고쳐 둔 등록물(PATH에 없는 바이너리를 가리킨다).
-	cfg := "[mcp_servers.ctr]\ncommand = \"C:\\\\bin\\\\context-router.exe\"\n" +
-		"[mcp_servers.ctr.env]\n" + codexMarkerKey + " = \"context-router/" + ver + "\"\n"
-	write(t, cfgPath, []byte(cfg))
-	projectRoot := t.TempDir()
-
-	var buf bytes.Buffer
-	if err := runDoctor(context.Background(), &buf, t.TempDir(), projectRoot, ver, false); err != nil {
-		t.Fatalf("runDoctor: %v out=%s", err, buf.String())
-	}
-	warn := doctorWarningLine(buf.String())
-	if warn == "" {
-		t.Fatalf("형식 드리프트인데 경고가 없다:\n%s", buf.String())
-	}
-	// 되쓰기 **방향**까지 한 어구로 결속한다 — command와 우리 이름이 줄 어딘가에 있는지만 보면
-	// "command는 보존합니다" 같은 **반대 뜻** 문면도 통과해 감시선이 물지 않는다.
-	if !strings.Contains(warn, "command는 \""+hookBinaryName+"\"로 다시 씁니다") {
-		t.Errorf("경고가 command 되쓰기를 예고하지 않는다:\n%s", warn)
-	}
-
-	// 문면이 사실인가 — --fix는 실제로 command를 우리 이름으로 되쓴다(D86 확정 동작).
-	var fixBuf bytes.Buffer
-	if err := runDoctor(context.Background(), &fixBuf, t.TempDir(), projectRoot, ver, true); err != nil {
-		t.Fatalf("runDoctor --fix: %v out=%s", err, fixBuf.String())
-	}
-	after, err := os.ReadFile(cfgPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(string(after), "command = \""+hookBinaryName+"\"") {
-		t.Errorf("--fix가 command를 되쓰지 않았다 — 경고 문면과 어긋난다:\n%s", after)
-	}
-}
-
-// TestDoctorNonStringMarkerIsDrift — 표식 키의 **값이 문자열이 아닌** 등록물은 드리프트다.
-// 종전에는 setInlineEnvMarker가 그 줄을 보존해 표식이 영영 현재 값이 되지 못했고, 그래서
-// Changed가 거짓이라 [20]은 "표식없음"을 경고 없이 내면서 같은 실행의 --fix가 "이미 현재
-// 형식·버전입니다"라고 보고했다 — 두 줄이 서로 모순이고 사용자에게 다음 조치가 없었다.
-// t.Setenv 사용 → t.Parallel 금지.
-func TestDoctorNonStringMarkerIsDrift(t *testing.T) {
-	const ver = "0.16.0"
-	codexHome := t.TempDir()
-	t.Setenv("CODEX_HOME", codexHome)
-	cfgPath := filepath.Join(codexHome, "config.toml")
-	cfg := "[mcp_servers.ctr]\ncommand = \"context-router\"\n" +
-		"env = { " + codexMarkerKey + " = 0 }\n"
-	write(t, cfgPath, []byte(cfg))
-	projectRoot := t.TempDir()
-
-	var buf bytes.Buffer
-	if err := runDoctor(context.Background(), &buf, t.TempDir(), projectRoot, ver, false); err != nil {
-		t.Fatalf("runDoctor: %v out=%s", err, buf.String())
-	}
-	if doctorWarningLine(buf.String()) == "" {
-		t.Errorf("판독되지 않는 표식인데 경고가 없다:\n%s", buf.String())
-	}
-
-	var fixBuf bytes.Buffer
-	if err := runDoctor(context.Background(), &fixBuf, t.TempDir(), projectRoot, ver, true); err != nil {
-		t.Fatalf("runDoctor --fix: %v out=%s", err, fixBuf.String())
-	}
-	if strings.Contains(fixBuf.String(), "이미 현재 형식·버전입니다") {
-		t.Errorf("경고를 낸 실행이 무변경을 보고했다:\n%s", fixBuf.String())
-	}
-	after, err := os.ReadFile(cfgPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(string(after), codexMarkerKey+" = \""+hookMarker(ver)+"\"") {
-		t.Errorf("--fix가 표식을 관리 표식 문자열로 교체하지 않았다:\n%s", after)
-	}
-
-	// 재실행 무변경 — 드리프트로 올린 상태가 매 실행 다시 기입되면 D84 단일 백업 슬롯이
-	// 2회차에 원본을 잃는다.
-	before, _ := os.ReadFile(cfgPath)
-	var againBuf bytes.Buffer
-	if err := runDoctor(context.Background(), &againBuf, t.TempDir(), projectRoot, ver, true); err != nil {
-		t.Fatalf("runDoctor --fix 2: %v", err)
-	}
-	if again, _ := os.ReadFile(cfgPath); !bytes.Equal(before, again) {
-		t.Errorf("고친 뒤 재실행이 파일을 또 바꿨다:\n%s", again)
-	}
-}
-
-// TestDoctorFixMigratesOldFormat — X6(§2-9). --fix가 v0.14 구 형식을 실제 파일에서 1회
-// 변환하는지, args가 보존되는지(D86), 재실행이 무변경이고 .bak이 원본을 유지하는지.
-func TestDoctorFixMigratesOldFormat(t *testing.T) {
-	codexHome := t.TempDir()
-	t.Setenv("CODEX_HOME", codexHome)
-	cfgPath := filepath.Join(codexHome, "config.toml")
-	old := codexBlockBegin + "\n" +
-		"[mcp_servers.ctr]\n" +
-		"command = \"context-router\"\n" +
-		"args = [\"--enable\", \"ingest\"]\n" +
-		"enabled_tools = [\"ctr_search\", \"ctr_index\", \"ctr_execute\"]\n" +
-		codexBlockEnd + "\n"
-	write(t, cfgPath, []byte(old))
-	projectRoot := t.TempDir()
-
-	var buf bytes.Buffer
-	if err := runDoctor(context.Background(), &buf, t.TempDir(), projectRoot, "0.16.0", true); err != nil {
-		t.Fatalf("--fix: %v out=%s", err, buf.String())
-	}
-	after1, err := os.ReadFile(cfgPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	got := string(after1)
-	if strings.Contains(got, codexBlockBegin) || strings.Contains(got, codexBlockEnd) {
-		t.Errorf("마커가 남아 있다:\n%s", got)
-	}
-	if !strings.Contains(got, codexMarkerKey+" = \""+hookMarker("0.16.0")+"\"") {
-		t.Errorf("표식이 기입되지 않았다:\n%s", got)
-	}
-	// D86 — 사용자가 넓힌 enabled_tools가 보존된다(프로필 ingest는 ctr_execute를 켜지 않는다)
-	if !strings.Contains(got, "ctr_execute") {
-		t.Errorf("--fix가 사용자 확장을 지웠다:\n%s", got)
-	}
-	if !strings.Contains(got, "args = [\"--enable\", \"ingest\"]") {
-		t.Errorf("--fix가 args를 바꿨다:\n%s", got)
-	}
-	bak, bErr := os.ReadFile(cfgPath + ".bak")
-	if bErr != nil || string(bak) != old {
-		t.Errorf(".bak이 원본을 담지 않았다: err=%v\n%s", bErr, bak)
-	}
-
-	// 2회차 무변경 + .bak 유지
-	var buf2 bytes.Buffer
-	if err := runDoctor(context.Background(), &buf2, t.TempDir(), projectRoot, "0.16.0", true); err != nil {
-		t.Fatalf("--fix 2회차: %v", err)
-	}
-	after2, _ := os.ReadFile(cfgPath)
-	if string(after2) != got {
-		t.Errorf("2회차가 파일을 바꿨다:\n%s", after2)
-	}
-	if !strings.Contains(buf2.String(), "이미 현재 형식·버전입니다") {
-		t.Errorf("2회차가 무변경을 보고하지 않았다:\n%s", buf2.String())
-	}
-	// 스펙 §2-4 — 보고 문면이 무엇을 맞추고 무엇을 보존했는지 알리는지. 1회차 출력을 본다.
-	for _, want := range []string{"표식과 command", "원문 보존"} {
-		if !strings.Contains(buf.String(), want) {
-			t.Errorf("--fix 보고에 %q 없음:\n%s", want, buf.String())
-		}
-	}
-	bak2, _ := os.ReadFile(cfgPath + ".bak")
-	if string(bak2) != old {
-		t.Errorf(".bak이 2회차에 덮였다:\n%s", bak2)
-	}
-}
-
-// TestRunDoctorFixFlag — D83 구현 이음새 ①. doctor 분기에 --fix 하나만 받는 자체 flagset을
-// 열고 그 밖의 인자는 종전대로 거부한다. 오류 문면은 사용자 입력을 에코하지 않는다(규약 §6).
+// TestRunDoctorFixFlag — D97 계약 1. doctor --fix는 더는 받아들여지지 않는다 — 플래그 자체가
+// 지워졌다(무동작으로 남기지 않는다는 것이 D96 요구다). 인자를 하나라도 주면 거부한다.
 func TestRunDoctorFixFlag(t *testing.T) {
 	t.Setenv("CODEX_HOME", t.TempDir())
 	var out, errOut bytes.Buffer
-	if err := Run(context.Background(), "doctor", []string{"--fix"}, t.TempDir(), t.TempDir(), "0.15.0", false, "", &out, &errOut); err != nil {
-		t.Fatalf("doctor --fix: %v out=%s", err, out.String())
+	if err := Run(context.Background(), "doctor", []string{"--fix"}, t.TempDir(), t.TempDir(), "0.19.0", &out, &errOut); err == nil {
+		t.Fatalf("--fix가 더는 존재하지 않는데 doctor가 받아들였다: %s", out.String())
 	}
-	if !strings.Contains(out.String(), "[20] ") {
-		t.Errorf("--fix 실행에 [20]이 없다:\n%s", out.String())
-	}
-	for _, args := range [][]string{{"--bogus"}, {"extra"}, {"--fix", "extra"}} {
+	// 릴리스 리뷰 F6: 옛 구현은 flag.NewFlagSet이라 아래 철자를 전부 받아들였다 — 그중 하나를
+	// 친 사용자가 일반 "예상치 않은 인자" 오류를 읽으면 그 능력이 어디로 갔는지 배우지 못하고,
+	// 그 안내가 이 특수 분기의 존재 이유다. --fixture는 --fix가 아니다(느슨한 접두 매치 금지).
+	for _, spelling := range []string{"--fix", "--fix=true", "-fix", "-fix=true", "-fix=false"} {
 		var o, e bytes.Buffer
-		err := Run(context.Background(), "doctor", args, t.TempDir(), t.TempDir(), "0.15.0", false, "", &o, &e)
+		err := Run(context.Background(), "doctor", []string{spelling}, t.TempDir(), t.TempDir(), "0.19.0", &o, &e)
 		if err == nil {
-			t.Errorf("%v: 인자를 거부하지 않았다", args)
-			continue
+			t.Fatalf("%s를 doctor가 받아들였다: %s", spelling, o.String())
 		}
-		for _, tok := range args {
-			if strings.Contains(err.Error(), strings.TrimLeft(tok, "-")) && tok != "--fix" {
-				t.Errorf("%v: 오류가 사용자 입력을 에코했다: %v", args, err)
-			}
+		if !strings.Contains(err.Error(), "--fix는 더는 없습니다") {
+			t.Errorf("%s가 --fix 은퇴 사유를 내지 않는다: %v", spelling, err)
 		}
+	}
+	var o2, e2 bytes.Buffer
+	err := Run(context.Background(), "doctor", []string{"--fixture"}, t.TempDir(), t.TempDir(), "0.19.0", &o2, &e2)
+	if err == nil {
+		t.Fatal("--fixture를 doctor가 받아들였다")
+	}
+	if strings.Contains(err.Error(), "--fix는 더는 없습니다") {
+		t.Errorf("--fixture를 --fix로 읽었다(접두 매치): %v", err)
+	}
+	// 인자 없는 정상 실행은 여전히 받아들인다 — 위 단정만 있으면 doctor가 인자를 통째로
+	// 거부하도록 망가져도(과잉 거부) 이 테스트가 통과해버린다.
+	var out2, errOut2 bytes.Buffer
+	if err := Run(context.Background(), "doctor", nil, t.TempDir(), t.TempDir(), "0.19.0", &out2, &errOut2); err != nil {
+		t.Fatalf("인자 없는 doctor 실행이 거부됐다: %v out=%s", err, out2.String())
 	}
 }
 
@@ -3130,7 +2454,7 @@ func TestRunDoctorFixFlag(t *testing.T) {
 func TestDoctorShowsRunnerLine(t *testing.T) {
 	isolateCodexHome(t)
 	var buf bytes.Buffer
-	_ = runDoctor(context.Background(), &buf, t.TempDir(), t.TempDir(), "0.11.0", false)
+	_ = runDoctor(context.Background(), &buf, t.TempDir(), t.TempDir(), "0.11.0")
 	if !strings.Contains(buf.String(), "[18] exec runners:") {
 		t.Fatalf("[18] 누락:\n%s", buf.String())
 	}
@@ -3143,7 +2467,7 @@ func TestDoctorWarnMentionsHookOnly(t *testing.T) {
 	storeRoot, projectRoot := doctorSizeWarnSetup(t)
 	t.Setenv("CTR_STORE_WARN_BYTES", "5") // blob 10B > 5B → 발화
 	var buf bytes.Buffer
-	if err := runDoctor(context.Background(), &buf, storeRoot, projectRoot, "0.0.1-dev", false); err != nil {
+	if err := runDoctor(context.Background(), &buf, storeRoot, projectRoot, "0.0.1-dev"); err != nil {
 		t.Fatalf("runDoctor err=%v out=%s", err, buf.String())
 	}
 	out := buf.String()
@@ -3175,48 +2499,6 @@ func TestHostSnippetNoExecAskRule(t *testing.T) {
 	// 대신 모드 기반 설명이 있어야 한다.
 	if !strings.Contains(hostSnippet, "권한 모드") {
 		t.Errorf("승인 강도를 호스트 권한 모드가 정한다는 안내가 없다")
-	}
-}
-
-// TestHostSnippetCodexTable — D80 §2-17. 스니펫이 인쇄하는 Codex 블록은 env.CTR_MANAGED를
-// 담아야 한다 — reportCodexMCPState의 안내가 "이 스니펫으로 수동 등록한 뒤 재실행"을 가리키므로,
-// 담지 않으면 그것을 붙여 넣은 사용자가 표식 없는 테이블을 갖는다(command를 그대로 붙여 넣으면
-// D80 인수 절이 받지만, 경로를 고쳐 쓰면 받지 못한다). 값은 **무버전 context-router**다 —
-// hostSnippet은 상수라 버전을 담으면 상수가 아니게 되고, 그 값은 D82의 정확 일치 절을 만족해
-// 소유 판정에 그대로 걸리며 D83의 검사는 "표식 있음·버전 미상"으로 읽어 --fix가 채운다.
-// 같은 테스트가 붙여넣기 대상에 승인 모드 **키**가 없는지도 본다(D81 — 권장 안내 문면 자체는
-// 주석 줄로 남을 수 있다).
-func TestHostSnippetCodexTable(t *testing.T) {
-	for _, want := range []string{
-		"[mcp_servers.ctr]",
-		"[mcp_servers.ctr.env]",
-		codexMarkerKey + ` = "context-router"`,
-		`"ctr_index"`,
-		`"ctr_fetch_and_index"`,
-	} {
-		if !strings.Contains(hostSnippet, want) {
-			t.Errorf("Codex 스니펫에 %q 없음:\n%s", want, hostSnippet)
-		}
-	}
-	// 버전이 박힌 표식을 인쇄하면 안 된다(상수가 릴리스마다 바뀌게 된다).
-	if strings.Contains(hostSnippet, codexMarkerKey+` = "context-router/`) {
-		t.Errorf("스니펫이 버전 있는 표식을 인쇄한다:\n%s", hostSnippet)
-	}
-	// 승인 모드 키는 **대입 줄**로 나오면 안 된다. 주석(#로 시작)은 안내라 허용한다.
-	for _, line := range strings.Split(hostSnippet, "\n") {
-		trimmed := strings.TrimSpace(line)
-		if strings.HasPrefix(trimmed, "#") {
-			continue
-		}
-		if strings.Contains(trimmed, "approval_mode") {
-			t.Errorf("붙여넣기 대상에 승인 모드 키가 있다: %s", line)
-		}
-	}
-	// D81 — .mcp.json 예시도 설치기 **기본 프로필**을 인쇄한다. exec만 켠 옛 예시를 붙여 넣은
-	// 사용자는 ctr_index·ctr_fetch_and_index가 없는 등록을 갖고, 바로 아래 ask 규칙이
-	// 매치할 도구가 없는 상태가 된다(TestHostSnippetUsesCurrentServerPrefix가 지키는 두 규칙).
-	if !strings.Contains(hostSnippet, `"args": ["--enable", "ingest,net"]`) {
-		t.Errorf(".mcp.json 예시가 기본 프로필을 인쇄하지 않는다:\n%s", hostSnippet)
 	}
 }
 
@@ -3349,7 +2631,7 @@ func TestDoctorShowsPermissionLine(t *testing.T) {
 	t.Setenv("USERPROFILE", home) // windows
 	t.Setenv("HOME", home)        // unix
 	var buf bytes.Buffer
-	_ = runDoctor(context.Background(), &buf, t.TempDir(), t.TempDir(), "0.12.0", false)
+	_ = runDoctor(context.Background(), &buf, t.TempDir(), t.TempDir(), "0.12.0")
 	if !strings.Contains(buf.String(), "[19] permissions: ask/allow 충돌 없음") {
 		t.Fatalf("[19] 충돌 없음 라인 누락:\n%s", buf.String())
 	}
@@ -3375,7 +2657,7 @@ func TestDoctorReportsAskShadowedAllow(t *testing.T) {
 		t.Fatalf("write settings: %v", err)
 	}
 	var buf bytes.Buffer
-	_ = runDoctor(context.Background(), &buf, t.TempDir(), projectRoot, "0.12.0", false)
+	_ = runDoctor(context.Background(), &buf, t.TempDir(), projectRoot, "0.12.0")
 	if !strings.Contains(buf.String(), "[19] permissions: ask와 겹치는 allow 항목 2건 — mcp__ctr-exec__ctr_execute, mcp__ctr-exec") {
 		t.Fatalf("[19] 충돌 보고 누락:\n%s", buf.String())
 	}
@@ -3393,7 +2675,7 @@ func TestDoctorIndeterminateOnUnreadableScope(t *testing.T) {
 		t.Fatalf("mkdir: %v", err)
 	}
 	var buf bytes.Buffer
-	_ = runDoctor(context.Background(), &buf, t.TempDir(), projectRoot, "0.12.0", false)
+	_ = runDoctor(context.Background(), &buf, t.TempDir(), projectRoot, "0.12.0")
 	if !strings.Contains(buf.String(), "[19] permissions: ask/allow 판정 불가") {
 		t.Fatalf("읽을 수 없는 스코프인데 판정 불가가 아니다:\n%s", buf.String())
 	}
@@ -3407,7 +2689,7 @@ func TestDoctorPermissionLineOnCheckFailure(t *testing.T) {
 	t.Setenv("USERPROFILE", "") // windows
 	t.Setenv("HOME", "")        // unix
 	var buf bytes.Buffer
-	_ = runDoctor(context.Background(), &buf, t.TempDir(), t.TempDir(), "0.12.0", false)
+	_ = runDoctor(context.Background(), &buf, t.TempDir(), t.TempDir(), "0.12.0")
 	if !strings.Contains(buf.String(), "[19] permissions: ask/allow 판정 불가") {
 		t.Fatalf("판정 실패인데 판정 불가 라인이 없다:\n%s", buf.String())
 	}
@@ -3423,7 +2705,7 @@ func TestDoctorIndexesRender(t *testing.T) {
 	var buf bytes.Buffer
 	// doctor는 실패 항목이 있으면 오류를 낼 수 있다 — 이 테스트는 [3] 렌더만 보므로 출력으로 판정하고
 	// 오류는 로그로 남긴다.
-	if err := runDoctor(context.Background(), &buf, storeRoot, projectRoot, "0.0.1-dev", false); err != nil {
+	if err := runDoctor(context.Background(), &buf, storeRoot, projectRoot, "0.0.1-dev"); err != nil {
 		t.Logf("runDoctor: %v", err)
 	}
 	out := buf.String()
@@ -3435,402 +2717,597 @@ func TestDoctorIndexesRender(t *testing.T) {
 	}
 }
 
-// TestDoctorCodexGateLabel — D89 소비자 5(라벨 생성기). 미배선이면 그 switch에 기본 갈래가
-// 없어 정상 계열 라벨(marker …)이 경고 없이 나간다.
-func TestDoctorCodexGateLabel(t *testing.T) {
-	home := isolateCodexHome(t)
-	writeCodexConfig(t, home, codexGateFixture)
-	out, _ := doctorOut(t, t.TempDir(), false)
-	if !strings.Contains(out, "codex=기입불가") {
-		t.Errorf("[20] 라벨에 기입불가가 없다:\n%s", out)
-	}
-	if strings.Contains(out, "codex=marker ") {
-		t.Errorf("[20]이 정상 계열 라벨을 냈다:\n%s", out)
-	}
-	if !strings.Contains(out, anomalyOutputInvalid.reason()) {
-		t.Errorf("[20] 사유 줄이 없다:\n%s", out)
-	}
-	// 소비자 4 — --fix가 기입 불가를 **명시적으로** 말해야 한다. 부정 단정만 두면 게이트가
-	// 없을 때도 그 문구가 안 나오므로(그 픽스처는 TableFound=false라 "관리 테이블이
-	// 없습니다"가 나간다) 감시선이 서지 않는다.
-	fixOut, _ := doctorOut(t, t.TempDir(), true)
-	if !strings.Contains(fixOut, "기입 가능한 상태가 아닙니다") {
-		t.Errorf("--fix가 기입불가 상태를 그렇게 보고하지 않았다:\n%s", fixOut)
-	}
-	if strings.Contains(fixOut, "이미 현재 형식") {
-		t.Errorf("--fix가 기입불가 상태를 정상으로 보고했다:\n%s", fixOut)
-	}
-}
-
-// TestDoctorCodexInputUnparsable — D89 부수 결정 ②. Codex가 통째로 읽지 못하는 파일을
-// doctor가 정상으로 보고하면 안 된다. failed에 계상하지 않으므로 종료코드는 그대로다.
-func TestDoctorCodexInputUnparsable(t *testing.T) {
-	home := isolateCodexHome(t)
-	// 같은 테이블 헤더 두 번 — **파서만** 거부한다. codexManagedSpans는 우리 두 이름의 중복만
-	// 세므로 [a]가 겹쳐도 anomalyNone이고, 그래서 이 픽스처는 이상 갈래에 걸리지 않고
-	// InputParses 축을 홀로 물린다(이상 갈래가 대신 물면 무엇을 쟀는지 알 수 없다).
-	writeCodexConfig(t, home, "[a]\nx = 1\n\n[a]\ny = 2\n")
-	out, err := doctorOut(t, t.TempDir(), false)
-	if !strings.Contains(out, "[16]") || !strings.Contains(out, "TOML로 파스되지 않습니다") {
-		t.Errorf("[16]에 입력 파스 실패 줄이 없다:\n%s", out)
-	}
-	if err != nil {
-		t.Errorf("입력 파스 실패가 종료코드를 바꿨다: %v", err)
-	}
-}
-
-// TestDoctorCodexSingleVerdict — [16]과 [20]이 같은 판정을 쓴다. 판정원이 갈리면 같은 파일을
-// 두 절이 다르게 부른다.
-func TestDoctorCodexSingleVerdict(t *testing.T) {
-	home := isolateCodexHome(t)
-	writeCodexConfig(t, home, codexGateFixture)
-	out, _ := doctorOut(t, t.TempDir(), false)
-	// **긍정 단정이어야 한다.** 부정형("테이블=존재" 없음)은 판정원 교체 전에도 통과한다 —
-	// 그 픽스처에서 현행 probe는 관리 테이블을 못 잡아 [16]이 "테이블=부재"를 인쇄한다.
-	if !strings.Contains(out, "[16] codex: [mcp_servers.ctr] 테이블=기입불가") {
-		t.Errorf("[16]이 게이트 상태를 모른다:\n%s", out)
-	}
-	// **`[16]` 줄에 한정한다.** 사유만 보면 [20]이 이미 같은 문자열을 인쇄하므로 늘 참이고,
-	// TestDoctorCodexGateLabel의 단정과 완전히 겹쳐 [16]의 사유 줄을 통째로 지워도 물지 않는다.
-	if !strings.Contains(out, "[16] warning: "+anomalyOutputInvalid.reason()) {
-		t.Errorf("[16] 사유 줄이 없다:\n%s", out)
-	}
-}
-
-// TestDoctorCodexDottedInlineReason — 사유가 [16]·[20] 둘 다에 나가야 한다. 결과 필드만
-// 보면 사유를 만들고 인쇄를 빠뜨린 구현이 통과한다.
-func TestDoctorCodexDottedInlineReason(t *testing.T) {
-	home := isolateCodexHome(t)
-	writeCodexConfig(t, home, "[mcp_servers.ctr]\ncommand = \"context-router\"\nenv = { CTR_MANAGED.sub = \"x\" }\n")
-	out, _ := doctorOut(t, t.TempDir(), false)
-	if !strings.Contains(out, "[16] warning: "+anomalyDottedEnv.reason()) {
-		t.Errorf("[16] 사유 줄이 없다:\n%s", out)
-	}
-	if !strings.Contains(out, "[20] codex: "+anomalyDottedEnv.reason()) {
-		t.Errorf("[20] 사유 줄이 없다:\n%s", out)
-	}
-}
-
 // TestCodexEnvNotTableStopsInstall — 재기준선 행 4. env 우변이 인라인 테이블이 아니면 넷이
-// **함께** 멈춘다: 상태·[16] 라벨·MCP 확정(가드 등록)·프로필 기입. 지금까지는 codexKeyName이
-// env를 읽어 정상 갈래로 흘러 command·args·enabled_tools가 실제로 기입되고 MCP가 확정돼
-// 가드까지 등록됐다 — 상태만 바꾸고 그 결합을 두면 사용자는 "무변경"과 "가드 등록됨"을
-// 동시에 본다.
-func TestCodexEnvNotTableStopsInstall(t *testing.T) {
-	home := isolateCodexHome(t)
-	src := "[mcp_servers.ctr]\ncommand = \"context-router\"\nenv = []\n"
-	writeCodexConfig(t, home, src)
-	proj := t.TempDir()
 
-	var out bytes.Buffer
-	if err := runHookInstall([]string{"--codex"}, t.TempDir(), "", false, proj, "0.18.0", &out); err != nil {
-		t.Fatalf("install: %v", err)
-	}
-	// ① 프로필 미기입 — config.toml이 바이트 동일해야 한다.
-	got, err := os.ReadFile(filepath.Join(home, "config.toml"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(got) != src {
-		t.Errorf("무변경 이탈인데 config.toml이 바뀌었다:\n%s", got)
-	}
-	// ② 가드 미등록 — MCP가 확정되지 않았으므로 hooks.json에 우리 PreToolUse 그룹이 없다.
-	// 훅 파일 경로는 codexHooksPath로 얻는다(--user 없는 --codex 설치는 프로젝트 스코프라
-	// proj/.codex/hooks.json이지 CODEX_HOME(home)이 아니다 — 손으로 조립하면 어긋난다.
-	// TestHookInstallCodexGateReport와 같은 자리를 잰다). runHookInstallCodex는 MCP
-	// 미확정이어도 hooks.json 자체는 항상 쓴다(가드 그룹만 빠진다 — mergeCodexHooks의
-	// withGuard가 PreToolUse 유무만 가른다) — 그러므로 이 픽스처에서 파일 부재는 통과
-	// 조건이 아니다: 읽기 실패는 조용히 건너뛰지 않고 즉시 테스트를 실패시킨다.
-	hp, hpErr := codexHooksPath(false, proj)
-	if hpErr != nil {
-		t.Fatalf("훅 경로 해석 실패: %v", hpErr)
-	}
-	hooks, hErr := os.ReadFile(hp)
-	if hErr != nil {
-		t.Fatalf("hooks.json 읽기 실패: %v", hErr)
-	}
-	if bytes.Contains(hooks, []byte("PreToolUse")) {
-		t.Errorf("MCP 미확정인데 가드가 등록됐다:\n%s", hooks)
-	}
-	// ③ 설치 보고에 사유가 실린다.
-	if !strings.Contains(out.String(), anomalyEnvNotTable.reason()) {
-		t.Errorf("설치 보고에 사유가 없다:\n%s", out.String())
-	}
-	// ④ [16] 라벨과 [20] 사유 — doctor가 같은 사유를 낸다.
-	dout, _ := doctorOut(t, proj, false)
-	if !strings.Contains(dout, "[16] warning: "+anomalyEnvNotTable.reason()) {
-		t.Errorf("[16] 사유 줄이 없다:\n%s", dout)
-	}
-	if !strings.Contains(dout, "[20] codex: "+anomalyEnvNotTable.reason()) {
-		t.Errorf("[20] 사유 줄이 없다:\n%s", dout)
-	}
-}
-
-// TestDoctorCodexBOMHeader — 문면 결속. BOM이 우리 헤더 줄에 붙은 파일을 doctor가
-// `테이블=이상` + "관리 테이블 밖에 ctr 관련 정의가 있습니다 — 수동으로 정리한 뒤 재실행하세요"로
-// 부르면, **우리가 만든 파일에 편집기가 세 바이트를 붙였을 뿐인 사용자에게 자기 파일을
-// 정리하라고 지시하는 것이다.** 결과 필드만 보면 라벨을 만드는 자리가 빠진 구현이 통과한다.
-func TestDoctorCodexBOMHeader(t *testing.T) {
-	home := isolateCodexHome(t)
-	writeCodexConfig(t, home, codexBOM+ctrTableFixture)
-	out, _ := doctorOut(t, t.TempDir(), false)
-	if !strings.Contains(out, "[16] codex: [mcp_servers.ctr] 테이블=존재") {
-		t.Errorf("[16]이 BOM 붙은 헤더의 테이블을 찾지 못한다:\n%s", out)
-	}
-	if strings.Contains(out, "codex=충돌") {
-		t.Errorf("우리 파일을 충돌로 불렀다:\n%s", out)
-	}
-	if strings.Contains(out, "수동으로 정리한 뒤") {
-		t.Errorf("멀쩡한 우리 파일에 수동 정리를 지시했다:\n%s", out)
-	}
-}
-
-// TestDoctorCodexUnownedTable — [16]의 미소유 갈래(신설). 소유를 구별하면 그 갈래의 문면이
-// 바뀌고 막다른 경로에 조치가 생긴다(스펙 §2.3·§1.4-마가 이 픽스처를 명시적으로 요구한다).
-func TestDoctorCodexUnownedTable(t *testing.T) {
-	home := isolateCodexHome(t)
-	writeCodexConfig(t, home, "[mcp_servers.ctr]\ncommand = \"other-binary\"\n")
-	out, _ := doctorOut(t, t.TempDir(), false)
-	if !strings.Contains(out, "테이블=존재(사용자 소유)") {
-		t.Errorf("[16]이 미소유를 구별하지 않는다:\n%s", out)
-	}
-	if !strings.Contains(out, "이름을 바꾸거나 수동으로 정리한 뒤") {
-		t.Errorf("[16] 막다른 갈래에 조치가 없다:\n%s", out)
-	}
-}
-
-// TestDoctorCodexToolsShort — D91. 모자란 목록만 알린다. 넓힌 것은 통과하고, 키가 아예 없는
-// 등록물은 부족으로 세지 않는다(부재와 빈 배열의 의미가 반대다).
-func TestDoctorCodexToolsShort(t *testing.T) {
-	const want = "도구 목록이 프로필보다 모자랍니다"
+// TestDoctorCodexHandEditDetection — D97 계약 2 핵심 표. doctor의 새 [16] 감지원
+// (codexServerHeaders, codex_scan.go)이 codex_toml.go를 전혀 거치지 않고 세 갈래를 옳게
+// 가르는지 잰다: 등록물 있음(파일:줄+다음 걸음 보고) · 등록물 없음(보고 없음, 무관 설정만
+// 있어도) · 파일 자체 없음(보고 없음). 네 번째 갈래(무효 TOML에서도 보고)가 D97이 codex_toml.go의
+// 정교한 스캐너를 버리고 줄 단위 스캐너로 갈아 끼우면서 "알고 받은 대가"의 완화 지점이다 —
+// 이 갈래가 깨지면 그 대가를 실제로 못 받고 있다는 뜻이다.
+// 이름은 더는 인쇄하지 않는다(리뷰 I2) — 인용된 헤더 이름에 점이 있으면 첫 점 자르기가 틀린
+// 이름을 낼 수 있고, 그 값을 codex mcp remove에 넘기면 없는 이름에도 exit 0이 나 "지웠다"는
+// 착각을 남긴다. "등록물 있음" 갈래에서 종료코드도 함께 잰다(리뷰 M6) — 이 보고가 failed에
+// 계상되지 않는다는 것을 discard하지 않고 확인한다.
+func TestDoctorCodexHandEditDetection(t *testing.T) {
 	cases := []struct {
-		name  string
-		table string
-		short bool
+		name       string
+		cfg        string // "" = config.toml을 만들지 않는다
+		wantReport bool
+		wantParses bool // wantReport일 때만 의미 — 다음 걸음이 codex mcp list/remove 안내인지(true), "직접 열어 정리" 안내인지(false, 재검토 리뷰 6)
 	}{
-		{"모자람", "enabled_tools = [\"ctr_search\"]\n", true},
-		{"정확히 프로필대로", "enabled_tools = [\"ctr_search\", \"ctr_fetch\", \"ctr_transform\", \"ctr_record_event\", \"ctr_session_summary\", \"ctr_export_events\", \"ctr_index\", \"ctr_fetch_and_index\"]\n", false},
-		{"사용자가 넓힘", "enabled_tools = [\"ctr_search\", \"ctr_fetch\", \"ctr_transform\", \"ctr_record_event\", \"ctr_session_summary\", \"ctr_export_events\", \"ctr_index\", \"ctr_fetch_and_index\", \"ctr_execute\"]\n", false},
-		// 빈 배열 — **부재와 반대 의미다.** 도구 0개 allowlist는 D91이 근거로 든 바로 그
-		// 형태이므로 부족으로 세야 한다. 이 행이 없으면 ToolsPresent를 물리 라인 존재가
-		// 아니라 값의 개수로 재는 회귀가 위 네 행 전부에서 같은 판정을 내 통과한다 —
-		// 그 회귀 뒤에는 이 파일에서 부족 경고가 조용히 사라진다.
-		{"빈 배열", "enabled_tools = []\n", true},
-		{"키 부재", "", false},
+		{"등록물 있음", "[mcp_servers.ctr]\ncommand = \"context-router\"\n", true, true},
+		{"등록물 없음 — 무관 설정만", "[model]\nname = \"gpt\"\n", false, false},
+		{"파일 자체가 없음", "", false, false},
+		{"무효 TOML이어도 헤더는 잡힌다(닫히지 않은 배열)", "[mcp_servers.ctr]\ncommand = \"context-router\"\nbad = [1, 2,\n", true, false},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			home := isolateCodexHome(t)
-			src := "[mcp_servers.ctr]\ncommand = \"context-router\"\nargs = [\"--enable\", \"ingest,net\"]\n" + c.table +
-				"\n[mcp_servers.ctr.env]\nCTR_MANAGED = \"" + hookMarker("0.17.0") + "\"\n"
-			writeCodexConfig(t, home, src)
-			out, _ := doctorOut(t, t.TempDir(), false)
-			if got := strings.Contains(out, want); got != c.short {
-				t.Errorf("부족 경고=%v want %v\n%s", got, c.short, out)
+			if c.cfg != "" {
+				writeCodexConfig(t, home, c.cfg)
 			}
-			if c.short && !strings.Contains(out, "손으로 더한 항목이 있으면 사라집니다") {
-				t.Errorf("권고가 되돌림을 예고하지 않는다:\n%s", out)
+			out, err := doctorOut(t, t.TempDir())
+			got := strings.Contains(out, "플러그인 이전 방식의 등록물이 남아 있다")
+			if got != c.wantReport {
+				t.Errorf("report=%v want %v:\n%s", got, c.wantReport, out)
+			}
+			if err != nil {
+				t.Errorf("이 보고는 실패 항목에 계상되면 안 된다(리뷰 M6) — err=%v:\n%s", err, out)
+			}
+			if !c.wantReport {
+				return
+			}
+			wantPath := filepath.Join(home, "config.toml")
+			// 재기준선(릴리스 리뷰 F1): 보고 줄이 서버 이름을 함께 든다 — 거름이 생겨 그 이름이
+			// retiredServerNames의 리터럴이고, 그래서 다음 걸음도 <이름> 자리표시자가 아니라
+			// 그 값을 그대로 든다.
+			if !strings.Contains(out, "플러그인 이전 방식의 등록물이 남아 있다 — "+wantPath+":1 (ctr)\n") {
+				t.Errorf("파일:줄 형식이 없다 — want 접미 %q:\n%s", wantPath+":1 (ctr)", out)
+			}
+			if !strings.Contains(out, "다음 걸음") || !strings.Contains(out, "codex mcp remove") || !strings.Contains(out, "codex mcp list") {
+				t.Errorf("다음 걸음 안내(codex mcp remove/list)가 없다:\n%s", out)
+			}
+			// 재검토 리뷰 6: 위 검사는 두 갈래 메시지 모두에 "codex mcp remove"·"codex mcp
+			// list" 부분 문자열이 들어 있어(하나는 실행을 권하고 하나는 닿지 못한다고 말한다)
+			// 갈래를 가르지 못한다 — 갈래별 실제 문구로 가른다.
+			if c.wantParses {
+				if !strings.Contains(out, "다음 걸음 — codex mcp remove ctr 뒤 codex mcp list로 부재를 확인하세요") {
+					t.Errorf("TOML이 파스되는데 codex mcp list/remove 실행 안내가 아니다:\n%s", out)
+				}
+			} else {
+				if !strings.Contains(out, "다음 걸음 — 이 파일은 TOML로 파스되지 않아") {
+					t.Errorf("TOML이 파스되지 않는데 '직접 열어 정리' 안내가 아니다:\n%s", out)
+				}
 			}
 		})
 	}
 }
 
-// TestDoctorCodexToolsOnlyWhenWritable — 기입 없이 이탈하는 상태에는 도구 조치를 권하지
-// 않는다 — 실행해도 바뀌지 않는 명령을 안내하게 된다.
-func TestDoctorCodexToolsOnlyWhenWritable(t *testing.T) {
+// TestDoctorCodexConfigUnreadable — 리뷰 I3. config.toml이 존재하지만 읽을 수 없으면(예:
+// 그 경로가 디렉터리) doctor는 조용히 "등록물 없음"으로 읽으면 안 된다 — [19]가 이미 세운
+// "판정 못 한 것을 판정했다고 말하지 않는다"는 원칙을 [16]에도 그대로 적용한다. 디렉터리를
+// 파일 자리에 둬 os.ReadFile이 부재가 아닌 오류(디렉터리)를 내게 만든다
+// (TestDoctorIndeterminateOnUnreadableScope와 같은 기법).
+func TestDoctorCodexConfigUnreadable(t *testing.T) {
 	home := isolateCodexHome(t)
-	writeCodexConfig(t, home, "[mcp_servers.ctr]\ncommand = \"other\"\nenabled_tools = [\"x\"]\n")
-	out, _ := doctorOut(t, t.TempDir(), false)
-	if strings.Contains(out, "도구 목록이 프로필보다 모자랍니다") {
-		t.Errorf("사용자 소유 테이블에 도구 조치를 권했다:\n%s", out)
+	if err := os.MkdirAll(filepath.Join(home, "config.toml"), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	out, _ := doctorOut(t, t.TempDir())
+	if !strings.Contains(out, "[16] codex: config.toml 읽기 실패") {
+		t.Errorf("읽기 실패가 조용히 삼켜졌다(등록물 없음으로 오판):\n%s", out)
+	}
+	if strings.Contains(out, "플러그인 이전 방식의 등록물이 남아 있다") {
+		t.Errorf("읽지 못한 파일에서 손편집 등록물을 찾았다고 보고했다:\n%s", out)
 	}
 }
 
-// TestDoctorCodexToolsArgsUnreadable — D91 리뷰 F1. args를 프로필로 되읽지 못하면
-// installCodexConfigBlock의 keepArgs가 서서 hook install --codex도 목록을 **보존한다** —
-// 그 상태에 기본 문면을 내면 실행해도 부족이 그대로인 명령을 조치로 안내하게 된다.
-// 감지는 유지하고(D91이 유보를 명시적으로 반대한다) 문면만 가른다.
-func TestDoctorCodexToolsArgsUnreadable(t *testing.T) {
+// TestDoctorCodexBackupLeftover — 옛 설치기의 config.toml.bak(D84 단일 슬롯)은 그것을 지우던
+// 경로가 없어 영구 잔존한다. doctor가 다른 잔존 부류를 전부 짚으므로 이것만 빠지면 마이그레이션을
+// 마친 사용자에게 아무도 언급하지 않는 파일이 남는다. **등록물 유무와 무관하게** 보고하는 것이
+// 계약이다 — 관리 블록을 이미 손으로 지운 사용자에게도 .bak은 남아 있다.
+func TestDoctorCodexBackupLeftover(t *testing.T) {
 	home := isolateCodexHome(t)
-	src := "[mcp_servers.ctr]\ncommand = \"context-router\"\nargs = [\"--profile\", \"global-search\"]\n" +
-		"enabled_tools = [\"custom\"]\n\n[mcp_servers.ctr.env]\nCTR_MANAGED = \"" + hookMarker("0.17.0") + "\"\n"
-	writeCodexConfig(t, home, src)
-	// 픽스처가 실제로 그 갈래인지 먼저 못박는다 — 다른 상태로 흘러가면 아래 단정이 무엇을
-	// 쟀는지 알 수 없어진다(그 축이 무너져도 문면 단정은 조용히 통과할 수 있다).
-	if v := codexRegistrationVerdict([]byte(src), "0.17.0"); v.State != mcpWritten ||
-		!v.TableFound || !v.ToolsPresent || v.ArgsReadable {
-		t.Fatalf("픽스처가 되읽기 실패 갈래가 아니다: state=%d table=%v toolsPresent=%v argsReadable=%v",
-			v.State, v.TableFound, v.ToolsPresent, v.ArgsReadable)
+	writeCodexConfig(t, home, "model = \"gpt-5\"\n") // 등록물 없음 — .bak만 남은 상태
+	bak := filepath.Join(home, "config.toml.bak")
+	if out, _ := doctorOut(t, t.TempDir()); strings.Contains(out, "config.toml 백업") {
+		t.Fatalf(".bak이 없는데 보고했다:\n%s", out)
 	}
-	out, _ := doctorOut(t, t.TempDir(), false)
-	if !strings.Contains(out, "args를 프로필로 해석하지 못해") {
-		t.Errorf("되읽기 실패를 알리지 않는다:\n%s", out)
+	write(t, bak, []byte("model = \"gpt-4\"\n"))
+	out, _ := doctorOut(t, t.TempDir())
+	if !strings.Contains(out, "옛 설치기가 남긴 config.toml 백업이 있다 — "+bak) {
+		t.Errorf(".bak 잔존을 보고하지 않았다:\n%s", out)
 	}
-	if !strings.Contains(out, "hook install --codex --enable <프로필>") {
-		t.Errorf("프로필을 명시하는 형태를 안내하지 않는다:\n%s", out)
-	}
-	// 권한 명령이 **원인이 된 그 args를** 교체한다 — 형제 경고가 같은 이유로 command 되쓰기를
-	// 예고하는 것과 같은 관례다. 예고가 빠지면 안내대로 실행한 사용자가 자기 설정을 잃는다.
-	if !strings.Contains(out, "해석하지 못한 기존 args도 프로필 값으로 함께 교체합니다") {
-		t.Errorf("args 교체를 예고하지 않는다:\n%s", out)
-	}
-	// 기본 문면이 그대로 나가면 그 명령은 이 상태에서 목록을 보존한다 — 조치가 아니다.
-	if strings.Contains(out, "hook install --codex로 반영하세요") {
-		t.Errorf("목록을 보존하는 명령을 조치로 안내했다:\n%s", out)
+	if b, err := os.ReadFile(bak); err != nil || string(b) != "model = \"gpt-4\"\n" {
+		t.Errorf("doctor가 .bak을 건드렸다: %q err=%v", b, err)
 	}
 }
 
-// TestDoctorMarkerWarningSplit — 한 문면이 두 파일의 조치를 함께 예고하면 반대쪽 드리프트만
-// 있는 사용자에게 없는 파일의 수리 동작이 약속된다. 각 절은 자기 드리프트에만 나온다.
-func TestDoctorMarkerWarningSplit(t *testing.T) {
-	isolateCodexHome(t) // config.toml 없음 → codexDrift 거짓
-	proj := t.TempDir()
-	if err := os.WriteFile(filepath.Join(proj, ".mcp.json"), []byte(`{"mcpServers":{"ctr-exec":{"command":"context-router","__ctrManaged":"context-router/0.1.0"}}}`), 0o600); err != nil {
-		t.Fatalf(".mcp.json 쓰기 실패: %v", err)
-	}
-	out, _ := doctorOut(t, proj, false)
-	// 픽스처가 정말 한쪽 드리프트만 만드는지 먼저 못박는다 — 반대쪽도 드리프트면 아래 부재
-	// 단정은 조건 분리가 아니라 우연을 잰다.
-	if !strings.Contains(out, "codex=없음") {
-		t.Fatalf("픽스처가 config.toml 부재 갈래가 아니다:\n%s", out)
-	}
-	// 절 단정은 **경고 줄에만** 건다 — 두 절의 어구는 --fix 성공 줄에도 있어(`[20] fix:`),
-	// 전체 출력을 보면 픽스처가 언젠가 fix=true가 되는 순간 부재 단정이 거짓 실패로,
-	// 존재 단정이 경고 절 없이도 통과로 조용히 뒤집힌다.
-	warn := doctorWarningLine(out)
-	if !strings.Contains(warn, "옛 이름의 항목") {
-		t.Errorf(".mcp.json 드리프트인데 은퇴 정리 예고가 없다:\n%s", out)
-	}
-	if strings.Contains(warn, "config.toml은 백업을 남깁니다") {
-		t.Errorf("config.toml이 없는데 백업을 약속했다:\n%s", out)
-	}
-}
-
-// TestDoctorMarkerWarningSplitCodexOnly — 반대 방향. 절마다 그 드리프트만 있는 픽스처로
-// 확인하지 않으면, 백업 절이 .mcp.json 조건에 잘못 걸려도 통과한다(스펙 §2.3).
-func TestDoctorMarkerWarningSplitCodexOnly(t *testing.T) {
+// TestDoctorWritesNothing — D96·D97: doctor는 읽기 전용이다. config.toml·.mcp.json·
+// .claude/settings.json·~/.claude.json 네 파일의 mtime과 바이트가 진단 전후 동일해야 한다.
+// --fix가 지워졌으니 이 계약을 깨는 유일한 경로는 회귀다(예: 실수로 남은 atomicWriteFile 호출).
+// ~/.claude.json은 [20]의 사용자 스코프 절이 읽는 자리다(최종 리뷰 S11) — 호스트의 주 상태
+// 저장소라 이 계약이 깨졌을 때 값이 가장 크고, 목록에 없으면 그 경로의 읽기 전용 성질이
+// 코드 검토에만 기대게 된다.
+func TestDoctorWritesNothing(t *testing.T) {
 	home := isolateCodexHome(t)
 	writeCodexConfig(t, home, "[mcp_servers.ctr]\ncommand = \"context-router\"\n\n[mcp_servers.ctr.env]\nCTR_MANAGED = \"context-router/0.1.0\"\n")
-	out, _ := doctorOut(t, t.TempDir(), false) // .mcp.json 없음 → mcpDrift 거짓
-	if !strings.Contains(out, ".mcp.json=없음") {
-		t.Fatalf("픽스처가 .mcp.json 부재 갈래가 아니다:\n%s", out)
+	cfgPath := filepath.Join(home, "config.toml")
+
+	userHome := t.TempDir()
+	t.Setenv("HOME", userHome)
+	t.Setenv("USERPROFILE", userHome) // Windows os.UserHomeDir 이음새
+	userMCPPath := filepath.Join(userHome, ".claude.json")
+	write(t, userMCPPath, []byte(`{"mcpServers":{"ctr-exec":{"command":"context-router","__ctrManaged":"context-router/0.1.0"}}}`))
+
+	projectRoot := t.TempDir()
+	mcpPath := mcpConfigPath(projectRoot)
+	write(t, mcpPath, []byte(`{"mcpServers":{"ctr-exec":{"command":"context-router","__ctrManaged":"context-router/0.1.0"}}}`))
+	if err := os.MkdirAll(filepath.Join(projectRoot, ".claude"), 0o755); err != nil {
+		t.Fatalf("mkdir .claude: %v", err)
 	}
-	warn := doctorWarningLine(out)
-	if !strings.Contains(warn, "config.toml은 백업을 남깁니다") {
-		t.Errorf("config.toml 드리프트인데 백업 예고가 없다:\n%s", out)
+	settingsPath := filepath.Join(projectRoot, ".claude", "settings.json")
+	write(t, settingsPath, []byte(`{"enabledMcpjsonServers":["ctr-exec"]}`))
+
+	type fileSnap struct {
+		mtime time.Time
+		data  []byte
 	}
-	if strings.Contains(warn, "옛 이름의 항목") {
-		t.Errorf(".mcp.json이 없는데 은퇴 정리를 예고했다:\n%s", out)
+	snapshot := func(p string) fileSnap {
+		t.Helper()
+		fi, err := os.Stat(p)
+		if err != nil {
+			t.Fatalf("stat %s: %v", filepath.Base(p), err)
+		}
+		data, err := os.ReadFile(p)
+		if err != nil {
+			t.Fatalf("read %s: %v", filepath.Base(p), err)
+		}
+		return fileSnap{fi.ModTime(), data}
+	}
+
+	targets := []string{cfgPath, mcpPath, settingsPath, userMCPPath}
+	before := make(map[string]fileSnap, len(targets))
+	for _, p := range targets {
+		before[p] = snapshot(p)
+	}
+
+	if _, err := doctorOut(t, projectRoot); err != nil {
+		t.Logf("doctorOut err(진단 실패 항목 존재 — 쓰기 여부와 무관, 무시): %v", err)
+	}
+
+	for _, p := range targets {
+		after := snapshot(p)
+		if !after.mtime.Equal(before[p].mtime) {
+			t.Errorf("%s의 mtime이 doctor 실행으로 바뀌었다: before=%v after=%v", filepath.Base(p), before[p].mtime, after.mtime)
+		}
+		if !bytes.Equal(after.data, before[p].data) {
+			t.Errorf("%s의 바이트가 doctor 실행으로 바뀌었다", filepath.Base(p))
+		}
 	}
 }
 
-// TestDoctorMarkerWarningBothDrift — 두 절이 **함께** 나오는 경우를 한 줄 동등 비교로 잠근다.
-// 한쪽만 세운 픽스처 둘로는 조립을 배타 분기(else if)로 바꿔도 전부 초록이다 — 각 테스트가
-// 자기 절만 보고 반대쪽 부재를 단정하므로 논리합과 배타 분기를 구별하지 못한다. 절의 순서도
-// 여기서만 물린다. want는 cli.go의 리터럴을 그대로 옮긴 것이라 %q도 원문 그대로 둔다.
-func TestDoctorMarkerWarningBothDrift(t *testing.T) {
+// bannedHortatoryVocab — D100 계약 2 금지 어휘: MANDATORY·BLOCKED·Do NOT·Never·PREFER X OVER Y·
+// 체크/크로스 불릿·이모지. hostSnippet과 doctor 자신의 출력 문면 양쪽이 이 목록을 공유한다
+// (리뷰 M4 — 어휘 규칙은 둘에 똑같이 걸린다).
+var bannedHortatoryVocab = []string{
+	"MANDATORY", "BLOCKED", "Do NOT", "DO NOT", "Never", "NEVER", "PREFER ",
+	"✅", "❌", "☑", "✓", "✗", "👍", "👎", "⚠️", "🚫",
+}
+
+// TestHostSnippetNoHortatoryVocabulary — D100 계약 2 어휘 규칙, hostSnippet 쪽.
+func TestHostSnippetNoHortatoryVocabulary(t *testing.T) {
+	for _, b := range bannedHortatoryVocab {
+		if strings.Contains(hostSnippet, b) {
+			t.Errorf("hostSnippet에 금지 어휘 %q가 있다", b)
+		}
+	}
+}
+
+// TestDoctorOutputNoHortatoryVocabulary — D100 계약 2 어휘 규칙, doctor 자신의 출력 쪽(리뷰
+// M4). hostSnippet만 재면 doctor가 조립하는 진단 문면(경고·다음 걸음 안내 등)은 규칙 밖에
+// 남는다 — 소스 그레핑 대신 실제 실행 출력을 재는 이유는 fmt 포맷 문자열이 아니라 사용자가
+// 보는 최종 텍스트가 계약의 대상이기 때문이다. 갈래를 여럿 동시에 트리거해([16]의 손편집
+// 감지·[20]의 두 절 모두) 가능한 한 많은 줄을 노출시킨다.
+func TestDoctorOutputNoHortatoryVocabulary(t *testing.T) {
 	home := isolateCodexHome(t)
-	writeCodexConfig(t, home, "[mcp_servers.ctr]\ncommand = \"context-router\"\n\n[mcp_servers.ctr.env]\nCTR_MANAGED = \"context-router/0.1.0\"\n")
+	writeCodexConfig(t, home, "[mcp_servers.ctr]\ncommand = \"context-router\"\n")
 	proj := t.TempDir()
-	if err := os.WriteFile(filepath.Join(proj, ".mcp.json"), []byte(`{"mcpServers":{"ctr-exec":{"command":"context-router","__ctrManaged":"context-router/0.1.0"}}}`), 0o600); err != nil {
-		t.Fatalf(".mcp.json 쓰기 실패: %v", err)
+	if err := os.MkdirAll(filepath.Join(proj, ".claude"), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
 	}
-	out, _ := doctorOut(t, proj, false)
-	// 픽스처 핀은 따로 두지 않는다 — 어느 한쪽 드리프트가 서지 않으면 그 절이 빠져 이 동등
-	// 비교가 바로 깨진다.
-	want := fmt.Sprintf("[20] warning: 다시 기입이 필요한 MCP 등록물이 있습니다 — doctor --fix로 고치세요(기존 파일만 고치고 등록을 만들지 않습니다. args·enabled_tools는 보존하지만 command는 %q로 다시 씁니다 — 직접 고쳐 둔 실행 경로가 있으면 그 값이 사라집니다. config.toml은 백업을 남깁니다. .mcp.json은 대체된 옛 이름의 항목을 함께 정리합니다)", hookBinaryName)
-	if got := doctorWarningLine(out); got != want {
-		t.Errorf("경고 줄이 다르다\n got=%s\nwant=%s", got, want)
+	write(t, filepath.Join(proj, ".claude", "settings.json"), []byte(`{"enabledMcpjsonServers":["`+ctrMCPServerName+`"]}`))
+	write(t, mcpConfigPath(proj), []byte(`{"mcpServers":{"ctr-exec":{"command":"context-router","__ctrManaged":"context-router/0.1.0"}}}`))
+	out, _ := doctorOut(t, proj)
+	for _, b := range bannedHortatoryVocab {
+		if strings.Contains(out, b) {
+			t.Errorf("doctor 출력에 금지 어휘 %q가 있다:\n%s", b, out)
+		}
 	}
 }
 
-// mcpFixtureCurrentMarker — .mcp.json 픽스처. 우리 항목은 **현재 버전 표식**이고 병합기가 내는
-// 형태(2칸 들여쓰기·구조체 필드 순서·끝 줄바꿈) 그대로다 — 그래서 은퇴 항목을 빼면 --fix가 다시
-// 쓸 것이 하나도 없다. 그 대조가 픽스처의 정밀도를 스스로 증명한다: 형태가 어긋나면 대조군에서
-// 예고가 나와 바로 깨진다.
-func mcpFixtureCurrentMarker(retired bool) string {
-	old := ""
-	if retired {
-		old = "    \"ctr\": {\n      \"command\": \"context-router\"\n    },\n"
+// TestDoctorCodexHooksScopePositive — 리뷰 I4a. [16] codex hooks: 줄의 유일한 긍정 커버리지는
+// 삭제된 TestDoctorCodexMCPLine 케이스 4였다 — 남은 참조(hook_install_test.go의
+// TestDoctorVersionlessHookMarker)는 "≠ 없음"을 재는 부정 필터라 그 줄이 통째로 사라져도
+// 공허하게 통과한다. 실제 Codex 훅 등록물을 놓고 "미등록"이 아닌 값이 찍히는지 직접 잰다.
+func TestDoctorCodexHooksScopePositive(t *testing.T) {
+	codexHome := t.TempDir()
+	t.Setenv("CODEX_HOME", codexHome)
+	projectRoot := t.TempDir()
+	hp, err := codexHooksPath(false, projectRoot)
+	if err != nil {
+		t.Fatalf("codexHooksPath: %v", err)
 	}
-	return "{\n  \"mcpServers\": {\n" + old +
-		"    \"ctr-exec\": {\n" +
-		"      \"command\": \"context-router\",\n" +
-		"      \"args\": [],\n" +
-		"      \"alwaysLoad\": true,\n" +
-		"      \"__ctrManaged\": \"" + hookMarker("0.17.0") + "\"\n" +
-		"    }\n  }\n}\n"
-}
-
-// TestDoctorMcpRetireAnnouncedAtCurrentMarker — [20]의 .mcp.json 절은 **--fix가 그 파일을 다시
-// 쓰는가**에 걸려야 한다. 표식 드리프트에 걸면 표식이 현재 버전이면서 은퇴 이름 항목이 남은
-// 파일에서 절이 빠지는데, 같은 실행의 --fix는 그 항목을 지우고 파일을 다시 쓴다 — 사용자는
-// 되돌릴 기회 없이 자기 항목을 잃는다. 예고와 행동을 한 테스트에서 함께 잰다.
-func TestDoctorMcpRetireAnnouncedAtCurrentMarker(t *testing.T) {
-	home := isolateCodexHome(t)
-	// config.toml만 드리프트시킨다 — 경고 블록 자체는 그쪽이 세우므로 아래 단정이 재는 것이
-	// 블록의 유무가 아니라 .mcp.json 절의 유무다.
-	writeCodexConfig(t, home, "[mcp_servers.ctr]\ncommand = \"context-router\"\n\n[mcp_servers.ctr.env]\nCTR_MANAGED = \"context-router/0.1.0\"\n")
-	proj := t.TempDir()
-	path := filepath.Join(proj, ".mcp.json")
-	write(t, path, []byte(mcpFixtureCurrentMarker(true)))
-
-	out, _ := doctorOut(t, proj, false)
-	// 픽스처가 정말 "표식은 현재 버전" 갈래인지 먼저 못박는다 — 드리프트로 흘러가면 아래 단정은
-	// 이 결함이 아니라 종전 조건을 재게 된다.
-	if !strings.Contains(out, ".mcp.json=marker 0.17.0 codex=") {
-		t.Fatalf("픽스처가 현재 버전 표식 갈래가 아니다:\n%s", out)
+	if err := atomicWriteFile(hp, seedCodexHooks(hookBinaryName, true)); err != nil {
+		t.Fatalf("seed: %v", err)
 	}
-	if warn := doctorWarningLine(out); !strings.Contains(warn, "옛 이름의 항목") {
-		t.Errorf("--fix가 은퇴 항목을 지우는데 예고가 없다:\n%s", out)
+	out, _ := doctorOut(t, projectRoot)
+	if !strings.Contains(out, "[16] codex hooks: project=등록됨(") {
+		t.Errorf("훅을 설치했는데 project 스코프가 등록됨으로 나오지 않는다:\n%s", out)
 	}
-	// 대조군 — 은퇴 항목만 뺀 같은 파일은 --fix가 손대지 않으므로 절도 나오지 않는다. 이 단정이
-	// 없으면 절을 무조건 붙여도 위 단정이 통과한다(경고 블록은 config.toml이 세우므로 이 대조는
-	// 공허하지 않다).
-	clean := t.TempDir()
-	write(t, filepath.Join(clean, ".mcp.json"), []byte(mcpFixtureCurrentMarker(false)))
-	cleanOut, _ := doctorOut(t, clean, false)
-	if warn := doctorWarningLine(cleanOut); strings.Contains(warn, "옛 이름의 항목") {
-		t.Errorf("--fix가 다시 쓸 것이 없는데 은퇴 정리를 예고했다:\n%s", cleanOut)
+	if strings.Contains(out, "[16] codex hooks: project=옛 그룹 없음") {
+		t.Errorf("등록된 훅이 없는 것으로 보고됐다:\n%s", out)
 	}
-
-	// 예고가 사실인지 같은 픽스처로 확인한다 — 문면만 맞추고 행동이 다르면 다시 어긋난다.
-	fixOut, _ := doctorOut(t, proj, true)
-	after, rErr := os.ReadFile(path)
-	if rErr != nil {
-		t.Fatal(rErr)
-	}
-	var doc struct {
-		Servers map[string]json.RawMessage `json:"mcpServers"`
-	}
-	if err := json.Unmarshal(after, &doc); err != nil {
-		t.Fatalf(".mcp.json 파싱 실패: %v", err)
-	}
-	if _, ok := doc.Servers["ctr"]; ok {
-		t.Errorf("--fix가 은퇴 항목을 지우지 않았다 — 픽스처가 그 갈래가 아니다:\n%s", fixOut)
-	}
-	if _, ok := doc.Servers[ctrMCPServerName]; !ok {
-		t.Errorf("--fix가 우리 항목까지 지웠다:\n%s", fixOut)
+	// 이 픽스처의 마커는 무버전(hookBinaryName)이라 marker=="" 갈래를 탄다. 그 갈래의 다음
+	// 걸음이 [9] 쪽에만 단정돼 있으면 여기 문면은 통째로 지워도 초록이다 — [16]의 짝을 함께
+	// 잰다(최종 재검토). 호스트 구분(--codex)까지 본다: 플래그가 빠지면 사용자가 Claude 쪽
+	// 그룹을 지우려 든다.
+	if !strings.Contains(out, "[16] codex hooks: project=등록됨(3개 — hook uninstall --codex로 옛 그룹을 지우고 플러그인 설치로 옮기세요 — 두 벌이 함께 있으면 같은 포착이 두 번 일어납니다)") {
+		t.Errorf("[16]의 무버전 갈래가 마이그레이션 걸음을 내지 않는다:\n%s", out)
 	}
 }
 
-// TestDoctorMcpRetireWarnsWithoutCodexDrift — 경고 **블록**의 진입 조건도 같은 축이어야 한다.
-// config.toml이 드리프트하지 않으면 블록이 통째로 빠지는데 --fix는 그래도 .mcp.json의 은퇴 이름
-// 항목을 지운다 — 예고가 사라지는 자리가 절 하나 위에 하나 더 있다. 반대쪽 절의 부재도 함께
-// 단정해 없는 파일의 수리 동작을 약속하지 않는 것을 이 방향에서도 잠근다.
-func TestDoctorMcpRetireWarnsWithoutCodexDrift(t *testing.T) {
-	isolateCodexHome(t) // config.toml 없음 → codexDrift 거짓
-	proj := t.TempDir()
-	write(t, filepath.Join(proj, ".mcp.json"), []byte(mcpFixtureCurrentMarker(true)))
-	out, _ := doctorOut(t, proj, false)
-	if !strings.Contains(out, "codex=없음") {
-		t.Fatalf("픽스처가 config.toml 부재 갈래가 아니다:\n%s", out)
+// TestDoctorMcpJsonHandEditDetection — 리뷰 I4b. [20]의 .mcp.json 절이 [16]과 같은 모양(파일 +
+// 다음 걸음)으로 보고하는지 표로 잰다. 옛 [20]은 라벨(존재·미등록·표식없음)만 보여줬는데 그
+// 라벨에는 경로도 다음 걸음도 없었다 — A⑧의 위험(호스트가 command·args 일치 서버를 경고 없이
+// 버린다)이 .mcp.json 쪽에도 그대로 있으므로 [16]과 같은 조치 가능한 보고가 필요하다.
+func TestDoctorMcpJsonHandEditDetection(t *testing.T) {
+	isolateCodexHome(t)
+	cases := []struct {
+		name       string
+		body       string // "" = .mcp.json을 만들지 않는다
+		wantReport bool
+	}{
+		{"소유 등록물 있음(마커)", `{"mcpServers":{"ctr-exec":{"command":"context-router","__ctrManaged":"context-router/0.1.0"}}}`, true},
+		{"소유 등록물 있음(command만, 표식 없음)", `{"mcpServers":{"ctr-exec":{"command":"context-router"}}}`, true},
+		{"우리 이름이 없음", `{"mcpServers":{"other":{"command":"other-tool"}}}`, false},
+		{"우리 이름은 있으나 소유 아님", `{"mcpServers":{"ctr-exec":{"command":"other-tool"}}}`, false},
+		{"파일 자체가 없음", "", false},
 	}
-	warn := doctorWarningLine(out)
-	if !strings.Contains(warn, "옛 이름의 항목") {
-		t.Errorf("config.toml이 멀쩡하다는 이유로 .mcp.json 예고가 통째로 빠졌다:\n%s", out)
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			projectRoot := t.TempDir()
+			if c.body != "" {
+				write(t, mcpConfigPath(projectRoot), []byte(c.body))
+			}
+			out, err := doctorOut(t, projectRoot)
+			got := strings.Contains(out, "[20] claude: 플러그인 이전 방식의 등록물이 남아 있다")
+			if got != c.wantReport {
+				t.Errorf("report=%v want %v:\n%s", got, c.wantReport, out)
+			}
+			if err != nil {
+				t.Errorf("이 보고는 실패 항목에 계상되면 안 된다(리뷰 M6) — err=%v", err)
+			}
+			if !c.wantReport {
+				return
+			}
+			wantPath := mcpConfigPath(projectRoot)
+			if !strings.Contains(out, "[20] claude: 플러그인 이전 방식의 등록물이 남아 있다 — "+wantPath+" ("+ctrMCPServerName+")\n") {
+				t.Errorf("파일 경로가 없다 — want %q:\n%s", wantPath, out)
+			}
+			if !strings.Contains(out, "[20] claude: 다음 걸음 — claude mcp remove "+ctrMCPServerName) {
+				t.Errorf("다음 걸음(claude mcp remove)이 없다:\n%s", out)
+			}
+		})
 	}
-	if strings.Contains(warn, "config.toml은 백업을 남깁니다") {
-		t.Errorf("config.toml이 없는데 백업을 약속했다:\n%s", out)
+}
+
+// TestDoctorMcpJsonUnreadable — .mcp.json 쪽도 [16]과 같은 원칙을 진다(리뷰 I4b "같은 모양"의
+// 연장): 존재하지만 못 읽으면 조용히 "없음"으로 읽으면 안 된다.
+func TestDoctorMcpJsonUnreadable(t *testing.T) {
+	isolateCodexHome(t)
+	projectRoot := t.TempDir()
+	if err := os.MkdirAll(mcpConfigPath(projectRoot), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
 	}
+	out, _ := doctorOut(t, projectRoot)
+	if !strings.Contains(out, "[20] claude: "+mcpConfigPath(projectRoot)+" 읽기 실패") {
+		t.Errorf("읽기 실패가 조용히 삼켜졌다:\n%s", out)
+	}
+}
+
+// TestDoctorMcpJsonUnparseable — 최종 리뷰 S5. 쉼표 하나가 남은 `.mcp.json`은 파싱만 실패하고
+// 등록물은 그대로 살아 있다. [16]이 무효 TOML에서 침묵하지 않는 것과 같은 원칙으로, 이 파일도
+// 조용히 "깨끗함"으로 읽히면 안 된다 — 옛 [20]은 그 입력에서 아무 줄도 내지 않았다.
+func TestDoctorMcpJsonUnparseable(t *testing.T) {
+	isolateCodexHome(t)
+	projectRoot := t.TempDir()
+	// 우리 등록물 + 꼬리 쉼표 하나. 파싱만 실패하고 등록물은 파일 안에 살아 있다.
+	write(t, mcpConfigPath(projectRoot), []byte(`{"mcpServers":{"ctr-exec":{"command":"context-router",}}}`))
+	out, err := doctorOut(t, projectRoot)
+	if err != nil {
+		t.Errorf("이 보고는 실패 항목에 계상되면 안 된다 — err=%v", err)
+	}
+	if !strings.Contains(out, "[20] claude: "+mcpConfigPath(projectRoot)+" 파싱 실패") {
+		t.Errorf("파싱 실패가 조용히 깨끗함으로 읽혔다:\n%s", out)
+	}
+}
+
+// TestDoctorMcpJsonUserScopeLeftover — 최종 리뷰 S11. `claude mcp add --scope user`가 쓰는
+// 자리는 `~/.claude.json` 최상위 `mcpServers`이고(설계 v0.12의 스코프 표), v0.18의 hostSnippet이
+// 그 스코프를 권했다. 프로젝트 `.mcp.json`만 보면 그 코호트에게 doctor가 정리할 것 없음을
+// 보고한다. 홈은 TestMain이 이미 임시 디렉터리로 격리한다.
+func TestDoctorMcpJsonUserScopeLeftover(t *testing.T) {
+	isolateCodexHome(t)
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home) // Windows os.UserHomeDir 이음새
+	userConfig := filepath.Join(home, ".claude.json")
+	write(t, userConfig, []byte(`{"mcpServers":{"ctr-exec":{"command":"context-router"}}}`))
+
+	out, err := doctorOut(t, t.TempDir())
+	if err != nil {
+		t.Errorf("이 보고는 실패 항목에 계상되면 안 된다 — err=%v", err)
+	}
+	if !strings.Contains(out, "[20] claude: 플러그인 이전 방식의 등록물이 남아 있다 — "+userConfig+" ("+ctrMCPServerName+")\n") {
+		t.Errorf("사용자 스코프 잔존 등록물을 놓쳤다:\n%s", out)
+	}
+}
+
+// TestDoctorEnabledMcpjsonServersLeftover — task-4 브리프의 추가 요구(D97 인접, 소유자 판정) +
+// 리뷰 I5 재기준선. 세 스코프(local·project·user)와 두 이름(현재 ctr-exec·옛 ctr)을 함께 잰다 —
+// enabledMcpjsonServers는 스코프 간 병합되지 않고 각 스코프의 정의가 그 스코프 안에서
+// 유효하므로, 한 스코프만 보면 다른 스코프의 잔존을 놓친다(옛 구현이 project 하나·현재 이름
+// 하나만 봤다). user 스코프를 확인하려면 HOME·USERPROFILE을 이 테스트 전용 임시 홈으로
+// 돌려야 한다(TestMain의 전역 격리 위에 이 서브테스트만의 값을 덮어써 알려진 파일을 그
+// 자리에 둔다).
+func TestDoctorEnabledMcpjsonServersLeftover(t *testing.T) {
+	isolateCodexHome(t)
+	cases := []struct {
+		name     string
+		scope    string // "local"|"project"|"user"|"" (파일 자체를 안 씀)
+		body     string
+		wantName string // "" = 보고 없음
+	}{
+		{"project 스코프 — 현재 이름", "project", `{"enabledMcpjsonServers":["` + ctrMCPServerName + `","other"]}`, ctrMCPServerName},
+		{"local 스코프 — 현재 이름", "local", `{"enabledMcpjsonServers":["` + ctrMCPServerName + `"]}`, ctrMCPServerName},
+		{"user 스코프 — 현재 이름", "user", `{"enabledMcpjsonServers":["` + ctrMCPServerName + `"]}`, ctrMCPServerName},
+		{"project 스코프 — 옛 이름(ctr)", "project", `{"enabledMcpjsonServers":["ctr"]}`, "ctr"},
+		{"옛 이름 없음 — 다른 이름만", "project", `{"enabledMcpjsonServers":["other"]}`, ""},
+		{"키 자체 없음", "project", `{}`, ""},
+		{"파일 없음", "", "", ""},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			home := t.TempDir()
+			t.Setenv("HOME", home)        // unix
+			t.Setenv("USERPROFILE", home) // windows
+			projectRoot := t.TempDir()
+			if c.scope != "" {
+				var target string
+				switch c.scope {
+				case "project":
+					target = filepath.Join(projectRoot, ".claude", "settings.json")
+				case "local":
+					target = filepath.Join(projectRoot, ".claude", "settings.local.json")
+				case "user":
+					target = filepath.Join(home, ".claude", "settings.json")
+				}
+				if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+					t.Fatalf("mkdir: %v", err)
+				}
+				write(t, target, []byte(c.body))
+			}
+			out, _ := doctorOut(t, projectRoot)
+			if c.wantName == "" {
+				if strings.Contains(out, "enabledMcpjsonServers에 옛 서버 이름") {
+					t.Errorf("보고가 없어야 하는데 나왔다:\n%s", out)
+				}
+				return
+			}
+			want := fmt.Sprintf("enabledMcpjsonServers에 옛 서버 이름 %q가 남아 있다", c.wantName)
+			if !strings.Contains(out, want) {
+				t.Errorf("%q 없음:\n%s", want, out)
+			}
+		})
+	}
+}
+
+// TestDoctorCodexOwnedServerFilter — 릴리스 리뷰 F1. codexServerHeaders는 이름을 가리지 않는
+// 스캐너다(무효 TOML에서도 도는 것이 존재 이유). 보고는 그 히트 중 **첫 점 앞 세그먼트가 우리가
+// 등록한 적 있는 이름**인 것만 낸다 — 거르지 않으면 `[mcp_servers.github]` 하나를 둔 사용자가
+// "우리 잔존물이 남아 있다 + codex mcp remove"를 읽고 남의 서버를 지운다. 거름이 생겼으므로
+// 이름도 함께 인쇄한다(보고되는 이름은 점도 인용부호도 없는 알려진 리터럴 둘 중 하나다).
+// `[mcp_servers.ctr]`와 `[mcp_servers.ctr.env]`는 한 서버 한 번으로 접어 보고한다 — 제거도
+// 한 번이다.
+func TestDoctorCodexOwnedServerFilter(t *testing.T) {
+	cases := []struct {
+		name      string
+		cfg       string
+		wantSuf   string // "" = 등록물 보고 없음
+		wantSteps string // "" = 다음 걸음 없음
+		wantAlso  string // 보고와 별개로 반드시 나와야 하는 줄("" = 없음)
+	}{
+		{"남의 서버만", "[mcp_servers.github]\ncommand = \"gh-mcp\"\n", "", "", ""},
+		{
+			"남의 서버와 우리 이름이 함께",
+			"[mcp_servers.github]\ncommand = \"gh-mcp\"\n\n[mcp_servers.ctr]\ncommand = \"context-router\"\n",
+			":4 (ctr)\n",
+			"[16] codex: 다음 걸음 — codex mcp remove ctr 뒤 codex mcp list로 부재를 확인하세요",
+			"",
+		},
+		{
+			"서브테이블은 같은 서버 한 번으로",
+			"[mcp_servers.ctr]\ncommand = \"context-router\"\n\n[mcp_servers.ctr.env]\nCTR_ENABLE = \"ingest\"\n",
+			":1,4 (ctr)\n",
+			"[16] codex: 다음 걸음 — codex mcp remove ctr 뒤 codex mcp list로 부재를 확인하세요",
+			"",
+		},
+		{
+			"현재 이름(ctr-exec)",
+			"[mcp_servers.ctr-exec]\ncommand = \"context-router\"\n",
+			":1 (ctr-exec)\n",
+			"[16] codex: 다음 걸음 — codex mcp remove ctr-exec 뒤 codex mcp list로 부재를 확인하세요",
+			"",
+		},
+		// 아래 둘은 재검토 리뷰가 잰 거짓 음성이다 — 둘 다 유효 TOML이라 파스 실패 줄도 뜨지
+		// 않아 그 사용자는 doctor에게서 아무 신호도 받지 못했다. 세그먼트를 다듬지 않고 그대로
+		// 비교하던 동안 `"ctr "`(점 앞 공백)와 `"ctr"`(따옴표)가 이름 집합에 없었다.
+		{
+			"첫 점 앞뒤 공백이 있는 서브테이블",
+			"[mcp_servers.ctr . env]\nCTR_ENABLE = \"ingest\"\n",
+			":1 (ctr)\n",
+			"[16] codex: 다음 걸음 — codex mcp remove ctr 뒤 codex mcp list로 부재를 확인하세요",
+			"",
+		},
+		{
+			"서버 이름만 인용된 서브테이블",
+			"[mcp_servers.\"ctr\".env]\nCTR_ENABLE = \"ingest\"\n",
+			":1 (ctr)\n",
+			"[16] codex: 다음 걸음 — codex mcp remove ctr 뒤 codex mcp list로 부재를 확인하세요",
+			"",
+		},
+		// 아래 둘은 **받아들이는 대가**다(양방향 하나씩) — 여기 재는 것은 그 대가의 실제 값이다.
+		{
+			// 이름 자체에 점이 있는 인용 헤더: 첫 세그먼트가 ctr이라 우리 이름으로 잡히고 보고
+			// 이름도 ctr이 된다. 첫 세그먼트 절단이 [mcp_servers.ctr.env]를 잡는 유일한 길이라
+			// 이 방향의 오검출을 함께 받는다.
+			"이름 자체에 점이 있는 인용 헤더 — ctr로 보고된다",
+			"[mcp_servers.\"ctr.env\"]\ncommand = \"other\"\n",
+			":1 (ctr)\n",
+			"[16] codex: 다음 걸음 — codex mcp remove ctr 뒤 codex mcp list로 부재를 확인하세요",
+			"",
+		},
+		{
+			// 안 닫힌 따옴표 오타: 이름이 `"ctr`로 남아 우리 이름과 맞지 않아 등록물 보고에서
+			// 빠진다. 그 파일은 TOML로 파스되지 않으므로 파스 실패 줄이 그 사용자에게 남는
+			// 신호다 — 그 줄이 "파일을 열어 고치라"로 이어진다.
+			"안 닫힌 따옴표 오타 — 등록물 보고는 없고 파스 실패 줄이 남는다",
+			"[mcp_servers.\"ctr]\ncommand = \"context-router\"\n",
+			"",
+			"",
+			"[16] codex: config.toml이 TOML로 파스되지 않습니다 — ",
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			home := isolateCodexHome(t)
+			writeCodexConfig(t, home, c.cfg)
+			cfgPath := filepath.Join(home, "config.toml")
+			out, err := doctorOut(t, t.TempDir())
+			if err != nil {
+				t.Errorf("이 보고는 실패 항목에 계상되면 안 된다 — err=%v", err)
+			}
+			const lead = "[16] codex: 플러그인 이전 방식의 등록물이 남아 있다 — "
+			if c.wantAlso != "" && !strings.Contains(out, c.wantAlso) {
+				t.Fatalf("want %q:\n%s", c.wantAlso, out)
+			}
+			if c.wantSuf == "" {
+				if strings.Contains(out, lead) {
+					t.Fatalf("남의 서버를 우리 잔존물로 보고했다:\n%s", out)
+				}
+				if strings.Contains(out, "[16] codex: 다음 걸음") {
+					t.Fatalf("보고가 없는데 다음 걸음을 냈다:\n%s", out)
+				}
+				return
+			}
+			if want := lead + cfgPath + c.wantSuf; !strings.Contains(out, want) {
+				t.Fatalf("want %q:\n%s", want, out)
+			}
+			if n := strings.Count(out, lead); n != 1 {
+				t.Fatalf("등록물 보고 줄 수=%d want 1(서버 하나 = 제거 하나):\n%s", n, out)
+			}
+			if !strings.Contains(out, c.wantSteps) {
+				t.Fatalf("다음 걸음이 이름을 들지 않는다 — want %q:\n%s", c.wantSteps, out)
+			}
+			if strings.Contains(out, "github") {
+				t.Fatalf("남의 서버 이름이 출력에 실렸다:\n%s", out)
+			}
+		})
+	}
+}
+
+// TestDoctorCodexInvalidTOMLUnconditional — 릴리스 리뷰 F2. 파스 판정은 우리 등록물을 찾았는지에
+// 매이지 않는다. Codex는 문법 오류 하나로 그 파일 전체를 무시하므로(모델 설정·훅 신뢰 항목·프로필)
+// mcp_servers 테이블이 하나도 없는 무효 config.toml에서도 이 줄이 그 사용자에게 유일한 신호다.
+// 유효한 파일에서는 이 줄이 없다는 것도 함께 잰다 — 무조건 인쇄하면 그것대로 오보다.
+func TestDoctorCodexInvalidTOMLUnconditional(t *testing.T) {
+	const wantLead = "[16] codex: config.toml이 TOML로 파스되지 않습니다 — "
+	t.Run("등록물 없는 무효 파일", func(t *testing.T) {
+		home := isolateCodexHome(t)
+		writeCodexConfig(t, home, "[hooks]\ntrusted = [1, 2,\n")
+		out, err := doctorOut(t, t.TempDir())
+		if err != nil {
+			t.Errorf("이 보고는 실패 항목에 계상되면 안 된다 — err=%v", err)
+		}
+		if want := wantLead + filepath.Join(home, "config.toml"); !strings.Contains(out, want) {
+			t.Fatalf("무효 config.toml이 깨끗함으로 읽혔다 — want %q:\n%s", want, out)
+		}
+		if strings.Contains(out, "플러그인 이전 방식의 등록물이 남아 있다") {
+			t.Fatalf("등록물이 없는데 잔존을 보고했다:\n%s", out)
+		}
+	})
+	t.Run("유효 파일", func(t *testing.T) {
+		home := isolateCodexHome(t)
+		writeCodexConfig(t, home, "[model]\nname = \"gpt\"\n")
+		out, _ := doctorOut(t, t.TempDir())
+		if strings.Contains(out, wantLead) {
+			t.Fatalf("파스되는 파일에 파스 실패를 인쇄했다:\n%s", out)
+		}
+	})
+}
+
+// TestDoctorEnabledScopeUnjudgeable — 릴리스 리뷰 F5. enabledMcpjsonServers 절은 읽기·파싱
+// 실패를 조용히 건너뛰어 그 스코프를 "깨끗함"으로 읽었다. 이 키를 지우는 호스트 CLI가 없으므로
+// (claude mcp remove는 등록물만 건드린다) 여기서 놓친 잔존은 아무도 짚지 않는다 — [20]의 앞
+// 절·[19]·[16]이 이미 세운 "판정 못 한 것을 판정했다고 말하지 않는다"를 이 절에도 적용한다.
+// 대상은 settings.local.json이다 — 이 절만의 실패를 만들면서 [9]의 훅 스코프 판정과 섞이지 않는다.
+func TestDoctorEnabledScopeUnjudgeable(t *testing.T) {
+	t.Run("읽기 실패", func(t *testing.T) {
+		isolateCodexHome(t)
+		projectRoot := t.TempDir()
+		p := filepath.Join(projectRoot, ".claude", "settings.local.json")
+		if err := os.MkdirAll(p, 0o755); err != nil { // 파일 자리에 디렉터리 — os.ReadFile이 부재 아닌 오류를 낸다
+			t.Fatalf("mkdir: %v", err)
+		}
+		out, _ := doctorOut(t, projectRoot)
+		if want := "[20] claude: " + p + " 읽기 실패"; !strings.Contains(out, want) {
+			t.Fatalf("읽지 못한 스코프가 조용히 깨끗함으로 읽혔다 — want %q:\n%s", want, out)
+		}
+	})
+	t.Run("파싱 실패", func(t *testing.T) {
+		isolateCodexHome(t)
+		projectRoot := t.TempDir()
+		p := filepath.Join(projectRoot, ".claude", "settings.local.json")
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatalf("mkdir: %v", err)
+		}
+		// 승인 목록에 옛 이름이 살아 있는 채로 쉼표 하나가 남은 파일 — 파싱만 실패한다.
+		write(t, p, []byte(`{"enabledMcpjsonServers":["`+ctrMCPServerName+`",}`))
+		out, _ := doctorOut(t, projectRoot)
+		if want := "[20] claude: " + p + " 파싱 실패"; !strings.Contains(out, want) {
+			t.Fatalf("파싱 실패가 조용히 깨끗함으로 읽혔다 — want %q:\n%s", want, out)
+		}
+	})
+	// 재검토 리뷰: 같은 바이트를 두 절이 다르게 읽던 자리. [9]는 scanRegisteredHooks의
+	// 공백-전용 가드로 `옛 그룹 없음`을 내는데 이 절만 그 가드가 없어 같은 파일을 `파싱 실패`로
+	// 읽었다 — 사용자는 doctor 한 번의 출력 안에서 상반된 두 판정을 받고 아무것도 없는 파일을
+	// 열어 보라는 안내를 읽는다. 두 판정을 한 단정에 함께 둔다.
+	t.Run("빈 파일 — [9]와 같은 판정", func(t *testing.T) {
+		isolateCodexHome(t)
+		projectRoot := t.TempDir()
+		p := filepath.Join(projectRoot, ".claude", "settings.json")
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatalf("mkdir: %v", err)
+		}
+		write(t, p, []byte(" \n\t\n"))
+		out, _ := doctorOut(t, projectRoot)
+		if !strings.Contains(out, "[9] hooks: project=옛 그룹 없음") {
+			t.Fatalf("[9]가 공백-전용 파일을 깨끗함으로 읽지 않았다:\n%s", out)
+		}
+		if strings.Contains(out, "[20] claude: "+p+" 파싱 실패") {
+			t.Fatalf("같은 파일을 [9]는 깨끗함으로, [20]은 파싱 실패로 읽었다:\n%s", out)
+		}
+	})
 }

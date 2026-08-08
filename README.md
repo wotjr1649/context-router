@@ -37,28 +37,83 @@ separately in `docs/oracle-mapping-ko.md`.
 
 ## Install & host registration
 
-No tagged release yet — install from source with `go install`, which places
-the binary in `$(go env GOPATH)/bin` (add that to `PATH`, or reference it by
-absolute path):
+`context-router` installs as a Claude Code / Codex plugin — the host reads
+the plugin manifest and registers the MCP server itself. This program does
+not write to `.mcp.json`, `settings.json`, or `config.toml`, with a single
+exception: `context-router hook uninstall` removes this tool's own hook
+groups from `.claude/settings.json` (with `--codex`, from the Codex
+`hooks.json`). That is how an install from before v0.19 is cleaned up; the
+plugin manifest carries the hook definitions from v0.19 on.
+
+**0. Remove any existing hand-written registration.** On Claude Code, the
+host silently discards a plugin-declared MCP server when its `command` +
+`args` already match a registered one — no warning, no error; the symptom
+is that the plugin appears to do nothing. The same mechanism on Codex has
+not been measured, but an old registration is a duplicate pointing at the
+same binary either way, so removing it first is sound on both hosts
+regardless of which one this was measured against. Remove old
+registrations (from a prior version of this tool, or a manual `mcp add`)
+first:
+
+```sh
+claude mcp remove <name>
+codex mcp remove <name>
+```
+
+`codex mcp remove` exits 0 even when `<name>` does not exist, so the exit
+code cannot confirm removal — check with `mcp list` that the entry is
+actually gone.
+
+**1. Get the binary:**
 
 ```sh
 go install github.com/wotjr1649/context-router/cmd/context-router@latest
 ```
 
-Or build locally and run it by path:
+or build locally with `go build -o context-router ./cmd/context-router`. The
+plugin manifest launches the bare `context-router` command, so the binary
+needs to resolve on `PATH`.
+
+**2. Install the plugin:**
 
 ```sh
-go build -o context-router ./cmd/context-router
-./context-router doctor
+# Claude Code
+claude plugin marketplace add wotjr1649/context-router
+claude plugin install context-router --scope <user|project|local>
+
+# Codex
+codex plugin marketplace add wotjr1649/context-router
+codex plugin add context-router
 ```
 
-`doctor` diagnoses the store root, DB, and FTS5 setup for the current
-project, and prints ready-to-use host registration snippets (e.g. for Claude
-Code's `.mcp.json` / `claude mcp add`, or Codex's `~/.codex/config.toml`),
-including recommended default permission rules (`ctr_index` /
-`ctr_fetch_and_index` and any `global-search`-profile tool default to "ask").
-If `context-router` is not on `PATH`, use the absolute path to the binary in
-the registration snippet the host config expects.
+**3. Verify.** `mcp list` shows the server, in each host's own format:
+Claude Code as `plugin:context-router:ctr … Connected`, Codex as
+`ctr … enabled`. `mcp list` is the command that sees it: `claude plugin
+details` leaves an `mcpServers` declared as a path string unresolved and
+reports `MCP servers (0)` while the runtime is connected.
+
+**4. On Codex, grant hook trust.** Codex requires persisted hook trust
+before it runs a plugin's hooks; without it nothing fires, `SessionStart`
+included. Skipping this leaves the capture that moves large tool output out
+of the context window switched off, silently. On Claude Code the plugin
+install carries the six hooks on its own.
+
+`ingest` and `net` are enabled by default; set `CTR_ENABLE` to a
+comma-separated list of `ingest` / `net` / `exec` to change that (e.g.
+`CTR_ENABLE=ingest,net,exec`), or to `none` for zero opt-in profiles (the
+search/fetch/transform-only posture) — `none` is only valid as the entire
+value; combining it with another name is an error. The plugin manifest
+passes no `--enable` flag, so this environment variable is what a
+plugin-managed install reads. A `--enable` flag, if you invoke the binary
+directly, always wins over `CTR_ENABLE`.
+
+`context-router doctor` diagnoses the store root, DB, and FTS5 setup for the
+current project, and prints the steps above together with the current tool
+prefix (`mcp__plugin_context-router_ctr__`) and a sample permission rule you
+can copy into `.claude/settings.json` to put `ctr_index` /
+`ctr_fetch_and_index` behind a prompt. Approval strength otherwise comes
+from the host's own permission mode — this program writes no permission
+rules.
 
 ## CLI
 
@@ -81,7 +136,7 @@ non-TTY (automation) context it refuses unless `--force` is passed.
 | `--root <path>` | cwd | project root |
 | `--store-root <path>` | OS-default store dir | override storage location (env `CTR_STORE_ROOT`) |
 | `--profile <list>` | `search,fetch,transform` | v0.0.1 accepts only the default 3-tool profile or `global-search` alone — arbitrary subsets are rejected at startup (tool gating by profile is reserved for a later version) |
-| `--enable <list>` | (none) | opt-in extra capabilities: `ingest`, `net` |
+| `--enable <list>` | `ingest,net` | opt-in capabilities: `ingest` / `net` / `exec`, or `none` for zero (only valid as the entire value) (env `CTR_ENABLE`, same comma-separated syntax — `--enable` wins over `CTR_ENABLE`, which wins over this default) |
 | `--allow-path <path>` | (none) | extra `ctr_index` allowed root (repeatable) |
 | `--projects <list>` | (none) | project allowlist, required with `--profile global-search` |
 | `--net-allow-local` | off | allow `127.0.0.1`/`::1` destinations for `ctr_fetch_and_index` |
