@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -259,10 +260,14 @@ func TestHookUninstall_SymmetricPreservesLookalikes(t *testing.T) {
 }
 
 // ⑤ 원자성 — 제거 후 임시 파일(.ctr-settings-*.tmp) 잔존물 부재. 두 번째 실행으로 Claude
-// 갈래의 **바이트 멱등**도 함께 잰다(리뷰 I3): 이 단정이 없으면 재실행이 파일을 흔들어도
-// (키 정렬·빈 컨테이너 처리 drift) 스위트 전체가 통과한다 — Codex 형제
-// (TestRemoveCodexHooksIdempotentBytes)만 그것을 재고 있었다. 파일 수준에서 재는 이유는
-// runHookUninstall이 순수 함수가 아니라 읽기·병합·쓰기 셋을 엮기 때문이다.
+// 갈래의 **파일 안정성**도 함께 잰다(리뷰 I3): 재실행이 파일을 흔들면(키 정렬·빈 컨테이너 처리
+// drift) 안 된다. 파일 수준에서 재는 이유는 runHookUninstall이 순수 함수가 아니라 읽기·병합·
+// 쓰기 셋을 엮기 때문이다.
+//
+// **재기준선(F1)**: 2차 실행은 이제 아예 쓰지 않으므로(지울 자기 그룹이 없다) 파일 비교만으로는
+// 병합기의 바이트 멱등을 더는 재지 못한다 — 안 쓰는 코드도 그 단정을 통과한다. 두 자리를 나눠
+// 든다: 여기서는 2차가 쓰지 않는다는 것(문면 + 바이트 동일)을, 병합기의 바이트 멱등은 아래
+// removeHookSettings 직접 호출이 잰다.
 func TestHookUninstall_AtomicWriteNoTempLeftover(t *testing.T) {
 	projectRoot := t.TempDir()
 	writeSeedClaudeHooks(t, false, projectRoot, hookBinaryName)
@@ -275,7 +280,11 @@ func TestHookUninstall_AtomicWriteNoTempLeftover(t *testing.T) {
 	if err != nil {
 		t.Fatalf("1차 read: %v", err)
 	}
-	if err := runHookUninstall(nil, projectRoot, &out); err != nil {
+	if !strings.Contains(out.String(), "제거 완료") {
+		t.Fatalf("1차 제거 완료 문면 누락: %q", out.String())
+	}
+	var second bytes.Buffer
+	if err := runHookUninstall(nil, projectRoot, &second); err != nil {
 		t.Fatalf("2차 uninstall: %v", err)
 	}
 	twice, err := os.ReadFile(path)
@@ -284,6 +293,22 @@ func TestHookUninstall_AtomicWriteNoTempLeftover(t *testing.T) {
 	}
 	if !bytes.Equal(once, twice) {
 		t.Fatalf("Claude 갈래 제거가 멱등이 아니다:\n1차=%s\n2차=%s", once, twice)
+	}
+	if !strings.Contains(second.String(), "제거할 항목 없음") {
+		t.Fatalf("2차가 지울 것이 없다고 알리지 않았다: %q", second.String())
+	}
+	// 병합기 자체의 바이트 멱등 — f(f(x)) == f(x). Codex 형제
+	// (TestRemoveCodexHooksIdempotentBytes)가 이미 재던 것을 Claude 갈래에도 둔다.
+	mergedOnce, removedOnce, err := removeHookSettings(seedClaudeHooks(hookBinaryName))
+	if err != nil || !removedOnce {
+		t.Fatalf("1차 병합: removed=%v err=%v", removedOnce, err)
+	}
+	mergedTwice, removedTwice, err := removeHookSettings(mergedOnce)
+	if err != nil || removedTwice {
+		t.Fatalf("2차 병합: removed=%v err=%v", removedTwice, err)
+	}
+	if !bytes.Equal(mergedOnce, mergedTwice) {
+		t.Fatalf("병합기 바이트 멱등 위반:\n1차=%s\n2차=%s", mergedOnce, mergedTwice)
 	}
 	entries, err := os.ReadDir(filepath.Join(projectRoot, ".claude"))
 	if err != nil {
@@ -360,9 +385,13 @@ func TestHookUninstall_UnparsableSettingsErrors(t *testing.T) {
 // 빈 컨테이너 정리 계약도 함께 잰다: 지울 것이 없으면 hooks 키를 만들지 않는다.
 func TestRemoveHookSettings_NullTolerant(t *testing.T) {
 	for _, existing := range []string{"null", `{"hooks":null}`} {
-		out, err := removeHookSettings([]byte(existing))
+		out, removed, err := removeHookSettings([]byte(existing))
 		if err != nil {
 			t.Fatalf("existing=%q 제거 err: %v", existing, err)
+		}
+		// 재기준선(F1): 지울 자기 그룹이 없는 입력이므로 removed는 거짓이다 — 호출자는 쓰지 않는다.
+		if removed {
+			t.Fatalf("existing=%q: 지운 것이 없는데 removed=true", existing)
 		}
 		var settings map[string]json.RawMessage
 		if err := json.Unmarshal(out, &settings); err != nil {
@@ -712,9 +741,12 @@ func TestRemoveCodexHooksPreservesForeign(t *testing.T) {
 		`{"matcher":"Bash","hooks":[{"type":"command","command":"pwsh -File policy.ps1","timeout":10,"statusMessage":"policy"}]},` +
 		`{"matcher":"Bash","hooks":[{"type":"command","command":"context-router codex-hook","timeout":10,"statusMessage":"context-router"}]}` +
 		`],"SessionStart":[{"matcher":"","hooks":[{"type":"command","command":"context-router codex-hook","timeout":10,"statusMessage":"context-router"}]}]},"otherTop":1}`)
-	out, err := removeCodexHooks(existing)
+	out, removed, err := removeCodexHooks(existing)
 	if err != nil {
 		t.Fatalf("remove: %v", err)
+	}
+	if !removed { // 재기준선(F1): 자기 그룹 둘을 지웠으므로 참 — 호출자가 쓰는 갈래다
+		t.Fatalf("자기 그룹을 지웠는데 removed=false: %s", out)
 	}
 	var m map[string]json.RawMessage
 	if err := json.Unmarshal(out, &m); err != nil {
@@ -744,13 +776,21 @@ func TestRemoveCodexHooksIdempotentBytes(t *testing.T) {
 	existing := []byte(`{"hooks":{"PreToolUse":[` +
 		`{"matcher":"Bash","hooks":[{"type":"command","command":"pwsh -File policy.ps1","timeout":10}]},` +
 		`{"matcher":"Bash","hooks":[{"type":"command","command":"context-router codex-hook","timeout":10,"statusMessage":"context-router"}]}]}}`)
-	once, err := removeCodexHooks(existing)
+	once, removed, err := removeCodexHooks(existing)
 	if err != nil {
 		t.Fatalf("1차: %v", err)
 	}
-	twice, err := removeCodexHooks(once)
+	if !removed {
+		t.Fatalf("1차에서 자기 그룹을 지웠는데 removed=false: %s", once)
+	}
+	twice, removedAgain, err := removeCodexHooks(once)
 	if err != nil {
 		t.Fatalf("2차: %v", err)
+	}
+	// 재기준선(F1): 2차에는 지울 것이 없다 — 멱등의 다른 얼굴이고, 이것이 곧 2차 쓰기가
+	// 일어나지 않는 근거다.
+	if removedAgain {
+		t.Fatalf("2차에 지울 것이 없는데 removed=true: %s", twice)
 	}
 	if !bytes.Equal(once, twice) {
 		t.Fatalf("멱등 위반:\n1차=%s\n2차=%s", once, twice)
@@ -766,9 +806,13 @@ func TestRemoveCodexHooksMixedGroupUntouched(t *testing.T) {
 	mixed := []byte(`{"hooks":{"PostToolUse":[{"matcher":"","hooks":[` +
 		`{"type":"command","command":"context-router codex-hook","timeout":10,"statusMessage":"context-router/0.3.9"},` +
 		`{"type":"command","command":"pwsh -File user.ps1","timeout":10,"statusMessage":"user"}]}]}}`)
-	out, err := removeCodexHooks(mixed)
+	out, removed, err := removeCodexHooks(mixed)
 	if err != nil {
 		t.Fatalf("remove: %v", err)
+	}
+	// 재기준선(F1): 혼합 그룹은 불가침이므로 지운 것이 없다 — 그러니 이 파일은 쓰이지도 않는다.
+	if removed {
+		t.Fatalf("혼합 그룹만 있는데 removed=true: %s", out)
 	}
 	if !strings.Contains(string(out), "user.ps1") || !strings.Contains(string(out), "context-router/0.3.9") {
 		t.Fatalf("혼합 그룹이 변형·삭제됨(불가침 위반): %s", out)
@@ -921,23 +965,29 @@ func TestRemoveCodexHooksClearsGuardGroup(t *testing.T) {
 	if !strings.Contains(string(seeded), `"PreToolUse"`) || !strings.Contains(string(seeded), `"matcher": "Bash"`) {
 		t.Fatalf("픽스처에 가드 그룹이 없다:\n%s", seeded)
 	}
-	removed, err := removeCodexHooks(seeded)
+	out, removed, err := removeCodexHooks(seeded)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(string(removed), "codex-hook") || strings.Contains(string(removed), `"PreToolUse"`) {
-		t.Fatalf("가드 포함 자기 그룹 잔존:\n%s", removed)
+	if !removed { // 재기준선(F1): 가드 포함 자기 그룹 셋을 지웠으므로 참
+		t.Fatalf("가드 포함 자기 그룹을 지웠는데 removed=false:\n%s", out)
 	}
-	if strings.Contains(string(removed), `"hooks"`) {
-		t.Fatalf("빈 hooks 컨테이너가 남았다:\n%s", removed)
+	if strings.Contains(string(out), "codex-hook") || strings.Contains(string(out), `"PreToolUse"`) {
+		t.Fatalf("가드 포함 자기 그룹 잔존:\n%s", out)
+	}
+	if strings.Contains(string(out), `"hooks"`) {
+		t.Fatalf("빈 hooks 컨테이너가 남았다:\n%s", out)
 	}
 	// 멱등: f(f(x)) == f(x) 바이트 동일
-	again, err := removeCodexHooks(removed)
+	again, removedAgain, err := removeCodexHooks(out)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !bytes.Equal(removed, again) {
-		t.Fatalf("제거 멱등 위반:\n1차=%s\n2차=%s", removed, again)
+	if removedAgain {
+		t.Fatalf("2차에 지울 것이 없는데 removed=true:\n%s", again)
+	}
+	if !bytes.Equal(out, again) {
+		t.Fatalf("제거 멱등 위반:\n1차=%s\n2차=%s", out, again)
 	}
 }
 
@@ -993,6 +1043,291 @@ func TestHookInstallGuidanceWritesNothing(t *testing.T) {
 	}
 	if out2.String() != out.String() {
 		t.Fatalf("플래그에 따라 안내가 갈린다:\n%s\n---\n%s", out.String(), out2.String())
+	}
+}
+
+// foreignOnlyClaudeSettings — 우리 항목이 하나도 없는 손으로 쓴 settings.json. 재직렬화가
+// 바이트 중립이 아님을 재려고 일부러 세 가지를 넣는다: 최상위 키가 사전순이 아니고(model이
+// $schema보다 앞), 들여쓰기가 4칸이며(MarshalIndent는 2칸), 값에 `&`가 있다(encoding/json은
+// 기본으로 `&`로 이스케이프한다 `[실측]` — 아래 테스트가 그 셋을 한꺼번에 잡는다).
+const foreignOnlyClaudeSettings = `{
+    "model": "opus",
+    "$schema": "https://example/schema.json?a=1&b=2",
+    "hooks": {
+        "PostToolUse": [
+            {"matcher": "Write", "hooks": [{"type": "command", "command": "other-tool run", "timeout": 5}]}
+        ]
+    }
+}
+`
+
+// TestHookUninstall_NoOwnedGroupsLeavesFileUntouched — F1(적대 검토). 우리 항목이 하나도 없으면
+// 쓰지 않는다. 재기록은 바이트 중립이 아니어서(키 정렬·유니코드 이스케이프·들여쓰기) 남의
+// 서버만 담긴 손으로 쓴 파일을 우리가 고쳐 놓게 된다. 삭제된 `.mcp.json` 제거 경로가 이 가드를
+// 그대로 들고 있었고 훅 경로에는 없었다.
+//
+// 문면도 함께 잰다 — 하지 않은 일을 했다고 말하지 않는다. 바이트만 재면 "제거 완료"를 내면서
+// 아무것도 지우지 않은 실행이 초록으로 통과한다.
+func TestHookUninstall_NoOwnedGroupsLeavesFileUntouched(t *testing.T) {
+	projectRoot := t.TempDir()
+	path := filepath.Join(projectRoot, ".claude", "settings.json")
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(foreignOnlyClaudeSettings), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	if err := runHookUninstall(nil, projectRoot, &out); err != nil {
+		t.Fatalf("uninstall: %v", err)
+	}
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if string(after) != foreignOnlyClaudeSettings {
+		t.Fatalf("우리 항목이 없는 파일을 고쳐 놓았다:\n%s", after)
+	}
+	if strings.Contains(out.String(), "제거 완료") {
+		t.Fatalf("지운 것이 없는데 제거 완료를 알렸다: %q", out.String())
+	}
+	if !strings.Contains(out.String(), "제거할 항목 없음") {
+		t.Fatalf("no-op 문면 누락: %q", out.String())
+	}
+}
+
+// foreignOnlyCodexHooks — 같은 취지의 Codex hooks.json 픽스처(F1의 Codex 갈래).
+const foreignOnlyCodexHooks = `{
+    "otherTop": "a&b",
+    "hooks": {
+        "PreToolUse": [
+            {"matcher": "Bash", "hooks": [{"type": "command", "command": "pwsh -File policy.ps1", "timeout": 10}]}
+        ]
+    }
+}
+`
+
+// TestRunHookUninstallCodex_NoOwnedGroupsLeavesFileUntouched — F1의 Codex 갈래. 두 호스트
+// 경로가 같은 가드를 든다.
+func TestRunHookUninstallCodex_NoOwnedGroupsLeavesFileUntouched(t *testing.T) {
+	isolateCodexHome(t)
+	root := t.TempDir()
+	path := filepath.Join(root, ".codex", "hooks.json")
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(foreignOnlyCodexHooks), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	if err := runHookUninstall([]string{"--codex"}, root, &out); err != nil {
+		t.Fatalf("uninstall --codex: %v", err)
+	}
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if string(after) != foreignOnlyCodexHooks {
+		t.Fatalf("우리 항목이 없는 파일을 고쳐 놓았다:\n%s", after)
+	}
+	if strings.Contains(out.String(), "제거 완료") {
+		t.Fatalf("지운 것이 없는데 제거 완료를 알렸다: %q", out.String())
+	}
+	if !strings.Contains(out.String(), "제거할 항목 없음") {
+		t.Fatalf("no-op 문면 누락: %q", out.String())
+	}
+}
+
+// TestHookUninstall_MixedGroupUntouched — F2(적대 검토). 마커가 붙은 그룹이라도 사용자가 자기
+// 항목을 더해 놓았으면 통째로 지우지 않는다(파손 금지 > 멱등 완전성). Codex 형제
+// (TestRemoveCodexHooksMixedGroupUntouched)가 이미 재던 계약을 Claude 갈래에 맞춘다.
+//
+// 순수 자기 그룹(SessionStart)을 함께 두어 **제거 자체는 일어나는** 실행에서 재므로 F1의
+// 조기 반환이 이 단정을 대신 통과시키지 않는다.
+func TestHookUninstall_MixedGroupUntouched(t *testing.T) {
+	projectRoot := t.TempDir()
+	path := filepath.Join(projectRoot, ".claude", "settings.json")
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	seed := `{
+  "hooks": {
+    "SessionStart": [
+      {"matcher": "", "hooks": [{"type": "command", "command": "context-router hook", "timeout": 10}], "__ctrManaged": "context-router"}
+    ],
+    "PostToolUse": [
+      {"matcher": "", "hooks": [
+        {"type": "command", "command": "context-router hook", "timeout": 10},
+        {"type": "command", "command": "user-tool run", "timeout": 5}
+      ], "__ctrManaged": "context-router"}
+    ]
+  }
+}`
+	if err := os.WriteFile(path, []byte(seed), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	if err := runHookUninstall(nil, projectRoot, &out); err != nil {
+		t.Fatalf("uninstall: %v", err)
+	}
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if !strings.Contains(string(after), "user-tool run") {
+		t.Fatalf("혼합 그룹의 사용자 항목이 삭제됐다:\n%s", after)
+	}
+	var s struct {
+		Hooks map[string][]json.RawMessage `json:"hooks"`
+	}
+	if err := json.Unmarshal(after, &s); err != nil {
+		t.Fatalf("out 파싱: %v\n%s", err, after)
+	}
+	if len(s.Hooks["PostToolUse"]) != 1 {
+		t.Fatalf("PostToolUse 그룹 수=%d want 1(혼합 그룹 보존): %s", len(s.Hooks["PostToolUse"]), after)
+	}
+	// 받아들인 거래: 혼합 그룹에 남은 우리 항목은 사용자 /hooks 몫이다.
+	if !strings.Contains(string(s.Hooks["PostToolUse"][0]), "context-router hook") {
+		t.Fatalf("혼합 그룹이 변형됐다(불가침 위반): %s", after)
+	}
+	// 순수 자기 그룹은 그대로 사라진다 — 혼합 보존이 제거 자체를 막지 않는다.
+	if _, ok := s.Hooks["SessionStart"]; ok {
+		t.Fatalf("순수 자기 그룹이 남았다: %s", after)
+	}
+}
+
+// TestIsOurHookGroupEdges — 소유 판정 직접 에지(Codex 형제 TestIsOurCodexGroupEdges의 짝).
+// 전건 판정(F2): 마커가 소유 값이고 **모든** 훅 항목의 command 토큰이 일치할 때만 자기 그룹.
+func TestIsOurHookGroupEdges(t *testing.T) {
+	ours := `{"type":"command","command":"context-router hook","timeout":10}`
+	cases := []struct {
+		name string
+		raw  string
+		want bool
+	}{
+		{"비JSON", `not-json`, false},
+		{"마커 없음", `{"matcher":"","hooks":[` + ours + `]}`, false},
+		{"빈 그룹", `{"matcher":"","hooks":[],"__ctrManaged":"context-router"}`, false},
+		{"전건 자기 항목", `{"matcher":"","hooks":[` + ours + `],"__ctrManaged":"context-router"}`, true},
+		{"버전 마커", `{"matcher":"","hooks":[` + ours + `],"__ctrManaged":"context-router/0.14.0"}`, true},
+		{"후행 플래그 허용", `{"matcher":"","hooks":[{"type":"command","command":"context-router hook --no-shadow"}],"__ctrManaged":"context-router"}`, true},
+		{"혼합(자기+외래)", `{"matcher":"","hooks":[` + ours + `,{"type":"command","command":"user-tool run"}],"__ctrManaged":"context-router"}`, false},
+		{"접두 닮은 명령(hook-wrapper)", `{"matcher":"","hooks":[{"type":"command","command":"context-router hook-wrapper"}],"__ctrManaged":"context-router"}`, false},
+		{"마커 값 불일치", `{"matcher":"","hooks":[` + ours + `],"__ctrManaged":"other/0.1.0"}`, false},
+	}
+	for _, c := range cases {
+		if got := isOurHookGroup(json.RawMessage(c.raw)); got != c.want {
+			t.Fatalf("%s: isOurHookGroup=%v want %v", c.name, got, c.want)
+		}
+	}
+}
+
+// TestAtomicWriteFile_SymlinkDestination — F7(적대 검토). 이 대상(dotfiles 저장소를 쓰는
+// 사용자)에게 `settings.json`이 심링크인 경우는 흔하다. rename은 링크를 일반 파일로 갈아치우고
+// 원래 대상 파일은 옛 내용을 든 채 남는다 — 호스트가 읽는 파일과 사용자가 관리하는 파일이
+// 갈라진다. 목적지를 먼저 풀어 임시 파일 위치와 rename 대상을 링크 대상 쪽에서 고른다.
+//
+// 링크와 대상을 **다른 디렉터리**에 두어 임시 파일이 어느 쪽에 생겼는지까지 잰다(같은 볼륨
+// rename만 원자적이므로 위치 선택이 계약의 일부다). 심링크 생성 권한이 없는 호스트에서는
+// 잴 수 없다 — Windows는 개발자 모드나 관리자 권한이 필요하다 `[실측]`.
+func TestAtomicWriteFile_SymlinkDestination(t *testing.T) {
+	targetDir := t.TempDir()
+	target := filepath.Join(targetDir, "real-settings.json")
+	if err := os.WriteFile(target, []byte("{\"old\":true}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	linkDir := t.TempDir()
+	link := filepath.Join(linkDir, "settings.json")
+	if err := os.Symlink(target, link); err != nil {
+		t.Skipf("이 호스트에서 심링크를 만들 수 없다: %v", err)
+	}
+	want := []byte("{\"new\":true}\n")
+	if err := atomicWriteFile(link, want); err != nil {
+		t.Fatalf("atomicWriteFile: %v", err)
+	}
+	fi, err := os.Lstat(link)
+	if err != nil {
+		t.Fatalf("lstat: %v", err)
+	}
+	if fi.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("심링크가 일반 파일로 대체됐다: mode=%v", fi.Mode())
+	}
+	got, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatalf("링크 대상 읽기: %v", err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("링크 대상이 갱신되지 않았다: %s", got)
+	}
+	assertNoTempLeftover(t, linkDir)
+	assertNoTempLeftover(t, targetDir)
+
+	// 목적지 부재 — EvalSymlinks가 오류를 내는 경로다. 그대로 새 파일을 만든다.
+	fresh := filepath.Join(linkDir, "fresh.json")
+	if err := atomicWriteFile(fresh, want); err != nil {
+		t.Fatalf("목적지 부재 쓰기: %v", err)
+	}
+	if got, err := os.ReadFile(fresh); err != nil || !bytes.Equal(got, want) {
+		t.Fatalf("목적지 부재 결과=%s err=%v", got, err)
+	}
+}
+
+// assertNoTempLeftover — dir에 `.ctr-settings-*.tmp` 잔존물이 없는지.
+func assertNoTempLeftover(t *testing.T, dir string) {
+	t.Helper()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("readdir %s: %v", dir, err)
+	}
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), ".ctr-settings-") {
+			t.Fatalf("임시 파일 잔존: %s/%s", dir, e.Name())
+		}
+	}
+}
+
+// TestAtomicWriteFile_PreservesDestinationMode — F8(적대 검토). os.CreateTemp은 0600으로 만들고
+// rename은 그 모드를 목적지에 옮긴다 `[실측]`(프로브: temp를 0444로 chmod 후 rename하면 목적지가
+// 0444가 된다) — 그래서 재기록이 사용자 소유 파일의 권한을 조용히 좁힌다. 기존 목적지의 모드를
+// 물려받고, 목적지가 없을 때만 0600으로 둔다.
+//
+// **Windows에서 이 단정은 공허하다** `[실측]`: Go는 0600·0644·0755를 모두 같은 속성(쓰기 가능)
+// 으로 접고 Stat이 0666을 돌려준다 — 구분되는 값은 읽기 전용 0444 하나인데 그 목적지 위로는
+// rename 자체가 Access denied로 실패한다. 판별력은 3-OS CI의 ubuntu·macos 러너에 있다.
+func TestAtomicWriteFile_PreservesDestinationMode(t *testing.T) {
+	dir := t.TempDir()
+	dest := filepath.Join(dir, "settings.json")
+	if err := os.WriteFile(dest, []byte("{}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(dest, 0o644); err != nil { // umask와 무관하게 확정
+		t.Fatalf("chmod: %v", err)
+	}
+	before, err := os.Stat(dest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := atomicWriteFile(dest, []byte("{\"a\":1}\n")); err != nil {
+		t.Fatalf("atomicWriteFile: %v", err)
+	}
+	after, err := os.Stat(dest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.Mode().Perm() != before.Mode().Perm() {
+		t.Fatalf("목적지 권한이 바뀌었다: before=%04o after=%04o", before.Mode().Perm(), after.Mode().Perm())
+	}
+
+	fresh := filepath.Join(dir, "fresh.json")
+	if err := atomicWriteFile(fresh, []byte("{}\n")); err != nil {
+		t.Fatalf("신규 목적지 쓰기: %v", err)
+	}
+	fi, err := os.Stat(fresh)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if runtime.GOOS != "windows" && fi.Mode().Perm() != 0o600 {
+		t.Fatalf("목적지가 없던 자리의 모드=%04o want 0600", fi.Mode().Perm())
 	}
 }
 

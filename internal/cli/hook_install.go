@@ -80,8 +80,16 @@ type hookGroupProbe struct {
 }
 
 // isOurHookGroup — 자기 소유 그룹 판정: 소유권 마커(정확 일치 또는 접두, isOurMarkerValue —
-// D82) AND 명령 토큰 정확 일치를 모두 요구한다(결합, 설계 §7). 마커 없는 수동 항목·접두사만
-// 닮은 `context-router hook-wrapper`는 어느 한 조건에서 탈락해 보존된다(오삭제 방지).
+// D82) AND **모든** 훅 항목의 명령 토큰 정확 일치를 요구한다(결합 + 전건, 설계 §7). 마커 없는
+// 수동 항목·접두사만 닮은 `context-router hook-wrapper`는 어느 한 조건에서 탈락해 보존된다
+// (오삭제 방지).
+//
+// 전건 판정은 Codex 형제 isOurCodexGroup이 이미 든 규칙을 이쪽에 맞춘 것이다(적대 검토 F2).
+// any-판정이면 사용자가 항목을 더한 혼합 그룹까지 통째로 지워져 그 사용자 항목이 소실된다
+// `[실측]`(고치기 전 e2e: 혼합 그룹만 든 파일이 `{}`로 줄었다). **받아들이는 거래**: 사용자가
+// 자기 항목을 더해 놓은 그룹은 우리 항목까지 함께 남고, 그 정리는 사용자 /hooks 몫이 된다 —
+// 파손 금지 > 멱등 완전성. 두 술어는 합치지 않는다: Claude 쪽은 그룹 레벨 __ctrManaged 마커를
+// 들고 Codex hooks.json은 미지 필드 금지라 항목 레벨 추론뿐이므로 소유 판정의 입력이 다르다.
 func isOurHookGroup(raw json.RawMessage) bool {
 	var p hookGroupProbe
 	if json.Unmarshal(raw, &p) != nil {
@@ -90,12 +98,15 @@ func isOurHookGroup(raw json.RawMessage) bool {
 	if !isOurMarkerValue(p.Managed) {
 		return false // 마커 없음 → 수동 항목, 보존
 	}
+	if len(p.Hooks) == 0 {
+		return false // 마커만 있고 항목이 없는 그룹 — 우리가 남긴 형태가 아니다
+	}
 	for _, h := range p.Hooks {
-		if isHookCommandToken(h.Command) {
-			return true
+		if !isHookCommandToken(h.Command) {
+			return false // 사용자 항목이 섞인 혼합 그룹 — 불가침
 		}
 	}
-	return false
+	return true
 }
 
 // isHookCommandToken — 명령을 공백 토큰화해 `context-router hook`과 정확 일치하는지(접두사
@@ -113,11 +124,18 @@ func isHookCommandToken(cmd string) bool {
 //
 // 방향이 하나뿐인 것이 D96 계약 1이다 — 등록(append) 갈래와 그것이 요구하던 그룹 타입·명령
 // 조립·마커 값이 이 릴리스에서 함께 사라졌다.
-func removeHookSettings(existing []byte) ([]byte, error) {
+//
+// 둘째 반환값 removed는 **자기 그룹을 실제로 하나라도 지웠는가**다. 호출자는 거짓이면 쓰지
+// 않는다 — 재기록이 바이트 중립이 아니어서 우리 항목이 없는 손으로 쓴 파일을 우리가 고쳐
+// 놓게 된다. 고치기 전 e2e가 남의 훅만 담긴 파일에서 세 가지를 한꺼번에 바꿨다 `[실측]`:
+// 들여쓰기 4칸→2칸, 최상위 키 원순서→사전순, 값의 앰퍼샌드→유니코드 이스케이프. 이
+// 릴리스가 지운 `.mcp.json` 제거 경로가 같은 가드를 changed 불로 들고 있었다
+// `[실측]`(4b8f50f:internal/cli/hook_install.go).
+func removeHookSettings(existing []byte) (out []byte, removed bool, err error) {
 	settings := map[string]json.RawMessage{}
 	if len(bytes.TrimSpace(existing)) > 0 {
 		if err := json.Unmarshal(existing, &settings); err != nil {
-			return nil, err
+			return nil, false, err
 		}
 		if settings == nil { // JSON `null` → Unmarshal이 맵을 nil로 설정(할당 시 패닉, 최종 리뷰 C5)
 			settings = map[string]json.RawMessage{}
@@ -126,7 +144,7 @@ func removeHookSettings(existing []byte) ([]byte, error) {
 	hooks := map[string]json.RawMessage{}
 	if raw, ok := settings["hooks"]; ok {
 		if err := json.Unmarshal(raw, &hooks); err != nil {
-			return nil, err
+			return nil, false, err
 		}
 		if hooks == nil { // `{"hooks":null}` 동일 경로(최종 리뷰 C5)
 			hooks = map[string]json.RawMessage{}
@@ -136,12 +154,13 @@ func removeHookSettings(existing []byte) ([]byte, error) {
 		var arr []json.RawMessage
 		if raw, ok := hooks[event]; ok {
 			if err := json.Unmarshal(raw, &arr); err != nil {
-				return nil, err
+				return nil, false, err
 			}
 		}
 		kept := make([]json.RawMessage, 0, len(arr))
 		for _, el := range arr {
 			if isOurHookGroup(el) {
+				removed = true
 				continue // 자기 항목 제거
 			}
 			kept = append(kept, el)
@@ -152,7 +171,7 @@ func removeHookSettings(existing []byte) ([]byte, error) {
 		}
 		b, err := json.Marshal(kept)
 		if err != nil {
-			return nil, err
+			return nil, false, err
 		}
 		hooks[event] = b
 	}
@@ -161,15 +180,15 @@ func removeHookSettings(existing []byte) ([]byte, error) {
 	} else {
 		b, err := json.Marshal(hooks)
 		if err != nil {
-			return nil, err
+			return nil, false, err
 		}
 		settings["hooks"] = b
 	}
-	out, err := json.MarshalIndent(settings, "", "  ")
+	b, err := json.MarshalIndent(settings, "", "  ")
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
-	return append(out, '\n'), nil // UTF-8 no BOM, LF + 끝 개행
+	return append(b, '\n'), removed, nil // UTF-8 no BOM, LF + 끝 개행
 }
 
 // codexRegistrations — Codex 쪽 제거 대상 이벤트 3개. 캡처 둘(D35, §11.1 G1 행 1)에 D47 가드
@@ -243,12 +262,13 @@ func codexHooksPath(user bool, projectRoot string) (string, error) {
 }
 
 // removeCodexHooks — removeHookSettings의 Codex 형제(D28 원칙 승계: 멱등·타 항목/미지 키 raw
-// 보존·빈 컨테이너 정리). 이벤트 집합과 소유 판정만 다르다.
-func removeCodexHooks(existing []byte) ([]byte, error) {
+// 보존·빈 컨테이너 정리). 이벤트 집합과 소유 판정만 다르다. 둘째 반환값 removed의 계약도
+// 형제와 같다 — 지운 것이 없으면 호출자가 쓰지 않는다.
+func removeCodexHooks(existing []byte) (out []byte, removed bool, err error) {
 	settings := map[string]json.RawMessage{}
 	if len(bytes.TrimSpace(existing)) > 0 {
 		if err := json.Unmarshal(existing, &settings); err != nil {
-			return nil, err
+			return nil, false, err
 		}
 		if settings == nil {
 			settings = map[string]json.RawMessage{}
@@ -257,7 +277,7 @@ func removeCodexHooks(existing []byte) ([]byte, error) {
 	hooks := map[string]json.RawMessage{}
 	if raw, ok := settings["hooks"]; ok {
 		if err := json.Unmarshal(raw, &hooks); err != nil {
-			return nil, err
+			return nil, false, err
 		}
 		if hooks == nil {
 			hooks = map[string]json.RawMessage{}
@@ -267,12 +287,13 @@ func removeCodexHooks(existing []byte) ([]byte, error) {
 		var arr []json.RawMessage
 		if raw, ok := hooks[event]; ok {
 			if err := json.Unmarshal(raw, &arr); err != nil {
-				return nil, err
+				return nil, false, err
 			}
 		}
 		kept := make([]json.RawMessage, 0, len(arr))
 		for _, el := range arr {
 			if isOurCodexGroup(el) {
+				removed = true
 				continue
 			}
 			kept = append(kept, el)
@@ -283,7 +304,7 @@ func removeCodexHooks(existing []byte) ([]byte, error) {
 		}
 		b, err := json.Marshal(kept)
 		if err != nil {
-			return nil, err
+			return nil, false, err
 		}
 		hooks[event] = b
 	}
@@ -292,20 +313,41 @@ func removeCodexHooks(existing []byte) ([]byte, error) {
 	} else {
 		b, err := json.Marshal(hooks)
 		if err != nil {
-			return nil, err
+			return nil, false, err
 		}
 		settings["hooks"] = b
 	}
-	out, err := json.MarshalIndent(settings, "", "  ")
+	b, err := json.MarshalIndent(settings, "", "  ")
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
-	return append(out, '\n'), nil
+	return append(b, '\n'), removed, nil
 }
 
 // atomicWriteFile — temp 파일 + rename 원자 쓰기(설계 §7). dir을 MkdirAll로 보강하고 같은 dir에
-// 임시 파일을 만들어 rename한다(같은 볼륨 rename만 원자적). 실패 시 임시 파일을 정리한다.
+// 임시 파일을 만들어 rename한다(같은 볼륨 rename만 원자적).
+//
+// 세 가지가 이 함수에 붙어 있다(적대 검토 F6·F7·F8):
+//
+//   - **심링크 해석**(F7): 이 대상은 dotfiles 저장소로 `settings.json`을 심링크해 두는 경우가
+//     흔하다. rename은 링크를 일반 파일로 갈아치우고 원래 대상은 옛 내용을 든 채 남는다 —
+//     호스트가 읽는 파일과 사용자가 관리하는 파일이 갈라진다. EvalSymlinks로 먼저 풀어 임시
+//     파일 위치와 rename 대상을 링크 대상 쪽에서 고른다. 목적지가 없으면 EvalSymlinks가
+//     오류를 내므로 `[문서]`(path/filepath) 그때는 받은 경로를 그대로 쓴다.
+//   - **모드 승계**(F8): os.CreateTemp은 0600으로 만들고 rename이 그 모드를 목적지로 옮긴다
+//     `[실측]`(프로브: temp를 0444로 chmod 후 rename하면 목적지가 0444가 된다) — 승계하지
+//     않으면 사용자 소유 파일의 권한을 조용히 좁힌다. 목적지가 없을 때만 0600이다.
+//   - **임시 파일 defer 정리**(F6): CreateTemp 직후에 건다. rename이 이름을 가져간 뒤의
+//     Remove는 대상이 없어 무동작이고, 패닉·중간 return 어느 쪽으로 빠져도 호스트 디렉터리에
+//     `.ctr-settings-*.tmp`가 남지 않는다. **불변식**: tmpName의 수명은 이 함수 안에서 끝난다.
 func atomicWriteFile(path string, data []byte) error {
+	if resolved, rerr := filepath.EvalSymlinks(path); rerr == nil {
+		path = resolved
+	}
+	perm := os.FileMode(0o600) // 목적지 부재 시의 값
+	if fi, serr := os.Stat(path); serr == nil {
+		perm = fi.Mode().Perm()
+	}
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
@@ -315,20 +357,19 @@ func atomicWriteFile(path string, data []byte) error {
 		return err
 	}
 	tmpName := tmp.Name()
+	defer func() { _ = os.Remove(tmpName) }()
 	_, werr := tmp.Write(data)
 	cerr := tmp.Close()
-	if werr != nil || cerr != nil {
-		_ = os.Remove(tmpName)
-		if werr != nil {
-			return werr
-		}
+	if werr != nil {
+		return werr
+	}
+	if cerr != nil {
 		return cerr
 	}
-	if err := os.Rename(tmpName, path); err != nil {
-		_ = os.Remove(tmpName)
+	if err := os.Chmod(tmpName, perm); err != nil {
 		return err
 	}
-	return nil
+	return os.Rename(tmpName, path)
 }
 
 // hookSettingsPath — 대상 settings.json 경로(설계 §7). 기본 프로젝트 `.claude/settings.json`,
@@ -344,22 +385,22 @@ func hookSettingsPath(user bool, projectRoot string) (string, error) {
 	return filepath.Join(projectRoot, ".claude", "settings.json"), nil
 }
 
-// removeSettingsFile — path의 기존 settings를 읽어 removeHookSettings를 적용한 결과 바이트를
-// 반환한다(쓰기는 호출자). 미존재 파일은 빈 기반으로 취급한다. 읽기 실패·병합 실패 오류에는
-// 절대경로를 담지 않는다(§12 canary — os.ReadFile의 *PathError는 경로 포함).
-func removeSettingsFile(path string) ([]byte, error) {
+// removeSettingsFile — path의 기존 settings를 읽어 removeHookSettings를 적용한 결과 바이트와
+// **실제로 지웠는지**를 반환한다(쓰기는 호출자). 미존재 파일은 빈 기반으로 취급한다. 읽기
+// 실패·병합 실패 오류에는 절대경로를 담지 않는다(§12 canary — os.ReadFile의 *PathError는 경로 포함).
+func removeSettingsFile(path string) ([]byte, bool, error) {
 	existing, err := os.ReadFile(path)
 	if err != nil {
 		if !errors.Is(err, os.ErrNotExist) {
-			return nil, errors.New("hook: 설정 파일 읽기 실패")
+			return nil, false, errors.New("hook: 설정 파일 읽기 실패")
 		}
 		existing = nil
 	}
-	merged, err := removeHookSettings(existing)
+	merged, removed, err := removeHookSettings(existing)
 	if err != nil {
-		return nil, fmt.Errorf("hook: 설정 병합 실패: %w", err) // JSON 오류는 경로 미포함
+		return nil, false, fmt.Errorf("hook: 설정 병합 실패: %w", err) // JSON 오류는 경로 미포함
 	}
-	return merged, nil
+	return merged, removed, nil
 }
 
 // runHookInstallGuidance — `hook install`이 내는 안내(D96·D97). 이 서브커맨드는 마이그레이션
@@ -459,10 +500,17 @@ func runHookUninstall(args []string, projectRoot string, stdout io.Writer) error
 		fmt.Fprintln(stdout, "hook uninstall: 설정 파일 없음 — 제거할 항목 없음")
 		return nil
 	}
-	merged, mergeErr := removeSettingsFile(path)
+	merged, removed, mergeErr := removeSettingsFile(path)
 	if mergeErr != nil {
 		fmt.Fprintln(stdout, "hook uninstall: 훅 설정 정리 실패")
 		return mergeErr
+	}
+	// 우리 항목이 하나도 없으면 쓰지 않는다 — 재기록은 바이트 중립이 아니어서(키 정렬·유니코드
+	// 이스케이프·들여쓰기) 남의 훅만 담긴 손으로 쓴 파일을 우리가 고쳐 놓게 된다. 문면도 하지
+	// 않은 일을 했다고 말하지 않는다.
+	if !removed {
+		fmt.Fprintln(stdout, "hook uninstall: 옛 훅 그룹 없음 — 제거할 항목 없음, 파일 그대로")
+		return nil
 	}
 	if writeErr := atomicWriteFile(path, merged); writeErr != nil {
 		fmt.Fprintln(stdout, "hook uninstall: 훅 설정 쓰기 실패")
@@ -492,9 +540,13 @@ func runHookUninstallCodex(user bool, projectRoot string, stdout io.Writer) erro
 		fmt.Fprintln(stdout, "hook uninstall (codex): 설정 파일 없음 — 제거할 항목 없음")
 		return nil
 	}
-	merged, mErr := removeCodexHooks(existing)
+	merged, removed, mErr := removeCodexHooks(existing)
 	if mErr != nil {
 		return fmt.Errorf("hook: 설정 병합 실패: %w", mErr)
+	}
+	if !removed { // Claude 갈래와 같은 가드 — 우리 항목이 없으면 남의 파일을 재기록하지 않는다
+		fmt.Fprintln(stdout, "hook uninstall (codex): 옛 훅 그룹 없음 — 제거할 항목 없음, 파일 그대로")
+		return nil
 	}
 	if wErr := atomicWriteFile(path, merged); wErr != nil {
 		return errors.New("hook uninstall: 설정 쓰기 실패")
