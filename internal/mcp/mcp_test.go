@@ -282,40 +282,64 @@ func TestSchemaTokenBudget(t *testing.T) {
 	}
 }
 
-// deferredToolNames: D99가 색인하는 지연 로드 여덟의 정본 목록(하나로 유지, D13 반파편화와
-// 동일 취지). [실측] 릴리스 리뷰 F1: 이 목록이 exec 둘을 빠뜨린 동안 mcp.go의 exec 갈래도
-// 같은 둘을 deferred에 넣지 않아, 기대값이 검사 대상과 같은 누락에서 파생되었다 —
-// `CTR_ENABLE=…,exec`로 켠 서버가 ctr_execute를 등록하고도 색인 문장에서 이름을 빼는 것을
-// 이 테스트가 초록으로 통과시켰다. 등록 갈래가 늘면 이 목록도 함께 는다.
-var deferredToolNames = []string{
-	"ctr_fetch", "ctr_transform", "ctr_record_event",
-	"ctr_session_summary", "ctr_export_events", "ctr_fetch_and_index",
-	"ctr_execute", "ctr_execute_file",
-}
-
-// assertDeferredIndexMatchesRegistration — 진입 도구 둘의 Description 꼬리 색인이 그 서버의
-// tools/list와 정확히 맞물리는지 확인한다: 등록된 지연 도구는 전부 이름이 있고, 등록되지 않은
-// 지연 도구는 하나도 없다. 기대값을 코드의 조건 분기에서 다시 적지 않고 tools/list 자신에서
-// 얻는다. 이름 뒤 `(`까지 보는 이유는 색인 항목이 `이름(한 줄 용도)` 형태이고, 그렇게 해야
-// `ctr_fetch`가 `ctr_fetch_and_index`의 부분 문자열로 잡히지 않기 때문이다.
+// assertDeferredIndexMatchesRegistration — 진입 도구의 Description 꼬리 색인이 그 서버의
+// tools/list와 정확히 맞물리는지 확인한다: 등록된 지연 도구는 전부 색인에 이름이 있고, 색인이
+// 든 이름은 전부 등록돼 있다(양방향).
+//
+// **후보 집합도 서버에서 얻는다** `[실측]`(재검토 리뷰, 이 머신). 옛 형태는 진리를
+// tools/list에서 얻으면서 후보는 손으로 유지하는 이름 목록에서 훑었고, 그래서 mcp.go의
+// deferred에 든 도구가 그 목록에서 빠지면 기대값이 검사 대상과 같은 누락에서 파생돼 결함이
+// 초록으로 통과했다 — 릴리스 리뷰 F1의 exec 둘이 정확히 그 형태였다(`CTR_ENABLE=…,exec`로
+// 켠 서버가 ctr_execute를 등록하고도 색인 문장에서 이름을 뺐다). 이제 후보는 tools/list에서
+// `anthropic/alwaysLoad`가 달린 진입 도구를 뺀 나머지라, 지연 도구가 아홉째로 늘어도 이
+// 단정이 손질 없이 함께 는다. 진입 도구가 정확히 어느 둘인지는
+// TestAlwaysLoadMetaExactlyEntryTools가 따로 잰다.
+//
+// 색인 문장의 머리말과 항목 구분자는 deferredToolIndex 자신에서 유도한다 — 문면이 바뀌면 이
+// 단정이 따라간다. 항목에서 이름을 `(` 앞까지로 끊는 이유는 항목이 `이름(한 줄 용도)` 형태라
+// `ctr_fetch`가 `ctr_fetch_and_index`의 부분 문자열로 잡히지 않게 하기 위해서다.
 func assertDeferredIndexMatchesRegistration(t *testing.T, cs *mcp.ClientSession) {
 	t.Helper()
 	lt, err := cs.ListTools(context.Background(), nil)
 	if err != nil {
 		t.Fatalf("list tools: %v", err)
 	}
-	registered, descByName := map[string]bool{}, map[string]string{}
+	var entryTools []string
+	deferredNames, descByName := map[string]bool{}, map[string]string{}
 	for _, tl := range lt.Tools {
-		registered[tl.Name], descByName[tl.Name] = true, tl.Description
-	}
-	for _, entry := range []string{"ctr_search", "ctr_index"} {
-		desc, ok := descByName[entry]
-		if !ok {
-			t.Fatalf("%s not found in tools/list", entry)
+		if v, _ := tl.Meta["anthropic/alwaysLoad"].(bool); v {
+			entryTools = append(entryTools, tl.Name)
+			descByName[tl.Name] = tl.Description
+			continue
 		}
-		for _, name := range deferredToolNames {
-			if indexed := strings.Contains(desc, name+"("); indexed != registered[name] {
-				t.Errorf("%s 설명의 %q 색인=%v, 실제 등록=%v:\n%s", entry, name, indexed, registered[name], desc)
+		deferredNames[tl.Name] = true
+	}
+	if len(entryTools) == 0 {
+		// 진입 도구가 하나도 없으면 아래 루프가 통째로 돌지 않아 이 단정이 공회전한다.
+		t.Fatalf("alwaysLoad 도구가 tools/list에 없다 — 색인을 실을 자리가 없다: %d개 도구", len(lt.Tools))
+	}
+	indexLead, _, _ := strings.Cut(deferredToolIndex([]string{"\x00"}), "\x00")
+	for _, entry := range entryTools {
+		_, tail, found := strings.Cut(descByName[entry], indexLead)
+		if !found {
+			t.Errorf("%s 설명에 지연 도구 색인 문장이 없다:\n%s", entry, descByName[entry])
+			continue
+		}
+		var order []string
+		indexed := map[string]bool{}
+		for _, item := range strings.Split(strings.TrimSuffix(tail, "."), ", ") {
+			name, _, _ := strings.Cut(item, "(")
+			order = append(order, name)
+			indexed[name] = true
+		}
+		for _, tl := range lt.Tools { // tools/list 순서로 — 보고가 결정적이다
+			if deferredNames[tl.Name] && !indexed[tl.Name] {
+				t.Errorf("%s 설명의 색인이 등록된 지연 도구 %q를 빠뜨렸다:\n%s", entry, tl.Name, descByName[entry])
+			}
+		}
+		for _, name := range order {
+			if !deferredNames[name] {
+				t.Errorf("%s 설명의 색인이 등록되지 않은 %q를 광고한다:\n%s", entry, name, descByName[entry])
 			}
 		}
 	}
