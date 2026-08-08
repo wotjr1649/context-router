@@ -166,13 +166,21 @@ func isHookCommandToken(cmd string) bool {
 	return len(f) >= 2 && f[0] == hookBinaryName && f[1] == "hook"
 }
 
-// removeHookSettings — 기존 settings JSON을 map[string]json.RawMessage 보존 패턴으로 파싱해,
-// 관리 대상 이벤트 배열에서 **자기 항목만 제거**한 뒤 재직렬화한다(설계 §7). 미지 최상위 키·타
-// 도구의 훅 항목·관리 대상 아닌 이벤트는 전부 raw로 왕복 보존된다. 빈 배열이 된 이벤트는
-// 제거하고, hooks 자체가 비면 최상위에서 제거한다.
+// removeHookGroups — 두 호스트의 훅 제거가 함께 쓰는 병합기. 기존 settings JSON을
+// map[string]json.RawMessage 보존 패턴으로 파싱해, events의 각 이벤트 배열에서 isOurs가 참인
+// 그룹만 빼고 재직렬화한다(설계 §7). 미지 최상위 키·타 도구의 훅 항목·관리 대상 아닌 이벤트는
+// 전부 raw로 왕복 보존된다. 빈 배열이 된 이벤트는 제거하고, hooks 자체가 비면 최상위에서
+// 제거한다.
 //
 // 방향이 하나뿐인 것이 D96 계약 1이다 — 등록(append) 갈래와 그것이 요구하던 그룹 타입·명령
 // 조립·마커 값이 이 릴리스에서 함께 사라졌다.
+//
+// **이벤트 목록과 소유 술어만 인자로 받는다** — 두 호스트의 차이가 정확히 그 둘뿐이기
+// 때문이다. 몸통을 복제하면 보존 계약의 다음 수정이 한쪽에만 닿고, 다른 호스트의 uninstall이
+// 사용자 훅 항목을 지우는데 그것을 떨어뜨릴 테스트가 없다. 가정이 아니라 이미 일어난 일이다:
+// 아래 두 nil 가드는 최종 리뷰가 같은 내용을 두 자리에 따로 넣어야 했다 `[문서]`(최종 리뷰 C5).
+// 술어와 이벤트 목록 자체는 합치지 않는다 — Claude 쪽은 그룹 레벨 __ctrManaged 마커를 들고
+// Codex hooks.json은 미지 필드 금지라 항목 레벨 추론뿐이라, 소유 판정의 입력이 서로 다르다.
 //
 // 둘째 반환값 removed는 **자기 그룹을 실제로 하나라도 지웠는가**다. 호출자는 거짓이면 쓰지
 // 않는다 — 재기록이 바이트 중립이 아니어서 우리 항목이 없는 손으로 쓴 파일을 우리가 고쳐
@@ -180,7 +188,7 @@ func isHookCommandToken(cmd string) bool {
 // 들여쓰기 4칸→2칸, 최상위 키 원순서→사전순, 값의 앰퍼샌드→유니코드 이스케이프. 이
 // 릴리스가 지운 `.mcp.json` 제거 경로가 같은 가드를 changed 불로 들고 있었다
 // `[실측]`(4b8f50f:internal/cli/hook_install.go).
-func removeHookSettings(existing []byte) (out []byte, removed bool, err error) {
+func removeHookGroups(existing []byte, events []string, isOurs func(json.RawMessage) bool) (out []byte, removed bool, err error) {
 	settings := map[string]json.RawMessage{}
 	if len(bytes.TrimSpace(existing)) > 0 {
 		if err := json.Unmarshal(existing, &settings); err != nil {
@@ -199,7 +207,7 @@ func removeHookSettings(existing []byte) (out []byte, removed bool, err error) {
 			hooks = map[string]json.RawMessage{}
 		}
 	}
-	for _, event := range hookRegistrations {
+	for _, event := range events {
 		var arr []json.RawMessage
 		if raw, ok := hooks[event]; ok {
 			if err := json.Unmarshal(raw, &arr); err != nil {
@@ -208,7 +216,7 @@ func removeHookSettings(existing []byte) (out []byte, removed bool, err error) {
 		}
 		kept := make([]json.RawMessage, 0, len(arr))
 		for _, el := range arr {
-			if isOurHookGroup(el) {
+			if isOurs(el) {
 				removed = true
 				continue // 자기 항목 제거
 			}
@@ -238,6 +246,12 @@ func removeHookSettings(existing []byte) (out []byte, removed bool, err error) {
 		return nil, false, err
 	}
 	return append(b, '\n'), removed, nil // UTF-8 no BOM, LF + 끝 개행
+}
+
+// removeHookSettings — Claude `settings.json` 갈래. 이벤트는 hookRegistrations 여섯,
+// 소유 판정은 그룹 레벨 마커를 보는 isOurHookGroup. 나머지 계약은 removeHookGroups에 있다.
+func removeHookSettings(existing []byte) (out []byte, removed bool, err error) {
+	return removeHookGroups(existing, hookRegistrations, isOurHookGroup)
 }
 
 // codexRegistrations — Codex 쪽 제거 대상 이벤트 3개. 캡처 둘(D35, §11.1 G1 행 1)에 D47 가드
@@ -310,67 +324,11 @@ func codexHooksPath(user bool, projectRoot string) (string, error) {
 	return filepath.Join(projectRoot, ".codex", "hooks.json"), nil
 }
 
-// removeCodexHooks — removeHookSettings의 Codex 형제(D28 원칙 승계: 멱등·타 항목/미지 키 raw
-// 보존·빈 컨테이너 정리). 이벤트 집합과 소유 판정만 다르다. 둘째 반환값 removed의 계약도
-// 형제와 같다 — 지운 것이 없으면 호출자가 쓰지 않는다.
+// removeCodexHooks — Codex `hooks.json` 갈래. 이벤트는 codexRegistrations 셋(D47 가드
+// PreToolUse 포함), 소유 판정은 항목 레벨 추론뿐인 isOurCodexGroup. 나머지 계약은
+// removeHookGroups에 있다.
 func removeCodexHooks(existing []byte) (out []byte, removed bool, err error) {
-	settings := map[string]json.RawMessage{}
-	if len(bytes.TrimSpace(existing)) > 0 {
-		if err := json.Unmarshal(existing, &settings); err != nil {
-			return nil, false, err
-		}
-		if settings == nil {
-			settings = map[string]json.RawMessage{}
-		}
-	}
-	hooks := map[string]json.RawMessage{}
-	if raw, ok := settings["hooks"]; ok {
-		if err := json.Unmarshal(raw, &hooks); err != nil {
-			return nil, false, err
-		}
-		if hooks == nil {
-			hooks = map[string]json.RawMessage{}
-		}
-	}
-	for _, event := range codexRegistrations {
-		var arr []json.RawMessage
-		if raw, ok := hooks[event]; ok {
-			if err := json.Unmarshal(raw, &arr); err != nil {
-				return nil, false, err
-			}
-		}
-		kept := make([]json.RawMessage, 0, len(arr))
-		for _, el := range arr {
-			if isOurCodexGroup(el) {
-				removed = true
-				continue
-			}
-			kept = append(kept, el)
-		}
-		if len(kept) == 0 {
-			delete(hooks, event)
-			continue
-		}
-		b, err := json.Marshal(kept)
-		if err != nil {
-			return nil, false, err
-		}
-		hooks[event] = b
-	}
-	if len(hooks) == 0 {
-		delete(settings, "hooks")
-	} else {
-		b, err := json.Marshal(hooks)
-		if err != nil {
-			return nil, false, err
-		}
-		settings["hooks"] = b
-	}
-	b, err := json.MarshalIndent(settings, "", "  ")
-	if err != nil {
-		return nil, false, err
-	}
-	return append(b, '\n'), removed, nil
+	return removeHookGroups(existing, codexRegistrations, isOurCodexGroup)
 }
 
 // atomicWriteFile — temp 파일 + rename 원자 쓰기(설계 §7). dir을 MkdirAll로 보강하고 같은 dir에
