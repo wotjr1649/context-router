@@ -1511,7 +1511,9 @@ const hostSnippet = `--- host adapter snippets (설계 §9) ---
 
 기본값은 서버가 갖는다 — --enable도 CTR_ENABLE도 지정하지 않으면 ingest,net으로 켜진다
 (플러그인은 프로필을 고정하지 않는다). 바꾸려면 CTR_ENABLE 환경 변수를 쓴다 — 값은 --enable과
-같은 쉼표 목록이다(예: CTR_ENABLE=ingest,net,exec). --enable을 직접 넘기면 그 값이 항상 이긴다.
+같은 쉼표 목록이다(예: CTR_ENABLE=ingest,net,exec). opt-in을 전부 끄려면 CTR_ENABLE=none을
+쓴다(none은 값 전체일 때만 유효하고 다른 이름과 섞으면 오류다). --enable을 직접 넘기면 그
+값이 항상 이긴다.
 
 ## 도구 접두
 

@@ -100,10 +100,12 @@ install carries the six hooks on its own.
 
 `ingest` and `net` are enabled by default; set `CTR_ENABLE` to a
 comma-separated list of `ingest` / `net` / `exec` to change that (e.g.
-`CTR_ENABLE=ingest,net,exec`) — the plugin manifest passes no `--enable`
-flag, so this environment variable is what a plugin-managed install reads.
-A `--enable` flag, if you invoke the binary directly, always wins over
-`CTR_ENABLE`.
+`CTR_ENABLE=ingest,net,exec`), or to `none` for zero opt-in profiles (the
+search/fetch/transform-only posture) — `none` is only valid as the entire
+value; combining it with another name is an error. The plugin manifest
+passes no `--enable` flag, so this environment variable is what a
+plugin-managed install reads. A `--enable` flag, if you invoke the binary
+directly, always wins over `CTR_ENABLE`.
 
 `context-router doctor` diagnoses the store root, DB, and FTS5 setup for the
 current project, and prints the steps above together with the current tool
@@ -134,7 +136,7 @@ non-TTY (automation) context it refuses unless `--force` is passed.
 | `--root <path>` | cwd | project root |
 | `--store-root <path>` | OS-default store dir | override storage location (env `CTR_STORE_ROOT`) |
 | `--profile <list>` | `search,fetch,transform` | v0.0.1 accepts only the default 3-tool profile or `global-search` alone — arbitrary subsets are rejected at startup (tool gating by profile is reserved for a later version) |
-| `--enable <list>` | `ingest,net` | opt-in capabilities: `ingest` / `net` / `exec` (env `CTR_ENABLE`, same comma-separated syntax — `--enable` wins over `CTR_ENABLE`, which wins over this default) |
+| `--enable <list>` | `ingest,net` | opt-in capabilities: `ingest` / `net` / `exec`, or `none` for zero (only valid as the entire value) (env `CTR_ENABLE`, same comma-separated syntax — `--enable` wins over `CTR_ENABLE`, which wins over this default) |
 | `--allow-path <path>` | (none) | extra `ctr_index` allowed root (repeatable) |
 | `--projects <list>` | (none) | project allowlist, required with `--profile global-search` |
 | `--net-allow-local` | off | allow `127.0.0.1`/`::1` destinations for `ctr_fetch_and_index` |
