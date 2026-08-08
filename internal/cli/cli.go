@@ -1584,7 +1584,14 @@ func ownedCodexHits(hits []codexHeaderHit, owned []string) []codexOwnedServer {
 	var out []codexOwnedServer
 	at := map[string]int{}
 	for _, hit := range hits {
+		// 자른 세그먼트를 다듬고 나서 비교한다 `[실측]`(재검토 리뷰 — 이 머신에서 헤더 철자
+		// 열다섯을 재서 나온 거짓 음성 둘). hit.Name은 codexHeaderName이 첫 점 기준으로 나누지
+		// 않은 원문이라 세그먼트 안에 TOML이 허용하는 점 주위 공백([mcp_servers.ctr . env] →
+		// "ctr ")과 세그먼트 단위 인용([mcp_servers."ctr".env] → `"ctr"`)이 그대로 남는다. 둘 다
+		// 유효 TOML이라 파스 실패 줄도 뜨지 않아, 다듬지 않고 비교하던 동안 그 사용자는 doctor
+		// 한 번에서 아무 신호도 받지 못했다 — 손으로 고친 사용자가 정확히 이 스캐너의 대상이다.
 		name, _, _ := strings.Cut(hit.Name, ".")
+		name = unquoteHeaderName(strings.TrimSpace(name))
 		if !slices.Contains(owned, name) {
 			continue
 		}
@@ -2045,11 +2052,19 @@ func runDoctor(ctx context.Context, w io.Writer, storeRoot, projectRoot, version
 	//
 	// 그 거름이 생기면서 이름도 함께 인쇄한다(리뷰 I2의 반대 판정을 대체한다) — 보고되는 이름은
 	// hit.Name의 추정값이 아니라 retiredServerNames의 리터럴이고, 점도 인용부호도 없는 알려진
-	// 값 둘 중 하나라 codex mcp remove에 그대로 넘길 수 있다. **받아들이는 대가**: 이름 자체에
-	// 점이 있는 인용 헤더([mcp_servers."ctr.env"])는 첫 세그먼트가 ctr이라 우리 이름으로 잡히고
-	// 보고 이름은 ctr이 된다 `[미실측]`. 그 형태를 놓치지 않는 쪽을 고른 것이다 —
-	// [mcp_servers.ctr.env] 서브테이블 헤더만 홀로 남아도 TOML 점 표기 규칙상 부모
-	// mcp_servers.ctr를 암묵적으로 되살리므로 첫 세그먼트 절단이 그 줄을 잡는 유일한 길이다.
+	// 값 둘 중 하나라 codex mcp remove에 그대로 넘길 수 있다.
+	//
+	// **받아들이는 대가는 양방향으로 하나씩이고 둘 다 쟀다** `[실측]`(재검토 리뷰가 헤더 철자
+	// 열다섯을 두 바이너리에서 재고, TestDoctorCodexOwnedServerFilter가 그 둘을 사례로 든다):
+	//   ① 과검출 — 이름 자체에 점이 있는 인용 헤더([mcp_servers."ctr.env"])는 첫 세그먼트가
+	//      ctr이라 우리 이름으로 잡히고 보고 이름도 ctr이 된다. 그 형태를 놓치지 않는 쪽을 고른
+	//      것이다 — [mcp_servers.ctr.env] 서브테이블 헤더만 홀로 남아도 TOML 점 표기 규칙상 부모
+	//      mcp_servers.ctr를 암묵적으로 되살리므로 첫 세그먼트 절단이 그 줄을 잡는 유일한 길이다.
+	//   ② 미검출 — 닫는 따옴표를 빠뜨린 오타([mcp_servers."ctr])는 이름이 `"ctr`로 남는다.
+	//      unquoteHeaderName은 양끝 짝이 맞을 때만 벗기므로 이 이름은 우리 이름과 맞지 않아
+	//      등록물 보고에서 빠진다. 한 겹 더 벗기는 쪽은 두지 않는다 — 그 파일은 TOML로 파스되지
+	//      않아 위 파스 실패 줄이 무조건 뜨고, 그 줄이 "파일을 열어 고치라"로 그 사용자를 같은
+	//      자리에 데려다 놓는다. 조용히 넘어가는 코호트가 아니다.
 	//
 	// 파스 판정은 등록물 발견 여부와 무관하게 낸다(릴리스 리뷰 F2). Codex는 문법 오류 하나로
 	// 그 파일 **전체**를 무시하므로 모델 설정도 [hooks] 신뢰 항목도 프로필도 함께 죽는다 —
@@ -2219,6 +2234,14 @@ func runDoctor(ctx context.Context, w io.Writer, storeRoot, projectRoot, version
 			if !errors.Is(err, os.ErrNotExist) {
 				fmt.Fprintf(w, "[20] claude: %s 읽기 실패 — enabledMcpjsonServers 잔존 여부를 판정하지 못했다(파일을 직접 열어 확인하세요)\n", p)
 			}
+			continue
+		}
+		// 빈 파일·공백뿐인 파일은 판정된 사실이다 — 그 안에 잔존 이름은 없다. 형제
+		// scanRegisteredHooks가 같은 가드로 같은 바이트를 `옛 그룹 없음`으로 읽으므로(hook_install.go)
+		// 이 가드가 없으면 doctor 한 번의 출력에서 [9]와 [20]이 같은 파일을 다르게 판정하고,
+		// 아무것도 없는 파일을 열어 보라는 안내가 남는다 `[실측]`(재검토 리뷰 — 0바이트와 공백뿐인
+		// .claude/settings.json에서 두 줄을 함께 재서 확인).
+		if len(bytes.TrimSpace(data)) == 0 {
 			continue
 		}
 		var enabledDoc struct {
