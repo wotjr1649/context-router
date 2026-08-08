@@ -1196,6 +1196,42 @@ func TestHookUninstall_MixedGroupUntouched(t *testing.T) {
 	}
 }
 
+// TestDoctor_MixedGroupReportsNoLegacyGroups — F2가 진단으로 번진 자리를 고정한다.
+// scanRegisteredHooks가 uninstall과 같은 술어(isOurHookGroup)를 쓰므로, 혼합 그룹만 남은
+// 사용자에게 doctor [9]는 "옛 그룹 없음"을 낸다 — 그런데 `context-router hook`은 파일에 그대로
+// 있고 계속 발화한다. **그 조합이 이 릴리스가 사용자에게 지는 빚이고**, CHANGELOG와 설계서 §6이
+// 그것을 설명한다. 단정이 없으면 그 조합은 코드 주석에만 살아 문서와 어긋나도 초록이다.
+// Codex 쪽 [16]은 이 변경 전부터 같은 전건 판정이라 형제 자리다.
+func TestDoctor_MixedGroupReportsNoLegacyGroups(t *testing.T) {
+	isolateCodexHome(t)
+	projectRoot := t.TempDir()
+	path := filepath.Join(projectRoot, ".claude", "settings.json")
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	seed := `{"hooks":{"PostToolUse":[{"matcher":"","hooks":[` +
+		`{"type":"command","command":"context-router hook","timeout":10},` +
+		`{"type":"command","command":"user-tool run","timeout":5}],"__ctrManaged":"context-router"}]}}`
+	if err := os.WriteFile(path, []byte(seed), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// 사용자가 보는 줄부터 잰다 — 실패 문면이 증상 그대로여야 한다.
+	out, _ := doctorOut(t, projectRoot)
+	if !strings.Contains(out, "[9] hooks: project=옛 그룹 없음") {
+		t.Fatalf("[9]가 혼합 그룹을 옛 그룹으로 셌다:\n%s", out)
+	}
+	if n, _, err := scanRegisteredHooks(path); err != nil || n != 0 {
+		t.Fatalf("혼합 그룹 소유 개수=%d err=%v want 0(전건 판정)", n, err)
+	}
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if !strings.Contains(string(after), "context-router hook") {
+		t.Fatalf("우리 명령이 파일에서 사라졌다 — 이 테스트가 재려던 상태가 아니다:\n%s", after)
+	}
+}
+
 // TestIsOurHookGroupEdges — 소유 판정 직접 에지(Codex 형제 TestIsOurCodexGroupEdges의 짝).
 // 전건 판정(F2): 마커가 소유 값이고 **모든** 훅 항목의 command 토큰이 일치할 때만 자기 그룹.
 func TestIsOurHookGroupEdges(t *testing.T) {
@@ -1295,6 +1331,11 @@ func assertNoTempLeftover(t *testing.T, dir string) {
 // 으로 접고 Stat이 0666을 돌려준다 — 구분되는 값은 읽기 전용 0444 하나인데 그 목적지 위로는
 // rename 자체가 Access denied로 실패한다. 판별력은 3-OS CI의 ubuntu·macos 러너에 있다.
 func TestAtomicWriteFile_PreservesDestinationMode(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		// 초록 줄이 아무것도 뜻하지 않는 것을 로컬 실행에서 보이게 한다 — 건너뛰지는 않는다
+		// (쓰기 자체가 깨지는 회귀는 여기서도 잡힌다).
+		t.Log("windows: 0600과 0644가 같은 속성으로 접혀 권한 단정에 판별력이 없다 — 판별은 ubuntu·macos 러너에서 일어난다")
+	}
 	dir := t.TempDir()
 	dest := filepath.Join(dir, "settings.json")
 	if err := os.WriteFile(dest, []byte("{}\n"), 0o600); err != nil {

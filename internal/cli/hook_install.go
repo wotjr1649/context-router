@@ -86,7 +86,8 @@ type hookGroupProbe struct {
 //
 // 전건 판정은 Codex 형제 isOurCodexGroup이 이미 든 규칙을 이쪽에 맞춘 것이다(적대 검토 F2).
 // any-판정이면 사용자가 항목을 더한 혼합 그룹까지 통째로 지워져 그 사용자 항목이 소실된다
-// `[실측]`(고치기 전 e2e: 혼합 그룹만 든 파일이 `{}`로 줄었다). **받아들이는 거래**: 사용자가
+// `[실측]`(고치기 전 e2e: 순수 자기 그룹 하나와 혼합 그룹 하나를 든 파일이 `{}`로 줄어,
+// 혼합 그룹 안의 사용자 항목까지 함께 사라졌다). **받아들이는 거래**: 사용자가
 // 자기 항목을 더해 놓은 그룹은 우리 항목까지 함께 남고, 그 정리는 사용자 /hooks 몫이 된다 —
 // 파손 금지 > 멱등 완전성. 두 술어는 합치지 않는다: Claude 쪽은 그룹 레벨 __ctrManaged 마커를
 // 들고 Codex hooks.json은 미지 필드 금지라 항목 레벨 추론뿐이므로 소유 판정의 입력이 다르다.
@@ -333,7 +334,13 @@ func removeCodexHooks(existing []byte) (out []byte, removed bool, err error) {
 //     흔하다. rename은 링크를 일반 파일로 갈아치우고 원래 대상은 옛 내용을 든 채 남는다 —
 //     호스트가 읽는 파일과 사용자가 관리하는 파일이 갈라진다. EvalSymlinks로 먼저 풀어 임시
 //     파일 위치와 rename 대상을 링크 대상 쪽에서 고른다. 목적지가 없으면 EvalSymlinks가
-//     오류를 내므로 `[문서]`(path/filepath) 그때는 받은 경로를 그대로 쓴다.
+//     오류를 내므로 그때는 받은 경로를 그대로 쓴다 — 설치된 Go의 doc 주석
+//     ($GOROOT/src/path/filepath/path.go)은 미존재 경로를 언급하지 않아 `[실측]`으로 잰
+//     동작이다(프로브: `GetFileAttributesEx ...: The system cannot find the file specified`).
+//     **하드링크는 이 해석이 못 본다** — 링크 수만 있고 가리킬 이름이 없어 EvalSymlinks가
+//     원본 이름을 돌려준다. rename은 그 링크를 끊고 다른 이름은 옛 내용을 든 채 남는다.
+//     temp+rename 방식에 내재한 한계이고, 고치려면 대상 파일을 제자리에서 truncate+write
+//     해야 하는데 그것은 원자성을 잃는다.
 //   - **모드 승계**(F8): os.CreateTemp은 0600으로 만들고 rename이 그 모드를 목적지로 옮긴다
 //     `[실측]`(프로브: temp를 0444로 chmod 후 rename하면 목적지가 0444가 된다) — 승계하지
 //     않으면 사용자 소유 파일의 권한을 조용히 좁힌다. 목적지가 없을 때만 0600이다.
