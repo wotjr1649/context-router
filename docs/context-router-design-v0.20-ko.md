@@ -98,9 +98,16 @@
 
 **계약 일곱**
 
-1. **병합은 행을 지우는 경로가 진다.** 자리 둘 — `PurgeOlderThan`(`internal/store/store.go:744`)과
-   `purgeHookRows`(`같은 파일 1145`)의 커밋 직후. 호출자마다 붙이지 않는다(D13 반파편화):
-   `checkFTSIntegrity`(`776`)가 이미 쓰는 **커밋 후 writer 경로**와 같은 자리다.
+1. **병합은 원시 명령 하나이고, 언제 도는지는 호출자가 갖는다.** `Store.MergeFTS`를
+   `checkFTSIntegrity`(`internal/store/store.go:776`) 옆에 두고 — 같은 **커밋 후 writer 경로**다 —
+   행을 지우는 세 경로가 각자 정책과 함께 부른다: **기동 퍼지 고루틴은 하루 한 번**
+   (`cmd/context-router/main.go:640-704`), **`runPurge --vacuum`과 `runPurgeHookOnly`는 무조건**
+   (`internal/cli/cli.go:931`·`1039`, VACUUM 직전).
+
+   **정책을 `PurgeOlderThan`·`purgeHookRows` 안으로 밀어 넣지 않는 이유**: 자동 경로와 수동
+   경로의 정책이 다르므로(하루 한 번 대 무조건), 안에 넣으면 게이트를 인자로 넘겨야 한다 —
+   그 인자가 곧 정책이고, 정책은 부르는 쪽 것이다. `checkFTSIntegrity`가 `PurgeOlderThan`에만
+   붙어 있고 hook purge에는 없는 것도 같은 형태다.
    (`GCOrphanBlobs`(`824`)는 블롭 파일만 회수하고 FTS 행을 건드리지 않으므로 대상이 아니다.)
 2. **자동 경로는 하루 한 번이다. 매 기동 무조건이 아니다.** 정상상태 병합이 쓰기 락을
    약 1.2초 잡는데, 훅 Read 가드의 총예산이 2000 ms이고 D67이 이미 *"이 배치의 잠금·쓰기 락
