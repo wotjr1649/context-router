@@ -2420,6 +2420,27 @@ func TestRunDoctorFixFlag(t *testing.T) {
 	if err := Run(context.Background(), "doctor", []string{"--fix"}, t.TempDir(), t.TempDir(), "0.19.0", &out, &errOut); err == nil {
 		t.Fatalf("--fix가 더는 존재하지 않는데 doctor가 받아들였다: %s", out.String())
 	}
+	// 릴리스 리뷰 F6: 옛 구현은 flag.NewFlagSet이라 아래 철자를 전부 받아들였다 — 그중 하나를
+	// 친 사용자가 일반 "예상치 않은 인자" 오류를 읽으면 그 능력이 어디로 갔는지 배우지 못하고,
+	// 그 안내가 이 특수 분기의 존재 이유다. --fixture는 --fix가 아니다(느슨한 접두 매치 금지).
+	for _, spelling := range []string{"--fix", "--fix=true", "-fix", "-fix=true", "-fix=false"} {
+		var o, e bytes.Buffer
+		err := Run(context.Background(), "doctor", []string{spelling}, t.TempDir(), t.TempDir(), "0.19.0", &o, &e)
+		if err == nil {
+			t.Fatalf("%s를 doctor가 받아들였다: %s", spelling, o.String())
+		}
+		if !strings.Contains(err.Error(), "--fix는 더는 없습니다") {
+			t.Errorf("%s가 --fix 은퇴 사유를 내지 않는다: %v", spelling, err)
+		}
+	}
+	var o2, e2 bytes.Buffer
+	err := Run(context.Background(), "doctor", []string{"--fixture"}, t.TempDir(), t.TempDir(), "0.19.0", &o2, &e2)
+	if err == nil {
+		t.Fatal("--fixture를 doctor가 받아들였다")
+	}
+	if strings.Contains(err.Error(), "--fix는 더는 없습니다") {
+		t.Errorf("--fixture를 --fix로 읽었다(접두 매치): %v", err)
+	}
 	// 인자 없는 정상 실행은 여전히 받아들인다 — 위 단정만 있으면 doctor가 인자를 통째로
 	// 거부하도록 망가져도(과잉 거부) 이 테스트가 통과해버린다.
 	var out2, errOut2 bytes.Buffer
@@ -2738,8 +2759,11 @@ func TestDoctorCodexHandEditDetection(t *testing.T) {
 				return
 			}
 			wantPath := filepath.Join(home, "config.toml")
-			if !strings.Contains(out, "플러그인 이전 방식의 등록물이 남아 있다 — "+wantPath+":1\n") {
-				t.Errorf("파일:줄 형식이 없다 — want 접미 %q:\n%s", wantPath+":1", out)
+			// 재기준선(릴리스 리뷰 F1): 보고 줄이 서버 이름을 함께 든다 — 거름이 생겨 그 이름이
+			// retiredServerNames의 리터럴이고, 그래서 다음 걸음도 <이름> 자리표시자가 아니라
+			// 그 값을 그대로 든다.
+			if !strings.Contains(out, "플러그인 이전 방식의 등록물이 남아 있다 — "+wantPath+":1 (ctr)\n") {
+				t.Errorf("파일:줄 형식이 없다 — want 접미 %q:\n%s", wantPath+":1 (ctr)", out)
 			}
 			if !strings.Contains(out, "다음 걸음") || !strings.Contains(out, "codex mcp remove") || !strings.Contains(out, "codex mcp list") {
 				t.Errorf("다음 걸음 안내(codex mcp remove/list)가 없다:\n%s", out)
@@ -2748,7 +2772,7 @@ func TestDoctorCodexHandEditDetection(t *testing.T) {
 			// list" 부분 문자열이 들어 있어(하나는 실행을 권하고 하나는 닿지 못한다고 말한다)
 			// 갈래를 가르지 못한다 — 갈래별 실제 문구로 가른다.
 			if c.wantParses {
-				if !strings.Contains(out, "다음 걸음 — codex mcp list로 등록된 이름을 확인한 뒤 codex mcp remove") {
+				if !strings.Contains(out, "다음 걸음 — codex mcp remove ctr 뒤 codex mcp list로 부재를 확인하세요") {
 					t.Errorf("TOML이 파스되는데 codex mcp list/remove 실행 안내가 아니다:\n%s", out)
 				}
 			} else {
@@ -3088,4 +3112,137 @@ func TestDoctorEnabledMcpjsonServersLeftover(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestDoctorCodexOwnedServerFilter — 릴리스 리뷰 F1. codexServerHeaders는 이름을 가리지 않는
+// 스캐너다(무효 TOML에서도 도는 것이 존재 이유). 보고는 그 히트 중 **첫 점 앞 세그먼트가 우리가
+// 등록한 적 있는 이름**인 것만 낸다 — 거르지 않으면 `[mcp_servers.github]` 하나를 둔 사용자가
+// "우리 잔존물이 남아 있다 + codex mcp remove"를 읽고 남의 서버를 지운다. 거름이 생겼으므로
+// 이름도 함께 인쇄한다(보고되는 이름은 점도 인용부호도 없는 알려진 리터럴 둘 중 하나다).
+// `[mcp_servers.ctr]`와 `[mcp_servers.ctr.env]`는 한 서버 한 번으로 접어 보고한다 — 제거도
+// 한 번이다.
+func TestDoctorCodexOwnedServerFilter(t *testing.T) {
+	cases := []struct {
+		name      string
+		cfg       string
+		wantSuf   string // "" = 등록물 보고 없음
+		wantSteps string // "" = 다음 걸음 없음
+	}{
+		{"남의 서버만", "[mcp_servers.github]\ncommand = \"gh-mcp\"\n", "", ""},
+		{
+			"남의 서버와 우리 이름이 함께",
+			"[mcp_servers.github]\ncommand = \"gh-mcp\"\n\n[mcp_servers.ctr]\ncommand = \"context-router\"\n",
+			":4 (ctr)\n",
+			"[16] codex: 다음 걸음 — codex mcp remove ctr 뒤 codex mcp list로 부재를 확인하세요",
+		},
+		{
+			"서브테이블은 같은 서버 한 번으로",
+			"[mcp_servers.ctr]\ncommand = \"context-router\"\n\n[mcp_servers.ctr.env]\nCTR_ENABLE = \"ingest\"\n",
+			":1,4 (ctr)\n",
+			"[16] codex: 다음 걸음 — codex mcp remove ctr 뒤 codex mcp list로 부재를 확인하세요",
+		},
+		{
+			"현재 이름(ctr-exec)",
+			"[mcp_servers.ctr-exec]\ncommand = \"context-router\"\n",
+			":1 (ctr-exec)\n",
+			"[16] codex: 다음 걸음 — codex mcp remove ctr-exec 뒤 codex mcp list로 부재를 확인하세요",
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			home := isolateCodexHome(t)
+			writeCodexConfig(t, home, c.cfg)
+			cfgPath := filepath.Join(home, "config.toml")
+			out, err := doctorOut(t, t.TempDir())
+			if err != nil {
+				t.Errorf("이 보고는 실패 항목에 계상되면 안 된다 — err=%v", err)
+			}
+			const lead = "[16] codex: 플러그인 이전 방식의 등록물이 남아 있다 — "
+			if c.wantSuf == "" {
+				if strings.Contains(out, lead) {
+					t.Fatalf("남의 서버를 우리 잔존물로 보고했다:\n%s", out)
+				}
+				if strings.Contains(out, "[16] codex: 다음 걸음") {
+					t.Fatalf("보고가 없는데 다음 걸음을 냈다:\n%s", out)
+				}
+				return
+			}
+			if want := lead + cfgPath + c.wantSuf; !strings.Contains(out, want) {
+				t.Fatalf("want %q:\n%s", want, out)
+			}
+			if n := strings.Count(out, lead); n != 1 {
+				t.Fatalf("등록물 보고 줄 수=%d want 1(서버 하나 = 제거 하나):\n%s", n, out)
+			}
+			if !strings.Contains(out, c.wantSteps) {
+				t.Fatalf("다음 걸음이 이름을 들지 않는다 — want %q:\n%s", c.wantSteps, out)
+			}
+			if strings.Contains(out, "github") {
+				t.Fatalf("남의 서버 이름이 출력에 실렸다:\n%s", out)
+			}
+		})
+	}
+}
+
+// TestDoctorCodexInvalidTOMLUnconditional — 릴리스 리뷰 F2. 파스 판정은 우리 등록물을 찾았는지에
+// 매이지 않는다. Codex는 문법 오류 하나로 그 파일 전체를 무시하므로(모델 설정·훅 신뢰 항목·프로필)
+// mcp_servers 테이블이 하나도 없는 무효 config.toml에서도 이 줄이 그 사용자에게 유일한 신호다.
+// 유효한 파일에서는 이 줄이 없다는 것도 함께 잰다 — 무조건 인쇄하면 그것대로 오보다.
+func TestDoctorCodexInvalidTOMLUnconditional(t *testing.T) {
+	const wantLead = "[16] codex: config.toml이 TOML로 파스되지 않습니다 — "
+	t.Run("등록물 없는 무효 파일", func(t *testing.T) {
+		home := isolateCodexHome(t)
+		writeCodexConfig(t, home, "[hooks]\ntrusted = [1, 2,\n")
+		out, err := doctorOut(t, t.TempDir())
+		if err != nil {
+			t.Errorf("이 보고는 실패 항목에 계상되면 안 된다 — err=%v", err)
+		}
+		if want := wantLead + filepath.Join(home, "config.toml"); !strings.Contains(out, want) {
+			t.Fatalf("무효 config.toml이 깨끗함으로 읽혔다 — want %q:\n%s", want, out)
+		}
+		if strings.Contains(out, "플러그인 이전 방식의 등록물이 남아 있다") {
+			t.Fatalf("등록물이 없는데 잔존을 보고했다:\n%s", out)
+		}
+	})
+	t.Run("유효 파일", func(t *testing.T) {
+		home := isolateCodexHome(t)
+		writeCodexConfig(t, home, "[model]\nname = \"gpt\"\n")
+		out, _ := doctorOut(t, t.TempDir())
+		if strings.Contains(out, wantLead) {
+			t.Fatalf("파스되는 파일에 파스 실패를 인쇄했다:\n%s", out)
+		}
+	})
+}
+
+// TestDoctorEnabledScopeUnjudgeable — 릴리스 리뷰 F5. enabledMcpjsonServers 절은 읽기·파싱
+// 실패를 조용히 건너뛰어 그 스코프를 "깨끗함"으로 읽었다. 이 키를 지우는 호스트 CLI가 없으므로
+// (claude mcp remove는 등록물만 건드린다) 여기서 놓친 잔존은 아무도 짚지 않는다 — [20]의 앞
+// 절·[19]·[16]이 이미 세운 "판정 못 한 것을 판정했다고 말하지 않는다"를 이 절에도 적용한다.
+// 대상은 settings.local.json이다 — 이 절만의 실패를 만들면서 [9]의 훅 스코프 판정과 섞이지 않는다.
+func TestDoctorEnabledScopeUnjudgeable(t *testing.T) {
+	t.Run("읽기 실패", func(t *testing.T) {
+		isolateCodexHome(t)
+		projectRoot := t.TempDir()
+		p := filepath.Join(projectRoot, ".claude", "settings.local.json")
+		if err := os.MkdirAll(p, 0o755); err != nil { // 파일 자리에 디렉터리 — os.ReadFile이 부재 아닌 오류를 낸다
+			t.Fatalf("mkdir: %v", err)
+		}
+		out, _ := doctorOut(t, projectRoot)
+		if want := "[20] claude: " + p + " 읽기 실패"; !strings.Contains(out, want) {
+			t.Fatalf("읽지 못한 스코프가 조용히 깨끗함으로 읽혔다 — want %q:\n%s", want, out)
+		}
+	})
+	t.Run("파싱 실패", func(t *testing.T) {
+		isolateCodexHome(t)
+		projectRoot := t.TempDir()
+		p := filepath.Join(projectRoot, ".claude", "settings.local.json")
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatalf("mkdir: %v", err)
+		}
+		// 승인 목록에 옛 이름이 살아 있는 채로 쉼표 하나가 남은 파일 — 파싱만 실패한다.
+		write(t, p, []byte(`{"enabledMcpjsonServers":["`+ctrMCPServerName+`",}`))
+		out, _ := doctorOut(t, projectRoot)
+		if want := "[20] claude: " + p + " 파싱 실패"; !strings.Contains(out, want) {
+			t.Fatalf("파싱 실패가 조용히 깨끗함으로 읽혔다 — want %q:\n%s", want, out)
+		}
+	})
 }

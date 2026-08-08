@@ -42,43 +42,37 @@ func mcpConfigPath(projectRoot string) string {
 	return filepath.Join(projectRoot, ".mcp.json")
 }
 
+// mcpServerEntry — 등록 파일의 서버 항목 하나에서 우리가 읽는 두 필드. command까지 읽는 이유:
+// 표식이 없어도 command가 우리 것이면 우리가 남긴 등록물이므로 잔존 보고 대상이다
+// (ownedRegistration이 그 논리합을 든다).
+type mcpServerEntry struct {
+	Managed string `json:"__ctrManaged"`
+	Command string `json:"command"`
+}
+
 // mcpServersDoc — MCP 등록 파일에서 우리가 읽는 형태. 최상위 `mcpServers` 객체 하나이고
 // 프로젝트 `.mcp.json`과 사용자 스코프 `~/.claude.json` 최상위가 같은 모양이다(설계 v0.12의
-// 스코프 표). mcpManagedMarker와 mcpJSONParses가 **같은 타입**을 봐야 doctor [20]의 "파싱
-// 실패"와 "항목 없음"이 실제로 갈린다 — 형태가 두 벌로 갈라지면 한쪽만 받아들이는 파일에서
-// 두 판정이 서로 모순된다.
+// 스코프 표).
 type mcpServersDoc struct {
-	Servers map[string]struct {
-		Managed string `json:"__ctrManaged"`
-		Command string `json:"command"`
-	} `json:"mcpServers"`
+	Servers map[string]mcpServerEntry `json:"mcpServers"`
 }
 
-// mcpJSONParses — 등록 파일이 mcpServersDoc 형태로 파스되는가. doctor [20]이 파싱 실패를
-// 조용히 "잔존물 없음"으로 읽지 않게 하는 판정원이다([16]의 codexTOMLParses와 같은 자리,
-// 최종 리뷰 S5) — 쉼표 하나가 남은 파일은 파싱만 실패하고 등록물은 그대로 살아 있다.
-func mcpJSONParses(data []byte) bool {
-	var doc mcpServersDoc
-	return json.Unmarshal(data, &doc) == nil
-}
-
-// mcpManagedMarker — .mcp.json에서 name 서버 항목의 __ctrManaged와 command를 읽는다(감지원).
-// 파싱 실패·그 이름의 항목 부재는 found=false다 — 파일 존재 여부는 호출자가 따로 본다.
-// command까지 돌려주는 이유: 표식이 없어도 command가 우리 것이면 우리가 남긴 등록물이므로
-// 잔존 보고 대상이다(ownedRegistration이 그 논리합을 든다). name을 매개변수로 받는다(재검토
-// 리뷰 4) — 유일한 호출자(doctor [20])가 현재 이름(ctrMCPServerName)뿐 아니라 D63 ②가 대체한
-// 옛 이름("ctr")도 같은 파일에서 확인해야 하고, 그 확인을 doctor 쪽에서 JSON 구조를 다시
-// 파싱해 중복 구현하지 않는다.
-func mcpManagedMarker(data []byte, name string) (marker, command string, found bool) {
+// mcpServerEntries — 등록 파일을 **파일당 한 번** 언마샬해 서버 항목 맵과 파싱 성패를 함께
+// 돌려준다. 파싱 실패는 ok=false다 — doctor [20]이 그것을 조용히 "잔존물 없음"으로 읽지 않게
+// 하는 판정원이고([16]의 codexTOMLParses와 같은 자리, 최종 리뷰 S5), 쉼표 하나가 남은 파일은
+// 파싱만 실패하고 등록물은 그대로 살아 있다.
+//
+// 판정과 조회가 **한 언마샬을 공유하는** 것이 이 함수의 형태다(릴리스 리뷰 F7). 앞선 구현은
+// 파싱 판정 1회 + 확인할 이름마다 1회로 같은 바이트를 파일당 세 번 훑었다 — 그 파일 하나가
+// 프로젝트별 이력을 통째로 든 `~/.claude.json`이라 무거운 사용자에게서 수십 MB를 반복해
+// 파싱했다. 한 자리로 합치면 두 판정이 같은 형태를 본다는 성질도 구조적으로 보장된다(형태가
+// 두 벌로 갈라지면 한쪽만 받아들이는 파일에서 두 판정이 서로 모순된다).
+func mcpServerEntries(data []byte) (map[string]mcpServerEntry, bool) {
 	var doc mcpServersDoc
 	if json.Unmarshal(data, &doc) != nil {
-		return "", "", false
+		return nil, false
 	}
-	e, ok := doc.Servers[name]
-	if !ok {
-		return "", "", false
-	}
-	return e.Managed, e.Command, true
+	return doc.Servers, true // nil 맵 조회는 (제로값, false)라 "mcpServers 키 없음"이 자연히 부재로 귀결된다
 }
 
 // permissionRules — settings 파일에서 읽는 규칙 배열.

@@ -110,6 +110,54 @@ func isOurHookGroup(raw json.RawMessage) bool {
 	return true
 }
 
+// heldHookGroup — 우리 항목이 사용자 항목과 **함께** 든 그룹인가(Claude). 마커가 소유 값이고
+// 우리 명령 항목이 하나 이상 있으면서 전건이 아닐 때 참이다 — isOurHookGroup이 거짓을 내는 바로
+// 그 형태이고, 둘은 구조적으로 배타적이다(전건이면 외래가 0이다).
+//
+// 이 술어가 있는 이유는 소유 판정의 대가를 진단이 갚기 위해서다. 전건 판정은 그 그룹을
+// **보존**하므로 우리 명령은 파일에 남아 계속 발화하고 플러그인 훅과 겹쳐 같은 포착이 두 번
+// 일어난다 `[문서]`(설계 v0.19 §6). 소유 판정을 되돌리면 사용자 훅 항목이 파괴되므로
+// `[실측]`(v0.19 구현 라운드 적대 검토 F2 — 파일이 `{}`로 무너졌다) 술어는 그대로 두고 세는
+// 방식만 늘린다: 지울 수 있는 부류(isOurHookGroup)와 동거 부류(이 술어)를 갈라 doctor가 각자의
+// 다음 걸음을 낸다.
+func heldHookGroup(raw json.RawMessage) bool {
+	var p hookGroupProbe
+	if json.Unmarshal(raw, &p) != nil {
+		return false
+	}
+	if !isOurMarkerValue(p.Managed) {
+		return false // 마커 없음 → 우리가 남긴 그룹이 아니다(소유 판정과 같은 관문)
+	}
+	ours, foreign := 0, 0
+	for _, h := range p.Hooks {
+		if isHookCommandToken(h.Command) {
+			ours++
+			continue
+		}
+		foreign++
+	}
+	return ours > 0 && foreign > 0
+}
+
+// heldCodexGroup — heldHookGroup의 Codex 형제. hooks.json은 미지 필드 금지라 그룹 레벨 마커가
+// 없고 소유는 항목 레벨 추론(command 토큰 + statusMessage 마커)뿐이므로, "우리 항목"의 기준이
+// isOurCodexGroup의 전건 조건 그대로다.
+func heldCodexGroup(raw json.RawMessage) bool {
+	var p codexGroupProbe
+	if json.Unmarshal(raw, &p) != nil {
+		return false
+	}
+	ours, foreign := 0, 0
+	for _, h := range p.Hooks {
+		if isCodexHookCommandToken(h.Command) && isOurMarkerValue(h.StatusMessage) {
+			ours++
+			continue
+		}
+		foreign++
+	}
+	return ours > 0 && foreign > 0
+}
+
 // isHookCommandToken — 명령을 공백 토큰화해 `context-router hook`과 정확 일치하는지(접두사
 // 매칭 금지 — `context-router hook-wrapper`는 두 번째 토큰이 다르므로 불일치). 뒤에 --no-shadow·
 // --store-root 등 추가 토큰이 붙어도 첫 두 토큰이 일치하면 우리 명령이다.
@@ -565,30 +613,35 @@ func runHookUninstallCodex(user bool, projectRoot string, stdout io.Writer) erro
 // scanRegisteredHooks — path의 settings에서 자기 소유 훅 그룹 수와 마커 버전을 함께 수집한다
 // (doctor [9] 등록 상태 + 버전 불일치 감지). 마커 버전은 첫 자기 그룹의 __ctrManaged에서
 // hookMarkerPrefix 뒤 부분이다 — 옛 설치기가 6개 그룹에 동일 버전 마커를 썼으므로(§7) 어느
-// 그룹에서 취하든 값이 같아 map 순회 순서와 무관하게 결정적이다. 파일 미존재·hooks 부재는 (0,""),
-// 파싱 실패만 오류.
-func scanRegisteredHooks(path string) (count int, marker string, err error) {
+// 그룹에서 취하든 값이 같아 map 순회 순서와 무관하게 결정적이다. 파일 미존재·hooks 부재는
+// (0,0,""), 파싱 실패만 오류.
+//
+// 둘째 반환값 held는 **동거 그룹 수**다(우리 항목과 사용자 항목이 한 그룹에 함께 있는 형태,
+// heldHookGroup). count와 배타적이고, 나뉘어 있는 이유는 다음 걸음이 다르기 때문이다:
+// count는 `hook uninstall`이 지우고 held는 호스트의 `/hooks`에서 사용자가 지운다. 한 수로
+// 합치면 doctor가 uninstall로 사라지지 않을 것을 uninstall 대상이라 말한다.
+func scanRegisteredHooks(path string) (count, held int, marker string, err error) {
 	data, rerr := os.ReadFile(path)
 	if rerr != nil {
 		if errors.Is(rerr, os.ErrNotExist) {
-			return 0, "", nil
+			return 0, 0, "", nil
 		}
-		return 0, "", errors.New("hook: 설정 파일 읽기 실패")
+		return 0, 0, "", errors.New("hook: 설정 파일 읽기 실패")
 	}
 	if len(bytes.TrimSpace(data)) == 0 {
-		return 0, "", nil
+		return 0, 0, "", nil
 	}
 	var settings map[string]json.RawMessage
 	if err := json.Unmarshal(data, &settings); err != nil {
-		return 0, "", err
+		return 0, 0, "", err
 	}
 	raw, ok := settings["hooks"]
 	if !ok {
-		return 0, "", nil
+		return 0, 0, "", nil
 	}
 	var hooks map[string]json.RawMessage
 	if err := json.Unmarshal(raw, &hooks); err != nil {
-		return 0, "", err
+		return 0, 0, "", err
 	}
 	for _, arr := range hooks {
 		var groups []json.RawMessage
@@ -596,48 +649,51 @@ func scanRegisteredHooks(path string) (count int, marker string, err error) {
 			continue // 배열이 아닌 이벤트는 우리 소유가 아님 — 건너뜀
 		}
 		for _, g := range groups {
-			if !isOurHookGroup(g) {
-				continue
-			}
-			count++
-			if marker == "" { // 첫 자기 그룹의 마커 버전만(옛 설치기가 모두 동일하게 썼다)
-				var p hookGroupProbe
-				if json.Unmarshal(g, &p) == nil {
-					marker = markerVersion(p.Managed)
+			switch {
+			case isOurHookGroup(g):
+				count++
+				if marker == "" { // 첫 자기 그룹의 마커 버전만(옛 설치기가 모두 동일하게 썼다)
+					var p hookGroupProbe
+					if json.Unmarshal(g, &p) == nil {
+						marker = markerVersion(p.Managed)
+					}
 				}
+			case heldHookGroup(g):
+				held++
 			}
 		}
 	}
-	return count, marker, nil
+	return count, held, marker, nil
 }
 
 // scanCodexRegisteredHooks — scanRegisteredHooks의 Codex 형제(D52, 스펙 v0.9 §0): hooks.json
 // 자기 그룹 수와 marker 버전(statusMessage의 hookMarkerPrefix 뒤)을 읽는다. 최상위는
 // removeCodexHooks와 동일한 {"hooks":{event:[group...]}} 래퍼로 파싱한다(형제 구조 미러링).
-// 파일 부재·hooks 부재는 (0,"",nil) — 미등록 정보 분기. isOurCodexGroup(전건 판정)을 그대로
-// 재사용한다. 읽기 실패 오류에는 절대경로를 담지 않는다(§12 canary — *PathError는 경로 포함).
-func scanCodexRegisteredHooks(path string) (count int, marker string, err error) {
+// 파일 부재·hooks 부재는 (0,0,"",nil) — 미등록 정보 분기. isOurCodexGroup(전건 판정)과
+// heldCodexGroup(동거)을 그대로 재사용하며 held의 계약은 형제와 같다. 읽기 실패 오류에는
+// 절대경로를 담지 않는다(§12 canary — *PathError는 경로 포함).
+func scanCodexRegisteredHooks(path string) (count, held int, marker string, err error) {
 	data, rerr := os.ReadFile(path)
 	if rerr != nil {
 		if errors.Is(rerr, os.ErrNotExist) {
-			return 0, "", nil
+			return 0, 0, "", nil
 		}
-		return 0, "", errors.New("hook: 설정 파일 읽기 실패")
+		return 0, 0, "", errors.New("hook: 설정 파일 읽기 실패")
 	}
 	if len(bytes.TrimSpace(data)) == 0 {
-		return 0, "", nil
+		return 0, 0, "", nil
 	}
 	var settings map[string]json.RawMessage
 	if err := json.Unmarshal(data, &settings); err != nil {
-		return 0, "", err
+		return 0, 0, "", err
 	}
 	raw, ok := settings["hooks"]
 	if !ok {
-		return 0, "", nil
+		return 0, 0, "", nil
 	}
 	var hooks map[string]json.RawMessage
 	if err := json.Unmarshal(raw, &hooks); err != nil {
-		return 0, "", err
+		return 0, 0, "", err
 	}
 	for _, arr := range hooks {
 		var groups []json.RawMessage
@@ -645,24 +701,26 @@ func scanCodexRegisteredHooks(path string) (count int, marker string, err error)
 			continue // 배열이 아닌 이벤트는 우리 소유 아님 — 건너뜀
 		}
 		for _, g := range groups {
-			if !isOurCodexGroup(g) {
-				continue
-			}
-			count++
-			if marker == "" { // 첫 자기 그룹의 마커만(옛 설치기가 모든 그룹에 동일 버전 마커를 썼다)
-				var p codexGroupProbe
-				if json.Unmarshal(g, &p) == nil && len(p.Hooks) > 0 {
-					marker = markerVersion(p.Hooks[0].StatusMessage)
+			switch {
+			case isOurCodexGroup(g):
+				count++
+				if marker == "" { // 첫 자기 그룹의 마커만(옛 설치기가 모든 그룹에 동일 버전 마커를 썼다)
+					var p codexGroupProbe
+					if json.Unmarshal(g, &p) == nil && len(p.Hooks) > 0 {
+						marker = markerVersion(p.Hooks[0].StatusMessage)
+					}
 				}
+			case heldCodexGroup(g):
+				held++
 			}
 		}
 	}
-	return count, marker, nil
+	return count, held, marker, nil
 }
 
 // countRegisteredHooks — scanRegisteredHooks의 개수 부분만(기존 호출부·테스트 호환 얇은 래퍼).
 func countRegisteredHooks(path string) (int, error) {
-	n, _, err := scanRegisteredHooks(path)
+	n, _, _, err := scanRegisteredHooks(path)
 	return n, err
 }
 

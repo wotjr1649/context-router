@@ -96,7 +96,9 @@ func TestDoctorCodexBOMNoFalseAlarm(t *testing.T) {
 	if !strings.Contains(out, "플러그인 이전 방식의 등록물이 남아 있다") {
 		t.Fatalf("BOM 파일의 등록물을 doctor가 놓쳤다:\n%s", out)
 	}
-	if !strings.Contains(out, ":3\n") {
+	// 재기준선(릴리스 리뷰 F1): 보고 줄이 이제 서버 이름을 함께 든다 — 거름이 생겨 그 이름이
+	// 알려진 리터럴이기 때문이다. 줄 번호 단정의 취지는 그대로다.
+	if !strings.Contains(out, ":3 (ctr)\n") {
 		t.Errorf("BOM이 줄 번호를 밀어냈다 — 헤더는 3번째 줄이어야 한다:\n%s", out)
 	}
 }

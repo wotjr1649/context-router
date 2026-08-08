@@ -602,7 +602,7 @@ func TestLegacyVersionedMarkerStillOwned(t *testing.T) {
 	for _, marker := range []string{"context-router/0.14.0", "context-router"} {
 		proj := t.TempDir()
 		path := writeSeedClaudeHooks(t, false, proj, marker)
-		n, _, err := scanRegisteredHooks(path)
+		n, _, _, err := scanRegisteredHooks(path)
 		if err != nil || n != len(hookRegistrations) {
 			t.Fatalf("marker %q: 소유 그룹 %d개 (err=%v) want %d", marker, n, err, len(hookRegistrations))
 		}
@@ -711,8 +711,8 @@ func TestRunHook_NoShadowRunningBranch(t *testing.T) {
 // 반환하므로 신설(적대 검수 P1). 파일 부재는 (0,"",nil) — 미등록 정보 분기.
 func TestScanCodexRegisteredHooks(t *testing.T) {
 	// ① 부재: count=0 marker="" err=nil
-	if n, m, err := scanCodexRegisteredHooks(filepath.Join(t.TempDir(), "hooks.json")); n != 0 || m != "" || err != nil {
-		t.Fatalf("부재: n=%d m=%q err=%v want 0/\"\"/nil", n, m, err)
+	if n, h, m, err := scanCodexRegisteredHooks(filepath.Join(t.TempDir(), "hooks.json")); n != 0 || h != 0 || m != "" || err != nil {
+		t.Fatalf("부재: n=%d h=%d m=%q err=%v want 0/0/\"\"/nil", n, h, m, err)
 	}
 	// ② 자기 그룹 존재(가드 포함 3그룹) → count>0, marker 추출.
 	const wantMarker = "0.9.0"
@@ -721,8 +721,8 @@ func TestScanCodexRegisteredHooks(t *testing.T) {
 	if err := os.WriteFile(selfPath, self, 0o600); err != nil {
 		t.Fatalf("self write: %v", err)
 	}
-	if n, m, err := scanCodexRegisteredHooks(selfPath); n <= 0 || m != wantMarker || err != nil {
-		t.Fatalf("자기 그룹: n=%d m=%q err=%v want >0/%q/nil", n, m, err, wantMarker)
+	if n, h, m, err := scanCodexRegisteredHooks(selfPath); n <= 0 || h != 0 || m != wantMarker || err != nil {
+		t.Fatalf("자기 그룹: n=%d h=%d m=%q err=%v want >0/0/%q/nil", n, h, m, err, wantMarker)
 	}
 	// ③ 타인 그룹만: statusMessage 마커 접두 없는 그룹 → count=0, marker=""(isOurCodexGroup 전건 탈락).
 	foreign := []byte(`{"hooks":{"PostToolUse":[{"matcher":"","hooks":[{"type":"command","command":"pwsh -File user.ps1","timeout":10,"statusMessage":"user"}]}]}}`)
@@ -730,8 +730,9 @@ func TestScanCodexRegisteredHooks(t *testing.T) {
 	if err := os.WriteFile(foreignPath, foreign, 0o600); err != nil {
 		t.Fatalf("foreign write: %v", err)
 	}
-	if n, m, err := scanCodexRegisteredHooks(foreignPath); n != 0 || m != "" || err != nil {
-		t.Fatalf("타인 그룹: n=%d m=%q err=%v want 0/\"\"/nil", n, m, err)
+	// 동거 부류도 0이다 — 이 그룹에는 우리 항목이 하나도 없다(전건 탈락의 사유가 "혼합"이 아니다).
+	if n, h, m, err := scanCodexRegisteredHooks(foreignPath); n != 0 || h != 0 || m != "" || err != nil {
+		t.Fatalf("타인 그룹: n=%d h=%d m=%q err=%v want 0/0/\"\"/nil", n, h, m, err)
 	}
 }
 
@@ -1196,39 +1197,108 @@ func TestHookUninstall_MixedGroupUntouched(t *testing.T) {
 	}
 }
 
-// TestDoctor_MixedGroupReportsNoLegacyGroups — F2가 진단으로 번진 자리를 고정한다.
-// scanRegisteredHooks가 uninstall과 같은 술어(isOurHookGroup)를 쓰므로, 혼합 그룹만 남은
-// 사용자에게 doctor [9]는 "옛 그룹 없음"을 낸다 — 그런데 `context-router hook`은 파일에 그대로
-// 있고 계속 발화한다. **그 조합이 이 릴리스가 사용자에게 지는 빚이고**, CHANGELOG와 설계서 §6이
-// 그것을 설명한다. 단정이 없으면 그 조합은 코드 주석에만 살아 문서와 어긋나도 초록이다.
-// Codex 쪽 [16]은 이 변경 전부터 같은 전건 판정이라 형제 자리다.
-func TestDoctor_MixedGroupReportsNoLegacyGroups(t *testing.T) {
-	isolateCodexHome(t)
+// TestDoctor_MixedGroupReportedAsHeld — 릴리스 리뷰 F4 재기준선(옛 이름
+// TestDoctor_MixedGroupReportsNoLegacyGroups). 전건 소유 판정은 그대로다 — 그 규칙은 사용자 훅
+// 항목을 파괴하던 any-판정을 대체한 자리이고 여기서 되돌리지 않는다. 바뀌는 것은 **세는 방식**이다:
+// 우리 항목이 사용자 항목과 함께 든 그룹은 "지울 수 있는 옛 그룹"이 아니라 **동거 부류**로 따로
+// 세어 그 자리와 정리 경로(호스트의 /hooks)를 낸다. 그러지 않으면 우리 명령이 파일에 남아 계속
+// 발화하는데 진단은 "옛 그룹 없음"만 말한다 — 두 호스트 모두 같은 자리다.
+func TestDoctor_MixedGroupReportedAsHeld(t *testing.T) {
+	const heldHint = "사용자 항목과 함께 있는 우리 항목 1그룹 — 호스트의 /hooks에서 그 항목을 지우세요(플러그인 훅과 겹쳐 같은 포착이 두 번 일어납니다)"
+
+	t.Run("claude", func(t *testing.T) {
+		isolateCodexHome(t)
+		projectRoot := t.TempDir()
+		path := filepath.Join(projectRoot, ".claude", "settings.json")
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		seed := `{"hooks":{"PostToolUse":[{"matcher":"","hooks":[` +
+			`{"type":"command","command":"context-router hook","timeout":10},` +
+			`{"type":"command","command":"user-tool run","timeout":5}],"__ctrManaged":"context-router"}]}}`
+		if err := os.WriteFile(path, []byte(seed), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		// 사용자가 보는 줄부터 잰다 — 실패 문면이 증상 그대로여야 한다.
+		out, _ := doctorOut(t, projectRoot)
+		if want := "[9] hooks: project=옛 그룹 없음, " + heldHint; !strings.Contains(out, want) {
+			t.Fatalf("[9]가 동거 그룹을 짚지 않는다 — want %q:\n%s", want, out)
+		}
+		// 소유 판정은 건드리지 않았다 — 제거 가능 부류는 여전히 0이고 파일도 그대로다.
+		if n, held, _, err := scanRegisteredHooks(path); err != nil || n != 0 || held != 1 {
+			t.Fatalf("소유=%d 동거=%d err=%v want 0/1(전건 판정 유지)", n, held, err)
+		}
+		after, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("read: %v", err)
+		}
+		if !strings.Contains(string(after), "context-router hook") {
+			t.Fatalf("우리 명령이 파일에서 사라졌다 — 이 테스트가 재려던 상태가 아니다:\n%s", after)
+		}
+	})
+
+	t.Run("codex", func(t *testing.T) {
+		isolateCodexHome(t)
+		projectRoot := t.TempDir()
+		path, err := codexHooksPath(false, projectRoot)
+		if err != nil {
+			t.Fatalf("codexHooksPath: %v", err)
+		}
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		seed := `{"hooks":{"PostToolUse":[{"matcher":"","hooks":[` +
+			`{"type":"command","command":"context-router codex-hook","timeout":10,"statusMessage":"context-router"},` +
+			`{"type":"command","command":"pwsh -File user.ps1","timeout":10,"statusMessage":"user"}]}]}}`
+		if err := os.WriteFile(path, []byte(seed), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		out, _ := doctorOut(t, projectRoot)
+		if want := "[16] codex hooks: project=옛 그룹 없음, " + heldHint; !strings.Contains(out, want) {
+			t.Fatalf("[16]이 동거 그룹을 짚지 않는다 — want %q:\n%s", want, out)
+		}
+		if n, held, _, err := scanCodexRegisteredHooks(path); err != nil || n != 0 || held != 1 {
+			t.Fatalf("소유=%d 동거=%d err=%v want 0/1(전건 판정 유지)", n, held, err)
+		}
+	})
+}
+
+// TestDoctor_UserScopeHintTargetsUserScope — 릴리스 리뷰 F3. 사용자 스코프에서 찾은 잔존물에
+// `hook uninstall`(프로젝트 파일 기본)을 안내하면 그 명령은 다른 파일을 열어 "제거할 항목 없음"을
+// 내고 끝난다 — 잔존 그룹은 그대로 남아 계속 발화하고 doctor는 같은 안내를 되풀이한다. 스코프마다
+// 자기 자리에 닿는 명령을 낸다. 두 호스트 모두 잰다.
+func TestDoctor_UserScopeHintTargetsUserScope(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home) // Windows os.UserHomeDir 이음새
+	codexHome := t.TempDir()
+	t.Setenv("CODEX_HOME", codexHome)
 	projectRoot := t.TempDir()
-	path := filepath.Join(projectRoot, ".claude", "settings.json")
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	seed := `{"hooks":{"PostToolUse":[{"matcher":"","hooks":[` +
-		`{"type":"command","command":"context-router hook","timeout":10},` +
-		`{"type":"command","command":"user-tool run","timeout":5}],"__ctrManaged":"context-router"}]}}`
-	if err := os.WriteFile(path, []byte(seed), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	// 사용자가 보는 줄부터 잰다 — 실패 문면이 증상 그대로여야 한다.
-	out, _ := doctorOut(t, projectRoot)
-	if !strings.Contains(out, "[9] hooks: project=옛 그룹 없음") {
-		t.Fatalf("[9]가 혼합 그룹을 옛 그룹으로 셌다:\n%s", out)
-	}
-	if n, _, err := scanRegisteredHooks(path); err != nil || n != 0 {
-		t.Fatalf("혼합 그룹 소유 개수=%d err=%v want 0(전건 판정)", n, err)
-	}
-	after, err := os.ReadFile(path)
+
+	writeSeedClaudeHooks(t, true, projectRoot, hookBinaryName)
+	codexUser, err := codexHooksPath(true, projectRoot)
 	if err != nil {
-		t.Fatalf("read: %v", err)
+		t.Fatalf("codexHooksPath: %v", err)
 	}
-	if !strings.Contains(string(after), "context-router hook") {
-		t.Fatalf("우리 명령이 파일에서 사라졌다 — 이 테스트가 재려던 상태가 아니다:\n%s", after)
+	if err := atomicWriteFile(codexUser, seedCodexHooks(hookBinaryName, true)); err != nil {
+		t.Fatalf("seed codex: %v", err)
+	}
+
+	out, _ := doctorOut(t, projectRoot)
+	if !strings.Contains(out, "user=등록됨(6개 — hook uninstall --user로 옛 그룹을 지우고") {
+		t.Errorf("[9] 사용자 스코프가 프로젝트 파일을 여는 명령을 안내한다:\n%s", out)
+	}
+	if !strings.Contains(out, "user=등록됨(3개 — hook uninstall --codex --user로 옛 그룹을 지우고") {
+		t.Errorf("[16] 사용자 스코프가 프로젝트 파일을 여는 명령을 안내한다:\n%s", out)
+	}
+	// 프로젝트 스코프의 문면은 그대로다 — 스코프 분리가 양쪽을 같은 값으로 뭉개면 안 된다.
+	for _, line := range strings.Split(out, "\n") {
+		if !strings.HasPrefix(line, "[9] hooks:") && !strings.HasPrefix(line, "[16] codex hooks:") {
+			continue
+		}
+		if strings.Contains(line, "project=등록됨") {
+			t.Errorf("프로젝트 스코프에 픽스처가 없는데 등록됨으로 나왔다: %s", line)
+		}
 	}
 }
 
