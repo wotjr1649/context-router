@@ -853,7 +853,52 @@ Expected: 컴파일 실패(`FreeBytes` 없음) · FAIL(임계 100 MiB, `free=` �
 	}
 ```
 
-- [ ] **Step 4: cli 구현 — 임계·출력·경고**
+- [ ] **Step 4: 보존 해석기를 `internal/store`로 옮긴다** (소유자 판정, 2026-08-09)
+
+`doctor [14]`가 보존 창을 **실효값**으로 적어야 한다(설계 D102 계약 8). 그 값을 내는
+`shadowRetention`이 `package main`에 있어 `internal/cli`가 부를 수 없고, 파싱 규칙을 복제하면
+두 구현이 갈라진다(D13). **해석기를 퍼지가 사는 패키지로 옮긴다** — D104의 측정 구간에서
+`CTR_SHADOW_RETENTION=336h`가 걸린 채 문면이 "기본 72시간"이라고 적으면 **그 줄이 필요한
+바로 그때 틀린다.**
+
+옮기는 셋은 `cmd/context-router/main.go`의 **459-479행**에 있고, 호출부는
+`main.go:640`(기동 퍼지)과 `main_test.go`뿐이다 `[실측 — 저장소 전체 grep]`.
+`internal/store/store.go`의 `PurgeHookOnlyOlderThan`(1126행) **바로 위**에 둔다 — 그 예산을
+쓰는 함수 옆이 제자리다.
+
+```go
+// DefaultShadowRetention — shadow 귀속 아티팩트 보존 기간(설계 v0.12 D67). 훅이 가로챈
+// 출력은 대개 해당 세션 안에서 소비되므로 짧게 잡는다. v0.20에서 cmd/context-router 에서
+// 이 패키지로 옮겼다 — doctor 문면이 실효값을 적으려면 internal/cli 도 이 해석기에 닿아야
+// 하는데, 규칙을 복제하면 두 구현이 갈라진다(D13, 설계 v0.20 D102 계약 8).
+const DefaultShadowRetention = 72 * time.Hour
+
+// ShadowRetention — CTR_SHADOW_RETENTION(time.ParseDuration 형식) 양수만 채택한다.
+// 파싱 실패·비양수는 기본값 — 잘못된 값이 정책을 무력화하지 않게 한다.
+func ShadowRetention(getenv func(string) string) time.Duration {
+	if d, err := time.ParseDuration(getenv("CTR_SHADOW_RETENTION")); err == nil && d > 0 {
+		return d
+	}
+	return DefaultShadowRetention
+}
+
+// ShadowCutoff — 보존 기간 d에 대한 회수 경계(unix 초). **0 이하면 회수를 건너뛰어야 한다**:
+// shadowOwnedFilter가 cutoffUnix<=0을 "나이 필터 없음"으로 읽으므로(TestPurgeHookOnlyOlderThanZeroMeansAll이
+// 그 계약을 고정한다) 보존을 늘리려는 설정이 나이 무관 전량 삭제로 반전된다. d가 epoch
+// 경과분(약 56년) 이상이면 그 경계에 닿는다 — 경계가 정확히 0에서 시작하므로 판정도 `<= 0`이다.
+func ShadowCutoff(now time.Time, d time.Duration) int64 {
+	return now.Add(-d).Unix()
+}
+```
+
+`main.go`에서 셋을 지우고 640행을 `store.ShadowCutoff(time.Now(), store.ShadowRetention(os.Getenv))`로
+바꾼다. `main_test.go`의 `TestShadowCutoffBoundary`(2417행)와 보존 표 테스트를
+`internal/store/store_test.go`로 **옮긴다**(복제가 아니라 이동 — 같은 계약을 두 곳에서 재지 않는다).
+
+Run: `go build ./... && go test ./cmd/context-router ./internal/store -count=1`
+Expected: PASS. `grep -rn "shadowRetention\|defaultShadowRetention\|shadowCutoff" --include=*.go cmd/ internal/`가 **0건**이어야 한다(소문자 옛 이름이 남아 있지 않다).
+
+- [ ] **Step 4b: cli 구현 — 임계·출력·경고**
 
 `internal/cli/cli.go:50`:
 
@@ -878,12 +923,14 @@ const defaultContentFileWarnBytes = 256 << 20 // 256MiB — D102 계약 6(정리
 		// 오히려 낮게 읽힌다(계약 7). 문면의 "자동 VACUUM 없음"은 옛 "자동 삭제 없음"을 고친
 		// 것이다: 바로 위에서 보고하는 artifacts 수는 D67 퍼지 때문에 사용자 조작 없이 줄어든다.
 		if warn := contentFileWarnBytes(os.Getenv); sz.FileBytes-sz.FreeBytes > warn {
-			fmt.Fprintf(w, "[14] warning: live %dB > 임계 %dB(CTR_CONTENT_FILE_WARN_BYTES) — 청크 텍스트+FTS 축(자문, live=file-free). free %dB는 이미 회수돼 재사용을 기다리는 몫이라 판정에 넣지 않는다. 파일 축소는 VACUUM(라이브 서버 제약 — 서버 비가동 시 purge --older-than --vacuum), --hook-only는 shadow 귀속 한정(explicit 소스 감축은 전체 purge). 훅 아티팩트 보존 창 기본 72시간(CTR_SHADOW_RETENTION). 자동 VACUUM 없음\n",
-				sz.FileBytes-sz.FreeBytes, warn, sz.FreeBytes)
+			fmt.Fprintf(w, "[14] warning: live %dB > 임계 %dB(CTR_CONTENT_FILE_WARN_BYTES) — 청크 텍스트+FTS 축(자문, live=file-free). free %dB는 이미 회수돼 재사용을 기다리는 몫이라 판정에 넣지 않는다. 파일 축소는 VACUUM(라이브 서버 제약 — 서버 비가동 시 purge --older-than --vacuum), --hook-only는 shadow 귀속 한정(explicit 소스 감축은 전체 purge). 훅 아티팩트 보존 창 %s(CTR_SHADOW_RETENTION). 자동 VACUUM 없음\n",
+				sz.FileBytes-sz.FreeBytes, warn, sz.FreeBytes, store.ShadowRetention(os.Getenv))
 		}
 ```
 
-**보존 창을 값이 아니라 "기본 72시간 + 키 이름"으로 적는 이유**: 실효값을 계산하는 `shadowRetention`은 `cmd/context-router`(main.go:466)에 있고 `internal/cli`는 그 패키지를 import할 수 없다. 규칙을 여기에 복제하면 두 구현이 갈라진다(D13) — 기본값과 키를 함께 적으면 D104의 측정 구간처럼 키가 덮인 상태에서도 문면이 거짓이 되지 않는다.
+**보존 창은 Step 4가 옮긴 해석기로 실효값을 적는다** — D104의 측정 구간에서
+`CTR_SHADOW_RETENTION=336h`가 걸리면 이 줄이 `336h0m0s`를 인쇄한다. 그 줄이 필요한 바로
+그때 기본값을 적으면 안 된다.
 
 - [ ] **Step 5: 임계 변경이 깨는 기존 테스트를 함께 고친다**
 
