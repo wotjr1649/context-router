@@ -47,7 +47,7 @@ func parseFlags(args []string) (serverFlags, error) {
 	fs.StringVar(&f.Root, "root", "", "project root (default: cwd)")
 	fs.StringVar(&f.StoreRoot, "store-root", "", "store root override")
 	fs.StringVar(&profile, "profile", "search,fetch,transform", "tool profile")
-	fs.StringVar(&enable, "enable", "", "opt-in profiles: ingest,net,exec")
+	fs.StringVar(&enable, "enable", "", "opt-in profiles: ingest,net,exec; none = zero profiles")
 	fs.StringVar(&f.LogLevel, "log-level", "info", "log level")
 	fs.Func("allow-path", "extra ingest root (repeatable)", func(v string) error {
 		f.AllowPaths = append(f.AllowPaths, v)
@@ -93,17 +93,25 @@ func parseFlags(args []string) (serverFlags, error) {
 	// 플래그가 쓸모없으면(빈 값이든 공백/쉼표뿐이든) 환경 변수로, 환경 변수도 쓸모없으면
 	// 기본값으로. 오류(모르는 이름)는 그 자리에서 바로 반환하고 다음 단계로 넘기지 않는다 —
 	// 오탈자를 조용히 삼키면 안 된다는 것은 기존 계약 그대로다.
-	enableList, err := parseEnableList(enable)
+	// 릴리스 리뷰 F2: 그 "파싱 결과가 비었는가" 판정은 프로필 0개를 요청할 자리를 남기지
+	// 않았다 — `--enable=`도 `CTR_ENABLE=""`도 "이 단계는 아무것도 안 줬다"로 읽혀 기본값
+	// ingest,net으로 떨어졌고, 아웃바운드 HTTP를 여는 net이 명시 지시와 반대 방향으로 켜진 채
+	// 그 사실을 알리는 곳도 없었다. 그래서 각 단계의 반환을 (목록, 값을 주었는가) 둘로 나눠
+	// "0개 요청"과 "무입력"이 서로 다른 모양이 되게 하고, 0개는 이름 none으로만 표현한다.
+	// 판정을 빈 문자열 유무로 되돌리는 방향(fs.Visit·os.LookupEnv)은 두지 않는다: 미설정 변수를
+	// 빈 값으로 펼치는 셸이 opt-in 전부를 조용히 끄게 되고, 우발적 빈 값이 의도적 빈 값보다
+	// 훨씬 흔하다. 이름은 우발적으로 도착하지 않는다.
+	enableList, supplied, err := parseEnableList(enable)
 	if err != nil {
 		return serverFlags{}, err
 	}
-	if len(enableList) == 0 {
-		if enableList, err = parseEnableList(os.Getenv("CTR_ENABLE")); err != nil {
+	if !supplied {
+		if enableList, supplied, err = parseEnableList(os.Getenv("CTR_ENABLE")); err != nil {
 			return serverFlags{}, err
 		}
 	}
-	if len(enableList) == 0 {
-		if enableList, err = parseEnableList(defaultEnableProfile); err != nil {
+	if !supplied {
+		if enableList, _, err = parseEnableList(defaultEnableProfile); err != nil {
 			return serverFlags{}, err // 상수라 사실상 도달하지 않는다
 		}
 	}
@@ -134,6 +142,16 @@ func parseFlags(args []string) (serverFlags, error) {
 // 같은 이름 셋(mcpProfileNames)은 기입 경로와 함께 지워졌으므로 이제 이 목록이 유일한 자리다.
 var enableProfileNames = []string{"ingest", "net", "exec"}
 
+// enableProfileNone — 빈 집합을 뜻하는 이름(릴리스 리뷰 F2). 값 전체일 때만 유효하다: 다른
+// 이름과 섞이면 두 해석(0개 / 그 이름만)이 다 말이 되므로 오류로 돌린다. 이 이름 하나가
+// v0.19 이전 자세(search/fetch/transform만, 색인 쓰기도 아웃바운드 HTTP도 없음)를 되돌리는
+// 유일한 표현이다.
+const enableProfileNone = "none"
+
+// enableNamesMsg — 두 오류 문면이 나열하는 허용 값 목록. 한 벌만 두어 이름이 늘 때 한쪽만
+// 갱신되는 일을 없앤다(D13 반파편화).
+var enableNamesMsg = strings.Join(enableProfileNames, ",") + "," + enableProfileNone
+
 // defaultEnableProfile — --enable도 CTR_ENABLE도 없을 때 서버가 갖는 기본값(D101 계약 2,
 // v0.19 리뷰 C1). exec는 여전히 opt-in이다 — 이 기본값이 켜는 것은 실행 도구가 아니라
 // 색인·네트워크뿐이다.
@@ -145,19 +163,32 @@ const defaultEnableProfile = "ingest,net"
 // 없이 그냥 아무 도구도 켜지 않는다 — CTR_ENABLE은 플래그보다 오타가 눈에 덜 띄어 그 침묵이
 // "프로필이 켜졌다"는 오인으로 이어지기 쉽다. 오류 문면에 입력 원문을 담지 않는다(규약 §6
 // 사용자 입력 에코 금지) — 허용 이름만 나열한다.
-func parseEnableList(raw string) ([]string, error) {
-	var out []string
+// supplied(릴리스 리뷰 F2): 이 단계가 값을 주었는지. 이름 하나라도 남으면 true이고, none
+// 단독도 true다(빈 목록을 명시로 요청한 것이라 다음 단계로 넘어가지 않는다). 빈 문자열·공백
+// 뿐·쉼표뿐은 false라 호출자가 다음 단계로 넘긴다 — 그 갈래는 종전 그대로다.
+func parseEnableList(raw string) (out []string, supplied bool, err error) {
+	sawNone := false
 	for _, name := range strings.Split(raw, ",") {
 		name = strings.TrimSpace(name)
 		if name == "" {
 			continue
 		}
+		if name == enableProfileNone {
+			sawNone = true
+			continue
+		}
 		if !slices.Contains(enableProfileNames, name) {
-			return nil, fmt.Errorf("ctr: --enable/CTR_ENABLE에 모르는 프로필 이름이 있습니다(가능: %s)", strings.Join(enableProfileNames, ","))
+			return nil, false, fmt.Errorf("ctr: --enable/CTR_ENABLE에 모르는 프로필 이름이 있습니다(가능: %s)", enableNamesMsg)
 		}
 		out = append(out, name)
 	}
-	return out, nil
+	if sawNone {
+		if len(out) > 0 {
+			return nil, false, fmt.Errorf("ctr: --enable/CTR_ENABLE의 %s은 값 전체일 때만 유효합니다(가능: %s)", enableProfileNone, enableNamesMsg)
+		}
+		return nil, true, nil // 빈 집합을 명시로 요청 — 다음 단계(환경 변수·기본값)로 넘기지 않는다
+	}
+	return out, len(out) > 0, nil
 }
 
 // parseRetentionEventsFlag — --retention-events 값을 검증한다(설계 §5, D17). 빈 문자열(플래그

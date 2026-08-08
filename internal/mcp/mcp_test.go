@@ -249,8 +249,13 @@ func TestNewServerProfileGating(t *testing.T) {
 // (여유 5B — 위 규칙대로 의도적으로 빡빡하게 유지, 폐기된 이전 값 14900). 이 값은 **단일 서버**의
 // tools/list 표면이다 — 클라이언트가 ctr·ctr-exec를 함께 등록하면 상주 총량은 두 서버 합집합이라
 // 다르다(더 오래된 폐기 값: exec 8-도구 12914→13000, 6-도구 10024×1.2=12029).
+// [실측] 릴리스 리뷰 F1(2026-08-08, 이 머신)이 exec 둘을 색인에 넣어 15795B→16067B가 됐다
+// (+272B: idxExecute 65B + idxExecuteFile 67B + 구분자 ", " 둘 4B = 136B가 진입 도구 둘의
+// Description에 각각 붙는다). 위 규칙대로 100의 배수로 올려 16100(여유 33B, 폐기된 이전 값
+// 15800). 이 증가분은 D99 설계가 값을 치르기로 한 자리다 — 색인에 없는 지연 도구는 모델이
+// 호출하지 않는다는 것이 이 색인의 근거이고, F1은 그 상태를 exec 프로필에서 실측한 것이다.
 // 실측값·근거는 docs/gates-v0.0.1-ko.md 게이트 11 항목 참조(정식 갱신은 게이트 문서 마일스톤에서).
-const maxToolSchemaBytes = 15800
+const maxToolSchemaBytes = 16100
 
 // TestSchemaTokenBudget: tools/list 결과(ListToolsResult 전체 — 실제 클라이언트가 받는
 // JSON 그대로) 직렬화 바이트가 maxToolSchemaBytes를 넘지 않는지 확인한다(게이트 11). 근사
@@ -277,11 +282,15 @@ func TestSchemaTokenBudget(t *testing.T) {
 	}
 }
 
-// deferredToolNames: D99가 색인하는 지연 로드 여섯의 정본 목록(하나로 유지, D13 반파편화와
-// 동일 취지).
+// deferredToolNames: D99가 색인하는 지연 로드 여덟의 정본 목록(하나로 유지, D13 반파편화와
+// 동일 취지). [실측] 릴리스 리뷰 F1: 이 목록이 exec 둘을 빠뜨린 동안 mcp.go의 exec 갈래도
+// 같은 둘을 deferred에 넣지 않아, 기대값이 검사 대상과 같은 누락에서 파생되었다 —
+// `CTR_ENABLE=…,exec`로 켠 서버가 ctr_execute를 등록하고도 색인 문장에서 이름을 빼는 것을
+// 이 테스트가 초록으로 통과시켰다. 등록 갈래가 늘면 이 목록도 함께 는다.
 var deferredToolNames = []string{
 	"ctr_fetch", "ctr_transform", "ctr_record_event",
 	"ctr_session_summary", "ctr_export_events", "ctr_fetch_and_index",
+	"ctr_execute", "ctr_execute_file",
 }
 
 // assertDeferredIndexMatchesRegistration — 진입 도구 둘의 Description 꼬리 색인이 그 서버의
@@ -341,10 +350,11 @@ func TestAlwaysLoadMetaExactlyEntryTools(t *testing.T) {
 // TestEntryToolDescriptionsIndexDeferredTools — D99 요구 2 + 최종 리뷰 S4 재기준선. 옛 형태는
 // 고정 문면(패키지 상수)이 지연 여섯의 이름을 전부 담는지만 봤고, 그래서 프로필을 좁힌 서버가
 // 등록하지도 않은 도구를 이름으로 광고해도 초록이었다 — `CTR_ENABLE=ingest`로 켠 서버가
-// `ctr_fetch_and_index`를 광고하는 것을 stdio로 실측한 것이 그 결함이다. 여섯 중 다섯이 조건부
-// 등록이므로 최대 프로필과 좁힌 프로필 양쪽에서 색인과 등록의 일치를 잰다.
+// `ctr_fetch_and_index`를 광고하는 것을 stdio로 실측한 것이 그 결함이다. 여덟 중 일곱이 조건부
+// 등록이므로 최대 프로필과 좁힌 프로필 양쪽에서 색인과 등록의 일치를 잰다. 반대 방향(등록했는데
+// 색인에 없음)도 같은 단정이 잡는다 — 릴리스 리뷰 F1의 exec 둘이 그 방향이었다.
 func TestEntryToolDescriptionsIndexDeferredTools(t *testing.T) {
-	t.Run("최대 프로필 — 여섯 전부", func(t *testing.T) {
+	t.Run("최대 프로필 — 여덟 전부", func(t *testing.T) {
 		cs, _, _, _ := newRecordEventTestServer(t, "ingest", "net", "exec")
 		assertDeferredIndexMatchesRegistration(t, cs)
 	})

@@ -16,6 +16,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -172,6 +173,11 @@ func TestParseFlags_EnablePrecedence(t *testing.T) {
 		{"둘 다 있음 → flag가 이긴다", "exec", "ingest,net", []string{"exec"}},
 		{"env가 공백/쉼표뿐 → 기본값", "", "  , , ", []string{"ingest", "net"}},
 		{"flag가 쉼표뿐 → env로 폴백", ",", "exec", []string{"exec"}},
+		// 릴리스 리뷰 F2: none은 값을 준 단계다 — 다음 단계로 넘어가지 않는다. 마지막 두 행이
+		// 우선순위 표의 그 갈래다(flag none이 값 있는 env를 이기고, env none이 기본값을 이긴다).
+		{"flag가 none → 프로필 0개", "none", "ingest,net", nil},
+		{"env가 none → 프로필 0개", "", "none", nil},
+		{"none 좌우 공백도 같다", " none ", "ingest", nil},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -186,6 +192,55 @@ func TestParseFlags_EnablePrecedence(t *testing.T) {
 			}
 			if strings.Join(got.Enable, ",") != strings.Join(c.wantOut, ",") {
 				t.Fatalf("Enable=%v want %v", got.Enable, c.wantOut)
+			}
+		})
+	}
+}
+
+// TestParseFlags_EnableNone — 릴리스 리뷰 F2. `--enable=`·`CTR_ENABLE=""`는 "이 단계는 값을
+// 주지 않았다"라서 기본값 ingest,net으로 떨어지고, 그래서 v0.19 이전 자세(색인 쓰기도
+// 아웃바운드 HTTP도 없음)를 요청할 자리가 없었다 — 이름 none이 그 자리다. 다른 이름과 섞인
+// 값은 오류이고(두 해석이 다 성립한다), 문면은 허용 값만 나열한다(규약 §6 입력 원문 에코
+// 금지). 우선순위 자체는 TestParseFlags_EnablePrecedence의 표가 잰다.
+func TestParseFlags_EnableNone(t *testing.T) {
+	t.Run("배너가 전부 off로 읽힌다", func(t *testing.T) {
+		t.Setenv("CTR_ENABLE", "ingest,net")
+		got, err := parseFlags([]string{"--enable", "none"})
+		if err != nil {
+			t.Fatalf("err=%v", err)
+		}
+		if len(got.Enable) != 0 {
+			t.Fatalf("Enable=%v want 빈 목록", got.Enable)
+		}
+		line := banner(got, "/p")
+		if !strings.Contains(line, "ingest=off net=off") {
+			t.Fatalf("banner=%q want ingest=off net=off", line)
+		}
+	})
+
+	for _, c := range []struct{ name, flag, env string }{
+		{"flag에서 none과 다른 이름 혼합", "none,ingest", ""},
+		{"flag에서 순서를 바꿔도 같다", "ingest,none", ""},
+		{"env에서 none과 다른 이름 혼합", "", "net,none"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			t.Setenv("CTR_ENABLE", c.env)
+			var args []string
+			if c.flag != "" {
+				args = []string{"--enable", c.flag}
+			}
+			_, err := parseFlags(args)
+			if err == nil {
+				t.Fatal("want error for none mixed with another profile name, got nil")
+			}
+			raw := c.flag + c.env
+			if strings.Contains(err.Error(), raw) {
+				t.Fatalf("error echoes user input(규약 §6 위반): %v", err)
+			}
+			for _, name := range append(slices.Clone(enableProfileNames), enableProfileNone) {
+				if !strings.Contains(err.Error(), name) {
+					t.Fatalf("error=%q missing allowed value %q", err, name)
+				}
 			}
 		})
 	}

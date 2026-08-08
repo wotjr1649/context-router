@@ -99,6 +99,11 @@ func NewServer(cfg Config) (*mcp.Server, error) {
 			slog.Warn("mcp: exec 격리 프로브 실패 — ctr_execute 비활성화", "error", err)
 		} else {
 			registerExecute(srv, cfg.Store, cfg.ScratchRoot, cfg.SelfExe, cfg.Canon.WorktreeRoot)
+			// [실측] 릴리스 리뷰 F1: 이 두 줄이 없는 동안 exec 프로필을 켠 서버는 두 도구를
+			// tools/list에 올리면서도 진입 도구의 색인 문장에서는 이름을 뺐고, 그 문장은 스스로를
+			// 지연 도구 전체 목록으로 제시한다 — 모델이 색인만 보고 실행 도구가 없다고 판정하는
+			// 경로다(v0.18의 서버 전역 alwaysLoad 아래에서는 열 도구가 모두 상주해 드러나지 않았다).
+			deferred = append(deferred, idxExecute, idxExecuteFile)
 		}
 	}
 	if cfg.Session != nil {
@@ -337,7 +342,7 @@ func buildSearchOutput(queries []string, qrs []search.QueryResult, evs [][]event
 
 // 지연 로드 도구의 색인 항목(이름 + 한 줄 용도만, 호출 방법·인자·예시는 적지 않는다 — D99
 // 계약 2. 그건 각 도구 자신의 지연 스키마가 이미 담고 있다). NewServer가 **실제로 등록한 것만**
-// 모아 진입 도구 둘(ctr_search·ctr_index)의 Description 꼬리에 붙인다 — 여섯 중 다섯은 조건부
+// 모아 진입 도구 둘(ctr_search·ctr_index)의 Description 꼬리에 붙인다 — 여덟 중 일곱은 조건부
 // 등록이라(ctr_fetch만 무조건) 고정 문면을 붙이면 `CTR_ENABLE=ingest`로 켠 서버가 없는
 // ctr_fetch_and_index를 이름으로 광고한다(최종 리뷰 S4에서 stdio로 실측). 항목 문자열은 각
 // 등록 갈래 옆에 한 벌씩만 두고 두 진입 도구가 같은 결과를 받는다(D13 반파편화).
@@ -348,6 +353,8 @@ const (
 	idxRecordEvent    = "ctr_record_event(세션 이벤트 1건 기록)"
 	idxSessionSummary = "ctr_session_summary(세션 이벤트를 타입별로 그룹핑해 요약)"
 	idxExportEvents   = "ctr_export_events(세션 이벤트를 페이지네이션으로 내보냄)"
+	idxExecute        = "ctr_execute(샌드박스에서 코드를 실행해 stdout 반환)"
+	idxExecuteFile    = "ctr_execute_file(파일 경로를 넘겨 샌드박스에서 실행)"
 )
 
 // deferredToolIndex: 등록된 지연 도구 항목들을 진입 도구 Description 꼬리 한 문장으로 만든다.
