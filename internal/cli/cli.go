@@ -242,6 +242,19 @@ func runStatsLocal(w io.Writer, storeRoot, projectRoot string) error {
 		totalReturned += s.BytesReturned
 	}
 	fmt.Fprintf(w, "total\t%d\t%d\t%d\tbytes suppressed (local, 진단용)\n", totalCalls, totalStored, totalReturned)
+
+	// D103 계약 9: 회수 실적 한 줄. D104의 착수 조건(ctr_* 10건 · 해소 30건 또는 미해소 5건)을
+	// 여기서 읽는다. 총 호출을 같은 줄에 병기하는 이유: 이 릴리스부터 위 표의 ctr_fetch calls가
+	// 뜻을 바꾸고(전에는 성공만, 이제 성공 + artifact 부재) 채택 문턱이 읽는 수가 그 총계다 —
+	// 병기하지 않으면 해소·미해소가 둘 다 0인 것과 원장 쓰기가 깨진 것이 구분되지 않는다.
+	// 오류는 위 LedgerStats 호출과 같은 방식으로 반환한다 — 이관 전 원장은 이미 오류 없는 0
+	// 결과이므로 여기서 삼킬 것이 없고, 삼키면 권한·손상 실패가 "데이터 없음"으로 읽힌다.
+	fs, err := store.LedgerFetchStats(projDir)
+	if err != nil {
+		return fmt.Errorf("stats: 회수 실적 집계 실패: %w", err)
+	}
+	fmt.Fprintf(w, "fetch\tcalls=%d\tresolved=%d\tmissed=%d\tage_s p50=%d p90=%d max=%d\n",
+		fs.Calls, fs.Resolved, fs.Missed, fs.AgeP50, fs.AgeP90, fs.AgeMax)
 	return nil
 }
 

@@ -1845,6 +1845,45 @@ func TestRunStats_Local_NoLedger(t *testing.T) {
 	}
 }
 
+// TestStatsPrintsFetchStats: stats가 회수 실적 줄을 낸다. 이 줄이 D104의 착수 조건을 사람이
+// 눈으로 확인하는 자리다 — ctr_* 호출 10건·해소 30건 또는 미해소 5건. **총 호출을 병기하는
+// 것이 계약**이다: 이 릴리스부터 위 표의 ctr_fetch calls가 뜻을 바꾸고(전에는 성공만, 이제
+// 성공 + artifact 부재), 채택 문턱이 읽는 수가 바로 그 총계다(D103 계약 9).
+// 나이를 10·20·30·40·50 다섯 값으로 심어 p50·p90·max를 서로 다른 세 수로 만든다 — 두 값짜리
+// 픽스처(600·1800)는 nearest-rank 오프셋상 p50=p90=600이 되어 그 둘을 뒤바꿔도 통과한다.
+func TestStatsPrintsFetchStats(t *testing.T) {
+	storeRoot, projectRoot := t.TempDir(), t.TempDir()
+	canon, err := ident.Canonicalize(projectRoot)
+	if err != nil {
+		t.Fatalf("canonicalize: %v", err)
+	}
+	projDir := filepath.Join(storeRoot, "projects", canon.ProjectID)
+	st, err := store.Open(projDir, false)
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	for i, age := range []int64{10, 20, 30, 40, 50} {
+		st.LedgerAppendFetch(100, 1, int64(i)+1, age) // 해소(나이 age초)
+	}
+	st.LedgerAppendFetch(0, 1, 0, 0) // 미해소
+	if err := st.Close(); err != nil {
+		t.Fatalf("store.Close: %v", err)
+	}
+
+	var out, errOut bytes.Buffer
+	if err := Run(context.Background(), "stats", nil, storeRoot, projectRoot, "0.0.1-dev", &out, &errOut); err != nil {
+		t.Fatalf("Run stats err=%v out=%s", err, out.String())
+	}
+	got := out.String()
+	for _, want := range []string{
+		"fetch\t", "calls=6", "resolved=5", "missed=1", "p50=30", "p90=40", "max=50",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("회수 실적 줄에 %q 없음:\n%s", want, got)
+		}
+	}
+}
+
 // TestRunStats_Provider: 임시 JSONL 3줄(usage 2건 + 파싱 불가 1건)을 스캔해 실측 토큰 합계와
 // skipped 카운트를 검증한다(설계 §6 provider 계약) — 절약 주장·비교 문구는 없다(실측 합계만).
 func TestRunStats_Provider(t *testing.T) {
