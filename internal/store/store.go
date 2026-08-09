@@ -1026,7 +1026,7 @@ func (s *Store) LedgerAppend(tool string, stored, returned, ms int64) {
 }
 
 // LastIndexedAtByHash — D103 계약 2: 이 콘텐츠의 **마지막 포착** 시각(unix 초). 시계도 범위도
-// D67 퍼지와 같은 것을 쓴다 — 퍼지 술어(shadowOwnedFilter의 나이 절, store.go:1099-1102)가
+// D67 퍼지와 같은 것을 쓴다 — 퍼지 술어(shadowOwnedFilter의 나이 절, store.go:1392-1394)가
 // 같은 content_hash를 가진 모든 artifact의 모든 소스에 대해 indexed_at을 보므로, 나이도 그렇게
 // 재야 분포가 보존 창 위에 그대로 겹쳐진다. artifact 단위로 재면 형제가 방금 재포착된
 // 아티팩트가 실제보다 늙어 보이고 그 오차는 창을 늘리는 쪽으로만 작용한다. 소스가 없으면 (0, nil).
