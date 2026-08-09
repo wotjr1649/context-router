@@ -1263,6 +1263,99 @@ func TestLedgerStats_StatErrorOtherThanNotExist(t *testing.T) {
 	}
 }
 
+// TestLedgerFetchStatsToleratesOldSchema: 새 열이 없는 옛 ledger.db를 만나도 실패하지 않는다.
+// ALTER는 writable Open에서만 도는데 LedgerFetchStats는 ledger.db를 따로 read-only로 연다 —
+// 새 바이너리의 stats가 아직 이관되지 않은 원장을 먼저 만날 수 있다(설계 v0.20 D103 계약 7).
+// 총 호출(Calls)은 옛 원장에서도 읽힌다 — 그 열은 처음부터 있었다.
+func TestLedgerFetchStatsToleratesOldSchema(t *testing.T) {
+	dir := t.TempDir()
+	db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(filepath.Join(dir, "ledger.db")))
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+	if _, err := db.Exec(`CREATE TABLE ledger(
+		id INTEGER PRIMARY KEY, ts INTEGER NOT NULL, tool TEXT NOT NULL,
+		bytes_stored INTEGER NOT NULL DEFAULT 0, bytes_returned INTEGER NOT NULL DEFAULT 0,
+		duration_ms INTEGER NOT NULL DEFAULT 0)`); err != nil {
+		t.Fatalf("옛 스키마 생성: %v", err)
+	}
+	if _, err := db.Exec(
+		`INSERT INTO ledger(ts,tool,bytes_stored,bytes_returned,duration_ms) VALUES(1,'ctr_fetch',0,10,1)`,
+	); err != nil {
+		t.Fatalf("레거시 행: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	fs, err := LedgerFetchStats(dir)
+	if err != nil {
+		t.Fatalf("옛 스키마에서 오류가 났다: %v", err)
+	}
+	if fs.Calls != 1 {
+		t.Fatalf("총 호출=%d, 기대 1(레거시 행도 센다)", fs.Calls)
+	}
+	if fs.Resolved != 0 || fs.Missed != 0 {
+		t.Fatalf("레거시 행이 해소/미해소로 셌다: %+v", fs)
+	}
+}
+
+// TestLedgerFetchStatsPartialMigration: 두 ALTER는 독립이라 **하나만 성공한 상태가 도달
+// 가능하다**. 그 상태에서 분위수 질의를 돌리면 경성 오류가 나므로, 열 **둘 다** 있을 때만 새
+// 질의를 돌리고 아니면 이관 전과 같은 빈 값 경로를 탄다(설계 v0.20 D103 계약 7).
+func TestLedgerFetchStatsPartialMigration(t *testing.T) {
+	dir := t.TempDir()
+	db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(filepath.Join(dir, "ledger.db")))
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+	if _, err := db.Exec(`CREATE TABLE ledger(
+		id INTEGER PRIMARY KEY, ts INTEGER NOT NULL, tool TEXT NOT NULL,
+		bytes_stored INTEGER NOT NULL DEFAULT 0, bytes_returned INTEGER NOT NULL DEFAULT 0,
+		duration_ms INTEGER NOT NULL DEFAULT 0, artifact_id INTEGER)`); err != nil { // age 열만 없다
+		t.Fatalf("부분 이관 스키마: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	fs, err := LedgerFetchStats(dir)
+	if err != nil {
+		t.Fatalf("부분 이관에서 오류가 났다: %v", err)
+	}
+	if fs.Resolved != 0 || fs.Missed != 0 {
+		t.Fatalf("부분 이관에서 0이 아닌 값: %+v", fs)
+	}
+}
+
+// TestLedgerColumnsAddedOnWritableOpen: writable Open이 두 열을 **실제로** 붙인다.
+// 판정을 PRAGMA table_info로 하는 이유: LedgerFetchStats가 열 부재를 관용하므로, 반환값만
+// 보면 ALTER를 아예 넣지 않은 구현도 0을 내며 통과한다. 두 번 열어도 "duplicate column name"이
+// 밖으로 새지 않는다(ledger 전체가 best-effort라 삼킨다).
+func TestLedgerColumnsAddedOnWritableOpen(t *testing.T) {
+	dir := t.TempDir()
+	st := openAt(t, dir)
+	if err := st.Close(); err != nil {
+		t.Fatalf("첫 Close: %v", err)
+	}
+	st2 := openAt(t, dir) // 두 번째 Open에서 ALTER가 중복 실패한다 — 그래도 열려야 한다
+	if err := st2.Close(); err != nil {
+		t.Fatalf("둘째 Close: %v", err)
+	}
+
+	db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(filepath.Join(dir, "ledger.db"))+"?mode=ro")
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+	defer db.Close()
+	cols, err := ledgerColumns(db)
+	if err != nil {
+		t.Fatalf("ledgerColumns: %v", err)
+	}
+	if !cols["artifact_id"] || !cols["artifact_age_s"] {
+		t.Fatalf("writable Open이 두 열을 붙이지 않았다: %v", cols)
+	}
+}
+
 // TestPurgeOlderThan: 구 source 1개(cutoff 이전에 등록) + 신 source 1개(cutoff 이후)를
 // 등록하고 cutoff를 그 경계로 준다(등록 사이에 time.Now()를 캡처 — indexed_at 조작을 위한
 // writer UPDATE 테스트 헬퍼 대신 실제 시각 흐름으로 경계를 만든다, 설계 §7). 구 source만

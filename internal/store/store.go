@@ -177,6 +177,13 @@ func OpenContext(ctx context.Context, dir string, readOnly bool) (*Store, error)
 				id INTEGER PRIMARY KEY, ts INTEGER NOT NULL, tool TEXT NOT NULL,
 				bytes_stored INTEGER NOT NULL DEFAULT 0, bytes_returned INTEGER NOT NULL DEFAULT 0,
 				duration_ms INTEGER NOT NULL DEFAULT 0)`)
+			// D103 계약 1: artifact 단위 회수 실적 두 열. 옛 ledger.db에도 붙여야 하므로 ALTER를
+			// 쓰는데, 이미 있으면 "duplicate column name"으로 실패한다 — ledger 전체가
+			// best-effort이므로 그 실패를 그대로 무시한다(위 CREATE와 같은 `_, _ =` 관례).
+			// 둘은 독립 문장이라 하나만 성공한 부분 이관이 도달 가능하다 — 읽는 쪽이
+			// PRAGMA table_info로 **둘 다** 있는지 보고 아니면 빈 값 경로를 탄다(계약 7).
+			_, _ = l.Exec(`ALTER TABLE ledger ADD COLUMN artifact_id INTEGER`)
+			_, _ = l.Exec(`ALTER TABLE ledger ADD COLUMN artifact_age_s INTEGER`)
 			s.ledger = l
 		}
 	}
@@ -1065,6 +1072,101 @@ func LedgerStats(dir string) ([]ToolStat, error) {
 		return nil, fmt.Errorf("store LedgerStats: %w", err)
 	}
 	return out, nil
+}
+
+// FetchStat: D103 회수 실적. Calls는 원장의 ctr_fetch 행 전부(레거시 포함)이고 D104의 채택
+// 문턱이 읽는 수다. Resolved는 artifact를 실제로 돌려준 fetch, Missed는 **artifact 부재**로
+// 끝난 fetch다(계약 3 — 잘못된 chunk id는 여기 들지 않는다). Age*는 **회수 시점에 박아 둔**
+// 나이(초)의 분포 — 아티팩트가 나중에 지워져도 남는다는 것이 이 계측의 요지다(계약 2).
+type FetchStat struct {
+	Calls                  int64
+	Resolved, Missed       int64
+	AgeP50, AgeP90, AgeMax int64
+}
+
+// ledgerColumns: PRAGMA table_info(ledger)의 열 이름 집합. 테이블이 없으면 빈 집합(오류 아님).
+// 드라이버 오류 문자열 대조("no such column")를 쓰지 않는 이유: 그 문면은 우리가 통제하지
+// 않는 계약이고 드라이버 판마다 바뀐다(설계 v0.20 D103 계약 7).
+func ledgerColumns(db *sql.DB) (map[string]bool, error) {
+	rows, err := db.Query(`PRAGMA table_info(ledger)`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	cols := map[string]bool{}
+	for rows.Next() {
+		var cid, notNull, pk int
+		var name, typ string
+		var dflt sql.NullString
+		if err := rows.Scan(&cid, &name, &typ, &notNull, &dflt, &pk); err != nil {
+			return nil, err
+		}
+		cols[name] = true
+	}
+	return cols, rows.Err()
+}
+
+// LedgerFetchStats: dir/ledger.db를 read-only로 열어 회수 실적을 낸다.
+// 파일 미존재는 LedgerStats와 동일하게 빈 값+nil이다. **새 열이 없는(또는 하나만 있는) 원장도
+// 해소/미해소 0 + nil이다** — ALTER는 writable Open에서만 돌므로 이 경로가 이관 전 원장을
+// 먼저 만날 수 있고, 그것은 손상이 아니다(설계 v0.20 D103 계약 7). 그 외 오류는 삼키지 않는다.
+func LedgerFetchStats(dir string) (FetchStat, error) {
+	var fs FetchStat
+	path := filepath.Join(dir, "ledger.db")
+	if _, err := os.Stat(path); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return fs, nil
+		}
+		return fs, sanitizeIOErr("ledger stat", err)
+	}
+	db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(path)+"?mode=ro&_pragma=busy_timeout(5000)")
+	if err != nil {
+		return fs, fmt.Errorf("store LedgerFetchStats: %w", err)
+	}
+	defer db.Close()
+
+	cols, err := ledgerColumns(db)
+	if err != nil {
+		return FetchStat{}, fmt.Errorf("store LedgerFetchStats: %w", err)
+	}
+	if len(cols) == 0 { // ledger 테이블 자체가 없다 — 이관 전과 같은 빈 값 경로
+		return fs, nil
+	}
+	if err := db.QueryRow(
+		`SELECT count(*) FROM ledger WHERE tool='ctr_fetch'`,
+	).Scan(&fs.Calls); err != nil {
+		return FetchStat{}, fmt.Errorf("store LedgerFetchStats: %w", err)
+	}
+	if !cols["artifact_id"] || !cols["artifact_age_s"] {
+		return fs, nil // 이관 전·부분 이관 — 총 호출만 유효하다
+	}
+	// 계약 1의 표: 레거시는 두 열 다 NULL, 미해소는 age=-1, 해소는 둘 다 값.
+	if err := db.QueryRow(`SELECT
+			coalesce(sum(artifact_id IS NOT NULL),0),
+			coalesce(sum(artifact_id IS NULL AND artifact_age_s IS NOT NULL),0)
+		FROM ledger WHERE tool='ctr_fetch'`).Scan(&fs.Resolved, &fs.Missed); err != nil {
+		return FetchStat{}, fmt.Errorf("store LedgerFetchStats: %w", err)
+	}
+	if fs.Resolved == 0 {
+		return fs, nil
+	}
+	// 분위수는 SQLite에 내장이 없으므로 정렬 + OFFSET으로 낸다. 행 수가 수만 단위라
+	// 이 방식으로 충분하다(하루 약 300행 × 무기한 보존 = 1년 11만 행).
+	for _, q := range []struct {
+		dst    *int64
+		offset int64
+	}{
+		{&fs.AgeP50, (fs.Resolved - 1) * 50 / 100},
+		{&fs.AgeP90, (fs.Resolved - 1) * 90 / 100},
+		{&fs.AgeMax, fs.Resolved - 1},
+	} {
+		if err := db.QueryRow(`SELECT artifact_age_s FROM ledger
+			WHERE tool='ctr_fetch' AND artifact_id IS NOT NULL
+			ORDER BY artifact_age_s LIMIT 1 OFFSET ?`, q.offset).Scan(q.dst); err != nil {
+			return FetchStat{}, fmt.Errorf("store LedgerFetchStats: %w", err)
+		}
+	}
+	return fs, nil
 }
 
 // SizeStat: content.db 규모 스냅샷(doctor [14] shadow 성장 관측 채널, 설계 v0.3 §2·D33).
