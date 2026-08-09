@@ -47,7 +47,7 @@ func storeWarnBytes(getenv func(string) string) int64 {
 
 // defaultContentFileWarnBytes — D46 content.db 파일 축 경고 임계 기본값(설계 v0.6 §4 — 가시화
 // 트리거: 조용한 기본값이 아니다).
-const defaultContentFileWarnBytes = 100 << 20 // 100MiB
+const defaultContentFileWarnBytes = 256 << 20 // 256MiB — D102 계약 6(정리 후 정상상태 실측 171 MB의 약 1.5배)
 
 // contentFileWarnBytes — CTR_CONTENT_FILE_WARN_BYTES 양수만 채택(storeWarnBytes와 동형 규율).
 // blob 키와 분리한 전용 키(D46) — 두 축은 크기·성장·구제 경로가 달라 한쪽 조정이 다른 축을
@@ -1894,16 +1894,22 @@ func runDoctor(ctx context.Context, w io.Writer, storeRoot, projectRoot, version
 		fmt.Fprintln(w, "[14] content.db: 없음")
 	} else {
 		sz = s
-		fmt.Fprintf(w, "[14] content.db: sources=%d artifacts=%d blob=%dB file=%dB\n", sz.Sources, sz.Artifacts, sz.BlobBytes, sz.FileBytes)
+		fmt.Fprintf(w, "[14] content.db: sources=%d artifacts=%d blob=%dB file=%dB free=%dB\n",
+			sz.Sources, sz.Artifacts, sz.BlobBytes, sz.FileBytes, sz.FreeBytes)
 		// D38 — CAS 전체 blob 총량 경고(shadow 전용 아님 — [14] 측정 실체 그대로). 관측 채널이지
 		// 정책 집행이 아니다(D27): 자동 삭제 없음. SizeStats 실패 경로는 이 분기 밖이라 미평가.
 		if warn := storeWarnBytes(os.Getenv); sz.BlobBytes > warn {
 			fmt.Fprintf(w, "[14] warning: blob %dB > 임계 %dB(CTR_STORE_WARN_BYTES) — 수동 구제는 purge 계열 CLI(purge --project <id> --hook-only로 shadow만 선택 삭제 가능). 자동 삭제 없음\n", sz.BlobBytes, warn)
 		}
-		// D46 — content.db 파일 축(청크 텍스트+FTS) 자문 경고. D38 기준 축(blob)은 대체하지
-		// 않는다 — 파일 축은 purge 후에도 free page로 즉시 안 줄어 별도 안내가 계약(설계 v0.6 §4).
-		if warn := contentFileWarnBytes(os.Getenv); sz.FileBytes > warn {
-			fmt.Fprintf(w, "[14] warning: file %dB > 임계 %dB(CTR_CONTENT_FILE_WARN_BYTES) — 청크 텍스트+FTS 축(자문). purge 행 삭제 후에도 free page로 즉시 줄지 않음, 회수는 VACUUM(라이브 서버 제약 — 서버 비가동 시), --hook-only는 shadow 귀속 한정(explicit 소스 감축은 전체 purge). 자동 삭제 없음\n", sz.FileBytes, warn)
+		// D102 계약 6·8 — content.db 라이브 축(청크 텍스트+FTS) 자문 경고. 판정은 파일 크기가
+		// 아니라 live 바이트다: 자동 경로가 VACUUM을 하지 않으므로 파일은 고수위에 머물고,
+		// 파일 기준 임계는 정리 뒤에도 상시 초과라 신호로서 죽는다(D67의 관측된 결함).
+		// free는 병기만 한다 — 병합 안 된 세그먼트는 live page라 freelist는 결함이 있을 때
+		// 오히려 낮게 읽힌다(계약 7). 문면의 "자동 VACUUM 없음"은 옛 "자동 삭제 없음"을 고친
+		// 것이다: 바로 위에서 보고하는 artifacts 수는 D67 퍼지 때문에 사용자 조작 없이 줄어든다.
+		if warn := contentFileWarnBytes(os.Getenv); sz.FileBytes-sz.FreeBytes > warn {
+			fmt.Fprintf(w, "[14] warning: live %dB > 임계 %dB(CTR_CONTENT_FILE_WARN_BYTES) — 청크 텍스트+FTS 축(자문, live=file-free). free %dB는 이미 회수돼 재사용을 기다리는 몫이라 판정에 넣지 않는다. 파일 축소는 VACUUM(라이브 서버 제약 — 서버 비가동 시 purge --older-than --vacuum), --hook-only는 shadow 귀속 한정(explicit 소스 감축은 전체 purge). 훅 아티팩트 보존 창 %s(CTR_SHADOW_RETENTION). 자동 VACUUM 없음\n",
+				sz.FileBytes-sz.FreeBytes, warn, sz.FreeBytes, store.ShadowRetention(os.Getenv))
 		}
 	}
 

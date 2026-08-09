@@ -1018,6 +1018,7 @@ type SizeStat struct {
 	Sources, Artifacts int64
 	BlobBytes          int64
 	FileBytes          int64            // content.db 파일 실크기(os.Stat) — D40, [14] 병기
+	FreeBytes          int64            // free page × page_size — 회수 가능분(D102 계약 7, 표시 전용)
 	ShadowOwnedBytes   int64            // 귀속 hash들의 물리 CAS 파일 바이트 합 (= ShadowOwned 값 합, 불변)
 	ShadowOwnedHashes  int              // 귀속 hash 수 (= len(ShadowOwned), 불변)
 	ShadowOwned        map[string]int64 // 귀속 content_hash → 물리 CAS 파일 바이트 — Task 3b/5a/5b 공용 원천
@@ -1064,6 +1065,19 @@ func SizeStats(dir string) (*SizeStat, error) {
 	defer db.Close()
 
 	st := SizeStat{FileBytes: fi.Size(), ShadowOwned: map[string]int64{}}
+
+	// D102 계약 7: 회수 가능분을 낸다. free page는 삭제가 만들고 이후 기록이 재사용하므로,
+	// 이 값이 크다는 것은 "파일이 크다"가 아니라 "지운 만큼이 아직 파일 안에 있다"는 뜻이다.
+	// 판정(계약 6)은 이 값이 아니라 FileBytes-FreeBytes로 한다 — 병합되지 않은 세그먼트는
+	// free page가 아니라 live page라 freelist는 결함이 있을 때 오히려 낮게 읽힌다.
+	// 두 pragma 모두 best-effort — 실패하면 0으로 두고 진단 전체를 실패시키지 않는다.
+	var pageSize, freeCount int64
+	if err := db.QueryRow("PRAGMA page_size").Scan(&pageSize); err == nil {
+		if err := db.QueryRow("PRAGMA freelist_count").Scan(&freeCount); err == nil {
+			st.FreeBytes = pageSize * freeCount
+		}
+	}
+
 	if err := db.QueryRow("SELECT count(*) FROM sources").Scan(&st.Sources); err != nil {
 		return nil, fmt.Errorf("store SizeStats: %w", err)
 	}
@@ -1177,6 +1191,29 @@ func shadowOwnedFilter(cutoffUnix int64, maxHashes int) (string, []any) {
 // PurgeHookOnly — 예산 없이 shadow 귀속 아티팩트를 지운다(기존 계약 유지).
 func (s *Store) PurgeHookOnly(ctx context.Context) (HookPurgeReport, error) {
 	return s.PurgeHookOnlyOlderThan(ctx, 0, 0)
+}
+
+// DefaultShadowRetention — shadow 귀속 아티팩트 보존 기간(설계 v0.12 D67). 훅이 가로챈
+// 출력은 대개 해당 세션 안에서 소비되므로 짧게 잡는다. v0.20에서 cmd/context-router 에서
+// 이 패키지로 옮겼다 — doctor 문면이 실효값을 적으려면 internal/cli 도 이 해석기에 닿아야
+// 하는데, 규칙을 복제하면 두 구현이 갈라진다(D13, 설계 v0.20 D102 계약 8).
+const DefaultShadowRetention = 72 * time.Hour
+
+// ShadowRetention — CTR_SHADOW_RETENTION(time.ParseDuration 형식) 양수만 채택한다.
+// 파싱 실패·비양수는 기본값 — 잘못된 값이 정책을 무력화하지 않게 한다.
+func ShadowRetention(getenv func(string) string) time.Duration {
+	if d, err := time.ParseDuration(getenv("CTR_SHADOW_RETENTION")); err == nil && d > 0 {
+		return d
+	}
+	return DefaultShadowRetention
+}
+
+// ShadowCutoff — 보존 기간 d에 대한 회수 경계(unix 초). **0 이하면 회수를 건너뛰어야 한다**:
+// shadowOwnedFilter가 cutoffUnix<=0을 "나이 필터 없음"으로 읽으므로(TestPurgeHookOnlyOlderThanZeroMeansAll이
+// 그 계약을 고정한다) 보존을 늘리려는 설정이 나이 무관 전량 삭제로 반전된다. d가 epoch
+// 경과분(약 56년) 이상이면 그 경계에 닿는다 — 경계가 정확히 0에서 시작하므로 판정도 `<= 0`이다.
+func ShadowCutoff(now time.Time, d time.Duration) int64 {
+	return now.Add(-d).Unix()
 }
 
 // PurgeHookOnlyOlderThan — D41 §3 + D67: shadow 귀속(그 hash를 참조하는 소스가 전부 hook) 아티팩트

@@ -422,7 +422,7 @@ func TestRunDoctor_ContentFileWarn(t *testing.T) {
 		t.Fatalf("runDoctor err=%v out=%s", err, buf.String())
 	}
 	out := buf.String()
-	if !strings.Contains(out, "[14] warning: file ") || !strings.Contains(out, "CTR_CONTENT_FILE_WARN_BYTES") {
+	if !strings.Contains(out, "[14] warning: live ") || !strings.Contains(out, "CTR_CONTENT_FILE_WARN_BYTES") {
 		t.Fatalf("파일 축 경고 미발화:\n%s", out)
 	}
 	if strings.Contains(out, "[14] warning: blob ") {
@@ -431,7 +431,7 @@ func TestRunDoctor_ContentFileWarn(t *testing.T) {
 }
 
 // TestRunDoctor_ContentFileWarnAxisIndependent — D46 축 독립: blob 키만 낮추면 blob 경고만
-// 발화하고 파일 경고는 기본 100MiB 임계라 침묵한다(소형 픽스처 ≪ 100MiB — 전용 키 분리 판별).
+// 발화하고 파일 경고는 기본 256MiB 임계라 침묵한다(소형 픽스처 ≪ 256MiB — 전용 키 분리 판별).
 func TestRunDoctor_ContentFileWarnAxisIndependent(t *testing.T) {
 	isolateCodexHome(t)
 	storeRoot, projectRoot := doctorSizeWarnSetup(t)
@@ -444,20 +444,59 @@ func TestRunDoctor_ContentFileWarnAxisIndependent(t *testing.T) {
 	if !strings.Contains(out, "[14] warning: blob ") {
 		t.Fatalf("blob 경고 미발화:\n%s", out)
 	}
-	if strings.Contains(out, "[14] warning: file ") {
+	if strings.Contains(out, "[14] warning: live ") {
 		t.Fatalf("blob 키 조정이 파일 축 경고를 발화(키 분리 위반):\n%s", out)
+	}
+}
+
+// TestContentFileWarnDefaultIs256MiB: 임계가 256 MiB다. 정리 후 정상상태가 실측 171 MB이므로
+// 옛 100 MiB는 정리 뒤에도 상시 초과라 신호로서 죽는다. 256 MiB는 그 1.5배이고,
+// 창을 7일로 늘리는 결정(약 400 MB)이 이 신호를 켜도록 고른 값이다(설계 v0.20 D102 계약 6).
+func TestContentFileWarnDefaultIs256MiB(t *testing.T) {
+	if defaultContentFileWarnBytes != 256<<20 {
+		t.Fatalf("임계 = %d, 기대 %d", defaultContentFileWarnBytes, 256<<20)
+	}
+}
+
+// TestRunDoctor_ContentLiveWarnUsesLiveBytes: [14] 경고가 파일 크기가 아니라 live 바이트로
+// 판정한다. free page가 임계를 넘는 몫을 차지하면 경고가 **꺼져야** 한다 — 그것이 "파일이
+// 크다"와 "쓰레기가 쌓였다"를 가르는 지점이고, 파일 크기 판정에서는 구조적으로 불가능하다.
+func TestRunDoctor_ContentLiveWarnUsesLiveBytes(t *testing.T) {
+	isolateCodexHome(t)
+	storeRoot, projectRoot := doctorSizeWarnSetup(t)
+	canon, err := ident.Canonicalize(projectRoot)
+	if err != nil {
+		t.Fatalf("canonicalize: %v", err)
+	}
+	projDir := filepath.Join(storeRoot, "projects", canon.ProjectID)
+	sz, err := store.SizeStats(projDir)
+	if err != nil || sz == nil {
+		t.Fatalf("SizeStats: sz=%v err=%v", sz, err)
+	}
+	// live 바로 위에 임계를 둔다 — file 기준이면 초과(발화), live 기준이면 미달(침묵).
+	live := sz.FileBytes - sz.FreeBytes
+	t.Setenv("CTR_CONTENT_FILE_WARN_BYTES", strconv.FormatInt(live, 10))
+	var buf bytes.Buffer
+	if err := runDoctor(context.Background(), &buf, storeRoot, projectRoot, "0.0.1-dev"); err != nil {
+		t.Fatalf("runDoctor err=%v out=%s", err, buf.String())
+	}
+	if strings.Contains(buf.String(), "[14] warning: live ") {
+		t.Fatalf("live 임계와 같은 값에서 경고가 발화(> 판정 위반):\n%s", buf.String())
+	}
+	if !strings.Contains(buf.String(), " free=") {
+		t.Fatalf("[14] 줄에 free= 병기 없음:\n%s", buf.String())
 	}
 }
 
 // TestContentFileWarnBytes — CTR_CONTENT_FILE_WARN_BYTES 양수만 채택(storeWarnBytes와 동형).
 func TestContentFileWarnBytes(t *testing.T) {
-	if got := contentFileWarnBytes(func(string) string { return "" }); got != 100<<20 {
+	if got := contentFileWarnBytes(func(string) string { return "" }); got != 256<<20 {
 		t.Fatalf("기본값: %d", got)
 	}
 	if got := contentFileWarnBytes(func(string) string { return "12345" }); got != 12345 {
 		t.Fatalf("env 채택: %d", got)
 	}
-	if got := contentFileWarnBytes(func(string) string { return "-1" }); got != 100<<20 {
+	if got := contentFileWarnBytes(func(string) string { return "-1" }); got != 256<<20 {
 		t.Fatalf("비양수 거부: %d", got)
 	}
 }

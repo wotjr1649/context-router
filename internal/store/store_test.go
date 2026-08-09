@@ -1851,6 +1851,38 @@ func TestSizeStatFileBytes(t *testing.T) {
 	}
 }
 
+// TestSizeStatsReportsFreeBytes: SizeStats가 회수 가능 바이트(free page)를 낸다.
+// 이 값이 없으면 "파일이 크다"와 "파일에 쓰레기가 있다"를 doctor에서 가를 수 없고,
+// 그 구분이 없어서 D67의 임계가 한 달 동안 죽은 신호였다(설계 v0.20 관측 B).
+func TestSizeStatsReportsFreeBytes(t *testing.T) {
+	dir := t.TempDir()
+	st := openAt(t, dir)
+	body := strings.Repeat("free page seed ", 8000)
+	for i := range 10 {
+		regChunked(t, st, body+strconv.Itoa(i), "shadow:Bash:free"+strconv.Itoa(i))
+	}
+	if _, err := st.writer.Exec(`DELETE FROM chunks`); err != nil {
+		t.Fatalf("DELETE FROM chunks: %v", err)
+	}
+	if err := st.MergeFTS(t.Context()); err != nil {
+		t.Fatalf("MergeFTS: %v", err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	sz, err := SizeStats(dir)
+	if err != nil || sz == nil {
+		t.Fatalf("SizeStats: sz=%v err=%v", sz, err)
+	}
+	if sz.FreeBytes <= 0 {
+		t.Fatalf("삭제+병합 뒤인데 FreeBytes=%d", sz.FreeBytes)
+	}
+	if sz.FreeBytes > sz.FileBytes {
+		t.Fatalf("FreeBytes(%d)가 FileBytes(%d)보다 크다", sz.FreeBytes, sz.FileBytes)
+	}
+}
+
 // --- D41 PurgeHookOnly 헬퍼 (Task 5a) ---------------------------------------
 
 func hashOf(content string) string {
@@ -2305,6 +2337,54 @@ func TestPurgeHookOnlyOlderThanCapsPerRun(t *testing.T) {
 	}
 	if rep2.Hashes != 1 {
 		t.Errorf("2회차 rep.Hashes=%d want 1(잔여분)", rep2.Hashes)
+	}
+}
+
+// TestShadowRetentionDefault: 기본 보존 기간이 3일이고, 환경변수로만 조정된다.
+// 임의 상향으로 정책이 조용히 무력화되지 않도록 파싱 실패·비양수는 기본값을 쓴다
+// (storeWarnBytes와 같은 규율).
+func TestShadowRetentionDefault(t *testing.T) {
+	cases := []struct {
+		env  string
+		want time.Duration
+	}{
+		{"", 72 * time.Hour},
+		{"24h", 24 * time.Hour},
+		{"0", 72 * time.Hour},
+		{"-5h", 72 * time.Hour},
+		{"garbage", 72 * time.Hour},
+	}
+	for _, c := range cases {
+		got := ShadowRetention(func(string) string { return c.env })
+		if got != c.want {
+			t.Errorf("ShadowRetention(%q)=%v want %v", c.env, got, c.want)
+		}
+	}
+}
+
+// TestShadowCutoffBoundary: ShadowCutoff의 0 경계를 고정한다. 보존 기간이 epoch 경과분보다 크면
+// 경계가 0 이하로 내려가고, store는 cutoffUnix<=0을 "나이 필터 없음"으로 읽는다
+// (TestPurgeHookOnlyOlderThanZeroMeansAll이 그 계약을 고정한다) — 보존을 늘리려는 설정이
+// 나이 무관 전량 삭제로 반전되는 데이터 손실형 결함이다(T12-F1). 기동 경로의 `cutoff <= 0` 건너뛰기가
+// 그 반전을 막는데, 판정을 `< 0`으로 좁히면 정확히 0인 경계(아래 세 번째 케이스)가 그대로 store에
+// 전달된다. 경계가 어디인지 여기서 고정해 조용한 이동을 막는다.
+func TestShadowCutoffBoundary(t *testing.T) {
+	now := time.Unix(1_800_000_000, 0) // 고정 기준 — 실행 시각에 흔들리지 않는다
+	for _, c := range []struct {
+		name string
+		d    time.Duration
+		want int64
+	}{
+		// 기대값은 리터럴로 적는다 — now.Add(-d).Unix()로 적으면 구현과 같은 식이라 부호·단위
+		// 오류를 잡지 못한다. 1_800_000_000 - 72h(259_200s).
+		{"기본 보존(72h)", DefaultShadowRetention, 1_799_740_800},
+		{"epoch 직전", time.Duration(now.Unix()-1) * time.Second, 1},
+		{"epoch 정각 — 여기서부터 반전", time.Duration(now.Unix()) * time.Second, 0},
+		{"epoch 초과", time.Duration(now.Unix()+1) * time.Second, -1},
+	} {
+		if got := ShadowCutoff(now, c.d); got != c.want {
+			t.Errorf("%s: ShadowCutoff(_, %v)=%d want %d", c.name, c.d, got, c.want)
+		}
 	}
 }
 

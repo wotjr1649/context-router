@@ -456,28 +456,6 @@ func parseLogLevel(s string) slog.Level {
 	}
 }
 
-// defaultShadowRetention — shadow 귀속 아티팩트 보존 기간(설계 v0.12 D67). 훅이 가로챈
-// 출력은 대개 해당 세션 안에서 소비되므로 짧게 잡는다.
-const defaultShadowRetention = 72 * time.Hour
-
-// shadowRetention — CTR_SHADOW_RETENTION(time.ParseDuration 형식) 양수만 채택한다.
-// 파싱 실패·비양수는 기본값(storeWarnBytes와 같은 규율 — 잘못된 값이 정책을 무력화하지
-// 않게 한다).
-func shadowRetention(getenv func(string) string) time.Duration {
-	if d, err := time.ParseDuration(getenv("CTR_SHADOW_RETENTION")); err == nil && d > 0 {
-		return d
-	}
-	return defaultShadowRetention
-}
-
-// shadowCutoff — 보존 기간 d에 대한 회수 경계(unix 초). **0 이하면 회수를 건너뛰어야 한다**: store는
-// cutoffUnix<=0을 "나이 필터 없음"으로 읽으므로(store.shadowOwnedFilter — TestPurgeHookOnlyOlderThanZeroMeansAll
-// 이 그 계약을 고정한다) 보존을 늘리려는 설정이 나이 무관 전량 삭제로 반전된다. d가 epoch 경과분(약 56년)
-// 이상이면 그 경계에 닿는다 — 경계가 정확히 0에서 시작하므로 판정도 `<= 0`이다(T12-F1).
-func shadowCutoff(now time.Time, d time.Duration) int64 {
-	return now.Add(-d).Unix()
-}
-
 // startupPurgeBudget — 기동 회수 고루틴의 폭주 가드. 회수는 mcp.Serve를 막지 않는 별도 고루틴이라
 // 이 값은 세션 시작 지연이 아니고, 정상적으로 느린 회수를 끊지 않을 만큼 넉넉해야 한다: 실측
 // 배치 보유가 100해시 약 0.63s(6~9ms/hash, 210MiB store)이고 거기에 txRetry BUSY 백오프(50/200/800ms)와
@@ -681,7 +659,7 @@ func run(ctx context.Context, args []string, stderr io.Writer) error {
 	// 실패하면 색인을 포기해 가드를 조용히 통과시킨다(internal/hook guardRead의 guard-store drop).
 	// 그래서 이 배치의 잠금·쓰기 락 보유 시간은 그 예산의 일부만 쓰도록 건수로 묶는다
 	// (startupPurgeMaxHashes 주석의 실측 근거).
-	cutoff := shadowCutoff(time.Now(), shadowRetention(os.Getenv))
+	cutoff := store.ShadowCutoff(time.Now(), store.ShadowRetention(os.Getenv))
 	purgeCtx, cancelPurge := context.WithTimeout(ctx, startupPurgeBudget)
 	purgeDone := make(chan struct{})
 	go func() {
@@ -691,7 +669,7 @@ func run(ctx context.Context, args []string, stderr io.Writer) error {
 			// "나이 필터 없음"으로 읽는다(shadowOwnedFilter) — 보존을 늘리려는 설정이 나이 무관 전량
 			// 삭제로 반전된다. 클램프하면 그 반전은 막아도 무의미한 배치를 한 번 돌리므로(쓰기 락을
 			// 잡는다) 회수 자체를 건너뛴다. 그 설정의 의도된 결과와도 같다 — 적격 대상이 없다.
-			// 경계 자체는 shadowCutoff의 표 테스트(TestShadowCutoffBoundary)가 고정한다.
+			// 경계 자체는 store.ShadowCutoff의 표 테스트(TestShadowCutoffBoundary, internal/store)가 고정한다.
 			return
 		}
 		rep, purgeErr := st.PurgeHookOnlyOlderThan(purgeCtx, cutoff, startupPurgeMaxHashes)
