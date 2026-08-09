@@ -782,6 +782,33 @@ func (s *Store) checkFTSIntegrity(ctx context.Context) error {
 	return nil
 }
 
+// MergeFTS — D102: fts_porter·fts_trigram의 세그먼트를 하나로 병합한다. 외부 콘텐츠 FTS5의
+// 삭제는 tombstone을 새 세그먼트에 쌓기만 하고 automerge(기본 4)가 그것을 따라잡지 못해,
+// 병합 없이는 퍼지가 지운 몫이 파일에서 회수되지 않는다 — 실측으로 이 저장소 파일의 75.9%가
+// 그렇게 쌓인 것이었다(설계 v0.20 관측 B).
+//
+// checkFTSIntegrity와 같은 **커밋 후 writer 경로**다. tx 안에서 부르지 않는다 — optimize는
+// 자체 트랜잭션을 잡고, 삭제 tx와 한 덩어리로 묶으면 그 tx의 락 보유 시간이 병합 시간만큼
+// 늘어난다(D67이 묶어 둔 예산 규율을 깬다).
+//
+// 원시 명령은 'optimize'다. 'merge=N'은 검토 후 기각됐다 — merge=512 한 번이 실측 churn의
+// 1/4~1/18에 그쳐 하루 한 번으로는 수렴하지 못한다(D102 계약 3). 비용 논거가 기대는 성질:
+// **이미 한 세그먼트로 병합된 인덱스에 건 optimize는 일 없이 반환한다**(번들 SQLite 3.53.3 /
+// modernc.org/sqlite v1.54.0) — 그래서 필요 없는 실행이 싸고, 조정 손잡이(환경 변수)를
+// 지금 만들지 않는다.
+//
+// 어느 한쪽 실패든 그대로 반환한다. 호출자는 이 실패로 기동이나 회수를 막지 않는다 —
+// 병합은 멱등이라 다음 기회에 다시 돌면 된다.
+func (s *Store) MergeFTS(ctx context.Context) error {
+	for _, fts := range [2]string{"fts_porter", "fts_trigram"} {
+		if _, err := s.writer.ExecContext(ctx,
+			"INSERT INTO "+fts+"("+fts+") VALUES('optimize')"); err != nil {
+			return fmt.Errorf("store: %s optimize 실패: %w", fts, err)
+		}
+	}
+	return nil
+}
+
 // hashesFromQuery: query가 반환하는 문자열 컬럼 1개를 집합으로 모은다(GCOrphanBlobs 전용
 // 소소한 헬퍼 — content_hash/raw_blob_hash 두 조회에 재사용).
 func hashesFromQuery(ctx context.Context, db *sql.DB, query string) (map[string]bool, error) {

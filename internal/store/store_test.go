@@ -2879,3 +2879,95 @@ func TestPurgeHookOnlyLockHoldBudget(t *testing.T) {
 			elapsed, budget, rep.Hashes, rep.ReclaimedB, rep.DeferredFiles, rep.FailedFiles)
 	}
 }
+
+// regChunked: regSource와 같되 Chunks를 명시로 실어 **FTS 행을 실제로 만든다**. regSource
+// (store_test.go:1717)는 Chunks 없는 Registration을 만들고 Register는 reg.Chunks에서만
+// chunks를 INSERT하므로(store.go:459) FTS 행이 0개다 — 인덱스 바이트를 재는 테스트가 그
+// 헬퍼로 시드하면 병합 유무와 무관하게 통과한다.
+func regChunked(t *testing.T, st *Store, content, uri string) {
+	t.Helper()
+	if _, err := st.Register(t.Context(), Registration{
+		StoredBytes: []byte(content), MediaType: "text/plain",
+		Source: SourceMeta{URI: uri, Kind: "hook", SrcHash: "sh-" + uri},
+		Chunks: []Chunk{{Ordinal: 0, ByteEnd: int64(len(content)), Text: content}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestMergeFTSShrinksIndex: 삭제가 남긴 세그먼트 표식을 MergeFTS가 걷어낸다.
+// FTS5 외부 콘텐츠 테이블의 삭제는 tombstone을 새 세그먼트에 쌓을 뿐이라, 병합 없이는
+// 행을 다 지워도 _data 바이트가 줄지 않는다 — 그것이 D102가 고치는 결함이고, 이 테스트가
+// 고정하는 것도 "삭제만으로는 안 준다"와 "병합하면 준다" 두 가지다.
+func TestMergeFTSShrinksIndex(t *testing.T) {
+	st := openAt(t, t.TempDir())
+	body := strings.Repeat("alpha beta gamma delta epsilon ", 4000) // 약 120 KB/건
+	for i := range 20 {
+		regChunked(t, st, body+strconv.Itoa(i), "shadow:Bash:seg"+strconv.Itoa(i))
+	}
+	seeded := ftsDataBytes(t, st, "fts_trigram_data")
+	if seeded == 0 {
+		t.Fatal("시드가 FTS 인덱스를 만들지 않았다 — 이 테스트가 공허 통과한다")
+	}
+
+	if _, err := st.writer.Exec(`DELETE FROM chunks`); err != nil {
+		t.Fatalf("DELETE FROM chunks: %v", err)
+	}
+	afterDelete := ftsDataBytes(t, st, "fts_trigram_data")
+	if afterDelete < seeded {
+		t.Fatalf("삭제만으로 인덱스가 줄었다(%d → %d) — D102의 전제가 이 환경에서 성립하지 않는다",
+			seeded, afterDelete)
+	}
+
+	if err := st.MergeFTS(t.Context()); err != nil {
+		t.Fatalf("MergeFTS: %v", err)
+	}
+	merged := ftsDataBytes(t, st, "fts_trigram_data")
+	if merged >= afterDelete {
+		t.Fatalf("MergeFTS 후에도 인덱스가 줄지 않았다: %d → %d", afterDelete, merged)
+	}
+}
+
+// TestMergeFTSKeepsSearchable: 병합이 검색 결과를 바꾸지 않는다 — optimize는 세그먼트를
+// 합칠 뿐 색인 내용을 바꾸지 않아야 한다. 이 확인이 없으면 "줄었다"만 보고 색인을 망가뜨린
+// 변경을 통과시킬 수 있다.
+func TestMergeFTSKeepsSearchable(t *testing.T) {
+	st := openAt(t, t.TempDir())
+	regChunked(t, st, strings.Repeat("needle haystack ", 2000), "shadow:Bash:keep")
+	before := ftsMatchCount(t, st, "needle")
+	if before == 0 {
+		t.Fatal("시드가 검색되지 않는다 — 이 테스트가 공허 통과한다")
+	}
+	if err := st.MergeFTS(t.Context()); err != nil {
+		t.Fatalf("MergeFTS: %v", err)
+	}
+	if after := ftsMatchCount(t, st, "needle"); after != before {
+		t.Fatalf("병합이 검색 결과를 바꿨다: %d → %d", before, after)
+	}
+}
+
+// ftsDataBytes: FTS5 그림자 테이블의 block 바이트 합 — 세그먼트 실점유의 직접 측정이다.
+// 행 수가 아니라 바이트를 재는 이유는, 병합이 줄이는 것이 세그먼트 수가 아니라 중복
+// 저장된 포스팅 바이트이기 때문이다.
+func ftsDataBytes(t *testing.T, st *Store, table string) int64 {
+	t.Helper()
+	var n int64
+	if err := st.reader.QueryRow(
+		`SELECT coalesce(sum(length(block)),0) FROM ` + table,
+	).Scan(&n); err != nil {
+		t.Fatalf("%s 조회: %v", table, err)
+	}
+	return n
+}
+
+// ftsMatchCount: porter 축의 히트 수.
+func ftsMatchCount(t *testing.T, st *Store, term string) int64 {
+	t.Helper()
+	var n int64
+	if err := st.reader.QueryRow(
+		`SELECT count(*) FROM fts_porter WHERE fts_porter MATCH ?`, term,
+	).Scan(&n); err != nil {
+		t.Fatalf("fts_porter MATCH: %v", err)
+	}
+	return n
+}
