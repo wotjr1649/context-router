@@ -458,12 +458,61 @@ func TestContentFileWarnDefaultIs256MiB(t *testing.T) {
 	}
 }
 
+// doctorLiveFreePageSetup — doctorSizeWarnSetup과 반환 모양은 같지만 삽입 전용이 아니다: chunked
+// 등록 다건 → PurgeHookOnlyOlderThan(전량, internal/store가 노출하는 실제 회수 경로) →
+// MergeFTS → 닫기로 **실제 free page**를 남긴다(internal/store TestSizeStatsReportsFreeBytes와
+// 같은 패턴). live/file 축을 가르는 테스트는 FreeBytes>0이 전제인데, doctorSizeWarnSetup은
+// 삽입만 하므로 freelist_count=0이라 live==FileBytes가 되어 두 술어가 같은 값에서 함께
+// 침묵해버린다(리뷰에서 발견된 공허 통과 — 계획의 Global Constraints가 금지하는 것과 같은
+// 형태). 공용 doctorSizeWarnSetup은 다른 테스트가 그 모양(삽입 전용·행수 단정)을 쓰므로
+// 건드리지 않는다.
+func doctorLiveFreePageSetup(t *testing.T) (storeRoot, projectRoot string) {
+	t.Helper()
+	t.Setenv("CTR_STORE_WARN_BYTES", "")
+	t.Setenv("CTR_CONTENT_FILE_WARN_BYTES", "")
+	storeRoot, projectRoot = t.TempDir(), t.TempDir()
+	canon, err := ident.Canonicalize(projectRoot)
+	if err != nil {
+		t.Fatalf("canonicalize: %v", err)
+	}
+	st, err := store.Open(filepath.Join(storeRoot, "projects", canon.ProjectID), false)
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	body := strings.Repeat("free page seed ", 8000) // internal/store TestSizeStatsReportsFreeBytes와 동일 규모
+	for i := range 10 {
+		s := body + strconv.Itoa(i)
+		if _, err := st.Register(context.Background(), store.Registration{
+			StoredBytes: []byte(s), MediaType: "text/plain",
+			Source: store.SourceMeta{URI: "shadow:Bash:free" + strconv.Itoa(i), Kind: "hook", SrcHash: "sh-free" + strconv.Itoa(i)},
+			Chunks: []store.Chunk{{Ordinal: 0, ByteEnd: int64(len(s)), Text: s}},
+		}); err != nil {
+			t.Fatalf("register %d: %v", i, err)
+		}
+	}
+	// 전량 회수(cutoffUnix=0, maxHashes=0) — 전부 hook 귀속이라 이 한 호출로 chunks·sources·
+	// artifacts가 다 지워지고 물리 blob도 회수된다. FTS 트리거가 tombstone을 남기고,
+	// MergeFTS가 그것을 압축해야 free page가 생긴다(삭제만으로는 안 준다 — D102).
+	if _, err := st.PurgeHookOnlyOlderThan(context.Background(), 0, 0); err != nil {
+		t.Fatalf("PurgeHookOnlyOlderThan: %v", err)
+	}
+	if err := st.MergeFTS(context.Background()); err != nil {
+		t.Fatalf("MergeFTS: %v", err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatalf("store.Close: %v", err)
+	}
+	return storeRoot, projectRoot
+}
+
 // TestRunDoctor_ContentLiveWarnUsesLiveBytes: [14] 경고가 파일 크기가 아니라 live 바이트로
 // 판정한다. free page가 임계를 넘는 몫을 차지하면 경고가 **꺼져야** 한다 — 그것이 "파일이
 // 크다"와 "쓰레기가 쌓였다"를 가르는 지점이고, 파일 크기 판정에서는 구조적으로 불가능하다.
+// 이 구분이 성립하려면 FreeBytes>0이 전제이므로 doctorLiveFreePageSetup(삽입+삭제+병합)을
+// 쓴다 — 삽입 전용 픽스처로는 FreeBytes=0이라 file==live가 되어 어떤 술어를 넣어도 통과한다.
 func TestRunDoctor_ContentLiveWarnUsesLiveBytes(t *testing.T) {
 	isolateCodexHome(t)
-	storeRoot, projectRoot := doctorSizeWarnSetup(t)
+	storeRoot, projectRoot := doctorLiveFreePageSetup(t)
 	canon, err := ident.Canonicalize(projectRoot)
 	if err != nil {
 		t.Fatalf("canonicalize: %v", err)
@@ -473,7 +522,12 @@ func TestRunDoctor_ContentLiveWarnUsesLiveBytes(t *testing.T) {
 	if err != nil || sz == nil {
 		t.Fatalf("SizeStats: sz=%v err=%v", sz, err)
 	}
-	// live 바로 위에 임계를 둔다 — file 기준이면 초과(발화), live 기준이면 미달(침묵).
+	// 이 전제가 없으면 아래 임계 설정이 live==file인 채로 진행돼, 판정을 옛 file 기준으로
+	// 되돌려도 이 테스트가 계속 통과한다(공허 통과) — 리뷰에서 실제로 발견된 결함.
+	if sz.FreeBytes <= 0 {
+		t.Fatalf("픽스처에 free page 없음 — 이 테스트는 live/file을 가르지 못한다(FreeBytes=%d)", sz.FreeBytes)
+	}
+	// live 바로 위에 임계를 둔다 — file 기준이면 엄격히 초과(발화), live 기준이면 미달(침묵).
 	live := sz.FileBytes - sz.FreeBytes
 	t.Setenv("CTR_CONTENT_FILE_WARN_BYTES", strconv.FormatInt(live, 10))
 	var buf bytes.Buffer

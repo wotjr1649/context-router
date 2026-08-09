@@ -46,7 +46,9 @@ func storeWarnBytes(getenv func(string) string) int64 {
 }
 
 // defaultContentFileWarnBytes — D46 content.db 파일 축 경고 임계 기본값(설계 v0.6 §4 — 가시화
-// 트리거: 조용한 기본값이 아니다).
+// 트리거: 조용한 기본값이 아니다). 식별자·환경변수(CTR_CONTENT_FILE_WARN_BYTES)는 "file"을
+// 달고 있지만 D102 계약 6부터 비교 대상은 live 바이트(file-free)다 — 사용자 대면 키라 이름은
+// 그대로 두고 의미만 옮겼다.
 const defaultContentFileWarnBytes = 256 << 20 // 256MiB — D102 계약 6(정리 후 정상상태 실측 171 MB의 약 1.5배)
 
 // contentFileWarnBytes — CTR_CONTENT_FILE_WARN_BYTES 양수만 채택(storeWarnBytes와 동형 규율).
@@ -1897,9 +1899,10 @@ func runDoctor(ctx context.Context, w io.Writer, storeRoot, projectRoot, version
 		fmt.Fprintf(w, "[14] content.db: sources=%d artifacts=%d blob=%dB file=%dB free=%dB\n",
 			sz.Sources, sz.Artifacts, sz.BlobBytes, sz.FileBytes, sz.FreeBytes)
 		// D38 — CAS 전체 blob 총량 경고(shadow 전용 아님 — [14] 측정 실체 그대로). 관측 채널이지
-		// 정책 집행이 아니다(D27): 자동 삭제 없음. SizeStats 실패 경로는 이 분기 밖이라 미평가.
+		// 정책 집행이 아니다(D27): [14] 자신은 아무것도 지우지 않는다. SizeStats 실패 경로는 이
+		// 분기 밖이라 미평가.
 		if warn := storeWarnBytes(os.Getenv); sz.BlobBytes > warn {
-			fmt.Fprintf(w, "[14] warning: blob %dB > 임계 %dB(CTR_STORE_WARN_BYTES) — 수동 구제는 purge 계열 CLI(purge --project <id> --hook-only로 shadow만 선택 삭제 가능). 자동 삭제 없음\n", sz.BlobBytes, warn)
+			fmt.Fprintf(w, "[14] warning: blob %dB > 임계 %dB(CTR_STORE_WARN_BYTES) — 수동 구제는 purge 계열 CLI(purge --project <id> --hook-only로 shadow만 선택 삭제 가능). shadow 귀속분은 기동 시 D67 퍼지가 보존 창 밖의 것을 자동 회수한다(explicit 소스는 자동 삭제 없음)\n", sz.BlobBytes, warn)
 		}
 		// D102 계약 6·8 — content.db 라이브 축(청크 텍스트+FTS) 자문 경고. 판정은 파일 크기가
 		// 아니라 live 바이트다: 자동 경로가 VACUUM을 하지 않으므로 파일은 고수위에 머물고,
@@ -1907,9 +1910,13 @@ func runDoctor(ctx context.Context, w io.Writer, storeRoot, projectRoot, version
 		// free는 병기만 한다 — 병합 안 된 세그먼트는 live page라 freelist는 결함이 있을 때
 		// 오히려 낮게 읽힌다(계약 7). 문면의 "자동 VACUUM 없음"은 옛 "자동 삭제 없음"을 고친
 		// 것이다: 바로 위에서 보고하는 artifacts 수는 D67 퍼지 때문에 사용자 조작 없이 줄어든다.
-		if warn := contentFileWarnBytes(os.Getenv); sz.FileBytes-sz.FreeBytes > warn {
+		// os.Stat(FileBytes)와 PRAGMA freelist_count(FreeBytes)는 서로 다른 스냅샷일 수 있다
+		// (doctor는 라이브 서버가 도는 중에 도는 것이 정상이라 체크포인트 직전 WAL이 큰 순간엔
+		// file-free가 음수로도 나온다) — 음수는 경고를 침묵시키는 방향이라 0으로 클램프한다.
+		live := max(0, sz.FileBytes-sz.FreeBytes)
+		if warn := contentFileWarnBytes(os.Getenv); live > warn {
 			fmt.Fprintf(w, "[14] warning: live %dB > 임계 %dB(CTR_CONTENT_FILE_WARN_BYTES) — 청크 텍스트+FTS 축(자문, live=file-free). free %dB는 이미 회수돼 재사용을 기다리는 몫이라 판정에 넣지 않는다. 파일 축소는 VACUUM(라이브 서버 제약 — 서버 비가동 시 purge --older-than --vacuum), --hook-only는 shadow 귀속 한정(explicit 소스 감축은 전체 purge). 훅 아티팩트 보존 창 %s(CTR_SHADOW_RETENTION). 자동 VACUUM 없음\n",
-				sz.FileBytes-sz.FreeBytes, warn, sz.FreeBytes, store.ShadowRetention(os.Getenv))
+				live, warn, sz.FreeBytes, store.ShadowRetention(os.Getenv))
 		}
 	}
 
