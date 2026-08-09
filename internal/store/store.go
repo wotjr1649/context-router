@@ -1025,6 +1025,48 @@ func (s *Store) LedgerAppend(tool string, stored, returned, ms int64) {
 		time.Now().Unix(), tool, stored, returned, ms)
 }
 
+// LastIndexedAtByHash — D103 계약 2: 이 콘텐츠의 **마지막 포착** 시각(unix 초). 시계도 범위도
+// D67 퍼지와 같은 것을 쓴다 — 퍼지 술어(shadowOwnedFilter의 나이 절, store.go:1099-1102)가
+// 같은 content_hash를 가진 모든 artifact의 모든 소스에 대해 indexed_at을 보므로, 나이도 그렇게
+// 재야 분포가 보존 창 위에 그대로 겹쳐진다. artifact 단위로 재면 형제가 방금 재포착된
+// 아티팩트가 실제보다 늙어 보이고 그 오차는 창을 늘리는 쪽으로만 작용한다. 소스가 없으면 (0, nil).
+// 색인: artifacts는 UNIQUE(content_hash, media_type)의 선두 컬럼이, sources는
+// idx_sources_artifact_indexed(artifact_id, indexed_at)가 각각 덮는다.
+func (s *Store) LastIndexedAtByHash(ctx context.Context, contentHash string) (int64, error) {
+	var ts sql.NullInt64
+	if err := s.reader.QueryRowContext(ctx, `SELECT max(s.indexed_at)
+		FROM sources s JOIN artifacts a ON a.id = s.artifact_id
+		WHERE a.content_hash = ?`, contentHash).Scan(&ts); err != nil {
+		return 0, fmt.Errorf("store LastIndexedAtByHash: %w", err)
+	}
+	if !ts.Valid {
+		return 0, nil
+	}
+	return ts.Int64, nil
+}
+
+// LedgerAppendFetch — D103: ctr_fetch 전용 원장 기록. artifactID<=0이면 artifact_id를 NULL로,
+// artifact_age_s를 **−1**로 남겨 **해소되지 않은 회수**를 기록한다 — 그것이 "창이 짧아서 못
+// 찾았다"의 유일한 직접 증거이고, 성공 기록만 남기면 영원히 나오지 않는다(계약 3).
+// −1인 이유: ALTER가 남긴 레거시 행은 두 열이 다 NULL이라 그 둘을 값으로 갈라야 한다(계약 1).
+// LedgerAppend와 같은 best-effort 계약이다(ledger 없음·오류는 무시). S4: 정수와 도구 이름만
+// 담는다 — 선택자도 경로도 내용도 담지 않는다(계약 6).
+func (s *Store) LedgerAppendFetch(returned, ms, artifactID, ageS int64) {
+	if s.ledger == nil {
+		return
+	}
+	var idCol any    // nil = NULL
+	age := int64(-1) // 미해소 표식
+	if artifactID > 0 {
+		idCol, age = artifactID, ageS
+	}
+	_, _ = s.ledger.Exec(
+		`INSERT INTO ledger(ts,tool,bytes_stored,bytes_returned,duration_ms,artifact_id,artifact_age_s)
+		 VALUES(?,'ctr_fetch',0,?,?,?,?)`,
+		time.Now().Unix(), returned, ms, idCol, age,
+	)
+}
+
 // ToolStat: ledger.db 도구별 집계 1행(설계 §6 stats local 계약). FirstTS/LastTS는
 // LedgerAppend가 기록하는 unix 초 단위(time.Now().Unix())다.
 type ToolStat struct {

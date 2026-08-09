@@ -1451,6 +1451,71 @@ func TestLedgerFetchStats_DirMissing(t *testing.T) {
 	}
 }
 
+// TestLastIndexedAtByHashUsesMaxOverSiblingArtifacts: 나이 시계가 마지막 포착이고 범위가
+// content_hash다. 두 축을 한 번에 잰다 — 같은 바이트를 media_type 둘로 등록하면 artifact 행이
+// 둘 생기는데(store.go:452의 조회 키가 (content_hash, media_type)), 퍼지 술어는 그 둘의 소스를
+// 전부 본다(shadowOwnedFilter). **artifact 단위로 재는 구현은 이 테스트에서 떨어진다** —
+// 형제 쪽이 최근 값을 쥐고 있기 때문이다.
+func TestLastIndexedAtByHashUsesMaxOverSiblingArtifacts(t *testing.T) {
+	st := openAt(t, t.TempDir())
+	regSource(t, st, "aged", "text/plain", "shadow:Bash:first", "hook")
+	regSource(t, st, "aged", "application/json", "shadow:Bash:second", "hook") // 같은 바이트, 다른 media_type
+
+	old, recent := int64(1_000), int64(9_000)
+	if _, err := st.writer.Exec(
+		`UPDATE sources SET indexed_at=? WHERE uri='shadow:Bash:first'`, old,
+	); err != nil {
+		t.Fatalf("첫 소스 시각: %v", err)
+	}
+	if _, err := st.writer.Exec(
+		`UPDATE sources SET indexed_at=? WHERE uri='shadow:Bash:second'`, recent,
+	); err != nil {
+		t.Fatalf("둘째 소스 시각: %v", err)
+	}
+	// 형제 둘 중 **오래된 쪽**의 artifact를 회수했다고 가정해도 나이는 최근 값이어야 한다.
+	got, err := st.LastIndexedAtByHash(t.Context(), hashOf("aged"))
+	if err != nil {
+		t.Fatalf("LastIndexedAtByHash: %v", err)
+	}
+	if got != recent {
+		t.Fatalf("LastIndexedAtByHash=%d, 기대 %d(형제 포함 최댓값)", got, recent)
+	}
+}
+
+// TestLastIndexedAtByHashMissingIsZero: 소스가 없으면 (0, nil)이다 — 호출부가 나이를 0으로 두고
+// 계속한다(회수 자체는 성공했다).
+func TestLastIndexedAtByHashMissingIsZero(t *testing.T) {
+	st := openAt(t, t.TempDir())
+	got, err := st.LastIndexedAtByHash(t.Context(), hashOf("nothing here"))
+	if err != nil || got != 0 {
+		t.Fatalf("got=%d err=%v, 기대 0/nil", got, err)
+	}
+}
+
+// TestLedgerAppendFetchMissMarksMinusOne: 미해소 행은 artifact_id NULL + artifact_age_s **−1**
+// 이다. NULL로 적으면 ALTER가 남긴 레거시 행과 구분되지 않아, 배포 첫날 레거시 49건만으로
+// D104의 "미해소 5건 이상"이 발화한다(설계 v0.20 D103 계약 1).
+func TestLedgerAppendFetchMissMarksMinusOne(t *testing.T) {
+	dir := t.TempDir()
+	st := openAt(t, dir)
+	st.LedgerAppendFetch(0, 1, 42, 3600) // 해소
+	st.LedgerAppendFetch(0, 1, 0, 0)     // 미해소
+	if err := st.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	fs, err := LedgerFetchStats(dir)
+	if err != nil {
+		t.Fatalf("LedgerFetchStats: %v", err)
+	}
+	if fs.Calls != 2 || fs.Resolved != 1 || fs.Missed != 1 {
+		t.Fatalf("calls=%d resolved=%d missed=%d, 기대 2/1/1", fs.Calls, fs.Resolved, fs.Missed)
+	}
+	if fs.AgeMax != 3600 {
+		t.Fatalf("AgeMax=%d, 기대 3600(미해소의 −1이 분포에 섞이면 안 된다)", fs.AgeMax)
+	}
+}
+
 // TestPurgeOlderThan: 구 source 1개(cutoff 이전에 등록) + 신 source 1개(cutoff 이후)를
 // 등록하고 cutoff를 그 경계로 준다(등록 사이에 time.Now()를 캡처 — indexed_at 조작을 위한
 // writer UPDATE 테스트 헬퍼 대신 실제 시각 흐름으로 경계를 만든다, 설계 §7). 구 source만
