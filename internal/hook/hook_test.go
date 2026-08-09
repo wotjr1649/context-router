@@ -1549,6 +1549,68 @@ func TestShadowAppendDrops(t *testing.T) {
 	}
 }
 
+// TestShadowCaptureRecordsLedgerRow: 성공한 포착마다 원장에 분모 행이 하나 남고, 저장되지
+// 않은 호출은 남기지 않는다. 이 분모가 없으면 회수율의 분모를 72시간 스냅샷에서 세게 되고,
+// 그것이 세션 54가 상계 11.6%를 잘못 낸 형태다 — 13일치 분자를 사흘치 분모로 나눴다.
+// 읽는 자리는 store.LedgerStats(contentDir)다. **임계 미달 케이스는 store를 열기 전에
+// 반환하므로 ledger.db 자체가 없고, 그때 LedgerStats는 nil 슬라이스+nil을 낸다** — 그것을
+// "0행"으로 받는다(Fatal이 아니다).
+func TestShadowCaptureRecordsLedgerRow(t *testing.T) {
+	_, _, contentDir, sdir := shadowSetup(t)
+	ad, err := session.OpenAppend(context.Background(), sdir, session.AppendOptions{
+		ExternalSessionID: "cc:3f2504e0-4f89-41d3-9a0c-0305e82c3301",
+		Producer:          "context-router/test",
+	})
+	if err != nil {
+		t.Fatalf("OpenAppend: %v", err)
+	}
+	defer func() { _ = ad.Close() }()
+	getenv := func(string) string { return "" }
+
+	// ① 임계 미달 → 저장도 분모도 없다(store를 열기 전에 반환한다).
+	small, err := json.Marshal(bigStdout(100))
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	shadowCapture(context.Background(), ad,
+		hookInput{HookEventName: "PostToolUse", ToolName: "Bash", ToolResponse: small},
+		sdir, contentDir, "cc:3f2504e0-4f89-41d3-9a0c-0305e82c3301", getenv)
+	if n := hookLedgerRows(t, contentDir); n != 0 {
+		t.Fatalf("임계 미달인데 분모 행=%d", n)
+	}
+
+	// ② 임계 초과 → 저장 1건, 분모 1행.
+	big, err := json.Marshal(bigStdout(20000))
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	shadowCapture(context.Background(), ad,
+		hookInput{HookEventName: "PostToolUse", ToolName: "Bash", ToolResponse: big},
+		sdir, contentDir, "cc:3f2504e0-4f89-41d3-9a0c-0305e82c3301", getenv)
+	if n := contentArtifacts(t, contentDir); n != 1 {
+		t.Fatalf("artifacts=%d want 1", n)
+	}
+	if n := hookLedgerRows(t, contentDir); n != 1 {
+		t.Fatalf("성공한 포착 뒤 분모 행=%d want 1", n)
+	}
+}
+
+// hookLedgerRows — contentDir 원장의 hook:shadow 행 수. ledger.db 미존재는 nil 슬라이스라
+// 자연히 0이 된다(store.LedgerStats 계약).
+func hookLedgerRows(t *testing.T, contentDir string) int64 {
+	t.Helper()
+	rows, err := store.LedgerStats(contentDir)
+	if err != nil {
+		t.Fatalf("LedgerStats: %v", err)
+	}
+	for _, r := range rows {
+		if r.Tool == "hook:shadow" {
+			return r.Calls
+		}
+	}
+	return 0
+}
+
 // ─── T7: large-read guard 4조건 판정 (설계 §4) ────────────────────────────────
 
 // guardSetup — session_start를 발화해 세션을 선재시키고 (storeRoot, cwd, contentDir, sdir)를

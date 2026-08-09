@@ -7,6 +7,7 @@ import (
 	"path"
 	"path/filepath"
 	"strconv"
+	"time"
 
 	"github.com/wotjr1649/context-router/internal/ingest"
 	"github.com/wotjr1649/context-router/internal/session"
@@ -31,6 +32,7 @@ var fileOriginTools = map[string]bool{"Read": true, "NotebookRead": true}
 // (oversize·denylist·store 불가)만 drops 1줄을 남긴다(fail-open §2.3 연장 — 어떤 실패도 훅
 // exit code를 바꾸지 않는다). drops는 세션 dir(dir)에, 아티팩트는 프로젝트 dir(contentDir)에.
 func shadowCapture(ctx context.Context, ad *session.AppendDB, in hookInput, dir, contentDir, external string, getenv func(string) string) {
+	start := time.Now()
 	if getenv("CTR_SHADOW_OFF") == "1" {
 		return
 	}
@@ -86,6 +88,15 @@ func shadowCapture(ctx context.Context, ad *session.AppendDB, in hookInput, dir,
 		appendDrop(dir, "shadow-ingest", external, in.HookEventName, in.ToolName)
 		return
 	}
+
+	// D103 계약 4: 회수율의 **분모**다. 성공한 ingest 뒤에만 쓴다 — 임계 미달·denylist·
+	// 바이너리·스토어 열기 실패로 끝난 호출은 저장되지 않았으므로 회수 대상이 아니다.
+	// 훅은 writable로 스토어를 열므로(위 OpenContext의 readOnly=false) ledger 연결이 이미
+	// 있다 — 지금까지 쓰지 않았을 뿐이다. ctx를 넘기는 이유는 계약 8: ledger.db의
+	// busy_timeout(5000ms)이 훅 총예산(2000ms)보다 커서, 겹친 훅에서 ctx 없이 쓰면 예산 밖에서
+	// 블록된다. best-effort라 실패해도 포착 자체와 훅의 fail-open 성질은 바뀌지 않는다.
+	// 이름이 ctr_로 시작하지 않는 것도 계약이다 — D104의 채택 문턱은 ctr_* 행만 센다.
+	st.LedgerAppendContext(ctx, "hook:shadow", int64(size), 0, time.Since(start).Milliseconds())
 
 	ref := "artifact://" + external + "/sha256-" + rep.Hash // 문자열 조립만(url.Parse 금지, §5)
 	shadowAppend(ctx, ad, dir, external, in.HookEventName, in.ToolName, session.Event{

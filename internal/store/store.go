@@ -1017,11 +1017,22 @@ func (s *Store) GCOrphanBlobs(ctx context.Context) (removed int64, err error) {
 }
 
 // LedgerAppend: best-effort 사용량 기록 — ledger 없음/오류는 무시(§3.5).
+// 기존 호출부 아홉 곳(전부 internal/mcp)의 시그니처를 유지하려고 남긴 얇은 위임이다.
 func (s *Store) LedgerAppend(tool string, stored, returned, ms int64) {
+	s.LedgerAppendContext(context.Background(), tool, stored, returned, ms)
+}
+
+// LedgerAppendContext — D103 계약 8: ctx를 ExecContext로 넘기는 원장 기록. **훅이 부르는
+// 경로가 이것이다**: ledger.db의 busy_timeout은 5000 ms인데 훅의 총예산은 2000 ms라
+// (internal/hook/hook.go의 defaultDeadlineMS·deadline) ctx 없이 쓰면 훅 프로세스가 겹칠 때 그
+// INSERT가 예산 밖에서 블록된다. 예산 초과는 오류로 돌아오고 best-effort라 삼켜진다 — 훅의
+// fail-open이 유지된다.
+func (s *Store) LedgerAppendContext(ctx context.Context, tool string, stored, returned, ms int64) {
 	if s.ledger == nil {
 		return
 	}
-	_, _ = s.ledger.Exec(`INSERT INTO ledger(ts,tool,bytes_stored,bytes_returned,duration_ms) VALUES(?,?,?,?,?)`,
+	_, _ = s.ledger.ExecContext(ctx,
+		`INSERT INTO ledger(ts,tool,bytes_stored,bytes_returned,duration_ms) VALUES(?,?,?,?,?)`,
 		time.Now().Unix(), tool, stored, returned, ms)
 }
 

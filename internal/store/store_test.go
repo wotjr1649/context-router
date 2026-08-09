@@ -1516,6 +1516,66 @@ func TestLedgerAppendFetchMissMarksMinusOne(t *testing.T) {
 	}
 }
 
+// TestLedgerAppendContextUnderContention: 겹친 쓰기에서 원장 INSERT가 훅 예산 안에 든다.
+// **단일 무경합 실행은 이 경로를 구조적으로 못 본다** — busy_timeout(5000ms)은 다른 연결이
+// 락을 쥐고 있을 때만 개입하고, 그 값이 훅의 총예산 2000ms보다 크다는 것이 계약 8의 위험이다.
+// 스토어를 넷 열어(각자 자기 ledger 연결) 동시에 쓴다: 같은 프로세스지만 연결이 별개라 파일
+// 락 계층은 훅 프로세스 여럿과 같다.
+func TestLedgerAppendContextUnderContention(t *testing.T) {
+	dir := t.TempDir()
+	const writers, perWriter = 4, 25
+	stores := make([]*Store, writers)
+	for i := range stores {
+		stores[i] = openAt(t, dir)
+	}
+
+	var worst atomic.Int64
+	var wg sync.WaitGroup
+	for _, st := range stores {
+		wg.Add(1)
+		go func(st *Store) {
+			defer wg.Done()
+			for range perWriter {
+				ctx, cancel := context.WithTimeout(t.Context(), 2000*time.Millisecond) // 훅 총예산
+				begin := time.Now()
+				st.LedgerAppendContext(ctx, "hook:shadow", 16384, 0, 1)
+				cancel()
+				// CompareAndSwap 재시도 루프 — 네 고루틴이 동시에 worst.Load()를 읽고 비교한 뒤
+				// Store하면 두 고루틴이 같은 낡은 값을 읽어 더 큰 쪽이 작은 쪽에 덮여 쓰이는
+				// lost-update가 가능하다(원자적 개별 연산이라 -race는 못 잡는다). CAS 실패는
+				// 다른 고루틴이 갱신했다는 뜻이므로 최신값으로 재비교한다.
+				if ms := time.Since(begin).Milliseconds(); ms > worst.Load() {
+					for {
+						old := worst.Load()
+						if ms <= old || worst.CompareAndSwap(old, ms) {
+							break
+						}
+					}
+				}
+			}
+		}(st)
+	}
+	wg.Wait()
+	t.Logf("경합 INSERT 최악 소요 = %dms (훅 총예산 2000ms)", worst.Load())
+
+	rows, err := LedgerStats(dir)
+	if err != nil {
+		t.Fatalf("LedgerStats: %v", err)
+	}
+	var got int64
+	for _, r := range rows {
+		if r.Tool == "hook:shadow" {
+			got = r.Calls
+		}
+	}
+	if want := int64(writers * perWriter); got != want {
+		t.Fatalf("hook:shadow 행=%d, 기대 %d — 예산 안에서 못 쓴 INSERT가 있다", got, want)
+	}
+	if worst.Load() >= 2000 {
+		t.Fatalf("경합 INSERT가 훅 예산을 넘겼다: %dms — 설계 §4-4의 분모 재배치 판단으로 간다", worst.Load())
+	}
+}
+
 // TestPurgeOlderThan: 구 source 1개(cutoff 이전에 등록) + 신 source 1개(cutoff 이후)를
 // 등록하고 cutoff를 그 경계로 준다(등록 사이에 time.Now()를 캡처 — indexed_at 조작을 위한
 // writer UPDATE 테스트 헬퍼 대신 실제 시각 흐름으로 경계를 만든다, 설계 §7). 구 source만
