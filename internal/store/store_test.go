@@ -2546,6 +2546,98 @@ func TestCheckpointTruncateBusyWithReader(t *testing.T) {
 	_, _ = conn.ExecContext(context.Background(), "ROLLBACK")
 }
 
+// TestJournalSizeLimitShrinksWALOnPassiveCheckpoint — D102 계약 5·6·9의 기제 자체를 검증한다:
+// journal_size_limit이 이 드라이버(modernc.org/sqlite)에서 WAL을 그 한도 이하로 줄이게
+// 만드는가. 32 MiB를 실제로 쓰지 않으려고 작은 한도(65536)를 건 생 sql.DB로 잰다 —
+// store.Open을 거치지 않는다(배선은 TestOpen_JournalSizeLimit이 잰다).
+//
+// 절단은 체크포인트 그 자체가 아니라 **그 뒤 첫 커밋**에서 일어난다 — 드라이버 소스
+// (modernc.org/sqlite v1.54.0, lib/의 _walFrames)를 직접 대조해 확인했다: 체크포인트가 WAL을
+// 완전히 비우면 Wal.truncateOnCommit이 세워지고, 그 빈 WAL에 첫 프레임을 쓰는 **다음 커밋**의
+// 프레임 쓰기 말미에서만 journal_size_limit을 넘는 만큼 파일을 자른다(Wal.mxWalSize 검사 —
+// walLimitSize). 체크포인트만 걸고 후속 커밋 없이 파일 크기를 재면 이 테스트는 늘 실패한다 —
+// 브리프 "정직하게 적을 것"의 "다음 커밋의 체크포인트가 완료될 때 내려간다"가 가리키는 바로
+// 그 지점이다. 그래서 체크포인트 뒤 사소한 쓰기를 한 번 더 커밋한다.
+//
+// TRUNCATE가 아니라 PASSIVE인 것이 요점이다 — TRUNCATE는 한도와 무관하게 WAL을 0으로 만들어
+// journal_size_limit을 아예 재지 않는다.
+func TestJournalSizeLimitShrinksWALOnPassiveCheckpoint(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.ToSlash(filepath.Join(dir, "content.db"))
+	const limit = 65536
+	db, err := sql.Open("sqlite", "file:"+dbPath+
+		"?_pragma=journal_mode(WAL)&_pragma=wal_autocheckpoint(0)&_pragma=journal_size_limit("+strconv.Itoa(limit)+")")
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+	db.SetMaxOpenConns(1) // 체크포인트를 CREATE/INSERT와 같은 커넥션에서 실행(결정론 — 별개 커넥션의 스냅샷 잔존 배제)
+
+	if _, err := db.Exec("CREATE TABLE t(v TEXT)"); err != nil {
+		t.Fatalf("create table: %v", err)
+	}
+	// 한도(65536B)를 확실히 넘도록 쓴다 — 리터럴 붙여넣기 대신 strings.Repeat.
+	if _, err := db.Exec("INSERT INTO t(v) VALUES(?)", strings.Repeat("x", 300_000)); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+
+	walPath := filepath.Join(dir, "content.db-wal")
+	fi, err := os.Stat(walPath)
+	if err != nil {
+		t.Fatalf("wal stat(사전 가드): %v", err)
+	}
+	// 사전 가드: 픽스처가 한도를 실제로 넘겼는지 확인한다 — 이 가드가 없으면 "원래 작았다"에도
+	// 통과해 이 테스트가 공허 통과한다.
+	if fi.Size() <= limit {
+		t.Fatalf("wal(사전 가드)=%dB want >%dB — 픽스처가 한도를 못 넘김", fi.Size(), limit)
+	}
+
+	var busy, walFrames, checkpointed int
+	if err := db.QueryRow("PRAGMA wal_checkpoint(PASSIVE)").Scan(&busy, &walFrames, &checkpointed); err != nil {
+		t.Fatalf("wal_checkpoint(PASSIVE): %v", err)
+	}
+	// 절단 트리거 — 위 주석 참조. 이 커밋이 없으면 파일은 체크포인트 전 크기 그대로 남는다.
+	if _, err := db.Exec("INSERT INTO t(v) VALUES('')"); err != nil {
+		t.Fatalf("post-checkpoint insert: %v", err)
+	}
+
+	fi, err = os.Stat(walPath)
+	if err != nil {
+		t.Fatalf("wal stat(사후): %v", err)
+	}
+	if fi.Size() > limit {
+		t.Fatalf("wal(사후)=%dB want <=%dB (checkpoint busy=%d walFrames=%d checkpointed=%d) — journal_size_limit이 WAL을 못 줄임",
+			fi.Size(), limit, busy, walFrames, checkpointed)
+	}
+}
+
+// TestOpen_JournalSizeLimit — D102 계약 5·6·9 배선: pragmas 상수가 writable/read-only 두 DSN의
+// 공통 접두라(store.go:145-152) journalSizeLimit 상수 한 자리 변경이 둘 다 덮는다.
+func TestOpen_JournalSizeLimit(t *testing.T) {
+	dir := t.TempDir()
+	st := openAt(t, dir)
+	var got string
+	if err := st.Reader().QueryRow("PRAGMA journal_size_limit").Scan(&got); err != nil {
+		t.Fatalf("PRAGMA journal_size_limit: %v", err)
+	}
+	if got != journalSizeLimit {
+		t.Fatalf("journal_size_limit=%q want %q", got, journalSizeLimit)
+	}
+
+	ro, err := Open(dir, true)
+	if err != nil {
+		t.Fatalf("open read-only: %v", err)
+	}
+	defer func() { _ = ro.Close() }()
+	var gotRO string
+	if err := ro.Reader().QueryRow("PRAGMA journal_size_limit").Scan(&gotRO); err != nil {
+		t.Fatalf("read-only PRAGMA journal_size_limit: %v", err)
+	}
+	if gotRO != journalSizeLimit {
+		t.Fatalf("read-only journal_size_limit=%q want %q", gotRO, journalSizeLimit)
+	}
+}
+
 // TestErrPredicates — 공개 술어의 비-sqlite 오류 음성 판정(양성은 실 BUSY 경로가 간접 커버).
 func TestErrPredicates(t *testing.T) {
 	if IsBusyErr(nil) || IsBusyErr(errors.New("x")) {

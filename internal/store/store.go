@@ -34,7 +34,27 @@ type Store struct {
 	ledger         *sql.DB
 }
 
-const pragmas = "?_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)&_pragma=busy_timeout(5000)&_pragma=foreign_keys(ON)"
+// journalSizeLimit — D102 계약 5·6·9: 병합(`optimize`)이 훑고 지나가며 남기는 WAL 고수위를
+// 되돌리는 바닥값. DSN에 이 pragma가 없으면 번들 SQLite 기본 −1이 걸려 체크포인트가 WAL을
+// *재사용*할 뿐 줄이지 않고(계약 5), 그 몫이 서버 세션 내내 `doctor [14]`의 file 축(계약 6,
+// 본체+`-wal`+`-shm`)에 잡힌다. wal_autocheckpoint가 1000페이지(4 MiB)라 정상 운용의 WAL
+// 작업 집합은 그 언저리다 — 32 MiB는 그 위로 넉넉해 평시에는 절단이 아예 일어나지 않고
+// (반복 truncate/extend로 쓰기 경로를 무겁게 만들지 않는다), 병합이 만드는 96 MiB
+// 스파이크보다는 확실히 아래라 그 몫이 회수된다.
+//
+// 병합 뒤 CheckpointTruncate를 직접 부르는 대신 DSN 파라미터를 쓴다 — 전자는 열린 reader와
+// 공존 시 busy_timeout 소진까지 최대 5초 쓰기 락을 늘리지만(TestCheckpointTruncateBusyWithReader),
+// 후자는 추가 락 보유가 0이다(계약 9가 최소화하려는 바로 그 구간).
+//
+// 바닥이지 0이 아니다: 절단은 체크포인트 자체가 아니라 그 뒤 빈 WAL에 첫 프레임을 쓰는
+// 다음 커밋에서 일어난다(modernc.org/sqlite 소스 대조, TestJournalSizeLimitShrinksWALOnPassiveCheckpoint
+// 참고) — 병합 직후 리더가 물려 있으면 체크포인트가 부분에 그쳐 절단이 미뤄지고, 다음 커밋의
+// 체크포인트가 완료될 때 96 MiB → 32 MiB로 내려간다(자기 치유이되 즉시는 아니다). 문자열
+// 상수인 이유는 pragmas DSN에 그대로 연결하고, 테스트도 이 상수 하나만 읽어 값을 두 곳에
+// 적지 않기 위해서다.
+const journalSizeLimit = "33554432" // 32 MiB
+
+const pragmas = "?_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)&_pragma=busy_timeout(5000)&_pragma=foreign_keys(ON)&_pragma=journal_size_limit(" + journalSizeLimit + ")"
 
 const lockFileName = "content.db.rebuild.lock"
 
