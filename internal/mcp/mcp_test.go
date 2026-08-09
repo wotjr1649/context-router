@@ -2864,7 +2864,11 @@ func TestFetchRecordsMissOnlyOnAbsentArtifact(t *testing.T) {
 	if fs := fetchStats(t, storeDir); fs.Missed != 1 {
 		t.Fatalf("잘못된 chunk id가 미해소로 셌다: missed=%d, 기대 1", fs.Missed)
 	}
-	// ③ 선택자 없음(ErrInvalidSelector) → 역시 늘지 않는다
+	// ③ 선택자 없음 → ReadRange까지 가지 않는다. selectorFromInput의 "정확히 1개" 게이트
+	// (mcp.go:484-486)가 먼저 거른다. ReadRange 자신의 ErrInvalidSelector(store.go:712-716,
+	// 미인식 sel.Kind)는 selectorFromInput이 "chunk"/"line"/"byte" 외의 Kind를 절대 만들지
+	// 않으므로 ctr_fetch 경로로는 구조적으로 도달 불가능하다 — 그래도 미해소가 늘면 안 되는
+	// 것은 다른 잘못된 입력과 같다.
 	callFetch(t, cs, FetchInput{ArtifactID: artID})
 	if fs := fetchStats(t, storeDir); fs.Missed != 1 {
 		t.Fatalf("잘못된 선택자가 미해소로 셌다: missed=%d, 기대 1", fs.Missed)
@@ -2899,6 +2903,45 @@ func TestFetchRecordsAgeOnResolve(t *testing.T) {
 	}
 	if fs.AgeMax < 7000 || fs.AgeMax > 7400 { // 2시간 = 7200초, 실행 시각 오차 허용
 		t.Fatalf("AgeMax=%d, 기대 약 7200", fs.AgeMax)
+	}
+}
+
+// TestFetchRecordsZeroAgeWhenSourceAbsent: LastIndexedAtByHash가 (0, nil)을 내는 경로 —
+// source 행이 없으면(artifact·chunks는 남아 ReadRange는 여전히 해소된다) at>0 조건이
+// 거짓이라 ageS는 초기값 0에 머문다. 나이 조회 실패·부재가 회수 자체를 실패시키지 않는다는
+// 계약(mcp.go의 fetch 핸들러 주석)의 유일한 실행 증거 — 해소·미해소 두 테스트 모두 이 분기를
+// 지나지 않는다. AgeMax는 원장 전체의 max이므로 다른 나이 값과 섞이면 못 잰다 — 전용 서버.
+func TestFetchRecordsZeroAgeWhenSourceAbsent(t *testing.T) {
+	cs, st, _, storeDir := newRecordEventTestServer(t)
+	ctx := context.Background()
+	body := "no source body"
+	artID, err := st.Register(ctx, store.Registration{
+		StoredBytes: []byte(body), MediaType: "text/plain",
+		Source: store.SourceMeta{URI: "shadow:Bash:noage", Kind: "hook", SrcHash: "sh-noage"},
+		Chunks: []store.Chunk{{Ordinal: 0, ByteEnd: int64(len(body)), Text: body}},
+	})
+	if err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	if _, err := st.Reader().Exec(`DELETE FROM sources WHERE uri='shadow:Bash:noage'`); err != nil {
+		t.Fatalf("소스 삭제: %v", err)
+	}
+	// 사전 가드: DELETE가 실패해 조용히 age-양성 테스트의 중복이 되는 것을 막는다.
+	var remaining int
+	if err := st.Reader().QueryRow(`SELECT count(*) FROM sources WHERE artifact_id=?`, artID).Scan(&remaining); err != nil {
+		t.Fatalf("소스 잔존 확인: %v", err)
+	}
+	if remaining != 0 {
+		t.Fatalf("소스 삭제 실패: 잔존 %d행", remaining)
+	}
+
+	callFetch(t, cs, FetchInput{ArtifactID: artID, ByteStart: ptrTo(int64(0)), ByteEnd: ptrTo(int64(5))})
+	fs := fetchStats(t, storeDir)
+	if fs.Resolved != 1 || fs.Missed != 0 {
+		t.Fatalf("resolved=%d missed=%d, 기대 1/0", fs.Resolved, fs.Missed)
+	}
+	if fs.AgeMax != 0 {
+		t.Fatalf("AgeMax=%d, 기대 0 (source 부재 폴백)", fs.AgeMax)
 	}
 }
 
