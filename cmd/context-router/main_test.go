@@ -2456,6 +2456,68 @@ func TestFTSMergeLoopMergesAndStamps(t *testing.T) {
 	}
 }
 
+// TestFTSMergeLoopChecksAgainWithinInterval — 릴리스 패스 B3: **"interval마다 최소 한 번"이
+// 실제로 성립하는가.** 옛 루프는 틱마다 무조건 t.Reset(interval)을 걸어, 아직 만기가 아니어서
+// 안 돈 틱 뒤에 다음 확인이 만기를 통째로 지나쳤다 — "하루 한 번"이 실효 최대 약 48시간이 된다.
+//
+// 픽스처: interval의 3/4만큼 나이 먹은 스탬프를 미리 두고 루프를 곧바로 띄운다. 첫 틱은
+// **만기가 아니고**(사전 가드가 그것을 재고 확인한다), 옳은 루프는 남은 1/4 뒤에 다시 확인해
+// 병합한다. 옛 루프는 첫 틱 뒤 interval을 통째로 기다리므로 그 창을 넘긴다.
+func TestFTSMergeLoopChecksAgainWithinInterval(t *testing.T) {
+	dir := t.TempDir()
+	st, err := store.Open(dir, false)
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	defer func() { _ = st.Close() }()
+
+	const interval = 2 * time.Second
+	stamp := filepath.Join(dir, "fts-merge.stamp") // store.mergeStampName은 비공개 — 위 테스트와 같은 리터럴
+	f, err := os.OpenFile(stamp, os.O_CREATE|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatalf("스탬프 생성: %v", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("스탬프 Close: %v", err)
+	}
+	seeded := time.Now().Add(-interval * 3 / 4) // 만기까지 약 500 ms 남은 상태
+	if err := os.Chtimes(stamp, seeded, seeded); err != nil {
+		t.Fatalf("Chtimes: %v", err)
+	}
+	// 사전 가드 — 첫 틱이 정말 "아직 만기 아님"인가. 이것이 서지 않으면(느린 머신에서 시드가
+	// 이미 만기가 됐다면) 아래 판정은 옛 루프에서도 통과한다(공허 통과).
+	if d := st.FTSMergeDueIn(interval, time.Now()); d <= 0 {
+		t.Fatalf("시드가 이미 만기다(잔여=%v) — 이 테스트는 B3을 가르지 못한다", d)
+	}
+
+	start := time.Now()
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { defer close(done); runFTSMergeLoop(ctx, st, time.Millisecond, interval) }()
+	defer func() { cancel(); <-done }() // 실패 경로에서도 join한다(최종리뷰 F10 선례 — Windows TempDir 정리)
+
+	// 스탬프 갱신 = 병합이 돌았다는 관측 가능한 증거(MergeFTSIfDue가 성공했을 때만 찍는다).
+	deadline := start.Add(interval * 3 / 4) // 1.5s — 옳은 루프는 약 0.5s, 옛 루프는 약 2.0s
+	var merged time.Time
+	for merged.IsZero() {
+		if fi, err := os.Stat(stamp); err == nil && fi.ModTime().After(seeded.Add(time.Second)) {
+			merged = time.Now()
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("만기(약 %v 뒤)가 지났는데 %v 안에 병합하지 않았다 — 다음 확인이 만기를 지나쳤다",
+				interval/4, time.Since(start))
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	// 하한 — 첫 틱(1 ms)에 이미 돌았다면 "만기 아닌 틱" 분기를 지나지 않은 것이라 공허 통과다.
+	if elapsed := merged.Sub(start); elapsed < interval/8 {
+		t.Fatalf("첫 틱에서 바로 병합했다(%v) — 만기 전 틱을 거치지 않아 이 테스트가 공허하다", elapsed)
+	} else {
+		t.Logf("병합까지 %v (만기 약 %v, 옛 루프 기대 약 %v)", elapsed, interval/4, interval)
+	}
+}
+
 // ftsTrigramBytes — fts_trigram_data의 block 바이트 합(세그먼트 실점유).
 func ftsTrigramBytes(t *testing.T, st *store.Store) int64 {
 	t.Helper()

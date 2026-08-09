@@ -831,26 +831,55 @@ const mergeStampName = "fts-merge.stamp"
 // 그 저장소는 영구히 병합하지 않는다. 반대로 스탬프 **쓰기** 실패는 무시한다: 다음 기회에
 // 한 번 더 도는 것이 전부다.
 //
-// 프로세스 둘이 동시에 기동하면 둘 다 스탬프를 낡은 것으로 보고 병합할 수 있다. 그래도
-// 무해하다 — 쓰기 락이 둘을 직렬화하고, 뒤엣것은 이미 한 세그먼트가 된 인덱스에 optimize를
-// 걸어 일 없이 반환한다(번들 SQLite 3.53.3 소스 대조, D102 계약 2·3).
+// 프로세스 둘이 동시에 기동하면 둘 다 스탬프를 낡은 것으로 보고 병합할 수 있다. 쓰기 락이
+// 둘을 직렬화하고 뒤엣것은 이미 한 세그먼트가 된 인덱스에 optimize를 걸어 일 없이 반환한다
+// (번들 SQLite 3.53.3 소스 대조, D102 계약 2·3). **다만 그 직렬화는 유한하다**(릴리스 패스 M4):
+// DSN의 busy_timeout이 5000 ms라, 앞엣것의 병합이 그보다 오래 걸리면 뒤엣것은 BUSY로 실패한다.
+// 무해한 것은 그 실패의 결과다 — 스탬프가 안 찍혀 다음 주기가 그대로 재시도하고, BUSY는
+// IsBusyErr로 진짜 결함과 갈라져 로그·안내 문면이 달라진다.
 func (s *Store) MergeFTSIfDue(ctx context.Context, interval time.Duration, now time.Time) (bool, error) {
-	stamp := filepath.Join(s.dir, mergeStampName)
-	if fi, err := os.Stat(stamp); err == nil {
-		if elapsed := now.Sub(fi.ModTime()); elapsed >= 0 && elapsed < interval {
-			return false, nil
-		}
+	if s.FTSMergeDueIn(interval, now) > 0 {
+		return false, nil
 	}
 	if err := s.MergeFTS(ctx); err != nil {
 		return false, err
 	}
 	// Chtimes는 생성 성공 분기 안에 둔다(최종리뷰 F12) — 밖에 두면 파일이 없는 상태에서도
 	// 부르게 되고, 그 호출은 반드시 실패하므로 하는 일이 없다.
-	if f, err := os.OpenFile(stamp, os.O_CREATE|os.O_WRONLY, 0o600); err == nil {
+	// 동작은 best-effort 그대로지만 **침묵하지는 않는다**(릴리스 패스 M1): 스탬프를 못 남기면
+	// 이 게이트는 조용히 "기동마다 병합"으로 퇴화하는데, 그 퇴화가 로그에 안 남으면 관측할
+	// 길이 자체가 없다. 경로는 sanitizeIOErr로 떼고 낸다(§12).
+	stamp := filepath.Join(s.dir, mergeStampName)
+	if f, err := os.OpenFile(stamp, os.O_CREATE|os.O_WRONLY, 0o600); err != nil {
+		slog.Warn("store: FTS 병합 스탬프 생성 실패 — 주기 게이트가 기동마다 병합으로 퇴화한다",
+			"error", sanitizeIOErr("merge stamp create", err))
+	} else {
 		_ = f.Close()
-		_ = os.Chtimes(stamp, now, now)
+		if err := os.Chtimes(stamp, now, now); err != nil {
+			slog.Warn("store: FTS 병합 스탬프 시각 기록 실패 — 주기 판정이 파일 mtime과 어긋난다",
+				"error", sanitizeIOErr("merge stamp chtimes", err))
+		}
 	}
 	return true, nil
+}
+
+// FTSMergeDueIn — 다음 병합 만기까지 남은 시간. 이미 만기이거나 판정할 수 없으면 0이다
+// (스탬프 부재·읽기 실패, 그리고 now보다 미래인 mtime — 위 주석의 "돌 때가 됐다" 둘과 같은
+// 산술을 MergeFTSIfDue와 공유한다).
+//
+// 자동 루프가 **다음 확인 시각**을 이 값으로 잡는다(릴리스 패스 B3). interval로 무조건 리셋하면
+// 아직 만기가 아니어서 안 돈 틱 뒤에 다음 확인이 만기를 통째로 지나쳐, 계약 2의 "하루 한 번"이
+// 실효 최대 약 48시간이 된다 — 만기가 아닌 것은 병합이지 **확인**이 아니다.
+func (s *Store) FTSMergeDueIn(interval time.Duration, now time.Time) time.Duration {
+	fi, err := os.Stat(filepath.Join(s.dir, mergeStampName))
+	if err != nil {
+		return 0
+	}
+	elapsed := now.Sub(fi.ModTime())
+	if elapsed < 0 || elapsed >= interval {
+		return 0
+	}
+	return interval - elapsed
 }
 
 // hashesFromQuery: query가 반환하는 문자열 컬럼 1개를 집합으로 모은다(GCOrphanBlobs 전용
@@ -1023,8 +1052,10 @@ func LedgerStats(dir string) ([]ToolStat, error) {
 type SizeStat struct {
 	Sources, Artifacts int64
 	BlobBytes          int64
-	FileBytes          int64            // content.db 파일 실크기(os.Stat) — D40, [14] 병기
+	FileBytes          int64            // content.db 본체 파일 실크기(os.Stat) — D40. **live 산출에 쓰지 않는다**(계약 6 개정)
 	FreeBytes          int64            // free page × page_size — 회수 가능분(D102 계약 7, 표시 전용)
+	LiveBytes          int64            // (page_count-freelist_count) × page_size — D102 계약 6의 live 축 판정값
+	PageStatsOK        bool             // 위 두 값이 실제 측정인가 — false면 0은 "없음"이 아니라 "못 쟀다"(릴리스 패스 M3)
 	ShadowOwnedBytes   int64            // 귀속 hash들의 물리 CAS 파일 바이트 합 (= ShadowOwned 값 합, 불변)
 	ShadowOwnedHashes  int              // 귀속 hash 수 (= len(ShadowOwned), 불변)
 	ShadowOwned        map[string]int64 // 귀속 content_hash → 물리 CAS 파일 바이트 — Task 3b/5a/5b 공용 원천
@@ -1072,16 +1103,28 @@ func SizeStats(dir string) (*SizeStat, error) {
 
 	st := SizeStat{FileBytes: fi.Size(), ShadowOwned: map[string]int64{}}
 
-	// D102 계약 7: 회수 가능분을 낸다. free page는 삭제가 만들고 이후 기록이 재사용하므로,
-	// 이 값이 크다는 것은 "파일이 크다"가 아니라 "지운 만큼이 아직 파일 안에 있다"는 뜻이다.
-	// 판정(계약 6)은 이 값이 아니라 FileBytes-FreeBytes로 한다 — 병합되지 않은 세그먼트는
-	// free page가 아니라 live page라 freelist는 결함이 있을 때 오히려 낮게 읽힌다.
-	// 두 pragma 모두 best-effort — 실패하면 0으로 두고 진단 전체를 실패시키지 않는다.
-	var pageSize, freeCount int64
-	if err := db.QueryRow("PRAGMA page_size").Scan(&pageSize); err == nil {
-		if err := db.QueryRow("PRAGMA freelist_count").Scan(&freeCount); err == nil {
-			st.FreeBytes = pageSize * freeCount
-		}
+	// D102 계약 6·7: live 축(판정값)과 회수 가능분(표시값)을 **한 스냅샷 안에서** 낸다.
+	// free page는 삭제가 만들고 이후 기록이 재사용하므로, free가 크다는 것은 "파일이 크다"가
+	// 아니라 "지운 만큼이 아직 파일 안에 있다"는 뜻이다. live는 그 반대편 — 병합되지 않은
+	// 세그먼트는 free page가 아니라 live page라 freelist는 결함이 있을 때 오히려 낮게 읽힌다.
+	//
+	// **FileBytes를 빼서 구하지 않는다**(릴리스 패스 B1). 옛 산출 `FileBytes-FreeBytes`는 서로
+	// 다른 두 스냅샷을 뺐다: FileBytes는 본체 파일의 os.Stat이고 freelist_count는 WAL 프레임까지
+	// 반영한 커밋 스냅샷이다. 자동 병합 경로는 체크포인트를 하지 않으므로(계약 5) 병합 직후에는
+	// free가 본체 파일 크기를 넘고, 그러면 live가 음수 → 클램프해 0이 된다 — **스토어가 가장
+	// 클 때 경고가 죽는다**(재현: file=4096 wal≈90 MB free≈89.5 MB, live(raw)<0).
+	//
+	// 세 pragma를 **한 문장**으로 읽는 이유도 같다: 따로 내면 각각이 제 암시 트랜잭션을 열어,
+	// 라이브 서버의 커밋이 사이에 끼면 page_count와 freelist_count가 다시 어긋난다.
+	// 실패는 삼키지 않고 PageStatsOK=false로 구분한다(릴리스 패스 M3) — 0 하나로는 "free page
+	// 없음"과 "못 쟀다"를 호출자가 가를 수 없다. 진단 전체를 실패시키지는 않는다(fail-soft).
+	var pageSize, pageCount, freeCount int64
+	if err := db.QueryRow(
+		"SELECT * FROM pragma_page_size(), pragma_page_count(), pragma_freelist_count()",
+	).Scan(&pageSize, &pageCount, &freeCount); err == nil {
+		st.FreeBytes = pageSize * freeCount
+		st.LiveBytes = pageSize * (pageCount - freeCount)
+		st.PageStatsOK = true
 	}
 
 	if err := db.QueryRow("SELECT count(*) FROM sources").Scan(&st.Sources); err != nil {

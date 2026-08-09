@@ -1881,6 +1881,88 @@ func TestSizeStatsReportsFreeBytes(t *testing.T) {
 	if sz.FreeBytes > sz.FileBytes {
 		t.Fatalf("FreeBytes(%d)가 FileBytes(%d)보다 크다", sz.FreeBytes, sz.FileBytes)
 	}
+	if !sz.PageStatsOK {
+		t.Fatal("PageStatsOK=false — free/live가 측정값이 아니다")
+	}
+	if sz.LiveBytes <= 0 {
+		t.Fatalf("LiveBytes=%d — 살아 있는 페이지가 0으로 읽힌다", sz.LiveBytes)
+	}
+}
+
+// TestSizeStatsLiveBytesSurvivesLargeWAL — 릴리스 패스 B1. live 축이 **큰 WAL이 있는 상태에서도**
+// 옳게 읽히는지 잰다. 옛 산출 `FileBytes-FreeBytes`는 서로 다른 두 스냅샷을 뺐다: FileBytes는
+// 본체 파일의 os.Stat이고 freelist_count는 WAL 프레임까지 반영한 커밋 스냅샷이라, 체크포인트가
+// 안 일어난 구간에서는 free가 본체 크기를 넘어 live가 음수 → 클램프해 0이 된다. **스토어가
+// 가장 클 때 0으로 읽히는 것**이 이 결함의 본질이고, 그 상태를 못 만드는 테스트는 이 수정을
+// 잠그지 못한다(재현 관측: file=4096 wal≈90 MB free≈89.5 MB).
+//
+// 상태를 만드는 방법은 `wal_autocheckpoint=0`이다. 라이브 서버에서 같은 상태가 나오는 기제는
+// 다르지만(자동 병합 경로가 체크포인트를 하지 않고 — 계약 5 — 리더가 붙어 있으면 passive
+// 체크포인트가 그냥 포기한다) **관측되는 파일/스냅샷 관계는 같다.**
+func TestSizeStatsLiveBytesSurvivesLargeWAL(t *testing.T) {
+	dir := t.TempDir()
+	st := openAt(t, dir)
+	// writer는 SetMaxOpenConns(1)이라 이 pragma가 그 한 커넥션에 그대로 붙는다.
+	if _, err := st.writer.Exec("PRAGMA wal_autocheckpoint=0"); err != nil {
+		t.Fatalf("wal_autocheckpoint=0: %v", err)
+	}
+	body := strings.Repeat("large wal seed ", 8000) // 120 KB/건 — TestSizeStatsReportsFreeBytes와 같은 규모
+	for i := range 10 {
+		regChunked(t, st, body+strconv.Itoa(i), "shadow:Bash:wal"+strconv.Itoa(i))
+	}
+	if _, err := st.writer.Exec(`DELETE FROM chunks`); err != nil {
+		t.Fatalf("DELETE FROM chunks: %v", err)
+	}
+	if err := st.MergeFTS(t.Context()); err != nil {
+		t.Fatalf("MergeFTS: %v", err)
+	}
+	// **닫지 않는다** — Close가 wal_checkpoint(TRUNCATE)로 이 상태를 없앤다(store.go Close).
+	sz, err := SizeStats(dir)
+	if err != nil || sz == nil {
+		t.Fatalf("SizeStats: sz=%v err=%v", sz, err)
+	}
+	if !sz.PageStatsOK {
+		t.Fatal("PageStatsOK=false — pragma를 못 읽어 아래 판정이 공허해진다")
+	}
+
+	// 사전 가드 — 픽스처가 의도한 상태를 **실제로** 만들었는가. 이 셋이 서지 않으면 아래 단정은
+	// 옛 산출에서도 통과하므로(공허 통과) 여기서 멈춘다.
+	walB := fileSizeOrZero(t, filepath.Join(dir, "content.db-wal"))
+	t.Logf("file=%d wal=%d free=%d live=%d old(file-free)=%d",
+		sz.FileBytes, walB, sz.FreeBytes, sz.LiveBytes, sz.FileBytes-sz.FreeBytes)
+	if walB <= sz.FileBytes {
+		t.Fatalf("WAL이 본체보다 크지 않다 — 큰 WAL 상태가 아니다(wal=%d file=%d)", walB, sz.FileBytes)
+	}
+	if sz.FreeBytes <= sz.FileBytes {
+		t.Fatalf("free가 본체 파일을 넘지 않는다 — 옛 산출이 음수가 되는 조건이 아니다(free=%d file=%d)",
+			sz.FreeBytes, sz.FileBytes)
+	}
+	if old := sz.FileBytes - sz.FreeBytes; old >= 0 {
+		t.Fatalf("옛 산출 file-free가 음수가 아니다(%d) — 이 픽스처는 B1을 재현하지 못한다", old)
+	}
+
+	// 본 단정 — 옛 눈금은 0으로 읽히고(경고가 영영 안 뜬다), 새 눈금은 살아 있는 바이트를 낸다.
+	if got := max(0, sz.FileBytes-sz.FreeBytes); got != 0 {
+		t.Fatalf("옛 클램프 산출이 0이 아니다: %d", got)
+	}
+	if sz.LiveBytes <= 0 {
+		t.Fatalf("LiveBytes=%d — 큰 WAL 상태에서 live가 죽었다", sz.LiveBytes)
+	}
+	// live는 free를 뺀 나머지이므로 스냅샷 총량(page_count×page_size)보다 작고, 그 총량은
+	// 본체 파일이 아니라 WAL 위에 있다 — 두 축이 서로 다른 것을 재고 있다는 확인.
+	if sz.LiveBytes <= sz.FileBytes {
+		t.Fatalf("live(%d)가 본체 파일(%d) 이하 — 스냅샷이 아니라 파일을 재고 있다", sz.LiveBytes, sz.FileBytes)
+	}
+}
+
+// fileSizeOrZero — 진단용 파일 크기(부재=0).
+func fileSizeOrZero(t *testing.T, path string) int64 {
+	t.Helper()
+	fi, err := os.Stat(path)
+	if err != nil {
+		return 0
+	}
+	return fi.Size()
 }
 
 // --- D41 PurgeHookOnly 헬퍼 (Task 5a) ---------------------------------------
@@ -3117,6 +3199,37 @@ func TestMergeFTSIfDueStamp(t *testing.T) {
 	ran, err = st.MergeFTSIfDue(t.Context(), 24*time.Hour, base.Add(25*time.Hour))
 	if err != nil || !ran {
 		t.Fatalf("interval 경과 후 안 돌았다: ran=%v err=%v", ran, err)
+	}
+}
+
+// TestFTSMergeDueInRemaining — 릴리스 패스 B3: 만기까지의 **잔여**를 낸다. 자동 루프가 다음
+// 확인 시각을 이 값으로 잡으므로, 여기서 interval을 통째로 돌려주면 "하루 한 번"이 최대 약
+// 48시간이 된다. 판정 불가(스탬프 부재·미래 mtime)와 이미 만기는 0이다 — MergeFTSIfDue의
+// "돌 때가 됐다" 둘과 같은 산술이라는 것이 계약이다.
+func TestFTSMergeDueInRemaining(t *testing.T) {
+	dir := t.TempDir()
+	st := openAt(t, dir)
+	const interval = 24 * time.Hour
+	base := time.Date(2026, 8, 9, 0, 0, 0, 0, time.UTC)
+
+	if d := st.FTSMergeDueIn(interval, base); d != 0 {
+		t.Fatalf("스탬프 부재에서 잔여=%v, 기대 0(즉시 만기)", d)
+	}
+	if ran, err := st.MergeFTSIfDue(t.Context(), interval, base); err != nil || !ran {
+		t.Fatalf("스탬프 시드 실패: ran=%v err=%v", ran, err)
+	}
+
+	// 스탬프가 base에 찍혔다 — 23시간 뒤의 잔여는 정확히 1시간이어야 한다.
+	if d := st.FTSMergeDueIn(interval, base.Add(23*time.Hour)); d != time.Hour {
+		t.Fatalf("잔여=%v, 기대 1h — interval을 통째로 돌려주면 다음 확인이 만기를 지나친다", d)
+	}
+	if d := st.FTSMergeDueIn(interval, base.Add(interval)); d != 0 {
+		t.Fatalf("만기에서 잔여=%v, 기대 0", d)
+	}
+	// 미래 mtime: MergeFTSIfDue가 "돌 때가 됐다"로 읽는 자리라 잔여도 0이어야 한다 —
+	// 여기서 양수를 내면 그 저장소는 영구히 병합하지 않는다.
+	if d := st.FTSMergeDueIn(interval, base.Add(-72*time.Hour)); d != 0 {
+		t.Fatalf("미래 스탬프에서 잔여=%v, 기대 0(영구 정지 방지)", d)
 	}
 }
 
