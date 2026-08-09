@@ -1453,7 +1453,7 @@ func TestLedgerFetchStats_DirMissing(t *testing.T) {
 
 // TestLastIndexedAtByHashUsesMaxOverSiblingArtifacts: 나이 시계가 마지막 포착이고 범위가
 // content_hash다. 두 축을 한 번에 잰다 — 같은 바이트를 media_type 둘로 등록하면 artifact 행이
-// 둘 생기는데(store.go:452의 조회 키가 (content_hash, media_type)), 퍼지 술어는 그 둘의 소스를
+// 둘 생기는데(store.go:479의 조회 키가 (content_hash, media_type)), 퍼지 술어는 그 둘의 소스를
 // 전부 본다(shadowOwnedFilter). **artifact 단위로 재는 구현은 이 테스트에서 떨어진다** —
 // 형제 쪽이 최근 값을 쥐고 있기 때문이다.
 func TestLastIndexedAtByHashUsesMaxOverSiblingArtifacts(t *testing.T) {
