@@ -1912,7 +1912,9 @@ func runDoctor(ctx context.Context, w io.Writer, storeRoot, projectRoot, version
 		// 것이다: 바로 위에서 보고하는 artifacts 수는 D67 퍼지 때문에 사용자 조작 없이 줄어든다.
 		// os.Stat(FileBytes)와 PRAGMA freelist_count(FreeBytes)는 서로 다른 스냅샷일 수 있다
 		// (doctor는 라이브 서버가 도는 중에 도는 것이 정상이라 체크포인트 직전 WAL이 큰 순간엔
-		// file-free가 음수로도 나온다) — 음수는 경고를 침묵시키는 방향이라 0으로 클램프한다.
+		// file-free가 음수로도 나온다) — 0으로 클램프해 그 무의미한 음수 표시를 없앤다.
+		// contentFileWarnBytes는 항상 양수(파싱 실패·비양수는 기본값으로 폴백)이므로
+		// max(0,x) > warn ⟺ x > warn이고, 경고 발화 여부 자체는 클램프 유무와 무관하다.
 		live := max(0, sz.FileBytes-sz.FreeBytes)
 		if warn := contentFileWarnBytes(os.Getenv); live > warn {
 			fmt.Fprintf(w, "[14] warning: live %dB > 임계 %dB(CTR_CONTENT_FILE_WARN_BYTES) — 청크 텍스트+FTS 축(자문, live=file-free). free %dB는 이미 회수돼 재사용을 기다리는 몫이라 판정에 넣지 않는다. 파일 축소는 VACUUM(라이브 서버 제약 — 서버 비가동 시 purge --older-than --vacuum), --hook-only는 shadow 귀속 한정(explicit 소스 감축은 전체 purge). 훅 아티팩트 보존 창 %s(CTR_SHADOW_RETENTION). 자동 VACUUM 없음\n",

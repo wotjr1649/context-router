@@ -1853,7 +1853,7 @@ func TestSizeStatFileBytes(t *testing.T) {
 
 // TestSizeStatsReportsFreeBytes: SizeStats가 회수 가능 바이트(free page)를 낸다.
 // 이 값이 없으면 "파일이 크다"와 "파일에 쓰레기가 있다"를 doctor에서 가를 수 없고,
-// 그 구분이 없어서 D67의 임계가 한 달 동안 죽은 신호였다(설계 v0.20 관측 B).
+// 그 구분이 없어서 D67의 임계가 15일간 죽은 신호였다(설계 v0.20 관측 B).
 func TestSizeStatsReportsFreeBytes(t *testing.T) {
 	dir := t.TempDir()
 	st := openAt(t, dir)
