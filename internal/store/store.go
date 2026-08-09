@@ -797,16 +797,20 @@ func (s *Store) checkFTSIntegrity(ctx context.Context) error {
 // modernc.org/sqlite v1.54.0) — 그래서 필요 없는 실행이 싸고, 조정 손잡이(환경 변수)를
 // 지금 만들지 않는다.
 //
-// 어느 한쪽 실패든 그대로 반환한다. 호출자는 이 실패로 기동이나 회수를 막지 않는다 —
-// 병합은 멱등이라 다음 기회에 다시 돌면 된다.
+// **둘 다 시도한 뒤 실패를 errors.Join으로 합쳐 반환한다**(최종리뷰 F4) — 앞엣것에서 즉시
+// 반환하면 porter에만 지속되는 오류가 trigram의 병합을 영영 막아 그 축만 무한히 자란다.
+// 호출자는 이 실패로 기동이나 회수를 막지 않는다 — 병합은 멱등이라 다음 기회에 다시 돌면 된다.
+// (errors.Join은 Is/As를 원소로 전개하므로 호출부의 errors.Is(err, context.Canceled) 강등
+// 분기는 그대로 산다.)
 func (s *Store) MergeFTS(ctx context.Context) error {
+	var errs []error
 	for _, fts := range [2]string{"fts_porter", "fts_trigram"} {
 		if _, err := s.writer.ExecContext(ctx,
 			"INSERT INTO "+fts+"("+fts+") VALUES('optimize')"); err != nil {
-			return fmt.Errorf("store: %s optimize 실패: %w", fts, err)
+			errs = append(errs, fmt.Errorf("store: %s optimize 실패: %w", fts, err))
 		}
 	}
-	return nil
+	return errors.Join(errs...)
 }
 
 // mergeStampName — D102 계약 2의 "하루 한 번"을 재는 자리. content.db 스키마를 건드리지
@@ -840,10 +844,12 @@ func (s *Store) MergeFTSIfDue(ctx context.Context, interval time.Duration, now t
 	if err := s.MergeFTS(ctx); err != nil {
 		return false, err
 	}
+	// Chtimes는 생성 성공 분기 안에 둔다(최종리뷰 F12) — 밖에 두면 파일이 없는 상태에서도
+	// 부르게 되고, 그 호출은 반드시 실패하므로 하는 일이 없다.
 	if f, err := os.OpenFile(stamp, os.O_CREATE|os.O_WRONLY, 0o600); err == nil {
 		_ = f.Close()
+		_ = os.Chtimes(stamp, now, now)
 	}
-	_ = os.Chtimes(stamp, now, now)
 	return true, nil
 }
 

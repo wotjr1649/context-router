@@ -2431,6 +2431,10 @@ func TestFTSMergeLoopMergesAndStamps(t *testing.T) {
 	defer cancel()
 	done := make(chan struct{})
 	go func() { defer close(done); runFTSMergeLoop(ctx, st, time.Millisecond, time.Hour) }()
+	// 실패 경로(t.Fatal)에서도 고루틴을 join한다(최종리뷰 F10) — 병합이 도는 중에 t.TempDir()
+	// 정리가 돌면 Windows에서 열린 파일 때문에 정리가 실패하고, 그 실패가 진짜 실패 사유를 덮는다.
+	// 아래 정상 경로의 cancel()·<-done과 중복이지만 둘 다 멱등이라 무해하다.
+	defer func() { cancel(); <-done }()
 
 	// store.mergeStampName은 비공개다 — 이름을 여기서 리터럴로 고정한다(바뀌면 이 테스트가 잡는다).
 	stamp := filepath.Join(dir, "fts-merge.stamp")

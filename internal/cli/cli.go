@@ -914,7 +914,7 @@ func runPurge(ctx context.Context, in io.Reader, w, stderr io.Writer, storeRoot 
 		// 선택 삭제 (+ 후속 --sessions, + 후속 --gc, + 후속 --vacuum(D50))
 		var beforeB int64
 		if *vacuum {
-			beforeB = contentFootprint(projDir) // 전 실측 = 명령 착수 전 기준점 — 보고 Δ는 명령 전체(삭제+VACUUM+checkpoint)의 총점유 순감소다
+			beforeB = contentFootprint(projDir) // 전 실측 = 명령 착수 전 기준점 — 보고 Δ는 명령 전체(삭제+병합+VACUUM+checkpoint)의 총점유 순감소다
 		}
 		st, err := store.Open(projDir, false)
 		if err != nil {
@@ -1036,7 +1036,7 @@ func runPurgeHookOnly(ctx context.Context, in io.Reader, w, stderr io.Writer, st
 	if err != nil {
 		return err
 	}
-	beforeB := contentFootprint(projDir) // D55: open 후·PurgeHookOnly 전 — 삭제+VACUUM 효과 격리(스펙 §0)
+	beforeB := contentFootprint(projDir) // D55: open 후·PurgeHookOnly 전 — 삭제+병합+VACUUM 효과 격리(스펙 §0)
 	rep, purgeErr := st.PurgeHookOnly(ctx)
 	var mergeErr, vacErr error
 	if purgeErr == nil {
@@ -1896,8 +1896,12 @@ func runDoctor(ctx context.Context, w io.Writer, storeRoot, projectRoot, version
 		fmt.Fprintln(w, "[14] content.db: 없음")
 	} else {
 		sz = s
-		fmt.Fprintf(w, "[14] content.db: sources=%d artifacts=%d blob=%dB file=%dB free=%dB\n",
-			sz.Sources, sz.Artifacts, sz.BlobBytes, sz.FileBytes, sz.FreeBytes)
+		// D102 계약 6의 **판정값**을 정보 줄에도 병기한다(최종리뷰 F8) — 경고가 없는 상태에서
+		// 사용자가 판정을 재현하려고 file-free를 손으로 빼야 하는 것을 없앤다. 정의와 클램프
+		// 근거는 아래 경고 분기 주석이 갖는다.
+		live := max(0, sz.FileBytes-sz.FreeBytes)
+		fmt.Fprintf(w, "[14] content.db: sources=%d artifacts=%d blob=%dB file=%dB free=%dB live=%dB\n",
+			sz.Sources, sz.Artifacts, sz.BlobBytes, sz.FileBytes, sz.FreeBytes, live)
 		// D38 — CAS 전체 blob 총량 경고(shadow 전용 아님 — [14] 측정 실체 그대로). 관측 채널이지
 		// 정책 집행이 아니다(D27): [14] 자신은 아무것도 지우지 않는다. SizeStats 실패 경로는 이
 		// 분기 밖이라 미평가.
@@ -1907,17 +1911,17 @@ func runDoctor(ctx context.Context, w io.Writer, storeRoot, projectRoot, version
 		// D102 계약 6·8 — content.db 라이브 축(청크 텍스트+FTS) 자문 경고. 판정은 파일 크기가
 		// 아니라 live 바이트다: 자동 경로가 VACUUM을 하지 않으므로 파일은 고수위에 머물고,
 		// 파일 기준 임계는 정리 뒤에도 상시 초과라 신호로서 죽는다(D67의 관측된 결함).
-		// free는 병기만 한다 — 병합 안 된 세그먼트는 live page라 freelist는 결함이 있을 때
-		// 오히려 낮게 읽힌다(계약 7). 문면의 "자동 VACUUM 없음"은 옛 "자동 삭제 없음"을 고친
+		// free는 **live 계산에서 차감할 뿐 독립된 경고 신호로 쓰지 않는다**(계약 7, 최종리뷰 F5) —
+		// 병합 안 된 세그먼트는 free page가 아니라 live page라 freelist는 결함이 있을 때 오히려
+		// 낮게 읽히기 때문이다. 문면의 "자동 VACUUM 없음"은 옛 "자동 삭제 없음"을 고친
 		// 것이다: 바로 위에서 보고하는 artifacts 수는 D67 퍼지 때문에 사용자 조작 없이 줄어든다.
 		// os.Stat(FileBytes)와 PRAGMA freelist_count(FreeBytes)는 서로 다른 스냅샷일 수 있다
 		// (doctor는 라이브 서버가 도는 중에 도는 것이 정상이라 체크포인트 직전 WAL이 큰 순간엔
 		// file-free가 음수로도 나온다) — 0으로 클램프해 그 무의미한 음수 표시를 없앤다.
 		// contentFileWarnBytes는 항상 양수(파싱 실패·비양수는 기본값으로 폴백)이므로
 		// max(0,x) > warn ⟺ x > warn이고, 경고 발화 여부 자체는 클램프 유무와 무관하다.
-		live := max(0, sz.FileBytes-sz.FreeBytes)
 		if warn := contentFileWarnBytes(os.Getenv); live > warn {
-			fmt.Fprintf(w, "[14] warning: live %dB > 임계 %dB(CTR_CONTENT_FILE_WARN_BYTES) — 청크 텍스트+FTS 축(자문, live=file-free). free %dB는 이미 회수돼 재사용을 기다리는 몫이라 판정에 넣지 않는다. 파일 축소는 VACUUM(라이브 서버 제약 — 서버 비가동 시 purge --older-than --vacuum), --hook-only는 shadow 귀속 한정(explicit 소스 감축은 전체 purge). 훅 아티팩트 보존 창 %s(CTR_SHADOW_RETENTION). 자동 VACUUM 없음\n",
+			fmt.Fprintf(w, "[14] warning: live %dB > 임계 %dB(CTR_CONTENT_FILE_WARN_BYTES) — 청크 텍스트+FTS 축(자문, live=file-free). free %dB는 live 계산에서 차감할 뿐 독립된 경고 신호로 쓰지 않는다(병합 안 된 세그먼트는 live page라 freelist는 결함이 있을 때 오히려 낮게 읽힌다). 파일 축소는 VACUUM(라이브 서버 제약 — 서버 비가동 시 purge --older-than --vacuum), --hook-only는 shadow 귀속 한정(explicit 소스 감축은 전체 purge). 훅 아티팩트 보존 창 %s(CTR_SHADOW_RETENTION). 자동 VACUUM 없음\n",
 				live, warn, sz.FreeBytes, store.ShadowRetention(os.Getenv))
 		}
 	}

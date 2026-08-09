@@ -507,7 +507,11 @@ const startupPurgeMaxHashes = 100
 const defaultFTSMergeInterval = 24 * time.Hour
 
 // ftsMergeStartDelay — 기동 첨두를 비켜나는 지연. 기동 직후에는 퍼지 배치가 쓰기 락을 잡고
-// (startupPurgeMaxHashes 주석의 실측 보유) 세션 시작 훅이 몰린다 — 그 위에 병합을 얹지 않는다.
+// (startupPurgeMaxHashes 주석의 실측 보유) 세션 시작 훅이 몰린다 — 그 첨두를 비켜 서려는
+// **경험적 완화이지 겹치지 않는다는 보장이 아니다**(최종리뷰 F6): 기동 퍼지의 예산은
+// startupPurgeBudget(60초)이라 느린 퍼지는 이 지연을 넘겨서까지 돈다. 겹쳐도 무해한 것은
+// 확인했다 — 병합은 SQLite 쓰기 락만 잡고 회수는 advisory 락 아래 파일 조작+reader 질의라
+// 둘 사이에 락 순환이 없다(둘째 것이 첫째 것을 기다릴 뿐이다).
 // **이 지연보다 짧은 세션은 병합하지 않는다**(의도된 성질): 스탬프는 벽시계라 다음에 이 지연을
 // 넘긴 세션 하나가 밀린 몫을 한 번에 걷는다.
 const ftsMergeStartDelay = 30 * time.Second
@@ -527,8 +531,8 @@ func runFTSMergeLoop(ctx context.Context, st *store.Store, delay, interval time.
 			return
 		case <-t.C:
 		}
-		start := time.Now()
-		if ran, err := st.MergeFTSIfDue(ctx, interval, time.Now()); errors.Is(err, context.Canceled) {
+		start := time.Now() // 주기 판정의 now와 소요 시간의 기준점을 한 번에 읽는다(최종리뷰 F11)
+		if ran, err := st.MergeFTSIfDue(ctx, interval, start); errors.Is(err, context.Canceled) {
 			// 정상 종료(cancelMerge)도 진행 중 병합을 이 취소로 만든다 — D102 계약 2가 퍼지 고루틴을
 			// 배제한 이유 ②와 같은 형태라 같은 파일의 퍼지 선례(729행)와 강등을 맞춘다: 깨끗한
 			// 종료를 실패로 찍지 않는다.

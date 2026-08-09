@@ -2782,13 +2782,21 @@ func ftsTrigramBytesRO(t *testing.T, projDir string) int64 {
 	return n
 }
 
-// TestPurgeHookOnlyMergesBeforeVacuum: --hook-only가 VACUUM 전에 FTS를 병합한다.
-// 병합 없이 VACUUM만 하면 tombstone은 free page가 아니라 live page라 회수되지 않는다 —
-// 실측 기준으로 회수 가능분의 29.6%만 돌아온다(설계 v0.20 D102 계약 4).
+// TestPurgeHookOnlyMergesFTS: --hook-only가 FTS를 병합한다. 병합 없이 VACUUM만 하면
+// tombstone은 free page가 아니라 live page라 회수되지 않는다 — 실측 기준으로 회수 가능분의
+// 29.6%만 돌아온다(설계 v0.20 D102 계약 4).
+//
+// **이름이 재는 것에 맞춰져 있다**(최종리뷰 F9). 옛 이름은 MergesBeforeVacuum이었으나 이
+// 테스트가 재는 것은 병합이 **일어났다**는 것뿐이고 병합→VACUUM **순서**가 아니다. 그 순서를
+// 결정적으로 잴 방법이 이 경계에 없다: 순서를 가르는 관측량은 VACUUM 뒤 파일 크기(또는 free
+// page 수)뿐인데 그 값은 라이브 프로세스 제약을 받아 테스트에서 불안정하고(ftsTrigramBytesRO
+// 주석), 순서 자체는 runPurgeHookOnly의 직선 4줄이라 눈으로 닫힌다. 불안정한 순서 테스트보다
+// 정직한 이름이 낫다.
+//
 // 진입점은 runPurge다: runPurgeHookOnly를 직접 부르는 테스트는 없고 --hook-only는 runPurge의
 // 조기 분기(cli.go:793-801)가 인터셉트한다. --force가 없으면 비TTY에서 confirmPurge가 즉시
 // 거부한다(cli.go:682-687).
-func TestPurgeHookOnlyMergesBeforeVacuum(t *testing.T) {
+func TestPurgeHookOnlyMergesFTS(t *testing.T) {
 	pid, projDir := seedShadowChunkedProject(t)
 	storeRoot := storeRootOf(projDir)
 	before := ftsTrigramBytesRO(t, projDir)

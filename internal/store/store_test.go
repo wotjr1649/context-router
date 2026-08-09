@@ -3002,27 +3002,71 @@ func TestMergeFTSShrinksIndex(t *testing.T) {
 	if err := st.MergeFTS(t.Context()); err != nil {
 		t.Fatalf("MergeFTS: %v", err)
 	}
+	// 줄었다는 것만으로는 "줄이면서 망가뜨린" 변경을 못 잡는다(최종리뷰 F1) — external-content
+	// 대조까지 건다. rank=1이라 chunks↔인덱스 행/토큰 드리프트도 여기서 걸린다.
+	if err := st.checkFTSIntegrity(t.Context()); err != nil {
+		t.Fatalf("병합이 chunks↔인덱스 대조를 깼다: %v", err)
+	}
 	merged := ftsDataBytes(t, st, "fts_trigram_data")
 	if merged >= afterDelete {
 		t.Fatalf("MergeFTS 후에도 인덱스가 줄지 않았다: %d → %d", afterDelete, merged)
 	}
 }
 
-// TestMergeFTSKeepsSearchable: 병합이 검색 결과를 바꾸지 않는다 — optimize는 세그먼트를
-// 합칠 뿐 색인 내용을 바꾸지 않아야 한다. 이 확인이 없으면 "줄었다"만 보고 색인을 망가뜨린
-// 변경을 통과시킬 수 있다.
+// TestMergeFTSKeepsSearchable: **부분 삭제 후** 병합이 두 축(porter·trigram)에서 생존분만
+// 반환한다 — optimize는 세그먼트를 합칠 뿐 색인 내용을 바꾸지 않아야 한다.
+//
+// 옛 형태는 **문서 1건·porter 축·삭제 없음**의 매치 수 하나뿐이었다(최종리뷰 F1). 그 그물은
+// 무인으로 매일 전체 인덱스를 다시 쓰는 변경에 대해 셋을 못 잡는다: 병합이 tombstone을 잘못
+// 접어 지운 문서를 되살리는 것, 생존 문서를 잃는 것, porter는 멀쩡한데 trigram만 망가지는 것
+// (축소를 단정하는 축이 바로 trigram이다). 여기서 재는 것 넷 —
+// ① 생존분이 두 축 모두에서 나온다 ② 삭제분이 두 축 모두에서 안 나온다 ③ 공통어의 총 히트가
+// 생존 건수와 정확히 같다(되살아난 tombstone이 여기서 걸린다) ④ 병합 뒤 checkFTSIntegrity가
+// 통과한다(chunks와 인덱스가 어긋나면 실패).
 func TestMergeFTSKeepsSearchable(t *testing.T) {
 	st := openAt(t, t.TempDir())
-	regChunked(t, st, strings.Repeat("needle haystack ", 2000), "shadow:Bash:keep")
-	before := ftsMatchCount(t, st, "needle")
-	if before == 0 {
-		t.Fatal("시드가 검색되지 않는다 — 이 테스트가 공허 통과한다")
+	const docs = 6 // 짝수 색인은 지우고 홀수 색인은 남긴다 — 전량 삭제와 달리 tombstone과 생존분이 섞인다
+	filler := strings.Repeat("filler token ", 500)
+	uri := func(i int) string { return "shadow:Bash:keep" + strconv.Itoa(i) }
+	for i := range docs {
+		regChunked(t, st, "haystack needle"+strconv.Itoa(i)+" "+filler, uri(i))
 	}
+	for _, fts := range [2]string{"fts_porter", "fts_trigram"} {
+		if n := ftsMatchCount(t, st, fts, "haystack"); n != docs {
+			t.Fatalf("%s 시드가 %d/%d만 검색된다 — 이 테스트가 공허 통과한다", fts, n, docs)
+		}
+	}
+
+	// 부분 삭제 — chunks_ad 트리거가 두 축에 tombstone을 쌓는다. 병합이 접어야 할 대상이다.
+	for i := 0; i < docs; i += 2 {
+		if _, err := st.writer.Exec(
+			`DELETE FROM chunks WHERE artifact_id IN (SELECT artifact_id FROM sources WHERE uri = ?)`,
+			uri(i),
+		); err != nil {
+			t.Fatalf("DELETE chunks(%s): %v", uri(i), err)
+		}
+	}
+
 	if err := st.MergeFTS(t.Context()); err != nil {
 		t.Fatalf("MergeFTS: %v", err)
 	}
-	if after := ftsMatchCount(t, st, "needle"); after != before {
-		t.Fatalf("병합이 검색 결과를 바꿨다: %d → %d", before, after)
+	if err := st.checkFTSIntegrity(t.Context()); err != nil {
+		t.Fatalf("병합이 chunks↔인덱스 대조를 깼다: %v", err)
+	}
+
+	for _, fts := range [2]string{"fts_porter", "fts_trigram"} {
+		if n := ftsMatchCount(t, st, fts, "haystack"); n != docs/2 {
+			t.Fatalf("%s 공통어 히트 %d, 기대 %d — 병합이 생존/삭제 집합을 바꿨다", fts, n, docs/2)
+		}
+		for i := range docs {
+			want, term := int64(1), "needle"+strconv.Itoa(i)
+			if i%2 == 0 {
+				want = 0 // 삭제분 — 되살아나면 여기서 걸린다
+			}
+			if n := ftsMatchCount(t, st, fts, term); n != want {
+				t.Fatalf("%s MATCH %q = %d, 기대 %d", fts, term, n, want)
+			}
+		}
 	}
 }
 
@@ -3040,14 +3084,15 @@ func ftsDataBytes(t *testing.T, st *Store, table string) int64 {
 	return n
 }
 
-// ftsMatchCount: porter 축의 히트 수.
-func ftsMatchCount(t *testing.T, st *Store, term string) int64 {
+// ftsMatchCount: 지정한 축(fts_porter·fts_trigram)에서 term의 히트 수. 축을 인자로 받는 이유는
+// 보존 증거가 한 축에만 있으면 다른 축이 병합에 망가져도 통과하기 때문이다(최종리뷰 F1).
+func ftsMatchCount(t *testing.T, st *Store, table, term string) int64 {
 	t.Helper()
 	var n int64
 	if err := st.reader.QueryRow(
-		`SELECT count(*) FROM fts_porter WHERE fts_porter MATCH ?`, term,
+		`SELECT count(*) FROM `+table+` WHERE `+table+` MATCH ?`, term,
 	).Scan(&n); err != nil {
-		t.Fatalf("fts_porter MATCH: %v", err)
+		t.Fatalf("%s MATCH %q: %v", table, term, err)
 	}
 	return n
 }
