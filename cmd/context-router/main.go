@@ -532,20 +532,57 @@ func runFTSMergeLoop(ctx context.Context, st *store.Store, delay, interval time.
 		case <-t.C:
 		}
 		start := time.Now() // 주기 판정의 now와 소요 시간의 기준점을 한 번에 읽는다(최종리뷰 F11)
-		if ran, err := st.MergeFTSIfDue(ctx, interval, start); errors.Is(err, context.Canceled) {
+		ran, err := st.MergeFTSIfDue(ctx, interval, start)
+		switch {
+		case err != nil && (ctx.Err() != nil || joinedAll(err, func(e error) bool { return errors.Is(e, context.Canceled) })):
 			// 정상 종료(cancelMerge)도 진행 중 병합을 이 취소로 만든다 — D102 계약 2가 퍼지 고루틴을
-			// 배제한 이유 ②와 같은 형태라 같은 파일의 퍼지 선례(729행)와 강등을 맞춘다: 깨끗한
-			// 종료를 실패로 찍지 않는다.
+			// 배제한 이유 ②와 같은 형태라 같은 파일의 퍼지 선례(748행)와 강등을 맞춘다: 깨끗한
+			// 종료를 실패로 찍지 않는다. **ctx가 살아 있을 때는 합류 원소가 전부 취소여야 한다**
+			// (릴리스 패스 M2): errors.Is는 errors.Join 위에서 OR라, 한 축의 취소가 다른 축의 진짜
+			// 실패까지 Debug로 강등한다.
 			slog.Debug("FTS 병합 중단 — 서버 종료", "error", err)
-		} else if err != nil {
+		case err != nil && joinedAll(err, store.IsBusyErr):
+			// BUSY/LOCKED는 결함이 아니라 경합이다(릴리스 패스 M4) — 다른 프로세스의 병합이나 긴
+			// 쓰기가 busy_timeout(5000 ms)을 넘겼다는 뜻이고, 스탬프가 안 찍혔으므로 다음 주기가
+			// 그대로 재시도한다. 진짜 실패와 같은 등급으로 찍으면 그 구분이 로그에서 사라진다.
+			slog.Info("FTS 병합 경합 — 쓰기 락 대기 초과, 다음 주기에 재시도", "error", err)
+		case err != nil:
 			slog.Warn("FTS 병합 실패 — 다음 주기에 재시도", "error", err)
-		} else if ran {
+		case ran:
 			// took: 설계 §4-1이 배포 후 반드시 잴 것 1순위로 못박은 optimize 소요 시간 — 실측 1.2초는
 			// 하한이고 훅 예산 잠식(계약 9) 논거가 그 위에 선다.
 			slog.Info("FTS 병합 완료", "took", time.Since(start))
 		}
-		t.Reset(interval)
+		// 다음 **확인**은 남은 만기로 잡는다(릴리스 패스 B3). interval 고정 리셋은 아직 만기가
+		// 아니어서 안 돈 틱(다른 프로세스가 방금 병합했거나 이 세션이 짧게 재기동된 경우) 뒤에
+		// 만기를 통째로 지나쳐, 계약 2의 "하루 한 번"을 실효 최대 약 48시간으로 늘린다.
+		// 병합했거나 실패한 틱은 잔여가 0이라 그대로 interval 뒤에 다시 본다(위 "다음 주기에 재시도").
+		wait := interval
+		if d := st.FTSMergeDueIn(interval, time.Now()); d > 0 {
+			wait = d
+		}
+		t.Reset(wait)
 	}
+}
+
+// joinedAll — errors.Join으로 합류한 오류의 **모든** 원소가 pred를 만족하는지(원소가 없으면
+// false). errors.Is/As는 합류 위에서 OR라 한 축의 취소·경합이 다른 축의 진짜 실패까지 같은
+// 등급으로 강등하는데, MergeFTS는 정확히 두 축(porter·trigram)의 실패를 합쳐 반환한다
+// (릴리스 패스 M2·M4).
+func joinedAll(err error, pred func(error) bool) bool {
+	if j, ok := err.(interface{ Unwrap() []error }); ok {
+		errs := j.Unwrap()
+		if len(errs) == 0 {
+			return false
+		}
+		for _, e := range errs {
+			if !joinedAll(e, pred) {
+				return false
+			}
+		}
+		return true
+	}
+	return pred(err)
 }
 
 func run(ctx context.Context, args []string, stderr io.Writer) error {
@@ -738,7 +775,7 @@ func run(ctx context.Context, args []string, stderr io.Writer) error {
 
 	// D102 계약 2: 병합은 퍼지와 별개 고루틴이고 서버 생존 ctx에 묶인다 — 퍼지의 60초 예산도
 	// purgeErr도 cutoff<=0 건너뛰기도 공유하지 않는다(그 셋 중 어느 것에 걸려도 병합이 영영
-	// 안 도는 구간이 생긴다). defer 등록이 st.Close()(636행)보다 뒤라 LIFO로 먼저 돌아, 고루틴이
+	// 안 도는 구간이 생긴다). defer 등록이 st.Close()(655행)보다 뒤라 LIFO로 먼저 돌아, 고루틴이
 	// 닫힌 DB를 만지거나 프로세스보다 오래 사는 일이 없다.
 	mergeCtx, cancelMerge := context.WithCancel(ctx)
 	mergeDone := make(chan struct{})

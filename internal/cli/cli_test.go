@@ -328,10 +328,12 @@ func TestRunDoctor_ContentDBSize(t *testing.T) {
 // 셋업·호출은 TestRunDoctor_ContentDBSize 관례.
 func doctorSizeWarnSetup(t *testing.T) (storeRoot, projectRoot string) {
 	t.Helper()
-	// 부모 env의 임계 키 누수 시 무경고 단정이 거짓 실패(Codex P2) — 양 축을 기본값으로
-	// 고정(""=기본 폴백, 개별 테스트의 후행 t.Setenv가 덮어씀).
+	// 부모 env의 임계 키 누수 시 무경고 단정이 거짓 실패(Codex P2) — 세 축을 기본값으로
+	// 고정(""=기본 폴백, 개별 테스트의 후행 t.Setenv가 덮어씀). live 키는 릴리스 패스 B1이 축을
+	// 둘로 나누며 생겼다 — 여기서 빠지면 부모 env가 그 축의 침묵 단정을 거짓 실패시킨다.
 	t.Setenv("CTR_STORE_WARN_BYTES", "")
 	t.Setenv("CTR_CONTENT_FILE_WARN_BYTES", "")
+	t.Setenv("CTR_CONTENT_LIVE_WARN_BYTES", "")
 	storeRoot, projectRoot = t.TempDir(), t.TempDir()
 	canon, err := ident.Canonicalize(projectRoot)
 	if err != nil {
@@ -410,9 +412,9 @@ func TestRunDoctor_StoreSizeWarnSilentUnderThreshold(t *testing.T) {
 	}
 }
 
-// TestRunDoctor_ContentFileWarn — D46 발화: 전용 키만 소액 설정 — content.db 파일은 항상 >1B.
+// TestRunDoctor_ContentFileWarn — D46 발화: 전용 키만 소액 설정 — content.db 총점유는 항상 >1B.
 // 픽스처·doctor 실행부는 TestRunDoctor_StoreSizeWarn과 동일. 역방향 축 독립(file 키 조정 시
-// blob 침묵)도 여기서 단정 — AxisIndependent 테스트의 blob→file 방향과 쌍.
+// blob·live 침묵)도 여기서 단정 — AxisIndependent 테스트의 blob→file 방향과 쌍.
 func TestRunDoctor_ContentFileWarn(t *testing.T) {
 	isolateCodexHome(t)
 	storeRoot, projectRoot := doctorSizeWarnSetup(t)
@@ -422,16 +424,39 @@ func TestRunDoctor_ContentFileWarn(t *testing.T) {
 		t.Fatalf("runDoctor err=%v out=%s", err, buf.String())
 	}
 	out := buf.String()
-	if !strings.Contains(out, "[14] warning: live ") || !strings.Contains(out, "CTR_CONTENT_FILE_WARN_BYTES") {
+	if !strings.Contains(out, "[14] warning: file ") || !strings.Contains(out, "CTR_CONTENT_FILE_WARN_BYTES") {
 		t.Fatalf("파일 축 경고 미발화:\n%s", out)
 	}
-	if strings.Contains(out, "[14] warning: blob ") {
-		t.Fatalf("file 키 조정이 blob 축 경고를 발화(키 분리 위반):\n%s", out)
+	for _, unwanted := range []string{"[14] warning: blob ", "[14] warning: live "} {
+		if strings.Contains(out, unwanted) {
+			t.Fatalf("file 키 조정이 %q를 발화(키 분리 위반):\n%s", unwanted, out)
+		}
+	}
+}
+
+// TestRunDoctor_ContentLiveWarn — 릴리스 패스 B1: live 축은 **자기 키**로 발화한다. 축이 둘로
+// 갈렸으므로 live 키만 낮추면 live만 뜨고 file·blob은 기본 임계라 조용해야 한다.
+func TestRunDoctor_ContentLiveWarn(t *testing.T) {
+	isolateCodexHome(t)
+	storeRoot, projectRoot := doctorSizeWarnSetup(t)
+	t.Setenv("CTR_CONTENT_LIVE_WARN_BYTES", "1")
+	var buf bytes.Buffer
+	if err := runDoctor(context.Background(), &buf, storeRoot, projectRoot, "0.0.1-dev"); err != nil {
+		t.Fatalf("runDoctor err=%v out=%s", err, buf.String())
+	}
+	out := buf.String()
+	if !strings.Contains(out, "[14] warning: live ") || !strings.Contains(out, "CTR_CONTENT_LIVE_WARN_BYTES") {
+		t.Fatalf("live 축 경고 미발화:\n%s", out)
+	}
+	for _, unwanted := range []string{"[14] warning: blob ", "[14] warning: file "} {
+		if strings.Contains(out, unwanted) {
+			t.Fatalf("live 키 조정이 %q를 발화(키 분리 위반):\n%s", unwanted, out)
+		}
 	}
 }
 
 // TestRunDoctor_ContentFileWarnAxisIndependent — D46 축 독립: blob 키만 낮추면 blob 경고만
-// 발화하고 파일 경고는 기본 256MiB 임계라 침묵한다(소형 픽스처 ≪ 256MiB — 전용 키 분리 판별).
+// 발화하고 content.db 두 축(file 512MiB·live 256MiB)은 기본 임계라 침묵한다(소형 픽스처 ≪ 둘 다).
 func TestRunDoctor_ContentFileWarnAxisIndependent(t *testing.T) {
 	isolateCodexHome(t)
 	storeRoot, projectRoot := doctorSizeWarnSetup(t)
@@ -444,17 +469,32 @@ func TestRunDoctor_ContentFileWarnAxisIndependent(t *testing.T) {
 	if !strings.Contains(out, "[14] warning: blob ") {
 		t.Fatalf("blob 경고 미발화:\n%s", out)
 	}
-	if strings.Contains(out, "[14] warning: live ") {
-		t.Fatalf("blob 키 조정이 파일 축 경고를 발화(키 분리 위반):\n%s", out)
+	for _, unwanted := range []string{"[14] warning: live ", "[14] warning: file "} {
+		if strings.Contains(out, unwanted) {
+			t.Fatalf("blob 키 조정이 %q를 발화(키 분리 위반):\n%s", unwanted, out)
+		}
 	}
 }
 
-// TestContentFileWarnDefaultIs256MiB: 임계가 256 MiB다. 정리 후 정상상태가 실측 171 MB이므로
-// 옛 100 MiB는 정리 뒤에도 상시 초과라 신호로서 죽는다. 256 MiB는 그 1.5배이고,
-// 창을 7일로 늘리는 결정(약 400 MB)이 이 신호를 켜도록 고른 값이다(설계 v0.20 D102 계약 6).
-func TestContentFileWarnDefaultIs256MiB(t *testing.T) {
-	if defaultContentFileWarnBytes != 256<<20 {
-		t.Fatalf("임계 = %d, 기대 %d", defaultContentFileWarnBytes, 256<<20)
+// TestContentWarnDefaults: 두 축의 기본 임계(릴리스 패스 B1·B2 — 소유자 판정으로 축이 갈렸다).
+// live 256 MiB는 D102 계약 6 그대로다 — 정리 후 정상상태 실측 170,790,912 B의 약 1.5배이고
+// 창을 7일로 늘리는 결정(약 400 MB)이 이 신호를 켠다. file 512 MiB는 그 정상상태의 총점유
+// (본체 170,790,912 B + 그날 병합이 다시 쓴 -wal, 정리 후 인덱스 116 MB급)에서는 조용하고
+// 실측된 부푼 상태(본체만 709,890,048 B)에서는 발화하도록 고른 값이다.
+func TestContentWarnDefaults(t *testing.T) {
+	if defaultContentLiveWarnBytes != 256<<20 {
+		t.Fatalf("live 임계 = %d, 기대 %d", defaultContentLiveWarnBytes, 256<<20)
+	}
+	if defaultContentFileWarnBytes != 512<<20 {
+		t.Fatalf("file 임계 = %d, 기대 %d", defaultContentFileWarnBytes, 512<<20)
+	}
+	// 부푼 실측(709,890,048 B)에서 발화하고 정리 후 본체(170,790,912 B)에서는 조용해야 한다 —
+	// 임계값을 무심코 옮기면 이 두 술어 중 하나가 깨진다.
+	if defaultContentFileWarnBytes >= 709_890_048 {
+		t.Fatalf("file 임계(%d)가 부푼 실측을 안 잡는다", defaultContentFileWarnBytes)
+	}
+	if defaultContentFileWarnBytes <= 170_790_912*2 {
+		t.Fatalf("file 임계(%d)가 정리 후 정상상태(본체+wal)를 상시 초과할 만큼 낮다", defaultContentFileWarnBytes)
 	}
 }
 
@@ -524,34 +564,112 @@ func TestRunDoctor_ContentLiveWarnUsesLiveBytes(t *testing.T) {
 	}
 	// 이 전제가 없으면 아래 임계 설정이 live==file인 채로 진행돼, 판정을 옛 file 기준으로
 	// 되돌려도 이 테스트가 계속 통과한다(공허 통과) — 리뷰에서 실제로 발견된 결함.
-	if sz.FreeBytes <= 0 {
-		t.Fatalf("픽스처에 free page 없음 — 이 테스트는 live/file을 가르지 못한다(FreeBytes=%d)", sz.FreeBytes)
+	if !sz.PageStatsOK || sz.FreeBytes <= 0 {
+		t.Fatalf("픽스처에 free page 없음 — 이 테스트는 live/file을 가르지 못한다(ok=%v FreeBytes=%d)",
+			sz.PageStatsOK, sz.FreeBytes)
 	}
-	// live 바로 위에 임계를 둔다 — file 기준이면 엄격히 초과(발화), live 기준이면 미달(침묵).
-	live := sz.FileBytes - sz.FreeBytes
-	t.Setenv("CTR_CONTENT_FILE_WARN_BYTES", strconv.FormatInt(live, 10))
+	if fp := contentFootprint(projDir); fp <= sz.LiveBytes {
+		t.Fatalf("총점유(%d)가 live(%d) 이하 — 두 축이 같은 값이라 가르지 못한다", fp, sz.LiveBytes)
+	}
+	// live 바로 위에 임계를 둔다 — file/총점유 기준이면 엄격히 초과(발화), live 기준이면 미달(침묵).
+	t.Setenv("CTR_CONTENT_LIVE_WARN_BYTES", strconv.FormatInt(sz.LiveBytes, 10))
 	var buf bytes.Buffer
 	if err := runDoctor(context.Background(), &buf, storeRoot, projectRoot, "0.0.1-dev"); err != nil {
 		t.Fatalf("runDoctor err=%v out=%s", err, buf.String())
 	}
 	if strings.Contains(buf.String(), "[14] warning: live ") {
-		t.Fatalf("live 임계와 같은 값에서 경고가 발화(> 판정 위반):\n%s", buf.String())
+		t.Fatalf("live 임계와 같은 값에서 경고가 발화(> 판정 위반 또는 file 기준 판정):\n%s", buf.String())
 	}
 	if !strings.Contains(buf.String(), " free=") {
 		t.Fatalf("[14] 줄에 free= 병기 없음:\n%s", buf.String())
 	}
 }
 
-// TestContentFileWarnBytes — CTR_CONTENT_FILE_WARN_BYTES 양수만 채택(storeWarnBytes와 동형).
+// TestRunDoctor_ContentFileWarnFiresOnReclaimableBloat — 릴리스 패스 B2: **회수 가능한 페이지로
+// 부푼 파일**(정확히 VACUUM이 필요한 상태)에서 file 축 경고가 뜬다. 0.19.0은 이 상태를 경고했고
+// 계약 6이 판정을 live로 옮기면서 0.19.1에서 그 진단이 통째로 사라졌다 — 자동 경로가 VACUUM을
+// 하지 않아 파일이 고수위에 영원히 머무는데 그것을 말해 주던 유일한 신호였다.
+//
+// 픽스처는 doctorLiveFreePageSetup(삽입+회수+병합+닫기) — free page가 실제로 남는다. live 축은
+// 임계를 총점유로 올려 조용하게 두고, file 축만 총점유 바로 아래로 내린다: **부푼 파일에서
+// 뜨는 것이 file 축**이라는 것이 이 테스트의 전부다.
+func TestRunDoctor_ContentFileWarnFiresOnReclaimableBloat(t *testing.T) {
+	isolateCodexHome(t)
+	storeRoot, projectRoot := doctorLiveFreePageSetup(t)
+	canon, err := ident.Canonicalize(projectRoot)
+	if err != nil {
+		t.Fatalf("canonicalize: %v", err)
+	}
+	projDir := filepath.Join(storeRoot, "projects", canon.ProjectID)
+	sz, err := store.SizeStats(projDir)
+	if err != nil || sz == nil {
+		t.Fatalf("SizeStats: sz=%v err=%v", sz, err)
+	}
+	footprint := contentFootprint(projDir)
+	// 사전 가드 — "회수 가능분으로 부푼" 상태를 픽스처가 실제로 만들었는가. free가 0이거나
+	// live가 총점유에 붙어 있으면 아래 두 술어가 같은 값 위에서 돌아 공허 통과한다.
+	if !sz.PageStatsOK || sz.FreeBytes <= 0 {
+		t.Fatalf("free page 없음 — 부푼 파일 상태가 아니다(ok=%v free=%d)", sz.PageStatsOK, sz.FreeBytes)
+	}
+	if sz.LiveBytes >= footprint-1 {
+		t.Fatalf("live(%d)가 총점유(%d)에 붙어 있다 — 두 축을 가르지 못한다", sz.LiveBytes, footprint)
+	}
+	t.Logf("부푼 상태: 총점유=%d 본체=%d free=%d live=%d", footprint, sz.FileBytes, sz.FreeBytes, sz.LiveBytes)
+	t.Setenv("CTR_CONTENT_LIVE_WARN_BYTES", strconv.FormatInt(footprint, 10)) // live ≪ 이 값 → 침묵
+	t.Setenv("CTR_CONTENT_FILE_WARN_BYTES", strconv.FormatInt(footprint-1, 10))
+
+	var buf bytes.Buffer
+	if err := runDoctor(context.Background(), &buf, storeRoot, projectRoot, "0.0.1-dev"); err != nil {
+		t.Fatalf("runDoctor err=%v out=%s", err, buf.String())
+	}
+	out := buf.String()
+	if !strings.Contains(out, "[14] warning: file ") {
+		t.Fatalf("부푼 파일에서 file 축 경고 미발화(0.19.0 대비 회귀):\n%s", out)
+	}
+	if !strings.Contains(out, "VACUUM") {
+		t.Fatalf("file 축 경고에 구제 경로(VACUUM) 없음:\n%s", out)
+	}
+	if strings.Contains(out, "[14] warning: live ") {
+		t.Fatalf("live 축이 file 축 임계에 반응했다 — 축이 갈리지 않았다:\n%s", out)
+	}
+}
+
+// TestContentFileWarnBytes — 두 전용 키가 양수만 채택하고 **서로 다른 키를 읽는다**(storeWarnBytes와
+// 동형 규율). 키 대조가 단정의 일부다 — 축을 둘로 나눈 뒤 한 키가 다른 축을 읽으면 조정이
+// 엉뚱한 경고를 끈다(릴리스 패스 B1).
 func TestContentFileWarnBytes(t *testing.T) {
-	if got := contentFileWarnBytes(func(string) string { return "" }); got != 256<<20 {
-		t.Fatalf("기본값: %d", got)
+	only := func(key, val string) func(string) string {
+		return func(k string) string {
+			if k == key {
+				return val
+			}
+			return ""
+		}
 	}
-	if got := contentFileWarnBytes(func(string) string { return "12345" }); got != 12345 {
-		t.Fatalf("env 채택: %d", got)
+	if got := contentFileWarnBytes(func(string) string { return "" }); got != 512<<20 {
+		t.Fatalf("file 기본값: %d", got)
 	}
-	if got := contentFileWarnBytes(func(string) string { return "-1" }); got != 256<<20 {
-		t.Fatalf("비양수 거부: %d", got)
+	if got := contentFileWarnBytes(only("CTR_CONTENT_FILE_WARN_BYTES", "12345")); got != 12345 {
+		t.Fatalf("file env 채택: %d", got)
+	}
+	if got := contentFileWarnBytes(only("CTR_CONTENT_FILE_WARN_BYTES", "-1")); got != 512<<20 {
+		t.Fatalf("file 비양수 거부: %d", got)
+	}
+	if got := contentLiveWarnBytes(func(string) string { return "" }); got != 256<<20 {
+		t.Fatalf("live 기본값: %d", got)
+	}
+	if got := contentLiveWarnBytes(only("CTR_CONTENT_LIVE_WARN_BYTES", "777")); got != 777 {
+		t.Fatalf("live env 채택: %d", got)
+	}
+	if got := contentLiveWarnBytes(only("CTR_CONTENT_LIVE_WARN_BYTES", "abc")); got != 256<<20 {
+		t.Fatalf("live 파싱 실패 거부: %d", got)
+	}
+	// 키 교차 — file 키를 낮춰도 live 임계는 안 움직인다(그 반대도).
+	if got := contentLiveWarnBytes(only("CTR_CONTENT_FILE_WARN_BYTES", "1")); got != 256<<20 {
+		t.Fatalf("live가 file 키를 읽는다: %d", got)
+	}
+	if got := contentFileWarnBytes(only("CTR_CONTENT_LIVE_WARN_BYTES", "1")); got != 512<<20 {
+		t.Fatalf("file이 live 키를 읽는다: %d", got)
 	}
 }
 

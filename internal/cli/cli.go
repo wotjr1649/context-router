@@ -36,29 +36,44 @@ const releaseURL = "https://api.github.com/repos/wotjr1649/context-router/releas
 // defaultStoreWarnBytes — D38 store 용량 경고 임계 기본값(설계 v0.4 §5 "기본 100MiB").
 const defaultStoreWarnBytes = 100 << 20 // 100MiB
 
-// storeWarnBytes — CTR_STORE_WARN_BYTES 양수만 채택, 파싱 실패·비양수는 기본값(D38 — 측정
-// 실체가 CAS 전체 blob이라 STORE 명명).
-func storeWarnBytes(getenv func(string) string) int64 {
-	if v, err := strconv.ParseInt(getenv("CTR_STORE_WARN_BYTES"), 10, 64); err == nil && v > 0 {
+// warnBytesEnv — 임계 키 셋의 공통 파싱: 양수만 채택하고 파싱 실패·비양수·미설정은 기본값
+// (D38이 세운 규율을 세 키가 그대로 쓴다 — 잘못 쓴 값이 경고를 조용히 끄면 안 된다).
+func warnBytesEnv(getenv func(string) string, key string, def int64) int64 {
+	if v, err := strconv.ParseInt(getenv(key), 10, 64); err == nil && v > 0 {
 		return v
 	}
-	return defaultStoreWarnBytes
+	return def
 }
 
-// defaultContentFileWarnBytes — D46 content.db 파일 축 경고 임계 기본값(설계 v0.6 §4 — 가시화
-// 트리거: 조용한 기본값이 아니다). 식별자·환경변수(CTR_CONTENT_FILE_WARN_BYTES)는 "file"을
-// 달고 있지만 D102 계약 6부터 비교 대상은 live 바이트(file-free)다 — 사용자 대면 키라 이름은
-// 그대로 두고 의미만 옮겼다.
-const defaultContentFileWarnBytes = 256 << 20 // 256MiB — D102 계약 6(정리 후 정상상태 실측 171 MB의 약 1.5배)
+// storeWarnBytes — CTR_STORE_WARN_BYTES(D38 — 측정 실체가 CAS 전체 blob이라 STORE 명명).
+func storeWarnBytes(getenv func(string) string) int64 {
+	return warnBytesEnv(getenv, "CTR_STORE_WARN_BYTES", defaultStoreWarnBytes)
+}
 
-// contentFileWarnBytes — CTR_CONTENT_FILE_WARN_BYTES 양수만 채택(storeWarnBytes와 동형 규율).
-// blob 키와 분리한 전용 키(D46) — 두 축은 크기·성장·구제 경로가 달라 한쪽 조정이 다른 축을
-// 무력화하면 안 된다.
+// defaultContentFileWarnBytes — content.db **file 축**(본체+`-wal`+`-shm` 총점유) 경고 임계
+// 기본값. D102 계약 6이 판정을 live로 옮기면서 이 축의 경고가 사라졌던 것을 되살리며 값을
+// 다시 골랐다(릴리스 패스 B2): 정리 후 정상상태는 본체 170,790,912 B에 그날의 병합이 다시 쓴
+// `-wal`(정리 후 인덱스 116 MB급)을 더해도 300 MB대라 조용하고, 실측된 부푼 상태는 본체만
+// 709,890,048 B라 발화한다. 이 축이 묻는 것은 "디스크를 얼마나 먹나"이고 답은 VACUUM이다.
+const defaultContentFileWarnBytes = 512 << 20 // 512MiB=536,870,912B — 정상상태 300 MB대 ↔ 부푼 실측 709,890,048 B 사이
+
+// defaultContentLiveWarnBytes — content.db **live 축**((page_count-freelist)×page_size) 경고
+// 임계 기본값. D102 계약 6이 고른 값 그대로다 — 정리 후 정상상태 실측 170,790,912 B의 약
+// 1.5배이고, 창을 7일로 늘리는 결정(약 400 MB)이 이 신호를 켠다. 이 축이 묻는 것은
+// "쓰레기가 쌓였나"이고 답은 퍼지+병합이다.
+const defaultContentLiveWarnBytes = 256 << 20 // 256MiB=268,435,456B — D102 계약 6
+
+// contentFileWarnBytes — CTR_CONTENT_FILE_WARN_BYTES. blob 키와 분리한 전용 키(D46) — 축마다
+// 크기·성장·구제 경로가 달라 한쪽 조정이 다른 축을 무력화하면 안 된다. 이름이 "file"이고
+// 이제 실제로 file 축(총점유)을 잰다 — 계약 6이 잠시 live에 붙였던 이름/의미 불일치도 닫혔다.
 func contentFileWarnBytes(getenv func(string) string) int64 {
-	if v, err := strconv.ParseInt(getenv("CTR_CONTENT_FILE_WARN_BYTES"), 10, 64); err == nil && v > 0 {
-		return v
-	}
-	return defaultContentFileWarnBytes
+	return warnBytesEnv(getenv, "CTR_CONTENT_FILE_WARN_BYTES", defaultContentFileWarnBytes)
+}
+
+// contentLiveWarnBytes — CTR_CONTENT_LIVE_WARN_BYTES(신규 키, 릴리스 패스 B1). file 키와
+// 나눈 이유는 두 축이 서로 다른 질문에 답하기 때문이다: 둘 다 뜰 수 있고 그것이 의도다.
+func contentLiveWarnBytes(getenv func(string) string) int64 {
+	return warnBytesEnv(getenv, "CTR_CONTENT_LIVE_WARN_BYTES", defaultContentLiveWarnBytes)
 }
 
 // Run: cli 서브커맨드 단일 진입점. storeRoot·projectRoot는 main이 이미 결정해 넘긴다(cli는
@@ -931,8 +946,15 @@ func runPurge(ctx context.Context, in io.Reader, w, stderr io.Writer, storeRoot 
 			// D102 계약 4 — runPurgeHookOnly와 같은 이유·같은 순서(VACUUM 앞, 실패해도 진행,
 			// 종료 상태에는 반영). 프로젝트별 보고 후 계속하고 루프 끝에서 집계한다(D50 관례).
 			if merr := st.MergeFTS(ctx); merr != nil {
-				fmt.Fprintf(stderr, "ctr: %s: FTS 병합 실패(회수량이 줄어든다): %v\n", id, merr)
+				fprintMergeErr(stderr, fmt.Sprintf("ctr: %s: %s", id, mergeFailMsg(merr)), merr)
 				mergeFailed++
+				// M5(릴리스 패스): 디스크 계열 병합 실패도 VACUUM 실패와 **같은 가드**를 탄다 —
+				// 꽉 찬 디스크에서 --all 스윕이 잔여 프로젝트로 계속 밀어붙이는 것을 막는다.
+				// 이 프로젝트의 VACUUM은 계약 4대로 그대로 진행한다(부분 회수 > 무회수);
+				// 가드가 걸리는 것은 잔여 프로젝트다.
+				if store.IsDiskErr(merr) {
+					vacuumDiskAbort = true
+				}
 			}
 			if verr := vacuumReclaim(ctx, st, projDir, beforeB, w); verr != nil {
 				fmt.Fprintf(stderr, "ctr: %s: %v\n", id, verr)
@@ -962,6 +984,27 @@ func runPurge(ctx context.Context, in io.Reader, w, stderr io.Writer, storeRoot 
 		return fmt.Errorf("purge: %d개 프로젝트 FTS 병합 실패 — 회수가 부분에 그쳤습니다", mergeFailed)
 	}
 	return nil
+}
+
+// mergeFailMsg — 병합 실패 안내 문면. BUSY/LOCKED가 원인에 **섞여 있으면** 경합 안내를 덧붙인다
+// (릴리스 패스 M4) — vacuumReclaim이 VACUUM 경합에 쓰는 것과 같은 규율이다. errors.Join 위의
+// IsBusyErr는 OR라 "전부 경합"을 뜻하지 않으므로 문면도 그 이상을 주장하지 않는다: 축별 원인은
+// 바로 아래 fprintMergeErr가 줄마다 그대로 낸다.
+func mergeFailMsg(err error) string {
+	if store.IsBusyErr(err) {
+		return "FTS 병합 실패(회수량이 줄어든다) — 경합 포함(라이브 프로세스 가동 중 추정 — 종료 후 재시도)"
+	}
+	return "FTS 병합 실패(회수량이 줄어든다)"
+}
+
+// fprintMergeErr — 원인을 **줄마다 접두를 붙여** 낸다(릴리스 패스 B5). MergeFTS는 두 축
+// (porter·trigram)의 실패를 errors.Join으로 합치고 그 Error()는 원소 사이에 개행을 넣으므로,
+// %v로 한 번에 찍으면 둘째 줄부터 접두 없는 맨 줄이 되어 "한 줄 = 한 진단"인 stderr 문면이
+// 깨진다(줄 단위로 읽는 스크립트가 그 줄의 출처를 잃는다).
+func fprintMergeErr(w io.Writer, prefix string, err error) {
+	for _, line := range strings.Split(err.Error(), "\n") {
+		fmt.Fprintf(w, "%s: %s\n", prefix, line)
+	}
 }
 
 // contentFootprint — content.db+(-wal/-shm) 총합 바이트(부재=0). D50 보고·검증은 main 파일
@@ -1050,7 +1093,7 @@ func runPurgeHookOnly(ctx context.Context, in io.Reader, w, stderr io.Writer, st
 		// 무회수보다 낫고 이미 커밋된 삭제는 유효하다 — 다만 **종료 상태에는 반영한다**:
 		// 스크립트가 부른 실행이 free page 몫만 회수하고 성공으로 보이면 안 된다.
 		if mergeErr = st.MergeFTS(ctx); mergeErr != nil {
-			fmt.Fprintf(stderr, "ctr: FTS 병합 실패(회수량이 줄어든다): %v\n", mergeErr)
+			fprintMergeErr(stderr, "ctr: "+mergeFailMsg(mergeErr), mergeErr)
 		}
 		// ⑤ D55: vacuumReclaim 합류 — checkpoint busy 검증·총합 보고, 실패는 rc≠0(본경로 동일).
 		vacErr = vacuumReclaim(ctx, st, projDir, beforeB, w)
@@ -1064,6 +1107,13 @@ func runPurgeHookOnly(ctx context.Context, in io.Reader, w, stderr io.Writer, st
 	}
 	if mergeErr != nil {
 		// 원인 문면은 위에서 stderr로 이미 냈다 — 반환 오류에는 경로 없는 정적 메시지만 남긴다(§12 canary).
+		// closeErr를 **버리지 않는다**(릴리스 패스 B4): 옛 코드는 mergeErr가 있으면 닫기 실패를
+		// 반환에도 stderr에도 내지 않아, 라이터를 못 닫은(=체크포인트 실패 포함) 실행이 병합 실패
+		// 하나로만 보였다. 반환값에 합치지 않는 이유는 Close 자신이 errors.Join이라 그 문면에
+		// 개행이 들어가기 때문이다(B5와 같은 결함) — 원인은 stderr에 줄마다 접두를 붙여 낸다.
+		if closeErr != nil {
+			fprintMergeErr(stderr, "ctr: store 닫기 실패", closeErr)
+		}
 		return errors.New("purge: FTS 병합 실패 — 회수가 부분에 그쳤습니다")
 	}
 	return closeErr
@@ -1890,39 +1940,55 @@ func runDoctor(ctx context.Context, w io.Writer, storeRoot, projectRoot, version
 	// 서버가 동시 실행 중이면 SizeStats의 ro-open이 content.db 점유와 경합해 실패할 수 있고 그때도
 	// "없음"으로 나온다 — 손상이 아니라 일시적 경합(서버 정지 후 재실행하면 값이 나옴).
 	var sz *store.SizeStat // [15]가 소비 — [14] else에서만 채워지고 그 외엔 nil(귀속 0으로 처리)
+	projDir := filepath.Join(storeRoot, "projects", canon.ProjectID)
 	if canon.ProjectID == "" {
 		fmt.Fprintln(w, "[14] content.db: 없음")
-	} else if s, err := store.SizeStats(filepath.Join(storeRoot, "projects", canon.ProjectID)); err != nil || s == nil {
+	} else if s, err := store.SizeStats(projDir); err != nil || s == nil {
 		fmt.Fprintln(w, "[14] content.db: 없음")
 	} else {
 		sz = s
-		// D102 계약 6의 **판정값**을 정보 줄에도 병기한다(최종리뷰 F8) — 경고가 없는 상태에서
-		// 사용자가 판정을 재현하려고 file-free를 손으로 빼야 하는 것을 없앤다. 정의와 클램프
-		// 근거는 아래 경고 분기 주석이 갖는다.
-		live := max(0, sz.FileBytes-sz.FreeBytes)
-		fmt.Fprintf(w, "[14] content.db: sources=%d artifacts=%d blob=%dB file=%dB free=%dB live=%dB\n",
-			sz.Sources, sz.Artifacts, sz.BlobBytes, sz.FileBytes, sz.FreeBytes, live)
+		// 두 축의 **판정값**을 정보 줄에 병기한다(최종리뷰 F8, 릴리스 패스 B1·B2) — 경고가 없는
+		// 상태에서 사용자가 판정을 손으로 재현해야 하는 것을 없앤다. file은 contentFootprint
+		// (본체+`-wal`+`-shm`)이고 live는 store가 한 스냅샷 안에서 낸 값이다: 옛 file-free는 서로
+		// 다른 두 스냅샷의 뺄셈이라 WAL이 클 때 0으로 읽혔다(정의는 store.SizeStats 주석).
+		fileB := contentFootprint(projDir)
+		// 측정 실패는 0과 갈라 적는다(릴리스 패스 M3) — free=0B가 "free page 없음"과 "pragma
+		// 실패"를 같은 문면으로 내면 판정을 재현할 수 없다.
+		freeS, liveS := "측정실패", "측정실패"
+		if sz.PageStatsOK {
+			freeS = strconv.FormatInt(sz.FreeBytes, 10) + "B"
+			liveS = strconv.FormatInt(sz.LiveBytes, 10) + "B"
+		}
+		fmt.Fprintf(w, "[14] content.db: sources=%d artifacts=%d blob=%dB file=%dB(db+wal+shm) free=%s live=%s\n",
+			sz.Sources, sz.Artifacts, sz.BlobBytes, fileB, freeS, liveS)
 		// D38 — CAS 전체 blob 총량 경고(shadow 전용 아님 — [14] 측정 실체 그대로). 관측 채널이지
 		// 정책 집행이 아니다(D27): [14] 자신은 아무것도 지우지 않는다. SizeStats 실패 경로는 이
 		// 분기 밖이라 미평가.
 		if warn := storeWarnBytes(os.Getenv); sz.BlobBytes > warn {
 			fmt.Fprintf(w, "[14] warning: blob %dB > 임계 %dB(CTR_STORE_WARN_BYTES) — 수동 구제는 purge 계열 CLI(purge --project <id> --hook-only로 shadow만 선택 삭제 가능). shadow 귀속분은 기동 시 D67 퍼지가 보존 창 밖의 것을 자동 회수한다(explicit 소스는 자동 삭제 없음)\n", sz.BlobBytes, warn)
 		}
-		// D102 계약 6·8 — content.db 라이브 축(청크 텍스트+FTS) 자문 경고. 판정은 파일 크기가
-		// 아니라 live 바이트다: 자동 경로가 VACUUM을 하지 않으므로 파일은 고수위에 머물고,
-		// 파일 기준 임계는 정리 뒤에도 상시 초과라 신호로서 죽는다(D67의 관측된 결함).
-		// free는 **live 계산에서 차감할 뿐 독립된 경고 신호로 쓰지 않는다**(계약 7, 최종리뷰 F5) —
-		// 병합 안 된 세그먼트는 free page가 아니라 live page라 freelist는 결함이 있을 때 오히려
-		// 낮게 읽히기 때문이다. 문면의 "자동 VACUUM 없음"은 옛 "자동 삭제 없음"을 고친
-		// 것이다: 바로 위에서 보고하는 artifacts 수는 D67 퍼지 때문에 사용자 조작 없이 줄어든다.
-		// os.Stat(FileBytes)와 PRAGMA freelist_count(FreeBytes)는 서로 다른 스냅샷일 수 있다
-		// (doctor는 라이브 서버가 도는 중에 도는 것이 정상이라 체크포인트 직전 WAL이 큰 순간엔
-		// file-free가 음수로도 나온다) — 0으로 클램프해 그 무의미한 음수 표시를 없앤다.
-		// contentFileWarnBytes는 항상 양수(파싱 실패·비양수는 기본값으로 폴백)이므로
-		// max(0,x) > warn ⟺ x > warn이고, 경고 발화 여부 자체는 클램프 유무와 무관하다.
-		if warn := contentFileWarnBytes(os.Getenv); live > warn {
-			fmt.Fprintf(w, "[14] warning: live %dB > 임계 %dB(CTR_CONTENT_FILE_WARN_BYTES) — 청크 텍스트+FTS 축(자문, live=file-free). free %dB는 live 계산에서 차감할 뿐 독립된 경고 신호로 쓰지 않는다(병합 안 된 세그먼트는 live page라 freelist는 결함이 있을 때 오히려 낮게 읽힌다). 파일 축소는 VACUUM(라이브 서버 제약 — 서버 비가동 시 purge --older-than --vacuum), --hook-only는 shadow 귀속 한정(explicit 소스 감축은 전체 purge). 훅 아티팩트 보존 창 %s(CTR_SHADOW_RETENTION). 자동 VACUUM 없음\n",
-				live, warn, sz.FreeBytes, store.ShadowRetention(os.Getenv))
+		// D102 계약 6·8 — 축이 둘이다(소유자 판정, 릴리스 패스 B1·B2). **둘 다 뜰 수 있고 그것이
+		// 의도다**: 서로 다른 질문에 답하기 때문이다.
+		//
+		// ① live 축 — "쓰레기가 쌓였나". 파일 크기로는 이 신호가 안 산다(자동 경로가 VACUUM을
+		// 하지 않아 파일은 고수위에 머물고, 파일 기준 임계는 정리 뒤에도 상시 초과라 죽는다 —
+		// D67의 관측된 결함). free는 **live 산출에서 차감할 뿐 독립된 경고 신호가 아니다**
+		// (계약 7, 최종리뷰 F5) — 병합 안 된 세그먼트는 free page가 아니라 live page라 freelist는
+		// 결함이 있을 때 오히려 낮게 읽힌다. 측정 실패(PageStatsOK=false)에서는 아예 판정하지
+		// 않는다 — 0을 "깨끗하다"로 읽으면 안 된다(릴리스 패스 M3).
+		if warn := contentLiveWarnBytes(os.Getenv); sz.PageStatsOK && sz.LiveBytes > warn {
+			fmt.Fprintf(w, "[14] warning: live %dB > 임계 %dB(CTR_CONTENT_LIVE_WARN_BYTES) — 살아 있는 페이지(청크 텍스트+FTS) 축(자문, live=(page_count-freelist_count)×page_size 한 스냅샷). 콘텐츠가 늘었거나 병합이 밀렸다는 뜻이고 VACUUM으로는 안 줄어든다 — 줄이는 것은 삭제+병합이다: 훅 아티팩트 보존 창 %s(CTR_SHADOW_RETENTION) 밖은 기동 시 D67 퍼지가 자동 회수하고, 즉시 줄이려면 purge --project <id> --hook-only(shadow 귀속 한정, explicit 소스 감축은 전체 purge)\n",
+				sz.LiveBytes, warn, store.ShadowRetention(os.Getenv))
+		}
+		// ② file 축 — "디스크를 얼마나 먹나". 0.19.0이 경고하던 자리를 되살린 것이다(릴리스 패스
+		// B2): 계약 6이 판정을 live로 옮기면서 **회수 가능한 페이지로 부푼 파일**(정확히 VACUUM이
+		// 필요한 상태)에 대해 아무 진단도 남지 않았다. 재는 값은 contentFootprint(본체+`-wal`+
+		// `-shm`)라 계약 5가 적은 `-wal` 팽창도 이 축이 덮는다. 문면의 "자동 VACUUM 없음"은 옛
+		// "자동 삭제 없음"을 고친 것이다 — 위에서 보고하는 artifacts 수는 D67 퍼지 때문에 사용자
+		// 조작 없이 줄어든다.
+		if warn := contentFileWarnBytes(os.Getenv); fileB > warn {
+			fmt.Fprintf(w, "[14] warning: file %dB > 임계 %dB(CTR_CONTENT_FILE_WARN_BYTES) — content.db 총점유(본체+-wal+-shm) 축(자문). 회수 가능분 free=%s는 VACUUM이 되돌린다(라이브 서버 제약 — 서버 비가동 시 purge --project <id> --older-than <기간> --vacuum). 자동 VACUUM 없음 — 자동 경로는 free page 재사용에 기대므로 파일은 고수위에 머문다(D102 계약 5)\n",
+				fileB, warn, freeS)
 		}
 	}
 
