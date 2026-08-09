@@ -847,6 +847,7 @@ func runPurge(ctx context.Context, in io.Reader, w, stderr io.Writer, storeRoot 
 	}
 
 	var vacuumFailed int
+	var mergeFailed int
 	var vacuumDiskAbort bool
 	for _, id := range ids {
 		if err := ctx.Err(); err != nil { // --all 다중 순회 취소 전파
@@ -925,9 +926,12 @@ func runPurge(ctx context.Context, in io.Reader, w, stderr io.Writer, storeRoot 
 			_, purgeErr = st.GCOrphanBlobs(ctx)
 		}
 		if purgeErr == nil && *vacuum && !vacuumDiskAbort {
-			// D50 집계 계약: VACUUM/checkpoint 실패는 프로젝트별 보고 후 계속 진행하고 루프
-			// 종료 시 비-zero로 집계한다(무성 성공 위장 방지). 디스크 계열(FULL/IOERR)만
-			// 잔여 프로젝트 VACUUM 중단(연쇄 악화 방지).
+			// D102 계약 4 — runPurgeHookOnly와 같은 이유·같은 순서(VACUUM 앞, 실패해도 진행,
+			// 종료 상태에는 반영). 프로젝트별 보고 후 계속하고 루프 끝에서 집계한다(D50 관례).
+			if merr := st.MergeFTS(ctx); merr != nil {
+				fmt.Fprintf(stderr, "ctr: %s: FTS 병합 실패(회수량이 줄어든다): %v\n", id, merr)
+				mergeFailed++
+			}
 			if verr := vacuumReclaim(ctx, st, projDir, beforeB, w); verr != nil {
 				fmt.Fprintf(stderr, "ctr: %s: %v\n", id, verr)
 				vacuumFailed++
@@ -951,6 +955,9 @@ func runPurge(ctx context.Context, in io.Reader, w, stderr io.Writer, storeRoot 
 	}
 	if vacuumFailed > 0 {
 		return fmt.Errorf("purge: %d개 프로젝트 VACUUM/checkpoint 실패", vacuumFailed)
+	}
+	if mergeFailed > 0 {
+		return fmt.Errorf("purge: %d개 프로젝트 FTS 병합 실패 — 회수가 부분에 그쳤습니다", mergeFailed)
 	}
 	return nil
 }
@@ -1029,13 +1036,21 @@ func runPurgeHookOnly(ctx context.Context, in io.Reader, w, stderr io.Writer, st
 	}
 	beforeB := contentFootprint(projDir) // D55: open 후·PurgeHookOnly 전 — 삭제+VACUUM 효과 격리(스펙 §0)
 	rep, purgeErr := st.PurgeHookOnly(ctx)
-	var vacErr error
+	var mergeErr, vacErr error
 	if purgeErr == nil {
 		// ④ 실회수 보고 먼저(스펙 §3 순서) — VACUUM 성패와 무관하게 부분 성공을 즉시 노출한다.
 		fmt.Fprintf(w, "hook-only purge: 실회수 %dB(%d hashes), 유예 %d건, 실패 %d건\n",
 			rep.ReclaimedB, rep.Hashes, rep.DeferredFiles, rep.FailedFiles)
+		// D102 계약 4: VACUUM은 free page만 되돌린다. 삭제가 남긴 FTS tombstone은 **free page가
+		// 아니라 live page**라 병합해야 회수되고, 병합 없이 VACUUM만 하면 회수 가능분의 약 30%만
+		// 돌아온다. 사용자가 회수를 명시로 요청한 자리이므로 주기 게이트를 걸지 않고, 스탬프도
+		// 갱신하지 않는다(스탬프는 자동 경로 것이다). 실패해도 VACUUM은 진행한다 — 부분 회수가
+		// 무회수보다 낫고 이미 커밋된 삭제는 유효하다 — 다만 **종료 상태에는 반영한다**:
+		// 스크립트가 부른 실행이 free page 몫만 회수하고 성공으로 보이면 안 된다.
+		if mergeErr = st.MergeFTS(ctx); mergeErr != nil {
+			fmt.Fprintf(stderr, "ctr: FTS 병합 실패(회수량이 줄어든다): %v\n", mergeErr)
+		}
 		// ⑤ D55: vacuumReclaim 합류 — checkpoint busy 검증·총합 보고, 실패는 rc≠0(본경로 동일).
-		// 이미 커밋된 삭제분은 유지된다(vacuumReclaim 계약 — 호출자 미롤백).
 		vacErr = vacuumReclaim(ctx, st, projDir, beforeB, w)
 	}
 	closeErr := st.Close()
@@ -1044,6 +1059,10 @@ func runPurgeHookOnly(ctx context.Context, in io.Reader, w, stderr io.Writer, st
 	}
 	if vacErr != nil {
 		return vacErr
+	}
+	if mergeErr != nil {
+		// 원인 문면은 위에서 stderr로 이미 냈다 — 반환 오류에는 경로 없는 정적 메시지만 남긴다(§12 canary).
+		return errors.New("purge: FTS 병합 실패 — 회수가 부분에 그쳤습니다")
 	}
 	return closeErr
 }

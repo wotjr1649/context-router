@@ -15,6 +15,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime/debug"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -2619,6 +2620,98 @@ func TestPurgeHookOnlyVacuumFailurePropagates(t *testing.T) {
 	}
 	if !strings.Contains(gw.buf.String(), "실회수") {
 		t.Fatalf("실회수 보고가 VACUUM 이전에 안 나옴:\n%s", gw.buf.String())
+	}
+}
+
+// seedShadowChunkedProject — hook 귀속 아티팩트 12건을 **Chunks를 실어** 시드해 FTS 인덱스를
+// 실제로 채우고, file(비귀속) 소스 하나를 남겨 --hook-only가 선택 삭제임을 유지한다.
+// 공용 seedShadowContentDB(cli_test.go:466)를 쓰지 않는 이유: 그 헬퍼는 Chunks 없는
+// Registration을 만들고 Register는 reg.Chunks에서만 chunks를 INSERT하므로(store.go:459)
+// fts_trigram_data가 병합 전후 모두 0바이트다 — 그 헬퍼로 시드하면 이 테스트는 병합이 있든
+// 없든 통과한다. 기존 헬퍼는 다른 테스트가 행수를 단정하므로 건드리지 않는다.
+func seedShadowChunkedProject(t *testing.T) (pid, projDir string) {
+	t.Helper()
+	storeRoot, projectRoot := t.TempDir(), t.TempDir()
+	canon, err := ident.Canonicalize(projectRoot)
+	if err != nil {
+		t.Fatalf("canonicalize: %v", err)
+	}
+	pid = canon.ProjectID
+	projDir = filepath.Join(storeRoot, "projects", pid)
+	st, err := store.Open(projDir, false)
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	body := strings.Repeat("segment merge probe ", 4000) // 약 80 KB/건
+	for i := range 12 {
+		s := body + strconv.Itoa(i)
+		if _, err := st.Register(context.Background(), store.Registration{
+			StoredBytes: []byte(s), MediaType: "text/plain",
+			Source: store.SourceMeta{
+				URI: "shadow:Bash:" + strconv.Itoa(i), Kind: "hook", SrcHash: "sh" + strconv.Itoa(i),
+			},
+			Chunks: []store.Chunk{{Ordinal: 0, ByteEnd: int64(len(s)), Text: s}},
+		}); err != nil {
+			t.Fatalf("register hook %d: %v", i, err)
+		}
+	}
+	if _, err := st.Register(context.Background(), store.Registration{ // 비귀속 — 보존 대상
+		StoredBytes: []byte("explicit-file-content"), MediaType: "text/plain",
+		Source: store.SourceMeta{URI: "/tmp/f.txt", Kind: "file", SrcHash: "sh-file"},
+		Chunks: []store.Chunk{{Ordinal: 0, Text: "explicit-file-content"}},
+	}); err != nil {
+		t.Fatalf("register file: %v", err)
+	}
+	// **여기서 반드시 닫는다** — runPurge는 writable Open(lockStore)을 하므로 열어 둔 채
+	// 부르면 잠금 경합으로 실패한다.
+	if err := st.Close(); err != nil {
+		t.Fatalf("store.Close: %v", err)
+	}
+	return pid, projDir
+}
+
+// ftsTrigramBytesRO — projDir/content.db를 read-only로 열어 fts_trigram_data의 block 바이트
+// 합을 읽는다. 파일 크기가 아니라 이 값을 재는 이유: VACUUM은 라이브 프로세스 제약을 받아
+// 테스트에서 불안정하지만 병합 여부는 결정적이다.
+func ftsTrigramBytesRO(t *testing.T, projDir string) int64 {
+	t.Helper()
+	st, err := store.Open(projDir, true)
+	if err != nil {
+		t.Fatalf("store.Open ro: %v", err)
+	}
+	defer func() { _ = st.Close() }()
+	var n int64
+	if err := st.Reader().QueryRow(
+		`SELECT coalesce(sum(length(block)),0) FROM fts_trigram_data`,
+	).Scan(&n); err != nil {
+		t.Fatalf("fts_trigram_data: %v", err)
+	}
+	return n
+}
+
+// TestPurgeHookOnlyMergesBeforeVacuum: --hook-only가 VACUUM 전에 FTS를 병합한다.
+// 병합 없이 VACUUM만 하면 tombstone은 free page가 아니라 live page라 회수되지 않는다 —
+// 실측 기준으로 회수 가능분의 29.6%만 돌아온다(설계 v0.20 D102 계약 4).
+// 진입점은 runPurge다: runPurgeHookOnly를 직접 부르는 테스트는 없고 --hook-only는 runPurge의
+// 조기 분기(cli.go:793-801)가 인터셉트한다. --force가 없으면 비TTY에서 confirmPurge가 즉시
+// 거부한다(cli.go:682-687).
+func TestPurgeHookOnlyMergesBeforeVacuum(t *testing.T) {
+	pid, projDir := seedShadowChunkedProject(t)
+	storeRoot := storeRootOf(projDir)
+	before := ftsTrigramBytesRO(t, projDir)
+	if before < 200<<10 { // 시드 약 960 KB 텍스트 → trigram 인덱스는 그 몇 배다
+		t.Fatalf("시드가 FTS를 충분히 채우지 않았다(%dB) — 이 테스트가 공허 통과한다", before)
+	}
+
+	var out bytes.Buffer
+	args := []string{"--project", pid, "--hook-only", "--force"}
+	if err := runPurge(context.Background(), failReader{}, &out, io.Discard, storeRoot, args, false); err != nil {
+		t.Fatalf("runPurge err=%v out=%s", err, out.String())
+	}
+
+	after := ftsTrigramBytesRO(t, projDir)
+	if after >= before {
+		t.Fatalf("병합이 없다 — 삭제만으로는 세그먼트가 줄지 않는다: %d → %d", before, after)
 	}
 }
 
