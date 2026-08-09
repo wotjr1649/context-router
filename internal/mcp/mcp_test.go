@@ -2834,3 +2834,93 @@ func TestExportEvents_LedgerAppend(t *testing.T) {
 		t.Fatalf("ctr_export_events ledger row missing: %+v", stats)
 	}
 }
+
+// --- ctr_fetch 원장 계측 (태스크 8b, 설계 v0.20 D103 계약 2·3) ---
+
+// TestFetchRecordsMissOnlyOnAbsentArtifact: 없는 artifact를 요청하면 미해소 행이 남고,
+// 잘못된 chunk id·잘못된 선택자는 남지 않는다. 앞의 둘은 store.ErrNotFound 하나를 공유하므로
+// (store.go:722·607) errors.Is로는 안 갈린다 — 이 테스트가 그 구분을 고정한다(D103 계약 3).
+func TestFetchRecordsMissOnlyOnAbsentArtifact(t *testing.T) {
+	cs, st, _, storeDir := newRecordEventTestServer(t)
+	ctx := context.Background()
+
+	body := "haystack needle haystack"
+	artID, err := st.Register(ctx, store.Registration{
+		StoredBytes: []byte(body), MediaType: "text/plain",
+		Source: store.SourceMeta{URI: "shadow:Bash:hit", Kind: "hook", SrcHash: "sh-hit"},
+		Chunks: []store.Chunk{{Ordinal: 0, ByteEnd: int64(len(body)), Text: body}},
+	})
+	if err != nil {
+		t.Fatalf("register: %v", err)
+	}
+
+	// ① 없는 artifact → 미해소 1행
+	callFetch(t, cs, FetchInput{ArtifactID: artID + 9999, ChunkID: ptrTo(int64(1))})
+	if fs := fetchStats(t, storeDir); fs.Missed != 1 || fs.Resolved != 0 {
+		t.Fatalf("artifact 부재 뒤 resolved=%d missed=%d, 기대 0/1", fs.Resolved, fs.Missed)
+	}
+	// ② 있는 artifact + 없는 chunk id → 입력 문제다, 미해소가 늘면 안 된다
+	callFetch(t, cs, FetchInput{ArtifactID: artID, ChunkID: ptrTo(int64(999_999))})
+	if fs := fetchStats(t, storeDir); fs.Missed != 1 {
+		t.Fatalf("잘못된 chunk id가 미해소로 셌다: missed=%d, 기대 1", fs.Missed)
+	}
+	// ③ 선택자 없음(ErrInvalidSelector) → 역시 늘지 않는다
+	callFetch(t, cs, FetchInput{ArtifactID: artID})
+	if fs := fetchStats(t, storeDir); fs.Missed != 1 {
+		t.Fatalf("잘못된 선택자가 미해소로 셌다: missed=%d, 기대 1", fs.Missed)
+	}
+}
+
+// TestFetchRecordsAgeOnResolve: 해소되면 나이가 박힌다. 시계는 max(sources.indexed_at)이므로
+// 소스 시각을 과거로 옮기면 그만큼 나이가 나온다(D103 계약 2).
+func TestFetchRecordsAgeOnResolve(t *testing.T) {
+	cs, st, _, storeDir := newRecordEventTestServer(t)
+	ctx := context.Background()
+	body := "resolved body"
+	artID, err := st.Register(ctx, store.Registration{
+		StoredBytes: []byte(body), MediaType: "text/plain",
+		Source: store.SourceMeta{URI: "shadow:Bash:age", Kind: "hook", SrcHash: "sh-age"},
+		Chunks: []store.Chunk{{Ordinal: 0, ByteEnd: int64(len(body)), Text: body}},
+	})
+	if err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	if _, err := st.Reader().Exec(
+		`UPDATE sources SET indexed_at=? WHERE uri='shadow:Bash:age'`,
+		time.Now().Add(-2*time.Hour).Unix(),
+	); err != nil {
+		t.Fatalf("소스 시각: %v", err)
+	}
+
+	callFetch(t, cs, FetchInput{ArtifactID: artID, ByteStart: ptrTo(int64(0)), ByteEnd: ptrTo(int64(5))})
+	fs := fetchStats(t, storeDir)
+	if fs.Resolved != 1 || fs.Missed != 0 {
+		t.Fatalf("resolved=%d missed=%d, 기대 1/0", fs.Resolved, fs.Missed)
+	}
+	if fs.AgeMax < 7000 || fs.AgeMax > 7400 { // 2시간 = 7200초, 실행 시각 오차 허용
+		t.Fatalf("AgeMax=%d, 기대 약 7200", fs.AgeMax)
+	}
+}
+
+// callFetch: ctr_fetch를 한 번 부른다. 오류 응답도 정상 반환이다(IsError로 온다) — 이 테스트가
+// 재는 것은 응답이 아니라 원장이다.
+func callFetch(t *testing.T, cs *mcp.ClientSession, in FetchInput) {
+	t.Helper()
+	if _, err := cs.CallTool(context.Background(),
+		&mcp.CallToolParams{Name: "ctr_fetch", Arguments: in}); err != nil {
+		t.Fatalf("call ctr_fetch: %v", err)
+	}
+}
+
+// fetchStats: storeDir의 원장에서 회수 실적을 읽는다(라이브 writer와 동시 열기 —
+// TestRecordEventLedgerAppend가 LedgerStats로 하는 것과 같은 형태다).
+func fetchStats(t *testing.T, storeDir string) store.FetchStat {
+	t.Helper()
+	fs, err := store.LedgerFetchStats(storeDir)
+	if err != nil {
+		t.Fatalf("LedgerFetchStats: %v", err)
+	}
+	return fs
+}
+
+func ptrTo[T any](v T) *T { return &v }

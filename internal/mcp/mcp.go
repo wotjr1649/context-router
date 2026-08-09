@@ -543,6 +543,17 @@ func registerFetch(srv *mcp.Server, st *store.Store, worktreeRoot string) {
 		}
 		res, err := st.ReadRange(ctx, in.ArtifactID, sel)
 		if err != nil {
+			// D103 계약 3: ErrNotFound **둘 중 artifact 부재만** 미해소로 센다. ReadRange의
+			// artifact 부재(store.go:722)와 readChunk의 chunk id 부재(store.go:607)가 같은
+			// 센티넬을 쓰므로 errors.Is 하나로는 안 갈린다 — artifact 행의 존재를 따로 확인해
+			// 가른다(ArtifactHashByID는 artifact 부재에만 ErrNotFound를 낸다, store.go:697).
+			// 잘못된 선택자·DB 오류는 창의 길이에 대해 아무 말도 하지 않으며, 넓게 세면 잘못된
+			// chunk id가 창을 늘리는 근거로 둔갑한다.
+			if errors.Is(err, store.ErrNotFound) {
+				if _, hashErr := st.ArtifactHashByID(ctx, in.ArtifactID); errors.Is(hashErr, store.ErrNotFound) {
+					st.LedgerAppendFetch(0, time.Since(start).Milliseconds(), 0, 0)
+				}
+			}
 			return nil, FetchOutput{}, toToolError(err)
 		}
 		maxBytes := in.MaxReturnBytes
@@ -570,7 +581,14 @@ func registerFetch(srv *mcp.Server, st *store.Store, worktreeRoot string) {
 			Provenance:        prov,
 			Untrusted:         true,
 		}
-		st.LedgerAppend("ctr_fetch", 0, jsonLen(out), time.Since(start).Milliseconds())
+		// D103 계약 2: 나이는 **회수 시점에 계산해 박는다** — 사후 계산은 아티팩트가 지워지면
+		// 불가능하다. 시계와 범위는 D67 퍼지와 같다(hash 단위 max(sources.indexed_at)).
+		// 나이 조회 실패는 회수를 실패시키지 않는다 — 0으로 두고 행은 남긴다.
+		var ageS int64
+		if at, ageErr := st.LastIndexedAtByHash(ctx, res.Artifact.ContentHash); ageErr == nil && at > 0 {
+			ageS = time.Now().Unix() - at
+		}
+		st.LedgerAppendFetch(jsonLen(out), time.Since(start).Milliseconds(), res.Artifact.ID, ageS)
 		return nil, out, nil
 	})
 }
