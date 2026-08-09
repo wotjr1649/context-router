@@ -456,28 +456,6 @@ func parseLogLevel(s string) slog.Level {
 	}
 }
 
-// defaultShadowRetention — shadow 귀속 아티팩트 보존 기간(설계 v0.12 D67). 훅이 가로챈
-// 출력은 대개 해당 세션 안에서 소비되므로 짧게 잡는다.
-const defaultShadowRetention = 72 * time.Hour
-
-// shadowRetention — CTR_SHADOW_RETENTION(time.ParseDuration 형식) 양수만 채택한다.
-// 파싱 실패·비양수는 기본값(storeWarnBytes와 같은 규율 — 잘못된 값이 정책을 무력화하지
-// 않게 한다).
-func shadowRetention(getenv func(string) string) time.Duration {
-	if d, err := time.ParseDuration(getenv("CTR_SHADOW_RETENTION")); err == nil && d > 0 {
-		return d
-	}
-	return defaultShadowRetention
-}
-
-// shadowCutoff — 보존 기간 d에 대한 회수 경계(unix 초). **0 이하면 회수를 건너뛰어야 한다**: store는
-// cutoffUnix<=0을 "나이 필터 없음"으로 읽으므로(store.shadowOwnedFilter — TestPurgeHookOnlyOlderThanZeroMeansAll
-// 이 그 계약을 고정한다) 보존을 늘리려는 설정이 나이 무관 전량 삭제로 반전된다. d가 epoch 경과분(약 56년)
-// 이상이면 그 경계에 닿는다 — 경계가 정확히 0에서 시작하므로 판정도 `<= 0`이다(T12-F1).
-func shadowCutoff(now time.Time, d time.Duration) int64 {
-	return now.Add(-d).Unix()
-}
-
 // startupPurgeBudget — 기동 회수 고루틴의 폭주 가드. 회수는 mcp.Serve를 막지 않는 별도 고루틴이라
 // 이 값은 세션 시작 지연이 아니고, 정상적으로 느린 회수를 끊지 않을 만큼 넉넉해야 한다: 실측
 // 배치 보유가 100해시 약 0.63s(6~9ms/hash, 210MiB store)이고 거기에 txRetry BUSY 백오프(50/200/800ms)와
@@ -521,6 +499,54 @@ const startupPurgeBudget = 60 * time.Second
 // 저장소(색인 없음, 아티팩트 1254개·210MiB) 값이라 색인 유무도 분포도 달라 절대값
 // 비교는 성립하지 않는다 — 게이트가 잡는 것은 해시당 비용의 회귀다.
 const startupPurgeMaxHashes = 100
+
+// defaultFTSMergeInterval — D102 계약 2. 세그먼트 축적이 하루 약 36 MB이고 정상상태 병합이
+// 약 1.2초 쓰기 락을 잡는다(설계 v0.20 관측 B). 그 보유가 훅 Read 가드의 2000 ms 총예산과
+// 겹치면 그 훅의 포착이 버려지므로(계약 9 — 수용 위험, doctor [12]의 shadow-store drop으로
+// 사후 관측된다) 하루 한 번으로 묶는다.
+const defaultFTSMergeInterval = 24 * time.Hour
+
+// ftsMergeStartDelay — 기동 첨두를 비켜나는 지연. 기동 직후에는 퍼지 배치가 쓰기 락을 잡고
+// (startupPurgeMaxHashes 주석의 실측 보유) 세션 시작 훅이 몰린다 — 그 첨두를 비켜 서려는
+// **경험적 완화이지 겹치지 않는다는 보장이 아니다**(최종리뷰 F6): 기동 퍼지의 예산은
+// startupPurgeBudget(60초)이라 느린 퍼지는 이 지연을 넘겨서까지 돈다. 겹쳐도 무해한 것은
+// 확인했다 — 병합은 SQLite 쓰기 락만 잡고 회수는 advisory 락 아래 파일 조작+reader 질의라
+// 둘 사이에 락 순환이 없다(둘째 것이 첫째 것을 기다릴 뿐이다).
+// **이 지연보다 짧은 세션은 병합하지 않는다**(의도된 성질): 스탬프는 벽시계라 다음에 이 지연을
+// 넘긴 세션 하나가 밀린 몫을 한 번에 걷는다.
+const ftsMergeStartDelay = 30 * time.Second
+
+// runFTSMergeLoop — D102 계약 2의 자동 경로. ctx가 죽을 때까지 delay 뒤 한 번, 그 뒤 interval
+// 마다 조건을 다시 본다. **기동 퍼지 고루틴에 얹지 않는 이유가 셋이다**(설계 v0.20 D102 계약 2):
+// 그 고루틴은 기동당 1회만 돌아 오래 사는 서버에서 병합이 영영 안 오고, purgeErr는 정상 종료
+// (purgeCtx 취소)에서도 non-nil이며, 60초 예산을 나눠 쓰면 optimize가 단일 암시 트랜잭션이라
+// 중단 시 통째 롤백돼 매번 0의 진전을 낸다. 그래서 여기는 purgeErr를 보지 않고 purgeCtx도
+// 쓰지 않는다. 실패는 로그만 남긴다 — 스탬프가 안 찍히므로 다음 주기가 그대로 재시도한다.
+func runFTSMergeLoop(ctx context.Context, st *store.Store, delay, interval time.Duration) {
+	t := time.NewTimer(delay)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+		start := time.Now() // 주기 판정의 now와 소요 시간의 기준점을 한 번에 읽는다(최종리뷰 F11)
+		if ran, err := st.MergeFTSIfDue(ctx, interval, start); errors.Is(err, context.Canceled) {
+			// 정상 종료(cancelMerge)도 진행 중 병합을 이 취소로 만든다 — D102 계약 2가 퍼지 고루틴을
+			// 배제한 이유 ②와 같은 형태라 같은 파일의 퍼지 선례(729행)와 강등을 맞춘다: 깨끗한
+			// 종료를 실패로 찍지 않는다.
+			slog.Debug("FTS 병합 중단 — 서버 종료", "error", err)
+		} else if err != nil {
+			slog.Warn("FTS 병합 실패 — 다음 주기에 재시도", "error", err)
+		} else if ran {
+			// took: 설계 §4-1이 배포 후 반드시 잴 것 1순위로 못박은 optimize 소요 시간 — 실측 1.2초는
+			// 하한이고 훅 예산 잠식(계약 9) 논거가 그 위에 선다.
+			slog.Info("FTS 병합 완료", "took", time.Since(start))
+		}
+		t.Reset(interval)
+	}
+}
 
 func run(ctx context.Context, args []string, stderr io.Writer) error {
 	f, err := parseFlags(args)
@@ -637,7 +663,7 @@ func run(ctx context.Context, args []string, stderr io.Writer) error {
 	// 실패하면 색인을 포기해 가드를 조용히 통과시킨다(internal/hook guardRead의 guard-store drop).
 	// 그래서 이 배치의 잠금·쓰기 락 보유 시간은 그 예산의 일부만 쓰도록 건수로 묶는다
 	// (startupPurgeMaxHashes 주석의 실측 근거).
-	cutoff := shadowCutoff(time.Now(), shadowRetention(os.Getenv))
+	cutoff := store.ShadowCutoff(time.Now(), store.ShadowRetention(os.Getenv))
 	purgeCtx, cancelPurge := context.WithTimeout(ctx, startupPurgeBudget)
 	purgeDone := make(chan struct{})
 	go func() {
@@ -647,7 +673,7 @@ func run(ctx context.Context, args []string, stderr io.Writer) error {
 			// "나이 필터 없음"으로 읽는다(shadowOwnedFilter) — 보존을 늘리려는 설정이 나이 무관 전량
 			// 삭제로 반전된다. 클램프하면 그 반전은 막아도 무의미한 배치를 한 번 돌리므로(쓰기 락을
 			// 잡는다) 회수 자체를 건너뛴다. 그 설정의 의도된 결과와도 같다 — 적격 대상이 없다.
-			// 경계 자체는 shadowCutoff의 표 테스트(TestShadowCutoffBoundary)가 고정한다.
+			// 경계 자체는 store.ShadowCutoff의 표 테스트(TestShadowCutoffBoundary, internal/store)가 고정한다.
 			return
 		}
 		rep, purgeErr := st.PurgeHookOnlyOlderThan(purgeCtx, cutoff, startupPurgeMaxHashes)
@@ -709,6 +735,18 @@ func run(ctx context.Context, args []string, stderr io.Writer) error {
 	// — 더 이상 잔여 배치 전체(≤startupPurgeMaxHashes)나 잠금 대기 최대 5초를 기다리지 않는다.
 	// 고루틴이 프로세스보다 오래 살지 않는다.
 	defer func() { cancelPurge(); <-purgeDone }()
+
+	// D102 계약 2: 병합은 퍼지와 별개 고루틴이고 서버 생존 ctx에 묶인다 — 퍼지의 60초 예산도
+	// purgeErr도 cutoff<=0 건너뛰기도 공유하지 않는다(그 셋 중 어느 것에 걸려도 병합이 영영
+	// 안 도는 구간이 생긴다). defer 등록이 st.Close()(636행)보다 뒤라 LIFO로 먼저 돌아, 고루틴이
+	// 닫힌 DB를 만지거나 프로세스보다 오래 사는 일이 없다.
+	mergeCtx, cancelMerge := context.WithCancel(ctx)
+	mergeDone := make(chan struct{})
+	go func() {
+		defer close(mergeDone)
+		runFTSMergeLoop(mergeCtx, st, ftsMergeStartDelay, defaultFTSMergeInterval)
+	}()
+	defer func() { cancelMerge(); <-mergeDone }()
 	return mcp.Serve(ctx, mcp.Config{
 		Canon: canon, Store: st, SelfExe: selfExe, ScratchRoot: scratchRoot,
 		Profile: f.Profile, Enable: f.Enable, AllowPaths: allowPaths,

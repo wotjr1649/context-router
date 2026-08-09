@@ -1851,6 +1851,38 @@ func TestSizeStatFileBytes(t *testing.T) {
 	}
 }
 
+// TestSizeStatsReportsFreeBytes: SizeStats가 회수 가능 바이트(free page)를 낸다.
+// 이 값이 없으면 "파일이 크다"와 "파일에 쓰레기가 있다"를 doctor에서 가를 수 없고,
+// 그 구분이 없어서 D67의 임계가 15일간 죽은 신호였다(설계 v0.20 관측 B).
+func TestSizeStatsReportsFreeBytes(t *testing.T) {
+	dir := t.TempDir()
+	st := openAt(t, dir)
+	body := strings.Repeat("free page seed ", 8000)
+	for i := range 10 {
+		regChunked(t, st, body+strconv.Itoa(i), "shadow:Bash:free"+strconv.Itoa(i))
+	}
+	if _, err := st.writer.Exec(`DELETE FROM chunks`); err != nil {
+		t.Fatalf("DELETE FROM chunks: %v", err)
+	}
+	if err := st.MergeFTS(t.Context()); err != nil {
+		t.Fatalf("MergeFTS: %v", err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	sz, err := SizeStats(dir)
+	if err != nil || sz == nil {
+		t.Fatalf("SizeStats: sz=%v err=%v", sz, err)
+	}
+	if sz.FreeBytes <= 0 {
+		t.Fatalf("삭제+병합 뒤인데 FreeBytes=%d", sz.FreeBytes)
+	}
+	if sz.FreeBytes > sz.FileBytes {
+		t.Fatalf("FreeBytes(%d)가 FileBytes(%d)보다 크다", sz.FreeBytes, sz.FileBytes)
+	}
+}
+
 // --- D41 PurgeHookOnly 헬퍼 (Task 5a) ---------------------------------------
 
 func hashOf(content string) string {
@@ -2305,6 +2337,54 @@ func TestPurgeHookOnlyOlderThanCapsPerRun(t *testing.T) {
 	}
 	if rep2.Hashes != 1 {
 		t.Errorf("2회차 rep.Hashes=%d want 1(잔여분)", rep2.Hashes)
+	}
+}
+
+// TestShadowRetentionDefault: 기본 보존 기간이 3일이고, 환경변수로만 조정된다.
+// 임의 상향으로 정책이 조용히 무력화되지 않도록 파싱 실패·비양수는 기본값을 쓴다
+// (storeWarnBytes와 같은 규율).
+func TestShadowRetentionDefault(t *testing.T) {
+	cases := []struct {
+		env  string
+		want time.Duration
+	}{
+		{"", 72 * time.Hour},
+		{"24h", 24 * time.Hour},
+		{"0", 72 * time.Hour},
+		{"-5h", 72 * time.Hour},
+		{"garbage", 72 * time.Hour},
+	}
+	for _, c := range cases {
+		got := ShadowRetention(func(string) string { return c.env })
+		if got != c.want {
+			t.Errorf("ShadowRetention(%q)=%v want %v", c.env, got, c.want)
+		}
+	}
+}
+
+// TestShadowCutoffBoundary: ShadowCutoff의 0 경계를 고정한다. 보존 기간이 epoch 경과분보다 크면
+// 경계가 0 이하로 내려가고, store는 cutoffUnix<=0을 "나이 필터 없음"으로 읽는다
+// (TestPurgeHookOnlyOlderThanZeroMeansAll이 그 계약을 고정한다) — 보존을 늘리려는 설정이
+// 나이 무관 전량 삭제로 반전되는 데이터 손실형 결함이다(T12-F1). 기동 경로의 `cutoff <= 0` 건너뛰기가
+// 그 반전을 막는데, 판정을 `< 0`으로 좁히면 정확히 0인 경계(아래 세 번째 케이스)가 그대로 store에
+// 전달된다. 경계가 어디인지 여기서 고정해 조용한 이동을 막는다.
+func TestShadowCutoffBoundary(t *testing.T) {
+	now := time.Unix(1_800_000_000, 0) // 고정 기준 — 실행 시각에 흔들리지 않는다
+	for _, c := range []struct {
+		name string
+		d    time.Duration
+		want int64
+	}{
+		// 기대값은 리터럴로 적는다 — now.Add(-d).Unix()로 적으면 구현과 같은 식이라 부호·단위
+		// 오류를 잡지 못한다. 1_800_000_000 - 72h(259_200s).
+		{"기본 보존(72h)", DefaultShadowRetention, 1_799_740_800},
+		{"epoch 직전", time.Duration(now.Unix()-1) * time.Second, 1},
+		{"epoch 정각 — 여기서부터 반전", time.Duration(now.Unix()) * time.Second, 0},
+		{"epoch 초과", time.Duration(now.Unix()+1) * time.Second, -1},
+	} {
+		if got := ShadowCutoff(now, c.d); got != c.want {
+			t.Errorf("%s: ShadowCutoff(_, %v)=%d want %d", c.name, c.d, got, c.want)
+		}
 	}
 }
 
@@ -2877,5 +2957,215 @@ func TestPurgeHookOnlyLockHoldBudget(t *testing.T) {
 	if elapsed >= budget {
 		t.Fatalf("잠금 보유가 예산을 넘었다: %v >= %v (hashes=%d reclaimed=%dB deferred=%d failed=%d) — 개발기 기준값은 이 절반 이하였다",
 			elapsed, budget, rep.Hashes, rep.ReclaimedB, rep.DeferredFiles, rep.FailedFiles)
+	}
+}
+
+// regChunked: regSource와 같되 Chunks를 명시로 실어 **FTS 행을 실제로 만든다**. regSource
+// (store_test.go:1717)는 Chunks 없는 Registration을 만들고 Register는 reg.Chunks에서만
+// chunks를 INSERT하므로(store.go:459) FTS 행이 0개다 — 인덱스 바이트를 재는 테스트가 그
+// 헬퍼로 시드하면 병합 유무와 무관하게 통과한다.
+func regChunked(t *testing.T, st *Store, content, uri string) {
+	t.Helper()
+	if _, err := st.Register(t.Context(), Registration{
+		StoredBytes: []byte(content), MediaType: "text/plain",
+		Source: SourceMeta{URI: uri, Kind: "hook", SrcHash: "sh-" + uri},
+		Chunks: []Chunk{{Ordinal: 0, ByteEnd: int64(len(content)), Text: content}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestMergeFTSShrinksIndex: 삭제가 남긴 세그먼트 표식을 MergeFTS가 걷어낸다.
+// FTS5 외부 콘텐츠 테이블의 삭제는 tombstone을 새 세그먼트에 쌓을 뿐이라, 병합 없이는
+// 행을 다 지워도 _data 바이트가 줄지 않는다 — 그것이 D102가 고치는 결함이고, 이 테스트가
+// 고정하는 것도 "삭제만으로는 안 준다"와 "병합하면 준다" 두 가지다.
+func TestMergeFTSShrinksIndex(t *testing.T) {
+	st := openAt(t, t.TempDir())
+	body := strings.Repeat("alpha beta gamma delta epsilon ", 4000) // 약 120 KB/건
+	for i := range 20 {
+		regChunked(t, st, body+strconv.Itoa(i), "shadow:Bash:seg"+strconv.Itoa(i))
+	}
+	seeded := ftsDataBytes(t, st, "fts_trigram_data")
+	if seeded == 0 {
+		t.Fatal("시드가 FTS 인덱스를 만들지 않았다 — 이 테스트가 공허 통과한다")
+	}
+
+	if _, err := st.writer.Exec(`DELETE FROM chunks`); err != nil {
+		t.Fatalf("DELETE FROM chunks: %v", err)
+	}
+	afterDelete := ftsDataBytes(t, st, "fts_trigram_data")
+	if afterDelete < seeded {
+		t.Fatalf("삭제만으로 인덱스가 줄었다(%d → %d) — D102의 전제가 이 환경에서 성립하지 않는다",
+			seeded, afterDelete)
+	}
+
+	if err := st.MergeFTS(t.Context()); err != nil {
+		t.Fatalf("MergeFTS: %v", err)
+	}
+	// 줄었다는 것만으로는 "줄이면서 망가뜨린" 변경을 못 잡는다(최종리뷰 F1) — external-content
+	// 대조까지 건다. rank=1이라 chunks↔인덱스 행/토큰 드리프트도 여기서 걸린다.
+	if err := st.checkFTSIntegrity(t.Context()); err != nil {
+		t.Fatalf("병합이 chunks↔인덱스 대조를 깼다: %v", err)
+	}
+	merged := ftsDataBytes(t, st, "fts_trigram_data")
+	if merged >= afterDelete {
+		t.Fatalf("MergeFTS 후에도 인덱스가 줄지 않았다: %d → %d", afterDelete, merged)
+	}
+}
+
+// TestMergeFTSKeepsSearchable: **부분 삭제 후** 병합이 두 축(porter·trigram)에서 생존분만
+// 반환한다 — optimize는 세그먼트를 합칠 뿐 색인 내용을 바꾸지 않아야 한다.
+//
+// 옛 형태는 **문서 1건·porter 축·삭제 없음**의 매치 수 하나뿐이었다(최종리뷰 F1). 그 그물은
+// 무인으로 매일 전체 인덱스를 다시 쓰는 변경에 대해 셋을 못 잡는다: 병합이 tombstone을 잘못
+// 접어 지운 문서를 되살리는 것, 생존 문서를 잃는 것, porter는 멀쩡한데 trigram만 망가지는 것
+// (축소를 단정하는 축이 바로 trigram이다). 여기서 재는 것 넷 —
+// ① 생존분이 두 축 모두에서 나온다 ② 삭제분이 두 축 모두에서 안 나온다 ③ 공통어의 총 히트가
+// 생존 건수와 정확히 같다(되살아난 tombstone이 여기서 걸린다) ④ 병합 뒤 checkFTSIntegrity가
+// 통과한다(chunks와 인덱스가 어긋나면 실패).
+func TestMergeFTSKeepsSearchable(t *testing.T) {
+	st := openAt(t, t.TempDir())
+	const docs = 6 // 짝수 색인은 지우고 홀수 색인은 남긴다 — 전량 삭제와 달리 tombstone과 생존분이 섞인다
+	filler := strings.Repeat("filler token ", 500)
+	uri := func(i int) string { return "shadow:Bash:keep" + strconv.Itoa(i) }
+	for i := range docs {
+		regChunked(t, st, "haystack needle"+strconv.Itoa(i)+" "+filler, uri(i))
+	}
+	for _, fts := range [2]string{"fts_porter", "fts_trigram"} {
+		if n := ftsMatchCount(t, st, fts, "haystack"); n != docs {
+			t.Fatalf("%s 시드가 %d/%d만 검색된다 — 이 테스트가 공허 통과한다", fts, n, docs)
+		}
+	}
+
+	// 부분 삭제 — chunks_ad 트리거가 두 축에 tombstone을 쌓는다. 병합이 접어야 할 대상이다.
+	for i := 0; i < docs; i += 2 {
+		if _, err := st.writer.Exec(
+			`DELETE FROM chunks WHERE artifact_id IN (SELECT artifact_id FROM sources WHERE uri = ?)`,
+			uri(i),
+		); err != nil {
+			t.Fatalf("DELETE chunks(%s): %v", uri(i), err)
+		}
+	}
+
+	if err := st.MergeFTS(t.Context()); err != nil {
+		t.Fatalf("MergeFTS: %v", err)
+	}
+	if err := st.checkFTSIntegrity(t.Context()); err != nil {
+		t.Fatalf("병합이 chunks↔인덱스 대조를 깼다: %v", err)
+	}
+
+	for _, fts := range [2]string{"fts_porter", "fts_trigram"} {
+		if n := ftsMatchCount(t, st, fts, "haystack"); n != docs/2 {
+			t.Fatalf("%s 공통어 히트 %d, 기대 %d — 병합이 생존/삭제 집합을 바꿨다", fts, n, docs/2)
+		}
+		for i := range docs {
+			want, term := int64(1), "needle"+strconv.Itoa(i)
+			if i%2 == 0 {
+				want = 0 // 삭제분 — 되살아나면 여기서 걸린다
+			}
+			if n := ftsMatchCount(t, st, fts, term); n != want {
+				t.Fatalf("%s MATCH %q = %d, 기대 %d", fts, term, n, want)
+			}
+		}
+	}
+}
+
+// ftsDataBytes: FTS5 그림자 테이블의 block 바이트 합 — 세그먼트 실점유의 직접 측정이다.
+// 행 수가 아니라 바이트를 재는 이유는, 병합이 줄이는 것이 세그먼트 수가 아니라 중복
+// 저장된 포스팅 바이트이기 때문이다.
+func ftsDataBytes(t *testing.T, st *Store, table string) int64 {
+	t.Helper()
+	var n int64
+	if err := st.reader.QueryRow(
+		`SELECT coalesce(sum(length(block)),0) FROM ` + table,
+	).Scan(&n); err != nil {
+		t.Fatalf("%s 조회: %v", table, err)
+	}
+	return n
+}
+
+// ftsMatchCount: 지정한 축(fts_porter·fts_trigram)에서 term의 히트 수. 축을 인자로 받는 이유는
+// 보존 증거가 한 축에만 있으면 다른 축이 병합에 망가져도 통과하기 때문이다(최종리뷰 F1).
+func ftsMatchCount(t *testing.T, st *Store, table, term string) int64 {
+	t.Helper()
+	var n int64
+	if err := st.reader.QueryRow(
+		`SELECT count(*) FROM `+table+` WHERE `+table+` MATCH ?`, term,
+	).Scan(&n); err != nil {
+		t.Fatalf("%s MATCH %q: %v", table, term, err)
+	}
+	return n
+}
+
+// TestMergeFTSIfDueStamp: 스탬프가 없으면 돌고, 방금 돌았으면 안 돌고, interval이 지나면
+// 다시 돈다. 조건이 **시간 하나**라는 것이 계약이다 — 삭제 건수는 조건에 들어가지 않는다
+// (설계 v0.20 D102 계약 2: 세그먼트는 삽입으로도 쌓이므로 건수 문턱은 삽입만 있고 삭제가
+// 적은 구간에서 병합을 영영 막는다).
+func TestMergeFTSIfDueStamp(t *testing.T) {
+	dir := t.TempDir()
+	st := openAt(t, dir)
+	base := time.Date(2026, 8, 9, 0, 0, 0, 0, time.UTC)
+
+	ran, err := st.MergeFTSIfDue(t.Context(), 24*time.Hour, base)
+	if err != nil || !ran {
+		t.Fatalf("스탬프 없음에서 안 돌았다: ran=%v err=%v", ran, err)
+	}
+	ran, err = st.MergeFTSIfDue(t.Context(), 24*time.Hour, base.Add(23*time.Hour))
+	if err != nil || ran {
+		t.Fatalf("interval 이내에 또 돌았다: ran=%v err=%v", ran, err)
+	}
+	ran, err = st.MergeFTSIfDue(t.Context(), 24*time.Hour, base.Add(25*time.Hour))
+	if err != nil || !ran {
+		t.Fatalf("interval 경과 후 안 돌았다: ran=%v err=%v", ran, err)
+	}
+}
+
+// TestMergeFTSIfDueFutureStampIsDue: now보다 **미래**인 스탬프도 "돌 때가 됐다"로 읽는다.
+// 시계 되돌림·복원·파일시스템 타임스탬프 이상으로 미래 mtime이 생기면 경과가 음수가 되는데,
+// 그것을 "아직 이르다"로 읽으면 그 저장소는 **영구히** 병합하지 않는다(설계 v0.20 D102 계약 2).
+func TestMergeFTSIfDueFutureStampIsDue(t *testing.T) {
+	dir := t.TempDir()
+	st := openAt(t, dir)
+	now := time.Date(2026, 8, 9, 0, 0, 0, 0, time.UTC)
+	stamp := filepath.Join(dir, mergeStampName)
+	f, err := os.OpenFile(stamp, os.O_CREATE|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatalf("스탬프 생성: %v", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("스탬프 Close: %v", err)
+	}
+	future := now.Add(72 * time.Hour)
+	if err := os.Chtimes(stamp, future, future); err != nil {
+		t.Fatalf("Chtimes: %v", err)
+	}
+
+	ran, err := st.MergeFTSIfDue(t.Context(), 24*time.Hour, now)
+	if err != nil || !ran {
+		t.Fatalf("미래 mtime에서 안 돌았다(영구 정지): ran=%v err=%v", ran, err)
+	}
+	fi, err := os.Stat(stamp)
+	if err != nil {
+		t.Fatalf("Stat: %v", err)
+	}
+	if fi.ModTime().After(now) {
+		t.Fatalf("병합 후에도 스탬프가 미래에 남았다: %v", fi.ModTime())
+	}
+}
+
+// TestMergeFTSIfDueFailureDoesNotStamp: 병합이 실패하면 스탬프를 찍지 않는다 — 찍으면 그
+// 프로젝트는 하루 동안 재시도조차 하지 않는다. writer를 닫아 실패를 만든다.
+func TestMergeFTSIfDueFailureDoesNotStamp(t *testing.T) {
+	dir := t.TempDir()
+	st := openAt(t, dir)
+	if err := st.writer.Close(); err != nil {
+		t.Fatalf("writer Close: %v", err)
+	}
+	now := time.Date(2026, 8, 9, 0, 0, 0, 0, time.UTC)
+	if _, err := st.MergeFTSIfDue(t.Context(), 24*time.Hour, now); err == nil {
+		t.Fatal("닫힌 writer에서 오류가 나지 않았다")
+	}
+	if _, err := os.Stat(filepath.Join(dir, mergeStampName)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("실패했는데 스탬프가 찍혔다: %v", err)
 	}
 }

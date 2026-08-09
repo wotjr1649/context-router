@@ -782,6 +782,77 @@ func (s *Store) checkFTSIntegrity(ctx context.Context) error {
 	return nil
 }
 
+// MergeFTS — D102: fts_porter·fts_trigram의 세그먼트를 하나로 병합한다. 외부 콘텐츠 FTS5의
+// 삭제는 tombstone을 새 세그먼트에 쌓기만 하고 automerge(기본 4)가 그것을 따라잡지 못해,
+// 병합 없이는 퍼지가 지운 몫이 파일에서 회수되지 않는다 — 실측으로 이 저장소 파일의 75.9%가
+// 그렇게 쌓인 것이었다(설계 v0.20 관측 B).
+//
+// checkFTSIntegrity와 같은 **커밋 후 writer 경로**다. tx 안에서 부르지 않는다 — optimize는
+// 자체 트랜잭션을 잡고, 삭제 tx와 한 덩어리로 묶으면 그 tx의 락 보유 시간이 병합 시간만큼
+// 늘어난다(D67이 묶어 둔 예산 규율을 깬다).
+//
+// 원시 명령은 'optimize'다. 'merge=N'은 검토 후 기각됐다 — merge=512 한 번이 실측 churn의
+// 1/4~1/18에 그쳐 하루 한 번으로는 수렴하지 못한다(D102 계약 3). 비용 논거가 기대는 성질:
+// **이미 한 세그먼트로 병합된 인덱스에 건 optimize는 일 없이 반환한다**(번들 SQLite 3.53.3 /
+// modernc.org/sqlite v1.54.0) — 그래서 필요 없는 실행이 싸고, 조정 손잡이(환경 변수)를
+// 지금 만들지 않는다.
+//
+// **둘 다 시도한 뒤 실패를 errors.Join으로 합쳐 반환한다**(최종리뷰 F4) — 앞엣것에서 즉시
+// 반환하면 porter에만 지속되는 오류가 trigram의 병합을 영영 막아 그 축만 무한히 자란다.
+// 호출자는 이 실패로 기동이나 회수를 막지 않는다 — 병합은 멱등이라 다음 기회에 다시 돌면 된다.
+// (errors.Join은 Is/As를 원소로 전개하므로 호출부의 errors.Is(err, context.Canceled) 강등
+// 분기는 그대로 산다.)
+func (s *Store) MergeFTS(ctx context.Context) error {
+	var errs []error
+	for _, fts := range [2]string{"fts_porter", "fts_trigram"} {
+		if _, err := s.writer.ExecContext(ctx,
+			"INSERT INTO "+fts+"("+fts+") VALUES('optimize')"); err != nil {
+			errs = append(errs, fmt.Errorf("store: %s optimize 실패: %w", fts, err))
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// mergeStampName — D102 계약 2의 "하루 한 번"을 재는 자리. content.db 스키마를 건드리지
+// 않으려고 파일 mtime을 쓴다 — 스키마에 넣으면 user_version 축과 구 바이너리 호환을 함께
+// 건드려야 하고, 그 값은 이 한 타임스탬프에 비례하지 않는다. 같은 디렉터리에
+// content.db.rebuild.lock이 이미 같은 부류로 있다.
+const mergeStampName = "fts-merge.stamp"
+
+// MergeFTSIfDue — D102 계약 2: 마지막 병합에서 interval이 지났을 때만 MergeFTS를 돌리고,
+// **성공했을 때만** 스탬프를 갱신한다. 돌았으면 true.
+//
+// 조건은 시간 하나다. 퍼지가 몇 건을 지웠는지는 보지 않는다 — 세그먼트는 삽입으로도 쌓이므로
+// 건수 문턱은 삽입만 있고 삭제가 적은 구간에서 병합을 영영 막는다(설계 v0.20 D102 계약 2).
+//
+// **"돌 때가 됐다"로 읽는 것이 둘이다**: ① 스탬프를 못 읽는 어떤 사유(부재·권한·손상) —
+// 병합은 멱등이고, 못 읽어서 영영 안 도는 쪽이 더 나쁜 실패다. ② mtime이 now보다 **미래**인
+// 스탬프 — 시계 되돌림이나 복원 뒤에 음수 경과가 나오는데, 그것을 "아직 이르다"로 읽으면
+// 그 저장소는 영구히 병합하지 않는다. 반대로 스탬프 **쓰기** 실패는 무시한다: 다음 기회에
+// 한 번 더 도는 것이 전부다.
+//
+// 프로세스 둘이 동시에 기동하면 둘 다 스탬프를 낡은 것으로 보고 병합할 수 있다. 그래도
+// 무해하다 — 쓰기 락이 둘을 직렬화하고, 뒤엣것은 이미 한 세그먼트가 된 인덱스에 optimize를
+// 걸어 일 없이 반환한다(번들 SQLite 3.53.3 소스 대조, D102 계약 2·3).
+func (s *Store) MergeFTSIfDue(ctx context.Context, interval time.Duration, now time.Time) (bool, error) {
+	stamp := filepath.Join(s.dir, mergeStampName)
+	if fi, err := os.Stat(stamp); err == nil {
+		if elapsed := now.Sub(fi.ModTime()); elapsed >= 0 && elapsed < interval {
+			return false, nil
+		}
+	}
+	if err := s.MergeFTS(ctx); err != nil {
+		return false, err
+	}
+	// Chtimes는 생성 성공 분기 안에 둔다(최종리뷰 F12) — 밖에 두면 파일이 없는 상태에서도
+	// 부르게 되고, 그 호출은 반드시 실패하므로 하는 일이 없다.
+	if f, err := os.OpenFile(stamp, os.O_CREATE|os.O_WRONLY, 0o600); err == nil {
+		_ = f.Close()
+		_ = os.Chtimes(stamp, now, now)
+	}
+	return true, nil
+}
+
 // hashesFromQuery: query가 반환하는 문자열 컬럼 1개를 집합으로 모은다(GCOrphanBlobs 전용
 // 소소한 헬퍼 — content_hash/raw_blob_hash 두 조회에 재사용).
 func hashesFromQuery(ctx context.Context, db *sql.DB, query string) (map[string]bool, error) {
@@ -953,6 +1024,7 @@ type SizeStat struct {
 	Sources, Artifacts int64
 	BlobBytes          int64
 	FileBytes          int64            // content.db 파일 실크기(os.Stat) — D40, [14] 병기
+	FreeBytes          int64            // free page × page_size — 회수 가능분(D102 계약 7, 표시 전용)
 	ShadowOwnedBytes   int64            // 귀속 hash들의 물리 CAS 파일 바이트 합 (= ShadowOwned 값 합, 불변)
 	ShadowOwnedHashes  int              // 귀속 hash 수 (= len(ShadowOwned), 불변)
 	ShadowOwned        map[string]int64 // 귀속 content_hash → 물리 CAS 파일 바이트 — Task 3b/5a/5b 공용 원천
@@ -999,6 +1071,19 @@ func SizeStats(dir string) (*SizeStat, error) {
 	defer db.Close()
 
 	st := SizeStat{FileBytes: fi.Size(), ShadowOwned: map[string]int64{}}
+
+	// D102 계약 7: 회수 가능분을 낸다. free page는 삭제가 만들고 이후 기록이 재사용하므로,
+	// 이 값이 크다는 것은 "파일이 크다"가 아니라 "지운 만큼이 아직 파일 안에 있다"는 뜻이다.
+	// 판정(계약 6)은 이 값이 아니라 FileBytes-FreeBytes로 한다 — 병합되지 않은 세그먼트는
+	// free page가 아니라 live page라 freelist는 결함이 있을 때 오히려 낮게 읽힌다.
+	// 두 pragma 모두 best-effort — 실패하면 0으로 두고 진단 전체를 실패시키지 않는다.
+	var pageSize, freeCount int64
+	if err := db.QueryRow("PRAGMA page_size").Scan(&pageSize); err == nil {
+		if err := db.QueryRow("PRAGMA freelist_count").Scan(&freeCount); err == nil {
+			st.FreeBytes = pageSize * freeCount
+		}
+	}
+
 	if err := db.QueryRow("SELECT count(*) FROM sources").Scan(&st.Sources); err != nil {
 		return nil, fmt.Errorf("store SizeStats: %w", err)
 	}
@@ -1112,6 +1197,29 @@ func shadowOwnedFilter(cutoffUnix int64, maxHashes int) (string, []any) {
 // PurgeHookOnly — 예산 없이 shadow 귀속 아티팩트를 지운다(기존 계약 유지).
 func (s *Store) PurgeHookOnly(ctx context.Context) (HookPurgeReport, error) {
 	return s.PurgeHookOnlyOlderThan(ctx, 0, 0)
+}
+
+// DefaultShadowRetention — shadow 귀속 아티팩트 보존 기간(설계 v0.12 D67). 훅이 가로챈
+// 출력은 대개 해당 세션 안에서 소비되므로 짧게 잡는다. v0.20에서 cmd/context-router 에서
+// 이 패키지로 옮겼다 — doctor 문면이 실효값을 적으려면 internal/cli 도 이 해석기에 닿아야
+// 하는데, 규칙을 복제하면 두 구현이 갈라진다(D13, 설계 v0.20 D102 계약 8).
+const DefaultShadowRetention = 72 * time.Hour
+
+// ShadowRetention — CTR_SHADOW_RETENTION(time.ParseDuration 형식) 양수만 채택한다.
+// 파싱 실패·비양수는 기본값 — 잘못된 값이 정책을 무력화하지 않게 한다.
+func ShadowRetention(getenv func(string) string) time.Duration {
+	if d, err := time.ParseDuration(getenv("CTR_SHADOW_RETENTION")); err == nil && d > 0 {
+		return d
+	}
+	return DefaultShadowRetention
+}
+
+// ShadowCutoff — 보존 기간 d에 대한 회수 경계(unix 초). **0 이하면 회수를 건너뛰어야 한다**:
+// shadowOwnedFilter가 cutoffUnix<=0을 "나이 필터 없음"으로 읽으므로(TestPurgeHookOnlyOlderThanZeroMeansAll이
+// 그 계약을 고정한다) 보존을 늘리려는 설정이 나이 무관 전량 삭제로 반전된다. d가 epoch
+// 경과분(약 56년) 이상이면 그 경계에 닿는다 — 경계가 정확히 0에서 시작하므로 판정도 `<= 0`이다.
+func ShadowCutoff(now time.Time, d time.Duration) int64 {
+	return now.Add(-d).Unix()
 }
 
 // PurgeHookOnlyOlderThan — D41 §3 + D67: shadow 귀속(그 hash를 참조하는 소스가 전부 hook) 아티팩트

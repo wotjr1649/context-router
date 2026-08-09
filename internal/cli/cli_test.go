@@ -15,6 +15,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime/debug"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -421,7 +422,7 @@ func TestRunDoctor_ContentFileWarn(t *testing.T) {
 		t.Fatalf("runDoctor err=%v out=%s", err, buf.String())
 	}
 	out := buf.String()
-	if !strings.Contains(out, "[14] warning: file ") || !strings.Contains(out, "CTR_CONTENT_FILE_WARN_BYTES") {
+	if !strings.Contains(out, "[14] warning: live ") || !strings.Contains(out, "CTR_CONTENT_FILE_WARN_BYTES") {
 		t.Fatalf("파일 축 경고 미발화:\n%s", out)
 	}
 	if strings.Contains(out, "[14] warning: blob ") {
@@ -430,7 +431,7 @@ func TestRunDoctor_ContentFileWarn(t *testing.T) {
 }
 
 // TestRunDoctor_ContentFileWarnAxisIndependent — D46 축 독립: blob 키만 낮추면 blob 경고만
-// 발화하고 파일 경고는 기본 100MiB 임계라 침묵한다(소형 픽스처 ≪ 100MiB — 전용 키 분리 판별).
+// 발화하고 파일 경고는 기본 256MiB 임계라 침묵한다(소형 픽스처 ≪ 256MiB — 전용 키 분리 판별).
 func TestRunDoctor_ContentFileWarnAxisIndependent(t *testing.T) {
 	isolateCodexHome(t)
 	storeRoot, projectRoot := doctorSizeWarnSetup(t)
@@ -443,20 +444,113 @@ func TestRunDoctor_ContentFileWarnAxisIndependent(t *testing.T) {
 	if !strings.Contains(out, "[14] warning: blob ") {
 		t.Fatalf("blob 경고 미발화:\n%s", out)
 	}
-	if strings.Contains(out, "[14] warning: file ") {
+	if strings.Contains(out, "[14] warning: live ") {
 		t.Fatalf("blob 키 조정이 파일 축 경고를 발화(키 분리 위반):\n%s", out)
+	}
+}
+
+// TestContentFileWarnDefaultIs256MiB: 임계가 256 MiB다. 정리 후 정상상태가 실측 171 MB이므로
+// 옛 100 MiB는 정리 뒤에도 상시 초과라 신호로서 죽는다. 256 MiB는 그 1.5배이고,
+// 창을 7일로 늘리는 결정(약 400 MB)이 이 신호를 켜도록 고른 값이다(설계 v0.20 D102 계약 6).
+func TestContentFileWarnDefaultIs256MiB(t *testing.T) {
+	if defaultContentFileWarnBytes != 256<<20 {
+		t.Fatalf("임계 = %d, 기대 %d", defaultContentFileWarnBytes, 256<<20)
+	}
+}
+
+// doctorLiveFreePageSetup — doctorSizeWarnSetup과 반환 모양은 같지만 삽입 전용이 아니다: chunked
+// 등록 다건 → PurgeHookOnlyOlderThan(전량, internal/store가 노출하는 실제 회수 경로) →
+// MergeFTS → 닫기로 **실제 free page**를 남긴다(internal/store TestSizeStatsReportsFreeBytes와
+// 같은 패턴). live/file 축을 가르는 테스트는 FreeBytes>0이 전제인데, doctorSizeWarnSetup은
+// 삽입만 하므로 freelist_count=0이라 live==FileBytes가 되어 두 술어가 같은 값에서 함께
+// 침묵해버린다(리뷰에서 발견된 공허 통과 — 계획의 Global Constraints가 금지하는 것과 같은
+// 형태). 공용 doctorSizeWarnSetup은 다른 테스트가 그 모양(삽입 전용·행수 단정)을 쓰므로
+// 건드리지 않는다.
+func doctorLiveFreePageSetup(t *testing.T) (storeRoot, projectRoot string) {
+	t.Helper()
+	t.Setenv("CTR_STORE_WARN_BYTES", "")
+	t.Setenv("CTR_CONTENT_FILE_WARN_BYTES", "")
+	storeRoot, projectRoot = t.TempDir(), t.TempDir()
+	canon, err := ident.Canonicalize(projectRoot)
+	if err != nil {
+		t.Fatalf("canonicalize: %v", err)
+	}
+	st, err := store.Open(filepath.Join(storeRoot, "projects", canon.ProjectID), false)
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	body := strings.Repeat("free page seed ", 8000) // internal/store TestSizeStatsReportsFreeBytes와 동일 규모
+	for i := range 10 {
+		s := body + strconv.Itoa(i)
+		if _, err := st.Register(context.Background(), store.Registration{
+			StoredBytes: []byte(s), MediaType: "text/plain",
+			Source: store.SourceMeta{URI: "shadow:Bash:free" + strconv.Itoa(i), Kind: "hook", SrcHash: "sh-free" + strconv.Itoa(i)},
+			Chunks: []store.Chunk{{Ordinal: 0, ByteEnd: int64(len(s)), Text: s}},
+		}); err != nil {
+			t.Fatalf("register %d: %v", i, err)
+		}
+	}
+	// 전량 회수(cutoffUnix=0, maxHashes=0) — 전부 hook 귀속이라 이 한 호출로 chunks·sources·
+	// artifacts가 다 지워지고 물리 blob도 회수된다. FTS 트리거가 tombstone을 남기고,
+	// MergeFTS가 그것을 압축해야 free page가 생긴다(삭제만으로는 안 준다 — D102).
+	if _, err := st.PurgeHookOnlyOlderThan(context.Background(), 0, 0); err != nil {
+		t.Fatalf("PurgeHookOnlyOlderThan: %v", err)
+	}
+	if err := st.MergeFTS(context.Background()); err != nil {
+		t.Fatalf("MergeFTS: %v", err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatalf("store.Close: %v", err)
+	}
+	return storeRoot, projectRoot
+}
+
+// TestRunDoctor_ContentLiveWarnUsesLiveBytes: [14] 경고가 파일 크기가 아니라 live 바이트로
+// 판정한다. free page가 임계를 넘는 몫을 차지하면 경고가 **꺼져야** 한다 — 그것이 "파일이
+// 크다"와 "쓰레기가 쌓였다"를 가르는 지점이고, 파일 크기 판정에서는 구조적으로 불가능하다.
+// 이 구분이 성립하려면 FreeBytes>0이 전제이므로 doctorLiveFreePageSetup(삽입+삭제+병합)을
+// 쓴다 — 삽입 전용 픽스처로는 FreeBytes=0이라 file==live가 되어 어떤 술어를 넣어도 통과한다.
+func TestRunDoctor_ContentLiveWarnUsesLiveBytes(t *testing.T) {
+	isolateCodexHome(t)
+	storeRoot, projectRoot := doctorLiveFreePageSetup(t)
+	canon, err := ident.Canonicalize(projectRoot)
+	if err != nil {
+		t.Fatalf("canonicalize: %v", err)
+	}
+	projDir := filepath.Join(storeRoot, "projects", canon.ProjectID)
+	sz, err := store.SizeStats(projDir)
+	if err != nil || sz == nil {
+		t.Fatalf("SizeStats: sz=%v err=%v", sz, err)
+	}
+	// 이 전제가 없으면 아래 임계 설정이 live==file인 채로 진행돼, 판정을 옛 file 기준으로
+	// 되돌려도 이 테스트가 계속 통과한다(공허 통과) — 리뷰에서 실제로 발견된 결함.
+	if sz.FreeBytes <= 0 {
+		t.Fatalf("픽스처에 free page 없음 — 이 테스트는 live/file을 가르지 못한다(FreeBytes=%d)", sz.FreeBytes)
+	}
+	// live 바로 위에 임계를 둔다 — file 기준이면 엄격히 초과(발화), live 기준이면 미달(침묵).
+	live := sz.FileBytes - sz.FreeBytes
+	t.Setenv("CTR_CONTENT_FILE_WARN_BYTES", strconv.FormatInt(live, 10))
+	var buf bytes.Buffer
+	if err := runDoctor(context.Background(), &buf, storeRoot, projectRoot, "0.0.1-dev"); err != nil {
+		t.Fatalf("runDoctor err=%v out=%s", err, buf.String())
+	}
+	if strings.Contains(buf.String(), "[14] warning: live ") {
+		t.Fatalf("live 임계와 같은 값에서 경고가 발화(> 판정 위반):\n%s", buf.String())
+	}
+	if !strings.Contains(buf.String(), " free=") {
+		t.Fatalf("[14] 줄에 free= 병기 없음:\n%s", buf.String())
 	}
 }
 
 // TestContentFileWarnBytes — CTR_CONTENT_FILE_WARN_BYTES 양수만 채택(storeWarnBytes와 동형).
 func TestContentFileWarnBytes(t *testing.T) {
-	if got := contentFileWarnBytes(func(string) string { return "" }); got != 100<<20 {
+	if got := contentFileWarnBytes(func(string) string { return "" }); got != 256<<20 {
 		t.Fatalf("기본값: %d", got)
 	}
 	if got := contentFileWarnBytes(func(string) string { return "12345" }); got != 12345 {
 		t.Fatalf("env 채택: %d", got)
 	}
-	if got := contentFileWarnBytes(func(string) string { return "-1" }); got != 100<<20 {
+	if got := contentFileWarnBytes(func(string) string { return "-1" }); got != 256<<20 {
 		t.Fatalf("비양수 거부: %d", got)
 	}
 }
@@ -2619,6 +2713,106 @@ func TestPurgeHookOnlyVacuumFailurePropagates(t *testing.T) {
 	}
 	if !strings.Contains(gw.buf.String(), "실회수") {
 		t.Fatalf("실회수 보고가 VACUUM 이전에 안 나옴:\n%s", gw.buf.String())
+	}
+}
+
+// seedShadowChunkedProject — hook 귀속 아티팩트 12건을 **Chunks를 실어** 시드해 FTS 인덱스를
+// 실제로 채우고, file(비귀속) 소스 하나를 남겨 --hook-only가 선택 삭제임을 유지한다.
+// 공용 seedShadowContentDB(cli_test.go:466)를 쓰지 않는 이유: 그 헬퍼는 Chunks 없는
+// Registration을 만들고 Register는 reg.Chunks에서만 chunks를 INSERT하므로(store.go:459)
+// fts_trigram_data가 병합 전후 모두 0바이트다 — 그 헬퍼로 시드하면 이 테스트는 병합이 있든
+// 없든 통과한다. 기존 헬퍼는 다른 테스트가 행수를 단정하므로 건드리지 않는다.
+func seedShadowChunkedProject(t *testing.T) (pid, projDir string) {
+	t.Helper()
+	storeRoot, projectRoot := t.TempDir(), t.TempDir()
+	canon, err := ident.Canonicalize(projectRoot)
+	if err != nil {
+		t.Fatalf("canonicalize: %v", err)
+	}
+	pid = canon.ProjectID
+	projDir = filepath.Join(storeRoot, "projects", pid)
+	st, err := store.Open(projDir, false)
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	body := strings.Repeat("segment merge probe ", 4000) // 약 80 KB/건
+	for i := range 12 {
+		s := body + strconv.Itoa(i)
+		if _, err := st.Register(context.Background(), store.Registration{
+			StoredBytes: []byte(s), MediaType: "text/plain",
+			Source: store.SourceMeta{
+				URI: "shadow:Bash:" + strconv.Itoa(i), Kind: "hook", SrcHash: "sh" + strconv.Itoa(i),
+			},
+			Chunks: []store.Chunk{{Ordinal: 0, ByteEnd: int64(len(s)), Text: s}},
+		}); err != nil {
+			t.Fatalf("register hook %d: %v", i, err)
+		}
+	}
+	if _, err := st.Register(context.Background(), store.Registration{ // 비귀속 — 보존 대상
+		StoredBytes: []byte("explicit-file-content"), MediaType: "text/plain",
+		Source: store.SourceMeta{URI: "/tmp/f.txt", Kind: "file", SrcHash: "sh-file"},
+		Chunks: []store.Chunk{{Ordinal: 0, Text: "explicit-file-content"}},
+	}); err != nil {
+		t.Fatalf("register file: %v", err)
+	}
+	// **여기서 반드시 닫는다** — runPurge는 writable Open(lockStore)을 하므로 열어 둔 채
+	// 부르면 잠금 경합으로 실패한다.
+	if err := st.Close(); err != nil {
+		t.Fatalf("store.Close: %v", err)
+	}
+	return pid, projDir
+}
+
+// ftsTrigramBytesRO — projDir/content.db를 read-only로 열어 fts_trigram_data의 block 바이트
+// 합을 읽는다. 파일 크기가 아니라 이 값을 재는 이유: VACUUM은 라이브 프로세스 제약을 받아
+// 테스트에서 불안정하지만 병합 여부는 결정적이다.
+func ftsTrigramBytesRO(t *testing.T, projDir string) int64 {
+	t.Helper()
+	st, err := store.Open(projDir, true)
+	if err != nil {
+		t.Fatalf("store.Open ro: %v", err)
+	}
+	defer func() { _ = st.Close() }()
+	var n int64
+	if err := st.Reader().QueryRow(
+		`SELECT coalesce(sum(length(block)),0) FROM fts_trigram_data`,
+	).Scan(&n); err != nil {
+		t.Fatalf("fts_trigram_data: %v", err)
+	}
+	return n
+}
+
+// TestPurgeHookOnlyMergesFTS: --hook-only가 FTS를 병합한다. 병합 없이 VACUUM만 하면
+// tombstone은 free page가 아니라 live page라 회수되지 않는다 — 실측 기준으로 회수 가능분의
+// 29.6%만 돌아온다(설계 v0.20 D102 계약 4).
+//
+// **이름이 재는 것에 맞춰져 있다**(최종리뷰 F9). 옛 이름은 MergesBeforeVacuum이었으나 이
+// 테스트가 재는 것은 병합이 **일어났다**는 것뿐이고 병합→VACUUM **순서**가 아니다. 그 순서를
+// 결정적으로 잴 방법이 이 경계에 없다: 순서를 가르는 관측량은 VACUUM 뒤 파일 크기(또는 free
+// page 수)뿐인데 그 값은 라이브 프로세스 제약을 받아 테스트에서 불안정하고(ftsTrigramBytesRO
+// 주석), 순서 자체는 runPurgeHookOnly의 직선 4줄이라 눈으로 닫힌다. 불안정한 순서 테스트보다
+// 정직한 이름이 낫다.
+//
+// 진입점은 runPurge다: runPurgeHookOnly를 직접 부르는 테스트는 없고 --hook-only는 runPurge의
+// 조기 분기(cli.go:793-801)가 인터셉트한다. --force가 없으면 비TTY에서 confirmPurge가 즉시
+// 거부한다(cli.go:682-687).
+func TestPurgeHookOnlyMergesFTS(t *testing.T) {
+	pid, projDir := seedShadowChunkedProject(t)
+	storeRoot := storeRootOf(projDir)
+	before := ftsTrigramBytesRO(t, projDir)
+	if before < 200<<10 { // 시드 약 960 KB 텍스트 → trigram 인덱스는 그 몇 배다
+		t.Fatalf("시드가 FTS를 충분히 채우지 않았다(%dB) — 이 테스트가 공허 통과한다", before)
+	}
+
+	var out bytes.Buffer
+	args := []string{"--project", pid, "--hook-only", "--force"}
+	if err := runPurge(context.Background(), failReader{}, &out, io.Discard, storeRoot, args, false); err != nil {
+		t.Fatalf("runPurge err=%v out=%s", err, out.String())
+	}
+
+	after := ftsTrigramBytesRO(t, projDir)
+	if after >= before {
+		t.Fatalf("병합이 없다 — 삭제만으로는 세그먼트가 줄지 않는다: %d → %d", before, after)
 	}
 }
 

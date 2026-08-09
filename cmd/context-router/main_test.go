@@ -17,6 +17,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -2392,50 +2393,88 @@ func TestE2E_HookConcurrentSummaryExport(t *testing.T) {
 	}
 }
 
-// TestShadowRetentionDefault: 기본 보존 기간이 3일이고, 환경변수로만 조정된다.
-// 임의 상향으로 정책이 조용히 무력화되지 않도록 파싱 실패·비양수는 기본값을 쓴다
-// (storeWarnBytes와 같은 규율).
-func TestShadowRetentionDefault(t *testing.T) {
-	cases := []struct {
-		env  string
-		want time.Duration
-	}{
-		{"", 72 * time.Hour},
-		{"24h", 24 * time.Hour},
-		{"0", 72 * time.Hour},
-		{"-5h", 72 * time.Hour},
-		{"garbage", 72 * time.Hour},
+// TestFTSMergeLoopMergesAndStamps: 병합 루프가 **실제로** 병합하고 스탬프를 남긴다.
+// 상수만 재는 테스트는 MergeFTSIfDue 호출을 통째로 빼먹어도 통과한다 — 이 테스트가 그 구멍을
+// 막는다. 판정은 둘이다: 스탬프 파일이 생겼는가(호출이 배선됐는가)와 tombstone이 실제로
+// 걷혔는가(삭제만으로는 인덱스가 줄지 않는다).
+func TestFTSMergeLoopMergesAndStamps(t *testing.T) {
+	dir := t.TempDir()
+	st, err := store.Open(dir, false)
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
 	}
-	for _, c := range cases {
-		got := shadowRetention(func(string) string { return c.env })
-		if got != c.want {
-			t.Errorf("shadowRetention(%q)=%v want %v", c.env, got, c.want)
+	defer func() { _ = st.Close() }()
+
+	body := strings.Repeat("alpha beta gamma delta ", 3000) // 약 70 KB/건
+	for i := range 12 {
+		s := body + strconv.Itoa(i)
+		if _, err := st.Register(context.Background(), store.Registration{
+			StoredBytes: []byte(s), MediaType: "text/plain",
+			Source: store.SourceMeta{
+				URI: "shadow:Bash:seg" + strconv.Itoa(i), Kind: "hook", SrcHash: "sh" + strconv.Itoa(i),
+			},
+			Chunks: []store.Chunk{{Ordinal: 0, ByteEnd: int64(len(s)), Text: s}},
+		}); err != nil {
+			t.Fatalf("register %d: %v", i, err)
 		}
+	}
+	// 전량 삭제 → FTS에는 tombstone만 쌓인다(병합 전에는 줄지 않는다).
+	if _, _, err := st.PurgeOlderThan(context.Background(), time.Now().Add(time.Hour).Unix()); err != nil {
+		t.Fatalf("PurgeOlderThan: %v", err)
+	}
+	before := ftsTrigramBytes(t, st)
+	if before == 0 {
+		t.Fatal("시드가 FTS 인덱스를 만들지 않았다 — 이 테스트가 공허 통과한다")
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan struct{})
+	go func() { defer close(done); runFTSMergeLoop(ctx, st, time.Millisecond, time.Hour) }()
+	// 실패 경로(t.Fatal)에서도 고루틴을 join한다(최종리뷰 F10) — 병합이 도는 중에 t.TempDir()
+	// 정리가 돌면 Windows에서 열린 파일 때문에 정리가 실패하고, 그 실패가 진짜 실패 사유를 덮는다.
+	// 아래 정상 경로의 cancel()·<-done과 중복이지만 둘 다 멱등이라 무해하다.
+	defer func() { cancel(); <-done }()
+
+	// store.mergeStampName은 비공개다 — 이름을 여기서 리터럴로 고정한다(바뀌면 이 테스트가 잡는다).
+	stamp := filepath.Join(dir, "fts-merge.stamp")
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		if _, err := os.Stat(stamp); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("루프가 스탬프를 남기지 않았다 — MergeFTSIfDue 호출이 배선되지 않았다")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	cancel()
+	<-done // 병합이 끝난 뒤에 읽는다(쓰기 중 측정 금지)
+
+	if after := ftsTrigramBytes(t, st); after >= before {
+		t.Fatalf("병합 후에도 인덱스가 줄지 않았다: %d → %d", before, after)
 	}
 }
 
-// TestShadowCutoffBoundary: shadowCutoff의 0 경계를 고정한다. 보존 기간이 epoch 경과분보다 크면
-// 경계가 0 이하로 내려가고, store는 cutoffUnix<=0을 "나이 필터 없음"으로 읽는다
-// (store.TestPurgeHookOnlyOlderThanZeroMeansAll이 그 계약을 고정한다) — 보존을 늘리려는 설정이
-// 나이 무관 전량 삭제로 반전되는 데이터 손실형 결함이다(T12-F1). 기동 경로의 `cutoff <= 0` 건너뛰기가
-// 그 반전을 막는데, 판정을 `< 0`으로 좁히면 정확히 0인 경계(아래 세 번째 케이스)가 그대로 store에
-// 전달된다. 경계가 어디인지 여기서 고정해 조용한 이동을 막는다.
-func TestShadowCutoffBoundary(t *testing.T) {
-	now := time.Unix(1_800_000_000, 0) // 고정 기준 — 실행 시각에 흔들리지 않는다
-	for _, c := range []struct {
-		name string
-		d    time.Duration
-		want int64
-	}{
-		// 기대값은 리터럴로 적는다 — now.Add(-d).Unix()로 적으면 구현과 같은 식이라 부호·단위
-		// 오류를 잡지 못한다. 1_800_000_000 - 72h(259_200s).
-		{"기본 보존(72h)", defaultShadowRetention, 1_799_740_800},
-		{"epoch 직전", time.Duration(now.Unix()-1) * time.Second, 1},
-		{"epoch 정각 — 여기서부터 반전", time.Duration(now.Unix()) * time.Second, 0},
-		{"epoch 초과", time.Duration(now.Unix()+1) * time.Second, -1},
-	} {
-		if got := shadowCutoff(now, c.d); got != c.want {
-			t.Errorf("%s: shadowCutoff(_, %v)=%d want %d", c.name, c.d, got, c.want)
-		}
+// ftsTrigramBytes — fts_trigram_data의 block 바이트 합(세그먼트 실점유).
+func ftsTrigramBytes(t *testing.T, st *store.Store) int64 {
+	t.Helper()
+	var n int64
+	if err := st.Reader().QueryRow(
+		`SELECT coalesce(sum(length(block)),0) FROM fts_trigram_data`,
+	).Scan(&n); err != nil {
+		t.Fatalf("fts_trigram_data: %v", err)
+	}
+	return n
+}
+
+// TestFTSMergeIntervalIsDaily: 자동 경로가 쓰는 병합 주기가 하루다. 위 루프 테스트가 동작을
+// 재고 이 상수 테스트는 **값**을 잰다 — 이 값이 D67의 락 보유 규율과 맞물려 있어서다:
+// 정상상태 병합이 쓰기 락을 약 1.2초 잡는데 훅의 총예산이 2000 ms다(설계 v0.20 D102 계약 9).
+// 매 기동으로 낮추는 변경은 이 테스트를 지나야 한다.
+func TestFTSMergeIntervalIsDaily(t *testing.T) {
+	if defaultFTSMergeInterval != 24*time.Hour {
+		t.Fatalf("병합 주기 = %v, 기대 24h — 설계 v0.20 D102 계약 2를 먼저 고쳐라",
+			defaultFTSMergeInterval)
 	}
 }
