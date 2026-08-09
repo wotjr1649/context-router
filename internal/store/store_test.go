@@ -2971,3 +2971,76 @@ func ftsMatchCount(t *testing.T, st *Store, term string) int64 {
 	}
 	return n
 }
+
+// TestMergeFTSIfDueStamp: 스탬프가 없으면 돌고, 방금 돌았으면 안 돌고, interval이 지나면
+// 다시 돈다. 조건이 **시간 하나**라는 것이 계약이다 — 삭제 건수는 조건에 들어가지 않는다
+// (설계 v0.20 D102 계약 2: 세그먼트는 삽입으로도 쌓이므로 건수 문턱은 삽입만 있고 삭제가
+// 적은 구간에서 병합을 영영 막는다).
+func TestMergeFTSIfDueStamp(t *testing.T) {
+	dir := t.TempDir()
+	st := openAt(t, dir)
+	base := time.Date(2026, 8, 9, 0, 0, 0, 0, time.UTC)
+
+	ran, err := st.MergeFTSIfDue(t.Context(), 24*time.Hour, base)
+	if err != nil || !ran {
+		t.Fatalf("스탬프 없음에서 안 돌았다: ran=%v err=%v", ran, err)
+	}
+	ran, err = st.MergeFTSIfDue(t.Context(), 24*time.Hour, base.Add(23*time.Hour))
+	if err != nil || ran {
+		t.Fatalf("interval 이내에 또 돌았다: ran=%v err=%v", ran, err)
+	}
+	ran, err = st.MergeFTSIfDue(t.Context(), 24*time.Hour, base.Add(25*time.Hour))
+	if err != nil || !ran {
+		t.Fatalf("interval 경과 후 안 돌았다: ran=%v err=%v", ran, err)
+	}
+}
+
+// TestMergeFTSIfDueFutureStampIsDue: now보다 **미래**인 스탬프도 "돌 때가 됐다"로 읽는다.
+// 시계 되돌림·복원·파일시스템 타임스탬프 이상으로 미래 mtime이 생기면 경과가 음수가 되는데,
+// 그것을 "아직 이르다"로 읽으면 그 저장소는 **영구히** 병합하지 않는다(설계 v0.20 D102 계약 2).
+func TestMergeFTSIfDueFutureStampIsDue(t *testing.T) {
+	dir := t.TempDir()
+	st := openAt(t, dir)
+	now := time.Date(2026, 8, 9, 0, 0, 0, 0, time.UTC)
+	stamp := filepath.Join(dir, mergeStampName)
+	f, err := os.OpenFile(stamp, os.O_CREATE|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatalf("스탬프 생성: %v", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("스탬프 Close: %v", err)
+	}
+	future := now.Add(72 * time.Hour)
+	if err := os.Chtimes(stamp, future, future); err != nil {
+		t.Fatalf("Chtimes: %v", err)
+	}
+
+	ran, err := st.MergeFTSIfDue(t.Context(), 24*time.Hour, now)
+	if err != nil || !ran {
+		t.Fatalf("미래 mtime에서 안 돌았다(영구 정지): ran=%v err=%v", ran, err)
+	}
+	fi, err := os.Stat(stamp)
+	if err != nil {
+		t.Fatalf("Stat: %v", err)
+	}
+	if fi.ModTime().After(now) {
+		t.Fatalf("병합 후에도 스탬프가 미래에 남았다: %v", fi.ModTime())
+	}
+}
+
+// TestMergeFTSIfDueFailureDoesNotStamp: 병합이 실패하면 스탬프를 찍지 않는다 — 찍으면 그
+// 프로젝트는 하루 동안 재시도조차 하지 않는다. writer를 닫아 실패를 만든다.
+func TestMergeFTSIfDueFailureDoesNotStamp(t *testing.T) {
+	dir := t.TempDir()
+	st := openAt(t, dir)
+	if err := st.writer.Close(); err != nil {
+		t.Fatalf("writer Close: %v", err)
+	}
+	now := time.Date(2026, 8, 9, 0, 0, 0, 0, time.UTC)
+	if _, err := st.MergeFTSIfDue(t.Context(), 24*time.Hour, now); err == nil {
+		t.Fatal("닫힌 writer에서 오류가 나지 않았다")
+	}
+	if _, err := os.Stat(filepath.Join(dir, mergeStampName)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("실패했는데 스탬프가 찍혔다: %v", err)
+	}
+}

@@ -809,6 +809,44 @@ func (s *Store) MergeFTS(ctx context.Context) error {
 	return nil
 }
 
+// mergeStampName — D102 계약 2의 "하루 한 번"을 재는 자리. content.db 스키마를 건드리지
+// 않으려고 파일 mtime을 쓴다 — 스키마에 넣으면 user_version 축과 구 바이너리 호환을 함께
+// 건드려야 하고, 그 값은 이 한 타임스탬프에 비례하지 않는다. 같은 디렉터리에
+// content.db.rebuild.lock이 이미 같은 부류로 있다.
+const mergeStampName = "fts-merge.stamp"
+
+// MergeFTSIfDue — D102 계약 2: 마지막 병합에서 interval이 지났을 때만 MergeFTS를 돌리고,
+// **성공했을 때만** 스탬프를 갱신한다. 돌았으면 true.
+//
+// 조건은 시간 하나다. 퍼지가 몇 건을 지웠는지는 보지 않는다 — 세그먼트는 삽입으로도 쌓이므로
+// 건수 문턱은 삽입만 있고 삭제가 적은 구간에서 병합을 영영 막는다(설계 v0.20 D102 계약 2).
+//
+// **"돌 때가 됐다"로 읽는 것이 둘이다**: ① 스탬프를 못 읽는 어떤 사유(부재·권한·손상) —
+// 병합은 멱등이고, 못 읽어서 영영 안 도는 쪽이 더 나쁜 실패다. ② mtime이 now보다 **미래**인
+// 스탬프 — 시계 되돌림이나 복원 뒤에 음수 경과가 나오는데, 그것을 "아직 이르다"로 읽으면
+// 그 저장소는 영구히 병합하지 않는다. 반대로 스탬프 **쓰기** 실패는 무시한다: 다음 기회에
+// 한 번 더 도는 것이 전부다.
+//
+// 프로세스 둘이 동시에 기동하면 둘 다 스탬프를 낡은 것으로 보고 병합할 수 있다. 그래도
+// 무해하다 — 쓰기 락이 둘을 직렬화하고, 뒤엣것은 이미 한 세그먼트가 된 인덱스에 optimize를
+// 걸어 일 없이 반환한다(번들 SQLite 3.53.3 소스 대조, D102 계약 2·3).
+func (s *Store) MergeFTSIfDue(ctx context.Context, interval time.Duration, now time.Time) (bool, error) {
+	stamp := filepath.Join(s.dir, mergeStampName)
+	if fi, err := os.Stat(stamp); err == nil {
+		if elapsed := now.Sub(fi.ModTime()); elapsed >= 0 && elapsed < interval {
+			return false, nil
+		}
+	}
+	if err := s.MergeFTS(ctx); err != nil {
+		return false, err
+	}
+	if f, err := os.OpenFile(stamp, os.O_CREATE|os.O_WRONLY, 0o600); err == nil {
+		_ = f.Close()
+	}
+	_ = os.Chtimes(stamp, now, now)
+	return true, nil
+}
+
 // hashesFromQuery: query가 반환하는 문자열 컬럼 1개를 집합으로 모은다(GCOrphanBlobs 전용
 // 소소한 헬퍼 — content_hash/raw_blob_hash 두 조회에 재사용).
 func hashesFromQuery(ctx context.Context, db *sql.DB, query string) (map[string]bool, error) {
