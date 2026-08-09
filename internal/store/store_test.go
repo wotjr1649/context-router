@@ -1356,6 +1356,101 @@ func TestLedgerColumnsAddedOnWritableOpen(t *testing.T) {
 	}
 }
 
+// TestLedgerFetchStatsFullMigration: 완전 이관된 ledger.db를 SQL로 직접 시딩해 계약 1의 세
+// 상태(레거시/미해소/해소)와 분위수 계산을 한 픽스처에서 함께 태운다. 위 두 테스트는 둘 다
+// 새 열이 없거나 하나만 있는 스키마로 조기 반환 경로만 타므로, Resolved/Missed 집계 질의와
+// AgeP50/AgeP90/AgeMax 루프는 그 어느 테스트에서도 실행되지 않는다(릴리스 리뷰 소견 —
+// LedgerFetchStats 커버리지 44.4%, count=0 구간이 바로 이 두 블록). writer(Task 8a)가 아직
+// 없으므로 SQL을 직접 써서 완전 이관 스키마를 만든다.
+//
+// 나이를 10/20/30/40/50 다섯 개(중복 없음, 삽입 순서는 뒤섞음 — ORDER BY가 실제로 정렬하게
+// 만든다)로 고른 이유: Resolved=5면 오프셋이 2/3/4로 갈라져 P50·P90·Max가 서로 다른 행을
+// 가리킨다 — 셋 중 하나라도 오프셋이 틀리면 그 하나만 값이 바뀐다. 미해소 2행(age=-1)을 함께
+// 넣어 그 값이 분위수 정렬에 섞이지 않는지도 같이 확인한다(-1은 10보다 작으므로 섞였다면
+// AgeP50/AgeP90/AgeMax가 바뀐다). ctr_search 행 하나(age=999)는 tool='ctr_fetch' 필터가
+// 실제로 걸러내는지 본다 — 안 걸러지면 Calls=9, Resolved=6, AgeMax=999가 된다.
+func TestLedgerFetchStatsFullMigration(t *testing.T) {
+	dir := t.TempDir()
+	db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(filepath.Join(dir, "ledger.db")))
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+	if _, err := db.Exec(`CREATE TABLE ledger(
+		id INTEGER PRIMARY KEY, ts INTEGER NOT NULL, tool TEXT NOT NULL,
+		bytes_stored INTEGER NOT NULL DEFAULT 0, bytes_returned INTEGER NOT NULL DEFAULT 0,
+		duration_ms INTEGER NOT NULL DEFAULT 0, artifact_id INTEGER, artifact_age_s INTEGER)`); err != nil {
+		t.Fatalf("완전 이관 스키마: %v", err)
+	}
+	inserts := []string{
+		`INSERT INTO ledger(ts,tool,artifact_id,artifact_age_s) VALUES(1,'ctr_fetch',NULL,NULL)`, // 레거시
+		`INSERT INTO ledger(ts,tool,artifact_id,artifact_age_s) VALUES(2,'ctr_fetch',NULL,-1)`,   // 미해소
+		`INSERT INTO ledger(ts,tool,artifact_id,artifact_age_s) VALUES(3,'ctr_fetch',NULL,-1)`,   // 미해소
+		`INSERT INTO ledger(ts,tool,artifact_id,artifact_age_s) VALUES(4,'ctr_fetch',1,30)`,      // 해소 — 순서 섞음
+		`INSERT INTO ledger(ts,tool,artifact_id,artifact_age_s) VALUES(5,'ctr_fetch',2,10)`,      // 해소
+		`INSERT INTO ledger(ts,tool,artifact_id,artifact_age_s) VALUES(6,'ctr_fetch',3,50)`,      // 해소
+		`INSERT INTO ledger(ts,tool,artifact_id,artifact_age_s) VALUES(7,'ctr_fetch',4,20)`,      // 해소
+		`INSERT INTO ledger(ts,tool,artifact_id,artifact_age_s) VALUES(8,'ctr_fetch',5,40)`,      // 해소
+		`INSERT INTO ledger(ts,tool,artifact_id,artifact_age_s) VALUES(9,'ctr_search',6,999)`,    // 다른 도구 — 필터 확인
+	}
+	for _, q := range inserts {
+		if _, err := db.Exec(q); err != nil {
+			t.Fatalf("행 삽입 %q: %v", q, err)
+		}
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	// pre-guard: 픽스처가 실제로 완전 이관(두 열 다 있음) 상태인지 먼저 확인한다. 이게 없으면
+	// 픽스처 실수가 이 테스트를 조기 반환 경로로 흘려보내면서도 통과시킨다 — 이 테스트가 잡으려는
+	// 바로 그 가짜 커버리지 상태다.
+	roDB, err := sql.Open("sqlite", "file:"+filepath.ToSlash(filepath.Join(dir, "ledger.db"))+"?mode=ro")
+	if err != nil {
+		t.Fatalf("sql.Open ro: %v", err)
+	}
+	cols, err := ledgerColumns(roDB)
+	closeErr := roDB.Close()
+	if err != nil {
+		t.Fatalf("ledgerColumns: %v", err)
+	}
+	if closeErr != nil {
+		t.Fatalf("ro Close: %v", closeErr)
+	}
+	if !cols["artifact_id"] || !cols["artifact_age_s"] {
+		t.Fatalf("픽스처가 완전 이관 상태가 아니다(테스트 버그): %v", cols)
+	}
+
+	fs, err := LedgerFetchStats(dir)
+	if err != nil {
+		t.Fatalf("LedgerFetchStats: %v", err)
+	}
+	if fs.Calls != 8 {
+		t.Fatalf("Calls=%d want 8 (ctr_search 행은 제외)", fs.Calls)
+	}
+	if fs.Resolved != 5 {
+		t.Fatalf("Resolved=%d want 5", fs.Resolved)
+	}
+	if fs.Missed != 2 {
+		t.Fatalf("Missed=%d want 2", fs.Missed)
+	}
+	if fs.AgeP50 != 30 || fs.AgeP90 != 40 || fs.AgeMax != 50 {
+		t.Fatalf("분위수 틀림: %+v want {AgeP50:30 AgeP90:40 AgeMax:50}", fs)
+	}
+}
+
+// TestLedgerFetchStats_DirMissing: ledger.db가 아예 없는 디렉터리는 LedgerStats와 동일하게
+// 빈 값 + nil이다(os.Stat 조기 반환 경로 — LedgerFetchStats의 os.Stat 분기 중 파일 미존재
+// 쪽은 위 세 테스트 모두 ledger.db를 만들어 두므로 그전까지 커버되지 않았다).
+func TestLedgerFetchStats_DirMissing(t *testing.T) {
+	fs, err := LedgerFetchStats(t.TempDir())
+	if err != nil {
+		t.Fatalf("ledger.db 미존재: err=%v want nil", err)
+	}
+	if fs != (FetchStat{}) {
+		t.Fatalf("ledger.db 미존재: fs=%+v want 제로값", fs)
+	}
+}
+
 // TestPurgeOlderThan: 구 source 1개(cutoff 이전에 등록) + 신 source 1개(cutoff 이후)를
 // 등록하고 cutoff를 그 경계로 준다(등록 사이에 time.Now()를 캡처 — indexed_at 조작을 위한
 // writer UPDATE 테스트 헬퍼 대신 실제 시각 흐름으로 경계를 만든다, 설계 §7). 구 source만
