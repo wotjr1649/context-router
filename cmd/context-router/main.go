@@ -522,6 +522,42 @@ const startupPurgeBudget = 60 * time.Second
 // 비교는 성립하지 않는다 — 게이트가 잡는 것은 해시당 비용의 회귀다.
 const startupPurgeMaxHashes = 100
 
+// defaultFTSMergeInterval — D102 계약 2. 세그먼트 축적이 하루 약 36 MB이고 정상상태 병합이
+// 약 1.2초 쓰기 락을 잡는다(설계 v0.20 관측 B). 그 보유가 훅 Read 가드의 2000 ms 총예산과
+// 겹치면 그 훅의 포착이 버려지므로(계약 9 — 수용 위험, doctor [12]의 shadow-store drop으로
+// 사후 관측된다) 하루 한 번으로 묶는다.
+const defaultFTSMergeInterval = 24 * time.Hour
+
+// ftsMergeStartDelay — 기동 첨두를 비켜나는 지연. 기동 직후에는 퍼지 배치가 쓰기 락을 잡고
+// (startupPurgeMaxHashes 주석의 실측 보유) 세션 시작 훅이 몰린다 — 그 위에 병합을 얹지 않는다.
+// **이 지연보다 짧은 세션은 병합하지 않는다**(의도된 성질): 스탬프는 벽시계라 다음에 이 지연을
+// 넘긴 세션 하나가 밀린 몫을 한 번에 걷는다.
+const ftsMergeStartDelay = 30 * time.Second
+
+// runFTSMergeLoop — D102 계약 2의 자동 경로. ctx가 죽을 때까지 delay 뒤 한 번, 그 뒤 interval
+// 마다 조건을 다시 본다. **기동 퍼지 고루틴에 얹지 않는 이유가 셋이다**(설계 v0.20 D102 계약 2):
+// 그 고루틴은 기동당 1회만 돌아 오래 사는 서버에서 병합이 영영 안 오고, purgeErr는 정상 종료
+// (purgeCtx 취소)에서도 non-nil이며, 60초 예산을 나눠 쓰면 optimize가 단일 암시 트랜잭션이라
+// 중단 시 통째 롤백돼 매번 0의 진전을 낸다. 그래서 여기는 purgeErr를 보지 않고 purgeCtx도
+// 쓰지 않는다. 실패는 로그만 남긴다 — 스탬프가 안 찍히므로 다음 주기가 그대로 재시도한다.
+func runFTSMergeLoop(ctx context.Context, st *store.Store, delay, interval time.Duration) {
+	t := time.NewTimer(delay)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+		if ran, err := st.MergeFTSIfDue(ctx, interval, time.Now()); err != nil {
+			slog.Warn("FTS 병합 실패 — 다음 주기에 재시도", "error", err)
+		} else if ran {
+			slog.Info("FTS 병합 완료")
+		}
+		t.Reset(interval)
+	}
+}
+
 func run(ctx context.Context, args []string, stderr io.Writer) error {
 	f, err := parseFlags(args)
 	if err != nil {
@@ -709,6 +745,18 @@ func run(ctx context.Context, args []string, stderr io.Writer) error {
 	// — 더 이상 잔여 배치 전체(≤startupPurgeMaxHashes)나 잠금 대기 최대 5초를 기다리지 않는다.
 	// 고루틴이 프로세스보다 오래 살지 않는다.
 	defer func() { cancelPurge(); <-purgeDone }()
+
+	// D102 계약 2: 병합은 퍼지와 별개 고루틴이고 서버 생존 ctx에 묶인다 — 퍼지의 60초 예산도
+	// purgeErr도 cutoff<=0 건너뛰기도 공유하지 않는다(그 셋 중 어느 것에 걸려도 병합이 영영
+	// 안 도는 구간이 생긴다). defer 등록이 st.Close()(592행)보다 뒤라 LIFO로 먼저 돌아, 고루틴이
+	// 닫힌 DB를 만지거나 프로세스보다 오래 사는 일이 없다.
+	mergeCtx, cancelMerge := context.WithCancel(ctx)
+	mergeDone := make(chan struct{})
+	go func() {
+		defer close(mergeDone)
+		runFTSMergeLoop(mergeCtx, st, ftsMergeStartDelay, defaultFTSMergeInterval)
+	}()
+	defer func() { cancelMerge(); <-mergeDone }()
 	return mcp.Serve(ctx, mcp.Config{
 		Canon: canon, Store: st, SelfExe: selfExe, ScratchRoot: scratchRoot,
 		Profile: f.Profile, Enable: f.Enable, AllowPaths: allowPaths,
