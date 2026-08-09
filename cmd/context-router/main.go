@@ -552,7 +552,7 @@ func runFTSMergeLoop(ctx context.Context, st *store.Store, delay, interval time.
 		start := time.Now()
 		if ran, err := st.MergeFTSIfDue(ctx, interval, time.Now()); errors.Is(err, context.Canceled) {
 			// 정상 종료(cancelMerge)도 진행 중 병합을 이 취소로 만든다 — D102 계약 2가 퍼지 고루틴을
-			// 배제한 이유 ②와 같은 형태라 같은 파일의 퍼지 선례(715-721행)와 강등을 맞춘다: 깨끗한
+			// 배제한 이유 ②와 같은 형태라 같은 파일의 퍼지 선례(729행)와 강등을 맞춘다: 깨끗한
 			// 종료를 실패로 찍지 않는다.
 			slog.Debug("FTS 병합 중단 — 서버 종료", "error", err)
 		} else if err != nil {
@@ -756,7 +756,7 @@ func run(ctx context.Context, args []string, stderr io.Writer) error {
 
 	// D102 계약 2: 병합은 퍼지와 별개 고루틴이고 서버 생존 ctx에 묶인다 — 퍼지의 60초 예산도
 	// purgeErr도 cutoff<=0 건너뛰기도 공유하지 않는다(그 셋 중 어느 것에 걸려도 병합이 영영
-	// 안 도는 구간이 생긴다). defer 등록이 st.Close()(628행)보다 뒤라 LIFO로 먼저 돌아, 고루틴이
+	// 안 도는 구간이 생긴다). defer 등록이 st.Close()(636행)보다 뒤라 LIFO로 먼저 돌아, 고루틴이
 	// 닫힌 DB를 만지거나 프로세스보다 오래 사는 일이 없다.
 	mergeCtx, cancelMerge := context.WithCancel(ctx)
 	mergeDone := make(chan struct{})
