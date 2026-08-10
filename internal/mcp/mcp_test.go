@@ -4,7 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
-	"database/sql" // 원장 열을 직접 읽는 테스트용 — mcp 본체는 아키텍처 §5-1로 이 import가 금지다
+	"database/sql" // 원장 열을 직접 읽는 테스트용 — mcp **본체**는 아키텍처 "부패 방지 계약"이 이 import를 금지한다
 	"encoding/json"
 	"errors"
 	"fmt"

@@ -1051,7 +1051,7 @@ const lastIndexedAtByHashQuery = `SELECT max(s.indexed_at), EXISTS(` + shadowOwn
 
 // LastIndexedAtByHash — D103 계약 2: 이 콘텐츠의 **마지막 포착** 시각(unix 초)과, 소견 F4의
 // **shadow 귀속 여부**. 시계도 범위도 D67 퍼지와 같은 것을 쓴다 — 퍼지 술어
-// (shadowOwnedFilter의 나이 절, store.go:1463-1465)가 같은 content_hash를 가진 모든 artifact의
+// (shadowOwnedFilter의 cutoffUnix 분기가 붙이는 나이 절)가 같은 content_hash를 가진 모든 artifact의
 // 모든 소스에 대해 indexed_at을 보므로, 나이도 그렇게 재야 분포가 보존 창 위에 그대로
 // 겹쳐진다. artifact 단위로 재면 형제가 방금 재포착된 아티팩트가 실제보다 늙어 보이고 그
 // 오차는 창을 늘리는 쪽으로만 작용한다. 소스가 없으면 (0, false, nil).
@@ -1080,8 +1080,8 @@ func (s *Store) LastIndexedAtByHash(ctx context.Context, contentHash string) (in
 // 나중에 창과 무관한 회수를 창의 증거로 만든다.
 // ageS가 **nil이면 나이 미상**이고 NULL로 적는다(소견 F6) — 0으로 적으면 "방금 포착한 것을
 // 같은 초에 회수했다"와 구분되지 않아 분포를 아래로 끌어내린다. 그 행도 해소로는 센다(바이트를
-// 실제로 돌려줬다). *int64인 이유: internal/mcp는 `database/sql` import가 금지돼 있어
-// (아키텍처 문서 §5-1) sql.NullInt64를 호출부에 둘 수 없다.
+// 실제로 돌려줬다). *int64인 이유: 아키텍처 문서 "부패 방지 계약"의 mcp god package 방지
+// 항목이 internal/mcp의 `database/sql` import를 금지해 sql.NullInt64를 호출부에 둘 수 없다.
 // ctx를 받는 이유는 계약 8과 같다 — 형제 LedgerAppendContext처럼 호출부의 예산을 탄다.
 // LedgerAppend와 같은 best-effort 계약이다(ledger 없음·오류는 무시). S4: 정수와 도구 이름만
 // 담는다 — 선택자도 경로도 내용도 담지 않는다(계약 6).
@@ -1155,15 +1155,17 @@ func LedgerStats(dir string) ([]ToolStat, error) {
 	return out, nil
 }
 
-// FetchStat: D103 회수 실적. Calls는 원장의 ctr_fetch 행 전부(레거시 포함)이고 D104의 채택
-// 문턱이 읽는 수다. Resolved는 artifact를 실제로 돌려준 fetch, Missed는 **artifact 부재**로
-// 끝난 fetch다(계약 3 — 잘못된 chunk id는 여기 들지 않는다). Age*는 **회수 시점에 박아 둔**
+// FetchStat: D103 회수 실적. Calls는 원장의 ctr_fetch 행 전부(레거시 포함)다 — **D104의 채택
+// 문턱이 읽는 수가 아니다**: 그것은 `stats`의 `total` 행(ctr_* 전 도구 합)이고, 이 열 하나가
+// 아니다. Resolved는 artifact를 실제로 돌려준 fetch, Missed는 **artifact 부재**로 끝난
+// fetch다(계약 3 — 잘못된 chunk id는 여기 들지 않는다). Age*는 **회수 시점에 박아 둔**
 // 나이(초)의 분포 — 아티팩트가 나중에 지워져도 남는다는 것이 이 계측의 요지다(계약 2).
 //
 // Legacy는 그 Calls 중 이관 전 행(두 열 다 NULL)이다 — 해소에도 미해소에도 들지 않으므로
 // Calls를 결과의 분모로 읽으면 그만큼 희석된다(소견 F9).
 //
-// ShadowResolved는 그 해소 중 **shadow 귀속**(= 퍼지가 실제로 지우는) 행만 센 수이고,
+// ShadowResolved는 그 해소 중 **shadow 귀속**(= 퍼지가 실제로 지우는)이면서 **나이가 기록된**
+// 행만 센 수이고(fetchAgeBasis 그대로 — 나이 미상은 빠진다, 소견 F6),
 // Age*는 그 부분집합에서만 나온다(소견 F4). Resolved와 갈라 두는 이유: 채택 게이트는 도구가
 // 쓰이는지를 묻고(모든 해소가 답이다) 창의 길이는 지워질 수 있는 것만 답할 수 있다.
 // ShadowArtifacts는 그 같은 모집단의 **distinct artifact_id**이고 D104의 착수 조건이 읽는
