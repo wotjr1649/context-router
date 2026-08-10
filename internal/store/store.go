@@ -1193,22 +1193,43 @@ func LedgerStats(dir string) ([]ToolStat, error) {
 }
 
 // FetchStat: D103 회수 실적. Calls는 원장의 ctr_fetch 행 전부(레거시 포함)다 — **D104의 채택
-// 문턱이 읽는 수가 아니다**: 문턱은 `Resolved + Missed`이고(W2 소유자 판정), 이 열은 이관 전
-// 레거시까지 품어 배포 첫날 역사만으로 문턱을 넘긴다. `stats`의 `total` 행도 아니다 — 그 행은
-// 이제 M6만 읽는다. Resolved는 artifact를 실제로 돌려준 fetch, Missed는 **artifact 부재**로 끝난
+// 문턱이 읽는 수가 아니다**: 이 열은 이관 전 레거시까지 품어 배포 첫날 역사만으로 문턱을
+// 넘긴다(W2 소유자 판정). `stats`의 `total` 행도 아니다 — 그 행은 이제 M6만 읽는다.
+// Resolved는 artifact를 실제로 돌려준 fetch, Missed는 **artifact 부재**로 끝난
 // fetch다(계약 3 — 잘못된 chunk id는 여기 들지 않는다). Age*는 **회수 시점에 박아 둔**
 // 나이(초)의 분포 — 아티팩트가 나중에 지워져도 남는다는 것이 이 계측의 요지다(계약 2).
 //
 // Legacy는 그 Calls 중 이관 전 행(두 열 다 NULL)이다 — 해소에도 미해소에도 들지 않으므로
 // Calls를 결과의 분모로 읽으면 그만큼 희석된다(소견 F9).
 //
+// ★ **행을 세는 수와 아티팩트를 세는 수를 갈라 둔다 — D104가 읽는 쪽은 뒤의 것이다**(릴리스
+// 패스 소견 F5·F7). ctr_fetch는 기본 16 KiB까지만 돌려주므로 아티팩트 하나를 끝까지 읽는 것이
+// 여러 호출이고, 164 KiB짜리 하나를 한 번 읽으면 해소 행이 열 개 남는다. 그래서 **채택 문턱은
+// `ResolvedArtifacts + Missed`를 읽어야 한다** — `Resolved + Missed`로 읽으면 아티팩트 하나를
+// 한 번 읽은 14일, 즉 도구가 사실상 안 쓰인 구간이 문턱 10을 통과해 행 2를 건너뛴다.
+// Resolved·ShadowResolved는 그래도 행 수로 남는다: Calls의 분해(= Legacy+Resolved+Missed)가
+// 그 위에 서 있고, 아티팩트 수를 옆에 나란히 놓아야 페이징 집중이 눈에 보인다.
+//
+// ★★ **Missed에는 그 짝이 없고, 앞으로도 없다**(소견 F6, 소유자 판정 2026-08-10). 미해소 행은
+// 요청된 id를 적지 않으므로(계약 1의 세 상태 인코딩이 `artifact_id` NULL로 판정한다) 같은 죽은
+// 참조를 선택자만 바꿔 여러 번 시도한 것이 여러 행으로 남는다 — **Missed는 죽은 참조 수의
+// 상한이다.** 열을 더해 dedup하는 안을 버린 이유는 정밀해 **보이게** 만들기 때문이다: 미해소는
+// 이미 세 모집단을 섞고 있고(퍼지된 귀속 아티팩트 = 신호 · 창이 건드리지 않는 explicit ·
+// 애초에 없던 id), 그 오염은 dedup으로 줄지 않는다. 아티팩트가 없어 귀속을 되물을 수 없다는
+// 것이 D103 계약 1이고 D104도 그 비대칭을 명시한다. 그리고 이 과대 계수가 결정표를 **틀린 행으로
+// 옮기지는 못한다**: 행 3·3b·5의 전제가 `Missed < 5`이므로 그 아래에서 Missed가 채택 문턱에
+// 보태는 몫은 최대 4이고, 그러면 통과에 `ResolvedArtifacts >= 6`이 필요하다 — 진짜 채택이다.
+// Missed가 문턱을 혼자 채울 만큼 크면(10행 이상) `Missed >= 5`가 반드시 참이라 행 4가 행 3을
+// 앞질러 발화한다. 행 4의 처방은 "한 단계 넓히고 다시 잰다"이고 과대 계수의 방향은 그 발화를
+// **빠르게** 하는 쪽 — 이 계측이 두려워하는 오독(침묵을 넉넉함으로 읽는 것)의 반대편이다.
+//
 // ShadowResolved는 그 해소 중 **shadow 귀속**(= 퍼지가 실제로 지우는)이면서 **나이가 기록된**
 // 행만 센 수이고(fetchAgeBasis 그대로 — 나이 미상은 빠진다, 소견 F6),
-// Age*는 그 부분집합에서만 나온다(소견 F4). Resolved와 갈라 두는 이유: 채택 게이트는 도구가
+// Age*는 그 모집단에서만 나온다(소견 F4). Resolved와 갈라 두는 이유: 채택 게이트는 도구가
 // 쓰이는지를 묻고(모든 해소가 답이다) 창의 길이는 지워질 수 있는 것만 답할 수 있다.
 // ShadowArtifacts는 그 같은 모집단의 **distinct artifact_id**이고 D104의 착수 조건이 읽는
-// 수다(소견 F5) — ctr_fetch는 기본 16 KiB까지만 돌려주므로 아티팩트 하나가 여러 행이 되고,
-// 행으로 세면 페이징 한 번이 조건을 채운다. 둘을 나란히 내면 그 집중이 보인다.
+// 수다(소견 F5). **Age*의 표본도 그 아티팩트 수만큼이다** — 아티팩트당 나이의 max 한 개씩이고,
+// 그 근거는 아래 분위수 루프의 주석에 있다.
 //
 // LegacyAfterMigrate는 그 Legacy 중 **이관 워터마크 뒤에 쓰인** 행이고, 릴리스 패스 소견 F2가
 // 요구한 관측이다 — 세션이 열린 채 새 바이너리를 깔면 훅이 원장을 이관하는 동안 **옛 서버가
@@ -1221,7 +1242,8 @@ func LedgerStats(dir string) ([]ToolStat, error) {
 // 패스 M3). ledger는 스키마 버전을 두지 않는 best-effort 보조 DB라 세 ALTER가 **아직 안 돈 원장을
 // 읽는 상태가 정상적으로 도달 가능**하고(계약 7), 그때 위 수들은 0이 아니라 **못 잰 것**이다.
 // 0으로 렌더하면 결정표가 **아무것도 재지 않은 원장을 관측으로 받는다**: 여섯 수가 다 숫자라
-// 행 0이 발화하지 못하고 ShadowArtifacts=0이 아니라 `Resolved + Missed = 0`이 행 2로 데려간다.
+// 행 0이 발화하지 못하고 ShadowArtifacts=0이 아니라 `ResolvedArtifacts + Missed = 0`이 행 2로
+// 데려간다.
 // 창 판단이 닫히지는 않지만 **처방이 틀린다** — 행 2는 채택을 늘리라고 하는데 할 일은
 // 바이너리를 가는 것이고, 그것을 모르면 다음 14일도 아무것도 재지 않는다.
 // 그래서 D104는 상태가 셋이다: 충족·불충족, 그리고 **판정 불가**(결정표 행 0 — 숫자가 아닌
@@ -1230,8 +1252,12 @@ func LedgerStats(dir string) ([]ToolStat, error) {
 // **별개 축**이다 — 열이 다 있어도 워터마크가 없을 수 있고(계약 7의 열 관용과 같은 이유로
 // 정상적으로 도달 가능하다), 그때 LegacyAfterMigrate의 0은 "없다"가 아니라 "못 잼"이다.
 type FetchStat struct {
-	Calls, Legacy          int64
-	Resolved, Missed       int64
+	Calls, Legacy    int64
+	Resolved, Missed int64
+	// ResolvedArtifacts — Resolved의 **distinct artifact_id**. 채택 문턱이 읽는 수이고(소견 F7),
+	// 귀속 제한은 걸리지 않는다 — 그 제한은 ShadowArtifacts 쪽의 것이다(소견 F4). 둘을 헷갈리면
+	// 채택 질문("도구가 쓰이는가")에 창 질문("퍼지가 지울 것을 회수했는가")의 수로 답하게 된다.
+	ResolvedArtifacts      int64
 	LegacyAfterMigrate     int64
 	ShadowResolved         int64
 	ShadowArtifacts        int64
@@ -1402,6 +1428,13 @@ func LedgerFetchStats(dir string) (FetchStat, error) {
 	}
 	defer db.Close()
 
+	// 열 집합은 트랜잭션 **밖**에서 읽는다. 원장 스키마는 단조다 — 원장 DDL을 던지는 곳은
+	// migrateLedger뿐이고 그것은 ADD COLUMN만 한다. 그래서 이 읽기와 아래 스냅샷 사이에 다른
+	// 프로세스의 이관이 끼면 결과는 **한 계단 낮게** 나오고, 그 계단은 *OK 표식이 "못 쟀다"로
+	// 정확히 나른다(계약 7이 이미 정상으로 규정한 상태다). 반대 방향 — 있다고 본 열이 사라져
+	// 질의가 깨지는 것 — 은 열을 지우는 코드가 없어 도달 불가다. 트랜잭션 안으로 넣으려면
+	// ledgerColumns가 *sql.DB와 *sql.Tx를 함께 받아야 하는데, 그것은 얻는 것 없이 아키텍처
+	// 문서의 "자체 정의 인터페이스 0개"를 깨는 값이다.
 	cols, err := ledgerColumns(db)
 	if err != nil {
 		return FetchStat{}, fmt.Errorf("store LedgerFetchStats: %w", err)
@@ -1409,7 +1442,24 @@ func LedgerFetchStats(dir string) (FetchStat, error) {
 	if len(cols) == 0 { // ledger 테이블 자체가 없다 — 이관 전과 같은 빈 값 경로
 		return fs, nil // LedgerOK=false: 여기의 0은 "호출 0회"가 아니라 "못 쟀다"다
 	}
-	if err := db.QueryRow(
+	// 소견 F8: 여기부터 끝까지의 질의를 **전부 한 스냅샷에서** 읽는다(열 집합만 위 문단의
+	// 이유로 바깥에 남는다). 따로 내면 각각이 제 암시 트랜잭션을
+	// 열고, 훅이 하루 약 295번 쓰는 원장이라 그 사이에 커밋이 끼는 것은 예외가 아니라 정상이다.
+	// 그러면 회수 줄은 **어떤 시점의 원장에도 대응하지 않는 수의 모음**이 된다: shadow_rows가
+	// resolved를 넘고(독스트링이 부분집합이라고 적은 그 관계), calls가 legacy+resolved+missed와
+	// 갈리며(legacy 열을 더한 이유가 그 분해다), 분위수 셋이 서로 다른 모집단에서 나와 p90이
+	// max를 넘는다. **v0.19.1이 SizeStats에서 고친 바로 그 부류다**(그 근거는 SizeStats의 주석에
+	// 있다 — 거기서는 pragma 셋이라 한 문장으로 합칠 수 있었고, 여기서는 서로 다른 집계와
+	// 오프셋 질의라 합칠 수 없어 트랜잭션이다).
+	// 부수 효과 하나가 더 있다: 오프셋을 정하는 건수와 오프셋을 쓰는 질의가 같은 모집단을 보므로
+	// `OFFSET N-1`이 행 없음으로 떨어져 회수 줄 전체가 사라지는 경로가 닫힌다.
+	// WAL이라 이 읽기 트랜잭션은 훅의 쓰기를 막지 않는다(읽는 쪽이 스냅샷을 들 뿐이다).
+	tx, err := db.Begin()
+	if err != nil {
+		return FetchStat{}, fmt.Errorf("store LedgerFetchStats: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }() // 읽기 전용 — 커밋할 것이 없다
+	if err := tx.QueryRow(
 		`SELECT count(*) FROM ledger WHERE tool='ctr_fetch'`,
 	).Scan(&fs.Calls); err != nil {
 		return FetchStat{}, fmt.Errorf("store LedgerFetchStats: %w", err)
@@ -1420,11 +1470,17 @@ func LedgerFetchStats(dir string) (FetchStat, error) {
 	}
 	// 계약 1의 표: 레거시는 두 열 다 NULL, 미해소는 age=-1, 해소는 artifact_id가 값
 	// (나이는 미상일 수 있다 — 소견 F6). 레거시를 같은 문장에서 세는 이유는 소견 F9다.
-	if err := db.QueryRow(`SELECT
+	// 넷째 칸이 소견 F7이다: 채택 문턱이 읽을 **distinct 아티팩트**를 같은 문장에서 낸다.
+	// count(DISTINCT)는 NULL을 세지 않으므로 술어를 따로 달 필요가 없다 — 해소 행만 값이 있다.
+	// 한 문장인 것이 요점이다(D13): 갈라 두면 분자와 분모가 다른 스냅샷을 볼 수 있고, 그때
+	// resolved_artifacts > resolved 같은 불가능한 줄이 나온다.
+	if err := tx.QueryRow(`SELECT
 			coalesce(sum(artifact_id IS NOT NULL),0),
 			coalesce(sum(artifact_id IS NULL AND artifact_age_s IS NOT NULL),0),
-			coalesce(sum(artifact_id IS NULL AND artifact_age_s IS NULL),0)
-		FROM ledger WHERE tool='ctr_fetch'`).Scan(&fs.Resolved, &fs.Missed, &fs.Legacy); err != nil {
+			coalesce(sum(artifact_id IS NULL AND artifact_age_s IS NULL),0),
+			count(DISTINCT artifact_id)
+		FROM ledger WHERE tool='ctr_fetch'`).
+		Scan(&fs.Resolved, &fs.Missed, &fs.Legacy, &fs.ResolvedArtifacts); err != nil {
 		return FetchStat{}, fmt.Errorf("store LedgerFetchStats: %w", err)
 	}
 	fs.OutcomeOK = true
@@ -1433,12 +1489,12 @@ func LedgerFetchStats(dir string) (FetchStat, error) {
 	// 0은 "워터마크가 없다"이지 0번 행이 아니다 — 그 원장은 판정하지 않고 MigrateMarkOK로
 	// 그 사실을 나른다. 스키마 계단과 달리 이 축은 열이 다 있어도 false일 수 있다.
 	var mark int64
-	if err := db.QueryRow(`PRAGMA user_version`).Scan(&mark); err != nil {
+	if err := tx.QueryRow(`PRAGMA user_version`).Scan(&mark); err != nil {
 		return FetchStat{}, fmt.Errorf("store LedgerFetchStats: %w", err)
 	}
 	if mark > 0 {
 		fs.MigrateMarkOK = true
-		if err := db.QueryRow(`SELECT count(*) FROM ledger
+		if err := tx.QueryRow(`SELECT count(*) FROM ledger
 			WHERE tool='ctr_fetch' AND artifact_id IS NULL AND artifact_age_s IS NULL AND id >= ?`,
 			mark).Scan(&fs.LegacyAfterMigrate); err != nil {
 			return FetchStat{}, fmt.Errorf("store LedgerFetchStats: %w", err)
@@ -1447,27 +1503,42 @@ func LedgerFetchStats(dir string) (FetchStat, error) {
 	if !cols["shadow_owned"] {
 		return fs, nil // 셋째 ALTER 이전 원장 — 귀속으로 제한한 수치는 낼 수 없다(계약 7과 같은 관용)
 	}
-	if err := db.QueryRow(
+	if err := tx.QueryRow(
 		`SELECT count(*), count(DISTINCT artifact_id) FROM ledger WHERE `+fetchAgeBasis,
 	).Scan(&fs.ShadowResolved, &fs.ShadowArtifacts); err != nil {
 		return FetchStat{}, fmt.Errorf("store LedgerFetchStats: %w", err)
 	}
 	fs.ShadowOK = true
-	if fs.ShadowResolved == 0 {
+	if fs.ShadowArtifacts == 0 { // 모집단이 비었다 — 오프셋을 정할 N이 없다
 		return fs, nil
 	}
 	// 분위수는 SQLite에 내장이 없으므로 정렬 + OFFSET으로 낸다. 행 수가 수만 단위라
 	// 이 방식으로 충분하다(하루 약 300행 × 무기한 보존 = 1년 11만 행).
+	//
+	// **모집단은 행이 아니라 아티팩트다**(소견 F5). ctr_fetch는 기본 16 KiB까지만 돌려주므로
+	// 아티팩트 하나를 끝까지 읽는 것이 여러 호출이고, 그 페이징은 **한 세션 안에서** 일어나
+	// 거의 같은 젊은 나이를 여럿 남긴다. 행으로 세면 그 무리가 p90을 자기 쪽으로 끌어내리고,
+	// D104 행 5는 그 p90을 그대로 보존 창의 처방값으로 바꾼다 — 계측이 제 데이터가 지지하는
+	// 것보다 **짧은** 창을 처방하게 된다. GROUP BY로 아티팩트당 한 표본만 남긴다.
+	//
+	// 아티팩트당 대푯값이 **max**인 이유: 창의 길이가 답하는 질문은 "이 아티팩트가 마지막으로
+	// 필요해진 것이 포착 뒤 얼마인가"이고, 그 답은 가장 **늦은** 회수다 — 그 시점까지 살아
+	// 있었어야 하므로 보존이 그만큼 필요했다는 뜻이다. min은 "언제 처음 읽혔나"를 재게 되어
+	// 행 가중과 같은 방향(창을 짧게)으로 틀린다.
+	//
+	// N도 ShadowArtifacts로 바뀐다 — 오프셋과 모집단이 갈리면 어느 쪽도 읽을 수 없다(D13,
+	// fetchAgeBasis를 두 문장이 공유하는 것과 같은 이유). ShadowResolved는 그대로 행 수로
+	// 남아 `shadow_rows` 옆의 `shadow_artifacts`가 페이징 집중을 보이게 한다.
 	for _, q := range []struct {
 		dst    *int64
 		offset int64
 	}{
-		{&fs.AgeP50, (fs.ShadowResolved - 1) * 50 / 100},
-		{&fs.AgeP90, (fs.ShadowResolved - 1) * 90 / 100},
-		{&fs.AgeMax, fs.ShadowResolved - 1},
+		{&fs.AgeP50, (fs.ShadowArtifacts - 1) * 50 / 100},
+		{&fs.AgeP90, (fs.ShadowArtifacts - 1) * 90 / 100},
+		{&fs.AgeMax, fs.ShadowArtifacts - 1},
 	} {
-		if err := db.QueryRow(`SELECT artifact_age_s FROM ledger WHERE `+fetchAgeBasis+`
-			ORDER BY artifact_age_s LIMIT 1 OFFSET ?`, q.offset).Scan(q.dst); err != nil {
+		if err := tx.QueryRow(`SELECT max(artifact_age_s) FROM ledger WHERE `+fetchAgeBasis+`
+			GROUP BY artifact_id ORDER BY 1 LIMIT 1 OFFSET ?`, q.offset).Scan(q.dst); err != nil {
 			return FetchStat{}, fmt.Errorf("store LedgerFetchStats: %w", err)
 		}
 	}

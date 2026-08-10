@@ -2248,7 +2248,8 @@ func TestLedgerAppendFetchUnknownAgeIsNull(t *testing.T) {
 }
 
 // TestLedgerFetchStatsRestrictsAgeToShadowOwned: 나이 분위수와 착수 조건이 읽는 수는
-// **퍼지 대상(shadow 귀속) 해소 행만** 센다(소견 F4). explicit 아티팩트는 영원히 안 지워지므로
+// **퍼지 대상(shadow 귀속) 해소만** 본다(소견 F4 — "행만"이라고 적혀 있었는데 분위수의 표본은
+// 소견 F5 이후 아티팩트당 하나다). explicit 아티팩트는 영원히 안 지워지므로
 // 그 회수 나이가 분포에 섞이면 "창이 넉넉하다"는 결론이 창과 무관한 데이터에서 나온다.
 // 비귀속 행에 귀속 행보다 큰 나이를 심어 — 섞이면 p90·max가 즉시 달라진다.
 func TestLedgerFetchStatsRestrictsAgeToShadowOwned(t *testing.T) {
@@ -2303,6 +2304,194 @@ func TestLedgerFetchStatsCountsDistinctShadowArtifacts(t *testing.T) {
 	}
 	if fs.ShadowArtifacts != 2 {
 		t.Fatalf("ShadowArtifacts=%d want 2(distinct artifact_id) — 페이징이 착수 조건을 채웠다", fs.ShadowArtifacts)
+	}
+}
+
+// seedPagedFetchLedger — 행 가중과 아티팩트 가중이 **다른 답을 내는** 원장을 만든다. 둘이 같은
+// 픽스처는 아티팩트 가중을 하나도 증명하지 못하므로(이 브랜치가 세 번 저지른 실수), 수치를
+// 골라서 갈라 놓았다:
+//
+//   - 아티팩트 1을 한 세션에서 다섯 번 이어 읽고(10·20·30·40·50) 뒤늦게 한 번 더 회수한다(350).
+//     16 KiB 상한이 만드는 페이징 폭주 그 자체다. 뒤늦은 350이 있어야 **아티팩트당 max와 min이
+//     서로 다른 순위에 서고**, 그래야 집계를 min으로 바꾼 구현이 걸린다.
+//   - 아티팩트 2~7은 각각 한 번씩(100~600).
+//   - 아티팩트 100은 explicit(귀속 아님)으로 두 번 — resolved_artifacts와 shadow_artifacts를
+//     갈라 놓아 소견 F4의 제한이 앞의 수에는 걸리지 않는다는 것도 같은 픽스처가 잠근다.
+//
+// 그래서 세 답이 전부 다르다: 행 가중 p50/p90/max = 100/400/600, 아티팩트당 **min** =
+// 300/500/600, 아티팩트당 **max**(옳은 것) = 350/500/600.
+func seedPagedFetchLedger(t *testing.T, dir string) {
+	t.Helper()
+	st := openAt(t, dir)
+	for _, age := range []int64{10, 20, 30, 40, 50, 350} { // 아티팩트 1 — 페이징 다섯 + 뒤늦은 회수 하나
+		st.LedgerAppendFetch(t.Context(), 0, 1, 1, &age, true)
+	}
+	for i, age := range []int64{100, 200, 300, 400, 500, 600} { // 아티팩트 2~7 — 한 번씩
+		st.LedgerAppendFetch(t.Context(), 0, 1, int64(i)+2, &age, true)
+	}
+	for range 2 { // explicit 아티팩트 — 귀속 제한이 거르는 쪽
+		st.LedgerAppendFetch(t.Context(), 0, 1, 100, agePtr(100_000), false)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatalf("픽스처 Close: %v", err)
+	}
+	ledgerSchemaGuard(t, dir, []string{"artifact_id", "artifact_age_s", "shadow_owned"}, nil)
+}
+
+// shadowRowsAndArtifacts — 원장을 **직접** 읽어 귀속 해소의 (행 수, distinct 아티팩트 수)를 낸다.
+// 사전 가드 전용이라 LedgerFetchStats도 fetchAgeBasis도 거치지 않는다 — 시험 대상으로 시험
+// 대상을 가드하면 그 둘이 함께 틀렸을 때 아무것도 안 잡힌다.
+func shadowRowsAndArtifacts(t *testing.T, dir string) (int64, int64) {
+	t.Helper()
+	db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(filepath.Join(dir, "ledger.db"))+"?mode=ro")
+	if err != nil {
+		t.Fatalf("사전 가드 open: %v", err)
+	}
+	var rows, arts int64
+	scanErr := db.QueryRow(`SELECT count(*), count(DISTINCT artifact_id) FROM ledger
+		WHERE tool='ctr_fetch' AND shadow_owned=1 AND artifact_age_s IS NOT NULL`).Scan(&rows, &arts)
+	closeErr := db.Close()
+	if scanErr != nil {
+		t.Fatalf("사전 가드 조회: %v", scanErr)
+	}
+	if closeErr != nil {
+		t.Fatalf("사전 가드 Close: %v", closeErr)
+	}
+	return rows, arts
+}
+
+// TestLedgerFetchStatsWeighsAgeByArtifact — 릴리스 패스 소견 F5. 나이 분위수의 **모집단이
+// 행이 아니라 아티팩트**다. 페이징은 한 세션 안에서 일어나므로 큰 아티팩트 하나가 거의 같은
+// **젊은** 나이를 여럿 남기고, 행으로 세면 그 무리가 p90을 자기 쪽으로 끌어내린다. D104 행 5는
+// 그 p90을 그대로 보존 창의 처방값으로 바꾸므로, 계측이 제 데이터가 지지하는 것보다 **짧은**
+// 창을 처방하게 된다 — 아무도 눈치채지 못하는 종류의 오류다.
+//
+// 아티팩트당 대푯값으로 **max**를 쓰는 이유: 창의 길이가 답해야 하는 질문은 "이 아티팩트가
+// 마지막으로 필요해진 것이 포착 뒤 얼마인가"이고, 그 답은 그 아티팩트의 **가장 늦은** 회수다.
+// min을 쓰면 "언제 처음 읽혔나"를 재게 되어 창을 짧게 처방하는 같은 방향으로 틀린다.
+func TestLedgerFetchStatsWeighsAgeByArtifact(t *testing.T) {
+	dir := t.TempDir()
+	seedPagedFetchLedger(t, dir)
+
+	// 사전 가드: 두 가중이 실제로 갈라져 있어야 아래 단언이 뜻을 갖는다.
+	rows, arts := shadowRowsAndArtifacts(t, dir)
+	if rows != 12 || arts != 7 {
+		t.Fatalf("사전 가드: 픽스처는 귀속 해소 행 12 · 아티팩트 7이어야 한다 — 실제 행 %d · 아티팩트 %d", rows, arts)
+	}
+
+	fs, err := LedgerFetchStats(dir)
+	if err != nil {
+		t.Fatalf("LedgerFetchStats: %v", err)
+	}
+	if fs.ShadowResolved != 12 || fs.ShadowArtifacts != 7 {
+		t.Fatalf("모집단이 픽스처와 다르다: %+v want shadow_rows=12 shadow_artifacts=7", fs)
+	}
+	if fs.AgeP50 != 350 || fs.AgeP90 != 500 || fs.AgeMax != 600 {
+		t.Fatalf("분위수가 아티팩트 가중이 아니다: p50=%d p90=%d max=%d — want 350/500/600"+
+			" (행 가중이면 100/400/600, 아티팩트당 min이면 300/500/600)", fs.AgeP50, fs.AgeP90, fs.AgeMax)
+	}
+}
+
+// TestLedgerFetchStatsCountsDistinctResolvedArtifacts — 릴리스 패스 소견 F7. D104의 **채택
+// 문턱**(`resolved + missed` 10건)도 행을 센다. 164 KiB 아티팩트 하나를 끝까지 읽으면 16 KiB
+// 상한 때문에 열 번 불리고 해소 행 열 개가 남는다 — 아티팩트 **하나를 한 번** 읽은 14일,
+// 즉 도구가 사실상 안 쓰인 구간이 문턱을 통과해 행 2를 건너뛰고 행 3("이 구간의 데이터로는
+// 창을 늘리지 않는다")으로 떨어진다. 문턱이 막으려던 바로 그 오독이다.
+//
+// 이 픽스처는 두 수가 문턱 10을 **사이에 두고** 갈리게 골랐다 — 행 14(통과) 대 아티팩트
+// 8(미달). 둘 다 같은 쪽에 있는 픽스처는 아무것도 증명하지 못한다.
+func TestLedgerFetchStatsCountsDistinctResolvedArtifacts(t *testing.T) {
+	dir := t.TempDir()
+	seedPagedFetchLedger(t, dir)
+
+	fs, err := LedgerFetchStats(dir)
+	if err != nil {
+		t.Fatalf("LedgerFetchStats: %v", err)
+	}
+	if fs.Resolved != 14 {
+		t.Fatalf("Resolved=%d want 14(행 수는 그대로 낸다 — calls의 분해가 그 위에 서 있다)", fs.Resolved)
+	}
+	if fs.ResolvedArtifacts != 8 {
+		t.Fatalf("ResolvedArtifacts=%d want 8(distinct artifact_id — 귀속 여부와 무관하게 센다)", fs.ResolvedArtifacts)
+	}
+	if fs.Resolved < 10 || fs.ResolvedArtifacts >= 10 {
+		t.Fatalf("문턱 10을 사이에 두지 않는 픽스처는 이 소견을 증명하지 못한다: %+v", fs)
+	}
+	// 귀속 제한은 shadow_* 쪽에만 걸린다(소견 F4) — 채택 문턱은 "도구가 쓰이는가"를 묻는다.
+	if fs.ShadowArtifacts != 7 {
+		t.Fatalf("ShadowArtifacts=%d want 7 — 귀속 제한이 resolved_artifacts에까지 번졌다", fs.ShadowArtifacts)
+	}
+}
+
+// TestLedgerFetchStatsReadsOneSnapshot — 릴리스 패스 소견 F8. 회수 줄의 수들이 **서로 다른
+// 스냅샷**에서 나오면 그 줄은 어떤 원장에도 대응하지 않는 수의 모음이 된다. 훅이 하루 약 295번
+// 쓰는 원장이므로 `stats`가 도는 사이 커밋이 끼는 것은 예외가 아니라 정상이다.
+//
+// 세 불변식을 건다 — 셋 다 이 줄을 읽는 사람이 실제로 기대는 것이다:
+//
+//	① calls = legacy + resolved + missed  (legacy 열을 더한 이유가 이 분해다)
+//	② shadow_rows ≤ resolved · shadow_artifacts ≤ resolved_artifacts  (독스트링이 말하는 부분집합)
+//	③ p50 ≤ p90 ≤ max  (세 오프셋이 같은 모집단에서 나온다)
+//
+// 동시 쓰기가 **작은 나이**를 넣는 이유: 뒤에 도는 질의일수록 같은 오프셋이 더 작은 값을
+// 가리키므로, 스냅샷이 갈리면 p90이 max보다 커지는 상태에 실제로 도달한다.
+// v0.19.1이 SizeStats에서 고친 것과 같은 부류다(그 근거는 SizeStats의 주석에 있다).
+func TestLedgerFetchStatsReadsOneSnapshot(t *testing.T) {
+	dir := t.TempDir()
+	st := openAt(t, dir)
+	for i := range 20 { // 분위수가 설 만큼의 씨앗 — 나이는 크게
+		age := int64(1000 + i*10)
+		st.LedgerAppendFetch(t.Context(), 0, 1, int64(i)+1, &age, true)
+	}
+	done := make(chan struct{})
+	first := make(chan struct{})
+	var written atomic.Int64
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := range 5000 {
+			select {
+			case <-done:
+				return
+			default:
+			}
+			st.LedgerAppendFetch(context.Background(), 0, 1, int64(1000+i), agePtr(1), true)
+			written.Add(1)
+			if i == 0 {
+				close(first)
+			}
+		}
+	}()
+	defer wg.Wait()
+	defer close(done)
+	<-first // 첫 쓰기가 들어간 뒤에 읽기 시작 — 동시성 없는 통과를 원천 차단한다
+	atStart := written.Load()
+
+	for i := range 40 {
+		fs, err := LedgerFetchStats(dir)
+		if err != nil {
+			t.Fatalf("반복 %d: %v", i, err)
+		}
+		if fs.Calls != fs.Legacy+fs.Resolved+fs.Missed {
+			t.Fatalf("반복 %d: calls=%d != legacy+resolved+missed=%d — 한 스냅샷이 아니다",
+				i, fs.Calls, fs.Legacy+fs.Resolved+fs.Missed)
+		}
+		if fs.ShadowResolved > fs.Resolved || fs.ShadowArtifacts > fs.ResolvedArtifacts {
+			t.Fatalf("반복 %d: 부분집합 불변식이 깨졌다 — %+v", i, fs)
+		}
+		if fs.AgeP50 > fs.AgeP90 || fs.AgeP90 > fs.AgeMax {
+			t.Fatalf("반복 %d: 분위수가 서로 다른 모집단에서 나왔다 — p50=%d p90=%d max=%d",
+				i, fs.AgeP50, fs.AgeP90, fs.AgeMax)
+		}
+	}
+
+	// 사후 가드: 읽는 40회 **동안** 쓰기가 실제로 흘렀는지 센다. "한 건 이상"으로는 부족하다 —
+	// 루프 전에 한 건만 들어오고 그 뒤 조용한 경우에도 통과해 버려, 사실상 직렬인 실행을
+	// 동시성 테스트라고 부르게 된다.
+	if during := written.Load() - atStart; during < 20 {
+		t.Fatalf("사후 가드: 읽는 40회 동안 동시 쓰기가 %d건뿐이다 — 그런 통과는 이 소견에 대해 "+
+			"아무 말도 하지 않는다", during)
 	}
 }
 
