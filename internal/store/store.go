@@ -1078,17 +1078,25 @@ func (s *Store) LastIndexedAtByHash(ctx context.Context, contentHash string) (in
 // shadowOwned는 **해소 행에만** 값으로 남는다(소견 F4) — 미해소 행은 아티팩트가 없어 귀속을
 // 물을 수 없으므로 NULL이다. 0으로 적으면 "explicit이었다"는 거짓 진술이 되고, 그 거짓이
 // 나중에 창과 무관한 회수를 창의 증거로 만든다.
+// ageS가 **nil이면 나이 미상**이고 NULL로 적는다(소견 F6) — 0으로 적으면 "방금 포착한 것을
+// 같은 초에 회수했다"와 구분되지 않아 분포를 아래로 끌어내린다. 그 행도 해소로는 센다(바이트를
+// 실제로 돌려줬다). *int64인 이유: internal/mcp는 `database/sql` import가 금지돼 있어
+// (아키텍처 문서 §5-1) sql.NullInt64를 호출부에 둘 수 없다.
 // ctx를 받는 이유는 계약 8과 같다 — 형제 LedgerAppendContext처럼 호출부의 예산을 탄다.
 // LedgerAppend와 같은 best-effort 계약이다(ledger 없음·오류는 무시). S4: 정수와 도구 이름만
 // 담는다 — 선택자도 경로도 내용도 담지 않는다(계약 6).
-func (s *Store) LedgerAppendFetch(ctx context.Context, returned, ms, artifactID, ageS int64, shadowOwned bool) {
+func (s *Store) LedgerAppendFetch(ctx context.Context, returned, ms, artifactID int64, ageS *int64, shadowOwned bool) {
 	if s.ledger == nil {
 		return
 	}
-	var idCol, owned any // nil = NULL
-	age := int64(-1)     // 미해소 표식
+	var idCol, owned any  // nil = NULL
+	age := any(int64(-1)) // 미해소 표식
 	if artifactID > 0 {
-		idCol, age, owned = artifactID, ageS, shadowOwned
+		idCol, owned = artifactID, shadowOwned
+		age = nil // 나이 미상
+		if ageS != nil {
+			age = *ageS
+		}
 	}
 	_, _ = s.ledger.ExecContext(
 		ctx,
@@ -1167,7 +1175,11 @@ type FetchStat struct {
 // shadow_owned=1로 제한하는 근거는 소견 F4: explicit 아티팩트는 퍼지 대상이 아니라 영원히
 // 남으므로 그 회수 나이는 창의 길이에 대해 아무 말도 하지 않는데, 섞이면 "해소 30건"을 채우고
 // 분위수까지 지배한다. NULL(미해소·레거시·귀속 미상)은 `=1`이 자연히 뺀다.
-const fetchAgeBasis = `tool='ctr_fetch' AND artifact_id IS NOT NULL AND shadow_owned=1`
+// artifact_age_s IS NOT NULL은 소견 F6: 나이를 모르는 해소 행을 뺀다. 오늘은 귀속 조건이
+// 그것을 대개 함께 배제하지만(귀속 판정에 hook 소스가 필요하고 그 소스가 곧 시계다) 그 결합은
+// 우연이다 — 명시하지 않으면 다음 변경이 조용히 NULL을 정렬 선두로 들여보낸다.
+const fetchAgeBasis = `tool='ctr_fetch' AND artifact_id IS NOT NULL AND shadow_owned=1
+	AND artifact_age_s IS NOT NULL`
 
 // ledgerColumns: PRAGMA table_info(ledger)의 열 이름 집합. 테이블이 없으면 빈 집합(오류 아님).
 // 드라이버 오류 문자열 대조("no such column")를 쓰지 않는 이유: 그 문면은 우리가 통제하지

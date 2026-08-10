@@ -553,7 +553,7 @@ func registerFetch(srv *mcp.Server, st *store.Store, worktreeRoot string) {
 				if _, hashErr := st.ArtifactHashByID(ctx, in.ArtifactID); errors.Is(hashErr, store.ErrNotFound) {
 					// 귀속 인자가 false인 것은 "explicit이었다"가 아니다 — 아티팩트가 없어 물을 수
 					// 없다는 뜻이고, 미해소 행은 그 값을 NULL로 남긴다(store.LedgerAppendFetch).
-					st.LedgerAppendFetch(ctx, 0, time.Since(start).Milliseconds(), 0, 0, false)
+					st.LedgerAppendFetch(ctx, 0, time.Since(start).Milliseconds(), 0, nil, false)
 				}
 			}
 			return nil, FetchOutput{}, toToolError(err)
@@ -589,13 +589,15 @@ func registerFetch(srv *mcp.Server, st *store.Store, worktreeRoot string) {
 		// 하나이고, 나중에는 아티팩트가 없어 되물을 수 없다. explicit 아티팩트는 퍼지 대상이
 		// 아니라 그 회수 나이가 창의 길이에 대해 아무 말도 하지 않는데, 표식이 없으면 그 회수가
 		// D104의 "해소 30건"을 채우고 분위수까지 지배한다.
-		// 나이 조회 실패는 회수를 실패시키지 않는다 — 0/비귀속으로 두고 행은 남긴다.
-		var ageS int64
+		// 나이 조회 실패·소스 부재는 회수를 실패시키지 않는다 — 나이를 **미상(nil)**으로 두고
+		// 행은 남긴다(소견 F6). 0으로 두면 같은 초에 회수한 행과 구분되지 않아 분포가 내려간다.
+		var ageS *int64
 		var shadowOwned bool
 		if at, owned, ageErr := st.LastIndexedAtByHash(ctx, res.Artifact.ContentHash); ageErr == nil {
 			shadowOwned = owned
 			if at > 0 {
-				ageS = time.Now().Unix() - at
+				age := time.Now().Unix() - at
+				ageS = &age
 			}
 		}
 		st.LedgerAppendFetch(ctx, jsonLen(out), time.Since(start).Milliseconds(), res.Artifact.ID, ageS, shadowOwned)

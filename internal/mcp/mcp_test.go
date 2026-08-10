@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"database/sql" // 원장 열을 직접 읽는 테스트용 — mcp 본체는 아키텍처 §5-1로 이 import가 금지다
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -3002,6 +3003,47 @@ func TestFetchRecordsZeroAgeWhenSourceAbsent(t *testing.T) {
 	if fs.ShadowResolved != 0 || fs.AgeMax != 0 {
 		t.Fatalf("ShadowResolved=%d AgeMax=%d, 기대 0/0 (source 부재 폴백)", fs.ShadowResolved, fs.AgeMax)
 	}
+	// 소견 F6: 그 행의 나이는 **NULL**이어야 한다. 0으로 적히면 "방금 포착한 것을 같은 초에
+	// 회수했다"와 같은 값이 되고, 집계만 보는 위 두 단언은 그 차이를 못 본다 — 열을 직접 읽는다.
+	if got := ledgerAgeCell(t, storeDir); got != "NULL" {
+		t.Fatalf("artifact_age_s=%s, 기대 NULL (나이 미상)", got)
+	}
+}
+
+// ledgerAgeCell — storeDir 원장의 유일한 ctr_fetch 행에서 artifact_age_s를 문자열로 읽는다
+// ("NULL" 또는 십진수). 행이 하나가 아니면 실패한다 — 이 헬퍼를 쓰는 테스트는 전용 서버에서
+// 단일 회수만 한다는 전제 위에 서 있고, 그 전제가 깨지면 어느 행을 본 것인지 알 수 없다.
+func ledgerAgeCell(t *testing.T, storeDir string) string {
+	t.Helper()
+	db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(filepath.Join(storeDir, "ledger.db"))+"?mode=ro")
+	if err != nil {
+		t.Fatalf("ledger open: %v", err)
+	}
+	defer db.Close()
+	rows, err := db.Query(`SELECT artifact_age_s FROM ledger WHERE tool='ctr_fetch'`)
+	if err != nil {
+		t.Fatalf("ledger query: %v", err)
+	}
+	defer rows.Close()
+	var cells []string
+	for rows.Next() {
+		var age sql.NullInt64
+		if err := rows.Scan(&age); err != nil {
+			t.Fatalf("scan: %v", err)
+		}
+		if !age.Valid {
+			cells = append(cells, "NULL")
+			continue
+		}
+		cells = append(cells, strconv.FormatInt(age.Int64, 10))
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("rows: %v", err)
+	}
+	if len(cells) != 1 {
+		t.Fatalf("ctr_fetch 행 %d개(기대 1): %v", len(cells), cells)
+	}
+	return cells[0]
 }
 
 // callFetch: ctr_fetch를 한 번 부른다. 오류 응답도 정상 반환이다(IsError로 온다) — 이 테스트가

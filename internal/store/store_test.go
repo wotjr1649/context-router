@@ -1573,9 +1573,9 @@ func TestLastIndexedAtByHashShadowMarkerAgreesWithPurgeFilter(t *testing.T) {
 // LedgerFetchStats가 열 부재를 관용하므로 집계만 보면 열을 안 쓴 구현도 통과하기 때문이다.
 func TestLedgerAppendFetchRecordsShadowOwnership(t *testing.T) {
 	st := openAt(t, t.TempDir())
-	st.LedgerAppendFetch(t.Context(), 0, 1, 11, 100, true)  // 해소 · shadow 귀속
-	st.LedgerAppendFetch(t.Context(), 0, 1, 12, 200, false) // 해소 · explicit
-	st.LedgerAppendFetch(t.Context(), 0, 1, 0, 0, false)    // 미해소
+	st.LedgerAppendFetch(t.Context(), 0, 1, 11, agePtr(100), true)  // 해소 · shadow 귀속
+	st.LedgerAppendFetch(t.Context(), 0, 1, 12, agePtr(200), false) // 해소 · explicit
+	st.LedgerAppendFetch(t.Context(), 0, 1, 0, nil, false)          // 미해소
 
 	rows, err := st.ledger.Query(`SELECT artifact_id, shadow_owned FROM ledger WHERE tool='ctr_fetch' ORDER BY id`)
 	if err != nil {
@@ -1607,6 +1607,55 @@ func nullStr(v sql.NullInt64) string {
 	return strconv.FormatInt(v.Int64, 10)
 }
 
+// agePtr — LedgerAppendFetch의 나이 인자(nil = 미상)를 리터럴에서 만드는 테스트 헬퍼.
+func agePtr(v int64) *int64 { return &v }
+
+// TestLedgerAppendFetchUnknownAgeIsNull: 나이를 **모르는** 해소와 **같은 초에 회수한** 해소를
+// 원장이 갈라 적는다(소견 F6). 전자를 0으로 적으면 분위수에 진짜 0으로 들어가 분포를 아래로
+// 끌어내리고, "창이 넉넉하다"는 결론이 측정하지 못한 회수에서 나온다. 미상은 NULL이고
+// **해소로는 계속 센다** — fetch는 실제로 바이트를 돌려줬다.
+func TestLedgerAppendFetchUnknownAgeIsNull(t *testing.T) {
+	dir := t.TempDir()
+	st := openAt(t, dir)
+	st.LedgerAppendFetch(t.Context(), 0, 1, 7, nil, true)       // 해소인데 나이 미상
+	st.LedgerAppendFetch(t.Context(), 0, 1, 8, agePtr(0), true) // 진짜 0초 — 방금 포착한 것을 회수
+
+	rows, err := st.ledger.Query(`SELECT artifact_age_s FROM ledger WHERE tool='ctr_fetch' ORDER BY id`)
+	if err != nil {
+		t.Fatalf("원장 조회: %v", err)
+	}
+	var got []string
+	for rows.Next() {
+		var age sql.NullInt64
+		if err := rows.Scan(&age); err != nil {
+			rows.Close()
+			t.Fatalf("scan: %v", err)
+		}
+		got = append(got, nullStr(age))
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		t.Fatalf("rows: %v", err)
+	}
+	if want := []string{"NULL", "0"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("artifact_age_s = %v, 기대 %v — 미상과 0초가 같은 값으로 적혔다", got, want)
+	}
+
+	if err := st.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	fs, err := LedgerFetchStats(dir)
+	if err != nil {
+		t.Fatalf("LedgerFetchStats: %v", err)
+	}
+	if fs.Resolved != 2 {
+		t.Fatalf("Resolved=%d want 2 — 나이를 몰라도 해소는 해소다", fs.Resolved)
+	}
+	if fs.ShadowResolved != 1 {
+		t.Fatalf("ShadowResolved=%d want 1 — 나이 미상 행이 분위수 모집단에 들었다", fs.ShadowResolved)
+	}
+}
+
 // TestLedgerFetchStatsRestrictsAgeToShadowOwned: 나이 분위수와 착수 조건이 읽는 수는
 // **퍼지 대상(shadow 귀속) 해소 행만** 센다(소견 F4). explicit 아티팩트는 영원히 안 지워지므로
 // 그 회수 나이가 분포에 섞이면 "창이 넉넉하다"는 결론이 창과 무관한 데이터에서 나온다.
@@ -1615,10 +1664,10 @@ func TestLedgerFetchStatsRestrictsAgeToShadowOwned(t *testing.T) {
 	dir := t.TempDir()
 	st := openAt(t, dir)
 	for i, age := range []int64{10, 20, 30, 40, 50} {
-		st.LedgerAppendFetch(t.Context(), 0, 1, int64(i)+1, age, true)
+		st.LedgerAppendFetch(t.Context(), 0, 1, int64(i)+1, &age, true)
 	}
 	for i, age := range []int64{100_000, 200_000} { // explicit — 창이 손대지 않는 나이
-		st.LedgerAppendFetch(t.Context(), 0, 1, int64(i)+100, age, false)
+		st.LedgerAppendFetch(t.Context(), 0, 1, int64(i)+100, &age, false)
 	}
 	if err := st.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
@@ -1679,8 +1728,8 @@ func TestLedgerFetchStatsShadowColumnMissing(t *testing.T) {
 func TestLedgerAppendFetchMissMarksMinusOne(t *testing.T) {
 	dir := t.TempDir()
 	st := openAt(t, dir)
-	st.LedgerAppendFetch(t.Context(), 0, 1, 42, 3600, true) // 해소(귀속 — 분위수에 든다)
-	st.LedgerAppendFetch(t.Context(), 0, 1, 0, 0, false)    // 미해소
+	st.LedgerAppendFetch(t.Context(), 0, 1, 42, agePtr(3600), true) // 해소(귀속 — 분위수에 든다)
+	st.LedgerAppendFetch(t.Context(), 0, 1, 0, nil, false)          // 미해소
 	if err := st.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}

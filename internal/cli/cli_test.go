@@ -1863,10 +1863,11 @@ func TestStatsPrintsFetchStats(t *testing.T) {
 		t.Fatalf("store.Open: %v", err)
 	}
 	for i, age := range []int64{10, 20, 30, 40, 50} {
-		st.LedgerAppendFetch(context.Background(), 100, 1, int64(i)+1, age, true) // 해소(shadow 귀속, 나이 age초)
+		st.LedgerAppendFetch(context.Background(), 100, 1, int64(i)+1, &age, true) // 해소(shadow 귀속, 나이 age초)
 	}
-	st.LedgerAppendFetch(context.Background(), 0, 1, 0, 0, false)          // 미해소
-	st.LedgerAppendFetch(context.Background(), 100, 1, 99, 999_999, false) // 해소(explicit) — 분위수 밖
+	explicitAge := int64(999_999)
+	st.LedgerAppendFetch(context.Background(), 0, 1, 0, nil, false)             // 미해소
+	st.LedgerAppendFetch(context.Background(), 100, 1, 99, &explicitAge, false) // 해소(explicit) — 분위수 밖
 	if err := st.Close(); err != nil {
 		t.Fatalf("store.Close: %v", err)
 	}
