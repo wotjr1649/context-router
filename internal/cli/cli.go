@@ -253,8 +253,11 @@ func runStatsLocal(w io.Writer, storeRoot, projectRoot string) error {
 	if err != nil {
 		return fmt.Errorf("stats: 회수 실적 집계 실패: %w", err)
 	}
-	fmt.Fprintf(w, "fetch\tcalls=%d\tresolved=%d\tmissed=%d\tage_s p50=%d p90=%d max=%d\n",
-		fs.Calls, fs.Resolved, fs.Missed, fs.AgeP50, fs.AgeP90, fs.AgeMax)
+	// shadow_rows는 나이 분위수가 실제로 선 모집단이다 — shadow 귀속(=퍼지가 지우는) 해소 행만
+	// 센다(소견 F4). 병기하지 않으면 p50/p90을 resolved 전체의 분포로 읽게 되는데, explicit
+	// 아티팩트는 창이 손대지 않으므로 그 나이는 창의 길이에 대해 아무 말도 하지 않는다.
+	fmt.Fprintf(w, "fetch\tcalls=%d\tresolved=%d\tmissed=%d\tshadow_rows=%d\tage_s p50=%d p90=%d max=%d\n",
+		fs.Calls, fs.Resolved, fs.Missed, fs.ShadowResolved, fs.AgeP50, fs.AgeP90, fs.AgeMax)
 	return nil
 }
 

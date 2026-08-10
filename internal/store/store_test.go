@@ -1351,8 +1351,8 @@ func TestLedgerColumnsAddedOnWritableOpen(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ledgerColumns: %v", err)
 	}
-	if !cols["artifact_id"] || !cols["artifact_age_s"] {
-		t.Fatalf("writable Open이 두 열을 붙이지 않았다: %v", cols)
+	if !cols["artifact_id"] || !cols["artifact_age_s"] || !cols["shadow_owned"] {
+		t.Fatalf("writable Open이 세 열을 붙이지 않았다: %v", cols)
 	}
 }
 
@@ -1378,19 +1378,20 @@ func TestLedgerFetchStatsFullMigration(t *testing.T) {
 	if _, err := db.Exec(`CREATE TABLE ledger(
 		id INTEGER PRIMARY KEY, ts INTEGER NOT NULL, tool TEXT NOT NULL,
 		bytes_stored INTEGER NOT NULL DEFAULT 0, bytes_returned INTEGER NOT NULL DEFAULT 0,
-		duration_ms INTEGER NOT NULL DEFAULT 0, artifact_id INTEGER, artifact_age_s INTEGER)`); err != nil {
+		duration_ms INTEGER NOT NULL DEFAULT 0, artifact_id INTEGER, artifact_age_s INTEGER,
+		shadow_owned INTEGER)`); err != nil {
 		t.Fatalf("완전 이관 스키마: %v", err)
 	}
 	inserts := []string{
-		`INSERT INTO ledger(ts,tool,artifact_id,artifact_age_s) VALUES(1,'ctr_fetch',NULL,NULL)`, // 레거시
-		`INSERT INTO ledger(ts,tool,artifact_id,artifact_age_s) VALUES(2,'ctr_fetch',NULL,-1)`,   // 미해소
-		`INSERT INTO ledger(ts,tool,artifact_id,artifact_age_s) VALUES(3,'ctr_fetch',NULL,-1)`,   // 미해소
-		`INSERT INTO ledger(ts,tool,artifact_id,artifact_age_s) VALUES(4,'ctr_fetch',1,30)`,      // 해소 — 순서 섞음
-		`INSERT INTO ledger(ts,tool,artifact_id,artifact_age_s) VALUES(5,'ctr_fetch',2,10)`,      // 해소
-		`INSERT INTO ledger(ts,tool,artifact_id,artifact_age_s) VALUES(6,'ctr_fetch',3,50)`,      // 해소
-		`INSERT INTO ledger(ts,tool,artifact_id,artifact_age_s) VALUES(7,'ctr_fetch',4,20)`,      // 해소
-		`INSERT INTO ledger(ts,tool,artifact_id,artifact_age_s) VALUES(8,'ctr_fetch',5,40)`,      // 해소
-		`INSERT INTO ledger(ts,tool,artifact_id,artifact_age_s) VALUES(9,'ctr_search',6,999)`,    // 다른 도구 — 필터 확인
+		`INSERT INTO ledger(ts,tool,artifact_id,artifact_age_s,shadow_owned) VALUES(1,'ctr_fetch',NULL,NULL,NULL)`, // 레거시
+		`INSERT INTO ledger(ts,tool,artifact_id,artifact_age_s,shadow_owned) VALUES(2,'ctr_fetch',NULL,-1,NULL)`,   // 미해소
+		`INSERT INTO ledger(ts,tool,artifact_id,artifact_age_s,shadow_owned) VALUES(3,'ctr_fetch',NULL,-1,NULL)`,   // 미해소
+		`INSERT INTO ledger(ts,tool,artifact_id,artifact_age_s,shadow_owned) VALUES(4,'ctr_fetch',1,30,1)`,         // 해소 — 순서 섞음
+		`INSERT INTO ledger(ts,tool,artifact_id,artifact_age_s,shadow_owned) VALUES(5,'ctr_fetch',2,10,1)`,         // 해소
+		`INSERT INTO ledger(ts,tool,artifact_id,artifact_age_s,shadow_owned) VALUES(6,'ctr_fetch',3,50,1)`,         // 해소
+		`INSERT INTO ledger(ts,tool,artifact_id,artifact_age_s,shadow_owned) VALUES(7,'ctr_fetch',4,20,1)`,         // 해소
+		`INSERT INTO ledger(ts,tool,artifact_id,artifact_age_s,shadow_owned) VALUES(8,'ctr_fetch',5,40,1)`,         // 해소
+		`INSERT INTO ledger(ts,tool,artifact_id,artifact_age_s,shadow_owned) VALUES(9,'ctr_search',6,999,1)`,       // 다른 도구 — 필터 확인
 	}
 	for _, q := range inserts {
 		if _, err := db.Exec(q); err != nil {
@@ -1416,7 +1417,7 @@ func TestLedgerFetchStatsFullMigration(t *testing.T) {
 	if closeErr != nil {
 		t.Fatalf("ro Close: %v", closeErr)
 	}
-	if !cols["artifact_id"] || !cols["artifact_age_s"] {
+	if !cols["artifact_id"] || !cols["artifact_age_s"] || !cols["shadow_owned"] {
 		t.Fatalf("픽스처가 완전 이관 상태가 아니다(테스트 버그): %v", cols)
 	}
 
@@ -1473,7 +1474,7 @@ func TestLastIndexedAtByHashUsesMaxOverSiblingArtifacts(t *testing.T) {
 		t.Fatalf("둘째 소스 시각: %v", err)
 	}
 	// 형제 둘 중 **오래된 쪽**의 artifact를 회수했다고 가정해도 나이는 최근 값이어야 한다.
-	got, err := st.LastIndexedAtByHash(t.Context(), hashOf("aged"))
+	got, _, err := st.LastIndexedAtByHash(t.Context(), hashOf("aged"))
 	if err != nil {
 		t.Fatalf("LastIndexedAtByHash: %v", err)
 	}
@@ -1482,13 +1483,193 @@ func TestLastIndexedAtByHashUsesMaxOverSiblingArtifacts(t *testing.T) {
 	}
 }
 
-// TestLastIndexedAtByHashMissingIsZero: 소스가 없으면 (0, nil)이다 — 호출부가 나이를 0으로 두고
-// 계속한다(회수 자체는 성공했다).
+// TestLastIndexedAtByHashMissingIsZero: 소스가 없으면 (0, false, nil)이다 — 호출부가 나이를
+// 0으로 두고 계속한다(회수 자체는 성공했다). 귀속도 false다 — hook 소스가 하나도 없으니
+// 퍼지 술어도 이 hash를 고르지 않는다. 집계 1행의 두 값이 다 NULL로 오는 경로라, 스캔이
+// NULL을 받아도 오류가 나지 않는다는 확인이기도 하다.
 func TestLastIndexedAtByHashMissingIsZero(t *testing.T) {
 	st := openAt(t, t.TempDir())
-	got, err := st.LastIndexedAtByHash(t.Context(), hashOf("nothing here"))
-	if err != nil || got != 0 {
-		t.Fatalf("got=%d err=%v, 기대 0/nil", got, err)
+	got, owned, err := st.LastIndexedAtByHash(t.Context(), hashOf("nothing here"))
+	if err != nil || got != 0 || owned {
+		t.Fatalf("got=%d owned=%v err=%v, 기대 0/false/nil", got, owned, err)
+	}
+}
+
+// TestLastIndexedAtByHashShadowMarkerAgreesWithPurgeFilter: 회수 시점에 박는 shadow 귀속
+// 표식은 **퍼지가 실제로 지우는 집합과 같은 정의**여야 한다(릴리스 리뷰 소견 F4). 정의가
+// 갈리면 나이 분포가 보존 창이 손대지도 않는 explicit 아티팩트로 채워지고, D104의 착수 조건
+// (해소 30건)이 창의 길이에 대해 아무 말도 하지 않는 회수로 충족된다.
+// **기대값을 손으로 적지 않는 것이 이 테스트의 요지다** — shadowOwnedFilter가 내는 집합을
+// 그대로 읽어 대조한다. 표식 쪽이 둘째 정의를 갖는 순간 이 대조가 깨진다.
+func TestLastIndexedAtByHashShadowMarkerAgreesWithPurgeFilter(t *testing.T) {
+	st := openAt(t, t.TempDir())
+	// 귀속 술어의 네 갈래를 다 태운다: hook 전용(귀속) · hook+file 공유(비귀속, 첫 NOT EXISTS) ·
+	// file 전용(비귀속, hook JOIN) · 비-hook 소스가 raw_blob_hash로 참조(비귀속, 둘째 NOT EXISTS).
+	hookOnly, shared, fileOnly, rawRef := "f4-hook-only", "f4-shared", "f4-file-only", "f4-raw-ref"
+	regSource(t, st, hookOnly, "text/plain", "shadow:Bash:f4a", "hook")
+	regSource(t, st, shared, "text/plain", "shadow:Bash:f4b", "hook")
+	regSource(t, st, shared, "text/plain", "/tmp/f4b.txt", "file")
+	regSource(t, st, fileOnly, "text/plain", "/tmp/f4c.txt", "file")
+	regSource(t, st, rawRef, "text/plain", "shadow:Bash:f4d", "hook")
+	if _, err := st.Register(t.Context(), Registration{ // web 소스가 같은 바이트를 raw_blob으로 보존
+		StoredBytes: []byte("f4-web-extracted"), MediaType: "text/plain",
+		Source:  SourceMeta{URI: "https://example.invalid/f4", Kind: "web", SrcHash: "sh-f4web"},
+		RawBlob: []byte(rawRef),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// 퍼지가 보는 집합 그대로(예산 0 = 나이·건수 필터 없음 — PurgeHookOnly와 같은 인자).
+	sel, args := shadowOwnedFilter(0, 0)
+	rows, err := st.reader.Query(sel, args...)
+	if err != nil {
+		t.Fatalf("shadowOwnedFilter 질의: %v", err)
+	}
+	purgeable := map[string]bool{}
+	for rows.Next() {
+		var h string
+		if err := rows.Scan(&h); err != nil {
+			rows.Close()
+			t.Fatalf("scan: %v", err)
+		}
+		purgeable[h] = true
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		t.Fatalf("rows: %v", err)
+	}
+
+	all := []string{hookOnly, shared, fileOnly, rawRef}
+	// 사전 가드: 넷 중 정확히 하나(hook 전용)만 퍼지 대상이어야 아래 대조가 무언가를 증명한다.
+	// 집합이 비거나 넷 다면 "표식 항상 false"·"항상 true" 구현이 통과해버린다.
+	owned := 0
+	for _, c := range all {
+		if purgeable[hashOf(c)] {
+			owned++
+		}
+	}
+	if owned != 1 || !purgeable[hashOf(hookOnly)] {
+		t.Fatalf("픽스처가 의도한 상태가 아니다: 퍼지 대상 %d개(기대 1 = hook 전용), 집합 크기=%d", owned, len(purgeable))
+	}
+
+	for _, c := range all {
+		h := hashOf(c)
+		at, got, err := st.LastIndexedAtByHash(t.Context(), h)
+		if err != nil {
+			t.Fatalf("LastIndexedAtByHash(%s): %v", c, err)
+		}
+		if got != purgeable[h] {
+			t.Fatalf("%s: 귀속 표식=%v, 퍼지 술어=%v — 두 정의가 갈렸다", c, got, purgeable[h])
+		}
+		if at <= 0 {
+			t.Fatalf("%s: 나이 시계=%d — 한 질의가 두 답을 다 내야 한다(왕복 하나)", c, at)
+		}
+	}
+}
+
+// TestLedgerAppendFetchRecordsShadowOwnership: 귀속 표식이 원장 행에 실제로 박힌다 —
+// 해소는 1/0, **미해소는 NULL**이다(아티팩트가 없으니 귀속을 알 길이 없고, 모른다를 0으로
+// 적으면 "explicit이었다"는 거짓 진술이 된다). 반환값이 아니라 열을 직접 읽는 이유는
+// LedgerFetchStats가 열 부재를 관용하므로 집계만 보면 열을 안 쓴 구현도 통과하기 때문이다.
+func TestLedgerAppendFetchRecordsShadowOwnership(t *testing.T) {
+	st := openAt(t, t.TempDir())
+	st.LedgerAppendFetch(t.Context(), 0, 1, 11, 100, true)  // 해소 · shadow 귀속
+	st.LedgerAppendFetch(t.Context(), 0, 1, 12, 200, false) // 해소 · explicit
+	st.LedgerAppendFetch(t.Context(), 0, 1, 0, 0, false)    // 미해소
+
+	rows, err := st.ledger.Query(`SELECT artifact_id, shadow_owned FROM ledger WHERE tool='ctr_fetch' ORDER BY id`)
+	if err != nil {
+		t.Fatalf("원장 조회: %v", err)
+	}
+	defer rows.Close()
+	var got []string
+	for rows.Next() {
+		var id, owned sql.NullInt64
+		if err := rows.Scan(&id, &owned); err != nil {
+			t.Fatalf("scan: %v", err)
+		}
+		got = append(got, fmt.Sprintf("%v/%v", nullStr(id), nullStr(owned)))
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("rows: %v", err)
+	}
+	want := []string{"11/1", "12/0", "NULL/NULL"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("(artifact_id/shadow_owned) = %v, 기대 %v", got, want)
+	}
+}
+
+// nullStr — NullInt64를 대조용 문자열로. NULL과 0을 눈으로 갈라야 하는 대조라서 필요하다.
+func nullStr(v sql.NullInt64) string {
+	if !v.Valid {
+		return "NULL"
+	}
+	return strconv.FormatInt(v.Int64, 10)
+}
+
+// TestLedgerFetchStatsRestrictsAgeToShadowOwned: 나이 분위수와 착수 조건이 읽는 수는
+// **퍼지 대상(shadow 귀속) 해소 행만** 센다(소견 F4). explicit 아티팩트는 영원히 안 지워지므로
+// 그 회수 나이가 분포에 섞이면 "창이 넉넉하다"는 결론이 창과 무관한 데이터에서 나온다.
+// 비귀속 행에 귀속 행보다 큰 나이를 심어 — 섞이면 p90·max가 즉시 달라진다.
+func TestLedgerFetchStatsRestrictsAgeToShadowOwned(t *testing.T) {
+	dir := t.TempDir()
+	st := openAt(t, dir)
+	for i, age := range []int64{10, 20, 30, 40, 50} {
+		st.LedgerAppendFetch(t.Context(), 0, 1, int64(i)+1, age, true)
+	}
+	for i, age := range []int64{100_000, 200_000} { // explicit — 창이 손대지 않는 나이
+		st.LedgerAppendFetch(t.Context(), 0, 1, int64(i)+100, age, false)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	fs, err := LedgerFetchStats(dir)
+	if err != nil {
+		t.Fatalf("LedgerFetchStats: %v", err)
+	}
+	if fs.Resolved != 7 {
+		t.Fatalf("Resolved=%d want 7 — 해소 건수 자체는 귀속과 무관하다", fs.Resolved)
+	}
+	if fs.ShadowResolved != 5 {
+		t.Fatalf("ShadowResolved=%d want 5", fs.ShadowResolved)
+	}
+	if fs.AgeP50 != 30 || fs.AgeP90 != 40 || fs.AgeMax != 50 {
+		t.Fatalf("분위수에 explicit 나이가 섞였다: %+v want p50=30 p90=40 max=50", fs)
+	}
+}
+
+// TestLedgerFetchStatsShadowColumnMissing: 세 번째 ALTER 이전 원장(두 열만 있음)에서도
+// 실패하지 않는다 — 해소·미해소는 읽히되 귀속으로 제한한 수치는 낼 수 없으므로 0이다
+// (계약 7의 부분 이관 관용을 셋째 열로 확장한 것).
+func TestLedgerFetchStatsShadowColumnMissing(t *testing.T) {
+	dir := t.TempDir()
+	db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(filepath.Join(dir, "ledger.db")))
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+	if _, err := db.Exec(`CREATE TABLE ledger(
+		id INTEGER PRIMARY KEY, ts INTEGER NOT NULL, tool TEXT NOT NULL,
+		bytes_stored INTEGER NOT NULL DEFAULT 0, bytes_returned INTEGER NOT NULL DEFAULT 0,
+		duration_ms INTEGER NOT NULL DEFAULT 0, artifact_id INTEGER, artifact_age_s INTEGER)`); err != nil {
+		t.Fatalf("두 열 스키마: %v", err)
+	}
+	if _, err := db.Exec(`INSERT INTO ledger(ts,tool,artifact_id,artifact_age_s) VALUES(1,'ctr_fetch',1,77)`); err != nil {
+		t.Fatalf("해소 행: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	fs, err := LedgerFetchStats(dir)
+	if err != nil {
+		t.Fatalf("shadow 열 부재에서 오류가 났다: %v", err)
+	}
+	if fs.Resolved != 1 {
+		t.Fatalf("Resolved=%d want 1", fs.Resolved)
+	}
+	if fs.ShadowResolved != 0 || fs.AgeMax != 0 {
+		t.Fatalf("귀속 열 없이 분위수를 냈다: %+v", fs)
 	}
 }
 
@@ -1498,8 +1679,8 @@ func TestLastIndexedAtByHashMissingIsZero(t *testing.T) {
 func TestLedgerAppendFetchMissMarksMinusOne(t *testing.T) {
 	dir := t.TempDir()
 	st := openAt(t, dir)
-	st.LedgerAppendFetch(0, 1, 42, 3600) // 해소
-	st.LedgerAppendFetch(0, 1, 0, 0)     // 미해소
+	st.LedgerAppendFetch(t.Context(), 0, 1, 42, 3600, true) // 해소(귀속 — 분위수에 든다)
+	st.LedgerAppendFetch(t.Context(), 0, 1, 0, 0, false)    // 미해소
 	if err := st.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}

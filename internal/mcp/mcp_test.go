@@ -2906,6 +2906,64 @@ func TestFetchRecordsAgeOnResolve(t *testing.T) {
 	}
 }
 
+// TestFetchRecordsShadowOwnershipOnResolve: 해소 행에 **퍼지 대상 여부**가 함께 박힌다
+// (릴리스 리뷰 소견 F4). explicit 아티팩트는 보존 창이 손대지 않으므로 그 회수 나이는 창의
+// 길이에 대해 아무 말도 하지 않는데, 표식이 없으면 그 회수가 D104의 "해소 30건"을 채우고
+// 분위수까지 지배한다. **표식이 없거나 항상 참이면 이 테스트가 두 군데서 떨어진다** —
+// explicit 쪽 나이를 hook 쪽보다 두 자릿수 크게 심어 두었기 때문이다.
+func TestFetchRecordsShadowOwnershipOnResolve(t *testing.T) {
+	cs, st, _, storeDir := newRecordEventTestServer(t)
+	ctx := context.Background()
+	reg := func(body, uri, kind string) int64 {
+		t.Helper()
+		id, err := st.Register(ctx, store.Registration{
+			StoredBytes: []byte(body), MediaType: "text/plain",
+			Source: store.SourceMeta{URI: uri, Kind: kind, SrcHash: "sh-" + uri},
+			Chunks: []store.Chunk{{Ordinal: 0, ByteEnd: int64(len(body)), Text: body}},
+		})
+		if err != nil {
+			t.Fatalf("register %s: %v", uri, err)
+		}
+		return id
+	}
+	hookID := reg("hook captured body", "shadow:Bash:owned", "hook")
+	fileID := reg("explicitly indexed body", "/tmp/explicit.txt", "file")
+	age := func(uri string, ago time.Duration) {
+		t.Helper()
+		if _, err := st.Reader().Exec(
+			`UPDATE sources SET indexed_at=? WHERE uri=?`, time.Now().Add(-ago).Unix(), uri,
+		); err != nil {
+			t.Fatalf("소스 시각 %s: %v", uri, err)
+		}
+	}
+	age("shadow:Bash:owned", time.Hour)           // 3600초
+	age("/tmp/explicit.txt", 500_000*time.Second) // 두 자릿수 더 큰 나이
+	// 사전 가드: 두 아티팩트가 정말 별개 hash여야 한다 — 같으면 귀속 판정이 한 집합에 섞인다.
+	var hashes int
+	if err := st.Reader().QueryRow(
+		`SELECT count(DISTINCT content_hash) FROM artifacts WHERE id IN (?,?)`, hookID, fileID,
+	).Scan(&hashes); err != nil {
+		t.Fatalf("hash 확인: %v", err)
+	}
+	if hashes != 2 {
+		t.Fatalf("픽스처가 의도한 상태가 아니다: 별개 hash %d개(기대 2)", hashes)
+	}
+
+	callFetch(t, cs, FetchInput{ArtifactID: hookID, ByteStart: ptrTo(int64(0)), ByteEnd: ptrTo(int64(5))})
+	callFetch(t, cs, FetchInput{ArtifactID: fileID, ByteStart: ptrTo(int64(0)), ByteEnd: ptrTo(int64(5))})
+
+	fs := fetchStats(t, storeDir)
+	if fs.Resolved != 2 {
+		t.Fatalf("Resolved=%d want 2 — 채택 게이트는 두 회수를 다 센다", fs.Resolved)
+	}
+	if fs.ShadowResolved != 1 {
+		t.Fatalf("ShadowResolved=%d want 1 — explicit 회수가 퍼지 대상 모집단에 섞였다", fs.ShadowResolved)
+	}
+	if fs.AgeMax < 3500 || fs.AgeMax > 3700 {
+		t.Fatalf("AgeMax=%d, 기대 약 3600 — explicit 쪽 500000초가 분포를 지배했다", fs.AgeMax)
+	}
+}
+
 // TestFetchRecordsZeroAgeWhenSourceAbsent: LastIndexedAtByHash가 (0, nil)을 내는 경로 —
 // source 행이 없으면(artifact·chunks는 남아 ReadRange는 여전히 해소된다) at>0 조건이
 // 거짓이라 ageS는 초기값 0에 머문다. 나이 조회 실패·부재가 회수 자체를 실패시키지 않는다는
@@ -2940,8 +2998,9 @@ func TestFetchRecordsZeroAgeWhenSourceAbsent(t *testing.T) {
 	if fs.Resolved != 1 || fs.Missed != 0 {
 		t.Fatalf("resolved=%d missed=%d, 기대 1/0", fs.Resolved, fs.Missed)
 	}
-	if fs.AgeMax != 0 {
-		t.Fatalf("AgeMax=%d, 기대 0 (source 부재 폴백)", fs.AgeMax)
+	// 소스가 없으면 hook 소스도 없다 = 퍼지 술어가 고르지 않는다 → 귀속 모집단 밖이다(소견 F4).
+	if fs.ShadowResolved != 0 || fs.AgeMax != 0 {
+		t.Fatalf("ShadowResolved=%d AgeMax=%d, 기대 0/0 (source 부재 폴백)", fs.ShadowResolved, fs.AgeMax)
 	}
 }
 

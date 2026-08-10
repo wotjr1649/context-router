@@ -177,13 +177,14 @@ func OpenContext(ctx context.Context, dir string, readOnly bool) (*Store, error)
 				id INTEGER PRIMARY KEY, ts INTEGER NOT NULL, tool TEXT NOT NULL,
 				bytes_stored INTEGER NOT NULL DEFAULT 0, bytes_returned INTEGER NOT NULL DEFAULT 0,
 				duration_ms INTEGER NOT NULL DEFAULT 0)`)
-			// D103 계약 1: artifact 단위 회수 실적 두 열. 옛 ledger.db에도 붙여야 하므로 ALTER를
-			// 쓰는데, 이미 있으면 "duplicate column name"으로 실패한다 — ledger 전체가
-			// best-effort이므로 그 실패를 그대로 무시한다(위 CREATE와 같은 `_, _ =` 관례).
-			// 둘은 독립 문장이라 하나만 성공한 부분 이관이 도달 가능하다 — 읽는 쪽이
-			// PRAGMA table_info로 **둘 다** 있는지 보고 아니면 빈 값 경로를 탄다(계약 7).
+			// D103 계약 1: artifact 단위 회수 실적 두 열 + 소견 F4의 귀속 표식 한 열. 옛
+			// ledger.db에도 붙여야 하므로 ALTER를 쓰는데, 이미 있으면 "duplicate column name"으로
+			// 실패한다 — ledger 전체가 best-effort이므로 그 실패를 그대로 무시한다(위 CREATE와
+			// 같은 `_, _ =` 관례). 셋은 독립 문장이라 일부만 성공한 부분 이관이 도달 가능하다 —
+			// 읽는 쪽이 PRAGMA table_info로 있는 열만 보고 나머지는 빈 값 경로를 탄다(계약 7).
 			_, _ = l.Exec(`ALTER TABLE ledger ADD COLUMN artifact_id INTEGER`)
 			_, _ = l.Exec(`ALTER TABLE ledger ADD COLUMN artifact_age_s INTEGER`)
+			_, _ = l.Exec(`ALTER TABLE ledger ADD COLUMN shadow_owned INTEGER`)
 			s.ledger = l
 		}
 	}
@@ -1036,45 +1037,64 @@ func (s *Store) LedgerAppendContext(ctx context.Context, tool string, stored, re
 		time.Now().Unix(), tool, stored, returned, ms)
 }
 
-// LastIndexedAtByHash — D103 계약 2: 이 콘텐츠의 **마지막 포착** 시각(unix 초). 시계도 범위도
-// D67 퍼지와 같은 것을 쓴다 — 퍼지 술어(shadowOwnedFilter의 나이 절, store.go:1392-1394)가
-// 같은 content_hash를 가진 모든 artifact의 모든 소스에 대해 indexed_at을 보므로, 나이도 그렇게
-// 재야 분포가 보존 창 위에 그대로 겹쳐진다. artifact 단위로 재면 형제가 방금 재포착된
-// 아티팩트가 실제보다 늙어 보이고 그 오차는 창을 늘리는 쪽으로만 작용한다. 소스가 없으면 (0, nil).
+// lastIndexedAtByHashQuery — 나이 시계와 shadow 귀속 여부를 **한 왕복에** 낸다.
+// 귀속 술어를 손으로 다시 쓰지 않고 퍼지가 쓰는 그 상수(shadowOwnedHashQuery)를 EXISTS로
+// 감싸는 것이 요지다(소견 F4): 정의가 갈리는 순간 나이 분포가 보존 창이 실제로 지우는 집합과
+// 다른 모집단을 재게 된다. EXISTS 안의 `a`는 바깥 `a`를 가리는 별개 별칭이라 상관 참조가
+// 아니고, 그래서 같은 hash를 인자로 한 번 더 바인딩한다(두 `?`는 같은 값).
+// 집계라 소스가 한 행도 없어도 1행이 오는데 그때 두 값은 NULL일 수 있다 — 호출부가 NULL을
+// (0, false)로 받는다.
+const lastIndexedAtByHashQuery = `SELECT max(s.indexed_at), EXISTS(` + shadowOwnedHashQuery + `
+  AND a.content_hash = ?)
+	FROM sources s JOIN artifacts a ON a.id = s.artifact_id
+	WHERE a.content_hash = ?`
+
+// LastIndexedAtByHash — D103 계약 2: 이 콘텐츠의 **마지막 포착** 시각(unix 초)과, 소견 F4의
+// **shadow 귀속 여부**. 시계도 범위도 D67 퍼지와 같은 것을 쓴다 — 퍼지 술어
+// (shadowOwnedFilter의 나이 절, store.go:1442-1444)가 같은 content_hash를 가진 모든 artifact의
+// 모든 소스에 대해 indexed_at을 보므로, 나이도 그렇게 재야 분포가 보존 창 위에 그대로
+// 겹쳐진다. artifact 단위로 재면 형제가 방금 재포착된 아티팩트가 실제보다 늙어 보이고 그
+// 오차는 창을 늘리는 쪽으로만 작용한다. 소스가 없으면 (0, false, nil).
+// **귀속 여부를 회수 시점에 함께 내는 이유**: explicit 아티팩트는 퍼지 대상이 아니라 영원히
+// 남으므로 그 회수 나이는 창의 길이에 대해 아무 말도 하지 않는데, 나중에는 아티팩트 자체가
+// 없어 되물을 수 없다. 오류일 때 호출부가 받는 false는 "explicit이다"가 아니라 "모른다"이고,
+// 모든 귀속 제한 질의가 그 행을 똑같이 뺀다.
 // 색인: artifacts는 UNIQUE(content_hash, media_type)의 선두 컬럼이, sources는
 // idx_sources_artifact_indexed(artifact_id, indexed_at)가 각각 덮는다.
-func (s *Store) LastIndexedAtByHash(ctx context.Context, contentHash string) (int64, error) {
+func (s *Store) LastIndexedAtByHash(ctx context.Context, contentHash string) (int64, bool, error) {
 	var ts sql.NullInt64
-	if err := s.reader.QueryRowContext(ctx, `SELECT max(s.indexed_at)
-		FROM sources s JOIN artifacts a ON a.id = s.artifact_id
-		WHERE a.content_hash = ?`, contentHash).Scan(&ts); err != nil {
-		return 0, fmt.Errorf("store LastIndexedAtByHash: %w", err)
+	var owned sql.NullBool
+	if err := s.reader.QueryRowContext(ctx, lastIndexedAtByHashQuery, contentHash, contentHash).
+		Scan(&ts, &owned); err != nil {
+		return 0, false, fmt.Errorf("store LastIndexedAtByHash: %w", err)
 	}
-	if !ts.Valid {
-		return 0, nil
-	}
-	return ts.Int64, nil
+	return ts.Int64, owned.Bool, nil // NullInt64/NullBool의 무효값은 0/false다
 }
 
 // LedgerAppendFetch — D103: ctr_fetch 전용 원장 기록. artifactID<=0이면 artifact_id를 NULL로,
 // artifact_age_s를 **−1**로 남겨 **해소되지 않은 회수**를 기록한다 — 그것이 "창이 짧아서 못
 // 찾았다"의 유일한 직접 증거이고, 성공 기록만 남기면 영원히 나오지 않는다(계약 3).
 // −1인 이유: ALTER가 남긴 레거시 행은 두 열이 다 NULL이라 그 둘을 값으로 갈라야 한다(계약 1).
+// shadowOwned는 **해소 행에만** 값으로 남는다(소견 F4) — 미해소 행은 아티팩트가 없어 귀속을
+// 물을 수 없으므로 NULL이다. 0으로 적으면 "explicit이었다"는 거짓 진술이 되고, 그 거짓이
+// 나중에 창과 무관한 회수를 창의 증거로 만든다.
+// ctx를 받는 이유는 계약 8과 같다 — 형제 LedgerAppendContext처럼 호출부의 예산을 탄다.
 // LedgerAppend와 같은 best-effort 계약이다(ledger 없음·오류는 무시). S4: 정수와 도구 이름만
 // 담는다 — 선택자도 경로도 내용도 담지 않는다(계약 6).
-func (s *Store) LedgerAppendFetch(returned, ms, artifactID, ageS int64) {
+func (s *Store) LedgerAppendFetch(ctx context.Context, returned, ms, artifactID, ageS int64, shadowOwned bool) {
 	if s.ledger == nil {
 		return
 	}
-	var idCol any    // nil = NULL
-	age := int64(-1) // 미해소 표식
+	var idCol, owned any // nil = NULL
+	age := int64(-1)     // 미해소 표식
 	if artifactID > 0 {
-		idCol, age = artifactID, ageS
+		idCol, age, owned = artifactID, ageS, shadowOwned
 	}
-	_, _ = s.ledger.Exec(
-		`INSERT INTO ledger(ts,tool,bytes_stored,bytes_returned,duration_ms,artifact_id,artifact_age_s)
-		 VALUES(?,'ctr_fetch',0,?,?,?,?)`,
-		time.Now().Unix(), returned, ms, idCol, age,
+	_, _ = s.ledger.ExecContext(
+		ctx,
+		`INSERT INTO ledger(ts,tool,bytes_stored,bytes_returned,duration_ms,artifact_id,artifact_age_s,shadow_owned)
+		 VALUES(?,'ctr_fetch',0,?,?,?,?,?)`,
+		time.Now().Unix(), returned, ms, idCol, age, owned,
 	)
 }
 
@@ -1131,11 +1151,23 @@ func LedgerStats(dir string) ([]ToolStat, error) {
 // 문턱이 읽는 수다. Resolved는 artifact를 실제로 돌려준 fetch, Missed는 **artifact 부재**로
 // 끝난 fetch다(계약 3 — 잘못된 chunk id는 여기 들지 않는다). Age*는 **회수 시점에 박아 둔**
 // 나이(초)의 분포 — 아티팩트가 나중에 지워져도 남는다는 것이 이 계측의 요지다(계약 2).
+//
+// ShadowResolved는 그 해소 중 **shadow 귀속**(= 퍼지가 실제로 지우는) 행만 센 수이고,
+// Age*는 그 부분집합에서만 나온다(소견 F4). Resolved와 갈라 두는 이유: 채택 게이트는 도구가
+// 쓰이는지를 묻고(모든 해소가 답이다) 창의 길이는 지워질 수 있는 것만 답할 수 있다.
 type FetchStat struct {
 	Calls                  int64
 	Resolved, Missed       int64
+	ShadowResolved         int64
 	AgeP50, AgeP90, AgeMax int64
 }
+
+// fetchAgeBasis — 나이 분위수와 D104 착수 조건이 **함께** 보는 모집단의 술어. 두 문장이 이
+// 상수를 공유하는 이유는 D13이다 — 분모와 분포가 갈리면 어느 쪽도 읽을 수 없다.
+// shadow_owned=1로 제한하는 근거는 소견 F4: explicit 아티팩트는 퍼지 대상이 아니라 영원히
+// 남으므로 그 회수 나이는 창의 길이에 대해 아무 말도 하지 않는데, 섞이면 "해소 30건"을 채우고
+// 분위수까지 지배한다. NULL(미해소·레거시·귀속 미상)은 `=1`이 자연히 뺀다.
+const fetchAgeBasis = `tool='ctr_fetch' AND artifact_id IS NOT NULL AND shadow_owned=1`
 
 // ledgerColumns: PRAGMA table_info(ledger)의 열 이름 집합. 테이블이 없으면 빈 집합(오류 아님).
 // 드라이버 오류 문자열 대조("no such column")를 쓰지 않는 이유: 그 문면은 우리가 통제하지
@@ -1200,7 +1232,15 @@ func LedgerFetchStats(dir string) (FetchStat, error) {
 		FROM ledger WHERE tool='ctr_fetch'`).Scan(&fs.Resolved, &fs.Missed); err != nil {
 		return FetchStat{}, fmt.Errorf("store LedgerFetchStats: %w", err)
 	}
-	if fs.Resolved == 0 {
+	if !cols["shadow_owned"] {
+		return fs, nil // 셋째 ALTER 이전 원장 — 귀속으로 제한한 수치는 낼 수 없다(계약 7과 같은 관용)
+	}
+	if err := db.QueryRow(
+		`SELECT count(*) FROM ledger WHERE ` + fetchAgeBasis,
+	).Scan(&fs.ShadowResolved); err != nil {
+		return FetchStat{}, fmt.Errorf("store LedgerFetchStats: %w", err)
+	}
+	if fs.ShadowResolved == 0 {
 		return fs, nil
 	}
 	// 분위수는 SQLite에 내장이 없으므로 정렬 + OFFSET으로 낸다. 행 수가 수만 단위라
@@ -1209,12 +1249,11 @@ func LedgerFetchStats(dir string) (FetchStat, error) {
 		dst    *int64
 		offset int64
 	}{
-		{&fs.AgeP50, (fs.Resolved - 1) * 50 / 100},
-		{&fs.AgeP90, (fs.Resolved - 1) * 90 / 100},
-		{&fs.AgeMax, fs.Resolved - 1},
+		{&fs.AgeP50, (fs.ShadowResolved - 1) * 50 / 100},
+		{&fs.AgeP90, (fs.ShadowResolved - 1) * 90 / 100},
+		{&fs.AgeMax, fs.ShadowResolved - 1},
 	} {
-		if err := db.QueryRow(`SELECT artifact_age_s FROM ledger
-			WHERE tool='ctr_fetch' AND artifact_id IS NOT NULL
+		if err := db.QueryRow(`SELECT artifact_age_s FROM ledger WHERE `+fetchAgeBasis+`
 			ORDER BY artifact_age_s LIMIT 1 OFFSET ?`, q.offset).Scan(q.dst); err != nil {
 			return FetchStat{}, fmt.Errorf("store LedgerFetchStats: %w", err)
 		}

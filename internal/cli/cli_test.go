@@ -1863,9 +1863,10 @@ func TestStatsPrintsFetchStats(t *testing.T) {
 		t.Fatalf("store.Open: %v", err)
 	}
 	for i, age := range []int64{10, 20, 30, 40, 50} {
-		st.LedgerAppendFetch(100, 1, int64(i)+1, age) // 해소(나이 age초)
+		st.LedgerAppendFetch(context.Background(), 100, 1, int64(i)+1, age, true) // 해소(shadow 귀속, 나이 age초)
 	}
-	st.LedgerAppendFetch(0, 1, 0, 0) // 미해소
+	st.LedgerAppendFetch(context.Background(), 0, 1, 0, 0, false)          // 미해소
+	st.LedgerAppendFetch(context.Background(), 100, 1, 99, 999_999, false) // 해소(explicit) — 분위수 밖
 	if err := st.Close(); err != nil {
 		t.Fatalf("store.Close: %v", err)
 	}
@@ -1876,7 +1877,7 @@ func TestStatsPrintsFetchStats(t *testing.T) {
 	}
 	got := out.String()
 	for _, want := range []string{
-		"fetch\t", "calls=6", "resolved=5", "missed=1", "p50=30", "p90=40", "max=50",
+		"fetch\t", "calls=7", "resolved=6", "missed=1", "shadow_rows=5", "p50=30", "p90=40", "max=50",
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("회수 실적 줄에 %q 없음:\n%s", want, got)
