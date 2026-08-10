@@ -1397,10 +1397,11 @@ func TestLedgerFetchStatsPartialMigration(t *testing.T) {
 	}
 }
 
-// TestLedgerColumnsAddedOnWritableOpen: writable Open이 두 열을 **실제로** 붙인다.
+// TestLedgerColumnsAddedOnWritableOpen: writable Open이 세 열을 **실제로** 붙인다.
 // 판정을 PRAGMA table_info로 하는 이유: LedgerFetchStats가 열 부재를 관용하므로, 반환값만
-// 보면 ALTER를 아예 넣지 않은 구현도 0을 내며 통과한다. 두 번 열어도 "duplicate column name"이
-// 밖으로 새지 않는다(ledger 전체가 best-effort라 삼킨다).
+// 보면 ALTER를 아예 넣지 않은 구현도 0을 내며 통과한다. 두 번 열어도 아무 일이 없다 — 옛
+// 형태는 "duplicate column name"을 내고 best-effort 관례가 그것을 삼켰지만, 이제는 이관이
+// 열 부재를 먼저 보므로 둘째 Open에서 DDL이 한 문장도 돌지 않는다(소견 F11).
 func TestLedgerColumnsAddedOnWritableOpen(t *testing.T) {
 	dir := t.TempDir()
 	st := openAt(t, dir)
@@ -1423,6 +1424,289 @@ func TestLedgerColumnsAddedOnWritableOpen(t *testing.T) {
 	}
 	if !cols["artifact_id"] || !cols["artifact_age_s"] || !cols["shadow_owned"] {
 		t.Fatalf("writable Open이 세 열을 붙이지 않았다: %v", cols)
+	}
+}
+
+// seedLedgerSchema — ledger.db를 원하는 이관 계단으로 **직접** 만든다. 다섯 옛 열은 항상 있고
+// extra로 준 새 열만 더 붙는다. writable Open은 이제 빠진 열을 메우므로(migrateLedger) 부분
+// 이관 상태를 Open으로는 만들 수 없다 — 쓰는 쪽의 관용을 보려면 이렇게 시딩해야 한다.
+func seedLedgerSchema(t *testing.T, dir string, extra ...string) {
+	t.Helper()
+	cols := `id INTEGER PRIMARY KEY, ts INTEGER NOT NULL, tool TEXT NOT NULL,
+		bytes_stored INTEGER NOT NULL DEFAULT 0, bytes_returned INTEGER NOT NULL DEFAULT 0,
+		duration_ms INTEGER NOT NULL DEFAULT 0`
+	for _, c := range extra {
+		cols += ", " + c + " INTEGER"
+	}
+	db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(filepath.Join(dir, "ledger.db"))+pragmas)
+	if err != nil {
+		t.Fatalf("원장 시딩 open: %v", err)
+	}
+	if _, err := db.Exec(`CREATE TABLE ledger(` + cols + `)`); err != nil {
+		t.Fatalf("원장 시딩 CREATE: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("원장 시딩 Close: %v", err)
+	}
+}
+
+// storeOverLedger — 시딩된 ledger.db 위에 Store를 그 스키마 **그대로** 얹는다(이관하지 않는다).
+// 생산 코드가 Open에서 하는 것과 같은 방식으로 열 집합을 잡는다 — ledgerColumns가 원천이다.
+func storeOverLedger(t *testing.T, dir string) *Store {
+	t.Helper()
+	db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(filepath.Join(dir, "ledger.db"))+pragmas)
+	if err != nil {
+		t.Fatalf("원장 open: %v", err)
+	}
+	db.SetMaxOpenConns(1)
+	t.Cleanup(func() { _ = db.Close() })
+	cols, err := ledgerColumns(db)
+	if err != nil {
+		t.Fatalf("ledgerColumns: %v", err)
+	}
+	return &Store{dir: dir, ledger: db, ledgerCols: cols}
+}
+
+// TestLedgerAppendFetchPartialMigrationRecordsOutcome — 릴리스 패스 소견 F1. 훅이 2000 ms
+// deadline에 죽어 `shadow_owned`만 못 붙은 원장이 도달 가능한데(계약 7), 쓰는 쪽의 INSERT가
+// 세 열을 다 지명하면 SQLite가 그 문장을 거절하고 best-effort 관례가 오류를 삼켜 **해소도
+// 미해소도 한 행 없이 통째로 사라진다**. 읽는 쪽은 그 계단에서 OutcomeOK=true를 세우므로
+// `stats`는 그 0을 측정값으로 렌더한다 — 아무것도 안 잰 원장이 관측으로 들어간다.
+// 쓰는 쪽도 읽는 쪽과 같은 계단을 관용해야 한다: 있는 열까지만 적고 퇴화한다.
+func TestLedgerAppendFetchPartialMigrationRecordsOutcome(t *testing.T) {
+	dir := t.TempDir()
+	seedLedgerSchema(t, dir, "artifact_id", "artifact_age_s")
+	ledgerSchemaGuard(t, dir, []string{"artifact_id", "artifact_age_s"}, []string{"shadow_owned"})
+
+	st := storeOverLedger(t, dir)
+	st.LedgerAppendFetch(t.Context(), 0, 1, 7, agePtr(30), true) // 해소
+	st.LedgerAppendFetch(t.Context(), 0, 1, 0, nil, false)       // 미해소
+
+	fs, err := LedgerFetchStats(dir)
+	if err != nil {
+		t.Fatalf("LedgerFetchStats: %v", err)
+	}
+	if fs.Calls != 2 {
+		t.Fatalf("Calls=%d want 2 — 부분 이관에서 행이 통째로 버려졌다(F1): %+v", fs.Calls, fs)
+	}
+	if fs.Resolved != 1 || fs.Missed != 1 {
+		t.Fatalf("Resolved=%d Missed=%d want 1/1 — 있는 두 열까지는 적어야 한다: %+v", fs.Resolved, fs.Missed, fs)
+	}
+	if fs.Legacy != 0 {
+		t.Fatalf("Legacy=%d want 0 — 두 열이 있는데 레거시로 적혔다: %+v", fs.Legacy, fs)
+	}
+	if !fs.OutcomeOK || fs.ShadowOK {
+		t.Fatalf("계단 표식이 틀렸다: %+v (기대 OutcomeOK만 true)", fs)
+	}
+}
+
+// TestLedgerAppendFetchPreMigrationRecordsCall — 소견 F1의 아래 계단. 새 열이 하나도 없는
+// 원장(구 바이너리가 만들고 아직 아무도 이관하지 않은 상태)에서도 **호출 자체는 남아야 한다**.
+// 남은 행은 두 새 열이 없으니 이관 뒤에 레거시로 읽히는데, 그게 정확한 진술이다 — 결과를
+// 표현할 수 없던 시점의 기록이다. 통째로 버리면 `calls`마저 아래로 편향된다.
+func TestLedgerAppendFetchPreMigrationRecordsCall(t *testing.T) {
+	dir := t.TempDir()
+	seedLedgerSchema(t, dir)
+	ledgerSchemaGuard(t, dir, []string{"tool"}, []string{"artifact_id", "artifact_age_s", "shadow_owned"})
+
+	st := storeOverLedger(t, dir)
+	st.LedgerAppendFetch(t.Context(), 0, 1, 7, agePtr(30), true)
+
+	fs, err := LedgerFetchStats(dir)
+	if err != nil {
+		t.Fatalf("LedgerFetchStats: %v", err)
+	}
+	if fs.Calls != 1 {
+		t.Fatalf("Calls=%d want 1 — 이관 전 원장에서 행이 버려졌다(F1): %+v", fs.Calls, fs)
+	}
+	if !fs.LedgerOK || fs.OutcomeOK || fs.ShadowOK {
+		t.Fatalf("계단 표식이 틀렸다: %+v (기대 LedgerOK만 true)", fs)
+	}
+}
+
+// TestMigrateLedgerAddsOnlyMissingColumns — 소견 F11. 이관은 `ledgerColumns`가 없다고 한 열에만
+// ALTER를 건다. 계단 둘(전무·부분)에서 시작해 셋을 다 채우는지, 그리고 반환한 열 집합이 실제
+// 스키마와 같은지를 함께 본다 — 반환값이 곧 쓰는 쪽의 계단 판정이라 둘이 갈리면 F1이 되돌아온다.
+func TestMigrateLedgerAddsOnlyMissingColumns(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		extra []string
+	}{
+		{"이관 전", nil},
+		{"부분 이관", []string{"artifact_id"}},
+		{"이미 완전", []string{"artifact_id", "artifact_age_s", "shadow_owned"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			seedLedgerSchema(t, dir, tc.extra...)
+			db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(filepath.Join(dir, "ledger.db"))+pragmas)
+			if err != nil {
+				t.Fatalf("open: %v", err)
+			}
+			db.SetMaxOpenConns(1)
+			defer db.Close()
+
+			got := migrateLedger(db)
+			for _, c := range ledgerFetchColumns {
+				if !got[c] {
+					t.Fatalf("반환 집합에 %q가 없다: %v", c, got)
+				}
+			}
+			// 반환값을 믿지 않고 스키마를 다시 읽는다 — 둘이 갈리는 것이 이 테스트가 잡는 것이다.
+			fresh, err := ledgerColumns(db)
+			if err != nil {
+				t.Fatalf("재확인 ledgerColumns: %v", err)
+			}
+			for _, c := range ledgerFetchColumns {
+				if !fresh[c] {
+					t.Fatalf("스키마에 %q가 실제로 없다: %v", c, fresh)
+				}
+			}
+		})
+	}
+}
+
+// TestMigrateLedgerSecondPassIsSilent — 소견 F11의 요지. 이관이 끝난 원장에 다시 걸어도 DDL이
+// 한 문장도 돌지 않는다. 관측 지점은 경고다: 게이트 없이 세 ALTER를 그냥 던지면 셋 다
+// "duplicate column name"으로 실패하고, 실패를 경고로 내는 이 구현에서는 그것이 매 Open마다
+// 경고 세 줄로 나타난다. 침묵이 곧 "안 돌았다"의 증거다.
+func TestMigrateLedgerSecondPassIsSilent(t *testing.T) {
+	dir := t.TempDir()
+	seedLedgerSchema(t, dir)
+	db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(filepath.Join(dir, "ledger.db"))+pragmas)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	db.SetMaxOpenConns(1)
+	defer db.Close()
+	migrateLedger(db) // 첫 번째 — 여기서 세 열이 붙는다
+
+	var logBuf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logBuf, nil)))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+	migrateLedger(db) // 두 번째 — 아무 일도 없어야 한다
+	if logBuf.Len() != 0 {
+		t.Fatalf("이관 뒤 재실행이 조용하지 않다 — DDL이 또 돌았다(F11):\n%s", logBuf.String())
+	}
+}
+
+// TestMigrateLedgerWarnsOnDDLFailure — 소견 F11의 나머지 절반. `_, _ =` 관례가 진짜 실패와
+// "이미 이관됨"을 구분 불가능하게 만드는 것이 F1의 침묵 상태에 경고 한 줄 없이 도달하는 경로다.
+// ensureIndexes가 색인마다 하는 것과 같이 열마다 한 줄을 남기고, 첫 실패에서 나머지를 멈추지
+// 않는다. 실패는 read-only 핸들로 주입한다 — 실제 권한 사고와 같은 오류이고, 그 핸들에서도
+// PRAGMA table_info는 읽히므로 이관 판정 자체는 정상으로 돈다.
+func TestMigrateLedgerWarnsOnDDLFailure(t *testing.T) {
+	dir := t.TempDir()
+	seedLedgerSchema(t, dir)
+	ro, err := sql.Open("sqlite", "file:"+filepath.ToSlash(filepath.Join(dir, "ledger.db"))+"?mode=ro&_pragma=busy_timeout(5000)")
+	if err != nil {
+		t.Fatalf("open ro: %v", err)
+	}
+	defer ro.Close()
+
+	var logBuf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logBuf, nil)))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+	got := migrateLedger(ro)
+
+	for _, c := range ledgerFetchColumns {
+		if got[c] {
+			t.Fatalf("붙지 않은 열 %q가 반환 집합에 들었다 — 쓰는 쪽이 없는 열을 지명하게 된다: %v", c, got)
+		}
+		if !strings.Contains(logBuf.String(), c) {
+			t.Fatalf("%q의 실패가 경고에 없다 — 첫 실패에서 멈췄거나 삼켰다:\n%s", c, logBuf.String())
+		}
+	}
+	if n := strings.Count(logBuf.String(), "level=WARN"); n != len(ledgerFetchColumns) {
+		t.Fatalf("경고 줄 수=%d want %d:\n%s", n, len(ledgerFetchColumns), logBuf.String())
+	}
+}
+
+// TestMigrateLedgerSkipsWhenSchemaUnknown — 소견 F11의 원칙("모르면 던지지 않는다")을 판정할 수
+// 없는 두 입력에 건다. ① 스키마를 아예 못 읽는 핸들: 경고는 그 사실 하나뿐이어야 하고, 열마다
+// 하나씩 더 붙으면 그것이 옛 무조건 ALTER다. ② `ledger` 테이블이 없는 원장(위 CREATE가 실패한
+// 상태 — 그쪽이 이미 경고를 냈다): 붙일 곳이 없으므로 완전한 침묵이 옳다.
+// 둘 다 반환 집합에 새 열이 없어야 한다 — 있으면 쓰는 쪽이 없는 열을 지명한다(소견 F1).
+func TestMigrateLedgerSkipsWhenSchemaUnknown(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		db       func(t *testing.T) *sql.DB
+		wantWarn int
+	}{
+		{"스키마 판정 불가", func(t *testing.T) *sql.DB {
+			db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(filepath.Join(t.TempDir(), "ledger.db"))+pragmas)
+			if err != nil {
+				t.Fatalf("open: %v", err)
+			}
+			if err := db.Close(); err != nil { // 닫힌 핸들 — PRAGMA도 ALTER도 못 돈다
+				t.Fatalf("Close: %v", err)
+			}
+			return db
+		}, 1},
+		{"ledger 테이블 없음", func(t *testing.T) *sql.DB {
+			db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(filepath.Join(t.TempDir(), "ledger.db"))+pragmas)
+			if err != nil {
+				t.Fatalf("open: %v", err)
+			}
+			t.Cleanup(func() { _ = db.Close() })
+			if _, err := db.Exec(`CREATE TABLE other(x INTEGER)`); err != nil {
+				t.Fatalf("무관 테이블: %v", err)
+			}
+			return db
+		}, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			db := tc.db(t)
+			var logBuf bytes.Buffer
+			prev := slog.Default()
+			slog.SetDefault(slog.New(slog.NewTextHandler(&logBuf, nil)))
+			t.Cleanup(func() { slog.SetDefault(prev) })
+
+			got := migrateLedger(db)
+			for _, c := range ledgerFetchColumns {
+				if got[c] {
+					t.Fatalf("판정 불가인데 %q가 반환 집합에 들었다: %v", c, got)
+				}
+			}
+			if n := strings.Count(logBuf.String(), "level=WARN"); n != tc.wantWarn {
+				t.Fatalf("경고 줄 수=%d want %d — ALTER를 던졌다(F11):\n%s", n, tc.wantWarn, logBuf.String())
+			}
+		})
+	}
+}
+
+// TestOpenSnapshotsLedgerColumns — 위 F11 테스트들을 실제 Open 경로에 묶는다. 둘을 본다:
+// ① Open이 쓰는 쪽에 넘기는 열 스냅샷이 **실제 스키마와 같다** — 이것이 F1 수정이 딛는
+// 불변식이고, OpenContext가 migrateLedger를 안 부르면 스냅샷이 비어 쓰는 쪽이 영원히 아래
+// 계단으로 퇴화한다. ② 이관이 끝난 원장을 다시 여는 둘째 Open이 조용하다 — 하루 약 295회의
+// 훅 포착 + 서버 기동마다 도는 자리라, 게이트가 빠지면 그 전부가 경고 세 줄이 된다.
+func TestOpenSnapshotsLedgerColumns(t *testing.T) {
+	dir := t.TempDir()
+	if err := openAt(t, dir).Close(); err != nil {
+		t.Fatalf("첫 Close: %v", err)
+	}
+	var logBuf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logBuf, nil)))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+	st := openAt(t, dir)
+	for _, c := range ledgerFetchColumns {
+		if !st.ledgerCols[c] {
+			t.Fatalf("Open이 넘긴 스냅샷에 %q가 없다 — 쓰는 쪽이 아래 계단으로 퇴화한다: %v", c, st.ledgerCols)
+		}
+		if strings.Contains(logBuf.String(), c) {
+			t.Fatalf("둘째 writable Open이 %q에 DDL을 또 걸었다(F11):\n%s", c, logBuf.String())
+		}
+	}
+	// 스냅샷이 실제 스키마와 갈리면 F1이 되돌아온다 — 반환값이 아니라 DB를 다시 읽어 대조한다.
+	fresh, err := ledgerColumns(st.ledger)
+	if err != nil {
+		t.Fatalf("ledgerColumns: %v", err)
+	}
+	if !reflect.DeepEqual(st.ledgerCols, fresh) {
+		t.Fatalf("스냅샷 %v != 실제 스키마 %v", st.ledgerCols, fresh)
 	}
 }
 

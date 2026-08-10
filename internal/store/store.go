@@ -32,6 +32,15 @@ type Store struct {
 	dir            string
 	writer, reader *sql.DB
 	ledger         *sql.DB
+	// ledgerCols — Open 시점에 관측한 ledger 테이블의 실제 열 집합(migrateLedger가 낸다).
+	// LedgerAppendFetch가 **있는 열만 지명**하려고 읽는다(릴리스 패스 소견 F1): 읽는 쪽이
+	// PRAGMA table_info로 부분 이관을 관용하는데 쓰는 쪽만 세 열을 무조건 지명하면, 그 원장에서
+	// INSERT가 통째로 거절되고 best-effort 관례가 그 오류를 삼킨다.
+	// **Open 시점 스냅샷이라 낡을 수 있다** — 이 Store가 살아 있는 동안 다른 프로세스가 writable
+	// Open으로 열을 붙일 수 있다(원장 DDL은 store open-lock 안에서 도는데 그 잠금은 Open 반환과
+	// 함께 풀린다). 그때 이 Store는 한 계단 아래 형태로 계속 적고, 그 행들은 레거시로 읽힌다 —
+	// 편향이지 유실이 아니다. 매 INSERT마다 PRAGMA를 다시 도는 값은 하지 않는다.
+	ledgerCols map[string]bool
 }
 
 // journalSizeLimit — D102 계약 5·6·9: 병합(`optimize`)이 훑고 지나가며 남기는 WAL 고수위를
@@ -173,19 +182,22 @@ func OpenContext(ctx context.Context, dir string, readOnly bool) (*Store, error)
 			l.SetMaxOpenConns(1)
 			// ledger는 best-effort 보조 DB(Store 계약 미포함, Close와 동일 취급) — 테이블 생성
 			// 실패해도 이후 ledger insert들이 그냥 계속 실패할 뿐 Store 본체 동작에는 영향 없다.
-			_, _ = l.Exec(`CREATE TABLE IF NOT EXISTS ledger(
+			// 그래도 침묵하지는 않는다(릴리스 패스 소견 F11): 이 실패는 이 세션의 사용량 기록을
+			// 통째로 없애는데, 로그에 안 남으면 관측할 길 자체가 없다 — MergeFTSIfDue의 스탬프
+			// 실패를 경고로 바꾼 것과 같은 판단이다.
+			if _, err := l.Exec(`CREATE TABLE IF NOT EXISTS ledger(
 				id INTEGER PRIMARY KEY, ts INTEGER NOT NULL, tool TEXT NOT NULL,
 				bytes_stored INTEGER NOT NULL DEFAULT 0, bytes_returned INTEGER NOT NULL DEFAULT 0,
-				duration_ms INTEGER NOT NULL DEFAULT 0)`)
-			// D103 계약 1: artifact 단위 회수 실적 두 열 + 소견 F4의 귀속 표식 한 열. 옛
-			// ledger.db에도 붙여야 하므로 ALTER를 쓰는데, 이미 있으면 "duplicate column name"으로
-			// 실패한다 — ledger 전체가 best-effort이므로 그 실패를 그대로 무시한다(위 CREATE와
-			// 같은 `_, _ =` 관례). 셋은 독립 문장이라 일부만 성공한 부분 이관이 도달 가능하다 —
-			// 읽는 쪽이 PRAGMA table_info로 있는 열만 보고 나머지는 빈 값 경로를 탄다(계약 7).
-			_, _ = l.Exec(`ALTER TABLE ledger ADD COLUMN artifact_id INTEGER`)
-			_, _ = l.Exec(`ALTER TABLE ledger ADD COLUMN artifact_age_s INTEGER`)
-			_, _ = l.Exec(`ALTER TABLE ledger ADD COLUMN shadow_owned INTEGER`)
+				duration_ms INTEGER NOT NULL DEFAULT 0)`); err != nil {
+				slog.Warn("store: 원장 테이블 생성 실패 — 이 세션의 사용량 기록이 통째로 유실된다", "error", err)
+			}
+			// D103 계약 1의 세 열(회수 실적 둘 + 소견 F4의 귀속 표식)을 옛 ledger.db에도 붙인다.
+			// **없는 열만** 붙이고 실패는 경고로 낸다 — 근거는 migrateLedger의 주석(소견 F11).
+			// 셋은 독립 문장이라 일부만 성공한 부분 이관이 여전히 도달 가능하고, 그때 읽는 쪽은
+			// PRAGMA table_info로 있는 열만 보고(계약 7) 쓰는 쪽은 아래 ledgerCols로 같은 계단을
+			// 탄다 — 둘이 갈리면 소견 F1이다.
 			s.ledger = l
+			s.ledgerCols = migrateLedger(l)
 		}
 	}
 	return s, nil
@@ -1085,6 +1097,8 @@ func (s *Store) LastIndexedAtByHash(ctx context.Context, contentHash string) (in
 // ctx를 받는 이유는 계약 8과 같다 — 형제 LedgerAppendContext처럼 호출부의 예산을 탄다.
 // LedgerAppend와 같은 best-effort 계약이다(ledger 없음·오류는 무시). S4: 정수와 도구 이름만
 // 담는다 — 선택자도 경로도 내용도 담지 않는다(계약 6).
+// **부분 이관 원장에서는 있는 열까지만 적고 퇴화한다**(릴리스 패스 소견 F1) — 계단은 아래
+// switch에 있고, 읽는 쪽 LedgerFetchStats의 계단과 같은 자리에서 갈린다.
 func (s *Store) LedgerAppendFetch(ctx context.Context, returned, ms, artifactID int64, ageS *int64, shadowOwned bool) {
 	if s.ledger == nil {
 		return
@@ -1098,12 +1112,34 @@ func (s *Store) LedgerAppendFetch(ctx context.Context, returned, ms, artifactID 
 			age = *ageS
 		}
 	}
-	_, _ = s.ledger.ExecContext(
-		ctx,
-		`INSERT INTO ledger(ts,tool,bytes_stored,bytes_returned,duration_ms,artifact_id,artifact_age_s,shadow_owned)
-		 VALUES(?,'ctr_fetch',0,?,?,?,?,?)`,
-		time.Now().Unix(), returned, ms, idCol, age, owned,
-	)
+	// 있는 열만 지명한다 — 계단은 읽는 쪽(LedgerFetchStats)의 것과 **같은 둘**이다(소견 F1).
+	// 갈라 두면 부분 이관 원장에서 INSERT가 통째로 거절되고 best-effort 관례가 그 오류를 삼켜
+	// 해소도 미해소도 한 행 없이 사라지는데, 읽는 쪽은 그 계단에서 OutcomeOK를 세우므로 `stats`가
+	// 그 0을 측정값으로 렌더한다.
+	switch {
+	case !s.ledgerCols["artifact_id"] || !s.ledgerCols["artifact_age_s"]:
+		// 결과를 적을 두 열이 없다. 판정의 축은 artifact_id이므로 하나만 있어도 결과는 못 적는다 —
+		// artifact_age_s만 적어 두면 나중에 열이 채워졌을 때 해소 행이 **미해소로 읽힌다**(계약 1).
+		// 구 바이너리와 같은 다섯 열로 남기면 이관 뒤 레거시로 읽히는데, 그것이 정확한 진술이다.
+		s.LedgerAppendContext(ctx, "ctr_fetch", 0, returned, ms)
+	case !s.ledgerCols["shadow_owned"]:
+		// 셋째 ALTER 이전 계단. 해소/미해소는 그대로 측정값이고(읽는 쪽도 OutcomeOK를 세운다),
+		// 귀속 미상은 NULL로 남아 fetchAgeBasis의 `shadow_owned=1`이 자연히 뺀다 — 나중에 열이
+		// 붙어도 이 행들은 분위수에 안 든다. 과소 계수이지 거짓 양성이 아니다.
+		_, _ = s.ledger.ExecContext(
+			ctx,
+			`INSERT INTO ledger(ts,tool,bytes_stored,bytes_returned,duration_ms,artifact_id,artifact_age_s)
+			 VALUES(?,'ctr_fetch',0,?,?,?,?)`,
+			time.Now().Unix(), returned, ms, idCol, age,
+		)
+	default:
+		_, _ = s.ledger.ExecContext(
+			ctx,
+			`INSERT INTO ledger(ts,tool,bytes_stored,bytes_returned,duration_ms,artifact_id,artifact_age_s,shadow_owned)
+			 VALUES(?,'ctr_fetch',0,?,?,?,?,?)`,
+			time.Now().Unix(), returned, ms, idCol, age, owned,
+		)
+	}
 }
 
 // ToolStat: ledger.db 도구별 집계 1행(설계 §6 stats local 계약). FirstTS/LastTS는
@@ -1226,6 +1262,46 @@ func ledgerColumns(db *sql.DB) (map[string]bool, error) {
 		cols[name] = true
 	}
 	return cols, rows.Err()
+}
+
+// ledgerFetchColumns — D103 계약 1이 원장에 더하는 세 열. 이 순서가 곧 ALTER를 거는 순서다.
+// 셋 다 INTEGER라 형은 코드에 한 번만 적는다.
+var ledgerFetchColumns = []string{"artifact_id", "artifact_age_s", "shadow_owned"}
+
+// migrateLedger — 세 열 중 **없는 것만** 붙이고, 그 뒤의 실제 열 집합을 낸다. 반환값이 곧
+// LedgerAppendFetch의 계단 판정이다(Store.ledgerCols).
+//
+// 조건 없이 세 ALTER를 던지던 옛 형태를 게이트로 바꾼 이유는 릴리스 패스 소견 F11이다.
+// ① 그 형태는 하루 약 295회의 훅 포착 + 서버 기동마다 이미 있는 열에 DDL 셋을 던져 매번
+// "duplicate column name"으로 실패했다 — 제품 수명 내내. ② 더 나쁘게, `_, _ =` 관례가
+// **진짜 실패**(잠금 경쟁이 busy_timeout을 넘긴 경우 등)와 "이미 이관됨"을 구분 불가능하게
+// 만들었다. 그 구분 불가가 소견 F1의 침묵 상태(부분 이관 + 모든 행 유실)에 경고 한 줄 없이
+// 도달하는 경로다. ensureIndexes가 색인마다 하듯 열마다 한 줄을 남기고, 첫 실패에서 나머지를
+// 멈추지 않는다 — 열은 서로 독립이라 하나가 막혀도 나머지는 붙는 편이 낫다.
+//
+// 이관 판정에 드라이버 오류 문자열을 쓰지 않는 근거는 ledgerColumns의 주석과 같다(계약 7).
+// 원장 전체가 best-effort 보조 DB이므로 실패는 여전히 오류로 **반환하지 않는다** — 경고는
+// 반환된 오류가 아니고, 못 붙은 열은 반환 집합에서 빠져 쓰는 쪽이 그만큼 낮은 계단으로 퇴화한다.
+func migrateLedger(l *sql.DB) map[string]bool {
+	cols, err := ledgerColumns(l)
+	if err != nil {
+		slog.Warn("store: 원장 스키마 확인 실패 — 회수 실적 열을 이관하지 않는다", "error", err)
+		return nil // 모르는 상태에서 ALTER를 던지지 않는다 — 그것이 F11이 없앤 바로 그 동작이다
+	}
+	if len(cols) == 0 {
+		return cols // ledger 테이블 자체가 없다(위 CREATE가 이미 경고를 냈다) — 붙일 곳이 없다
+	}
+	for _, c := range ledgerFetchColumns {
+		if cols[c] {
+			continue
+		}
+		if _, err := l.Exec(`ALTER TABLE ledger ADD COLUMN ` + c + ` INTEGER`); err != nil {
+			slog.Warn("store: 원장 열 추가 실패 — 그 열이 나르는 회수 실적을 못 잰다", "column", c, "error", err)
+			continue
+		}
+		cols[c] = true
+	}
+	return cols
 }
 
 // LedgerFetchStats: dir/ledger.db를 read-only로 열어 회수 실적을 낸다.
