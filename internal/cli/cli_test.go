@@ -1878,11 +1878,50 @@ func TestStatsPrintsFetchStats(t *testing.T) {
 	}
 	got := out.String()
 	for _, want := range []string{
-		"fetch\t", "calls=7", "resolved=6", "missed=1", "shadow_rows=5", "p50=30", "p90=40", "max=50",
+		"fetch\t", "calls=7", "legacy=0", "resolved=6", "missed=1",
+		"shadow_rows=5", "shadow_artifacts=5", "p50=30", "p90=40", "max=50",
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("회수 실적 줄에 %q 없음:\n%s", want, got)
 		}
+	}
+}
+
+// TestStatsTotalExcludesNonCtrRows: `total` 줄은 **`ctr_` 접두 도구만** 합산한다(릴리스 리뷰
+// W1). 훅 분모 행(`hook:shadow`)은 하루 약 295행이라 그대로 합치면 총계를 지배하는데, D104의
+// 채택 문턱이 읽는 수가 바로 그 총계다 — 이 릴리스 전 원장의 도구는 전부 `ctr_*`였으므로
+// 제외가 총계의 뜻을 **유지**한다. 행 자체는 표에 그대로 찍힌다(관측 채널은 안 잃는다).
+func TestStatsTotalExcludesNonCtrRows(t *testing.T) {
+	storeRoot, projectRoot := t.TempDir(), t.TempDir()
+	canon, err := ident.Canonicalize(projectRoot)
+	if err != nil {
+		t.Fatalf("canonicalize: %v", err)
+	}
+	projDir := filepath.Join(storeRoot, "projects", canon.ProjectID)
+	st, err := store.Open(projDir, false)
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	st.LedgerAppend("ctr_search", 10, 20, 1)
+	st.LedgerAppend("ctr_search", 10, 20, 1)
+	for range 5 { // 훅 분모 — 실전에서는 하루 약 295행
+		st.LedgerAppend("hook:shadow", 1000, 0, 1)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatalf("store.Close: %v", err)
+	}
+
+	var out, errOut bytes.Buffer
+	if err := Run(context.Background(), "stats", nil, storeRoot, projectRoot, "0.0.1-dev", &out, &errOut); err != nil {
+		t.Fatalf("Run stats err=%v out=%s", err, out.String())
+	}
+	got := out.String()
+	// 사전 가드: 훅 행이 실제로 표에 있어야 아래 총계 단언이 무언가를 증명한다.
+	if !strings.Contains(got, "hook:shadow\t5\t") {
+		t.Fatalf("훅 행이 표에 없다 — 픽스처가 의도한 상태가 아니다:\n%s", got)
+	}
+	if !strings.Contains(got, "total\t2\t20\t40\t") {
+		t.Fatalf("total이 ctr_* 2건이 아니다(훅 5건이 섞였다):\n%s", got)
 	}
 }
 

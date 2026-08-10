@@ -237,6 +237,14 @@ func runStatsLocal(w io.Writer, storeRoot, projectRoot string) error {
 	for _, s := range stats {
 		span := time.Unix(s.FirstTS, 0).UTC().Format(time.RFC3339) + "~" + time.Unix(s.LastTS, 0).UTC().Format(time.RFC3339)
 		fmt.Fprintf(w, "%s\t%d\t%d\t%d\t%s\n", s.Tool, s.Calls, s.BytesStored, s.BytesReturned, span)
+		// D103 계약 4 후반부(릴리스 리뷰 W1): 훅 분모 행(`hook:shadow`)은 이름이 `ctr_`로
+		// 시작하지 않고, **총계에서 빠지는 것까지가 그 계약이다** — 하루 약 295행이면 그 총계를
+		// 훅이 지배하는데 D104의 채택 문턱이 읽는 수가 바로 그 총계다. 이 릴리스 전 원장의
+		// 도구는 전부 `ctr_*`였으므로 이 제외는 총계의 뜻을 바꾸는 게 아니라 유지한다.
+		// 행 자체는 위에서 이미 찍었다 — 관측 채널은 잃지 않는다.
+		if !strings.HasPrefix(s.Tool, "ctr_") {
+			continue
+		}
 		totalCalls += s.Calls
 		totalStored += s.BytesStored
 		totalReturned += s.BytesReturned
@@ -253,11 +261,16 @@ func runStatsLocal(w io.Writer, storeRoot, projectRoot string) error {
 	if err != nil {
 		return fmt.Errorf("stats: 회수 실적 집계 실패: %w", err)
 	}
-	// shadow_rows는 나이 분위수가 실제로 선 모집단이다 — shadow 귀속(=퍼지가 지우는) 해소 행만
-	// 센다(소견 F4). 병기하지 않으면 p50/p90을 resolved 전체의 분포로 읽게 되는데, explicit
-	// 아티팩트는 창이 손대지 않으므로 그 나이는 창의 길이에 대해 아무 말도 하지 않는다.
-	fmt.Fprintf(w, "fetch\tcalls=%d\tresolved=%d\tmissed=%d\tshadow_rows=%d\tage_s p50=%d p90=%d max=%d\n",
-		fs.Calls, fs.Resolved, fs.Missed, fs.ShadowResolved, fs.AgeP50, fs.AgeP90, fs.AgeMax)
+	// 한 줄에 넷을 병기하는 이유가 각각 다르다:
+	//  - legacy: 이관 전 행은 해소에도 미해소에도 안 드는데 calls에는 든다 — 병기하지 않으면
+	//    calls가 결과의 분모로 읽힌다(소견 F9). 배포 시점 실측이 calls=49 legacy=49였다.
+	//  - shadow_rows: 나이 분위수가 실제로 선 모집단(shadow 귀속 해소 행)이다. explicit
+	//    아티팩트는 창이 손대지 않으므로 그 나이는 창의 길이에 답하지 않는다(소견 F4).
+	//  - shadow_artifacts: 그 모집단의 distinct artifact 수이고 **D104 착수 조건이 읽는 수**다.
+	//    shadow_rows와 나란히 봐야 페이징 집중(한 아티팩트가 행 수를 채운 상태)이 보인다(소견 F5).
+	fmt.Fprintf(w, "fetch\tcalls=%d\tlegacy=%d\tresolved=%d\tmissed=%d\tshadow_rows=%d\tshadow_artifacts=%d\tage_s p50=%d p90=%d max=%d\n",
+		fs.Calls, fs.Legacy, fs.Resolved, fs.Missed, fs.ShadowResolved, fs.ShadowArtifacts,
+		fs.AgeP50, fs.AgeP90, fs.AgeMax)
 	return nil
 }
 

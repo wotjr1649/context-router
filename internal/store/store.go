@@ -1160,13 +1160,20 @@ func LedgerStats(dir string) ([]ToolStat, error) {
 // 끝난 fetch다(계약 3 — 잘못된 chunk id는 여기 들지 않는다). Age*는 **회수 시점에 박아 둔**
 // 나이(초)의 분포 — 아티팩트가 나중에 지워져도 남는다는 것이 이 계측의 요지다(계약 2).
 //
+// Legacy는 그 Calls 중 이관 전 행(두 열 다 NULL)이다 — 해소에도 미해소에도 들지 않으므로
+// Calls를 결과의 분모로 읽으면 그만큼 희석된다(소견 F9).
+//
 // ShadowResolved는 그 해소 중 **shadow 귀속**(= 퍼지가 실제로 지우는) 행만 센 수이고,
 // Age*는 그 부분집합에서만 나온다(소견 F4). Resolved와 갈라 두는 이유: 채택 게이트는 도구가
 // 쓰이는지를 묻고(모든 해소가 답이다) 창의 길이는 지워질 수 있는 것만 답할 수 있다.
+// ShadowArtifacts는 그 같은 모집단의 **distinct artifact_id**이고 D104의 착수 조건이 읽는
+// 수다(소견 F5) — ctr_fetch는 기본 16 KiB까지만 돌려주므로 아티팩트 하나가 여러 행이 되고,
+// 행으로 세면 페이징 한 번이 조건을 채운다. 둘을 나란히 내면 그 집중이 보인다.
 type FetchStat struct {
-	Calls                  int64
+	Calls, Legacy          int64
 	Resolved, Missed       int64
 	ShadowResolved         int64
+	ShadowArtifacts        int64
 	AgeP50, AgeP90, AgeMax int64
 }
 
@@ -1237,19 +1244,21 @@ func LedgerFetchStats(dir string) (FetchStat, error) {
 	if !cols["artifact_id"] || !cols["artifact_age_s"] {
 		return fs, nil // 이관 전·부분 이관 — 총 호출만 유효하다
 	}
-	// 계약 1의 표: 레거시는 두 열 다 NULL, 미해소는 age=-1, 해소는 둘 다 값.
+	// 계약 1의 표: 레거시는 두 열 다 NULL, 미해소는 age=-1, 해소는 artifact_id가 값
+	// (나이는 미상일 수 있다 — 소견 F6). 레거시를 같은 문장에서 세는 이유는 소견 F9다.
 	if err := db.QueryRow(`SELECT
 			coalesce(sum(artifact_id IS NOT NULL),0),
-			coalesce(sum(artifact_id IS NULL AND artifact_age_s IS NOT NULL),0)
-		FROM ledger WHERE tool='ctr_fetch'`).Scan(&fs.Resolved, &fs.Missed); err != nil {
+			coalesce(sum(artifact_id IS NULL AND artifact_age_s IS NOT NULL),0),
+			coalesce(sum(artifact_id IS NULL AND artifact_age_s IS NULL),0)
+		FROM ledger WHERE tool='ctr_fetch'`).Scan(&fs.Resolved, &fs.Missed, &fs.Legacy); err != nil {
 		return FetchStat{}, fmt.Errorf("store LedgerFetchStats: %w", err)
 	}
 	if !cols["shadow_owned"] {
 		return fs, nil // 셋째 ALTER 이전 원장 — 귀속으로 제한한 수치는 낼 수 없다(계약 7과 같은 관용)
 	}
 	if err := db.QueryRow(
-		`SELECT count(*) FROM ledger WHERE ` + fetchAgeBasis,
-	).Scan(&fs.ShadowResolved); err != nil {
+		`SELECT count(*), count(DISTINCT artifact_id) FROM ledger WHERE `+fetchAgeBasis,
+	).Scan(&fs.ShadowResolved, &fs.ShadowArtifacts); err != nil {
 		return FetchStat{}, fmt.Errorf("store LedgerFetchStats: %w", err)
 	}
 	if fs.ShadowResolved == 0 {

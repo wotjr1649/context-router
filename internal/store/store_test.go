@@ -1434,6 +1434,10 @@ func TestLedgerFetchStatsFullMigration(t *testing.T) {
 	if fs.Missed != 2 {
 		t.Fatalf("Missed=%d want 2", fs.Missed)
 	}
+	// 소견 F9: 레거시 행 수를 따로 낸다 — Calls 안에 섞여 있어 그 줄만 보면 결과 분모로 읽힌다.
+	if fs.Legacy != 1 {
+		t.Fatalf("Legacy=%d want 1(두 열 다 NULL인 이관 전 행)", fs.Legacy)
+	}
 	if fs.AgeP50 != 30 || fs.AgeP90 != 40 || fs.AgeMax != 50 {
 		t.Fatalf("분위수 틀림: %+v want {AgeP50:30 AgeP90:40 AgeMax:50}", fs)
 	}
@@ -1685,6 +1689,33 @@ func TestLedgerFetchStatsRestrictsAgeToShadowOwned(t *testing.T) {
 	}
 	if fs.AgeP50 != 30 || fs.AgeP90 != 40 || fs.AgeMax != 50 {
 		t.Fatalf("분위수에 explicit 나이가 섞였다: %+v want p50=30 p90=40 max=50", fs)
+	}
+}
+
+// TestLedgerFetchStatsCountsDistinctShadowArtifacts: 착수 조건은 **행이 아니라 아티팩트**를
+// 센다(소견 F5). ctr_fetch는 기본 16 KiB까지만 돌려주므로 큰 아티팩트 하나를 읽는 데 여러 번
+// 불리고, 그 한 번의 페이징 폭주가 "해소 30건"을 채우고 분위수까지 지배할 수 있다. 행 수와
+// 아티팩트 수를 나란히 내면 그 집중이 눈에 보인다.
+func TestLedgerFetchStatsCountsDistinctShadowArtifacts(t *testing.T) {
+	dir := t.TempDir()
+	st := openAt(t, dir)
+	for _, age := range []int64{10, 20, 30} { // 아티팩트 1을 세 번 페이징
+		st.LedgerAppendFetch(t.Context(), 0, 1, 1, &age, true)
+	}
+	st.LedgerAppendFetch(t.Context(), 0, 1, 2, agePtr(40), true)
+	if err := st.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	fs, err := LedgerFetchStats(dir)
+	if err != nil {
+		t.Fatalf("LedgerFetchStats: %v", err)
+	}
+	if fs.ShadowResolved != 4 {
+		t.Fatalf("ShadowResolved=%d want 4(행 수)", fs.ShadowResolved)
+	}
+	if fs.ShadowArtifacts != 2 {
+		t.Fatalf("ShadowArtifacts=%d want 2(distinct artifact_id) — 페이징이 착수 조건을 채웠다", fs.ShadowArtifacts)
 	}
 }
 
