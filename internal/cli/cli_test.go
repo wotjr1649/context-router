@@ -1846,9 +1846,10 @@ func TestRunStats_Local_NoLedger(t *testing.T) {
 }
 
 // TestStatsPrintsFetchStats: stats가 회수 실적 줄을 낸다. 이 줄이 D104의 착수 조건을 사람이
-// 눈으로 확인하는 자리다 — ctr_* 호출 10건·해소 30건 또는 미해소 5건. **총 호출을 병기하는
-// 것이 계약**이다: 이 릴리스부터 위 표의 ctr_fetch calls가 뜻을 바꾸고(전에는 성공만, 이제
-// 성공 + artifact 부재), 채택 문턱이 읽는 수가 바로 그 총계다(D103 계약 9).
+// 눈으로 확인하는 자리다 — `resolved + missed` 10건 · `shadow_artifacts` 30건 또는 `missed`
+// 5건(W2·F5 소유자 판정으로 개정된 수들이고, 전부 이 줄에 그 이름으로 찍힌다).
+// **총 호출을 병기하는 것이 계약**이다: 이 릴리스부터 위 표의 ctr_fetch calls가 뜻을 바꾸고
+// (전에는 성공만, 이제 성공 + artifact 부재) 그 수가 레거시까지 품기 때문이다(D103 계약 9).
 // 나이를 10·20·30·40·50 다섯 값으로 심어 p50·p90·max를 서로 다른 세 수로 만든다 — 두 값짜리
 // 픽스처(600·1800)는 nearest-rank 오프셋상 p50=p90=600이 되어 그 둘을 뒤바꿔도 통과한다.
 func TestStatsPrintsFetchStats(t *testing.T) {
@@ -1996,9 +1997,11 @@ func TestStatsRendersUnmeasuredTiers(t *testing.T) {
 }
 
 // TestStatsTotalExcludesNonCtrRows: `total` 줄은 **`ctr_` 접두 도구만** 합산한다(릴리스 리뷰
-// W1). 훅 분모 행(`hook:shadow`)은 하루 약 295행이라 그대로 합치면 총계를 지배하는데, D104의
-// 채택 문턱이 읽는 수가 바로 그 총계다 — 이 릴리스 전 원장의 도구는 전부 `ctr_*`였으므로
-// 제외가 총계의 뜻을 **유지**한다. 행 자체는 표에 그대로 찍힌다(관측 채널은 안 잃는다).
+// W1). 훅 분모 행(`hook:shadow`)은 하루 약 295행이라 그대로 합치면 총계를 지배한다 — 이
+// 릴리스 전 원장의 도구는 전부 `ctr_*`였으므로 제외가 총계의 뜻을 **유지**한다. 총계를 읽는
+// 것은 이제 M6뿐이고 D104의 채택 문턱은 `resolved + missed`를 읽는다(W2) — 그래도 이 제외가
+// 필요한 이유는 그 총계가 M6에게 여전히 의미를 가져야 하기 때문이다.
+// 행 자체는 표에 그대로 찍힌다(관측 채널은 안 잃는다).
 func TestStatsTotalExcludesNonCtrRows(t *testing.T) {
 	storeRoot, projectRoot := t.TempDir(), t.TempDir()
 	canon, err := ident.Canonicalize(projectRoot)

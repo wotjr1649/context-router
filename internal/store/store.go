@@ -1156,8 +1156,9 @@ func LedgerStats(dir string) ([]ToolStat, error) {
 }
 
 // FetchStat: D103 회수 실적. Calls는 원장의 ctr_fetch 행 전부(레거시 포함)다 — **D104의 채택
-// 문턱이 읽는 수가 아니다**: 그것은 `stats`의 `total` 행(ctr_* 전 도구 합)이고, 이 열 하나가
-// 아니다. Resolved는 artifact를 실제로 돌려준 fetch, Missed는 **artifact 부재**로 끝난
+// 문턱이 읽는 수가 아니다**: 문턱은 `Resolved + Missed`이고(W2 소유자 판정), 이 열은 이관 전
+// 레거시까지 품어 배포 첫날 역사만으로 문턱을 넘긴다. `stats`의 `total` 행도 아니다 — 그 행은
+// 이제 M6만 읽는다. Resolved는 artifact를 실제로 돌려준 fetch, Missed는 **artifact 부재**로 끝난
 // fetch다(계약 3 — 잘못된 chunk id는 여기 들지 않는다). Age*는 **회수 시점에 박아 둔**
 // 나이(초)의 분포 — 아티팩트가 나중에 지워져도 남는다는 것이 이 계측의 요지다(계약 2).
 //
@@ -1177,6 +1178,8 @@ func LedgerStats(dir string) ([]ToolStat, error) {
 // 읽는 상태가 정상적으로 도달 가능**하고(계약 7), 그때 위 수들은 0이 아니라 **못 잰 것**이다.
 // 0으로 렌더하면 D104의 착수 조건이 읽는 ShadowArtifacts=0이 "아무도 회수를 안 쓴다"로 읽혀
 // 결정표의 종결 행이 발화한다 — 이 릴리스가 막으려는 바로 그 오독이 세 번째 경로로 온다.
+// 그래서 D104는 상태가 셋이다: 충족·불충족, 그리고 **판정 불가**(결정표 행 0 — 숫자가 아닌
+// 칸이 하나라도 있으면 그 원장으로는 조건을 판정하지 않는다).
 // 계단은 셋이고 단조다: LedgerOK ⊇ OutcomeOK ⊇ ShadowOK.
 type FetchStat struct {
 	Calls, Legacy          int64

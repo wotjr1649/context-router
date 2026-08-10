@@ -109,7 +109,9 @@ func shadowCapture(ctx context.Context, ad *session.AppendDB, in hookInput, dir,
 	// 있다 — 지금까지 쓰지 않았을 뿐이다. ctx를 넘기는 이유는 계약 8: ledger.db의
 	// busy_timeout(5000ms)이 훅 총예산(2000ms)보다 커서, 겹친 훅에서 ctx 없이 쓰면 예산 밖에서
 	// 블록된다. best-effort라 실패해도 포착 자체와 훅의 fail-open 성질은 바뀌지 않는다.
-	// 이름이 ctr_로 시작하지 않는 것도 계약이다 — D104의 채택 문턱은 ctr_* 행만 센다.
+	// 이름이 ctr_로 시작하지 않는 것도 계약이고, 이름만으로는 부족해 `stats`가 이 행을 총계
+	// 누적에서 실제로 뺀다(W1). D104의 채택 문턱은 총계도 이 행도 아닌 회수 줄의
+	// `resolved + missed`를 읽는다(W2) — 이 행을 읽는 결정 규칙은 없다.
 	st.LedgerAppendContext(ctx, "hook:shadow", int64(size), 0, time.Since(start).Milliseconds())
 }
 
