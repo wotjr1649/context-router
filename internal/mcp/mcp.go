@@ -543,18 +543,11 @@ func registerFetch(srv *mcp.Server, st *store.Store, worktreeRoot string) {
 		}
 		res, err := st.ReadRange(ctx, in.ArtifactID, sel)
 		if err != nil {
-			// D103 계약 3: ErrNotFound **둘 중 artifact 부재만** 미해소로 센다. ReadRange의
-			// artifact 부재(store.go:722)와 readChunk의 chunk id 부재(store.go:607)가 같은
-			// 센티넬을 쓰므로 errors.Is 하나로는 안 갈린다 — artifact 행의 존재를 따로 확인해
-			// 가른다(ArtifactHashByID는 artifact 부재에만 ErrNotFound를 낸다, store.go:697).
-			// 잘못된 선택자·DB 오류는 창의 길이에 대해 아무 말도 하지 않으며, 넓게 세면 잘못된
-			// chunk id가 창을 늘리는 근거로 둔갑한다.
+			// D103 계약 3: ErrNotFound **둘 중 artifact 부재만** 미해소로 센다(가르는 방법은
+			// recordFetchMiss에 있다). 잘못된 선택자·DB 오류는 창의 길이에 대해 아무 말도 하지
+			// 않으며, 넓게 세면 잘못된 chunk id가 창을 늘리는 근거로 둔갑한다.
 			if errors.Is(err, store.ErrNotFound) {
-				if _, hashErr := st.ArtifactHashByID(ctx, in.ArtifactID); errors.Is(hashErr, store.ErrNotFound) {
-					// 귀속 인자가 false인 것은 "explicit이었다"가 아니다 — 아티팩트가 없어 물을 수
-					// 없다는 뜻이고, 미해소 행은 그 값을 NULL로 남긴다(store.LedgerAppendFetch).
-					st.LedgerAppendFetch(ctx, 0, time.Since(start).Milliseconds(), 0, nil, false)
-				}
+				recordFetchMiss(ctx, st, in.ArtifactID, time.Since(start).Milliseconds())
 			}
 			return nil, FetchOutput{}, toToolError(err)
 		}
@@ -583,26 +576,93 @@ func registerFetch(srv *mcp.Server, st *store.Store, worktreeRoot string) {
 			Provenance:        prov,
 			Untrusted:         true,
 		}
-		// D103 계약 2: 나이는 **회수 시점에 계산해 박는다** — 사후 계산은 아티팩트가 지워지면
-		// 불가능하다. 시계와 범위는 D67 퍼지와 같다(hash 단위 max(sources.indexed_at)).
-		// 소견 F4: **shadow 귀속 여부도 지금 박는다** — 같은 질의가 함께 내므로 왕복은 그대로
-		// 하나이고, 나중에는 아티팩트가 없어 되물을 수 없다. explicit 아티팩트는 퍼지 대상이
-		// 아니라 그 회수 나이가 창의 길이에 대해 아무 말도 하지 않는데, 표식이 없으면 그 회수가
-		// D104의 "해소 30건"을 채우고 분위수까지 지배한다.
-		// 나이 조회 실패·소스 부재는 회수를 실패시키지 않는다 — 나이를 **미상(nil)**으로 두고
-		// 행은 남긴다(소견 F6). 0으로 두면 같은 초에 회수한 행과 구분되지 않아 분포가 내려간다.
-		var ageS *int64
-		var shadowOwned bool
-		if at, owned, ageErr := st.LastIndexedAtByHash(ctx, res.Artifact.ContentHash); ageErr == nil {
-			shadowOwned = owned
-			if at > 0 {
-				age := time.Now().Unix() - at
+		recordFetchResolve(ctx, st, res.Artifact.ID, res.Artifact.ContentHash,
+			jsonLen(out), time.Since(start).Milliseconds())
+		return nil, out, nil
+	})
+}
+
+// fetchLedgerBudget — 아래 fetchLedgerCtx가 씌우는 명시 기한. **유도된 값이다**: 떼어 낸 ctx가
+// 덮는 문장은 나이·귀속 조회와 INSERT 둘뿐이고, 각각이 최악의 경우 다른 프로세스가 쥔 락을
+// 스토어 DSN의 busy_timeout(5000 ms)만큼 기다린 뒤 BUSY로 돌아온다. 그 둘의 합이다.
+const fetchLedgerBudget = 10 * time.Second
+
+// fetchLedgerCtx — ctr_fetch의 **계측만** 요청 ctx에서 떼어 낸다(릴리스 패스 소견 F3).
+// 요청이 취소된 뒤에 기록해야 하는 이유: 원장 행은 응답을 다 만든 뒤에 쓰는데, 사용자가 Esc를
+// 누르거나 클라이언트가 시간 초과하면 그 사이에 ctx가 죽는다. database/sql은 죽은 ctx의
+// ExecContext를 거절하고 best-effort 관례가 그 오류를 삼키므로, **실제로 성공한 회수가 흔적
+// 없이 사라진다**. 취소는 부하와 상관이 있어 손실이 무작위가 아니고, 14일 뒤 D104는 정말 쓰인
+// 창을 채택 미달로 읽는다.
+//
+// **훅 경로는 일부러 반대다** — 다음 독자가 둘을 맞추려 들지 않도록 여기 적는다.
+// store.LedgerAppendContext(D103 계약 8)는 훅의 ctx를 그대로 탄다: ledger.db의 busy_timeout이
+// 5000 ms인데 훅의 총예산은 2000 ms라, 거기서는 예산 밖으로 밀린 INSERT가 **잘려 나가는 것이
+// 옳은 동작**이다(훅의 fail-open이 그 위에 서 있다). ctr_fetch에는 그런 예산이 없다 —
+// 자르는 것이 예산을 지키는 게 아니라 계측을 잃는 것뿐이다.
+//
+// **무엇이 이 쓰기를 가두는가**: 죽은 요청 위의 무한 쓰기는 그 자체로 결함이므로, 취소만 떼고
+// (context.WithoutCancel) 기한은 fetchLedgerBudget으로 새로 씌운다 — 상한이 DSN pragma와 풀
+// 크기에서 **추론되는** 값이 아니라 읽을 수 있는 리터럴로 남는다. 고루틴은 새로 만들지 않는다:
+// 기록은 요청 자신의 핸들러 고루틴에서 동기로 끝나므로 핸들러보다 오래 사는 쓰기가 없다.
+// 종료와도 엇갈리지 않는다 — 이미 시작된 문장은 제 커넥션에서 끝나고 그 커넥션은 반납 시점에
+// 닫히며(database/sql의 DB.Close·putConn), 그 뒤에 도착한 것은 닫힌 DB 오류로 돌아와 원장의
+// best-effort 관례가 삼킨다. 어느 쪽도 프로세스보다 오래 사는 쓰기를 만들지 않는다.
+func fetchLedgerCtx(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(ctx), fetchLedgerBudget)
+}
+
+// recordFetchMiss — artifact 부재로 끝난 회수 한 건을 원장에 남긴다(D103 계약 3).
+// 부르는 쪽이 이미 store.ErrNotFound를 확인했고, 여기서 그 둘 중 **artifact 부재만** 가른다:
+// ReadRange의 artifact 부재와 readChunk의 chunk id 부재가 같은 센티넬을 쓰므로 errors.Is
+// 하나로는 안 갈리고, ArtifactHashByID는 artifact 부재에만 ErrNotFound를 낸다.
+// 귀속 인자가 false인 것은 "explicit이었다"가 아니다 — 아티팩트가 없어 물을 수 없다는 뜻이고,
+// 미해소 행은 그 값을 NULL로 남긴다(store.LedgerAppendFetch).
+// 판별 질의도 떼어 낸 ctx를 탄다(소견 F3): 취소된 ctx에서 그것은 ErrNotFound가 아니라 드라이버
+// 오류를 내므로, 여기서 요청 ctx를 쓰면 미해소 행은 삼켜지는 게 아니라 **아예 시도되지 않는다**.
+func recordFetchMiss(ctx context.Context, st *store.Store, artifactID, ms int64) {
+	lctx, cancel := fetchLedgerCtx(ctx)
+	defer cancel()
+	if _, hashErr := st.ArtifactHashByID(lctx, artifactID); errors.Is(hashErr, store.ErrNotFound) {
+		st.LedgerAppendFetch(lctx, 0, ms, 0, nil, false)
+	}
+}
+
+// recordFetchResolve — 해소된 회수 한 건을 원장에 남긴다.
+// D103 계약 2: 나이는 **회수 시점에 계산해 박는다** — 사후 계산은 아티팩트가 지워지면
+// 불가능하다. 시계와 범위는 D67 퍼지와 같다(hash 단위 max(sources.indexed_at)).
+// 소견 F4: **shadow 귀속 여부도 지금 박는다** — 같은 질의가 함께 내므로 왕복은 그대로
+// 하나이고, 나중에는 아티팩트가 없어 되물을 수 없다. explicit 아티팩트는 퍼지 대상이
+// 아니라 그 회수 나이가 창의 길이에 대해 아무 말도 하지 않는데, 표식이 없으면 그 회수가
+// D104의 채택 문턱을 채우고 분위수까지 지배한다.
+// 나이 조회 실패·소스 부재는 회수를 실패시키지 않는다 — 나이를 **미상(nil)**으로 두고
+// 행은 남긴다(소견 F6). 0으로 두면 같은 초에 회수한 행과 구분되지 않아 분포가 내려간다.
+// 조회도 기록도 떼어 낸 ctx를 탄다(소견 F3, 근거는 fetchLedgerCtx) — 요청 ctx를 쓰면 행이
+// 사라지고, 살아남은 행조차 나이도 귀속 표식도 없다.
+func recordFetchResolve(ctx context.Context, st *store.Store, artifactID int64, contentHash string, returned, ms int64) {
+	lctx, cancel := fetchLedgerCtx(ctx)
+	defer cancel()
+	var ageS *int64
+	var shadowOwned bool
+	if at, owned, ageErr := st.LastIndexedAtByHash(lctx, contentHash); ageErr == nil {
+		shadowOwned = owned
+		if at > 0 {
+			// 소견 F9: **음수 나이는 미상이다.** NTP 스텝·VM 재개·듀얼부팅이 벽시계를 뒤로
+			// 돌리면 스텝 이전에 포착된 소스의 indexed_at이 새 시계 기준으로 미래가 되어 이 뺄셈이
+			// 음수를 낸다. 그 값을 적으면 `ORDER BY artifact_age_s`에서 선두로 정렬돼 p50·p90을
+			// 끌어내리고, D104 행 5는 그 p90을 보존 창의 처방값으로 바꾼다 — 계측이 제 데이터가
+			// 지지하는 것보다 **짧은** 창을 처방한다.
+			// **0으로 클램프하지 않는 이유**: 0은 "방금 포착한 것을 같은 초에 회수했다"는 측정을
+			// 주장하는 값이고, 시계가 움직였다는 증거는 아티팩트가 젊다는 증거가 아니다. 그
+			// 거짓 표본은 여전히 분위수 모집단에 들어가 분포를 아래로 끌고, 게다가 D104의 착수
+			// 조건까지 채워 준다. 미상(nil)이면 fetchAgeBasis의 `artifact_age_s IS NOT NULL`이
+			// 그 행을 분위수에서도 착수 조건에서도 빼고(계측이 "못 쟀다"로 물러난다), 해소 계수는
+			// 그대로 남는다 — 바이트는 실제로 돌려줬으므로 그것은 참인 진술이다.
+			if age := time.Now().Unix() - at; age >= 0 {
 				ageS = &age
 			}
 		}
-		st.LedgerAppendFetch(ctx, jsonLen(out), time.Since(start).Milliseconds(), res.Artifact.ID, ageS, shadowOwned)
-		return nil, out, nil
-	})
+	}
+	st.LedgerAppendFetch(lctx, returned, ms, artifactID, ageS, shadowOwned)
 }
 
 // --- ctr_execute / ctr_execute_file (설계 v0.11 D58, Enable "exec" + 프로브 게이트) ---
