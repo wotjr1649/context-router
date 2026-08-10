@@ -218,6 +218,10 @@ func runStats(ctx context.Context, w io.Writer, args []string, storeRoot, projec
 // store.LedgerStats로 집계해 tool/calls/bytes_stored/bytes_returned/span(RFC3339) 표를
 // 출력한다. 합계 줄 끝에는 고정 문구 "bytes suppressed (local, 진단용)"를 붙인다 — 토큰·달러
 // 환산이나 절약률 주장은 여기 어디에도 없다(설계 §6).
+//
+// **집계가 실패해도 찍을 수 있는 것은 다 찍는다**(릴리스 패스 소견 F4) — 근거는 아래
+// LedgerStats 호출 자리의 주석에 있다. 실패는 그대로 오류로 반환하므로 종료 코드는 여전히
+// 0이 아니다.
 func runStatsLocal(w io.Writer, storeRoot, projectRoot string) error {
 	canon, err := ident.Canonicalize(projectRoot)
 	if err != nil {
@@ -227,9 +231,26 @@ func runStatsLocal(w io.Writer, storeRoot, projectRoot string) error {
 		return errors.New("stats: 프로젝트 식별 실패")
 	}
 	projDir := filepath.Join(storeRoot, "projects", canon.ProjectID)
-	stats, err := store.LedgerStats(projDir)
-	if err != nil {
-		return fmt.Errorf("stats: ledger 집계 실패: %w", err)
+	// ★ 릴리스 패스 소견 F4: **집계 실패로 명령 전체를 중단하지 않는다.** 종전에는 여기서 바로
+	// 반환해 헤더도 total도 회수 줄도 **한 줄도** 안 찍혔다. 도달 경로가 드물지 않다: `ledger.db`는
+	// 있는데 `ledger` 테이블이 없는 상태 — SQLite는 연결을 여는 순간 파일을 만들고 CREATE는 그
+	// 뒤에 도므로, 디스크가 차거나 busy_timeout을 넘긴 잠금이 그 CREATE만 떨어뜨리면 도달한다 —
+	// 에서 LedgerStats는 `no such table: ledger`로 죽지만 **LedgerFetchStats는 같은 상태를 오류
+	// 없이 LedgerOK=false로 낸다**(계약 7의 관용이 그 계단까지 덮는다). 즉 회수 줄은 낼 수 있는데
+	// 그 앞에서 죽고 있었고, 14일 측정 구간의 운영자는 D104 행 0(판정 불가)으로 가는 표식 대신
+	// 깨진 명령만 봤다.
+	//
+	// **저장소 쪽을 관용적으로 만드는 안은 기각됐다**(소유자 판정): 진짜 이상을 조용한 빈 결과로
+	// 바꾸는 것은 이 릴리스가 세운 원칙의 정확한 역이다. 그래서 고치는 자리가 호출부이고, 형태는
+	// "찍을 수 있는 것은 다 찍고 실패는 그대로 반환한다"다 — 침묵도 거짓 0도 만들지 않는다.
+	//
+	// **아래 LedgerFetchStats는 반대로 조기 반환을 유지한다.** F4가 지목한 해악은 "명령이 아무
+	// 것도 안 찍는다"이고 그것은 **먼저 도는** 읽기가 죽을 때만 생긴다 — 뒤의 읽기가 죽으면 표는
+	// 이미 찍혀 있고, 남는 것은 마지막 한 줄뿐이다. 두 자리의 처리가 다른 것은 실수가 아니라 이
+	// 비대칭 때문이다.
+	stats, statsErr := store.LedgerStats(projDir)
+	if statsErr != nil {
+		statsErr = fmt.Errorf("stats: ledger 집계 실패: %w", statsErr)
 	}
 
 	fmt.Fprintln(w, "tool\tcalls\tbytes_stored\tbytes_returned\tspan")
@@ -241,7 +262,8 @@ func runStatsLocal(w io.Writer, storeRoot, projectRoot string) error {
 		// 시작하지 않고, **총계에서 빠지는 것까지가 그 계약이다** — 하루 약 295행이면 그 총계를
 		// 훅이 지배한다. 이 릴리스 전 원장의 도구는 전부 `ctr_*`였으므로 이 제외는 총계의 뜻을
 		// 바꾸는 게 아니라 유지한다. **총계를 읽는 것은 이제 M6뿐이다**: D104의 채택 문턱은
-		// 총계가 아니라 아래 회수 줄의 `resolved + missed`를 읽는다(W2 소유자 판정).
+		// 총계가 아니라 아래 회수 줄의 `resolved_artifacts + missed`를 읽는다(W2 소유자 판정 +
+		// 소견 F7이 그 앞 항을 행 수에서 아티팩트 수로 옮겼다).
 		// 행 자체는 위에서 이미 찍었다 — 관측 채널은 잃지 않는다.
 		if !strings.HasPrefix(s.Tool, "ctr_") {
 			continue
@@ -250,10 +272,24 @@ func runStatsLocal(w io.Writer, storeRoot, projectRoot string) error {
 		totalStored += s.BytesStored
 		totalReturned += s.BytesReturned
 	}
-	fmt.Fprintf(w, "total\t%d\t%d\t%d\tbytes suppressed (local, 진단용)\n", totalCalls, totalStored, totalReturned)
+	// 총계의 세 칸도 표식을 탄다(소견 F4). 집계가 실패하면 위 루프가 **0바퀴** 돈 것이라 여기서
+	// 0을 찍는 순간 아무것도 못 읽은 원장이 "호출 0회"로 읽힌다 — 이 릴리스 패스의 지배적 결함
+	// 부류(못 잰 수를 0으로 찍는다) 그 자체이고, 회수 줄에 표식을 세운 것과 같은 이유다.
+	// 표식이 선 total 줄은 진단이기도 하다: **원장 파일이 아예 없는 정상 상태는 여기가 숫자 0**
+	// 이다(LedgerStats가 미존재를 오류 없는 빈 결과로 낸다). 두 상태는 회수 줄에서 똑같이
+	// `없음`이라, stdout만 보고 "아직 아무것도 안 썼다"와 "읽지 못했다"를 가르는 것이 이 줄이다.
+	total := func(v int64) string {
+		if statsErr != nil {
+			return "없음"
+		}
+		return strconv.FormatInt(v, 10)
+	}
+	fmt.Fprintf(w, "total\t%s\t%s\t%s\tbytes suppressed (local, 진단용)\n",
+		total(totalCalls), total(totalStored), total(totalReturned))
 
 	// D103 계약 9: 회수 실적 한 줄. D104의 착수 조건을 여기서 읽는다 —
-	// **`resolved + missed` 10건**(채택 문턱) · **`shadow_artifacts` 30건 또는 `missed` 5건**.
+	// **`resolved_artifacts + missed` 10건**(채택 문턱, 소견 F7이 앞 항을 행 수에서 아티팩트
+	// 수로 옮겼다) · **`shadow_artifacts` 30건 또는 `missed` 5건**.
 	// 조건이 필드 이름 그대로인 것이 계약이다: 문턱이 읽는 수와 사람이 보는 수가 갈리지 않는다.
 	// 총 호출을 같은 줄에 병기하는 이유: 이 릴리스부터 위 표의 ctr_fetch calls가 뜻을 바꾸고
 	// (전에는 성공만, 이제 성공 + artifact 부재) 그 수가 레거시까지 품기 때문이다 —
@@ -262,22 +298,29 @@ func runStatsLocal(w io.Writer, storeRoot, projectRoot string) error {
 	// 결과이므로 여기서 삼킬 것이 없고, 삼키면 권한·손상 실패가 "데이터 없음"으로 읽힌다.
 	fs, err := store.LedgerFetchStats(projDir)
 	if err != nil {
-		return fmt.Errorf("stats: 회수 실적 집계 실패: %w", err)
+		// 조기 반환을 유지하는 근거는 위 LedgerStats 자리의 주석 마지막 문단이다. statsErr를
+		// 함께 나르는 이유: 둘 다 실패했는데 하나만 보고하면 남은 하나가 조용히 사라진다.
+		return errors.Join(statsErr, fmt.Errorf("stats: 회수 실적 집계 실패: %w", err))
 	}
 	// ★ **못 잰 수는 0으로 찍지 않는다**(릴리스 패스 M3이 doctor [14] free/live에서 세운 관례).
-	// ledger는 user_version이 없는 best-effort 보조 DB라 세 ALTER가 아직 안 돈 원장을 stats가
+	// ledger는 스키마 버전을 두지 않는 best-effort 보조 DB라 세 ALTER가 아직 안 돈 원장을 stats가
 	// 먼저 만나는 상태가 정상적으로 도달 가능하고(D103 계약 7), 그 계단에서 0은 측정값이
 	// 아니다. 여기서는 doctor보다 무겁다 — **D104의 착수 조건이 shadow_artifacts를 읽는다.**
 	// 표식 없이 그 0이 숫자로 찍히면 **결정표가 아무것도 재지 않은 원장을 관측으로 받는다**:
-	// 여섯 수가 다 숫자라 행 0이 발화하지 못하고 `resolved + missed = 0`이라 행 2로 떨어진다.
+	// 칸이 전부 숫자라 행 0이 발화하지 못하고 `resolved_artifacts + missed = 0`이라 행 2로 떨어진다.
 	// 창 판단이 닫히지는 않지만 **처방이 틀린다** — 행 2는 "채택의 문제다"라고 말하는데 할 일은
 	// 채택을 늘리는 것이 아니라 **바이너리를 가는 것**이고, 그것을 모르면 다음 14일도 아무것도
 	// 재지 않는다. 표식이 그 오독을 행 0(판정 불가)에서 끊는다.
-	// 계단이 셋이라 표식의 **자리**가 곧 계단이다(①은 calls부터, ②는 legacy부터, ③은
-	// shadow_rows부터 미이관).
+	// 스키마 계단이 셋이라 표식의 **자리**가 곧 계단이다(①은 calls부터, ②는 legacy부터, ③은
+	// shadow_rows부터 미이관). **예외가 하나 있고 그것이 의도다**: legacy_after_migrate는
+	// MigrateMarkOK를 타는데 그 축은 계단과 독립이라, 왼쪽에서 오른쪽으로 이어지는 접두 모양이
+	// 그 칸 하나에서만 끊길 수 있다(열은 다 있는데 워터마크가 없는 원장). 아래 그 칸의 설명 참조.
 	// 말이 둘인 이유: 왜 못 쟀는지가 다르고, 읽는 사람이 할 일도 다르다. `미이관`은 "새
-	// 바이너리로 스토어를 한 번 열면 채워진다", `없음`은 "원장 자체가 없다 — 아직 아무것도
-	// 기록된 적이 없다"다.
+	// 바이너리로 스토어를 한 번 열면 채워진다", `없음`은 "잴 것이 아직 없다 — 원장 자체가 없거나
+	// 읽지 못했다"다. 뒤의 둘(파일 부재 ↔ 소견 F4의 테이블 부재)은 위 total 줄이 갈라 준다.
+	// **셋째 말을 만들지 않은 것이 판단이다**: D104는 숫자가 아닌 칸이 하나라도 있으면 행 0
+	// (판정 불가)으로 가고 그 처방은 어느 쪽이든 같다 — "이 원장으로는 판정하지 않는다".
+	// 말을 늘리면 결정표가 읽지 않는 구분이 줄에만 늘어난다.
 	mark := "미이관"
 	if !fs.LedgerOK {
 		mark = "없음"
@@ -299,21 +342,45 @@ func runStatsLocal(w io.Writer, storeRoot, projectRoot string) error {
 		}
 		return strconv.FormatInt(v, 10)
 	}
-	// 한 줄에 넷을 병기하는 이유가 각각 다르다:
+	// 병기하는 수마다 이유가 다르다. **행을 세는 칸 바로 옆에 그 부분집합을 놓는 것**이 이 줄의
+	// 배치 규칙이다 — 포함 관계가 눈에 보여야 두 수를 뒤바꿔 읽지 않는다.
 	//  - legacy: 이관 전 행은 해소에도 미해소에도 안 드는데 calls에는 든다 — 병기하지 않으면
 	//    calls가 결과의 분모로 읽힌다(소견 F9). 라이브 원장은 `calls=49` `[실측]`이고, 이관되면
 	//    그 49가 전부 legacy로 간다 `[추정]` — 세 상태 질의는 아직 한 번도 돌지 않았다(설치본이
 	//    ALTER보다 앞서고 이 경로는 원장을 read-only로만 연다). 실측된 줄은 `legacy=미이관`이었다.
+	//  - legacy_after_migrate: 그 legacy 중 **이관 워터마크 뒤에 쓰인** 행(소견 F2). **이 줄에서
+	//    가장 값비싼 칸이다** — 원장은 이관됐는데 `ctr_fetch`를 쓰는 것은 여전히 옛 서버인 상태를
+	//    이관 전 역사(정상)와 가른다. 그 상태에서는 나머지 칸이 다 숫자라 결정표가 행 2("채택의
+	//    문제")로 떨어지는데, 할 일은 채택을 늘리는 것이 아니라 **서버를 다시 띄우는 것**이다.
+	//    **이 수는 누적이고 지워지지 않는다** — 서버를 다시 띄워도 더 늘지 않을 뿐 0으로 돌아
+	//    가지 않는다. 그것이 옳다: 그 행들이 쌓인 구간의 회수는 실제로 안 재졌고, D104의 14일은
+	//    그만큼 오염됐다. 불리언이 아니라 **수**인 이유도 그것이다(크기를 옆의 수들과 대 볼 수
+	//    있다). 그래서 이 칸이 0이 아닌 것을 보고 서버를 재시작한 사람은, 내일 같은 수를 다시
+	//    보더라도 그것을 "고쳐지지 않았다"로 읽으면 안 된다 — 늘어나는지를 봐야 한다.
+	//    표식 축이 다른 것도 그래서다: MigrateMarkOK는 스키마 계단(LedgerOK ⊇ OutcomeOK ⊇
+	//    ShadowOK)과 **독립**이라 열이 다 있어도 false일 수 있다. 그 경우의 `미이관`에는 두 번째
+	//    원인이 있다 — 열은 붙었는데 워터마크가 없는 원장(이 브랜치의 앞선 빌드)은 바이너리를
+	//    갈아도 표식이 채워지지 않고 그 축에서 영구히 판정 불가다(markLedgerMigrated 참조).
+	//  - resolved_artifacts: 그 해소의 distinct artifact 수이고 **D104 채택 문턱이 읽는 수**다
+	//    (소견 F7). ctr_fetch는 기본 16 KiB까지만 돌려주므로 아티팩트 하나를 끝까지 읽는 것이
+	//    여러 호출이다 — 행으로 세면 아티팩트 하나를 한 번 읽은 14일이 문턱 10을 통과한다.
+	//    `resolved`와 나란히 놓아야 그 페이징 배수가 보인다. 표식은 **OutcomeOK를 그대로 탄다**:
+	//    같은 SELECT의 한 칸이라 새 축이 아니다.
 	//  - shadow_rows: 나이 분위수가 실제로 선 모집단(shadow 귀속 해소 행)이다. explicit
 	//    아티팩트는 창이 손대지 않으므로 그 나이는 창의 길이에 답하지 않는다(소견 F4).
-	//  - shadow_artifacts: 그 모집단의 distinct artifact 수이고 **D104 착수 조건이 읽는 수**다.
-	//    shadow_rows와 나란히 봐야 페이징 집중(한 아티팩트가 행 수를 채운 상태)이 보인다(소견 F5).
-	fmt.Fprintf(w, "fetch\tcalls=%s\tlegacy=%s\tresolved=%s\tmissed=%s\tshadow_rows=%s\tshadow_artifacts=%s\tage_s p50=%s p90=%s max=%s\n",
-		num(fs.Calls, fs.LedgerOK), num(fs.Legacy, fs.OutcomeOK),
-		num(fs.Resolved, fs.OutcomeOK), num(fs.Missed, fs.OutcomeOK),
+	//    **어떤 판정도 이 수를 읽지 않는다**(분위수의 N도 착수 조건도 shadow_artifacts다) —
+	//    그래도 남기는 이유는 이것 하나다: 옆의 아티팩트 수와 나란히 놓여야 사람이 페이징 집중을
+	//    본다. 판정이 안 읽는다고 "정리"하면 그 관측 채널이 사라진다.
+	//  - shadow_artifacts: 그 모집단의 distinct artifact 수이고 **D104 착수 조건이 읽는 수**다
+	//    (소견 F5).
+	fmt.Fprintf(w, "fetch\tcalls=%s\tlegacy=%s\tlegacy_after_migrate=%s\tresolved=%s\tresolved_artifacts=%s\tmissed=%s\tshadow_rows=%s\tshadow_artifacts=%s\tage_s p50=%s p90=%s max=%s\n",
+		num(fs.Calls, fs.LedgerOK),
+		num(fs.Legacy, fs.OutcomeOK), num(fs.LegacyAfterMigrate, fs.MigrateMarkOK),
+		num(fs.Resolved, fs.OutcomeOK), num(fs.ResolvedArtifacts, fs.OutcomeOK),
+		num(fs.Missed, fs.OutcomeOK),
 		num(fs.ShadowResolved, fs.ShadowOK), num(fs.ShadowArtifacts, fs.ShadowOK),
 		age(fs.AgeP50), age(fs.AgeP90), age(fs.AgeMax))
-	return nil
+	return statsErr
 }
 
 // providerUsageLine: Claude Code transcript 한 줄 중 관심 필드만 취한다(그 외 필드는 무시,
