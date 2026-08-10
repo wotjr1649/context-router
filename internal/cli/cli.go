@@ -237,7 +237,7 @@ func runStatsLocal(w io.Writer, storeRoot, projectRoot string) error {
 	for _, s := range stats {
 		span := time.Unix(s.FirstTS, 0).UTC().Format(time.RFC3339) + "~" + time.Unix(s.LastTS, 0).UTC().Format(time.RFC3339)
 		fmt.Fprintf(w, "%s\t%d\t%d\t%d\t%s\n", s.Tool, s.Calls, s.BytesStored, s.BytesReturned, span)
-		// D103 계약 4 후반부(릴리스 리뷰 W1): 훅 분모 행(`hook:shadow`)은 이름이 `ctr_`로
+		// D103 계약 4 후반부(릴리스 리뷰 W1): 훅 포착 활동량 행(`hook:shadow`)은 이름이 `ctr_`로
 		// 시작하지 않고, **총계에서 빠지는 것까지가 그 계약이다** — 하루 약 295행이면 그 총계를
 		// 훅이 지배한다. 이 릴리스 전 원장의 도구는 전부 `ctr_*`였으므로 이 제외는 총계의 뜻을
 		// 바꾸는 게 아니라 유지한다. **총계를 읽는 것은 이제 M6뿐이다**: D104의 채택 문턱은
@@ -297,7 +297,9 @@ func runStatsLocal(w io.Writer, storeRoot, projectRoot string) error {
 	}
 	// 한 줄에 넷을 병기하는 이유가 각각 다르다:
 	//  - legacy: 이관 전 행은 해소에도 미해소에도 안 드는데 calls에는 든다 — 병기하지 않으면
-	//    calls가 결과의 분모로 읽힌다(소견 F9). 배포 시점 실측이 calls=49 legacy=49였다.
+	//    calls가 결과의 분모로 읽힌다(소견 F9). 라이브 원장은 `calls=49` `[실측]`이고, 이관되면
+	//    그 49가 전부 legacy로 간다 `[추정]` — 세 상태 질의는 아직 한 번도 돌지 않았다(설치본이
+	//    ALTER보다 앞서고 이 경로는 원장을 read-only로만 연다). 실측된 줄은 `legacy=미이관`이었다.
 	//  - shadow_rows: 나이 분위수가 실제로 선 모집단(shadow 귀속 해소 행)이다. explicit
 	//    아티팩트는 창이 손대지 않으므로 그 나이는 창의 길이에 답하지 않는다(소견 F4).
 	//  - shadow_artifacts: 그 모집단의 distinct artifact 수이고 **D104 착수 조건이 읽는 수**다.

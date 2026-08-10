@@ -1997,7 +1997,7 @@ func TestStatsRendersUnmeasuredTiers(t *testing.T) {
 }
 
 // TestStatsTotalExcludesNonCtrRows: `total` 줄은 **`ctr_` 접두 도구만** 합산한다(릴리스 리뷰
-// W1). 훅 분모 행(`hook:shadow`)은 하루 약 295행이라 그대로 합치면 총계를 지배한다 — 이
+// W1). 훅 포착 활동량 행(`hook:shadow`)은 하루 약 295행이라 그대로 합치면 총계를 지배한다 — 이
 // 릴리스 전 원장의 도구는 전부 `ctr_*`였으므로 제외가 총계의 뜻을 **유지**한다. 총계를 읽는
 // 것은 이제 M6뿐이고 D104의 채택 문턱은 `resolved + missed`를 읽는다(W2) — 그래도 이 제외가
 // 필요한 이유는 그 총계가 M6에게 여전히 의미를 가져야 하기 때문이다.
@@ -2015,7 +2015,7 @@ func TestStatsTotalExcludesNonCtrRows(t *testing.T) {
 	}
 	st.LedgerAppend("ctr_search", 10, 20, 1)
 	st.LedgerAppend("ctr_search", 10, 20, 1)
-	for range 5 { // 훅 분모 — 실전에서는 하루 약 295행
+	for range 5 { // 훅 포착 활동량 행 — 실전에서는 하루 약 295행
 		st.LedgerAppend("hook:shadow", 1000, 0, 1)
 	}
 	if err := st.Close(); err != nil {
