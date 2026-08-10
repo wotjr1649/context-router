@@ -102,7 +102,7 @@ func shadowCapture(ctx context.Context, ad *session.AppendDB, in hookInput, dir,
 	// D103 계약 4: **포착 활동량의 눈금**이다. **여기서 "분모"라는 옛 말을 쓰지 않는다**
 	// (소견 F8): 세는 것은 포착 *사건*이지 저장된 객체가 아니고(내용 주소 중복 재포착에도
 	// ingest.Run이 Indexed=1을 낸다 — 새 객체 없이 이 행만 하나 더 남는다), **회수 결과의
-	// 분모는 회수 줄의 `resolved + missed`다.** 이 행이 답하는 것은 "얼마나 포착되는가"이고,
+	// 분모는 회수 줄의 `resolved_artifacts + missed`다.** 이 행이 답하는 것은 "얼마나 포착되는가"이고,
 	// 창의 길이가 묻는 "포착된 것이 회수되는가"의 분모는 회수 행 쪽에 있다.
 	// 성공한 ingest 뒤에만 쓴다 — 임계 미달·denylist·바이너리·스토어 열기 실패로 끝난 호출은
 	// 저장되지 않았으므로 회수 대상이 아니다.
@@ -115,8 +115,9 @@ func shadowCapture(ctx context.Context, ad *session.AppendDB, in hookInput, dir,
 	// busy_timeout(5000ms)이 훅 총예산(2000ms)보다 커서, 겹친 훅에서 ctx 없이 쓰면 예산 밖에서
 	// 블록된다. best-effort라 실패해도 포착 자체와 훅의 fail-open 성질은 바뀌지 않는다.
 	// 이름이 ctr_로 시작하지 않는 것도 계약이고, 이름만으로는 부족해 `stats`가 이 행을 총계
-	// 누적에서 실제로 뺀다(W1). D104의 채택 문턱은 총계도 이 행도 아닌 `resolved + missed`를
-	// 읽는다(W2) — **이 행을 읽는 판정 규칙은 하나도 없다.**
+	// 누적에서 실제로 뺀다(W1). D104의 채택 문턱은 총계도 이 행도 아닌
+	// `resolved_artifacts + missed`를 읽는다(W2 + 소견 F7이 앞 항을 행 수에서 아티팩트 수로
+	// 옮겼다) — **이 행을 읽는 판정 규칙은 하나도 없다.**
 	st.LedgerAppendContext(ctx, "hook:shadow", int64(size), 0, time.Since(start).Milliseconds())
 }
 

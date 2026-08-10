@@ -1365,9 +1365,11 @@ func TestLedgerFetchStatsToleratesOldSchema(t *testing.T) {
 	}
 }
 
-// TestLedgerFetchStatsPartialMigration: 두 ALTER는 독립이라 **하나만 성공한 상태가 도달
-// 가능하다**. 그 상태에서 분위수 질의를 돌리면 경성 오류가 나므로, 열 **둘 다** 있을 때만 새
-// 질의를 돌리고 아니면 이관 전과 같은 빈 값 경로를 탄다(설계 v0.20 D103 계약 7).
+// TestLedgerFetchStatsPartialMigration: 세 ALTER는 서로 독립이라 **일부만 성공한 상태가 도달
+// 가능하다**. 그 상태에서 없는 열을 지명하면 경성 오류가 나므로, 읽는 쪽은 계단 셋으로 퇴화한다
+// (설계 v0.20 D103 계약 7): ①`artifact_id`·`artifact_age_s` 중 하나라도 없으면 총 호출만,
+// ②둘 다 있고 `shadow_owned`가 없으면 해소·미해소까지, ③셋 다 있어야 귀속·분위수까지.
+// 이 픽스처는 ①(나이 열만 없다)을 세운다 — ②는 TestLedgerFetchStatsShadowColumnMissing이다.
 func TestLedgerFetchStatsPartialMigration(t *testing.T) {
 	dir := t.TempDir()
 	db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(filepath.Join(dir, "ledger.db")))
@@ -1754,8 +1756,9 @@ const oldWriterFetchRow = `INSERT INTO ledger(ts,tool,bytes_stored,bytes_returne
 
 // TestLedgerWatermarkSurvivesLaterOpens — 릴리스 패스 소견 F2의 핵심. 세션이 열린 채 새
 // 바이너리를 깔면 훅이 원장을 이관하는 동안 **옛 서버가 ctr_fetch의 유일한 기록자**로 남는다.
-// 그 행들은 레거시로 읽히므로 여섯 수가 다 숫자로 찍히고, 해소·미해소가 0이라 결정표가 행 2
-// ("채택의 문제")로 떨어진다 — 할 일은 서버를 다시 띄우는 것인데.
+// 그 행들은 레거시로 읽히므로 표식이 하나도 서지 않고(열은 다 있다) 나머지 칸이 다 숫자로
+// 찍히는데, 해소·미해소가 0이라 결정표가 행 2("채택의 문제")로 떨어진다 — 할 일은 서버를 다시
+// 띄우는 것인데. 이 수가 그 상태를 받는 행 0b를 발화시킨다.
 //
 // **그리고 훅은 하루 약 295번 뛴다.** 이관이 돌 때마다 워터마크를 다시 찍으면 그다음 훅이
 // 워터마크를 옛 서버의 행들 **위로** 올려 경보를 지운다 — F2 시나리오의 뒤쪽 절반이 앞쪽
@@ -2393,7 +2396,9 @@ func TestLedgerFetchStatsWeighsAgeByArtifact(t *testing.T) {
 }
 
 // TestLedgerFetchStatsCountsDistinctResolvedArtifacts — 릴리스 패스 소견 F7. D104의 **채택
-// 문턱**(`resolved + missed` 10건)도 행을 센다. 164 KiB 아티팩트 하나를 끝까지 읽으면 16 KiB
+// 문턱**은 10건인데, 그 앞 항이 `resolved`(행)였을 때는 행을 셌다 — 지금 계약은
+// `resolved_artifacts + missed`이고 이 테스트가 그 앞 항을 고정한다.
+// 164 KiB 아티팩트 하나를 끝까지 읽으면 16 KiB
 // 상한 때문에 열 번 불리고 해소 행 열 개가 남는다 — 아티팩트 **하나를 한 번** 읽은 14일,
 // 즉 도구가 사실상 안 쓰인 구간이 문턱을 통과해 행 2를 건너뛰고 행 3("이 구간의 데이터로는
 // 창을 늘리지 않는다")으로 떨어진다. 문턱이 막으려던 바로 그 오독이다.
@@ -2495,7 +2500,8 @@ func TestLedgerFetchStatsReadsOneSnapshot(t *testing.T) {
 	}
 }
 
-// TestLedgerFetchStatsShadowColumnMissing: 세 번째 ALTER 이전 원장(두 열만 있음)에서도
+// TestLedgerFetchStatsShadowColumnMissing: 세 번째 ALTER 이전 원장(세 열 중 둘만 있음 —
+// 계약 7의 계단 ②)에서도
 // 실패하지 않는다 — 해소·미해소는 읽히되 귀속으로 제한한 수치는 낼 수 없으므로 0이다
 // (계약 7의 부분 이관 관용을 셋째 열로 확장한 것).
 func TestLedgerFetchStatsShadowColumnMissing(t *testing.T) {
@@ -2529,8 +2535,8 @@ func TestLedgerFetchStatsShadowColumnMissing(t *testing.T) {
 	if fs.ShadowResolved != 0 || fs.AgeMax != 0 {
 		t.Fatalf("귀속 열 없이 분위수를 냈다: %+v", fs)
 	}
-	// **D104 착수 조건이 읽는 수가 이 계단에서 0이다.** 측정값이 아니라는 표식이 없으면 여섯
-	// 수가 다 숫자로 보여 결정표 행 0이 발화하지 못하고 행 2로 떨어진다 — 창 판단은 열려 있지만
+	// **D104 착수 조건이 읽는 수가 이 계단에서 0이다.** 측정값이 아니라는 표식이 없으면 회수
+	// 줄의 칸이 다 숫자로 보여 결정표 행 0이 발화하지 못하고 행 2로 떨어진다 — 창 판단은 열려 있지만
 	// 처방이 "채택을 늘려라"가 되고, 정작 할 일인 바이너리 교체는 지시되지 않는다.
 	if !fs.LedgerOK || !fs.OutcomeOK {
 		t.Fatalf("총 호출·해소는 읽었는데 표식이 false: %+v", fs)
