@@ -89,15 +89,6 @@ func shadowCapture(ctx context.Context, ad *session.AppendDB, in hookInput, dir,
 		return
 	}
 
-	// D103 계약 4: 회수율의 **분모**다. 성공한 ingest 뒤에만 쓴다 — 임계 미달·denylist·
-	// 바이너리·스토어 열기 실패로 끝난 호출은 저장되지 않았으므로 회수 대상이 아니다.
-	// 훅은 writable로 스토어를 열므로(위 OpenContext의 readOnly=false) ledger 연결이 이미
-	// 있다 — 지금까지 쓰지 않았을 뿐이다. ctx를 넘기는 이유는 계약 8: ledger.db의
-	// busy_timeout(5000ms)이 훅 총예산(2000ms)보다 커서, 겹친 훅에서 ctx 없이 쓰면 예산 밖에서
-	// 블록된다. best-effort라 실패해도 포착 자체와 훅의 fail-open 성질은 바뀌지 않는다.
-	// 이름이 ctr_로 시작하지 않는 것도 계약이다 — D104의 채택 문턱은 ctr_* 행만 센다.
-	st.LedgerAppendContext(ctx, "hook:shadow", int64(size), 0, time.Since(start).Milliseconds())
-
 	ref := "artifact://" + external + "/sha256-" + rep.Hash // 문자열 조립만(url.Parse 금지, §5)
 	shadowAppend(ctx, ad, dir, external, in.HookEventName, in.ToolName, session.Event{
 		Type: "artifact_created", Summary: summaryLine(in.ToolName, "shadow artifact"),
@@ -107,6 +98,19 @@ func shadowCapture(ctx context.Context, ad *session.AppendDB, in hookInput, dir,
 		Type: "tool_result_summary", Summary: summaryLine(in.ToolName, strconv.Itoa(size)+"B"),
 		ArtifactRefs: []string{ref},
 	})
+
+	// D103 계약 4: 회수율의 **분모**다. 성공한 ingest 뒤에만 쓴다 — 임계 미달·denylist·
+	// 바이너리·스토어 열기 실패로 끝난 호출은 저장되지 않았으므로 회수 대상이 아니다.
+	// **위 두 shadowAppend 다음이 자리다**(릴리스 리뷰): 셋이 같은 2000 ms 예산을 나눠 쓰는데
+	// 이 행은 진단이고 그 둘은 모델이 실제로 보는 산출이다 — 예산이 쪼들릴 때 굶어야 하는 쪽이
+	// 진단이다. ingest 실패 조기 반환은 여전히 이 줄보다 앞이므로 "성공한 ingest 뒤에만"은
+	// 그대로다(TestShadowCaptureRecordsLedgerRow ③이 그 불변을 고정한다).
+	// 훅은 writable로 스토어를 열므로(위 OpenContext의 readOnly=false) ledger 연결이 이미
+	// 있다 — 지금까지 쓰지 않았을 뿐이다. ctx를 넘기는 이유는 계약 8: ledger.db의
+	// busy_timeout(5000ms)이 훅 총예산(2000ms)보다 커서, 겹친 훅에서 ctx 없이 쓰면 예산 밖에서
+	// 블록된다. best-effort라 실패해도 포착 자체와 훅의 fail-open 성질은 바뀌지 않는다.
+	// 이름이 ctr_로 시작하지 않는 것도 계약이다 — D104의 채택 문턱은 ctr_* 행만 센다.
+	st.LedgerAppendContext(ctx, "hook:shadow", int64(size), 0, time.Since(start).Milliseconds())
 }
 
 // shadowInputDenied: tool_input의 파일 경로(file_path 우선, 없으면 notebook_path)가 secret 파일명
