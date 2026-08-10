@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -1209,8 +1210,15 @@ func LedgerStats(dir string) ([]ToolStat, error) {
 // 수다(소견 F5) — ctr_fetch는 기본 16 KiB까지만 돌려주므로 아티팩트 하나가 여러 행이 되고,
 // 행으로 세면 페이징 한 번이 조건을 채운다. 둘을 나란히 내면 그 집중이 보인다.
 //
-// ★ 세 `*OK`는 **어느 수가 측정값인가**를 나른다(SizeStat.PageStatsOK와 같은 관례, 릴리스
-// 패스 M3). ledger는 user_version이 없는 best-effort 보조 DB라 세 ALTER가 **아직 안 돈 원장을
+// LegacyAfterMigrate는 그 Legacy 중 **이관 워터마크 뒤에 쓰인** 행이고, 릴리스 패스 소견 F2가
+// 요구한 관측이다 — 세션이 열린 채 새 바이너리를 깔면 훅이 원장을 이관하는 동안 **옛 서버가
+// ctr_fetch의 유일한 기록자**로 남아 다섯 열만 적는다. 그 행은 레거시로 읽히므로 여섯 수가 다
+// 숫자로 찍히고, 해소·미해소가 0이라 결정표가 행 2("채택의 문제")로 떨어진다 — 할 일은 채택을
+// 늘리는 게 아니라 서버를 다시 띄우는 것인데. 이 수가 그 상태를 이관 전 역사(정상)와 가른다:
+// 역사는 전부 워터마크 **앞**이고 옛 기록자의 행은 전부 **뒤**다. 자세한 것은 markLedgerMigrated.
+//
+// ★ `*OK` 넷은 **어느 수가 측정값인가**를 나른다(SizeStat.PageStatsOK와 같은 관례, 릴리스
+// 패스 M3). ledger는 스키마 버전을 두지 않는 best-effort 보조 DB라 세 ALTER가 **아직 안 돈 원장을
 // 읽는 상태가 정상적으로 도달 가능**하고(계약 7), 그때 위 수들은 0이 아니라 **못 잰 것**이다.
 // 0으로 렌더하면 결정표가 **아무것도 재지 않은 원장을 관측으로 받는다**: 여섯 수가 다 숫자라
 // 행 0이 발화하지 못하고 ShadowArtifacts=0이 아니라 `Resolved + Missed = 0`이 행 2로 데려간다.
@@ -1218,10 +1226,13 @@ func LedgerStats(dir string) ([]ToolStat, error) {
 // 바이너리를 가는 것이고, 그것을 모르면 다음 14일도 아무것도 재지 않는다.
 // 그래서 D104는 상태가 셋이다: 충족·불충족, 그리고 **판정 불가**(결정표 행 0 — 숫자가 아닌
 // 칸이 하나라도 있으면 그 원장으로는 조건을 판정하지 않는다).
-// 계단은 셋이고 단조다: LedgerOK ⊇ OutcomeOK ⊇ ShadowOK.
+// 스키마 계단은 셋이고 단조다: LedgerOK ⊇ OutcomeOK ⊇ ShadowOK. MigrateMarkOK는 그 사다리와
+// **별개 축**이다 — 열이 다 있어도 워터마크가 없을 수 있고(계약 7의 열 관용과 같은 이유로
+// 정상적으로 도달 가능하다), 그때 LegacyAfterMigrate의 0은 "없다"가 아니라 "못 잼"이다.
 type FetchStat struct {
 	Calls, Legacy          int64
 	Resolved, Missed       int64
+	LegacyAfterMigrate     int64
 	ShadowResolved         int64
 	ShadowArtifacts        int64
 	AgeP50, AgeP90, AgeMax int64
@@ -1229,6 +1240,11 @@ type FetchStat struct {
 	LedgerOK  bool // ledger 테이블이 있다 → Calls가 측정값 (false면 ledger.db 부재도 포함)
 	OutcomeOK bool // artifact_id·artifact_age_s가 있다 → Resolved/Missed/Legacy가 측정값
 	ShadowOK  bool // shadow_owned가 있다 → ShadowResolved/ShadowArtifacts·Age*가 측정값
+	// MigrateMarkOK — 이관 워터마크(ledger.db의 user_version)를 읽었다 → LegacyAfterMigrate가
+	// 측정값. false면 **판정 불가**이지 "이관 뒤 레거시 없음"이 아니다: 이 브랜치의 앞선 빌드가
+	// 열만 붙이고 표식은 안 남긴 원장이 그렇고, 그 원장의 레거시 행이 이관 앞인지 뒤인지는
+	// 되물을 방법이 없다. 그 상태에서 전부 경보로 찍으면 정상 역사가 경보가 된다.
+	MigrateMarkOK bool
 }
 
 // fetchAgeBasis — 나이 분위수와 D104 착수 조건이 **함께** 보는 모집단의 술어. 두 문장이 이
@@ -1291,6 +1307,7 @@ func migrateLedger(l *sql.DB) map[string]bool {
 	if len(cols) == 0 {
 		return cols // ledger 테이블 자체가 없다(위 CREATE가 이미 경고를 냈다) — 붙일 곳이 없다
 	}
+	added := false
 	for _, c := range ledgerFetchColumns {
 		if cols[c] {
 			continue
@@ -1300,8 +1317,70 @@ func migrateLedger(l *sql.DB) map[string]bool {
 			continue
 		}
 		cols[c] = true
+		added = true
+	}
+	// 이관 워터마크는 **열을 실제로 붙였을 때만** 찍는다(소견 F2) — 이 함수는 하루 약 295회의
+	// 훅 포착 + 기동마다 도는데, 이관이 아닌데 찍으면 그다음 훅이 워터마크를 옛 기록자의 행
+	// 위로 올려 경보를 지운다. 덮어쓰기 금지는 markLedgerMigrated 안에 있다(부분 이관이 나중에
+	// 완성되면 이 조건이 두 번 참이 되기 때문이다).
+	if added {
+		markLedgerMigrated(l)
 	}
 	return cols
+}
+
+// markLedgerMigrated — 이관 워터마크를 ledger.db의 `user_version`에 **딱 한 번** 찍는다.
+// 값의 뜻은 "이관된 기록자가 낼 수 있는 첫 행 id"(= max(id)+1)이고, 읽는 쪽은 `id >= mark`인
+// 레거시 ctr_fetch 행을 **이관 뒤에 쓰인 것**으로 센다(FetchStat.LegacyAfterMigrate, 소견 F2).
+//
+// **왜 앵커가 필요한가.** 이관 전 역사(레거시 행)는 정상 상태이고 옛 기록자가 지금 남기는 행도
+// 레거시다 — 둘을 가르려면 "이관이 언제였나"를 어딘가에 적어 둘 수밖에 없다. 그리고 그 앵커는
+// 행에서 유도할 수 없다: F2 시나리오에서는 새 열에 값이 든 행이 **0개**라 유도할 재료가 없다.
+//
+// **왜 `user_version`인가.** 앵커가 그것이 재는 행들과 **같은 파일 안에** 있어야 한다 — 별도
+// 스탬프 파일은 백업 복원·체크아웃이 둘을 갈라놓아 경보를 죽이거나 지어낸다. 원장 안의 마커
+// 행은 `LedgerStats`의 도구 표와 총계에 그대로 새어 나간다. 시각이 아니라 id를 적는 이유는
+// 시계 역행·복원 mtime이 이 판정에 못 들어오게 하기 위해서다.
+//
+// **왜 max(id)+1인가.** 빈 원장의 max(id)=0이 "안 찍힘"의 0과 구분되지 않는다. +1이면 찍힌 값이
+// 절대 0이 아니므로 `user_version > 0`이 곧 "찍혔다"이고, 그래서 비교가 `>=`다.
+//
+// **두 조건이 다 필요하다.** ① 부르는 쪽이 **열을 실제로 붙였을 때만** 부른다(migrateLedger) —
+// 훅은 하루 약 295번 뛰고, 이관이 아닌데 찍으면 그다음 훅이 워터마크를 옛 기록자의 행 위로
+// 올려 경보를 지운다. ② 그런데 부분 이관이 나중에 완성되면 ①이 **두 번** 참이 되므로, 이미
+// 값이 있으면 절대 덮어쓰지 않는다. 늦게 찍힌 워터마크는 그 사이의 행을 "이관 전"으로 만든다.
+// 그 결과 열만 붙고 표식이 없는 원장(이 브랜치의 앞선 빌드)이 남는데, 그것은 **판정 불가**로
+// 정확히 퇴화한다 — 뒤늦게 찍어 넣는 것보다 정직하다.
+//
+// **다운그레이드는 경보가 맞다.** v0.19.1로 되돌리면 그 바이너리의 ctr_fetch 기록이 워터마크
+// 위의 레거시 행으로 쌓여 경보가 뜬다. 거짓 양성이 아니라 정확한 진술이다 — 그 기간의 회수는
+// 실제로 안 재졌다. 나중에 이것을 "고치지" 말 것.
+//
+// 실패는 셋 다 경고 한 줄이고 오류를 반환하지 않는다(원장 전체가 best-effort). 못 찍힌 결과는
+// 위의 판정 불가로 떨어진다. **int32를 넘으면 SQLite가 조용히 0으로 자른다** `[실측 — 번들
+// 드라이버, 2147483648을 쓰고 읽으면 0]`: 하루 약 300행이면 2^31까지 19,600년이고, 잘린 0은
+// "안 찍힘"이라 **경보가 안 뜨는 쪽**으로 퇴화한다(거짓 양성이 아니다).
+//
+// ★ 이 저장소에서 **값을 문자열로 끼워 넣는 유일한 SQL**이다. `PRAGMA user_version = ?`가
+// 파라미터 바인딩을 거부하기 때문이고 `[실측 — near "?": syntax error]`, 안전한 이유는 값의
+// 출처다: 바로 위 줄에서 DB가 낸 int64 max(id)이지 외부 입력이 아니며 strconv가 숫자만 낸다.
+func markLedgerMigrated(l *sql.DB) {
+	var cur int64
+	if err := l.QueryRow(`PRAGMA user_version`).Scan(&cur); err != nil {
+		slog.Warn("store: 원장 이관 표식 확인 실패 — 이관 뒤 레거시 기록을 판정할 수 없게 된다", "error", err)
+		return
+	}
+	if cur != 0 {
+		return // 이미 찍혔다 — 덮어쓰면 그 사이의 옛 기록자 행이 워터마크 아래로 숨는다
+	}
+	var mark int64
+	if err := l.QueryRow(`SELECT coalesce(max(id),0)+1 FROM ledger`).Scan(&mark); err != nil {
+		slog.Warn("store: 원장 이관 표식 기준 행 조회 실패 — 표식을 남기지 않는다", "error", err)
+		return
+	}
+	if _, err := l.Exec(`PRAGMA user_version = ` + strconv.FormatInt(mark, 10)); err != nil {
+		slog.Warn("store: 원장 이관 표식 기록 실패 — 이관 뒤 레거시 기록을 판정할 수 없게 된다", "error", err)
+	}
 }
 
 // LedgerFetchStats: dir/ledger.db를 read-only로 열어 회수 실적을 낸다.
@@ -1349,6 +1428,22 @@ func LedgerFetchStats(dir string) (FetchStat, error) {
 		return FetchStat{}, fmt.Errorf("store LedgerFetchStats: %w", err)
 	}
 	fs.OutcomeOK = true
+	// 소견 F2: 그 레거시 중 **이관 뒤에 쓰인 것**을 가른다. 워터마크는 "이관된 기록자가 낼 수
+	// 있는 첫 id"라 비교가 `>=`다(markLedgerMigrated가 max(id)+1을 적는 이유도 거기 있다).
+	// 0은 "워터마크가 없다"이지 0번 행이 아니다 — 그 원장은 판정하지 않고 MigrateMarkOK로
+	// 그 사실을 나른다. 스키마 계단과 달리 이 축은 열이 다 있어도 false일 수 있다.
+	var mark int64
+	if err := db.QueryRow(`PRAGMA user_version`).Scan(&mark); err != nil {
+		return FetchStat{}, fmt.Errorf("store LedgerFetchStats: %w", err)
+	}
+	if mark > 0 {
+		fs.MigrateMarkOK = true
+		if err := db.QueryRow(`SELECT count(*) FROM ledger
+			WHERE tool='ctr_fetch' AND artifact_id IS NULL AND artifact_age_s IS NULL AND id >= ?`,
+			mark).Scan(&fs.LegacyAfterMigrate); err != nil {
+			return FetchStat{}, fmt.Errorf("store LedgerFetchStats: %w", err)
+		}
+	}
 	if !cols["shadow_owned"] {
 		return fs, nil // 셋째 ALTER 이전 원장 — 귀속으로 제한한 수치는 낼 수 없다(계약 7과 같은 관용)
 	}

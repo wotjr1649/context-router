@@ -1710,6 +1710,249 @@ func TestOpenSnapshotsLedgerColumns(t *testing.T) {
 	}
 }
 
+// ledgerExec — 원장에 SQL 한 문장을 직접 건다(구 바이너리의 다섯 열 기록을 흉내내거나 워터마크를
+// 직접 확인할 때 쓴다). Store를 거치지 않는 것이 요지다 — 흉내낼 기록자가 이 코드가 아니다.
+func ledgerExec(t *testing.T, dir, q string) {
+	t.Helper()
+	db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(filepath.Join(dir, "ledger.db"))+pragmas)
+	if err != nil {
+		t.Fatalf("원장 exec open: %v", err)
+	}
+	_, execErr := db.Exec(q)
+	closeErr := db.Close()
+	if execErr != nil {
+		t.Fatalf("원장 exec %q: %v", q, execErr)
+	}
+	if closeErr != nil {
+		t.Fatalf("원장 exec Close: %v", closeErr)
+	}
+}
+
+// ledgerUserVersion — ledger.db의 워터마크를 read-only로 읽는다(사전 가드·사후 대조 공용).
+func ledgerUserVersion(t *testing.T, dir string) int64 {
+	t.Helper()
+	db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(filepath.Join(dir, "ledger.db"))+"?mode=ro")
+	if err != nil {
+		t.Fatalf("워터마크 open: %v", err)
+	}
+	var v int64
+	scanErr := db.QueryRow(`PRAGMA user_version`).Scan(&v)
+	closeErr := db.Close()
+	if scanErr != nil {
+		t.Fatalf("워터마크 읽기: %v", scanErr)
+	}
+	if closeErr != nil {
+		t.Fatalf("워터마크 Close: %v", closeErr)
+	}
+	return v
+}
+
+// oldWriterFetchRow — 옛 바이너리(v0.19.1)의 ctr_fetch 기록. 다섯 열만 지명하므로 새 두 열이
+// NULL로 남아 레거시로 읽힌다 — F2가 말하는 "옛 서버가 유일한 기록자" 상태의 실제 산물이다.
+const oldWriterFetchRow = `INSERT INTO ledger(ts,tool,bytes_stored,bytes_returned,duration_ms)
+	VALUES(1,'ctr_fetch',0,10,1)`
+
+// TestLedgerWatermarkSurvivesLaterOpens — 릴리스 패스 소견 F2의 핵심. 세션이 열린 채 새
+// 바이너리를 깔면 훅이 원장을 이관하는 동안 **옛 서버가 ctr_fetch의 유일한 기록자**로 남는다.
+// 그 행들은 레거시로 읽히므로 여섯 수가 다 숫자로 찍히고, 해소·미해소가 0이라 결정표가 행 2
+// ("채택의 문제")로 떨어진다 — 할 일은 서버를 다시 띄우는 것인데.
+//
+// **그리고 훅은 하루 약 295번 뛴다.** 이관이 돌 때마다 워터마크를 다시 찍으면 그다음 훅이
+// 워터마크를 옛 서버의 행들 **위로** 올려 경보를 지운다 — F2 시나리오의 뒤쪽 절반이 앞쪽
+// 절반의 증거를 몇 분 만에, 영구히 없앤다. 그래서 이 테스트의 마지막 Open이 본체다.
+func TestLedgerWatermarkSurvivesLaterOpens(t *testing.T) {
+	dir := t.TempDir()
+	// ① 이관 전 역사 두 행 — 정상 상태다. 경보에 절대 들면 안 된다.
+	seedLedgerSchema(t, dir)
+	ledgerSchemaGuard(t, dir, []string{"tool"}, ledgerFetchColumns)
+	ledgerExec(t, dir, oldWriterFetchRow)
+	ledgerExec(t, dir, oldWriterFetchRow)
+	if got := ledgerUserVersion(t, dir); got != 0 {
+		t.Fatalf("사전 가드: 이관 전 워터마크=%d want 0", got)
+	}
+
+	// ② 훅이 새 바이너리로 원장을 이관한다 — 여기서 워터마크가 찍힌다(= max(id)+1 = 3).
+	if err := openAt(t, dir).Close(); err != nil {
+		t.Fatalf("이관 Open Close: %v", err)
+	}
+	ledgerSchemaGuard(t, dir, ledgerFetchColumns, nil)
+	mark := ledgerUserVersion(t, dir)
+	if mark != 3 {
+		t.Fatalf("워터마크=%d want 3(= 이관 전 2행의 max(id)+1)", mark)
+	}
+
+	// ③ 옛 서버가 아직 살아서 한 행 더 적는다 — 이것이 경보의 대상이다.
+	ledgerExec(t, dir, oldWriterFetchRow)
+	// ④ 그리고 새 바이너리도 정상으로 적는다(해소 하나·미해소 하나).
+	st := openAt(t, dir)
+	st.LedgerAppendFetch(t.Context(), 0, 1, 9, agePtr(30), true)
+	st.LedgerAppendFetch(t.Context(), 0, 1, 0, nil, false)
+
+	// ⑤ **본체**: 훅이 또 뛴다. 이관은 이미 끝났으므로 워터마크가 움직이면 안 된다.
+	if err := openAt(t, dir).Close(); err != nil {
+		t.Fatalf("둘째 훅 Open Close: %v", err)
+	}
+	if got := ledgerUserVersion(t, dir); got != mark {
+		t.Fatalf("워터마크가 %d→%d로 움직였다 — 다음 훅이 경보를 지운다(F2)", mark, got)
+	}
+
+	fs, err := LedgerFetchStats(dir)
+	if err != nil {
+		t.Fatalf("LedgerFetchStats: %v", err)
+	}
+	if !fs.MigrateMarkOK {
+		t.Fatalf("워터마크를 찍었는데 MigrateMarkOK=false: %+v", fs)
+	}
+	if fs.Legacy != 3 {
+		t.Fatalf("Legacy=%d want 3(이관 전 2 + 옛 기록자 1)", fs.Legacy)
+	}
+	if fs.LegacyAfterMigrate != 1 {
+		t.Fatalf("LegacyAfterMigrate=%d want 1 — 이관 전 역사가 새거나 옛 기록자의 행을 놓쳤다: %+v",
+			fs.LegacyAfterMigrate, fs)
+	}
+	if fs.Resolved != 1 || fs.Missed != 1 {
+		t.Fatalf("Resolved=%d Missed=%d want 1/1 — 결과 행이 경보 셈에 섞였는지 함께 본다: %+v",
+			fs.Resolved, fs.Missed, fs)
+	}
+}
+
+// TestLedgerWatermarkNotMovedWhenLaterAlterCompletes — 위 테스트가 **못 잡는** 나머지 경로.
+// 거기서는 둘째 Open이 붙일 열이 없어 "열을 붙였을 때만 찍는다"는 조건이 한 번만 참이고, 그
+// 조건 홀로 표식을 지킨다. 여기서는 그 조건이 **두 번** 참이 된다.
+//
+// 도달 경로(소견 F11이 이름 붙인 그 상태): 앞선 실행이 앞 두 ALTER는 성공하고 셋째에서 잠금
+// 경쟁이 busy_timeout을 넘겨 실패했다 — 죽은 게 아니라 루프를 끝냈으므로 **표식은 찍혔다**.
+// 그 뒤 옛 기록자가 행을 남기고, 다음 실행이 셋째 열을 마저 붙인다. 이때 표식을 다시 쓰면
+// 그 사이의 행이 워터마크 **아래로** 숨어 경보가 사라진다. 픽스처는 그 상태를 직접 만든다 —
+// 열 하나만 골라 실패시키는 주입보다 도달 상태를 그대로 세우는 쪽이 정직하다.
+func TestLedgerWatermarkNotMovedWhenLaterAlterCompletes(t *testing.T) {
+	dir := t.TempDir()
+	seedLedgerSchema(t, dir, "artifact_id", "artifact_age_s") // 셋째 ALTER만 실패했던 원장
+	ledgerSchemaGuard(t, dir, []string{"artifact_id", "artifact_age_s"}, []string{"shadow_owned"})
+	ledgerExec(t, dir, oldWriterFetchRow) // 이관 전 역사 1행(id=1)
+	ledgerExec(t, dir, `PRAGMA user_version = 2`)
+	if got := ledgerUserVersion(t, dir); got != 2 { // 사전 가드: 앞선 실행이 남긴 표식
+		t.Fatalf("사전 가드: 워터마크=%d want 2", got)
+	}
+	ledgerExec(t, dir, oldWriterFetchRow) // 옛 기록자가 표식 뒤에 남긴 행(id=2) — 경보 대상
+
+	db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(filepath.Join(dir, "ledger.db"))+pragmas)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	db.SetMaxOpenConns(1)
+	defer db.Close()
+	migrateLedger(db) // 셋째 열을 마저 붙인다 → "열을 붙였다"가 두 번째로 참이 되는 지점
+	ledgerSchemaGuard(t, dir, ledgerFetchColumns, nil)
+
+	if got := ledgerUserVersion(t, dir); got != 2 {
+		t.Fatalf("워터마크가 2→%d로 움직였다 — 이관 뒤 레거시가 워터마크 아래로 숨는다", got)
+	}
+	fs, err := LedgerFetchStats(dir)
+	if err != nil {
+		t.Fatalf("LedgerFetchStats: %v", err)
+	}
+	if !fs.MigrateMarkOK || fs.LegacyAfterMigrate != 1 {
+		t.Fatalf("LegacyAfterMigrate=%d MigrateMarkOK=%v want 1/true: %+v",
+			fs.LegacyAfterMigrate, fs.MigrateMarkOK, fs)
+	}
+}
+
+// TestLedgerFetchStatsNoWatermarkIsUnjudgeable — 이 브랜치의 **앞선 빌드**가 열만 붙이고 표식은
+// 안 남긴 원장. 그 원장의 레거시 행이 이관 앞인지 뒤인지는 되물을 방법이 없으므로, 전부 경보로
+// 찍으면 정상 역사가 통째로 경보가 된다. 답은 계단 사다리가 다른 데서 내는 것과 같은
+// **판정 불가**다 — MigrateMarkOK=false, 그리고 그 0은 "없다"가 아니라 "못 잼"이다.
+// 표식이 없다고 writable Open이 뒤늦게 찍어 넣지도 않는다 — 늦게 찍은 워터마크는 실제 이관
+// 시점보다 뒤라 그 사이의 옛 기록자 행을 "이관 전"으로 만든다.
+func TestLedgerFetchStatsNoWatermarkIsUnjudgeable(t *testing.T) {
+	dir := t.TempDir()
+	seedLedgerSchema(t, dir, ledgerFetchColumns...) // 열은 다 있고 워터마크만 없다
+	ledgerSchemaGuard(t, dir, ledgerFetchColumns, nil)
+	ledgerExec(t, dir, oldWriterFetchRow)
+	ledgerExec(t, dir, oldWriterFetchRow)
+	if got := ledgerUserVersion(t, dir); got != 0 {
+		t.Fatalf("사전 가드: 워터마크=%d want 0", got)
+	}
+
+	if err := openAt(t, dir).Close(); err != nil { // 붙일 열이 없다 → 표식도 안 찍는다
+		t.Fatalf("Open Close: %v", err)
+	}
+	if got := ledgerUserVersion(t, dir); got != 0 {
+		t.Fatalf("이관한 적 없는 원장에 워터마크 %d가 뒤늦게 찍혔다", got)
+	}
+
+	fs, err := LedgerFetchStats(dir)
+	if err != nil {
+		t.Fatalf("LedgerFetchStats: %v", err)
+	}
+	if !fs.OutcomeOK {
+		t.Fatalf("열이 다 있는데 OutcomeOK=false: %+v", fs)
+	}
+	if fs.MigrateMarkOK {
+		t.Fatalf("워터마크가 없는데 판정 가능으로 섰다: %+v", fs)
+	}
+	if fs.LegacyAfterMigrate != 0 {
+		t.Fatalf("판정 불가인데 경보 수가 찍혔다: %+v", fs)
+	}
+	if fs.Legacy != 2 {
+		t.Fatalf("Legacy=%d want 2 — 레거시 자체는 그대로 측정값이다: %+v", fs.Legacy, fs)
+	}
+}
+
+// TestMarkLedgerMigratedFailuresAreWarnedNotFatal — 표식을 못 남기는 세 지점(현재값 읽기 ·
+// max(id) 읽기 · PRAGMA 쓰기)에서 경고만 내고 넘어간다. 원장 전체가 best-effort이므로 표식
+// 실패가 이관이나 Open을 막으면 안 되고, 못 찍힌 결과는 위 "판정 불가"로 정확히 퇴화한다.
+func TestMarkLedgerMigratedFailuresAreWarnedNotFatal(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		db   func(t *testing.T) *sql.DB
+	}{
+		{"현재값 못 읽음", func(t *testing.T) *sql.DB { // 닫힌 핸들 — PRAGMA 읽기부터 실패한다
+			db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(filepath.Join(t.TempDir(), "ledger.db"))+pragmas)
+			if err != nil {
+				t.Fatalf("open: %v", err)
+			}
+			if err := db.Close(); err != nil {
+				t.Fatalf("Close: %v", err)
+			}
+			return db
+		}},
+		{"max(id) 못 읽음", func(t *testing.T) *sql.DB { // ledger 테이블이 없다
+			dir := t.TempDir()
+			db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(filepath.Join(dir, "ledger.db"))+pragmas)
+			if err != nil {
+				t.Fatalf("open: %v", err)
+			}
+			t.Cleanup(func() { _ = db.Close() })
+			if _, err := db.Exec(`CREATE TABLE other(x INTEGER)`); err != nil {
+				t.Fatalf("무관 테이블: %v", err)
+			}
+			return db
+		}},
+		{"PRAGMA 못 씀", func(t *testing.T) *sql.DB { // read-only 핸들 — 읽기 둘은 되고 쓰기만 막힌다
+			dir := t.TempDir()
+			seedLedgerSchema(t, dir)
+			db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(filepath.Join(dir, "ledger.db"))+"?mode=ro&_pragma=busy_timeout(5000)")
+			if err != nil {
+				t.Fatalf("open ro: %v", err)
+			}
+			t.Cleanup(func() { _ = db.Close() })
+			return db
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var logBuf bytes.Buffer
+			prev := slog.Default()
+			slog.SetDefault(slog.New(slog.NewTextHandler(&logBuf, nil)))
+			t.Cleanup(func() { slog.SetDefault(prev) })
+			markLedgerMigrated(tc.db(t)) // panic도 오류 반환도 없다
+			if n := strings.Count(logBuf.String(), "level=WARN"); n != 1 {
+				t.Fatalf("경고 줄 수=%d want 1:\n%s", n, logBuf.String())
+			}
+		})
+	}
+}
+
 // TestLedgerFetchStatsFullMigration: 완전 이관된 ledger.db를 SQL로 직접 시딩해 계약 1의 세
 // 상태(레거시/미해소/해소)와 분위수 계산을 한 픽스처에서 함께 태운다. 위 두 테스트는 둘 다
 // 새 열이 없거나 하나만 있는 스키마로 조기 반환 경로만 타므로, Resolved/Missed 집계 질의와
