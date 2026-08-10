@@ -1051,7 +1051,7 @@ const lastIndexedAtByHashQuery = `SELECT max(s.indexed_at), EXISTS(` + shadowOwn
 
 // LastIndexedAtByHash — D103 계약 2: 이 콘텐츠의 **마지막 포착** 시각(unix 초)과, 소견 F4의
 // **shadow 귀속 여부**. 시계도 범위도 D67 퍼지와 같은 것을 쓴다 — 퍼지 술어
-// (shadowOwnedFilter의 나이 절, store.go:1442-1444)가 같은 content_hash를 가진 모든 artifact의
+// (shadowOwnedFilter의 나이 절, store.go:1463-1465)가 같은 content_hash를 가진 모든 artifact의
 // 모든 소스에 대해 indexed_at을 보므로, 나이도 그렇게 재야 분포가 보존 창 위에 그대로
 // 겹쳐진다. artifact 단위로 재면 형제가 방금 재포착된 아티팩트가 실제보다 늙어 보이고 그
 // 오차는 창을 늘리는 쪽으로만 작용한다. 소스가 없으면 (0, false, nil).
