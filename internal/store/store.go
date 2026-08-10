@@ -1169,12 +1169,23 @@ func LedgerStats(dir string) ([]ToolStat, error) {
 // ShadowArtifacts는 그 같은 모집단의 **distinct artifact_id**이고 D104의 착수 조건이 읽는
 // 수다(소견 F5) — ctr_fetch는 기본 16 KiB까지만 돌려주므로 아티팩트 하나가 여러 행이 되고,
 // 행으로 세면 페이징 한 번이 조건을 채운다. 둘을 나란히 내면 그 집중이 보인다.
+//
+// ★ 세 `*OK`는 **어느 수가 측정값인가**를 나른다(SizeStat.PageStatsOK와 같은 관례, 릴리스
+// 패스 M3). ledger는 user_version이 없는 best-effort 보조 DB라 세 ALTER가 **아직 안 돈 원장을
+// 읽는 상태가 정상적으로 도달 가능**하고(계약 7), 그때 위 수들은 0이 아니라 **못 잰 것**이다.
+// 0으로 렌더하면 D104의 착수 조건이 읽는 ShadowArtifacts=0이 "아무도 회수를 안 쓴다"로 읽혀
+// 결정표의 종결 행이 발화한다 — 이 릴리스가 막으려는 바로 그 오독이 세 번째 경로로 온다.
+// 계단은 셋이고 단조다: LedgerOK ⊇ OutcomeOK ⊇ ShadowOK.
 type FetchStat struct {
 	Calls, Legacy          int64
 	Resolved, Missed       int64
 	ShadowResolved         int64
 	ShadowArtifacts        int64
 	AgeP50, AgeP90, AgeMax int64
+
+	LedgerOK  bool // ledger 테이블이 있다 → Calls가 측정값 (false면 ledger.db 부재도 포함)
+	OutcomeOK bool // artifact_id·artifact_age_s가 있다 → Resolved/Missed/Legacy가 측정값
+	ShadowOK  bool // shadow_owned가 있다 → ShadowResolved/ShadowArtifacts·Age*가 측정값
 }
 
 // fetchAgeBasis — 나이 분위수와 D104 착수 조건이 **함께** 보는 모집단의 술어. 두 문장이 이
@@ -1234,13 +1245,14 @@ func LedgerFetchStats(dir string) (FetchStat, error) {
 		return FetchStat{}, fmt.Errorf("store LedgerFetchStats: %w", err)
 	}
 	if len(cols) == 0 { // ledger 테이블 자체가 없다 — 이관 전과 같은 빈 값 경로
-		return fs, nil
+		return fs, nil // LedgerOK=false: 여기의 0은 "호출 0회"가 아니라 "못 쟀다"다
 	}
 	if err := db.QueryRow(
 		`SELECT count(*) FROM ledger WHERE tool='ctr_fetch'`,
 	).Scan(&fs.Calls); err != nil {
 		return FetchStat{}, fmt.Errorf("store LedgerFetchStats: %w", err)
 	}
+	fs.LedgerOK = true
 	if !cols["artifact_id"] || !cols["artifact_age_s"] {
 		return fs, nil // 이관 전·부분 이관 — 총 호출만 유효하다
 	}
@@ -1253,6 +1265,7 @@ func LedgerFetchStats(dir string) (FetchStat, error) {
 		FROM ledger WHERE tool='ctr_fetch'`).Scan(&fs.Resolved, &fs.Missed, &fs.Legacy); err != nil {
 		return FetchStat{}, fmt.Errorf("store LedgerFetchStats: %w", err)
 	}
+	fs.OutcomeOK = true
 	if !cols["shadow_owned"] {
 		return fs, nil // 셋째 ALTER 이전 원장 — 귀속으로 제한한 수치는 낼 수 없다(계약 7과 같은 관용)
 	}
@@ -1261,6 +1274,7 @@ func LedgerFetchStats(dir string) (FetchStat, error) {
 	).Scan(&fs.ShadowResolved, &fs.ShadowArtifacts); err != nil {
 		return FetchStat{}, fmt.Errorf("store LedgerFetchStats: %w", err)
 	}
+	fs.ShadowOK = true
 	if fs.ShadowResolved == 0 {
 		return fs, nil
 	}

@@ -1887,6 +1887,114 @@ func TestStatsPrintsFetchStats(t *testing.T) {
 	}
 }
 
+// TestStatsRendersUnmeasuredTiers: 이관이 덜 된 원장에서 **못 잰 수를 0으로 찍지 않는다**.
+// v0.19.1 릴리스 패스가 `doctor [14]`에서 고친 것과 같은 결함이고(free=0B가 "free page 없음"과
+// "pragma 실패"를 같은 문면으로 냈다), 여기서는 더 무겁다 — **D104의 착수 조건이
+// `shadow_artifacts`를 읽는다.** 미이관 원장의 0을 "아무도 회수를 안 쓴다"로 읽으면 결정표가
+// "창을 늘리지 않는다, 확정" 종결 행을 발화한다.
+//
+// 사전 가드는 store 표면(LedgerFetchStats의 세 표식)으로 건다 — 그 표식 자체의 정확성은
+// internal/store 쪽 계단별 테스트가 PRAGMA table_info로 따로 고정한다. 이 테스트의 주제는
+// **렌더링**이므로 순환이 아니다.
+func TestStatsRendersUnmeasuredTiers(t *testing.T) {
+	base := `id INTEGER PRIMARY KEY, ts INTEGER NOT NULL, tool TEXT NOT NULL,
+		bytes_stored INTEGER NOT NULL DEFAULT 0, bytes_returned INTEGER NOT NULL DEFAULT 0,
+		duration_ms INTEGER NOT NULL DEFAULT 0`
+	for _, tc := range []struct {
+		name                          string
+		ddl, seed                     string
+		ledgerOK, outcomeOK, shadowOK bool
+		want                          []string
+	}{
+		{
+			// ledger.db 자체가 없다(스토어를 writable로 연 적 없는 새 프로젝트). **`stats`로
+			// 도달 가능한 LedgerOK=false는 이것뿐이다** — "파일은 있는데 ledger 테이블이 없는"
+			// 계단은 앞선 LedgerStats가 `no such table`로 먼저 실패시켜 회수 줄에 닿지 못한다
+			// (그 계단의 LedgerFetchStats 계약은 store 쪽 TestLedgerFetchStatsNoLedgerTable이
+			// PRAGMA 가드와 함께 고정한다).
+			name: "① 원장 자체가 없다",
+			want: []string{"calls=없음", "legacy=없음", "resolved=없음", "missed=없음", "shadow_rows=없음", "shadow_artifacts=없음", "p50=없음"},
+		},
+		{
+			name:     "② 나이 열 둘 이전 — 설치된 구버전이 쓴 원장",
+			ddl:      `CREATE TABLE ledger(` + base + `)`,
+			seed:     `INSERT INTO ledger(ts,tool) VALUES(1,'ctr_fetch')`,
+			ledgerOK: true,
+			want:     []string{"calls=1", "legacy=미이관", "resolved=미이관", "missed=미이관", "shadow_rows=미이관", "shadow_artifacts=미이관", "p50=미이관"},
+		},
+		{
+			name:      "③ shadow_owned 열 이전",
+			ddl:       `CREATE TABLE ledger(` + base + `, artifact_id INTEGER, artifact_age_s INTEGER)`,
+			seed:      `INSERT INTO ledger(ts,tool,artifact_id,artifact_age_s) VALUES(1,'ctr_fetch',1,77)`,
+			ledgerOK:  true,
+			outcomeOK: true,
+			want:      []string{"calls=1", "legacy=0", "resolved=1", "missed=0", "shadow_rows=미이관", "shadow_artifacts=미이관", "p50=미이관"},
+		},
+		{
+			// **측정 구간 첫날의 상태**이자 이 테스트의 대조군: 이관은 끝났고 아직 귀속 해소가
+			// 0건이다. 여기서 0들은 **진짜 측정값**이라 숫자로 찍혀야 하고(표식을 일괄로
+			// 바르는 구현은 여기서 떨어진다), 표본이 없는 분위수만 "없음"이다.
+			name:      "④ 완전 이관, 귀속 해소 0건",
+			ddl:       `CREATE TABLE ledger(` + base + `, artifact_id INTEGER, artifact_age_s INTEGER, shadow_owned INTEGER)`,
+			ledgerOK:  true,
+			outcomeOK: true,
+			shadowOK:  true,
+			want:      []string{"calls=0", "legacy=0", "resolved=0", "missed=0", "shadow_rows=0", "shadow_artifacts=0", "p50=없음", "p90=없음", "max=없음"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			storeRoot, projectRoot := t.TempDir(), t.TempDir()
+			canon, err := ident.Canonicalize(projectRoot)
+			if err != nil {
+				t.Fatalf("canonicalize: %v", err)
+			}
+			projDir := filepath.Join(storeRoot, "projects", canon.ProjectID)
+			if err := os.MkdirAll(projDir, 0o700); err != nil {
+				t.Fatalf("MkdirAll: %v", err)
+			}
+			if tc.ddl != "" { // ①은 파일을 아예 만들지 않는다
+				db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(filepath.Join(projDir, "ledger.db")))
+				if err != nil {
+					t.Fatalf("sql.Open: %v", err)
+				}
+				if _, err := db.Exec(tc.ddl); err != nil {
+					t.Fatalf("스키마: %v", err)
+				}
+				if tc.seed != "" {
+					if _, err := db.Exec(tc.seed); err != nil {
+						t.Fatalf("행 삽입: %v", err)
+					}
+				}
+				if err := db.Close(); err != nil {
+					t.Fatalf("Close: %v", err)
+				}
+			}
+
+			// 사전 가드: 픽스처가 정말 이 계단인가. 없으면 DDL 한 글자 실수가 이 케이스를
+			// 조용히 다른 계단의 중복으로 만든다.
+			fs, err := store.LedgerFetchStats(projDir)
+			if err != nil {
+				t.Fatalf("LedgerFetchStats: %v", err)
+			}
+			if fs.LedgerOK != tc.ledgerOK || fs.OutcomeOK != tc.outcomeOK || fs.ShadowOK != tc.shadowOK {
+				t.Fatalf("픽스처가 의도한 계단이 아니다: ok=%v/%v/%v 기대 %v/%v/%v",
+					fs.LedgerOK, fs.OutcomeOK, fs.ShadowOK, tc.ledgerOK, tc.outcomeOK, tc.shadowOK)
+			}
+
+			var out, errOut bytes.Buffer
+			if err := Run(context.Background(), "stats", nil, storeRoot, projectRoot, "0.0.1-dev", &out, &errOut); err != nil {
+				t.Fatalf("Run stats err=%v out=%s", err, out.String())
+			}
+			got := out.String()
+			for _, w := range tc.want {
+				if !strings.Contains(got, w) {
+					t.Fatalf("회수 줄에 %q 없음 — 못 잰 수를 0으로 찍고 있다:\n%s", w, got)
+				}
+			}
+		})
+	}
+}
+
 // TestStatsTotalExcludesNonCtrRows: `total` 줄은 **`ctr_` 접두 도구만** 합산한다(릴리스 리뷰
 // W1). 훅 분모 행(`hook:shadow`)은 하루 약 295행이라 그대로 합치면 총계를 지배하는데, D104의
 // 채택 문턱이 읽는 수가 바로 그 총계다 — 이 릴리스 전 원장의 도구는 전부 `ctr_*`였으므로

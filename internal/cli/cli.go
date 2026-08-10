@@ -261,6 +261,37 @@ func runStatsLocal(w io.Writer, storeRoot, projectRoot string) error {
 	if err != nil {
 		return fmt.Errorf("stats: 회수 실적 집계 실패: %w", err)
 	}
+	// ★ **못 잰 수는 0으로 찍지 않는다**(릴리스 패스 M3이 doctor [14] free/live에서 세운 관례).
+	// ledger는 user_version이 없는 best-effort 보조 DB라 세 ALTER가 아직 안 돈 원장을 stats가
+	// 먼저 만나는 상태가 정상적으로 도달 가능하고(D103 계약 7), 그 계단에서 0은 측정값이
+	// 아니다. 여기서는 doctor보다 무겁다 — **D104의 착수 조건이 shadow_artifacts를 읽는다.**
+	// 미이관 원장의 0을 "아무도 회수를 안 쓴다"로 읽으면 결정표가 "창을 늘리지 않는다, 확정"
+	// 종결 행을 발화한다. 계단이 셋이라 표식의 **자리**가 곧 계단이다(①은 calls부터, ②는
+	// legacy부터, ③은 shadow_rows부터 미이관).
+	// 말이 둘인 이유: 왜 못 쟀는지가 다르고, 읽는 사람이 할 일도 다르다. `미이관`은 "새
+	// 바이너리로 스토어를 한 번 열면 채워진다", `없음`은 "원장 자체가 없다 — 아직 아무것도
+	// 기록된 적이 없다"다.
+	mark := "미이관"
+	if !fs.LedgerOK {
+		mark = "없음"
+	}
+	num := func(v int64, measured bool) string {
+		if !measured {
+			return mark
+		}
+		return strconv.FormatInt(v, 10)
+	}
+	// 분위수는 한 겹 더 갈린다: 열이 없으면 위와 같고, 열은 있는데 귀속 해소가 0건이면 잴
+	// 표본 자체가 "없음"이다 — 셋 다 "0초에 회수했다"와는 다른 말이다.
+	age := func(v int64) string {
+		switch {
+		case !fs.ShadowOK:
+			return mark
+		case fs.ShadowResolved == 0:
+			return "없음"
+		}
+		return strconv.FormatInt(v, 10)
+	}
 	// 한 줄에 넷을 병기하는 이유가 각각 다르다:
 	//  - legacy: 이관 전 행은 해소에도 미해소에도 안 드는데 calls에는 든다 — 병기하지 않으면
 	//    calls가 결과의 분모로 읽힌다(소견 F9). 배포 시점 실측이 calls=49 legacy=49였다.
@@ -268,9 +299,11 @@ func runStatsLocal(w io.Writer, storeRoot, projectRoot string) error {
 	//    아티팩트는 창이 손대지 않으므로 그 나이는 창의 길이에 답하지 않는다(소견 F4).
 	//  - shadow_artifacts: 그 모집단의 distinct artifact 수이고 **D104 착수 조건이 읽는 수**다.
 	//    shadow_rows와 나란히 봐야 페이징 집중(한 아티팩트가 행 수를 채운 상태)이 보인다(소견 F5).
-	fmt.Fprintf(w, "fetch\tcalls=%d\tlegacy=%d\tresolved=%d\tmissed=%d\tshadow_rows=%d\tshadow_artifacts=%d\tage_s p50=%d p90=%d max=%d\n",
-		fs.Calls, fs.Legacy, fs.Resolved, fs.Missed, fs.ShadowResolved, fs.ShadowArtifacts,
-		fs.AgeP50, fs.AgeP90, fs.AgeMax)
+	fmt.Fprintf(w, "fetch\tcalls=%s\tlegacy=%s\tresolved=%s\tmissed=%s\tshadow_rows=%s\tshadow_artifacts=%s\tage_s p50=%s p90=%s max=%s\n",
+		num(fs.Calls, fs.LedgerOK), num(fs.Legacy, fs.OutcomeOK),
+		num(fs.Resolved, fs.OutcomeOK), num(fs.Missed, fs.OutcomeOK),
+		num(fs.ShadowResolved, fs.ShadowOK), num(fs.ShadowArtifacts, fs.ShadowOK),
+		age(fs.AgeP50), age(fs.AgeP90), age(fs.AgeMax))
 	return nil
 }
 

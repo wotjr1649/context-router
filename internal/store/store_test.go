@@ -1263,6 +1263,62 @@ func TestLedgerStats_StatErrorOtherThanNotExist(t *testing.T) {
 	}
 }
 
+// ledgerSchemaGuard — 픽스처가 정말 의도한 이관 계단에 도달했는지 PRAGMA table_info로 확인한다.
+// 계단마다 테스트가 따로 있는데 이 가드가 없으면 픽스처 실수 하나가 **어느 계단의 테스트인지를
+// 조용히 바꿔 놓고**(예: 열을 빼먹어 한 계단 아래로 미끄러짐) 그래도 통과한다.
+func ledgerSchemaGuard(t *testing.T, dir string, want, absent []string) {
+	t.Helper()
+	db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(filepath.Join(dir, "ledger.db"))+"?mode=ro")
+	if err != nil {
+		t.Fatalf("사전 가드 open: %v", err)
+	}
+	cols, err := ledgerColumns(db)
+	closeErr := db.Close()
+	if err != nil {
+		t.Fatalf("사전 가드 ledgerColumns: %v", err)
+	}
+	if closeErr != nil {
+		t.Fatalf("사전 가드 Close: %v", closeErr)
+	}
+	for _, c := range want {
+		if !cols[c] {
+			t.Fatalf("픽스처가 의도한 계단이 아니다: %q가 있어야 한다 — 실제 %v", c, cols)
+		}
+	}
+	for _, c := range absent {
+		if cols[c] {
+			t.Fatalf("픽스처가 의도한 계단이 아니다: %q가 없어야 한다 — 실제 %v", c, cols)
+		}
+	}
+}
+
+// TestLedgerFetchStatsNoLedgerTable: ledger.db는 있는데 `ledger` 테이블이 없는 계단.
+// **총 호출조차 측정값이 아니다** — 0을 찍으면 "회수가 한 번도 없었다"로 읽히는데 실제로는
+// 아직 아무것도 못 읽은 상태다(v0.19.1 릴리스 패스가 doctor [14] free=0B에서 고친 것과 같은
+// 결함). LedgerOK=false가 그 구분을 호출부까지 나른다.
+func TestLedgerFetchStatsNoLedgerTable(t *testing.T) {
+	dir := t.TempDir()
+	db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(filepath.Join(dir, "ledger.db")))
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+	if _, err := db.Exec(`CREATE TABLE other(x INTEGER)`); err != nil { // 파일은 있되 ledger는 없다
+		t.Fatalf("무관 테이블: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	ledgerSchemaGuard(t, dir, nil, []string{"tool", "artifact_id", "artifact_age_s", "shadow_owned"})
+
+	fs, err := LedgerFetchStats(dir)
+	if err != nil {
+		t.Fatalf("ledger 테이블 부재에서 오류가 났다: %v", err)
+	}
+	if fs.LedgerOK || fs.OutcomeOK || fs.ShadowOK {
+		t.Fatalf("측정 못 한 계단인데 측정 표식이 섰다: %+v", fs)
+	}
+}
+
 // TestLedgerFetchStatsToleratesOldSchema: 새 열이 없는 옛 ledger.db를 만나도 실패하지 않는다.
 // ALTER는 writable Open에서만 도는데 LedgerFetchStats는 ledger.db를 따로 read-only로 연다 —
 // 새 바이너리의 stats가 아직 이관되지 않은 원장을 먼저 만날 수 있다(설계 v0.20 D103 계약 7).
@@ -1288,6 +1344,8 @@ func TestLedgerFetchStatsToleratesOldSchema(t *testing.T) {
 		t.Fatalf("Close: %v", err)
 	}
 
+	ledgerSchemaGuard(t, dir, []string{"tool"}, []string{"artifact_id", "artifact_age_s", "shadow_owned"})
+
 	fs, err := LedgerFetchStats(dir)
 	if err != nil {
 		t.Fatalf("옛 스키마에서 오류가 났다: %v", err)
@@ -1297,6 +1355,13 @@ func TestLedgerFetchStatsToleratesOldSchema(t *testing.T) {
 	}
 	if fs.Resolved != 0 || fs.Missed != 0 {
 		t.Fatalf("레거시 행이 해소/미해소로 셌다: %+v", fs)
+	}
+	// 이 계단에서 0인 해소·미해소는 **측정값이 아니다** — 호출부가 0으로 찍으면 안 된다.
+	if !fs.LedgerOK {
+		t.Fatalf("총 호출은 읽었는데 LedgerOK=false: %+v", fs)
+	}
+	if fs.OutcomeOK || fs.ShadowOK {
+		t.Fatalf("나이 열이 없는데 측정 표식이 섰다: %+v", fs)
 	}
 }
 
@@ -1318,12 +1383,17 @@ func TestLedgerFetchStatsPartialMigration(t *testing.T) {
 	if err := db.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
+	ledgerSchemaGuard(t, dir, []string{"artifact_id"}, []string{"artifact_age_s", "shadow_owned"})
+
 	fs, err := LedgerFetchStats(dir)
 	if err != nil {
 		t.Fatalf("부분 이관에서 오류가 났다: %v", err)
 	}
 	if fs.Resolved != 0 || fs.Missed != 0 {
 		t.Fatalf("부분 이관에서 0이 아닌 값: %+v", fs)
+	}
+	if !fs.LedgerOK || fs.OutcomeOK || fs.ShadowOK {
+		t.Fatalf("부분 이관의 측정 표식이 틀렸다: %+v (기대 LedgerOK만 true)", fs)
 	}
 }
 
@@ -1402,24 +1472,10 @@ func TestLedgerFetchStatsFullMigration(t *testing.T) {
 		t.Fatalf("Close: %v", err)
 	}
 
-	// pre-guard: 픽스처가 실제로 완전 이관(두 열 다 있음) 상태인지 먼저 확인한다. 이게 없으면
+	// pre-guard: 픽스처가 실제로 완전 이관(세 열 다 있음) 상태인지 먼저 확인한다. 이게 없으면
 	// 픽스처 실수가 이 테스트를 조기 반환 경로로 흘려보내면서도 통과시킨다 — 이 테스트가 잡으려는
 	// 바로 그 가짜 커버리지 상태다.
-	roDB, err := sql.Open("sqlite", "file:"+filepath.ToSlash(filepath.Join(dir, "ledger.db"))+"?mode=ro")
-	if err != nil {
-		t.Fatalf("sql.Open ro: %v", err)
-	}
-	cols, err := ledgerColumns(roDB)
-	closeErr := roDB.Close()
-	if err != nil {
-		t.Fatalf("ledgerColumns: %v", err)
-	}
-	if closeErr != nil {
-		t.Fatalf("ro Close: %v", closeErr)
-	}
-	if !cols["artifact_id"] || !cols["artifact_age_s"] || !cols["shadow_owned"] {
-		t.Fatalf("픽스처가 완전 이관 상태가 아니다(테스트 버그): %v", cols)
-	}
+	ledgerSchemaGuard(t, dir, []string{"artifact_id", "artifact_age_s", "shadow_owned"}, nil)
 
 	fs, err := LedgerFetchStats(dir)
 	if err != nil {
@@ -1437,6 +1493,10 @@ func TestLedgerFetchStatsFullMigration(t *testing.T) {
 	// 소견 F9: 레거시 행 수를 따로 낸다 — Calls 안에 섞여 있어 그 줄만 보면 결과 분모로 읽힌다.
 	if fs.Legacy != 1 {
 		t.Fatalf("Legacy=%d want 1(두 열 다 NULL인 이관 전 행)", fs.Legacy)
+	}
+	// 완전 이관에서만 세 표식이 다 선다 — 여기의 0은 전부 진짜 측정값이다.
+	if !fs.LedgerOK || !fs.OutcomeOK || !fs.ShadowOK {
+		t.Fatalf("완전 이관인데 측정 표식이 빠졌다: %+v", fs)
 	}
 	if fs.AgeP50 != 30 || fs.AgeP90 != 40 || fs.AgeMax != 50 {
 		t.Fatalf("분위수 틀림: %+v want {AgeP50:30 AgeP90:40 AgeMax:50}", fs)
@@ -1741,6 +1801,8 @@ func TestLedgerFetchStatsShadowColumnMissing(t *testing.T) {
 		t.Fatalf("Close: %v", err)
 	}
 
+	ledgerSchemaGuard(t, dir, []string{"artifact_id", "artifact_age_s"}, []string{"shadow_owned"})
+
 	fs, err := LedgerFetchStats(dir)
 	if err != nil {
 		t.Fatalf("shadow 열 부재에서 오류가 났다: %v", err)
@@ -1750,6 +1812,14 @@ func TestLedgerFetchStatsShadowColumnMissing(t *testing.T) {
 	}
 	if fs.ShadowResolved != 0 || fs.AgeMax != 0 {
 		t.Fatalf("귀속 열 없이 분위수를 냈다: %+v", fs)
+	}
+	// **D104 착수 조건이 읽는 수가 이 계단에서 0이다.** 측정값이 아니라는 표식이 없으면
+	// "아무도 회수를 안 쓴다"로 읽혀 결정표의 종결 행이 발화한다.
+	if !fs.LedgerOK || !fs.OutcomeOK {
+		t.Fatalf("총 호출·해소는 읽었는데 표식이 false: %+v", fs)
+	}
+	if fs.ShadowOK {
+		t.Fatalf("shadow 열이 없는데 ShadowOK=true: %+v", fs)
 	}
 }
 
