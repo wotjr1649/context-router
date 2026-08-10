@@ -1095,7 +1095,14 @@ func (s *Store) LastIndexedAtByHash(ctx context.Context, contentHash string) (in
 // 같은 초에 회수했다"와 구분되지 않아 분포를 아래로 끌어내린다. 그 행도 해소로는 센다(바이트를
 // 실제로 돌려줬다). *int64인 이유: 아키텍처 문서 "부패 방지 계약"의 mcp god package 방지
 // 항목이 internal/mcp의 `database/sql` import를 금지해 sql.NullInt64를 호출부에 둘 수 없다.
-// ctx를 받는 이유는 계약 8과 같다 — 형제 LedgerAppendContext처럼 호출부의 예산을 탄다.
+// ctx는 **부르는 쪽이 정한 예산**을 탄다. 형제 LedgerAppendContext와 시그니처는 같지만 **계약 8과
+// 같은 이유는 아니다** — 두 호출부가 일부러 서로 다른 ctx를 건넨다(D103 계약 8 ★★, 소견 F3).
+// 훅은 제 요청 ctx를 그대로 넘긴다: 총예산 2000 ms에 ledger.db의 busy_timeout이 5000 ms라
+// 예산 밖으로 밀린 INSERT는 **잘려 나가는 것이 옳고**, 훅의 fail-open이 그 위에 선다.
+// ctr_fetch는 반대로 요청 ctx에서 **떼어 낸** ctx를 넘긴다(mcp의 fetchLedgerCtx): 이 행은 응답을
+// 다 만든 뒤에 쓰는데 그 사이 사용자가 취소하면 **실제로 성공한 회수가 흔적 없이 사라지고**,
+// 취소는 부하와 상관돼 있어 그 손실이 무작위가 아니다. 거기에는 자를 예산이 없으므로 자르는 것이
+// 계측을 잃는 것뿐이다. **여기를 "일관성 있게" 맞추려고 요청 ctx를 흘려보내면 F3이 되살아난다.**
 // LedgerAppend와 같은 best-effort 계약이다(ledger 없음·오류는 무시). S4: 정수와 도구 이름만
 // 담는다 — 선택자도 경로도 내용도 담지 않는다(계약 6).
 // **부분 이관 원장에서는 있는 열까지만 적고 퇴화한다**(릴리스 패스 소견 F1) — 계단은 아래
