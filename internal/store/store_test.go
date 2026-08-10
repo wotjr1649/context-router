@@ -1813,8 +1813,9 @@ func TestLedgerFetchStatsShadowColumnMissing(t *testing.T) {
 	if fs.ShadowResolved != 0 || fs.AgeMax != 0 {
 		t.Fatalf("귀속 열 없이 분위수를 냈다: %+v", fs)
 	}
-	// **D104 착수 조건이 읽는 수가 이 계단에서 0이다.** 측정값이 아니라는 표식이 없으면
-	// "아무도 회수를 안 쓴다"로 읽혀 결정표의 종결 행이 발화한다.
+	// **D104 착수 조건이 읽는 수가 이 계단에서 0이다.** 측정값이 아니라는 표식이 없으면 여섯
+	// 수가 다 숫자로 보여 결정표 행 0이 발화하지 못하고 행 2로 떨어진다 — 창 판단은 열려 있지만
+	// 처방이 "채택을 늘려라"가 되고, 정작 할 일인 바이너리 교체는 지시되지 않는다.
 	if !fs.LedgerOK || !fs.OutcomeOK {
 		t.Fatalf("총 호출·해소는 읽었는데 표식이 false: %+v", fs)
 	}

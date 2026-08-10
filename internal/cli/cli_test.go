@@ -1891,8 +1891,10 @@ func TestStatsPrintsFetchStats(t *testing.T) {
 // TestStatsRendersUnmeasuredTiers: 이관이 덜 된 원장에서 **못 잰 수를 0으로 찍지 않는다**.
 // v0.19.1 릴리스 패스가 `doctor [14]`에서 고친 것과 같은 결함이고(free=0B가 "free page 없음"과
 // "pragma 실패"를 같은 문면으로 냈다), 여기서는 더 무겁다 — **D104의 착수 조건이
-// `shadow_artifacts`를 읽는다.** 미이관 원장의 0을 "아무도 회수를 안 쓴다"로 읽으면 결정표가
-// "창을 늘리지 않는다, 확정" 종결 행을 발화한다.
+// `shadow_artifacts`를 읽는다.** 표식 없이 그 0이 숫자로 찍히면 여섯 수가 다 숫자라 결정표
+// 행 0이 발화하지 못하고 `resolved + missed = 0`이 행 2로 떨어진다 — 창 판단은 열려 있지만
+// **처방이 틀린다**: 할 일은 채택을 늘리는 것이 아니라 **바이너리를 가는 것**이고, 그것을
+// 모르면 다음 14일도 아무것도 재지 않는다.
 //
 // 사전 가드는 store 표면(LedgerFetchStats의 세 표식)으로 건다 — 그 표식 자체의 정확성은
 // internal/store 쪽 계단별 테스트가 PRAGMA table_info로 따로 고정한다. 이 테스트의 주제는
