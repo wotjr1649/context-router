@@ -1549,6 +1549,106 @@ func TestShadowAppendDrops(t *testing.T) {
 	}
 }
 
+// TestShadowCaptureRecordsLedgerRow: 성공한 포착마다 원장에 **포착 활동량 행**이 하나 남고,
+// 저장되지 않은 호출은 남기지 않는다. 이 행이 없으면 포착량을 72시간 스냅샷에서 세게 되고,
+// 그것이 세션 54가 상계 11.6%를 잘못 낸 형태다 — 13일치 분자를 사흘치 분모로 나눴다. 그
+// **형태**가 이 행이 퍼지 밖 원장에 사는 이유다. 다만 이 행 자체를 "회수율의 분모"로 부르지는
+// 않는다(소견 F8): 세는 것은 포착 *사건*이고, 회수 결과의 분모는 `resolved_artifacts + missed`다.
+// 아래 실패 문면의 "분모 행"은 그 시절 이름 그대로 둔 별칭이다 — SDD 기록이 그 문자열로
+// 회귀 증거를 남겨 두었다.
+// 읽는 자리는 store.LedgerStats(contentDir)다. **임계 미달 케이스는 store를 열기 전에
+// 반환하므로 ledger.db 자체가 없고, 그때 LedgerStats는 nil 슬라이스+nil을 낸다** — 그것을
+// "0행"으로 받는다(Fatal이 아니다).
+func TestShadowCaptureRecordsLedgerRow(t *testing.T) {
+	_, _, contentDir, sdir := shadowSetup(t)
+	ad, err := session.OpenAppend(context.Background(), sdir, session.AppendOptions{
+		ExternalSessionID: "cc:3f2504e0-4f89-41d3-9a0c-0305e82c3301",
+		Producer:          "context-router/test",
+	})
+	if err != nil {
+		t.Fatalf("OpenAppend: %v", err)
+	}
+	defer func() { _ = ad.Close() }()
+	getenv := func(string) string { return "" }
+
+	// ① 임계 미달 → 저장도 분모도 없다(store를 열기 전에 반환한다).
+	small, err := json.Marshal(bigStdout(100))
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	shadowCapture(context.Background(), ad,
+		hookInput{HookEventName: "PostToolUse", ToolName: "Bash", ToolResponse: small},
+		sdir, contentDir, "cc:3f2504e0-4f89-41d3-9a0c-0305e82c3301", getenv)
+	if n := hookLedgerRows(t, contentDir); n != 0 {
+		t.Fatalf("임계 미달인데 분모 행=%d", n)
+	}
+
+	// ② 임계 초과 → 저장 1건, 분모 1행.
+	big, err := json.Marshal(bigStdout(20000))
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	shadowCapture(context.Background(), ad,
+		hookInput{HookEventName: "PostToolUse", ToolName: "Bash", ToolResponse: big},
+		sdir, contentDir, "cc:3f2504e0-4f89-41d3-9a0c-0305e82c3301", getenv)
+	if n := contentArtifacts(t, contentDir); n != 1 {
+		t.Fatalf("artifacts=%d want 1", n)
+	}
+	if n := hookLedgerRows(t, contentDir); n != 1 {
+		t.Fatalf("성공한 포착 뒤 분모 행=%d want 1", n)
+	}
+
+	// ③ 임계 통과·denylist 무해·decode 정상이지만 ingest가 **ctx와 무관한** 사유로 실패 →
+	// 저장도 분모도 늘지 않는다. ②의 취소된 ctx 기법(TestShadowIngestDrops)은 여기서 못 쓴다 —
+	// 죽은 ctx가 LedgerAppendContext의 ExecContext에도 그대로 흘러들어가 분모 기록이 함께
+	// 실패해버려서, "ingest 실패 뒤에도 분모를 쓰는" mutation과 정상 구현을 못 가른다(둘 다
+	// 0행으로 보인다). 대신 artifacts/ 밑 두 hex 슬롯 256개 전부를 평범한 파일로 막는다 —
+	// store.OpenContext(store.go)는 artifacts 자체만 만들어 통과하지만, 그 안쪽
+	// Register→writeBlob(store.go)의 os.MkdirAll(artifacts/<hash[:2]>)은 실제 content hash의
+	// 앞 2자와 무관하게 항상 ENOTDIR로 실패한다 — 256개 전부를 막아 어떤 해시가 나오든
+	// 예측 없이 충돌을 보장한다. ctx는 끝까지 유효해 ExecContext는 항상 성공하므로, 분모가
+	// 성공 판정보다 먼저 쓰이는 버그가 있다면 이 케이스에서만 드러난다.
+	artifactsDir := filepath.Join(contentDir, "artifacts")
+	for i := range 256 {
+		p := filepath.Join(artifactsDir, fmt.Sprintf("%02x", i))
+		if err := os.RemoveAll(p); err != nil { // ②가 실제로 쓴 슬롯은 디렉터리 — 지우고 파일로 교체
+			t.Fatalf("RemoveAll %s: %v", p, err)
+		}
+		if err := os.WriteFile(p, nil, 0o600); err != nil {
+			t.Fatalf("collision 파일 시딩 %s: %v", p, err)
+		}
+	}
+	huge, err := json.Marshal(bigStdout(30000)) // ②와 다른 바이트 — 별개 content hash
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	shadowCapture(context.Background(), ad,
+		hookInput{HookEventName: "PostToolUse", ToolName: "Bash", ToolResponse: huge},
+		sdir, contentDir, "cc:3f2504e0-4f89-41d3-9a0c-0305e82c3301", getenv)
+	if n := contentArtifacts(t, contentDir); n != 1 {
+		t.Fatalf("ingest 실패(ENOTDIR) 뒤 artifacts=%d want 1(불변) — mkdir 충돌 시딩이 안 먹었다", n)
+	}
+	if n := hookLedgerRows(t, contentDir); n != 1 {
+		t.Fatalf("ingest 실패(ENOTDIR) 뒤 분모 행=%d want 1(불변) — 분모가 샜다", n)
+	}
+}
+
+// hookLedgerRows — contentDir 원장의 hook:shadow 행 수. ledger.db 미존재는 nil 슬라이스라
+// 자연히 0이 된다(store.LedgerStats 계약).
+func hookLedgerRows(t *testing.T, contentDir string) int64 {
+	t.Helper()
+	rows, err := store.LedgerStats(contentDir)
+	if err != nil {
+		t.Fatalf("LedgerStats: %v", err)
+	}
+	for _, r := range rows {
+		if r.Tool == "hook:shadow" {
+			return r.Calls
+		}
+	}
+	return 0
+}
+
 // ─── T7: large-read guard 4조건 판정 (설계 §4) ────────────────────────────────
 
 // guardSetup — session_start를 발화해 세션을 선재시키고 (storeRoot, cwd, contentDir, sdir)를

@@ -1845,6 +1845,376 @@ func TestRunStats_Local_NoLedger(t *testing.T) {
 	}
 }
 
+// TestStatsPrintsFetchStats: stats가 회수 실적 줄을 낸다. 이 줄이 D104의 착수 조건을 사람이
+// 눈으로 확인하는 자리다 — `resolved_artifacts + missed` 10건 · `shadow_artifacts` 30건 또는
+// `missed` 5건(W2·F5·F7 소유자 판정으로 개정된 수들이고, 전부 이 줄에 그 이름으로 찍힌다).
+// **총 호출을 병기하는 것이 계약**이다: 이 릴리스부터 위 표의 ctr_fetch calls가 뜻을 바꾸고
+// (전에는 성공만, 이제 성공 + artifact 부재) 그 수가 레거시까지 품기 때문이다(D103 계약 9).
+// 나이를 10·20·30·40·50 다섯 값으로 심어 p50·p90·max를 서로 다른 세 수로 만든다 — 두 값짜리
+// 픽스처(600·1800)는 nearest-rank 오프셋상 p50=p90=600이 되어 그 둘을 뒤바꿔도 통과한다.
+//
+// ★ **아티팩트 1에 페이징 행 하나를 더 심는 것이 이 픽스처의 핵심이다.** 그것이 없으면
+// `resolved == resolved_artifacts`이고 `shadow_rows == shadow_artifacts`라 행 수 칸과 아티팩트
+// 수 칸을 **서로 뒤바꿔도 통과한다** — 소견 F5·F7이 그 둘을 갈라 놓은 이유가 통째로 검증되지
+// 않는다. 나이를 5로 잡아 아티팩트 1의 max(=10)를 바꾸지 않으므로 분위수 셋은 그대로다.
+// 단언을 탭으로 감싸는 이유도 같다: `resolved=7`은 `resolved_artifacts=7`의 부분 문자열이라
+// 탭이 없으면 두 칸이 뒤바뀐 출력도 통과한다.
+func TestStatsPrintsFetchStats(t *testing.T) {
+	storeRoot, projectRoot := t.TempDir(), t.TempDir()
+	canon, err := ident.Canonicalize(projectRoot)
+	if err != nil {
+		t.Fatalf("canonicalize: %v", err)
+	}
+	projDir := filepath.Join(storeRoot, "projects", canon.ProjectID)
+	st, err := store.Open(projDir, false)
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	for i, age := range []int64{10, 20, 30, 40, 50} {
+		st.LedgerAppendFetch(context.Background(), 100, 1, int64(i)+1, &age, true) // 해소(shadow 귀속, 나이 age초)
+	}
+	pagedAge := int64(5)
+	explicitAge := int64(999_999)
+	st.LedgerAppendFetch(context.Background(), 100, 1, 1, &pagedAge, true)      // 같은 아티팩트의 페이징 행
+	st.LedgerAppendFetch(context.Background(), 0, 1, 0, nil, false)             // 미해소
+	st.LedgerAppendFetch(context.Background(), 100, 1, 99, &explicitAge, false) // 해소(explicit) — 분위수 밖
+	if err := st.Close(); err != nil {
+		t.Fatalf("store.Close: %v", err)
+	}
+
+	// 사전 가드: 픽스처가 정말 행 수와 아티팩트 수를 가르는가. 여기서 두 쌍이 같아지면 아래
+	// 단언은 뒤바뀐 렌더도 통과시킨다.
+	fs, err := store.LedgerFetchStats(projDir)
+	if err != nil {
+		t.Fatalf("LedgerFetchStats: %v", err)
+	}
+	if fs.Resolved == fs.ResolvedArtifacts || fs.ShadowResolved == fs.ShadowArtifacts {
+		t.Fatalf("픽스처가 행/아티팩트를 가르지 않는다: %+v", fs)
+	}
+	if !fs.MigrateMarkOK {
+		t.Fatalf("새 원장인데 이관 워터마크가 없다 — legacy_after_migrate 단언이 무의미해진다: %+v", fs)
+	}
+
+	var out, errOut bytes.Buffer
+	if err := Run(context.Background(), "stats", nil, storeRoot, projectRoot, "0.0.1-dev", &out, &errOut); err != nil {
+		t.Fatalf("Run stats err=%v out=%s", err, out.String())
+	}
+	got := out.String()
+	for _, want := range []string{
+		"fetch\t", "\tcalls=8\t", "\tlegacy=0\t", "\tlegacy_after_migrate=0\t",
+		"\tresolved=7\t", "\tresolved_artifacts=6\t", "\tmissed=1\t",
+		"\tshadow_rows=6\t", "\tshadow_artifacts=5\t", "\tage_s p50=30 p90=40 max=50\n",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("회수 실적 줄에 %q 없음:\n%s", want, got)
+		}
+	}
+}
+
+// TestStatsRendersLegacyAfterMigrateAlarm: **이 줄에서 가장 값비싼 상태**를 렌더가 실제로 낸다 —
+// 원장은 이관됐는데 `ctr_fetch`를 쓰는 것은 여전히 옛 서버인 상태(소견 F2). 그 상태의 처방은
+// "채택을 늘려라"가 아니라 **"서버를 다시 띄워라"** 이고, 둘을 가르는 유일한 수가 이 칸이다.
+//
+// 픽스처는 그 상태 그대로다: 이관 전 역사 2행(id 1·2) → 워터마크 3 → 옛 기록자의 3행(id 3·4·5).
+// 나머지 칸이 전부 숫자이고 `resolved_artifacts + missed = 0`이라, 이 칸이 없으면 결정표는
+// 행 2("채택의 문제")로 떨어진다 — `legacy_after_migrate=3`이 그 오독을 끊는다.
+//
+// `legacy=5`와 `legacy_after_migrate=3`을 **다른 수로** 잡은 것이 요점이다(전자가 후자를 포함
+// 한다). 같은 수면 두 칸을 뒤바꿔도 통과한다. 단언을 탭으로 감싸는 이유는 `legacy=5`가
+// `legacy_after_migrate=5`의 부분 문자열이기 때문이다.
+func TestStatsRendersLegacyAfterMigrateAlarm(t *testing.T) {
+	storeRoot, projectRoot := t.TempDir(), t.TempDir()
+	canon, err := ident.Canonicalize(projectRoot)
+	if err != nil {
+		t.Fatalf("canonicalize: %v", err)
+	}
+	projDir := filepath.Join(storeRoot, "projects", canon.ProjectID)
+	if err := os.MkdirAll(projDir, 0o700); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(filepath.Join(projDir, "ledger.db")))
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+	for _, stmt := range []string{
+		`CREATE TABLE ledger(id INTEGER PRIMARY KEY, ts INTEGER NOT NULL, tool TEXT NOT NULL,
+			bytes_stored INTEGER NOT NULL DEFAULT 0, bytes_returned INTEGER NOT NULL DEFAULT 0,
+			duration_ms INTEGER NOT NULL DEFAULT 0,
+			artifact_id INTEGER, artifact_age_s INTEGER, shadow_owned INTEGER)`,
+		`INSERT INTO ledger(ts,tool) VALUES(1,'ctr_fetch'),(1,'ctr_fetch')`, // id 1·2 — 이관 전 역사
+		`PRAGMA user_version = 3`, // = max(id)+1, markLedgerMigrated가 적는 값
+		`INSERT INTO ledger(ts,tool) VALUES(2,'ctr_fetch'),(2,'ctr_fetch'),(2,'ctr_fetch')`, // id 3·4·5 — 옛 기록자
+	} {
+		if _, err := db.Exec(stmt); err != nil {
+			t.Fatalf("픽스처 %q: %v", stmt, err)
+		}
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	// 사전 가드: 워터마크가 실제로 읽히고 두 수가 갈렸는가. 워터마크가 안 찍혔으면(MigrateMarkOK
+	// = false) 이 줄은 `미이관`을 찍는 것이 옳고, 그러면 아래 단언은 다른 상태를 재게 된다.
+	fs, err := store.LedgerFetchStats(projDir)
+	if err != nil {
+		t.Fatalf("LedgerFetchStats: %v", err)
+	}
+	if !fs.MigrateMarkOK || fs.Legacy != 5 || fs.LegacyAfterMigrate != 3 {
+		t.Fatalf("픽스처가 F2 상태가 아니다: markOK=%v legacy=%d after=%d",
+			fs.MigrateMarkOK, fs.Legacy, fs.LegacyAfterMigrate)
+	}
+
+	var out, errOut bytes.Buffer
+	if err := Run(context.Background(), "stats", nil, storeRoot, projectRoot, "0.0.1-dev", &out, &errOut); err != nil {
+		t.Fatalf("Run stats err=%v out=%s", err, out.String())
+	}
+	got := out.String()
+	for _, want := range []string{"\tcalls=5\t", "\tlegacy=5\t", "\tlegacy_after_migrate=3\t"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("회수 실적 줄에 %q 없음 — 옛 기록자 경보가 안 보인다:\n%s", want, got)
+		}
+	}
+}
+
+// TestStatsRendersFetchLineWhenLedgerTableMissing: 릴리스 패스 소견 **F4**. `ledger.db`는 있는데
+// `ledger` 테이블이 없으면 — SQLite가 연결을 여는 순간 파일을 만들고 `CREATE TABLE`은 그 뒤에
+// 도므로, 디스크가 차거나 busy_timeout을 넘긴 잠금이 그 CREATE만 떨어뜨리면 도달한다 —
+// `LedgerStats`가 `no such table: ledger`로 죽는다. 종전에는 그 오류가 `runStatsLocal`을 즉시
+// 반환시켜 **헤더도 total도 회수 줄도 한 줄도 안 찍혔다**: 14일 측정 구간의 운영자가 D104 행 0
+// (판정 불가)으로 가는 표식 대신 깨진 명령만 봤다.
+//
+// **오류 문면만 확인하는 테스트는 이 요구의 반대를 증명한다.** 그래서 둘을 함께 단언한다 —
+// 실패는 여전히 오류로 나오고(삼키지 않는다), **그럼에도 회수 줄은 표식과 함께 찍힌다**.
+// total 줄까지 표식을 타는 것이 원장 파일 자체가 없는 정상 상태(그때 total은 숫자 0이다)와
+// 이 상태를 stdout만 보고 가르는 신호다.
+func TestStatsRendersFetchLineWhenLedgerTableMissing(t *testing.T) {
+	storeRoot, projectRoot := t.TempDir(), t.TempDir()
+	canon, err := ident.Canonicalize(projectRoot)
+	if err != nil {
+		t.Fatalf("canonicalize: %v", err)
+	}
+	projDir := filepath.Join(storeRoot, "projects", canon.ProjectID)
+	if err := os.MkdirAll(projDir, 0o700); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(filepath.Join(projDir, "ledger.db")))
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+	if _, err := db.Exec(`CREATE TABLE other(x INTEGER)`); err != nil { // 파일은 있되 ledger는 없다
+		t.Fatalf("무관 테이블: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	// 사전 가드 둘. ①이 없으면 이 테스트는 F4를 재현하지 않고, ②가 없으면 "회수 줄을 찍을 수
+	// 있었다"는 전제 자체가 검증되지 않는다.
+	if _, err := store.LedgerStats(projDir); err == nil {
+		t.Fatalf("픽스처가 F4 상태가 아니다: LedgerStats가 성공했다")
+	}
+	fs, err := store.LedgerFetchStats(projDir)
+	if err != nil || fs.LedgerOK {
+		t.Fatalf("픽스처가 F4 상태가 아니다: LedgerFetchStats err=%v LedgerOK=%v", err, fs.LedgerOK)
+	}
+
+	var out, errOut bytes.Buffer
+	runErr := Run(context.Background(), "stats", nil, storeRoot, projectRoot, "0.0.1-dev", &out, &errOut)
+	got := out.String()
+	if runErr == nil {
+		t.Fatalf("읽을 수 없는 원장인데 실패를 삼켰다 — 이상을 조용한 빈 결과로 바꾸면 안 된다:\n%s", got)
+	}
+	for _, want := range []string{
+		"tool\tcalls\tbytes_stored\tbytes_returned\tspan",
+		"total\t없음\t없음\t없음\tbytes suppressed (local, 진단용)",
+		"fetch\t", "\tcalls=없음\t", "\tlegacy=없음\t", "\tlegacy_after_migrate=없음\t",
+		"\tresolved=없음\t", "\tresolved_artifacts=없음\t", "\tmissed=없음\t",
+		"\tshadow_rows=없음\t", "\tshadow_artifacts=없음\t", "\tage_s p50=없음 p90=없음 max=없음\n",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("집계 실패로 %q가 사라졌다 — 명령이 아무것도 안 찍고 죽는다(F4):\n%s", want, got)
+		}
+	}
+	for _, banned := range []string{"token", "$"} {
+		if strings.Contains(got, banned) {
+			t.Fatalf("out must not contain %q (환산·절약 금지, 설계 §6): %s", banned, got)
+		}
+	}
+}
+
+// TestStatsRendersUnmeasuredTiers: 이관이 덜 된 원장에서 **못 잰 수를 0으로 찍지 않는다**.
+// v0.19.1 릴리스 패스가 `doctor [14]`에서 고친 것과 같은 결함이고(free=0B가 "free page 없음"과
+// "pragma 실패"를 같은 문면으로 냈다), 여기서는 더 무겁다 — **D104의 착수 조건이
+// `shadow_artifacts`를 읽는다.** 표식 없이 그 0이 숫자로 찍히면 칸이 전부 숫자라 결정표
+// 행 0이 발화하지 못하고 `resolved_artifacts + missed = 0`이 행 2로 떨어진다 — 창 판단은 열려 있지만
+// **처방이 틀린다**: 할 일은 채택을 늘리는 것이 아니라 **바이너리를 가는 것**이고, 그것을
+// 모르면 다음 14일도 아무것도 재지 않는다.
+//
+// 사전 가드는 store 표면(LedgerFetchStats의 세 표식)으로 건다 — 그 표식 자체의 정확성은
+// internal/store 쪽 계단별 테스트가 PRAGMA table_info로 따로 고정한다. 이 테스트의 주제는
+// **렌더링**이므로 순환이 아니다.
+func TestStatsRendersUnmeasuredTiers(t *testing.T) {
+	base := `id INTEGER PRIMARY KEY, ts INTEGER NOT NULL, tool TEXT NOT NULL,
+		bytes_stored INTEGER NOT NULL DEFAULT 0, bytes_returned INTEGER NOT NULL DEFAULT 0,
+		duration_ms INTEGER NOT NULL DEFAULT 0`
+	for _, tc := range []struct {
+		name                                  string
+		ddl, seed                             string
+		ledgerOK, outcomeOK, shadowOK, markOK bool
+		want                                  []string
+	}{
+		{
+			// ledger.db 자체가 없다(스토어를 writable로 연 적 없는 새 프로젝트). 파일은 있는데
+			// `ledger` 테이블이 없는 계단도 같은 `없음`을 찍는데(소견 F4 이후 그 계단이 회수
+			// 줄까지 도달한다), 그쪽은 **total 줄까지 표식을 타는 것**으로 갈린다 —
+			// TestStatsRendersFetchLineWhenLedgerTableMissing이 그 상태를 따로 고정한다.
+			name: "① 원장 자체가 없다",
+			want: []string{
+				"\tcalls=없음\t", "\tlegacy=없음\t", "\tlegacy_after_migrate=없음\t",
+				"\tresolved=없음\t", "\tresolved_artifacts=없음\t", "\tmissed=없음\t",
+				"\tshadow_rows=없음\t", "\tshadow_artifacts=없음\t", "\tage_s p50=없음",
+				"total\t0\t0\t0\t", // 파일이 없는 것은 집계 실패가 아니다 — 총계는 진짜 0이다
+			},
+		},
+		{
+			name:     "② 나이 열 둘 이전 — 설치된 구버전이 쓴 원장",
+			ddl:      `CREATE TABLE ledger(` + base + `)`,
+			seed:     `INSERT INTO ledger(ts,tool) VALUES(1,'ctr_fetch')`,
+			ledgerOK: true,
+			want: []string{
+				"\tcalls=1\t", "\tlegacy=미이관\t", "\tlegacy_after_migrate=미이관\t",
+				"\tresolved=미이관\t", "\tresolved_artifacts=미이관\t", "\tmissed=미이관\t",
+				"\tshadow_rows=미이관\t", "\tshadow_artifacts=미이관\t", "\tage_s p50=미이관",
+			},
+		},
+		{
+			// 열은 다 안 붙었고 워터마크도 없다 — **이 계단이 두 축이 독립임을 잠근다**:
+			// artifact_* 둘로 OutcomeOK가 서서 legacy/resolved가 숫자인데, 워터마크 축은
+			// 여전히 `미이관`이다. 경보 칸을 OutcomeOK에 태우는 구현은 여기서 떨어진다.
+			name:      "③ shadow_owned 열 이전 — 워터마크 축은 따로 논다",
+			ddl:       `CREATE TABLE ledger(` + base + `, artifact_id INTEGER, artifact_age_s INTEGER)`,
+			seed:      `INSERT INTO ledger(ts,tool,artifact_id,artifact_age_s) VALUES(1,'ctr_fetch',1,77)`,
+			ledgerOK:  true,
+			outcomeOK: true,
+			want: []string{
+				"\tcalls=1\t", "\tlegacy=0\t", "\tlegacy_after_migrate=미이관\t",
+				"\tresolved=1\t", "\tresolved_artifacts=1\t", "\tmissed=0\t",
+				"\tshadow_rows=미이관\t", "\tshadow_artifacts=미이관\t", "\tage_s p50=미이관",
+			},
+		},
+		{
+			// **측정 구간 첫날의 상태**이자 이 테스트의 대조군: 이관은 끝났고(워터마크까지)
+			// 아직 귀속 해소가 0건이다. 여기서 0들은 **진짜 측정값**이라 숫자로 찍혀야 하고
+			// (표식을 일괄로 바르는 구현은 여기서 떨어진다), 표본이 없는 분위수만 "없음"이다.
+			name:      "④ 완전 이관, 귀속 해소 0건",
+			ddl:       `CREATE TABLE ledger(` + base + `, artifact_id INTEGER, artifact_age_s INTEGER, shadow_owned INTEGER)`,
+			seed:      `PRAGMA user_version = 1`, // 빈 원장의 markLedgerMigrated가 적는 값(= max(id)+1)
+			ledgerOK:  true,
+			outcomeOK: true,
+			shadowOK:  true,
+			markOK:    true,
+			want: []string{
+				"\tcalls=0\t", "\tlegacy=0\t", "\tlegacy_after_migrate=0\t",
+				"\tresolved=0\t", "\tresolved_artifacts=0\t", "\tmissed=0\t",
+				"\tshadow_rows=0\t", "\tshadow_artifacts=0\t", "\tage_s p50=없음 p90=없음 max=없음\n",
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			storeRoot, projectRoot := t.TempDir(), t.TempDir()
+			canon, err := ident.Canonicalize(projectRoot)
+			if err != nil {
+				t.Fatalf("canonicalize: %v", err)
+			}
+			projDir := filepath.Join(storeRoot, "projects", canon.ProjectID)
+			if err := os.MkdirAll(projDir, 0o700); err != nil {
+				t.Fatalf("MkdirAll: %v", err)
+			}
+			if tc.ddl != "" { // ①은 파일을 아예 만들지 않는다
+				db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(filepath.Join(projDir, "ledger.db")))
+				if err != nil {
+					t.Fatalf("sql.Open: %v", err)
+				}
+				if _, err := db.Exec(tc.ddl); err != nil {
+					t.Fatalf("스키마: %v", err)
+				}
+				if tc.seed != "" {
+					if _, err := db.Exec(tc.seed); err != nil {
+						t.Fatalf("행 삽입: %v", err)
+					}
+				}
+				if err := db.Close(); err != nil {
+					t.Fatalf("Close: %v", err)
+				}
+			}
+
+			// 사전 가드: 픽스처가 정말 이 계단인가. 없으면 DDL 한 글자 실수가 이 케이스를
+			// 조용히 다른 계단의 중복으로 만든다.
+			fs, err := store.LedgerFetchStats(projDir)
+			if err != nil {
+				t.Fatalf("LedgerFetchStats: %v", err)
+			}
+			if fs.LedgerOK != tc.ledgerOK || fs.OutcomeOK != tc.outcomeOK ||
+				fs.ShadowOK != tc.shadowOK || fs.MigrateMarkOK != tc.markOK {
+				t.Fatalf("픽스처가 의도한 계단이 아니다: ok=%v/%v/%v/%v 기대 %v/%v/%v/%v",
+					fs.LedgerOK, fs.OutcomeOK, fs.ShadowOK, fs.MigrateMarkOK,
+					tc.ledgerOK, tc.outcomeOK, tc.shadowOK, tc.markOK)
+			}
+
+			var out, errOut bytes.Buffer
+			if err := Run(context.Background(), "stats", nil, storeRoot, projectRoot, "0.0.1-dev", &out, &errOut); err != nil {
+				t.Fatalf("Run stats err=%v out=%s", err, out.String())
+			}
+			got := out.String()
+			for _, w := range tc.want {
+				if !strings.Contains(got, w) {
+					t.Fatalf("회수 줄에 %q 없음 — 못 잰 수를 0으로 찍고 있다:\n%s", w, got)
+				}
+			}
+		})
+	}
+}
+
+// TestStatsTotalExcludesNonCtrRows: `total` 줄은 **`ctr_` 접두 도구만** 합산한다(릴리스 리뷰
+// W1). 훅 포착 활동량 행(`hook:shadow`)은 하루 약 295행이라 그대로 합치면 총계를 지배한다 — 이
+// 릴리스 전 원장의 도구는 전부 `ctr_*`였으므로 제외가 총계의 뜻을 **유지**한다. 총계를 읽는
+// 것은 이제 M6뿐이고 D104의 채택 문턱은 `resolved_artifacts + missed`를 읽는다(W2·F7) — 그래도 이 제외가
+// 필요한 이유는 그 총계가 M6에게 여전히 의미를 가져야 하기 때문이다.
+// 행 자체는 표에 그대로 찍힌다(관측 채널은 안 잃는다).
+func TestStatsTotalExcludesNonCtrRows(t *testing.T) {
+	storeRoot, projectRoot := t.TempDir(), t.TempDir()
+	canon, err := ident.Canonicalize(projectRoot)
+	if err != nil {
+		t.Fatalf("canonicalize: %v", err)
+	}
+	projDir := filepath.Join(storeRoot, "projects", canon.ProjectID)
+	st, err := store.Open(projDir, false)
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	st.LedgerAppend("ctr_search", 10, 20, 1)
+	st.LedgerAppend("ctr_search", 10, 20, 1)
+	for range 5 { // 훅 포착 활동량 행 — 실전에서는 하루 약 295행
+		st.LedgerAppend("hook:shadow", 1000, 0, 1)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatalf("store.Close: %v", err)
+	}
+
+	var out, errOut bytes.Buffer
+	if err := Run(context.Background(), "stats", nil, storeRoot, projectRoot, "0.0.1-dev", &out, &errOut); err != nil {
+		t.Fatalf("Run stats err=%v out=%s", err, out.String())
+	}
+	got := out.String()
+	// 사전 가드: 훅 행이 실제로 표에 있어야 아래 총계 단언이 무언가를 증명한다.
+	if !strings.Contains(got, "hook:shadow\t5\t") {
+		t.Fatalf("훅 행이 표에 없다 — 픽스처가 의도한 상태가 아니다:\n%s", got)
+	}
+	if !strings.Contains(got, "total\t2\t20\t40\t") {
+		t.Fatalf("total이 ctr_* 2건이 아니다(훅 5건이 섞였다):\n%s", got)
+	}
+}
+
 // TestRunStats_Provider: 임시 JSONL 3줄(usage 2건 + 파싱 불가 1건)을 스캔해 실측 토큰 합계와
 // skipped 카운트를 검증한다(설계 §6 provider 계약) — 절약 주장·비교 문구는 없다(실측 합계만).
 func TestRunStats_Provider(t *testing.T) {

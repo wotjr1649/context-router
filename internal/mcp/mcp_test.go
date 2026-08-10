@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"database/sql" // 원장 열을 직접 읽는 테스트용 — mcp **본체**는 아키텍처 "부패 방지 계약"이 이 import를 금지한다
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -2834,3 +2835,381 @@ func TestExportEvents_LedgerAppend(t *testing.T) {
 		t.Fatalf("ctr_export_events ledger row missing: %+v", stats)
 	}
 }
+
+// --- ctr_fetch 원장 계측 (태스크 8b, 설계 v0.20 D103 계약 2·3) ---
+
+// TestFetchRecordsMissOnlyOnAbsentArtifact: 없는 artifact를 요청하면 미해소 행이 남고,
+// 잘못된 chunk id·잘못된 선택자는 남지 않는다. 앞의 둘은 store.ErrNotFound 하나를 공유하므로
+// (store.go:722·607) errors.Is로는 안 갈린다 — 이 테스트가 그 구분을 고정한다(D103 계약 3).
+func TestFetchRecordsMissOnlyOnAbsentArtifact(t *testing.T) {
+	cs, st, _, storeDir := newRecordEventTestServer(t)
+	ctx := context.Background()
+
+	body := "haystack needle haystack"
+	artID, err := st.Register(ctx, store.Registration{
+		StoredBytes: []byte(body), MediaType: "text/plain",
+		Source: store.SourceMeta{URI: "shadow:Bash:hit", Kind: "hook", SrcHash: "sh-hit"},
+		Chunks: []store.Chunk{{Ordinal: 0, ByteEnd: int64(len(body)), Text: body}},
+	})
+	if err != nil {
+		t.Fatalf("register: %v", err)
+	}
+
+	// ① 없는 artifact → 미해소 1행
+	callFetch(t, cs, FetchInput{ArtifactID: artID + 9999, ChunkID: ptrTo(int64(1))})
+	if fs := fetchStats(t, storeDir); fs.Missed != 1 || fs.Resolved != 0 {
+		t.Fatalf("artifact 부재 뒤 resolved=%d missed=%d, 기대 0/1", fs.Resolved, fs.Missed)
+	}
+	// ② 있는 artifact + 없는 chunk id → 입력 문제다, 미해소가 늘면 안 된다
+	callFetch(t, cs, FetchInput{ArtifactID: artID, ChunkID: ptrTo(int64(999_999))})
+	if fs := fetchStats(t, storeDir); fs.Missed != 1 {
+		t.Fatalf("잘못된 chunk id가 미해소로 셌다: missed=%d, 기대 1", fs.Missed)
+	}
+	// ③ 선택자 없음 → ReadRange까지 가지 않는다. selectorFromInput의 "정확히 1개" 게이트
+	// (mcp.go:484-486)가 먼저 거른다. ReadRange 자신의 ErrInvalidSelector(store.go:712-716,
+	// 미인식 sel.Kind)는 selectorFromInput이 "chunk"/"line"/"byte" 외의 Kind를 절대 만들지
+	// 않으므로 ctr_fetch 경로로는 구조적으로 도달 불가능하다 — 그래도 미해소가 늘면 안 되는
+	// 것은 다른 잘못된 입력과 같다.
+	callFetch(t, cs, FetchInput{ArtifactID: artID})
+	if fs := fetchStats(t, storeDir); fs.Missed != 1 {
+		t.Fatalf("잘못된 선택자가 미해소로 셌다: missed=%d, 기대 1", fs.Missed)
+	}
+}
+
+// TestFetchRecordsAgeOnResolve: 해소되면 나이가 박힌다. 시계는 max(sources.indexed_at)이므로
+// 소스 시각을 과거로 옮기면 그만큼 나이가 나온다(D103 계약 2).
+func TestFetchRecordsAgeOnResolve(t *testing.T) {
+	cs, st, _, storeDir := newRecordEventTestServer(t)
+	ctx := context.Background()
+	body := "resolved body"
+	artID, err := st.Register(ctx, store.Registration{
+		StoredBytes: []byte(body), MediaType: "text/plain",
+		Source: store.SourceMeta{URI: "shadow:Bash:age", Kind: "hook", SrcHash: "sh-age"},
+		Chunks: []store.Chunk{{Ordinal: 0, ByteEnd: int64(len(body)), Text: body}},
+	})
+	if err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	if _, err := st.Reader().Exec(
+		`UPDATE sources SET indexed_at=? WHERE uri='shadow:Bash:age'`,
+		time.Now().Add(-2*time.Hour).Unix(),
+	); err != nil {
+		t.Fatalf("소스 시각: %v", err)
+	}
+
+	callFetch(t, cs, FetchInput{ArtifactID: artID, ByteStart: ptrTo(int64(0)), ByteEnd: ptrTo(int64(5))})
+	fs := fetchStats(t, storeDir)
+	if fs.Resolved != 1 || fs.Missed != 0 {
+		t.Fatalf("resolved=%d missed=%d, 기대 1/0", fs.Resolved, fs.Missed)
+	}
+	if fs.AgeMax < 7000 || fs.AgeMax > 7400 { // 2시간 = 7200초, 실행 시각 오차 허용
+		t.Fatalf("AgeMax=%d, 기대 약 7200", fs.AgeMax)
+	}
+}
+
+// TestFetchRecordsShadowOwnershipOnResolve: 해소 행에 **퍼지 대상 여부**가 함께 박힌다
+// (릴리스 리뷰 소견 F4). explicit 아티팩트는 보존 창이 손대지 않으므로 그 회수 나이는 창의
+// 길이에 대해 아무 말도 하지 않는데, 표식이 없으면 그 회수가 D104의 "해소 30건"을 채우고
+// 분위수까지 지배한다. **표식이 없거나 항상 참이면 이 테스트가 두 군데서 떨어진다** —
+// explicit 쪽 나이를 hook 쪽보다 두 자릿수 크게 심어 두었기 때문이다.
+func TestFetchRecordsShadowOwnershipOnResolve(t *testing.T) {
+	cs, st, _, storeDir := newRecordEventTestServer(t)
+	ctx := context.Background()
+	reg := func(body, uri, kind string) int64 {
+		t.Helper()
+		id, err := st.Register(ctx, store.Registration{
+			StoredBytes: []byte(body), MediaType: "text/plain",
+			Source: store.SourceMeta{URI: uri, Kind: kind, SrcHash: "sh-" + uri},
+			Chunks: []store.Chunk{{Ordinal: 0, ByteEnd: int64(len(body)), Text: body}},
+		})
+		if err != nil {
+			t.Fatalf("register %s: %v", uri, err)
+		}
+		return id
+	}
+	hookID := reg("hook captured body", "shadow:Bash:owned", "hook")
+	fileID := reg("explicitly indexed body", "/tmp/explicit.txt", "file")
+	age := func(uri string, ago time.Duration) {
+		t.Helper()
+		if _, err := st.Reader().Exec(
+			`UPDATE sources SET indexed_at=? WHERE uri=?`, time.Now().Add(-ago).Unix(), uri,
+		); err != nil {
+			t.Fatalf("소스 시각 %s: %v", uri, err)
+		}
+	}
+	age("shadow:Bash:owned", time.Hour)           // 3600초
+	age("/tmp/explicit.txt", 500_000*time.Second) // 두 자릿수 더 큰 나이
+	// 사전 가드: 두 아티팩트가 정말 별개 hash여야 한다 — 같으면 귀속 판정이 한 집합에 섞인다.
+	var hashes int
+	if err := st.Reader().QueryRow(
+		`SELECT count(DISTINCT content_hash) FROM artifacts WHERE id IN (?,?)`, hookID, fileID,
+	).Scan(&hashes); err != nil {
+		t.Fatalf("hash 확인: %v", err)
+	}
+	if hashes != 2 {
+		t.Fatalf("픽스처가 의도한 상태가 아니다: 별개 hash %d개(기대 2)", hashes)
+	}
+
+	callFetch(t, cs, FetchInput{ArtifactID: hookID, ByteStart: ptrTo(int64(0)), ByteEnd: ptrTo(int64(5))})
+	callFetch(t, cs, FetchInput{ArtifactID: fileID, ByteStart: ptrTo(int64(0)), ByteEnd: ptrTo(int64(5))})
+
+	fs := fetchStats(t, storeDir)
+	if fs.Resolved != 2 {
+		t.Fatalf("Resolved=%d want 2 — 채택 게이트는 두 회수를 다 센다", fs.Resolved)
+	}
+	if fs.ShadowResolved != 1 {
+		t.Fatalf("ShadowResolved=%d want 1 — explicit 회수가 퍼지 대상 모집단에 섞였다", fs.ShadowResolved)
+	}
+	if fs.AgeMax < 3500 || fs.AgeMax > 3700 {
+		t.Fatalf("AgeMax=%d, 기대 약 3600 — explicit 쪽 500000초가 분포를 지배했다", fs.AgeMax)
+	}
+}
+
+// TestFetchRecordsZeroAgeWhenSourceAbsent: LastIndexedAtByHash가 (0, nil)을 내는 경로 —
+// source 행이 없으면(artifact·chunks는 남아 ReadRange는 여전히 해소된다) at>0 조건이
+// 거짓이라 ageS는 초기값 0에 머문다. 나이 조회 실패·부재가 회수 자체를 실패시키지 않는다는
+// 계약(mcp.go의 fetch 핸들러 주석)의 유일한 실행 증거 — 해소·미해소 두 테스트 모두 이 분기를
+// 지나지 않는다. AgeMax는 원장 전체의 max이므로 다른 나이 값과 섞이면 못 잰다 — 전용 서버.
+func TestFetchRecordsZeroAgeWhenSourceAbsent(t *testing.T) {
+	cs, st, _, storeDir := newRecordEventTestServer(t)
+	ctx := context.Background()
+	body := "no source body"
+	artID, err := st.Register(ctx, store.Registration{
+		StoredBytes: []byte(body), MediaType: "text/plain",
+		Source: store.SourceMeta{URI: "shadow:Bash:noage", Kind: "hook", SrcHash: "sh-noage"},
+		Chunks: []store.Chunk{{Ordinal: 0, ByteEnd: int64(len(body)), Text: body}},
+	})
+	if err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	if _, err := st.Reader().Exec(`DELETE FROM sources WHERE uri='shadow:Bash:noage'`); err != nil {
+		t.Fatalf("소스 삭제: %v", err)
+	}
+	// 사전 가드: DELETE가 실패해 조용히 age-양성 테스트의 중복이 되는 것을 막는다.
+	var remaining int
+	if err := st.Reader().QueryRow(`SELECT count(*) FROM sources WHERE artifact_id=?`, artID).Scan(&remaining); err != nil {
+		t.Fatalf("소스 잔존 확인: %v", err)
+	}
+	if remaining != 0 {
+		t.Fatalf("소스 삭제 실패: 잔존 %d행", remaining)
+	}
+
+	callFetch(t, cs, FetchInput{ArtifactID: artID, ByteStart: ptrTo(int64(0)), ByteEnd: ptrTo(int64(5))})
+	fs := fetchStats(t, storeDir)
+	if fs.Resolved != 1 || fs.Missed != 0 {
+		t.Fatalf("resolved=%d missed=%d, 기대 1/0", fs.Resolved, fs.Missed)
+	}
+	// 소스가 없으면 hook 소스도 없다 = 퍼지 술어가 고르지 않는다 → 귀속 모집단 밖이다(소견 F4).
+	if fs.ShadowResolved != 0 || fs.AgeMax != 0 {
+		t.Fatalf("ShadowResolved=%d AgeMax=%d, 기대 0/0 (source 부재 폴백)", fs.ShadowResolved, fs.AgeMax)
+	}
+	// 소견 F6: 그 행의 나이는 **NULL**이어야 한다. 0으로 적히면 "방금 포착한 것을 같은 초에
+	// 회수했다"와 같은 값이 되고, 집계만 보는 위 두 단언은 그 차이를 못 본다 — 열을 직접 읽는다.
+	if got := ledgerAgeCell(t, storeDir); got != "NULL" {
+		t.Fatalf("artifact_age_s=%s, 기대 NULL (나이 미상)", got)
+	}
+}
+
+// --- 요청 ctx 취소와 시계 역행 (릴리스 패스 소견 F3·F9) ---
+
+// registerAgedHookArtifact — hook 소스 하나짜리 아티팩트를 등록하고 그 소스의 indexed_at을
+// now+offset으로 옮긴다(offset이 음수면 그만큼 늙은 것, 양수면 **시계가 뒤로 간 뒤에 본 미래
+// 타임스탬프**다). 반환은 (artifact id, content_hash).
+// 사전 가드: 나이 시계와 귀속 표식이 정말 심은 대로인지 LastIndexedAtByHash로 확인한다 —
+// 소스가 안 옮겨졌거나 hook 귀속이 아니면 아래 단정들이 다른 이유로 통과·실패한다.
+func registerAgedHookArtifact(t *testing.T, st *store.Store, body, uri string, offset time.Duration) (int64, string) {
+	t.Helper()
+	ctx := context.Background()
+	artID, err := st.Register(ctx, store.Registration{
+		StoredBytes: []byte(body), MediaType: "text/plain",
+		Source: store.SourceMeta{URI: uri, Kind: "hook", SrcHash: "sh-" + uri},
+		Chunks: []store.Chunk{{Ordinal: 0, ByteEnd: int64(len(body)), Text: body}},
+	})
+	if err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	want := time.Now().Add(offset).Unix()
+	if _, err := st.Reader().Exec(`UPDATE sources SET indexed_at=? WHERE uri=?`, want, uri); err != nil {
+		t.Fatalf("소스 시각: %v", err)
+	}
+	var hash string
+	if err := st.Reader().QueryRow(`SELECT content_hash FROM artifacts WHERE id=?`, artID).Scan(&hash); err != nil {
+		t.Fatalf("content_hash: %v", err)
+	}
+	at, owned, err := st.LastIndexedAtByHash(ctx, hash)
+	if err != nil {
+		t.Fatalf("사전 가드 LastIndexedAtByHash: %v", err)
+	}
+	if at != want || !owned {
+		t.Fatalf("픽스처가 의도한 상태가 아니다: indexed_at=%d(기대 %d) shadow 귀속=%v(기대 true)", at, want, owned)
+	}
+	return artID, hash
+}
+
+// cancelledCtx — 이미 취소된 요청 ctx. 사용자가 Esc를 누르거나 클라이언트가 시간 초과해
+// 핸들러의 ctx가 죽은 상태를 결정론적으로 만든다.
+func cancelledCtx(t *testing.T) context.Context {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if ctx.Err() == nil {
+		t.Fatal("사전 가드: ctx가 취소되지 않았다 — 아래 단정이 취소 없는 정상 경로를 재게 된다")
+	}
+	return ctx
+}
+
+// TestFetchResolveRecordsUnderCancelledCtx — 릴리스 패스 소견 F3. 응답을 **다 만든 뒤** 요청
+// ctx가 취소되면(Esc·클라이언트 시간 초과) database/sql이 그 ctx의 ExecContext를 거절하고
+// best-effort `_, _ =`가 그 오류를 삼켜, **실제로 성공한 회수가 원장에 흔적을 안 남긴다**.
+// 바로 위의 나이 조회도 같은 ctx에서 죽으므로 살아남은 행조차 나이도 귀속 표식도 없다.
+// 취소는 부하와 상관이 있어 14일 동안 resolved·resolved_artifacts·shadow_artifacts가 함께
+// 낮게 나오고, 정말 쓰인 창이 채택 문턱 미달로 읽혀 D104가 창의 판정 대신 "채택의 문제"로
+// 떨어진다 — 이 계측이 사고로 도달하지 않으려는 바로 그 결론이다.
+// 세 단정이 각각 원장 기록·나이 조회·귀속 조회의 생존을 잡는다.
+func TestFetchResolveRecordsUnderCancelledCtx(t *testing.T) {
+	_, st, _, storeDir := newRecordEventTestServer(t)
+	artID, hash := registerAgedHookArtifact(t, st, "cancelled but resolved", "shadow:Bash:cancel", -2*time.Hour)
+
+	recordFetchResolve(cancelledCtx(t), st, artID, hash, 123, 4)
+
+	fs := fetchStats(t, storeDir)
+	if fs.Resolved != 1 {
+		t.Fatalf("Resolved=%d want 1 — 성공한 회수의 행이 ctx 취소로 사라졌다", fs.Resolved)
+	}
+	if fs.ShadowResolved != 1 {
+		t.Fatalf("ShadowResolved=%d want 1 — 행은 남았는데 귀속 조회가 취소된 ctx에서 죽었다", fs.ShadowResolved)
+	}
+	if fs.AgeMax < 7000 || fs.AgeMax > 7400 { // 2시간 = 7200초, 실행 시각 오차 허용
+		t.Fatalf("AgeMax=%d, 기대 약 7200 — 나이 조회가 취소된 ctx에서 죽었다", fs.AgeMax)
+	}
+}
+
+// TestFetchMissRecordsUnderCancelledCtx — 같은 소견 F3의 미해소 쪽. 여기서는 원장 쓰기 앞의
+// **판별 질의**(ArtifactHashByID)가 먼저 죽는다: 취소된 ctx에서 그것은 ErrNotFound가 아니라
+// 드라이버 오류를 내므로 미해소 행은 삼켜지는 게 아니라 아예 시도되지 않는다. 미해소가 적게
+// 세이면 D104의 "미해소 5건" 발화가 미달로 떨어져 편향 방향은 해소 쪽과 같다 — 창이 넉넉해
+// 보인다.
+func TestFetchMissRecordsUnderCancelledCtx(t *testing.T) {
+	_, st, _, storeDir := newRecordEventTestServer(t)
+	const absentID = 424242
+	// 사전 가드: 그 id가 정말 없어야 미해소다. 있으면 이 테스트는 아무것도 안 재게 된다.
+	if _, err := st.ArtifactHashByID(context.Background(), absentID); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("사전 가드: artifact %d가 부재가 아니다(err=%v)", absentID, err)
+	}
+
+	recordFetchMiss(cancelledCtx(t), st, absentID, 3)
+
+	fs := fetchStats(t, storeDir)
+	if fs.Missed != 1 || fs.Resolved != 0 {
+		t.Fatalf("resolved=%d missed=%d, 기대 0/1 — 미해소 행이 ctx 취소로 사라졌다", fs.Resolved, fs.Missed)
+	}
+}
+
+// TestFetchLedgerCtxIsDetachedButBounded — 소견 F3의 고침이 **두 조건을 동시에** 만족하는지
+// 잰다. 위 두 테스트는 앞 절반(취소가 안 옮는다)만 잡는데, 뒤 절반 없이 앞 절반만 있으면
+// 죽은 요청 위에서 무한히 기다리는 쓰기가 되어 그 자체로 결함이다. 상한이 DSN pragma와 풀
+// 크기에서 추론되는 값이 아니라 코드에 적힌 리터럴이라는 것이 요지다(fetchLedgerBudget).
+func TestFetchLedgerCtxIsDetachedButBounded(t *testing.T) {
+	lctx, cancel := fetchLedgerCtx(cancelledCtx(t))
+	defer cancel()
+	if err := lctx.Err(); err != nil {
+		t.Fatalf("떼어 낸 ctx가 이미 죽었다: %v — 요청 취소가 그대로 옮았다", err)
+	}
+	dl, ok := lctx.Deadline()
+	if !ok {
+		t.Fatal("기한이 없다 — 죽은 요청 위의 무한 쓰기다")
+	}
+	if left := time.Until(dl); left <= 0 || left > fetchLedgerBudget {
+		t.Fatalf("남은 기한 %v, 기대 (0, %v] — 상한이 의도한 값이 아니다", left, fetchLedgerBudget)
+	}
+}
+
+// TestFetchNegativeAgeIsUnknownNotZero — 릴리스 패스 소견 F9. NTP 스텝·VM 재개·듀얼부팅이
+// 벽시계를 뒤로 돌리면, 스텝 **이전에** 포착된 아티팩트의 indexed_at은 새 시계 기준으로 미래다.
+// 그때 `time.Now().Unix() - at`은 음수이고, 하한이 없으면 그 값이 그대로 원장에 적힌다.
+// 음수는 `ORDER BY artifact_age_s`에서 선두로 정렬되므로 p50·p90을 아래로 끌고, D104 행 5는
+// 그 p90을 보존 창의 처방값으로 바꾼다 — 계측이 참값보다 **짧은** 창을 처방하게 된다.
+//
+// **픽스처가 세 후보를 갈라 놓는다**(indexed_at = now+30분):
+//   - 하한 없음(naive): 셀 "-1800", ShadowResolved=1, AgeMax=-1800 — 분포에 들어간다
+//   - 0으로 클램프:      셀 "0",     ShadowResolved=1, AgeMax=0    — "방금 포착"이라는 측정을 주장한다
+//   - 미상(nil, 채택):   셀 "NULL",  ShadowResolved=0, AgeMax=0    — 측정이 없다고 인정한다
+//
+// 셋 다 Resolved=1이다 — 시계가 어긋났어도 바이트는 실제로 돌려줬고, 그 사실까지 버리면
+// 채택 게이트가 F3과 같은 방향으로 또 낮아진다.
+func TestFetchNegativeAgeIsUnknownNotZero(t *testing.T) {
+	cs, st, _, storeDir := newRecordEventTestServer(t)
+	artID, _ := registerAgedHookArtifact(t, st, "clock stepped back", "shadow:Bash:skew", 30*time.Minute)
+
+	callFetch(t, cs, FetchInput{ArtifactID: artID, ByteStart: ptrTo(int64(0)), ByteEnd: ptrTo(int64(5))})
+
+	fs := fetchStats(t, storeDir)
+	if fs.Resolved != 1 || fs.Missed != 0 {
+		t.Fatalf("resolved=%d missed=%d, 기대 1/0 — 시계 역행이 회수 자체를 버렸다", fs.Resolved, fs.Missed)
+	}
+	if got := ledgerAgeCell(t, storeDir); got != "NULL" {
+		t.Fatalf("artifact_age_s=%s, 기대 NULL — 음수 나이는 아티팩트가 젊다는 증거가 아니라 시계가 움직였다는 증거다", got)
+	}
+	if fs.ShadowResolved != 0 || fs.AgeMax != 0 {
+		t.Fatalf("ShadowResolved=%d AgeMax=%d, 기대 0/0 — 시계가 어긋난 표본이 분위수 모집단에 들어갔다", fs.ShadowResolved, fs.AgeMax)
+	}
+}
+
+// ledgerAgeCell — storeDir 원장의 유일한 ctr_fetch 행에서 artifact_age_s를 문자열로 읽는다
+// ("NULL" 또는 십진수). 행이 하나가 아니면 실패한다 — 이 헬퍼를 쓰는 테스트는 전용 서버에서
+// 단일 회수만 한다는 전제 위에 서 있고, 그 전제가 깨지면 어느 행을 본 것인지 알 수 없다.
+func ledgerAgeCell(t *testing.T, storeDir string) string {
+	t.Helper()
+	db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(filepath.Join(storeDir, "ledger.db"))+"?mode=ro")
+	if err != nil {
+		t.Fatalf("ledger open: %v", err)
+	}
+	defer db.Close()
+	rows, err := db.Query(`SELECT artifact_age_s FROM ledger WHERE tool='ctr_fetch'`)
+	if err != nil {
+		t.Fatalf("ledger query: %v", err)
+	}
+	defer rows.Close()
+	var cells []string
+	for rows.Next() {
+		var age sql.NullInt64
+		if err := rows.Scan(&age); err != nil {
+			t.Fatalf("scan: %v", err)
+		}
+		if !age.Valid {
+			cells = append(cells, "NULL")
+			continue
+		}
+		cells = append(cells, strconv.FormatInt(age.Int64, 10))
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("rows: %v", err)
+	}
+	if len(cells) != 1 {
+		t.Fatalf("ctr_fetch 행 %d개(기대 1): %v", len(cells), cells)
+	}
+	return cells[0]
+}
+
+// callFetch: ctr_fetch를 한 번 부른다. 오류 응답도 정상 반환이다(IsError로 온다) — 이 테스트가
+// 재는 것은 응답이 아니라 원장이다.
+func callFetch(t *testing.T, cs *mcp.ClientSession, in FetchInput) {
+	t.Helper()
+	if _, err := cs.CallTool(context.Background(),
+		&mcp.CallToolParams{Name: "ctr_fetch", Arguments: in}); err != nil {
+		t.Fatalf("call ctr_fetch: %v", err)
+	}
+}
+
+// fetchStats: storeDir의 원장에서 회수 실적을 읽는다(라이브 writer와 동시 열기 —
+// TestRecordEventLedgerAppend가 LedgerStats로 하는 것과 같은 형태다).
+func fetchStats(t *testing.T, storeDir string) store.FetchStat {
+	t.Helper()
+	fs, err := store.LedgerFetchStats(storeDir)
+	if err != nil {
+		t.Fatalf("LedgerFetchStats: %v", err)
+	}
+	return fs
+}
+
+func ptrTo[T any](v T) *T { return &v }

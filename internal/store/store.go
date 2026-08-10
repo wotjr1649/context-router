@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -32,9 +33,38 @@ type Store struct {
 	dir            string
 	writer, reader *sql.DB
 	ledger         *sql.DB
+	// ledgerCols — Open 시점에 관측한 ledger 테이블의 실제 열 집합(migrateLedger가 낸다).
+	// LedgerAppendFetch가 **있는 열만 지명**하려고 읽는다(릴리스 패스 소견 F1): 읽는 쪽이
+	// PRAGMA table_info로 부분 이관을 관용하는데 쓰는 쪽만 세 열을 무조건 지명하면, 그 원장에서
+	// INSERT가 통째로 거절되고 best-effort 관례가 그 오류를 삼킨다.
+	// **Open 시점 스냅샷이라 낡을 수 있다** — 이 Store가 살아 있는 동안 다른 프로세스가 writable
+	// Open으로 열을 붙일 수 있다(원장 DDL은 store open-lock 안에서 도는데 그 잠금은 Open 반환과
+	// 함께 풀린다). 그때 이 Store는 한 계단 아래 형태로 계속 적고, 그 행들은 레거시로 읽힌다 —
+	// 편향이지 유실이 아니다. 매 INSERT마다 PRAGMA를 다시 도는 값은 하지 않는다.
+	ledgerCols map[string]bool
 }
 
-const pragmas = "?_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)&_pragma=busy_timeout(5000)&_pragma=foreign_keys(ON)"
+// journalSizeLimit — D102 계약 5·6·9: 병합(`optimize`)이 훑고 지나가며 남기는 WAL 고수위를
+// 되돌리는 바닥값. DSN에 이 pragma가 없으면 번들 SQLite 기본 −1이 걸려 체크포인트가 WAL을
+// *재사용*할 뿐 줄이지 않고(계약 5), 그 몫이 서버 세션 내내 `doctor [14]`의 file 축(계약 6,
+// 본체+`-wal`+`-shm`)에 잡힌다. wal_autocheckpoint가 1000페이지(4 MiB)라 정상 운용의 WAL
+// 작업 집합은 그 언저리다 — 32 MiB는 그 위로 넉넉해 평시에는 절단이 아예 일어나지 않고
+// (반복 truncate/extend로 쓰기 경로를 무겁게 만들지 않는다), 병합이 만드는 96 MiB
+// 스파이크보다는 확실히 아래라 그 몫이 회수된다.
+//
+// 병합 뒤 CheckpointTruncate를 직접 부르는 대신 DSN 파라미터를 쓴다 — 전자는 열린 reader와
+// 공존 시 busy_timeout 소진까지 최대 5초 쓰기 락을 늘리지만(TestCheckpointTruncateBusyWithReader),
+// 후자는 추가 락 보유가 0이다(계약 9가 최소화하려는 바로 그 구간).
+//
+// 바닥이지 0이 아니다: 절단은 체크포인트 자체가 아니라 그 뒤 빈 WAL에 첫 프레임을 쓰는
+// 다음 커밋에서 일어난다(modernc.org/sqlite 소스 대조, TestJournalSizeLimitShrinksWALOnPassiveCheckpoint
+// 참고) — 병합 직후 리더가 물려 있으면 체크포인트가 부분에 그쳐 절단이 미뤄지고, 다음 커밋의
+// 체크포인트가 완료될 때 96 MiB → 32 MiB로 내려간다(자기 치유이되 즉시는 아니다). 문자열
+// 상수인 이유는 pragmas DSN에 그대로 연결하고, 테스트도 이 상수 하나만 읽어 값을 두 곳에
+// 적지 않기 위해서다.
+const journalSizeLimit = "33554432" // 32 MiB
+
+const pragmas = "?_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)&_pragma=busy_timeout(5000)&_pragma=foreign_keys(ON)&_pragma=journal_size_limit(" + journalSizeLimit + ")"
 
 const lockFileName = "content.db.rebuild.lock"
 
@@ -153,11 +183,22 @@ func OpenContext(ctx context.Context, dir string, readOnly bool) (*Store, error)
 			l.SetMaxOpenConns(1)
 			// ledger는 best-effort 보조 DB(Store 계약 미포함, Close와 동일 취급) — 테이블 생성
 			// 실패해도 이후 ledger insert들이 그냥 계속 실패할 뿐 Store 본체 동작에는 영향 없다.
-			_, _ = l.Exec(`CREATE TABLE IF NOT EXISTS ledger(
+			// 그래도 침묵하지는 않는다(릴리스 패스 소견 F11): 이 실패는 이 세션의 사용량 기록을
+			// 통째로 없애는데, 로그에 안 남으면 관측할 길 자체가 없다 — MergeFTSIfDue의 스탬프
+			// 실패를 경고로 바꾼 것과 같은 판단이다.
+			if _, err := l.Exec(`CREATE TABLE IF NOT EXISTS ledger(
 				id INTEGER PRIMARY KEY, ts INTEGER NOT NULL, tool TEXT NOT NULL,
 				bytes_stored INTEGER NOT NULL DEFAULT 0, bytes_returned INTEGER NOT NULL DEFAULT 0,
-				duration_ms INTEGER NOT NULL DEFAULT 0)`)
+				duration_ms INTEGER NOT NULL DEFAULT 0)`); err != nil {
+				slog.Warn("store: 원장 테이블 생성 실패 — 이 세션의 사용량 기록이 통째로 유실된다", "error", err)
+			}
+			// D103 계약 1의 세 열(회수 실적 둘 + 소견 F4의 귀속 표식)을 옛 ledger.db에도 붙인다.
+			// **없는 열만** 붙이고 실패는 경고로 낸다 — 근거는 migrateLedger의 주석(소견 F11).
+			// 셋은 독립 문장이라 일부만 성공한 부분 이관이 여전히 도달 가능하고, 그때 읽는 쪽은
+			// PRAGMA table_info로 있는 열만 보고(계약 7) 쓰는 쪽은 아래 ledgerCols로 같은 계단을
+			// 탄다 — 둘이 갈리면 소견 F1이다.
 			s.ledger = l
+			s.ledgerCols = migrateLedger(l)
 		}
 	}
 	return s, nil
@@ -990,12 +1031,123 @@ func (s *Store) GCOrphanBlobs(ctx context.Context) (removed int64, err error) {
 }
 
 // LedgerAppend: best-effort 사용량 기록 — ledger 없음/오류는 무시(§3.5).
+// 기존 호출부 아홉 곳(전부 internal/mcp)의 시그니처를 유지하려고 남긴 얇은 위임이다.
 func (s *Store) LedgerAppend(tool string, stored, returned, ms int64) {
+	s.LedgerAppendContext(context.Background(), tool, stored, returned, ms)
+}
+
+// LedgerAppendContext — D103 계약 8: ctx를 ExecContext로 넘기는 원장 기록. **훅이 부르는
+// 경로가 이것이다**: ledger.db의 busy_timeout은 5000 ms인데 훅의 총예산은 2000 ms라
+// (internal/hook/hook.go의 defaultDeadlineMS·deadline) ctx 없이 쓰면 훅 프로세스가 겹칠 때 그
+// INSERT가 예산 밖에서 블록된다. 예산 초과는 오류로 돌아오고 best-effort라 삼켜진다 — 훅의
+// fail-open이 유지된다.
+func (s *Store) LedgerAppendContext(ctx context.Context, tool string, stored, returned, ms int64) {
 	if s.ledger == nil {
 		return
 	}
-	_, _ = s.ledger.Exec(`INSERT INTO ledger(ts,tool,bytes_stored,bytes_returned,duration_ms) VALUES(?,?,?,?,?)`,
+	_, _ = s.ledger.ExecContext(ctx,
+		`INSERT INTO ledger(ts,tool,bytes_stored,bytes_returned,duration_ms) VALUES(?,?,?,?,?)`,
 		time.Now().Unix(), tool, stored, returned, ms)
+}
+
+// lastIndexedAtByHashQuery — 나이 시계와 shadow 귀속 여부를 **한 왕복에** 낸다.
+// 귀속 술어를 손으로 다시 쓰지 않고 퍼지가 쓰는 그 상수(shadowOwnedHashQuery)를 EXISTS로
+// 감싸는 것이 요지다(소견 F4): 정의가 갈리는 순간 나이 분포가 보존 창이 실제로 지우는 집합과
+// 다른 모집단을 재게 된다. EXISTS 안의 `a`는 바깥 `a`를 가리는 별개 별칭이라 상관 참조가
+// 아니고, 그래서 같은 hash를 인자로 한 번 더 바인딩한다(두 `?`는 같은 값).
+// 집계라 소스가 한 행도 없어도 1행이 오는데 그때 두 값은 NULL일 수 있다 — 호출부가 NULL을
+// (0, false)로 받는다.
+const lastIndexedAtByHashQuery = `SELECT max(s.indexed_at), EXISTS(` + shadowOwnedHashQuery + `
+  AND a.content_hash = ?)
+	FROM sources s JOIN artifacts a ON a.id = s.artifact_id
+	WHERE a.content_hash = ?`
+
+// LastIndexedAtByHash — D103 계약 2: 이 콘텐츠의 **마지막 포착** 시각(unix 초)과, 소견 F4의
+// **shadow 귀속 여부**. 시계도 범위도 D67 퍼지와 같은 것을 쓴다 — 퍼지 술어
+// (shadowOwnedFilter의 cutoffUnix 분기가 붙이는 나이 절)가 같은 content_hash를 가진 모든 artifact의
+// 모든 소스에 대해 indexed_at을 보므로, 나이도 그렇게 재야 분포가 보존 창 위에 그대로
+// 겹쳐진다. artifact 단위로 재면 형제가 방금 재포착된 아티팩트가 실제보다 늙어 보이고 그
+// 오차는 창을 늘리는 쪽으로만 작용한다. 소스가 없으면 (0, false, nil).
+// **귀속 여부를 회수 시점에 함께 내는 이유**: explicit 아티팩트는 퍼지 대상이 아니라 영원히
+// 남으므로 그 회수 나이는 창의 길이에 대해 아무 말도 하지 않는데, 나중에는 아티팩트 자체가
+// 없어 되물을 수 없다. 오류일 때 호출부가 받는 false는 "explicit이다"가 아니라 "모른다"이고,
+// 모든 귀속 제한 질의가 그 행을 똑같이 뺀다.
+// 색인: artifacts는 UNIQUE(content_hash, media_type)의 선두 컬럼이, sources는
+// idx_sources_artifact_indexed(artifact_id, indexed_at)가 각각 덮는다.
+func (s *Store) LastIndexedAtByHash(ctx context.Context, contentHash string) (int64, bool, error) {
+	var ts sql.NullInt64
+	var owned sql.NullBool
+	if err := s.reader.QueryRowContext(ctx, lastIndexedAtByHashQuery, contentHash, contentHash).
+		Scan(&ts, &owned); err != nil {
+		return 0, false, fmt.Errorf("store LastIndexedAtByHash: %w", err)
+	}
+	return ts.Int64, owned.Bool, nil // NullInt64/NullBool의 무효값은 0/false다
+}
+
+// LedgerAppendFetch — D103: ctr_fetch 전용 원장 기록. artifactID<=0이면 artifact_id를 NULL로,
+// artifact_age_s를 **−1**로 남겨 **해소되지 않은 회수**를 기록한다 — 그것이 "창이 짧아서 못
+// 찾았다"의 유일한 직접 증거이고, 성공 기록만 남기면 영원히 나오지 않는다(계약 3).
+// −1인 이유: ALTER가 남긴 레거시 행은 두 열이 다 NULL이라 그 둘을 값으로 갈라야 한다(계약 1).
+// shadowOwned는 **해소 행에만** 값으로 남는다(소견 F4) — 미해소 행은 아티팩트가 없어 귀속을
+// 물을 수 없으므로 NULL이다. 0으로 적으면 "explicit이었다"는 거짓 진술이 되고, 그 거짓이
+// 나중에 창과 무관한 회수를 창의 증거로 만든다.
+// ageS가 **nil이면 나이 미상**이고 NULL로 적는다(소견 F6) — 0으로 적으면 "방금 포착한 것을
+// 같은 초에 회수했다"와 구분되지 않아 분포를 아래로 끌어내린다. 그 행도 해소로는 센다(바이트를
+// 실제로 돌려줬다). *int64인 이유: 아키텍처 문서 "부패 방지 계약"의 mcp god package 방지
+// 항목이 internal/mcp의 `database/sql` import를 금지해 sql.NullInt64를 호출부에 둘 수 없다.
+// ctx는 **부르는 쪽이 정한 예산**을 탄다. 형제 LedgerAppendContext와 시그니처는 같지만 **계약 8과
+// 같은 이유는 아니다** — 두 호출부가 일부러 서로 다른 ctx를 건넨다(D103 계약 8 ★★, 소견 F3).
+// 훅은 제 요청 ctx를 그대로 넘긴다: 총예산 2000 ms에 ledger.db의 busy_timeout이 5000 ms라
+// 예산 밖으로 밀린 INSERT는 **잘려 나가는 것이 옳고**, 훅의 fail-open이 그 위에 선다.
+// ctr_fetch는 반대로 요청 ctx에서 **떼어 낸** ctx를 넘긴다(mcp의 fetchLedgerCtx): 이 행은 응답을
+// 다 만든 뒤에 쓰는데 그 사이 사용자가 취소하면 **실제로 성공한 회수가 흔적 없이 사라지고**,
+// 취소는 부하와 상관돼 있어 그 손실이 무작위가 아니다. 거기에는 자를 예산이 없으므로 자르는 것이
+// 계측을 잃는 것뿐이다. **여기를 "일관성 있게" 맞추려고 요청 ctx를 흘려보내면 F3이 되살아난다.**
+// LedgerAppend와 같은 best-effort 계약이다(ledger 없음·오류는 무시). S4: 정수와 도구 이름만
+// 담는다 — 선택자도 경로도 내용도 담지 않는다(계약 6).
+// **부분 이관 원장에서는 있는 열까지만 적고 퇴화한다**(릴리스 패스 소견 F1) — 계단은 아래
+// switch에 있고, 읽는 쪽 LedgerFetchStats의 계단과 같은 자리에서 갈린다.
+func (s *Store) LedgerAppendFetch(ctx context.Context, returned, ms, artifactID int64, ageS *int64, shadowOwned bool) {
+	if s.ledger == nil {
+		return
+	}
+	var idCol, owned any  // nil = NULL
+	age := any(int64(-1)) // 미해소 표식
+	if artifactID > 0 {
+		idCol, owned = artifactID, shadowOwned
+		age = nil // 나이 미상
+		if ageS != nil {
+			age = *ageS
+		}
+	}
+	// 있는 열만 지명한다 — 계단은 읽는 쪽(LedgerFetchStats)의 것과 **같은 둘**이다(소견 F1).
+	// 갈라 두면 부분 이관 원장에서 INSERT가 통째로 거절되고 best-effort 관례가 그 오류를 삼켜
+	// 해소도 미해소도 한 행 없이 사라지는데, 읽는 쪽은 그 계단에서 OutcomeOK를 세우므로 `stats`가
+	// 그 0을 측정값으로 렌더한다.
+	switch {
+	case !s.ledgerCols["artifact_id"] || !s.ledgerCols["artifact_age_s"]:
+		// 결과를 적을 두 열이 없다. 판정의 축은 artifact_id이므로 하나만 있어도 결과는 못 적는다 —
+		// artifact_age_s만 적어 두면 나중에 열이 채워졌을 때 해소 행이 **미해소로 읽힌다**(계약 1).
+		// 구 바이너리와 같은 다섯 열로 남기면 이관 뒤 레거시로 읽히는데, 그것이 정확한 진술이다.
+		s.LedgerAppendContext(ctx, "ctr_fetch", 0, returned, ms)
+	case !s.ledgerCols["shadow_owned"]:
+		// 셋째 ALTER 이전 계단. 해소/미해소는 그대로 측정값이고(읽는 쪽도 OutcomeOK를 세운다),
+		// 귀속 미상은 NULL로 남아 fetchAgeBasis의 `shadow_owned=1`이 자연히 뺀다 — 나중에 열이
+		// 붙어도 이 행들은 분위수에 안 든다. 과소 계수이지 거짓 양성이 아니다.
+		_, _ = s.ledger.ExecContext(
+			ctx,
+			`INSERT INTO ledger(ts,tool,bytes_stored,bytes_returned,duration_ms,artifact_id,artifact_age_s)
+			 VALUES(?,'ctr_fetch',0,?,?,?,?)`,
+			time.Now().Unix(), returned, ms, idCol, age,
+		)
+	default:
+		_, _ = s.ledger.ExecContext(
+			ctx,
+			`INSERT INTO ledger(ts,tool,bytes_stored,bytes_returned,duration_ms,artifact_id,artifact_age_s,shadow_owned)
+			 VALUES(?,'ctr_fetch',0,?,?,?,?,?)`,
+			time.Now().Unix(), returned, ms, idCol, age, owned,
+		)
+	}
 }
 
 // ToolStat: ledger.db 도구별 집계 1행(설계 §6 stats local 계약). FirstTS/LastTS는
@@ -1045,6 +1197,367 @@ func LedgerStats(dir string) ([]ToolStat, error) {
 		return nil, fmt.Errorf("store LedgerStats: %w", err)
 	}
 	return out, nil
+}
+
+// FetchStat: D103 회수 실적. Calls는 원장의 ctr_fetch 행 전부(레거시 포함)다 — **D104의 채택
+// 문턱이 읽는 수가 아니다**: 이 열은 이관 전 레거시까지 품어 배포 첫날 역사만으로 문턱을
+// 넘긴다(W2 소유자 판정). `stats`의 `total` 행도 아니다 — 그 행은 이제 M6만 읽는다.
+// Resolved는 artifact를 실제로 돌려준 fetch, Missed는 **artifact 부재**로 끝난
+// fetch다(계약 3 — 잘못된 chunk id는 여기 들지 않는다). Age*는 **회수 시점에 박아 둔**
+// 나이(초)의 분포 — 아티팩트가 나중에 지워져도 남는다는 것이 이 계측의 요지다(계약 2).
+//
+// Legacy는 그 Calls 중 이관 전 행(두 열 다 NULL)이다 — 해소에도 미해소에도 들지 않으므로
+// Calls를 결과의 분모로 읽으면 그만큼 희석된다(소견 F9).
+//
+// ★ **행을 세는 수와 아티팩트를 세는 수를 갈라 둔다 — D104가 읽는 쪽은 뒤의 것이다**(릴리스
+// 패스 소견 F5·F7). ctr_fetch는 기본 16 KiB까지만 돌려주므로 아티팩트 하나를 끝까지 읽는 것이
+// 여러 호출이고, 164 KiB짜리 하나를 한 번 읽으면 해소 행이 열 개 남는다. 그래서 **채택 문턱은
+// `ResolvedArtifacts + Missed`를 읽어야 한다** — `Resolved + Missed`로 읽으면 아티팩트 하나를
+// 한 번 읽은 14일, 즉 도구가 사실상 안 쓰인 구간이 문턱 10을 통과해 행 2를 건너뛴다.
+// Resolved·ShadowResolved는 그래도 행 수로 남는다: Calls의 분해(= Legacy+Resolved+Missed)가
+// 그 위에 서 있고, 아티팩트 수를 옆에 나란히 놓아야 페이징 집중이 눈에 보인다.
+//
+// ★★ **Missed에는 그 짝이 없고, 앞으로도 없다**(릴리스 패스 소견 F6, 소유자 판정 2026-08-10).
+// 미해소 행은 요청된 id를 적지 않으므로(계약 1의 세 상태 인코딩이 `artifact_id` NULL로
+// 판정한다) 같은 죽은 참조를 선택자만 바꿔 여러 번 시도한 것이 여러 행으로 남는다.
+// **Missed는 행 수이고 두 방향으로 참값과 어긋난다 — 미해소 *호출* 수에 대해서는 하한이고,
+// 서로 다른 *죽은 참조* 수에 대해서는 위로 부푼다**(계약 3이 artifact 행의 존재를 다시 묻는데
+// 그 재질의가 ErrNotFound가 아니라 DB 오류·경합으로 끝나면 그 회수는 행을 아예 안 남긴다 —
+// 두 방향 다 D103 **알고 받는 대가** ②에 있다). 한쪽만 읽으면 판정 세션이 틀린 편향을 안고
+// 간다. 하한이 부풀림을 부분적으로 상쇄하지만 **크기를 모른다** `[미실측]`.
+// 열을 더해 dedup하는 안을 버린 이유는 정밀해 **보이게** 만들기 때문이다: 미해소는
+// 이미 세 모집단을 섞고 있고(퍼지된 귀속 아티팩트 = 신호 · 창이 건드리지 않는 explicit ·
+// 애초에 없던 id), 그 오염은 dedup으로 줄지 않는다. 아티팩트가 없어 귀속을 되물을 수 없다는
+// 것이 D103 계약 1이고 D104도 그 비대칭을 명시한다. 그리고 이 과대 계수가 결정표를 **틀린 행으로
+// 옮기지는 못한다**: 행 3·3b·5의 전제가 `Missed < 5`이므로 그 아래에서 Missed가 채택 문턱에
+// 보태는 몫은 최대 4이고, 그러면 통과에 `ResolvedArtifacts >= 6`이 필요하다 — 진짜 채택이다.
+// Missed가 문턱을 혼자 채울 만큼 크면(10행 이상) `Missed >= 5`가 반드시 참이라 행 4가 행 3을
+// 앞질러 발화한다. 행 4의 처방은 "한 단계 넓히고 다시 잰다"이고 과대 계수의 방향은 그 발화를
+// **빠르게** 하는 쪽 — 이 계측이 두려워하는 오독(침묵을 넉넉함으로 읽는 것)의 반대편이다.
+//
+// ShadowResolved는 그 해소 중 **shadow 귀속**(= 퍼지가 실제로 지우는)이면서 **나이가 기록된**
+// 행만 센 수이고(fetchAgeBasis 그대로 — 나이 미상은 빠진다, 소견 F6),
+// Age*는 그 모집단에서만 나온다(소견 F4). Resolved와 갈라 두는 이유: 채택 게이트는 도구가
+// 쓰이는지를 묻고(모든 해소가 답이다) 창의 길이는 지워질 수 있는 것만 답할 수 있다.
+// ShadowArtifacts는 그 같은 모집단의 **distinct artifact_id**이고 D104의 착수 조건이 읽는
+// 수다(소견 F5). **Age*의 표본도 그 아티팩트 수만큼이다** — 아티팩트당 나이의 max 한 개씩이고,
+// 그 근거는 아래 분위수 루프의 주석에 있다.
+//
+// LegacyAfterMigrate는 그 Legacy 중 **이관 워터마크 뒤에 쓰인** 행이고, 릴리스 패스 소견 F2가
+// 요구한 관측이다 — 세션이 열린 채 새 바이너리를 깔면 훅이 원장을 이관하는 동안 **옛 서버가
+// ctr_fetch의 유일한 기록자**로 남아 다섯 열만 적는다. 그 행은 레거시로 읽히므로 **표식이
+// 하나도 안 서고 수를 세는 칸이 다 숫자로 찍히는데**, 해소·미해소는 0이다 — 이 수가 없으면
+// 결정표가 행 2("채택의 문제")로 떨어진다. 할 일은 채택을 늘리는 게 아니라 서버를 다시 띄우는
+// 것인데. 이 수가 그 상태를 이관 전 역사(정상)와 가르고(역사는 전부 워터마크 **앞**이고 옛
+// 기록자의 행은 전부 **뒤**다), **결정표 행 0b가 그것만을 받는다**. 자세한 것은 markLedgerMigrated.
+//
+// ★ `*OK` 넷은 **어느 수가 측정값인가**를 나른다(SizeStat.PageStatsOK와 같은 관례, 릴리스
+// 패스 M3). ledger는 스키마 버전을 두지 않는 best-effort 보조 DB라 세 ALTER가 **아직 안 돈 원장을
+// 읽는 상태가 정상적으로 도달 가능**하고(계약 7), 그때 위 수들은 0이 아니라 **못 잰 것**이다.
+// 0으로 렌더하면 결정표가 **아무것도 재지 않은 원장을 관측으로 받는다**: 수를 세는 칸이 다
+// 숫자라 행 0이 발화하지 못하고 ShadowArtifacts=0이 아니라 `ResolvedArtifacts + Missed = 0`이
+// 행 2로 데려간다.
+// 창 판단이 닫히지는 않지만 **처방이 틀린다** — 행 2는 채택을 늘리라고 하는데 할 일은
+// 바이너리를 가는 것이고, 그것을 모르면 다음 14일도 아무것도 재지 않는다.
+// 그래서 D104는 상태가 셋이다: 충족·불충족, 그리고 **판정 불가**(결정표 행 0 — **수를 세는 칸**
+// 중 숫자가 아닌 것이 하나라도 있으면 그 원장으로는 조건을 판정하지 않는다. `age_s`는 그 칸이
+// 아니다 — 표본이 없다는 `없음`은 행 3이 받는다).
+// 스키마 계단은 셋이고 단조다: LedgerOK ⊇ OutcomeOK ⊇ ShadowOK. MigrateMarkOK는 그 사다리와
+// **별개 축**이다 — 열이 다 있어도 워터마크가 없을 수 있고(계약 7의 열 관용과 같은 이유로
+// 정상적으로 도달 가능하다), 그때 LegacyAfterMigrate의 0은 "없다"가 아니라 "못 잼"이다.
+type FetchStat struct {
+	Calls, Legacy    int64
+	Resolved, Missed int64
+	// ResolvedArtifacts — Resolved의 **distinct artifact_id**. 채택 문턱이 읽는 수이고(소견 F7),
+	// 귀속 제한은 걸리지 않는다 — 그 제한은 ShadowArtifacts 쪽의 것이다(소견 F4). 둘을 헷갈리면
+	// 채택 질문("도구가 쓰이는가")에 창 질문("퍼지가 지울 것을 회수했는가")의 수로 답하게 된다.
+	ResolvedArtifacts      int64
+	LegacyAfterMigrate     int64
+	ShadowResolved         int64
+	ShadowArtifacts        int64
+	AgeP50, AgeP90, AgeMax int64
+
+	LedgerOK  bool // ledger 테이블이 있다 → Calls가 측정값 (false면 ledger.db 부재도 포함)
+	OutcomeOK bool // artifact_id·artifact_age_s가 있다 → Resolved/Missed/Legacy가 측정값
+	ShadowOK  bool // shadow_owned가 있다 → ShadowResolved/ShadowArtifacts·Age*가 측정값
+	// MigrateMarkOK — 이관 워터마크(ledger.db의 user_version)를 읽었다 → LegacyAfterMigrate가
+	// 측정값. false면 **판정 불가**이지 "이관 뒤 레거시 없음"이 아니다: 이 브랜치의 앞선 빌드가
+	// 열만 붙이고 표식은 안 남긴 원장이 그렇고, 그 원장의 레거시 행이 이관 앞인지 뒤인지는
+	// 되물을 방법이 없다. 그 상태에서 전부 경보로 찍으면 정상 역사가 경보가 된다.
+	MigrateMarkOK bool
+}
+
+// fetchAgeBasis — 나이 분위수와 D104 착수 조건이 **함께** 보는 모집단의 술어. 두 문장이 이
+// 상수를 공유하는 이유는 D13이다 — 분모와 분포가 갈리면 어느 쪽도 읽을 수 없다.
+// shadow_owned=1로 제한하는 근거는 소견 F4: explicit 아티팩트는 퍼지 대상이 아니라 영원히
+// 남으므로 그 회수 나이는 창의 길이에 대해 아무 말도 하지 않는데, 섞이면 "해소 30건"을 채우고
+// 분위수까지 지배한다. NULL(미해소·레거시·귀속 미상)은 `=1`이 자연히 뺀다.
+// artifact_age_s IS NOT NULL은 소견 F6: 나이를 모르는 해소 행을 뺀다. 오늘은 귀속 조건이
+// 그것을 대개 함께 배제하지만(귀속 판정에 hook 소스가 필요하고 그 소스가 곧 시계다) 그 결합은
+// 우연이다 — 명시하지 않으면 다음 변경이 조용히 NULL을 정렬 선두로 들여보낸다.
+const fetchAgeBasis = `tool='ctr_fetch' AND artifact_id IS NOT NULL AND shadow_owned=1
+	AND artifact_age_s IS NOT NULL`
+
+// ledgerColumns: PRAGMA table_info(ledger)의 열 이름 집합. 테이블이 없으면 빈 집합(오류 아님).
+// 드라이버 오류 문자열 대조("no such column")를 쓰지 않는 이유: 그 문면은 우리가 통제하지
+// 않는 계약이고 드라이버 판마다 바뀐다(설계 v0.20 D103 계약 7).
+func ledgerColumns(db *sql.DB) (map[string]bool, error) {
+	rows, err := db.Query(`PRAGMA table_info(ledger)`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	cols := map[string]bool{}
+	for rows.Next() {
+		var cid, notNull, pk int
+		var name, typ string
+		var dflt sql.NullString
+		if err := rows.Scan(&cid, &name, &typ, &notNull, &dflt, &pk); err != nil {
+			return nil, err
+		}
+		cols[name] = true
+	}
+	return cols, rows.Err()
+}
+
+// ledgerFetchColumns — D103 계약 1이 원장에 더하는 세 열. 이 순서가 곧 ALTER를 거는 순서다.
+// 셋 다 INTEGER라 형은 코드에 한 번만 적는다.
+var ledgerFetchColumns = []string{"artifact_id", "artifact_age_s", "shadow_owned"}
+
+// migrateLedger — 세 열 중 **없는 것만** 붙이고, 그 뒤의 실제 열 집합을 낸다. 반환값이 곧
+// LedgerAppendFetch의 계단 판정이다(Store.ledgerCols).
+//
+// 조건 없이 세 ALTER를 던지던 옛 형태를 게이트로 바꾼 이유는 릴리스 패스 소견 F11이다.
+// ① 그 형태는 하루 약 295회의 훅 포착 + 서버 기동마다 이미 있는 열에 DDL 셋을 던져 매번
+// "duplicate column name"으로 실패했다 — 제품 수명 내내. ② 더 나쁘게, `_, _ =` 관례가
+// **진짜 실패**(잠금 경쟁이 busy_timeout을 넘긴 경우 등)와 "이미 이관됨"을 구분 불가능하게
+// 만들었다. 그 구분 불가가 소견 F1의 침묵 상태(부분 이관 + 모든 행 유실)에 경고 한 줄 없이
+// 도달하는 경로다. ensureIndexes가 색인마다 하듯 열마다 한 줄을 남기고, 첫 실패에서 나머지를
+// 멈추지 않는다 — 열은 서로 독립이라 하나가 막혀도 나머지는 붙는 편이 낫다.
+//
+// 이관 판정에 드라이버 오류 문자열을 쓰지 않는 근거는 ledgerColumns의 주석과 같다(계약 7).
+// 원장 전체가 best-effort 보조 DB이므로 실패는 여전히 오류로 **반환하지 않는다** — 경고는
+// 반환된 오류가 아니고, 못 붙은 열은 반환 집합에서 빠져 쓰는 쪽이 그만큼 낮은 계단으로 퇴화한다.
+func migrateLedger(l *sql.DB) map[string]bool {
+	cols, err := ledgerColumns(l)
+	if err != nil {
+		slog.Warn("store: 원장 스키마 확인 실패 — 회수 실적 열을 이관하지 않는다", "error", err)
+		return nil // 모르는 상태에서 ALTER를 던지지 않는다 — 그것이 F11이 없앤 바로 그 동작이다
+	}
+	if len(cols) == 0 {
+		return cols // ledger 테이블 자체가 없다(위 CREATE가 이미 경고를 냈다) — 붙일 곳이 없다
+	}
+	added := false
+	for _, c := range ledgerFetchColumns {
+		if cols[c] {
+			continue
+		}
+		if _, err := l.Exec(`ALTER TABLE ledger ADD COLUMN ` + c + ` INTEGER`); err != nil {
+			slog.Warn("store: 원장 열 추가 실패 — 그 열이 나르는 회수 실적을 못 잰다", "column", c, "error", err)
+			continue
+		}
+		cols[c] = true
+		added = true
+	}
+	// 이관 워터마크는 **열을 실제로 붙였을 때만** 찍는다(소견 F2) — 이 함수는 하루 약 295회의
+	// 훅 포착 + 기동마다 도는데, 이관이 아닌데 찍으면 그다음 훅이 워터마크를 옛 기록자의 행
+	// 위로 올려 경보를 지운다. 덮어쓰기 금지는 markLedgerMigrated 안에 있다(부분 이관이 나중에
+	// 완성되면 이 조건이 두 번 참이 되기 때문이다).
+	if added {
+		markLedgerMigrated(l)
+	}
+	return cols
+}
+
+// markLedgerMigrated — 이관 워터마크를 ledger.db의 `user_version`에 **딱 한 번** 찍는다.
+// 값의 뜻은 "이관된 기록자가 낼 수 있는 첫 행 id"(= max(id)+1)이고, 읽는 쪽은 `id >= mark`인
+// 레거시 ctr_fetch 행을 **이관 뒤에 쓰인 것**으로 센다(FetchStat.LegacyAfterMigrate, 소견 F2).
+//
+// **왜 앵커가 필요한가.** 이관 전 역사(레거시 행)는 정상 상태이고 옛 기록자가 지금 남기는 행도
+// 레거시다 — 둘을 가르려면 "이관이 언제였나"를 어딘가에 적어 둘 수밖에 없다. 그리고 그 앵커는
+// 행에서 유도할 수 없다: F2 시나리오에서는 새 열에 값이 든 행이 **0개**라 유도할 재료가 없다.
+//
+// **왜 `user_version`인가.** 앵커가 그것이 재는 행들과 **같은 파일 안에** 있어야 한다 — 별도
+// 스탬프 파일은 백업 복원·체크아웃이 둘을 갈라놓아 경보를 죽이거나 지어낸다. 원장 안의 마커
+// 행은 `LedgerStats`의 도구 표와 총계에 그대로 새어 나간다. 시각이 아니라 id를 적는 이유는
+// 시계 역행·복원 mtime이 이 판정에 못 들어오게 하기 위해서다.
+//
+// **왜 max(id)+1인가.** 빈 원장의 max(id)=0이 "안 찍힘"의 0과 구분되지 않는다. +1이면 찍힌 값이
+// 절대 0이 아니므로 `user_version > 0`이 곧 "찍혔다"이고, 그래서 비교가 `>=`다.
+//
+// **두 조건이 다 필요하다.** ① 부르는 쪽이 **열을 실제로 붙였을 때만** 부른다(migrateLedger) —
+// 훅은 하루 약 295번 뛰고, 이관이 아닌데 찍으면 그다음 훅이 워터마크를 옛 기록자의 행 위로
+// 올려 경보를 지운다. ② 그런데 부분 이관이 나중에 완성되면 ①이 **두 번** 참이 되므로, 이미
+// 값이 있으면 절대 덮어쓰지 않는다. 늦게 찍힌 워터마크는 그 사이의 행을 "이관 전"으로 만든다.
+// 그 결과 열만 붙고 표식이 없는 원장(이 브랜치의 앞선 빌드)이 남는데, 그것은 **판정 불가**로
+// 정확히 퇴화한다 — 뒤늦게 찍어 넣는 것보다 정직하다.
+//
+// **다운그레이드는 경보가 맞다.** v0.19.1로 되돌리면 그 바이너리의 ctr_fetch 기록이 워터마크
+// 위의 레거시 행으로 쌓여 경보가 뜬다. 거짓 양성이 아니라 정확한 진술이다 — 그 기간의 회수는
+// 실제로 안 재졌다. 나중에 이것을 "고치지" 말 것.
+//
+// 실패는 셋 다 경고 한 줄이고 오류를 반환하지 않는다(원장 전체가 best-effort). 못 찍힌 결과는
+// 위의 판정 불가로 떨어진다. **int32를 넘으면 SQLite가 조용히 0으로 자른다** `[실측 — 번들
+// 드라이버, 2147483648을 쓰고 읽으면 0]`: 하루 약 300행이면 2^31까지 19,600년이고, 잘린 0은
+// "안 찍힘"이라 **경보가 안 뜨는 쪽**으로 퇴화한다(거짓 양성이 아니다).
+//
+// ★ 이 저장소에서 **값을 문자열로 끼워 넣는 유일한 SQL**이다. `PRAGMA user_version = ?`가
+// 파라미터 바인딩을 거부하기 때문이고 `[실측 — near "?": syntax error]`, 안전한 이유는 값의
+// 출처다: 바로 위 줄에서 DB가 낸 int64 max(id)이지 외부 입력이 아니며 strconv가 숫자만 낸다.
+func markLedgerMigrated(l *sql.DB) {
+	var cur int64
+	if err := l.QueryRow(`PRAGMA user_version`).Scan(&cur); err != nil {
+		slog.Warn("store: 원장 이관 표식 확인 실패 — 이관 뒤 레거시 기록을 판정할 수 없게 된다", "error", err)
+		return
+	}
+	if cur != 0 {
+		return // 이미 찍혔다 — 덮어쓰면 그 사이의 옛 기록자 행이 워터마크 아래로 숨는다
+	}
+	var mark int64
+	if err := l.QueryRow(`SELECT coalesce(max(id),0)+1 FROM ledger`).Scan(&mark); err != nil {
+		slog.Warn("store: 원장 이관 표식 기준 행 조회 실패 — 표식을 남기지 않는다", "error", err)
+		return
+	}
+	if _, err := l.Exec(`PRAGMA user_version = ` + strconv.FormatInt(mark, 10)); err != nil {
+		slog.Warn("store: 원장 이관 표식 기록 실패 — 이관 뒤 레거시 기록을 판정할 수 없게 된다", "error", err)
+	}
+}
+
+// LedgerFetchStats: dir/ledger.db를 read-only로 열어 회수 실적을 낸다.
+// 파일 미존재는 LedgerStats와 동일하게 빈 값+nil이다. **새 열이 없는(또는 하나만 있는) 원장도
+// 해소/미해소 0 + nil이다** — ALTER는 writable Open에서만 돌므로 이 경로가 이관 전 원장을
+// 먼저 만날 수 있고, 그것은 손상이 아니다(설계 v0.20 D103 계약 7). 그 외 오류는 삼키지 않는다.
+func LedgerFetchStats(dir string) (FetchStat, error) {
+	var fs FetchStat
+	path := filepath.Join(dir, "ledger.db")
+	if _, err := os.Stat(path); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return fs, nil
+		}
+		return fs, sanitizeIOErr("ledger stat", err)
+	}
+	db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(path)+"?mode=ro&_pragma=busy_timeout(5000)")
+	if err != nil {
+		return fs, fmt.Errorf("store LedgerFetchStats: %w", err)
+	}
+	defer db.Close()
+
+	// 열 집합은 트랜잭션 **밖**에서 읽는다. 원장 스키마는 단조다 — 원장 DDL을 던지는 곳은
+	// migrateLedger뿐이고 그것은 ADD COLUMN만 한다. 그래서 이 읽기와 아래 스냅샷 사이에 다른
+	// 프로세스의 이관이 끼면 결과는 **한 계단 낮게** 나오고, 그 계단은 *OK 표식이 "못 쟀다"로
+	// 정확히 나른다(계약 7이 이미 정상으로 규정한 상태다). 반대 방향 — 있다고 본 열이 사라져
+	// 질의가 깨지는 것 — 은 열을 지우는 코드가 없어 도달 불가다. 트랜잭션 안으로 넣으려면
+	// ledgerColumns가 *sql.DB와 *sql.Tx를 함께 받아야 하는데, 그것은 얻는 것 없이 아키텍처
+	// 문서의 "자체 정의 인터페이스 0개"를 깨는 값이다.
+	cols, err := ledgerColumns(db)
+	if err != nil {
+		return FetchStat{}, fmt.Errorf("store LedgerFetchStats: %w", err)
+	}
+	if len(cols) == 0 { // ledger 테이블 자체가 없다 — 이관 전과 같은 빈 값 경로
+		return fs, nil // LedgerOK=false: 여기의 0은 "호출 0회"가 아니라 "못 쟀다"다
+	}
+	// 소견 F8: 여기부터 끝까지의 질의를 **전부 한 스냅샷에서** 읽는다(열 집합만 위 문단의
+	// 이유로 바깥에 남는다). 따로 내면 각각이 제 암시 트랜잭션을
+	// 열고, 훅이 하루 약 295번 쓰는 원장이라 그 사이에 커밋이 끼는 것은 예외가 아니라 정상이다.
+	// 그러면 회수 줄은 **어떤 시점의 원장에도 대응하지 않는 수의 모음**이 된다: shadow_rows가
+	// resolved를 넘고(독스트링이 부분집합이라고 적은 그 관계), calls가 legacy+resolved+missed와
+	// 갈리며(legacy 열을 더한 이유가 그 분해다), 분위수 셋이 서로 다른 모집단에서 나와 p90이
+	// max를 넘는다. **v0.19.1이 SizeStats에서 고친 바로 그 부류다**(그 근거는 SizeStats의 주석에
+	// 있다 — 거기서는 pragma 셋이라 한 문장으로 합칠 수 있었고, 여기서는 서로 다른 집계와
+	// 오프셋 질의라 합칠 수 없어 트랜잭션이다).
+	// 부수 효과 하나가 더 있다: 오프셋을 정하는 건수와 오프셋을 쓰는 질의가 같은 모집단을 보므로
+	// `OFFSET N-1`이 행 없음으로 떨어져 회수 줄 전체가 사라지는 경로가 닫힌다.
+	// WAL이라 이 읽기 트랜잭션은 훅의 쓰기를 막지 않는다(읽는 쪽이 스냅샷을 들 뿐이다).
+	tx, err := db.Begin()
+	if err != nil {
+		return FetchStat{}, fmt.Errorf("store LedgerFetchStats: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }() // 읽기 전용 — 커밋할 것이 없다
+	if err := tx.QueryRow(
+		`SELECT count(*) FROM ledger WHERE tool='ctr_fetch'`,
+	).Scan(&fs.Calls); err != nil {
+		return FetchStat{}, fmt.Errorf("store LedgerFetchStats: %w", err)
+	}
+	fs.LedgerOK = true
+	if !cols["artifact_id"] || !cols["artifact_age_s"] {
+		return fs, nil // 이관 전·부분 이관 — 총 호출만 유효하다
+	}
+	// 계약 1의 표: 레거시는 두 열 다 NULL, 미해소는 age=-1, 해소는 artifact_id가 값
+	// (나이는 미상일 수 있다 — 소견 F6). 레거시를 같은 문장에서 세는 이유는 소견 F9다.
+	// 넷째 칸이 소견 F7이다: 채택 문턱이 읽을 **distinct 아티팩트**를 같은 문장에서 낸다.
+	// count(DISTINCT)는 NULL을 세지 않으므로 술어를 따로 달 필요가 없다 — 해소 행만 값이 있다.
+	// 한 문장인 것이 요점이다(D13): 갈라 두면 분자와 분모가 다른 스냅샷을 볼 수 있고, 그때
+	// resolved_artifacts > resolved 같은 불가능한 줄이 나온다.
+	if err := tx.QueryRow(`SELECT
+			coalesce(sum(artifact_id IS NOT NULL),0),
+			coalesce(sum(artifact_id IS NULL AND artifact_age_s IS NOT NULL),0),
+			coalesce(sum(artifact_id IS NULL AND artifact_age_s IS NULL),0),
+			count(DISTINCT artifact_id)
+		FROM ledger WHERE tool='ctr_fetch'`).
+		Scan(&fs.Resolved, &fs.Missed, &fs.Legacy, &fs.ResolvedArtifacts); err != nil {
+		return FetchStat{}, fmt.Errorf("store LedgerFetchStats: %w", err)
+	}
+	fs.OutcomeOK = true
+	// 소견 F2: 그 레거시 중 **이관 뒤에 쓰인 것**을 가른다. 워터마크는 "이관된 기록자가 낼 수
+	// 있는 첫 id"라 비교가 `>=`다(markLedgerMigrated가 max(id)+1을 적는 이유도 거기 있다).
+	// 0은 "워터마크가 없다"이지 0번 행이 아니다 — 그 원장은 판정하지 않고 MigrateMarkOK로
+	// 그 사실을 나른다. 스키마 계단과 달리 이 축은 열이 다 있어도 false일 수 있다.
+	var mark int64
+	if err := tx.QueryRow(`PRAGMA user_version`).Scan(&mark); err != nil {
+		return FetchStat{}, fmt.Errorf("store LedgerFetchStats: %w", err)
+	}
+	if mark > 0 {
+		fs.MigrateMarkOK = true
+		if err := tx.QueryRow(`SELECT count(*) FROM ledger
+			WHERE tool='ctr_fetch' AND artifact_id IS NULL AND artifact_age_s IS NULL AND id >= ?`,
+			mark).Scan(&fs.LegacyAfterMigrate); err != nil {
+			return FetchStat{}, fmt.Errorf("store LedgerFetchStats: %w", err)
+		}
+	}
+	if !cols["shadow_owned"] {
+		return fs, nil // 셋째 ALTER 이전 원장 — 귀속으로 제한한 수치는 낼 수 없다(계약 7과 같은 관용)
+	}
+	if err := tx.QueryRow(
+		`SELECT count(*), count(DISTINCT artifact_id) FROM ledger WHERE `+fetchAgeBasis,
+	).Scan(&fs.ShadowResolved, &fs.ShadowArtifacts); err != nil {
+		return FetchStat{}, fmt.Errorf("store LedgerFetchStats: %w", err)
+	}
+	fs.ShadowOK = true
+	if fs.ShadowArtifacts == 0 { // 모집단이 비었다 — 오프셋을 정할 N이 없다
+		return fs, nil
+	}
+	// 분위수는 SQLite에 내장이 없으므로 정렬 + OFFSET으로 낸다. 행 수가 수만 단위라
+	// 이 방식으로 충분하다(하루 약 300행 × 무기한 보존 = 1년 11만 행).
+	//
+	// **모집단은 행이 아니라 아티팩트다**(소견 F5). ctr_fetch는 기본 16 KiB까지만 돌려주므로
+	// 아티팩트 하나를 끝까지 읽는 것이 여러 호출이고, 그 페이징은 **한 세션 안에서** 일어나
+	// 거의 같은 젊은 나이를 여럿 남긴다. 행으로 세면 그 무리가 p90을 자기 쪽으로 끌어내리고,
+	// D104 행 5는 그 p90(절단 보정한 값)을 덮는 가장 작은 값을 보존 창의 처방으로 삼는다 —
+	// 계측이 제 데이터가 지지하는 것보다 **짧은** 창을 처방하게 된다. GROUP BY로 아티팩트당
+	// 한 표본만 남긴다.
+	//
+	// 아티팩트당 대푯값이 **max**인 이유: 창의 길이가 답하는 질문은 "이 아티팩트가 마지막으로
+	// 필요해진 것이 포착 뒤 얼마인가"이고, 그 답은 가장 **늦은** 회수다 — 그 시점까지 살아
+	// 있었어야 하므로 보존이 그만큼 필요했다는 뜻이다. min은 "언제 처음 읽혔나"를 재게 되어
+	// 행 가중과 같은 방향(창을 짧게)으로 틀린다.
+	//
+	// N도 ShadowArtifacts로 바뀐다 — 오프셋과 모집단이 갈리면 어느 쪽도 읽을 수 없다(D13,
+	// fetchAgeBasis를 두 문장이 공유하는 것과 같은 이유). ShadowResolved는 그대로 행 수로
+	// 남아 `shadow_rows` 옆의 `shadow_artifacts`가 페이징 집중을 보이게 한다.
+	for _, q := range []struct {
+		dst    *int64
+		offset int64
+	}{
+		{&fs.AgeP50, (fs.ShadowArtifacts - 1) * 50 / 100},
+		{&fs.AgeP90, (fs.ShadowArtifacts - 1) * 90 / 100},
+		{&fs.AgeMax, fs.ShadowArtifacts - 1},
+	} {
+		if err := tx.QueryRow(`SELECT max(artifact_age_s) FROM ledger WHERE `+fetchAgeBasis+`
+			GROUP BY artifact_id ORDER BY 1 LIMIT 1 OFFSET ?`, q.offset).Scan(q.dst); err != nil {
+			return FetchStat{}, fmt.Errorf("store LedgerFetchStats: %w", err)
+		}
+	}
+	return fs, nil
 }
 
 // SizeStat: content.db 규모 스냅샷(doctor [14] shadow 성장 관측 채널, 설계 v0.3 §2·D33).

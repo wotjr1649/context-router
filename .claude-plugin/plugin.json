@@ -1,6 +1,6 @@
 {
   "name": "context-router",
-  "version": "0.19.0",
+  "version": "0.20.0",
   "description": "Keeps large tool outputs and files outside the model context window: per-project SQLite store, FTS search, byte-exact fetch, hermetic starlark transform, SSRF-safe web fetch.",
   "author": {
     "name": "Kim Jae Seok",

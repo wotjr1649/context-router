@@ -1263,6 +1263,1373 @@ func TestLedgerStats_StatErrorOtherThanNotExist(t *testing.T) {
 	}
 }
 
+// ledgerSchemaGuard — 픽스처가 정말 의도한 이관 계단에 도달했는지 PRAGMA table_info로 확인한다.
+// 계단마다 테스트가 따로 있는데 이 가드가 없으면 픽스처 실수 하나가 **어느 계단의 테스트인지를
+// 조용히 바꿔 놓고**(예: 열을 빼먹어 한 계단 아래로 미끄러짐) 그래도 통과한다.
+func ledgerSchemaGuard(t *testing.T, dir string, want, absent []string) {
+	t.Helper()
+	db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(filepath.Join(dir, "ledger.db"))+"?mode=ro")
+	if err != nil {
+		t.Fatalf("사전 가드 open: %v", err)
+	}
+	cols, err := ledgerColumns(db)
+	closeErr := db.Close()
+	if err != nil {
+		t.Fatalf("사전 가드 ledgerColumns: %v", err)
+	}
+	if closeErr != nil {
+		t.Fatalf("사전 가드 Close: %v", closeErr)
+	}
+	for _, c := range want {
+		if !cols[c] {
+			t.Fatalf("픽스처가 의도한 계단이 아니다: %q가 있어야 한다 — 실제 %v", c, cols)
+		}
+	}
+	for _, c := range absent {
+		if cols[c] {
+			t.Fatalf("픽스처가 의도한 계단이 아니다: %q가 없어야 한다 — 실제 %v", c, cols)
+		}
+	}
+}
+
+// TestLedgerFetchStatsNoLedgerTable: ledger.db는 있는데 `ledger` 테이블이 없는 계단.
+// **총 호출조차 측정값이 아니다** — 0을 찍으면 "회수가 한 번도 없었다"로 읽히는데 실제로는
+// 아직 아무것도 못 읽은 상태다(v0.19.1 릴리스 패스가 doctor [14] free=0B에서 고친 것과 같은
+// 결함). LedgerOK=false가 그 구분을 호출부까지 나른다.
+func TestLedgerFetchStatsNoLedgerTable(t *testing.T) {
+	dir := t.TempDir()
+	db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(filepath.Join(dir, "ledger.db")))
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+	if _, err := db.Exec(`CREATE TABLE other(x INTEGER)`); err != nil { // 파일은 있되 ledger는 없다
+		t.Fatalf("무관 테이블: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	ledgerSchemaGuard(t, dir, nil, []string{"tool", "artifact_id", "artifact_age_s", "shadow_owned"})
+
+	fs, err := LedgerFetchStats(dir)
+	if err != nil {
+		t.Fatalf("ledger 테이블 부재에서 오류가 났다: %v", err)
+	}
+	if fs.LedgerOK || fs.OutcomeOK || fs.ShadowOK {
+		t.Fatalf("측정 못 한 계단인데 측정 표식이 섰다: %+v", fs)
+	}
+}
+
+// TestLedgerFetchStatsToleratesOldSchema: 새 열이 없는 옛 ledger.db를 만나도 실패하지 않는다.
+// ALTER는 writable Open에서만 도는데 LedgerFetchStats는 ledger.db를 따로 read-only로 연다 —
+// 새 바이너리의 stats가 아직 이관되지 않은 원장을 먼저 만날 수 있다(설계 v0.20 D103 계약 7).
+// 총 호출(Calls)은 옛 원장에서도 읽힌다 — 그 열은 처음부터 있었다.
+func TestLedgerFetchStatsToleratesOldSchema(t *testing.T) {
+	dir := t.TempDir()
+	db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(filepath.Join(dir, "ledger.db")))
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+	if _, err := db.Exec(`CREATE TABLE ledger(
+		id INTEGER PRIMARY KEY, ts INTEGER NOT NULL, tool TEXT NOT NULL,
+		bytes_stored INTEGER NOT NULL DEFAULT 0, bytes_returned INTEGER NOT NULL DEFAULT 0,
+		duration_ms INTEGER NOT NULL DEFAULT 0)`); err != nil {
+		t.Fatalf("옛 스키마 생성: %v", err)
+	}
+	if _, err := db.Exec(
+		`INSERT INTO ledger(ts,tool,bytes_stored,bytes_returned,duration_ms) VALUES(1,'ctr_fetch',0,10,1)`,
+	); err != nil {
+		t.Fatalf("레거시 행: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	ledgerSchemaGuard(t, dir, []string{"tool"}, []string{"artifact_id", "artifact_age_s", "shadow_owned"})
+
+	fs, err := LedgerFetchStats(dir)
+	if err != nil {
+		t.Fatalf("옛 스키마에서 오류가 났다: %v", err)
+	}
+	if fs.Calls != 1 {
+		t.Fatalf("총 호출=%d, 기대 1(레거시 행도 센다)", fs.Calls)
+	}
+	if fs.Resolved != 0 || fs.Missed != 0 {
+		t.Fatalf("레거시 행이 해소/미해소로 셌다: %+v", fs)
+	}
+	// 이 계단에서 0인 해소·미해소는 **측정값이 아니다** — 호출부가 0으로 찍으면 안 된다.
+	if !fs.LedgerOK {
+		t.Fatalf("총 호출은 읽었는데 LedgerOK=false: %+v", fs)
+	}
+	if fs.OutcomeOK || fs.ShadowOK {
+		t.Fatalf("나이 열이 없는데 측정 표식이 섰다: %+v", fs)
+	}
+}
+
+// TestLedgerFetchStatsPartialMigration: 세 ALTER는 서로 독립이라 **일부만 성공한 상태가 도달
+// 가능하다**. 그 상태에서 없는 열을 지명하면 경성 오류가 나므로, 읽는 쪽은 계단 셋으로 퇴화한다
+// (설계 v0.20 D103 계약 7): ①`artifact_id`·`artifact_age_s` 중 하나라도 없으면 총 호출만,
+// ②둘 다 있고 `shadow_owned`가 없으면 해소·미해소까지, ③셋 다 있어야 귀속·분위수까지.
+// 이 픽스처는 ①(나이 열만 없다)을 세운다 — ②는 TestLedgerFetchStatsShadowColumnMissing이다.
+func TestLedgerFetchStatsPartialMigration(t *testing.T) {
+	dir := t.TempDir()
+	db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(filepath.Join(dir, "ledger.db")))
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+	if _, err := db.Exec(`CREATE TABLE ledger(
+		id INTEGER PRIMARY KEY, ts INTEGER NOT NULL, tool TEXT NOT NULL,
+		bytes_stored INTEGER NOT NULL DEFAULT 0, bytes_returned INTEGER NOT NULL DEFAULT 0,
+		duration_ms INTEGER NOT NULL DEFAULT 0, artifact_id INTEGER)`); err != nil { // age 열만 없다
+		t.Fatalf("부분 이관 스키마: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	ledgerSchemaGuard(t, dir, []string{"artifact_id"}, []string{"artifact_age_s", "shadow_owned"})
+
+	fs, err := LedgerFetchStats(dir)
+	if err != nil {
+		t.Fatalf("부분 이관에서 오류가 났다: %v", err)
+	}
+	if fs.Resolved != 0 || fs.Missed != 0 {
+		t.Fatalf("부분 이관에서 0이 아닌 값: %+v", fs)
+	}
+	if !fs.LedgerOK || fs.OutcomeOK || fs.ShadowOK {
+		t.Fatalf("부분 이관의 측정 표식이 틀렸다: %+v (기대 LedgerOK만 true)", fs)
+	}
+}
+
+// TestLedgerColumnsAddedOnWritableOpen: writable Open이 세 열을 **실제로** 붙인다.
+// 판정을 PRAGMA table_info로 하는 이유: LedgerFetchStats가 열 부재를 관용하므로, 반환값만
+// 보면 ALTER를 아예 넣지 않은 구현도 0을 내며 통과한다. 두 번 열어도 아무 일이 없다 — 옛
+// 형태는 "duplicate column name"을 내고 best-effort 관례가 그것을 삼켰지만, 이제는 이관이
+// 열 부재를 먼저 보므로 둘째 Open에서 DDL이 한 문장도 돌지 않는다(소견 F11).
+func TestLedgerColumnsAddedOnWritableOpen(t *testing.T) {
+	dir := t.TempDir()
+	st := openAt(t, dir)
+	if err := st.Close(); err != nil {
+		t.Fatalf("첫 Close: %v", err)
+	}
+	st2 := openAt(t, dir) // 두 번째 Open에서 ALTER가 중복 실패한다 — 그래도 열려야 한다
+	if err := st2.Close(); err != nil {
+		t.Fatalf("둘째 Close: %v", err)
+	}
+
+	db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(filepath.Join(dir, "ledger.db"))+"?mode=ro")
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+	defer db.Close()
+	cols, err := ledgerColumns(db)
+	if err != nil {
+		t.Fatalf("ledgerColumns: %v", err)
+	}
+	if !cols["artifact_id"] || !cols["artifact_age_s"] || !cols["shadow_owned"] {
+		t.Fatalf("writable Open이 세 열을 붙이지 않았다: %v", cols)
+	}
+}
+
+// seedLedgerSchema — ledger.db를 원하는 이관 계단으로 **직접** 만든다. 다섯 옛 열은 항상 있고
+// extra로 준 새 열만 더 붙는다. writable Open은 이제 빠진 열을 메우므로(migrateLedger) 부분
+// 이관 상태를 Open으로는 만들 수 없다 — 쓰는 쪽의 관용을 보려면 이렇게 시딩해야 한다.
+func seedLedgerSchema(t *testing.T, dir string, extra ...string) {
+	t.Helper()
+	cols := `id INTEGER PRIMARY KEY, ts INTEGER NOT NULL, tool TEXT NOT NULL,
+		bytes_stored INTEGER NOT NULL DEFAULT 0, bytes_returned INTEGER NOT NULL DEFAULT 0,
+		duration_ms INTEGER NOT NULL DEFAULT 0`
+	for _, c := range extra {
+		cols += ", " + c + " INTEGER"
+	}
+	db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(filepath.Join(dir, "ledger.db"))+pragmas)
+	if err != nil {
+		t.Fatalf("원장 시딩 open: %v", err)
+	}
+	if _, err := db.Exec(`CREATE TABLE ledger(` + cols + `)`); err != nil {
+		t.Fatalf("원장 시딩 CREATE: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("원장 시딩 Close: %v", err)
+	}
+}
+
+// storeOverLedger — 시딩된 ledger.db 위에 Store를 그 스키마 **그대로** 얹는다(이관하지 않는다).
+// 생산 코드가 Open에서 하는 것과 같은 방식으로 열 집합을 잡는다 — ledgerColumns가 원천이다.
+func storeOverLedger(t *testing.T, dir string) *Store {
+	t.Helper()
+	db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(filepath.Join(dir, "ledger.db"))+pragmas)
+	if err != nil {
+		t.Fatalf("원장 open: %v", err)
+	}
+	db.SetMaxOpenConns(1)
+	t.Cleanup(func() { _ = db.Close() })
+	cols, err := ledgerColumns(db)
+	if err != nil {
+		t.Fatalf("ledgerColumns: %v", err)
+	}
+	return &Store{dir: dir, ledger: db, ledgerCols: cols}
+}
+
+// TestLedgerAppendFetchPartialMigrationRecordsOutcome — 릴리스 패스 소견 F1. 훅이 2000 ms
+// deadline에 죽어 `shadow_owned`만 못 붙은 원장이 도달 가능한데(계약 7), 쓰는 쪽의 INSERT가
+// 세 열을 다 지명하면 SQLite가 그 문장을 거절하고 best-effort 관례가 오류를 삼켜 **해소도
+// 미해소도 한 행 없이 통째로 사라진다**. 읽는 쪽은 그 계단에서 OutcomeOK=true를 세우므로
+// `stats`는 그 0을 측정값으로 렌더한다 — 아무것도 안 잰 원장이 관측으로 들어간다.
+// 쓰는 쪽도 읽는 쪽과 같은 계단을 관용해야 한다: 있는 열까지만 적고 퇴화한다.
+func TestLedgerAppendFetchPartialMigrationRecordsOutcome(t *testing.T) {
+	dir := t.TempDir()
+	seedLedgerSchema(t, dir, "artifact_id", "artifact_age_s")
+	ledgerSchemaGuard(t, dir, []string{"artifact_id", "artifact_age_s"}, []string{"shadow_owned"})
+
+	st := storeOverLedger(t, dir)
+	st.LedgerAppendFetch(t.Context(), 0, 1, 7, agePtr(30), true) // 해소
+	st.LedgerAppendFetch(t.Context(), 0, 1, 0, nil, false)       // 미해소
+
+	fs, err := LedgerFetchStats(dir)
+	if err != nil {
+		t.Fatalf("LedgerFetchStats: %v", err)
+	}
+	if fs.Calls != 2 {
+		t.Fatalf("Calls=%d want 2 — 부분 이관에서 행이 통째로 버려졌다(F1): %+v", fs.Calls, fs)
+	}
+	if fs.Resolved != 1 || fs.Missed != 1 {
+		t.Fatalf("Resolved=%d Missed=%d want 1/1 — 있는 두 열까지는 적어야 한다: %+v", fs.Resolved, fs.Missed, fs)
+	}
+	if fs.Legacy != 0 {
+		t.Fatalf("Legacy=%d want 0 — 두 열이 있는데 레거시로 적혔다: %+v", fs.Legacy, fs)
+	}
+	if !fs.OutcomeOK || fs.ShadowOK {
+		t.Fatalf("계단 표식이 틀렸다: %+v (기대 OutcomeOK만 true)", fs)
+	}
+}
+
+// TestLedgerAppendFetchPreMigrationRecordsCall — 소견 F1의 아래 계단. 새 열이 하나도 없는
+// 원장(구 바이너리가 만들고 아직 아무도 이관하지 않은 상태)에서도 **호출 자체는 남아야 한다**.
+// 남은 행은 두 새 열이 없으니 이관 뒤에 레거시로 읽히는데, 그게 정확한 진술이다 — 결과를
+// 표현할 수 없던 시점의 기록이다. 통째로 버리면 `calls`마저 아래로 편향된다.
+func TestLedgerAppendFetchPreMigrationRecordsCall(t *testing.T) {
+	dir := t.TempDir()
+	seedLedgerSchema(t, dir)
+	ledgerSchemaGuard(t, dir, []string{"tool"}, []string{"artifact_id", "artifact_age_s", "shadow_owned"})
+
+	st := storeOverLedger(t, dir)
+	st.LedgerAppendFetch(t.Context(), 0, 1, 7, agePtr(30), true)
+
+	fs, err := LedgerFetchStats(dir)
+	if err != nil {
+		t.Fatalf("LedgerFetchStats: %v", err)
+	}
+	if fs.Calls != 1 {
+		t.Fatalf("Calls=%d want 1 — 이관 전 원장에서 행이 버려졌다(F1): %+v", fs.Calls, fs)
+	}
+	if !fs.LedgerOK || fs.OutcomeOK || fs.ShadowOK {
+		t.Fatalf("계단 표식이 틀렸다: %+v (기대 LedgerOK만 true)", fs)
+	}
+}
+
+// TestMigrateLedgerAddsOnlyMissingColumns — 소견 F11. 이관은 `ledgerColumns`가 없다고 한 열에만
+// ALTER를 건다. 계단 둘(전무·부분)에서 시작해 셋을 다 채우는지, 그리고 반환한 열 집합이 실제
+// 스키마와 같은지를 함께 본다 — 반환값이 곧 쓰는 쪽의 계단 판정이라 둘이 갈리면 F1이 되돌아온다.
+func TestMigrateLedgerAddsOnlyMissingColumns(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		extra []string
+	}{
+		{"이관 전", nil},
+		{"부분 이관", []string{"artifact_id"}},
+		{"이미 완전", []string{"artifact_id", "artifact_age_s", "shadow_owned"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			seedLedgerSchema(t, dir, tc.extra...)
+			db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(filepath.Join(dir, "ledger.db"))+pragmas)
+			if err != nil {
+				t.Fatalf("open: %v", err)
+			}
+			db.SetMaxOpenConns(1)
+			defer db.Close()
+
+			got := migrateLedger(db)
+			for _, c := range ledgerFetchColumns {
+				if !got[c] {
+					t.Fatalf("반환 집합에 %q가 없다: %v", c, got)
+				}
+			}
+			// 반환값을 믿지 않고 스키마를 다시 읽는다 — 둘이 갈리는 것이 이 테스트가 잡는 것이다.
+			fresh, err := ledgerColumns(db)
+			if err != nil {
+				t.Fatalf("재확인 ledgerColumns: %v", err)
+			}
+			for _, c := range ledgerFetchColumns {
+				if !fresh[c] {
+					t.Fatalf("스키마에 %q가 실제로 없다: %v", c, fresh)
+				}
+			}
+		})
+	}
+}
+
+// TestMigrateLedgerSecondPassIsSilent — 소견 F11의 요지. 이관이 끝난 원장에 다시 걸어도 DDL이
+// 한 문장도 돌지 않는다. 관측 지점은 경고다: 게이트 없이 세 ALTER를 그냥 던지면 셋 다
+// "duplicate column name"으로 실패하고, 실패를 경고로 내는 이 구현에서는 그것이 매 Open마다
+// 경고 세 줄로 나타난다. 침묵이 곧 "안 돌았다"의 증거다.
+func TestMigrateLedgerSecondPassIsSilent(t *testing.T) {
+	dir := t.TempDir()
+	seedLedgerSchema(t, dir)
+	db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(filepath.Join(dir, "ledger.db"))+pragmas)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	db.SetMaxOpenConns(1)
+	defer db.Close()
+	migrateLedger(db) // 첫 번째 — 여기서 세 열이 붙는다
+
+	var logBuf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logBuf, nil)))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+	migrateLedger(db) // 두 번째 — 아무 일도 없어야 한다
+	if logBuf.Len() != 0 {
+		t.Fatalf("이관 뒤 재실행이 조용하지 않다 — DDL이 또 돌았다(F11):\n%s", logBuf.String())
+	}
+}
+
+// TestMigrateLedgerWarnsOnDDLFailure — 소견 F11의 나머지 절반. `_, _ =` 관례가 진짜 실패와
+// "이미 이관됨"을 구분 불가능하게 만드는 것이 F1의 침묵 상태에 경고 한 줄 없이 도달하는 경로다.
+// ensureIndexes가 색인마다 하는 것과 같이 열마다 한 줄을 남기고, 첫 실패에서 나머지를 멈추지
+// 않는다. 실패는 read-only 핸들로 주입한다 — 실제 권한 사고와 같은 오류이고, 그 핸들에서도
+// PRAGMA table_info는 읽히므로 이관 판정 자체는 정상으로 돈다.
+func TestMigrateLedgerWarnsOnDDLFailure(t *testing.T) {
+	dir := t.TempDir()
+	seedLedgerSchema(t, dir)
+	ro, err := sql.Open("sqlite", "file:"+filepath.ToSlash(filepath.Join(dir, "ledger.db"))+"?mode=ro&_pragma=busy_timeout(5000)")
+	if err != nil {
+		t.Fatalf("open ro: %v", err)
+	}
+	defer ro.Close()
+
+	var logBuf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logBuf, nil)))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+	got := migrateLedger(ro)
+
+	for _, c := range ledgerFetchColumns {
+		if got[c] {
+			t.Fatalf("붙지 않은 열 %q가 반환 집합에 들었다 — 쓰는 쪽이 없는 열을 지명하게 된다: %v", c, got)
+		}
+		if !strings.Contains(logBuf.String(), c) {
+			t.Fatalf("%q의 실패가 경고에 없다 — 첫 실패에서 멈췄거나 삼켰다:\n%s", c, logBuf.String())
+		}
+	}
+	if n := strings.Count(logBuf.String(), "level=WARN"); n != len(ledgerFetchColumns) {
+		t.Fatalf("경고 줄 수=%d want %d:\n%s", n, len(ledgerFetchColumns), logBuf.String())
+	}
+}
+
+// TestMigrateLedgerSkipsWhenSchemaUnknown — 소견 F11의 원칙("모르면 던지지 않는다")을 판정할 수
+// 없는 두 입력에 건다. ① 스키마를 아예 못 읽는 핸들: 경고는 그 사실 하나뿐이어야 하고, 열마다
+// 하나씩 더 붙으면 그것이 옛 무조건 ALTER다. ② `ledger` 테이블이 없는 원장(위 CREATE가 실패한
+// 상태 — 그쪽이 이미 경고를 냈다): 붙일 곳이 없으므로 완전한 침묵이 옳다.
+// 둘 다 반환 집합에 새 열이 없어야 한다 — 있으면 쓰는 쪽이 없는 열을 지명한다(소견 F1).
+func TestMigrateLedgerSkipsWhenSchemaUnknown(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		db       func(t *testing.T) *sql.DB
+		wantWarn int
+	}{
+		{"스키마 판정 불가", func(t *testing.T) *sql.DB {
+			db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(filepath.Join(t.TempDir(), "ledger.db"))+pragmas)
+			if err != nil {
+				t.Fatalf("open: %v", err)
+			}
+			if err := db.Close(); err != nil { // 닫힌 핸들 — PRAGMA도 ALTER도 못 돈다
+				t.Fatalf("Close: %v", err)
+			}
+			return db
+		}, 1},
+		{"ledger 테이블 없음", func(t *testing.T) *sql.DB {
+			db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(filepath.Join(t.TempDir(), "ledger.db"))+pragmas)
+			if err != nil {
+				t.Fatalf("open: %v", err)
+			}
+			t.Cleanup(func() { _ = db.Close() })
+			if _, err := db.Exec(`CREATE TABLE other(x INTEGER)`); err != nil {
+				t.Fatalf("무관 테이블: %v", err)
+			}
+			return db
+		}, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			db := tc.db(t)
+			var logBuf bytes.Buffer
+			prev := slog.Default()
+			slog.SetDefault(slog.New(slog.NewTextHandler(&logBuf, nil)))
+			t.Cleanup(func() { slog.SetDefault(prev) })
+
+			got := migrateLedger(db)
+			for _, c := range ledgerFetchColumns {
+				if got[c] {
+					t.Fatalf("판정 불가인데 %q가 반환 집합에 들었다: %v", c, got)
+				}
+			}
+			if n := strings.Count(logBuf.String(), "level=WARN"); n != tc.wantWarn {
+				t.Fatalf("경고 줄 수=%d want %d — ALTER를 던졌다(F11):\n%s", n, tc.wantWarn, logBuf.String())
+			}
+		})
+	}
+}
+
+// TestOpenSnapshotsLedgerColumns — 위 F11 테스트들을 실제 Open 경로에 묶는다. 둘을 본다:
+// ① Open이 쓰는 쪽에 넘기는 열 스냅샷이 **실제 스키마와 같다** — 이것이 F1 수정이 딛는
+// 불변식이고, OpenContext가 migrateLedger를 안 부르면 스냅샷이 비어 쓰는 쪽이 영원히 아래
+// 계단으로 퇴화한다. ② 이관이 끝난 원장을 다시 여는 둘째 Open이 조용하다 — 하루 약 295회의
+// 훅 포착 + 서버 기동마다 도는 자리라, 게이트가 빠지면 그 전부가 경고 세 줄이 된다.
+func TestOpenSnapshotsLedgerColumns(t *testing.T) {
+	dir := t.TempDir()
+	if err := openAt(t, dir).Close(); err != nil {
+		t.Fatalf("첫 Close: %v", err)
+	}
+	var logBuf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logBuf, nil)))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+	st := openAt(t, dir)
+	for _, c := range ledgerFetchColumns {
+		if !st.ledgerCols[c] {
+			t.Fatalf("Open이 넘긴 스냅샷에 %q가 없다 — 쓰는 쪽이 아래 계단으로 퇴화한다: %v", c, st.ledgerCols)
+		}
+		if strings.Contains(logBuf.String(), c) {
+			t.Fatalf("둘째 writable Open이 %q에 DDL을 또 걸었다(F11):\n%s", c, logBuf.String())
+		}
+	}
+	// 스냅샷이 실제 스키마와 갈리면 F1이 되돌아온다 — 반환값이 아니라 DB를 다시 읽어 대조한다.
+	fresh, err := ledgerColumns(st.ledger)
+	if err != nil {
+		t.Fatalf("ledgerColumns: %v", err)
+	}
+	if !reflect.DeepEqual(st.ledgerCols, fresh) {
+		t.Fatalf("스냅샷 %v != 실제 스키마 %v", st.ledgerCols, fresh)
+	}
+}
+
+// ledgerExec — 원장에 SQL 한 문장을 직접 건다(구 바이너리의 다섯 열 기록을 흉내내거나 워터마크를
+// 직접 확인할 때 쓴다). Store를 거치지 않는 것이 요지다 — 흉내낼 기록자가 이 코드가 아니다.
+func ledgerExec(t *testing.T, dir, q string) {
+	t.Helper()
+	db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(filepath.Join(dir, "ledger.db"))+pragmas)
+	if err != nil {
+		t.Fatalf("원장 exec open: %v", err)
+	}
+	_, execErr := db.Exec(q)
+	closeErr := db.Close()
+	if execErr != nil {
+		t.Fatalf("원장 exec %q: %v", q, execErr)
+	}
+	if closeErr != nil {
+		t.Fatalf("원장 exec Close: %v", closeErr)
+	}
+}
+
+// ledgerUserVersion — ledger.db의 워터마크를 read-only로 읽는다(사전 가드·사후 대조 공용).
+func ledgerUserVersion(t *testing.T, dir string) int64 {
+	t.Helper()
+	db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(filepath.Join(dir, "ledger.db"))+"?mode=ro")
+	if err != nil {
+		t.Fatalf("워터마크 open: %v", err)
+	}
+	var v int64
+	scanErr := db.QueryRow(`PRAGMA user_version`).Scan(&v)
+	closeErr := db.Close()
+	if scanErr != nil {
+		t.Fatalf("워터마크 읽기: %v", scanErr)
+	}
+	if closeErr != nil {
+		t.Fatalf("워터마크 Close: %v", closeErr)
+	}
+	return v
+}
+
+// oldWriterFetchRow — 옛 바이너리(v0.19.1)의 ctr_fetch 기록. 다섯 열만 지명하므로 새 두 열이
+// NULL로 남아 레거시로 읽힌다 — F2가 말하는 "옛 서버가 유일한 기록자" 상태의 실제 산물이다.
+const oldWriterFetchRow = `INSERT INTO ledger(ts,tool,bytes_stored,bytes_returned,duration_ms)
+	VALUES(1,'ctr_fetch',0,10,1)`
+
+// TestLedgerWatermarkSurvivesLaterOpens — 릴리스 패스 소견 F2의 핵심. 세션이 열린 채 새
+// 바이너리를 깔면 훅이 원장을 이관하는 동안 **옛 서버가 ctr_fetch의 유일한 기록자**로 남는다.
+// 그 행들은 레거시로 읽히므로 표식이 하나도 서지 않고(열은 다 있다) 나머지 칸이 다 숫자로
+// 찍히는데, 해소·미해소가 0이라 결정표가 행 2("채택의 문제")로 떨어진다 — 할 일은 서버를 다시
+// 띄우는 것인데. 이 수가 그 상태를 받는 행 0b를 발화시킨다.
+//
+// **그리고 훅은 하루 약 295번 뛴다.** 이관이 돌 때마다 워터마크를 다시 찍으면 그다음 훅이
+// 워터마크를 옛 서버의 행들 **위로** 올려 경보를 지운다 — F2 시나리오의 뒤쪽 절반이 앞쪽
+// 절반의 증거를 몇 분 만에, 영구히 없앤다. 그래서 이 테스트의 마지막 Open이 본체다.
+func TestLedgerWatermarkSurvivesLaterOpens(t *testing.T) {
+	dir := t.TempDir()
+	// ① 이관 전 역사 두 행 — 정상 상태다. 경보에 절대 들면 안 된다.
+	seedLedgerSchema(t, dir)
+	ledgerSchemaGuard(t, dir, []string{"tool"}, ledgerFetchColumns)
+	ledgerExec(t, dir, oldWriterFetchRow)
+	ledgerExec(t, dir, oldWriterFetchRow)
+	if got := ledgerUserVersion(t, dir); got != 0 {
+		t.Fatalf("사전 가드: 이관 전 워터마크=%d want 0", got)
+	}
+
+	// ② 훅이 새 바이너리로 원장을 이관한다 — 여기서 워터마크가 찍힌다(= max(id)+1 = 3).
+	if err := openAt(t, dir).Close(); err != nil {
+		t.Fatalf("이관 Open Close: %v", err)
+	}
+	ledgerSchemaGuard(t, dir, ledgerFetchColumns, nil)
+	mark := ledgerUserVersion(t, dir)
+	if mark != 3 {
+		t.Fatalf("워터마크=%d want 3(= 이관 전 2행의 max(id)+1)", mark)
+	}
+
+	// ③ 옛 서버가 아직 살아서 한 행 더 적는다 — 이것이 경보의 대상이다.
+	ledgerExec(t, dir, oldWriterFetchRow)
+	// ④ 그리고 새 바이너리도 정상으로 적는다(해소 하나·미해소 하나).
+	st := openAt(t, dir)
+	st.LedgerAppendFetch(t.Context(), 0, 1, 9, agePtr(30), true)
+	st.LedgerAppendFetch(t.Context(), 0, 1, 0, nil, false)
+
+	// ⑤ **본체**: 훅이 또 뛴다. 이관은 이미 끝났으므로 워터마크가 움직이면 안 된다.
+	if err := openAt(t, dir).Close(); err != nil {
+		t.Fatalf("둘째 훅 Open Close: %v", err)
+	}
+	if got := ledgerUserVersion(t, dir); got != mark {
+		t.Fatalf("워터마크가 %d→%d로 움직였다 — 다음 훅이 경보를 지운다(F2)", mark, got)
+	}
+
+	fs, err := LedgerFetchStats(dir)
+	if err != nil {
+		t.Fatalf("LedgerFetchStats: %v", err)
+	}
+	if !fs.MigrateMarkOK {
+		t.Fatalf("워터마크를 찍었는데 MigrateMarkOK=false: %+v", fs)
+	}
+	if fs.Legacy != 3 {
+		t.Fatalf("Legacy=%d want 3(이관 전 2 + 옛 기록자 1)", fs.Legacy)
+	}
+	if fs.LegacyAfterMigrate != 1 {
+		t.Fatalf("LegacyAfterMigrate=%d want 1 — 이관 전 역사가 새거나 옛 기록자의 행을 놓쳤다: %+v",
+			fs.LegacyAfterMigrate, fs)
+	}
+	if fs.Resolved != 1 || fs.Missed != 1 {
+		t.Fatalf("Resolved=%d Missed=%d want 1/1 — 결과 행이 경보 셈에 섞였는지 함께 본다: %+v",
+			fs.Resolved, fs.Missed, fs)
+	}
+}
+
+// TestLedgerWatermarkNotMovedWhenLaterAlterCompletes — 위 테스트가 **못 잡는** 나머지 경로.
+// 거기서는 둘째 Open이 붙일 열이 없어 "열을 붙였을 때만 찍는다"는 조건이 한 번만 참이고, 그
+// 조건 홀로 표식을 지킨다. 여기서는 그 조건이 **두 번** 참이 된다.
+//
+// 도달 경로(소견 F11이 이름 붙인 그 상태): 앞선 실행이 앞 두 ALTER는 성공하고 셋째에서 잠금
+// 경쟁이 busy_timeout을 넘겨 실패했다 — 죽은 게 아니라 루프를 끝냈으므로 **표식은 찍혔다**.
+// 그 뒤 옛 기록자가 행을 남기고, 다음 실행이 셋째 열을 마저 붙인다. 이때 표식을 다시 쓰면
+// 그 사이의 행이 워터마크 **아래로** 숨어 경보가 사라진다. 픽스처는 그 상태를 직접 만든다 —
+// 열 하나만 골라 실패시키는 주입보다 도달 상태를 그대로 세우는 쪽이 정직하다.
+func TestLedgerWatermarkNotMovedWhenLaterAlterCompletes(t *testing.T) {
+	dir := t.TempDir()
+	seedLedgerSchema(t, dir, "artifact_id", "artifact_age_s") // 셋째 ALTER만 실패했던 원장
+	ledgerSchemaGuard(t, dir, []string{"artifact_id", "artifact_age_s"}, []string{"shadow_owned"})
+	ledgerExec(t, dir, oldWriterFetchRow) // 이관 전 역사 1행(id=1)
+	ledgerExec(t, dir, `PRAGMA user_version = 2`)
+	if got := ledgerUserVersion(t, dir); got != 2 { // 사전 가드: 앞선 실행이 남긴 표식
+		t.Fatalf("사전 가드: 워터마크=%d want 2", got)
+	}
+	ledgerExec(t, dir, oldWriterFetchRow) // 옛 기록자가 표식 뒤에 남긴 행(id=2) — 경보 대상
+
+	db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(filepath.Join(dir, "ledger.db"))+pragmas)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	db.SetMaxOpenConns(1)
+	defer db.Close()
+	migrateLedger(db) // 셋째 열을 마저 붙인다 → "열을 붙였다"가 두 번째로 참이 되는 지점
+	ledgerSchemaGuard(t, dir, ledgerFetchColumns, nil)
+
+	if got := ledgerUserVersion(t, dir); got != 2 {
+		t.Fatalf("워터마크가 2→%d로 움직였다 — 이관 뒤 레거시가 워터마크 아래로 숨는다", got)
+	}
+	fs, err := LedgerFetchStats(dir)
+	if err != nil {
+		t.Fatalf("LedgerFetchStats: %v", err)
+	}
+	if !fs.MigrateMarkOK || fs.LegacyAfterMigrate != 1 {
+		t.Fatalf("LegacyAfterMigrate=%d MigrateMarkOK=%v want 1/true: %+v",
+			fs.LegacyAfterMigrate, fs.MigrateMarkOK, fs)
+	}
+}
+
+// TestLedgerFetchStatsNoWatermarkIsUnjudgeable — 이 브랜치의 **앞선 빌드**가 열만 붙이고 표식은
+// 안 남긴 원장. 그 원장의 레거시 행이 이관 앞인지 뒤인지는 되물을 방법이 없으므로, 전부 경보로
+// 찍으면 정상 역사가 통째로 경보가 된다. 답은 계단 사다리가 다른 데서 내는 것과 같은
+// **판정 불가**다 — MigrateMarkOK=false, 그리고 그 0은 "없다"가 아니라 "못 잼"이다.
+// 표식이 없다고 writable Open이 뒤늦게 찍어 넣지도 않는다 — 늦게 찍은 워터마크는 실제 이관
+// 시점보다 뒤라 그 사이의 옛 기록자 행을 "이관 전"으로 만든다.
+func TestLedgerFetchStatsNoWatermarkIsUnjudgeable(t *testing.T) {
+	dir := t.TempDir()
+	seedLedgerSchema(t, dir, ledgerFetchColumns...) // 열은 다 있고 워터마크만 없다
+	ledgerSchemaGuard(t, dir, ledgerFetchColumns, nil)
+	ledgerExec(t, dir, oldWriterFetchRow)
+	ledgerExec(t, dir, oldWriterFetchRow)
+	if got := ledgerUserVersion(t, dir); got != 0 {
+		t.Fatalf("사전 가드: 워터마크=%d want 0", got)
+	}
+
+	if err := openAt(t, dir).Close(); err != nil { // 붙일 열이 없다 → 표식도 안 찍는다
+		t.Fatalf("Open Close: %v", err)
+	}
+	if got := ledgerUserVersion(t, dir); got != 0 {
+		t.Fatalf("이관한 적 없는 원장에 워터마크 %d가 뒤늦게 찍혔다", got)
+	}
+
+	fs, err := LedgerFetchStats(dir)
+	if err != nil {
+		t.Fatalf("LedgerFetchStats: %v", err)
+	}
+	if !fs.OutcomeOK {
+		t.Fatalf("열이 다 있는데 OutcomeOK=false: %+v", fs)
+	}
+	if fs.MigrateMarkOK {
+		t.Fatalf("워터마크가 없는데 판정 가능으로 섰다: %+v", fs)
+	}
+	if fs.LegacyAfterMigrate != 0 {
+		t.Fatalf("판정 불가인데 경보 수가 찍혔다: %+v", fs)
+	}
+	if fs.Legacy != 2 {
+		t.Fatalf("Legacy=%d want 2 — 레거시 자체는 그대로 측정값이다: %+v", fs.Legacy, fs)
+	}
+}
+
+// TestMarkLedgerMigratedFailuresAreWarnedNotFatal — 표식을 못 남기는 세 지점(현재값 읽기 ·
+// max(id) 읽기 · PRAGMA 쓰기)에서 경고만 내고 넘어간다. 원장 전체가 best-effort이므로 표식
+// 실패가 이관이나 Open을 막으면 안 되고, 못 찍힌 결과는 위 "판정 불가"로 정확히 퇴화한다.
+func TestMarkLedgerMigratedFailuresAreWarnedNotFatal(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		db   func(t *testing.T) *sql.DB
+	}{
+		{"현재값 못 읽음", func(t *testing.T) *sql.DB { // 닫힌 핸들 — PRAGMA 읽기부터 실패한다
+			db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(filepath.Join(t.TempDir(), "ledger.db"))+pragmas)
+			if err != nil {
+				t.Fatalf("open: %v", err)
+			}
+			if err := db.Close(); err != nil {
+				t.Fatalf("Close: %v", err)
+			}
+			return db
+		}},
+		{"max(id) 못 읽음", func(t *testing.T) *sql.DB { // ledger 테이블이 없다
+			dir := t.TempDir()
+			db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(filepath.Join(dir, "ledger.db"))+pragmas)
+			if err != nil {
+				t.Fatalf("open: %v", err)
+			}
+			t.Cleanup(func() { _ = db.Close() })
+			if _, err := db.Exec(`CREATE TABLE other(x INTEGER)`); err != nil {
+				t.Fatalf("무관 테이블: %v", err)
+			}
+			return db
+		}},
+		{"PRAGMA 못 씀", func(t *testing.T) *sql.DB { // read-only 핸들 — 읽기 둘은 되고 쓰기만 막힌다
+			dir := t.TempDir()
+			seedLedgerSchema(t, dir)
+			db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(filepath.Join(dir, "ledger.db"))+"?mode=ro&_pragma=busy_timeout(5000)")
+			if err != nil {
+				t.Fatalf("open ro: %v", err)
+			}
+			t.Cleanup(func() { _ = db.Close() })
+			return db
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var logBuf bytes.Buffer
+			prev := slog.Default()
+			slog.SetDefault(slog.New(slog.NewTextHandler(&logBuf, nil)))
+			t.Cleanup(func() { slog.SetDefault(prev) })
+			markLedgerMigrated(tc.db(t)) // panic도 오류 반환도 없다
+			if n := strings.Count(logBuf.String(), "level=WARN"); n != 1 {
+				t.Fatalf("경고 줄 수=%d want 1:\n%s", n, logBuf.String())
+			}
+		})
+	}
+}
+
+// TestLedgerFetchStatsFullMigration: 완전 이관된 ledger.db를 SQL로 직접 시딩해 계약 1의 세
+// 상태(레거시/미해소/해소)와 분위수 계산을 한 픽스처에서 함께 태운다. 위 두 테스트는 둘 다
+// 새 열이 없거나 하나만 있는 스키마로 조기 반환 경로만 타므로, Resolved/Missed 집계 질의와
+// AgeP50/AgeP90/AgeMax 루프는 그 어느 테스트에서도 실행되지 않는다(릴리스 리뷰 소견 —
+// LedgerFetchStats 커버리지 44.4%, count=0 구간이 바로 이 두 블록). writer(Task 8a)가 아직
+// 없으므로 SQL을 직접 써서 완전 이관 스키마를 만든다.
+//
+// 나이를 10/20/30/40/50 다섯 개(중복 없음, 삽입 순서는 뒤섞음 — ORDER BY가 실제로 정렬하게
+// 만든다)로 고른 이유: Resolved=5면 오프셋이 2/3/4로 갈라져 P50·P90·Max가 서로 다른 행을
+// 가리킨다 — 셋 중 하나라도 오프셋이 틀리면 그 하나만 값이 바뀐다. 미해소 2행(age=-1)을 함께
+// 넣어 그 값이 분위수 정렬에 섞이지 않는지도 같이 확인한다(-1은 10보다 작으므로 섞였다면
+// AgeP50/AgeP90/AgeMax가 바뀐다). ctr_search 행 하나(age=999)는 tool='ctr_fetch' 필터가
+// 실제로 걸러내는지 본다 — 안 걸러지면 Calls=9, Resolved=6, AgeMax=999가 된다.
+func TestLedgerFetchStatsFullMigration(t *testing.T) {
+	dir := t.TempDir()
+	db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(filepath.Join(dir, "ledger.db")))
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+	if _, err := db.Exec(`CREATE TABLE ledger(
+		id INTEGER PRIMARY KEY, ts INTEGER NOT NULL, tool TEXT NOT NULL,
+		bytes_stored INTEGER NOT NULL DEFAULT 0, bytes_returned INTEGER NOT NULL DEFAULT 0,
+		duration_ms INTEGER NOT NULL DEFAULT 0, artifact_id INTEGER, artifact_age_s INTEGER,
+		shadow_owned INTEGER)`); err != nil {
+		t.Fatalf("완전 이관 스키마: %v", err)
+	}
+	inserts := []string{
+		`INSERT INTO ledger(ts,tool,artifact_id,artifact_age_s,shadow_owned) VALUES(1,'ctr_fetch',NULL,NULL,NULL)`, // 레거시
+		`INSERT INTO ledger(ts,tool,artifact_id,artifact_age_s,shadow_owned) VALUES(2,'ctr_fetch',NULL,-1,NULL)`,   // 미해소
+		`INSERT INTO ledger(ts,tool,artifact_id,artifact_age_s,shadow_owned) VALUES(3,'ctr_fetch',NULL,-1,NULL)`,   // 미해소
+		`INSERT INTO ledger(ts,tool,artifact_id,artifact_age_s,shadow_owned) VALUES(4,'ctr_fetch',1,30,1)`,         // 해소 — 순서 섞음
+		`INSERT INTO ledger(ts,tool,artifact_id,artifact_age_s,shadow_owned) VALUES(5,'ctr_fetch',2,10,1)`,         // 해소
+		`INSERT INTO ledger(ts,tool,artifact_id,artifact_age_s,shadow_owned) VALUES(6,'ctr_fetch',3,50,1)`,         // 해소
+		`INSERT INTO ledger(ts,tool,artifact_id,artifact_age_s,shadow_owned) VALUES(7,'ctr_fetch',4,20,1)`,         // 해소
+		`INSERT INTO ledger(ts,tool,artifact_id,artifact_age_s,shadow_owned) VALUES(8,'ctr_fetch',5,40,1)`,         // 해소
+		`INSERT INTO ledger(ts,tool,artifact_id,artifact_age_s,shadow_owned) VALUES(9,'ctr_search',6,999,1)`,       // 다른 도구 — 필터 확인
+	}
+	for _, q := range inserts {
+		if _, err := db.Exec(q); err != nil {
+			t.Fatalf("행 삽입 %q: %v", q, err)
+		}
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	// pre-guard: 픽스처가 실제로 완전 이관(세 열 다 있음) 상태인지 먼저 확인한다. 이게 없으면
+	// 픽스처 실수가 이 테스트를 조기 반환 경로로 흘려보내면서도 통과시킨다 — 이 테스트가 잡으려는
+	// 바로 그 가짜 커버리지 상태다.
+	ledgerSchemaGuard(t, dir, []string{"artifact_id", "artifact_age_s", "shadow_owned"}, nil)
+
+	fs, err := LedgerFetchStats(dir)
+	if err != nil {
+		t.Fatalf("LedgerFetchStats: %v", err)
+	}
+	if fs.Calls != 8 {
+		t.Fatalf("Calls=%d want 8 (ctr_search 행은 제외)", fs.Calls)
+	}
+	if fs.Resolved != 5 {
+		t.Fatalf("Resolved=%d want 5", fs.Resolved)
+	}
+	if fs.Missed != 2 {
+		t.Fatalf("Missed=%d want 2", fs.Missed)
+	}
+	// 소견 F9: 레거시 행 수를 따로 낸다 — Calls 안에 섞여 있어 그 줄만 보면 결과 분모로 읽힌다.
+	if fs.Legacy != 1 {
+		t.Fatalf("Legacy=%d want 1(두 열 다 NULL인 이관 전 행)", fs.Legacy)
+	}
+	// 완전 이관에서만 세 표식이 다 선다 — 여기의 0은 전부 진짜 측정값이다.
+	if !fs.LedgerOK || !fs.OutcomeOK || !fs.ShadowOK {
+		t.Fatalf("완전 이관인데 측정 표식이 빠졌다: %+v", fs)
+	}
+	if fs.AgeP50 != 30 || fs.AgeP90 != 40 || fs.AgeMax != 50 {
+		t.Fatalf("분위수 틀림: %+v want {AgeP50:30 AgeP90:40 AgeMax:50}", fs)
+	}
+}
+
+// TestLedgerFetchStats_DirMissing: ledger.db가 아예 없는 디렉터리는 LedgerStats와 동일하게
+// 빈 값 + nil이다(os.Stat 조기 반환 경로 — LedgerFetchStats의 os.Stat 분기 중 파일 미존재
+// 쪽은 위 세 테스트 모두 ledger.db를 만들어 두므로 그전까지 커버되지 않았다).
+func TestLedgerFetchStats_DirMissing(t *testing.T) {
+	fs, err := LedgerFetchStats(t.TempDir())
+	if err != nil {
+		t.Fatalf("ledger.db 미존재: err=%v want nil", err)
+	}
+	if fs != (FetchStat{}) {
+		t.Fatalf("ledger.db 미존재: fs=%+v want 제로값", fs)
+	}
+}
+
+// TestLastIndexedAtByHashUsesMaxOverSiblingArtifacts: 나이 시계가 마지막 포착이고 범위가
+// content_hash다. 두 축을 한 번에 잰다 — 같은 바이트를 media_type 둘로 등록하면 artifact 행이
+// 둘 생기는데(store.go:479의 조회 키가 (content_hash, media_type)), 퍼지 술어는 그 둘의 소스를
+// 전부 본다(shadowOwnedFilter). **artifact 단위로 재는 구현은 이 테스트에서 떨어진다** —
+// 형제 쪽이 최근 값을 쥐고 있기 때문이다.
+func TestLastIndexedAtByHashUsesMaxOverSiblingArtifacts(t *testing.T) {
+	st := openAt(t, t.TempDir())
+	regSource(t, st, "aged", "text/plain", "shadow:Bash:first", "hook")
+	regSource(t, st, "aged", "application/json", "shadow:Bash:second", "hook") // 같은 바이트, 다른 media_type
+
+	old, recent := int64(1_000), int64(9_000)
+	if _, err := st.writer.Exec(
+		`UPDATE sources SET indexed_at=? WHERE uri='shadow:Bash:first'`, old,
+	); err != nil {
+		t.Fatalf("첫 소스 시각: %v", err)
+	}
+	if _, err := st.writer.Exec(
+		`UPDATE sources SET indexed_at=? WHERE uri='shadow:Bash:second'`, recent,
+	); err != nil {
+		t.Fatalf("둘째 소스 시각: %v", err)
+	}
+	// 형제 둘 중 **오래된 쪽**의 artifact를 회수했다고 가정해도 나이는 최근 값이어야 한다.
+	got, _, err := st.LastIndexedAtByHash(t.Context(), hashOf("aged"))
+	if err != nil {
+		t.Fatalf("LastIndexedAtByHash: %v", err)
+	}
+	if got != recent {
+		t.Fatalf("LastIndexedAtByHash=%d, 기대 %d(형제 포함 최댓값)", got, recent)
+	}
+}
+
+// TestLastIndexedAtByHashMissingIsZero: 소스가 없으면 (0, false, nil)이다 — 호출부가 나이를
+// 0으로 두고 계속한다(회수 자체는 성공했다). 귀속도 false다 — hook 소스가 하나도 없으니
+// 퍼지 술어도 이 hash를 고르지 않는다. 집계 1행의 두 값이 다 NULL로 오는 경로라, 스캔이
+// NULL을 받아도 오류가 나지 않는다는 확인이기도 하다.
+func TestLastIndexedAtByHashMissingIsZero(t *testing.T) {
+	st := openAt(t, t.TempDir())
+	got, owned, err := st.LastIndexedAtByHash(t.Context(), hashOf("nothing here"))
+	if err != nil || got != 0 || owned {
+		t.Fatalf("got=%d owned=%v err=%v, 기대 0/false/nil", got, owned, err)
+	}
+}
+
+// TestLastIndexedAtByHashShadowMarkerAgreesWithPurgeFilter: 회수 시점에 박는 shadow 귀속
+// 표식은 **퍼지가 실제로 지우는 집합과 같은 정의**여야 한다(릴리스 리뷰 소견 F4). 정의가
+// 갈리면 나이 분포가 보존 창이 손대지도 않는 explicit 아티팩트로 채워지고, D104의 착수 조건
+// (해소 30건)이 창의 길이에 대해 아무 말도 하지 않는 회수로 충족된다.
+// **기대값을 손으로 적지 않는 것이 이 테스트의 요지다** — shadowOwnedFilter가 내는 집합을
+// 그대로 읽어 대조한다. 표식 쪽이 둘째 정의를 갖는 순간 이 대조가 깨진다.
+func TestLastIndexedAtByHashShadowMarkerAgreesWithPurgeFilter(t *testing.T) {
+	st := openAt(t, t.TempDir())
+	// 귀속 술어의 네 갈래를 다 태운다: hook 전용(귀속) · hook+file 공유(비귀속, 첫 NOT EXISTS) ·
+	// file 전용(비귀속, hook JOIN) · 비-hook 소스가 raw_blob_hash로 참조(비귀속, 둘째 NOT EXISTS).
+	hookOnly, shared, fileOnly, rawRef := "f4-hook-only", "f4-shared", "f4-file-only", "f4-raw-ref"
+	regSource(t, st, hookOnly, "text/plain", "shadow:Bash:f4a", "hook")
+	regSource(t, st, shared, "text/plain", "shadow:Bash:f4b", "hook")
+	regSource(t, st, shared, "text/plain", "/tmp/f4b.txt", "file")
+	regSource(t, st, fileOnly, "text/plain", "/tmp/f4c.txt", "file")
+	regSource(t, st, rawRef, "text/plain", "shadow:Bash:f4d", "hook")
+	if _, err := st.Register(t.Context(), Registration{ // web 소스가 같은 바이트를 raw_blob으로 보존
+		StoredBytes: []byte("f4-web-extracted"), MediaType: "text/plain",
+		Source:  SourceMeta{URI: "https://example.invalid/f4", Kind: "web", SrcHash: "sh-f4web"},
+		RawBlob: []byte(rawRef),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// 퍼지가 보는 집합 그대로(예산 0 = 나이·건수 필터 없음 — PurgeHookOnly와 같은 인자).
+	sel, args := shadowOwnedFilter(0, 0)
+	rows, err := st.reader.Query(sel, args...)
+	if err != nil {
+		t.Fatalf("shadowOwnedFilter 질의: %v", err)
+	}
+	purgeable := map[string]bool{}
+	for rows.Next() {
+		var h string
+		if err := rows.Scan(&h); err != nil {
+			rows.Close()
+			t.Fatalf("scan: %v", err)
+		}
+		purgeable[h] = true
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		t.Fatalf("rows: %v", err)
+	}
+
+	all := []string{hookOnly, shared, fileOnly, rawRef}
+	// 사전 가드: 넷 중 정확히 하나(hook 전용)만 퍼지 대상이어야 아래 대조가 무언가를 증명한다.
+	// 집합이 비거나 넷 다면 "표식 항상 false"·"항상 true" 구현이 통과해버린다.
+	owned := 0
+	for _, c := range all {
+		if purgeable[hashOf(c)] {
+			owned++
+		}
+	}
+	if owned != 1 || !purgeable[hashOf(hookOnly)] {
+		t.Fatalf("픽스처가 의도한 상태가 아니다: 퍼지 대상 %d개(기대 1 = hook 전용), 집합 크기=%d", owned, len(purgeable))
+	}
+
+	for _, c := range all {
+		h := hashOf(c)
+		at, got, err := st.LastIndexedAtByHash(t.Context(), h)
+		if err != nil {
+			t.Fatalf("LastIndexedAtByHash(%s): %v", c, err)
+		}
+		if got != purgeable[h] {
+			t.Fatalf("%s: 귀속 표식=%v, 퍼지 술어=%v — 두 정의가 갈렸다", c, got, purgeable[h])
+		}
+		if at <= 0 {
+			t.Fatalf("%s: 나이 시계=%d — 한 질의가 두 답을 다 내야 한다(왕복 하나)", c, at)
+		}
+	}
+}
+
+// TestLedgerAppendFetchRecordsShadowOwnership: 귀속 표식이 원장 행에 실제로 박힌다 —
+// 해소는 1/0, **미해소는 NULL**이다(아티팩트가 없으니 귀속을 알 길이 없고, 모른다를 0으로
+// 적으면 "explicit이었다"는 거짓 진술이 된다). 반환값이 아니라 열을 직접 읽는 이유는
+// LedgerFetchStats가 열 부재를 관용하므로 집계만 보면 열을 안 쓴 구현도 통과하기 때문이다.
+func TestLedgerAppendFetchRecordsShadowOwnership(t *testing.T) {
+	st := openAt(t, t.TempDir())
+	st.LedgerAppendFetch(t.Context(), 0, 1, 11, agePtr(100), true)  // 해소 · shadow 귀속
+	st.LedgerAppendFetch(t.Context(), 0, 1, 12, agePtr(200), false) // 해소 · explicit
+	st.LedgerAppendFetch(t.Context(), 0, 1, 0, nil, false)          // 미해소
+
+	rows, err := st.ledger.Query(`SELECT artifact_id, shadow_owned FROM ledger WHERE tool='ctr_fetch' ORDER BY id`)
+	if err != nil {
+		t.Fatalf("원장 조회: %v", err)
+	}
+	defer rows.Close()
+	var got []string
+	for rows.Next() {
+		var id, owned sql.NullInt64
+		if err := rows.Scan(&id, &owned); err != nil {
+			t.Fatalf("scan: %v", err)
+		}
+		got = append(got, fmt.Sprintf("%v/%v", nullStr(id), nullStr(owned)))
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("rows: %v", err)
+	}
+	want := []string{"11/1", "12/0", "NULL/NULL"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("(artifact_id/shadow_owned) = %v, 기대 %v", got, want)
+	}
+}
+
+// nullStr — NullInt64를 대조용 문자열로. NULL과 0을 눈으로 갈라야 하는 대조라서 필요하다.
+func nullStr(v sql.NullInt64) string {
+	if !v.Valid {
+		return "NULL"
+	}
+	return strconv.FormatInt(v.Int64, 10)
+}
+
+// agePtr — LedgerAppendFetch의 나이 인자(nil = 미상)를 리터럴에서 만드는 테스트 헬퍼.
+func agePtr(v int64) *int64 { return &v }
+
+// TestLedgerAppendFetchUnknownAgeIsNull: 나이를 **모르는** 해소와 **같은 초에 회수한** 해소를
+// 원장이 갈라 적는다(소견 F6). 전자를 0으로 적으면 분위수에 진짜 0으로 들어가 분포를 아래로
+// 끌어내리고, "창이 넉넉하다"는 결론이 측정하지 못한 회수에서 나온다. 미상은 NULL이고
+// **해소로는 계속 센다** — fetch는 실제로 바이트를 돌려줬다.
+func TestLedgerAppendFetchUnknownAgeIsNull(t *testing.T) {
+	dir := t.TempDir()
+	st := openAt(t, dir)
+	st.LedgerAppendFetch(t.Context(), 0, 1, 7, nil, true)       // 해소인데 나이 미상
+	st.LedgerAppendFetch(t.Context(), 0, 1, 8, agePtr(0), true) // 진짜 0초 — 방금 포착한 것을 회수
+
+	rows, err := st.ledger.Query(`SELECT artifact_age_s FROM ledger WHERE tool='ctr_fetch' ORDER BY id`)
+	if err != nil {
+		t.Fatalf("원장 조회: %v", err)
+	}
+	var got []string
+	for rows.Next() {
+		var age sql.NullInt64
+		if err := rows.Scan(&age); err != nil {
+			rows.Close()
+			t.Fatalf("scan: %v", err)
+		}
+		got = append(got, nullStr(age))
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		t.Fatalf("rows: %v", err)
+	}
+	if want := []string{"NULL", "0"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("artifact_age_s = %v, 기대 %v — 미상과 0초가 같은 값으로 적혔다", got, want)
+	}
+
+	if err := st.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	fs, err := LedgerFetchStats(dir)
+	if err != nil {
+		t.Fatalf("LedgerFetchStats: %v", err)
+	}
+	if fs.Resolved != 2 {
+		t.Fatalf("Resolved=%d want 2 — 나이를 몰라도 해소는 해소다", fs.Resolved)
+	}
+	if fs.ShadowResolved != 1 {
+		t.Fatalf("ShadowResolved=%d want 1 — 나이 미상 행이 분위수 모집단에 들었다", fs.ShadowResolved)
+	}
+}
+
+// TestLedgerFetchStatsRestrictsAgeToShadowOwned: 나이 분위수와 착수 조건이 읽는 수는
+// **퍼지 대상(shadow 귀속) 해소만** 본다(소견 F4 — "행만"이라고 적혀 있었는데 분위수의 표본은
+// 소견 F5 이후 아티팩트당 하나다). explicit 아티팩트는 영원히 안 지워지므로
+// 그 회수 나이가 분포에 섞이면 "창이 넉넉하다"는 결론이 창과 무관한 데이터에서 나온다.
+// 비귀속 행에 귀속 행보다 큰 나이를 심어 — 섞이면 p90·max가 즉시 달라진다.
+func TestLedgerFetchStatsRestrictsAgeToShadowOwned(t *testing.T) {
+	dir := t.TempDir()
+	st := openAt(t, dir)
+	for i, age := range []int64{10, 20, 30, 40, 50} {
+		st.LedgerAppendFetch(t.Context(), 0, 1, int64(i)+1, &age, true)
+	}
+	for i, age := range []int64{100_000, 200_000} { // explicit — 창이 손대지 않는 나이
+		st.LedgerAppendFetch(t.Context(), 0, 1, int64(i)+100, &age, false)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	fs, err := LedgerFetchStats(dir)
+	if err != nil {
+		t.Fatalf("LedgerFetchStats: %v", err)
+	}
+	if fs.Resolved != 7 {
+		t.Fatalf("Resolved=%d want 7 — 해소 건수 자체는 귀속과 무관하다", fs.Resolved)
+	}
+	if fs.ShadowResolved != 5 {
+		t.Fatalf("ShadowResolved=%d want 5", fs.ShadowResolved)
+	}
+	if fs.AgeP50 != 30 || fs.AgeP90 != 40 || fs.AgeMax != 50 {
+		t.Fatalf("분위수에 explicit 나이가 섞였다: %+v want p50=30 p90=40 max=50", fs)
+	}
+}
+
+// TestLedgerFetchStatsCountsDistinctShadowArtifacts: 착수 조건은 **행이 아니라 아티팩트**를
+// 센다(소견 F5). ctr_fetch는 기본 16 KiB까지만 돌려주므로 큰 아티팩트 하나를 읽는 데 여러 번
+// 불리고, 그 한 번의 페이징 폭주가 "해소 30건"을 채우고 분위수까지 지배할 수 있다. 행 수와
+// 아티팩트 수를 나란히 내면 그 집중이 눈에 보인다.
+func TestLedgerFetchStatsCountsDistinctShadowArtifacts(t *testing.T) {
+	dir := t.TempDir()
+	st := openAt(t, dir)
+	for _, age := range []int64{10, 20, 30} { // 아티팩트 1을 세 번 페이징
+		st.LedgerAppendFetch(t.Context(), 0, 1, 1, &age, true)
+	}
+	st.LedgerAppendFetch(t.Context(), 0, 1, 2, agePtr(40), true)
+	if err := st.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	fs, err := LedgerFetchStats(dir)
+	if err != nil {
+		t.Fatalf("LedgerFetchStats: %v", err)
+	}
+	if fs.ShadowResolved != 4 {
+		t.Fatalf("ShadowResolved=%d want 4(행 수)", fs.ShadowResolved)
+	}
+	if fs.ShadowArtifacts != 2 {
+		t.Fatalf("ShadowArtifacts=%d want 2(distinct artifact_id) — 페이징이 착수 조건을 채웠다", fs.ShadowArtifacts)
+	}
+}
+
+// seedPagedFetchLedger — 행 가중과 아티팩트 가중이 **다른 답을 내는** 원장을 만든다. 둘이 같은
+// 픽스처는 아티팩트 가중을 하나도 증명하지 못하므로(이 브랜치가 세 번 저지른 실수), 수치를
+// 골라서 갈라 놓았다:
+//
+//   - 아티팩트 1을 한 세션에서 다섯 번 이어 읽고(10·20·30·40·50) 뒤늦게 한 번 더 회수한다(350).
+//     16 KiB 상한이 만드는 페이징 폭주 그 자체다. 뒤늦은 350이 있어야 **아티팩트당 max와 min이
+//     서로 다른 순위에 서고**, 그래야 집계를 min으로 바꾼 구현이 걸린다.
+//   - 아티팩트 2~7은 각각 한 번씩(100~600).
+//   - 아티팩트 100은 explicit(귀속 아님)으로 두 번 — resolved_artifacts와 shadow_artifacts를
+//     갈라 놓아 소견 F4의 제한이 앞의 수에는 걸리지 않는다는 것도 같은 픽스처가 잠근다.
+//
+// 그래서 세 답이 전부 다르다: 행 가중 p50/p90/max = 100/400/600, 아티팩트당 **min** =
+// 300/500/600, 아티팩트당 **max**(옳은 것) = 350/500/600.
+func seedPagedFetchLedger(t *testing.T, dir string) {
+	t.Helper()
+	st := openAt(t, dir)
+	for _, age := range []int64{10, 20, 30, 40, 50, 350} { // 아티팩트 1 — 페이징 다섯 + 뒤늦은 회수 하나
+		st.LedgerAppendFetch(t.Context(), 0, 1, 1, &age, true)
+	}
+	for i, age := range []int64{100, 200, 300, 400, 500, 600} { // 아티팩트 2~7 — 한 번씩
+		st.LedgerAppendFetch(t.Context(), 0, 1, int64(i)+2, &age, true)
+	}
+	for range 2 { // explicit 아티팩트 — 귀속 제한이 거르는 쪽
+		st.LedgerAppendFetch(t.Context(), 0, 1, 100, agePtr(100_000), false)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatalf("픽스처 Close: %v", err)
+	}
+	ledgerSchemaGuard(t, dir, []string{"artifact_id", "artifact_age_s", "shadow_owned"}, nil)
+}
+
+// shadowRowsAndArtifacts — 원장을 **직접** 읽어 귀속 해소의 (행 수, distinct 아티팩트 수)를 낸다.
+// 사전 가드 전용이라 LedgerFetchStats도 fetchAgeBasis도 거치지 않는다 — 시험 대상으로 시험
+// 대상을 가드하면 그 둘이 함께 틀렸을 때 아무것도 안 잡힌다.
+func shadowRowsAndArtifacts(t *testing.T, dir string) (int64, int64) {
+	t.Helper()
+	db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(filepath.Join(dir, "ledger.db"))+"?mode=ro")
+	if err != nil {
+		t.Fatalf("사전 가드 open: %v", err)
+	}
+	var rows, arts int64
+	scanErr := db.QueryRow(`SELECT count(*), count(DISTINCT artifact_id) FROM ledger
+		WHERE tool='ctr_fetch' AND shadow_owned=1 AND artifact_age_s IS NOT NULL`).Scan(&rows, &arts)
+	closeErr := db.Close()
+	if scanErr != nil {
+		t.Fatalf("사전 가드 조회: %v", scanErr)
+	}
+	if closeErr != nil {
+		t.Fatalf("사전 가드 Close: %v", closeErr)
+	}
+	return rows, arts
+}
+
+// TestLedgerFetchStatsWeighsAgeByArtifact — 릴리스 패스 소견 F5. 나이 분위수의 **모집단이
+// 행이 아니라 아티팩트**다. 페이징은 한 세션 안에서 일어나므로 큰 아티팩트 하나가 거의 같은
+// **젊은** 나이를 여럿 남기고, 행으로 세면 그 무리가 p90을 자기 쪽으로 끌어내린다. D104 행 5는
+// 그 p90을 그대로 보존 창의 처방값으로 바꾸므로, 계측이 제 데이터가 지지하는 것보다 **짧은**
+// 창을 처방하게 된다 — 아무도 눈치채지 못하는 종류의 오류다.
+//
+// 아티팩트당 대푯값으로 **max**를 쓰는 이유: 창의 길이가 답해야 하는 질문은 "이 아티팩트가
+// 마지막으로 필요해진 것이 포착 뒤 얼마인가"이고, 그 답은 그 아티팩트의 **가장 늦은** 회수다.
+// min을 쓰면 "언제 처음 읽혔나"를 재게 되어 창을 짧게 처방하는 같은 방향으로 틀린다.
+func TestLedgerFetchStatsWeighsAgeByArtifact(t *testing.T) {
+	dir := t.TempDir()
+	seedPagedFetchLedger(t, dir)
+
+	// 사전 가드: 두 가중이 실제로 갈라져 있어야 아래 단언이 뜻을 갖는다.
+	rows, arts := shadowRowsAndArtifacts(t, dir)
+	if rows != 12 || arts != 7 {
+		t.Fatalf("사전 가드: 픽스처는 귀속 해소 행 12 · 아티팩트 7이어야 한다 — 실제 행 %d · 아티팩트 %d", rows, arts)
+	}
+
+	fs, err := LedgerFetchStats(dir)
+	if err != nil {
+		t.Fatalf("LedgerFetchStats: %v", err)
+	}
+	if fs.ShadowResolved != 12 || fs.ShadowArtifacts != 7 {
+		t.Fatalf("모집단이 픽스처와 다르다: %+v want shadow_rows=12 shadow_artifacts=7", fs)
+	}
+	if fs.AgeP50 != 350 || fs.AgeP90 != 500 || fs.AgeMax != 600 {
+		t.Fatalf("분위수가 아티팩트 가중이 아니다: p50=%d p90=%d max=%d — want 350/500/600"+
+			" (행 가중이면 100/400/600, 아티팩트당 min이면 300/500/600)", fs.AgeP50, fs.AgeP90, fs.AgeMax)
+	}
+}
+
+// TestLedgerFetchStatsCountsDistinctResolvedArtifacts — 릴리스 패스 소견 F7. D104의 **채택
+// 문턱**은 10건인데, 그 앞 항이 `resolved`(행)였을 때는 행을 셌다 — 지금 계약은
+// `resolved_artifacts + missed`이고 이 테스트가 그 앞 항을 고정한다.
+// 164 KiB 아티팩트 하나를 끝까지 읽으면 16 KiB
+// 상한 때문에 열 번 불리고 해소 행 열 개가 남는다 — 아티팩트 **하나를 한 번** 읽은 14일,
+// 즉 도구가 사실상 안 쓰인 구간이 문턱을 통과해 행 2를 건너뛰고 행 3("이 구간의 데이터로는
+// 창을 늘리지 않는다")으로 떨어진다. 문턱이 막으려던 바로 그 오독이다.
+//
+// 이 픽스처는 두 수가 문턱 10을 **사이에 두고** 갈리게 골랐다 — 행 14(통과) 대 아티팩트
+// 8(미달). 둘 다 같은 쪽에 있는 픽스처는 아무것도 증명하지 못한다.
+func TestLedgerFetchStatsCountsDistinctResolvedArtifacts(t *testing.T) {
+	dir := t.TempDir()
+	seedPagedFetchLedger(t, dir)
+
+	fs, err := LedgerFetchStats(dir)
+	if err != nil {
+		t.Fatalf("LedgerFetchStats: %v", err)
+	}
+	if fs.Resolved != 14 {
+		t.Fatalf("Resolved=%d want 14(행 수는 그대로 낸다 — calls의 분해가 그 위에 서 있다)", fs.Resolved)
+	}
+	if fs.ResolvedArtifacts != 8 {
+		t.Fatalf("ResolvedArtifacts=%d want 8(distinct artifact_id — 귀속 여부와 무관하게 센다)", fs.ResolvedArtifacts)
+	}
+	if fs.Resolved < 10 || fs.ResolvedArtifacts >= 10 {
+		t.Fatalf("문턱 10을 사이에 두지 않는 픽스처는 이 소견을 증명하지 못한다: %+v", fs)
+	}
+	// 귀속 제한은 shadow_* 쪽에만 걸린다(소견 F4) — 채택 문턱은 "도구가 쓰이는가"를 묻는다.
+	if fs.ShadowArtifacts != 7 {
+		t.Fatalf("ShadowArtifacts=%d want 7 — 귀속 제한이 resolved_artifacts에까지 번졌다", fs.ShadowArtifacts)
+	}
+}
+
+// TestLedgerFetchStatsReadsOneSnapshot — 릴리스 패스 소견 F8. 회수 줄의 수들이 **서로 다른
+// 스냅샷**에서 나오면 그 줄은 어떤 원장에도 대응하지 않는 수의 모음이 된다. 훅이 하루 약 295번
+// 쓰는 원장이므로 `stats`가 도는 사이 커밋이 끼는 것은 예외가 아니라 정상이다.
+//
+// 세 불변식을 건다 — 셋 다 이 줄을 읽는 사람이 실제로 기대는 것이다:
+//
+//	① calls = legacy + resolved + missed  (legacy 열을 더한 이유가 이 분해다)
+//	② shadow_rows ≤ resolved · shadow_artifacts ≤ resolved_artifacts  (독스트링이 말하는 부분집합)
+//	③ p50 ≤ p90 ≤ max  (세 오프셋이 같은 모집단에서 나온다)
+//
+// 동시 쓰기가 **작은 나이**를 넣는 이유: 뒤에 도는 질의일수록 같은 오프셋이 더 작은 값을
+// 가리키므로, 스냅샷이 갈리면 p90이 max보다 커지는 상태에 실제로 도달한다.
+// v0.19.1이 SizeStats에서 고친 것과 같은 부류다(그 근거는 SizeStats의 주석에 있다).
+func TestLedgerFetchStatsReadsOneSnapshot(t *testing.T) {
+	dir := t.TempDir()
+	st := openAt(t, dir)
+	for i := range 20 { // 분위수가 설 만큼의 씨앗 — 나이는 크게
+		age := int64(1000 + i*10)
+		st.LedgerAppendFetch(t.Context(), 0, 1, int64(i)+1, &age, true)
+	}
+	done := make(chan struct{})
+	first := make(chan struct{})
+	var written atomic.Int64
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := range 5000 {
+			select {
+			case <-done:
+				return
+			default:
+			}
+			st.LedgerAppendFetch(context.Background(), 0, 1, int64(1000+i), agePtr(1), true)
+			written.Add(1)
+			if i == 0 {
+				close(first)
+			}
+		}
+	}()
+	defer wg.Wait()
+	defer close(done)
+	<-first // 첫 쓰기가 들어간 뒤에 읽기 시작 — 동시성 없는 통과를 원천 차단한다
+	atStart := written.Load()
+
+	for i := range 40 {
+		fs, err := LedgerFetchStats(dir)
+		if err != nil {
+			t.Fatalf("반복 %d: %v", i, err)
+		}
+		if fs.Calls != fs.Legacy+fs.Resolved+fs.Missed {
+			t.Fatalf("반복 %d: calls=%d != legacy+resolved+missed=%d — 한 스냅샷이 아니다",
+				i, fs.Calls, fs.Legacy+fs.Resolved+fs.Missed)
+		}
+		if fs.ShadowResolved > fs.Resolved || fs.ShadowArtifacts > fs.ResolvedArtifacts {
+			t.Fatalf("반복 %d: 부분집합 불변식이 깨졌다 — %+v", i, fs)
+		}
+		if fs.AgeP50 > fs.AgeP90 || fs.AgeP90 > fs.AgeMax {
+			t.Fatalf("반복 %d: 분위수가 서로 다른 모집단에서 나왔다 — p50=%d p90=%d max=%d",
+				i, fs.AgeP50, fs.AgeP90, fs.AgeMax)
+		}
+	}
+
+	// 사후 가드: 읽는 40회 **동안** 쓰기가 실제로 흘렀는지 센다. "한 건 이상"으로는 부족하다 —
+	// 루프 전에 한 건만 들어오고 그 뒤 조용한 경우에도 통과해 버려, 사실상 직렬인 실행을
+	// 동시성 테스트라고 부르게 된다.
+	if during := written.Load() - atStart; during < 20 {
+		t.Fatalf("사후 가드: 읽는 40회 동안 동시 쓰기가 %d건뿐이다 — 그런 통과는 이 소견에 대해 "+
+			"아무 말도 하지 않는다", during)
+	}
+}
+
+// TestLedgerFetchStatsShadowColumnMissing: 세 번째 ALTER 이전 원장(세 열 중 둘만 있음 —
+// 계약 7의 계단 ②)에서도
+// 실패하지 않는다 — 해소·미해소는 읽히되 귀속으로 제한한 수치는 낼 수 없으므로 0이다
+// (계약 7의 부분 이관 관용을 셋째 열로 확장한 것).
+func TestLedgerFetchStatsShadowColumnMissing(t *testing.T) {
+	dir := t.TempDir()
+	db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(filepath.Join(dir, "ledger.db")))
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+	if _, err := db.Exec(`CREATE TABLE ledger(
+		id INTEGER PRIMARY KEY, ts INTEGER NOT NULL, tool TEXT NOT NULL,
+		bytes_stored INTEGER NOT NULL DEFAULT 0, bytes_returned INTEGER NOT NULL DEFAULT 0,
+		duration_ms INTEGER NOT NULL DEFAULT 0, artifact_id INTEGER, artifact_age_s INTEGER)`); err != nil {
+		t.Fatalf("두 열 스키마: %v", err)
+	}
+	if _, err := db.Exec(`INSERT INTO ledger(ts,tool,artifact_id,artifact_age_s) VALUES(1,'ctr_fetch',1,77)`); err != nil {
+		t.Fatalf("해소 행: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	ledgerSchemaGuard(t, dir, []string{"artifact_id", "artifact_age_s"}, []string{"shadow_owned"})
+
+	fs, err := LedgerFetchStats(dir)
+	if err != nil {
+		t.Fatalf("shadow 열 부재에서 오류가 났다: %v", err)
+	}
+	if fs.Resolved != 1 {
+		t.Fatalf("Resolved=%d want 1", fs.Resolved)
+	}
+	if fs.ShadowResolved != 0 || fs.AgeMax != 0 {
+		t.Fatalf("귀속 열 없이 분위수를 냈다: %+v", fs)
+	}
+	// **D104 착수 조건이 읽는 수가 이 계단에서 0이다.** 측정값이 아니라는 표식이 없으면 회수
+	// 줄의 칸이 다 숫자로 보여 결정표 행 0이 발화하지 못하고 행 2로 떨어진다 — 창 판단은 열려 있지만
+	// 처방이 "채택을 늘려라"가 되고, 정작 할 일인 바이너리 교체는 지시되지 않는다.
+	if !fs.LedgerOK || !fs.OutcomeOK {
+		t.Fatalf("총 호출·해소는 읽었는데 표식이 false: %+v", fs)
+	}
+	if fs.ShadowOK {
+		t.Fatalf("shadow 열이 없는데 ShadowOK=true: %+v", fs)
+	}
+}
+
+// TestLedgerAppendFetchMissMarksMinusOne: 미해소 행은 artifact_id NULL + artifact_age_s **−1**
+// 이다. NULL로 적으면 ALTER가 남긴 레거시 행과 구분되지 않아, 배포 첫날 레거시 49건만으로
+// D104의 "미해소 5건 이상"이 발화한다(설계 v0.20 D103 계약 1).
+func TestLedgerAppendFetchMissMarksMinusOne(t *testing.T) {
+	dir := t.TempDir()
+	st := openAt(t, dir)
+	st.LedgerAppendFetch(t.Context(), 0, 1, 42, agePtr(3600), true) // 해소(귀속 — 분위수에 든다)
+	st.LedgerAppendFetch(t.Context(), 0, 1, 0, nil, false)          // 미해소
+	if err := st.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	fs, err := LedgerFetchStats(dir)
+	if err != nil {
+		t.Fatalf("LedgerFetchStats: %v", err)
+	}
+	if fs.Calls != 2 || fs.Resolved != 1 || fs.Missed != 1 {
+		t.Fatalf("calls=%d resolved=%d missed=%d, 기대 2/1/1", fs.Calls, fs.Resolved, fs.Missed)
+	}
+	if fs.AgeMax != 3600 {
+		t.Fatalf("AgeMax=%d, 기대 3600(미해소의 −1이 분포에 섞이면 안 된다)", fs.AgeMax)
+	}
+}
+
+// TestLedgerAppendContextUnderContention: 겹친 쓰기에서 원장 INSERT가 훅 예산 안에 든다.
+// **단일 무경합 실행은 이 경로를 구조적으로 못 본다** — busy_timeout(5000ms)은 다른 연결이
+// 락을 쥐고 있을 때만 개입하고, 그 값이 훅의 총예산 2000ms보다 크다는 것이 계약 8의 위험이다.
+// 스토어를 넷 열어(각자 자기 ledger 연결) 동시에 쓴다: 같은 프로세스지만 연결이 별개라 파일
+// 락 계층은 훅 프로세스 여럿과 같다.
+func TestLedgerAppendContextUnderContention(t *testing.T) {
+	dir := t.TempDir()
+	const writers, perWriter = 4, 25
+	stores := make([]*Store, writers)
+	for i := range stores {
+		stores[i] = openAt(t, dir)
+	}
+
+	var worst atomic.Int64
+	var wg sync.WaitGroup
+	for _, st := range stores {
+		wg.Add(1)
+		go func(st *Store) {
+			defer wg.Done()
+			for range perWriter {
+				ctx, cancel := context.WithTimeout(t.Context(), 2000*time.Millisecond) // 훅 총예산
+				begin := time.Now()
+				st.LedgerAppendContext(ctx, "hook:shadow", 16384, 0, 1)
+				cancel()
+				// CompareAndSwap 재시도 루프 — 네 고루틴이 동시에 worst.Load()를 읽고 비교한 뒤
+				// Store하면 두 고루틴이 같은 낡은 값을 읽어 더 큰 쪽이 작은 쪽에 덮여 쓰이는
+				// lost-update가 가능하다(원자적 개별 연산이라 -race는 못 잡는다). CAS 실패는
+				// 다른 고루틴이 갱신했다는 뜻이므로 최신값으로 재비교한다.
+				if ms := time.Since(begin).Milliseconds(); ms > worst.Load() {
+					for {
+						old := worst.Load()
+						if ms <= old || worst.CompareAndSwap(old, ms) {
+							break
+						}
+					}
+				}
+			}
+		}(st)
+	}
+	wg.Wait()
+	t.Logf("경합 INSERT 최악 소요 = %dms (훅 총예산 2000ms)", worst.Load())
+
+	rows, err := LedgerStats(dir)
+	if err != nil {
+		t.Fatalf("LedgerStats: %v", err)
+	}
+	var got int64
+	for _, r := range rows {
+		if r.Tool == "hook:shadow" {
+			got = r.Calls
+		}
+	}
+	if want := int64(writers * perWriter); got != want {
+		t.Fatalf("hook:shadow 행=%d, 기대 %d — 예산 안에서 못 쓴 INSERT가 있다", got, want)
+	}
+	if worst.Load() >= 2000 {
+		t.Fatalf("경합 INSERT가 훅 예산을 넘겼다: %dms — 설계 §4-4의 분모 재배치 판단으로 간다", worst.Load())
+	}
+}
+
 // TestPurgeOlderThan: 구 source 1개(cutoff 이전에 등록) + 신 source 1개(cutoff 이후)를
 // 등록하고 cutoff를 그 경계로 준다(등록 사이에 time.Now()를 캡처 — indexed_at 조작을 위한
 // writer UPDATE 테스트 헬퍼 대신 실제 시각 흐름으로 경계를 만든다, 설계 §7). 구 source만
@@ -2544,6 +3911,98 @@ func TestCheckpointTruncateBusyWithReader(t *testing.T) {
 		t.Fatalf("busy=0 — 열린 reader 공존인데 완료로 보고(회귀)")
 	}
 	_, _ = conn.ExecContext(context.Background(), "ROLLBACK")
+}
+
+// TestJournalSizeLimitShrinksWALOnPassiveCheckpoint — D102 계약 5·6·9의 기제 자체를 검증한다:
+// journal_size_limit이 이 드라이버(modernc.org/sqlite)에서 WAL을 그 한도 이하로 줄이게
+// 만드는가. 32 MiB를 실제로 쓰지 않으려고 작은 한도(65536)를 건 생 sql.DB로 잰다 —
+// store.Open을 거치지 않는다(배선은 TestOpen_JournalSizeLimit이 잰다).
+//
+// 절단은 체크포인트 그 자체가 아니라 **그 뒤 첫 커밋**에서 일어난다 — 드라이버 소스
+// (modernc.org/sqlite v1.54.0, lib/의 _walFrames)를 직접 대조해 확인했다: 체크포인트가 WAL을
+// 완전히 비우면 Wal.truncateOnCommit이 세워지고, 그 빈 WAL에 첫 프레임을 쓰는 **다음 커밋**의
+// 프레임 쓰기 말미에서만 journal_size_limit을 넘는 만큼 파일을 자른다(Wal.mxWalSize 검사 —
+// walLimitSize). 체크포인트만 걸고 후속 커밋 없이 파일 크기를 재면 이 테스트는 늘 실패한다 —
+// 브리프 "정직하게 적을 것"의 "다음 커밋의 체크포인트가 완료될 때 내려간다"가 가리키는 바로
+// 그 지점이다. 그래서 체크포인트 뒤 사소한 쓰기를 한 번 더 커밋한다.
+//
+// TRUNCATE가 아니라 PASSIVE인 것이 요점이다 — TRUNCATE는 한도와 무관하게 WAL을 0으로 만들어
+// journal_size_limit을 아예 재지 않는다.
+func TestJournalSizeLimitShrinksWALOnPassiveCheckpoint(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.ToSlash(filepath.Join(dir, "content.db"))
+	const limit = 65536
+	db, err := sql.Open("sqlite", "file:"+dbPath+
+		"?_pragma=journal_mode(WAL)&_pragma=wal_autocheckpoint(0)&_pragma=journal_size_limit("+strconv.Itoa(limit)+")")
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+	db.SetMaxOpenConns(1) // 체크포인트를 CREATE/INSERT와 같은 커넥션에서 실행(결정론 — 별개 커넥션의 스냅샷 잔존 배제)
+
+	if _, err := db.Exec("CREATE TABLE t(v TEXT)"); err != nil {
+		t.Fatalf("create table: %v", err)
+	}
+	// 한도(65536B)를 확실히 넘도록 쓴다 — 리터럴 붙여넣기 대신 strings.Repeat.
+	if _, err := db.Exec("INSERT INTO t(v) VALUES(?)", strings.Repeat("x", 300_000)); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+
+	walPath := filepath.Join(dir, "content.db-wal")
+	fi, err := os.Stat(walPath)
+	if err != nil {
+		t.Fatalf("wal stat(사전 가드): %v", err)
+	}
+	// 사전 가드: 픽스처가 한도를 실제로 넘겼는지 확인한다 — 이 가드가 없으면 "원래 작았다"에도
+	// 통과해 이 테스트가 공허 통과한다.
+	if fi.Size() <= limit {
+		t.Fatalf("wal(사전 가드)=%dB want >%dB — 픽스처가 한도를 못 넘김", fi.Size(), limit)
+	}
+
+	var busy, walFrames, checkpointed int
+	if err := db.QueryRow("PRAGMA wal_checkpoint(PASSIVE)").Scan(&busy, &walFrames, &checkpointed); err != nil {
+		t.Fatalf("wal_checkpoint(PASSIVE): %v", err)
+	}
+	// 절단 트리거 — 위 주석 참조. 이 커밋이 없으면 파일은 체크포인트 전 크기 그대로 남는다.
+	if _, err := db.Exec("INSERT INTO t(v) VALUES('')"); err != nil {
+		t.Fatalf("post-checkpoint insert: %v", err)
+	}
+
+	fi, err = os.Stat(walPath)
+	if err != nil {
+		t.Fatalf("wal stat(사후): %v", err)
+	}
+	if fi.Size() > limit {
+		t.Fatalf("wal(사후)=%dB want <=%dB (checkpoint busy=%d walFrames=%d checkpointed=%d) — journal_size_limit이 WAL을 못 줄임",
+			fi.Size(), limit, busy, walFrames, checkpointed)
+	}
+}
+
+// TestOpen_JournalSizeLimit — D102 계약 5·6·9 배선: pragmas 상수가 writable/read-only 두 DSN의
+// 공통 접두라(store.go:145-152) journalSizeLimit 상수 한 자리 변경이 둘 다 덮는다.
+func TestOpen_JournalSizeLimit(t *testing.T) {
+	dir := t.TempDir()
+	st := openAt(t, dir)
+	var got string
+	if err := st.Reader().QueryRow("PRAGMA journal_size_limit").Scan(&got); err != nil {
+		t.Fatalf("PRAGMA journal_size_limit: %v", err)
+	}
+	if got != journalSizeLimit {
+		t.Fatalf("journal_size_limit=%q want %q", got, journalSizeLimit)
+	}
+
+	ro, err := Open(dir, true)
+	if err != nil {
+		t.Fatalf("open read-only: %v", err)
+	}
+	defer func() { _ = ro.Close() }()
+	var gotRO string
+	if err := ro.Reader().QueryRow("PRAGMA journal_size_limit").Scan(&gotRO); err != nil {
+		t.Fatalf("read-only PRAGMA journal_size_limit: %v", err)
+	}
+	if gotRO != journalSizeLimit {
+		t.Fatalf("read-only journal_size_limit=%q want %q", gotRO, journalSizeLimit)
+	}
 }
 
 // TestErrPredicates — 공개 술어의 비-sqlite 오류 음성 판정(양성은 실 BUSY 경로가 간접 커버).

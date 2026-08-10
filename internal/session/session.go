@@ -37,9 +37,18 @@ const (
 	recoverMarkerName = "session.recover-pending"
 )
 
-// pragmas — internal/store/store.go의 `pragmas` 상수(D9 PRAGMA 세트)와 문자 그대로 동일한
-// 값이다. session은 store 상수를 import하지 않고 리터럴을 복제한다(설계 §2.1) — 두 패키지가
-// 독립적으로 진화해도 D9 규율 자체는 텍스트로 고정된다.
+// pragmas — internal/store/store.go의 `pragmas` 상수(D9 PRAGMA 세트)와 기반 넷
+// (journal_mode·synchronous·busy_timeout·foreign_keys)은 문자 그대로 동일한 값이다. session은
+// store 상수를 import하지 않고 리터럴을 복제한다(설계 §2.1) — 두 패키지가 독립적으로
+// 진화해도 D9 규율 자체는 텍스트로 고정된다.
+//
+// 더는 완전히 동일하지 않다: store 쪽은 여기에 `journal_size_limit(33554432)`를 하나 더
+// 붙인다(D102 계약 5·6·9, store.go의 journalSizeLimit) — 매일 도는 FTS 세그먼트 병합
+// (`optimize`)이 한 트랜잭션에서 전체 인덱스를 다시 쓰며 남기는 WAL 고수위를 되돌리기
+// 위해서다. session.db에는 그 병합이 없다(이벤트 FTS는 트리거로만 동기화한다, retention.go) —
+// 이 pragma가 푸는 문제 자체가 content.db 전용이므로 session 쪽은 그대로 드라이버 기본값
+// (무제한)으로 둔다. **여기에 옮겨 붙이지 마라** — session.db가 그 문제를 갖게 되기 전에는
+// 재는 게 없는 한도일 뿐이다.
 const pragmas = "?_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)&_pragma=busy_timeout(5000)&_pragma=foreign_keys(ON)"
 
 const schemaVersion = 1 // session.db 독자 PRAGMA user_version 공간(설계 §2.1) — store.SchemaVersion과 무관
