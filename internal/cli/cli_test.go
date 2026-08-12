@@ -1917,7 +1917,8 @@ func TestStatsPrintsFetchStats(t *testing.T) {
 //
 // 픽스처는 그 상태 그대로다: 이관 전 역사 2행(id 1·2) → 워터마크 3 → 옛 기록자의 3행(id 3·4·5).
 // 나머지 칸이 전부 숫자이고 `resolved_artifacts + missed = 0`이라, 이 칸이 없으면 결정표는
-// 행 2("채택의 문제")로 떨어진다 — `legacy_after_migrate=3`이 그 오독을 끊는다.
+// 행 2("창을 sizing하기에 채택이 부족하다")로 떨어진다 — `legacy_after_migrate=3`이 그 오독을
+// 끊는다.
 //
 // `legacy=5`와 `legacy_after_migrate=3`을 **다른 수로** 잡은 것이 요점이다(전자가 후자를 포함
 // 한다). 같은 수면 두 칸을 뒤바꿔도 통과한다. 단언을 탭으로 감싸는 이유는 `legacy=5`가

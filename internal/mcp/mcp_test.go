@@ -3063,8 +3063,8 @@ func cancelledCtx(t *testing.T) context.Context {
 // best-effort `_, _ =`가 그 오류를 삼켜, **실제로 성공한 회수가 원장에 흔적을 안 남긴다**.
 // 바로 위의 나이 조회도 같은 ctx에서 죽으므로 살아남은 행조차 나이도 귀속 표식도 없다.
 // 취소는 부하와 상관이 있어 14일 동안 resolved·resolved_artifacts·shadow_artifacts가 함께
-// 낮게 나오고, 정말 쓰인 창이 채택 문턱 미달로 읽혀 D104가 창의 판정 대신 "채택의 문제"로
-// 떨어진다 — 이 계측이 사고로 도달하지 않으려는 바로 그 결론이다.
+// 낮게 나오고, 정말 쓰인 창이 채택 문턱 미달로 읽혀 D104가 창의 판정 대신 "창을 sizing하기에
+// 채택이 부족하다"로 떨어진다 — 이 계측이 사고로 도달하지 않으려는 바로 그 결론이다.
 // 세 단정이 각각 원장 기록·나이 조회·귀속 조회의 생존을 잡는다.
 func TestFetchResolveRecordsUnderCancelledCtx(t *testing.T) {
 	_, st, _, storeDir := newRecordEventTestServer(t)
