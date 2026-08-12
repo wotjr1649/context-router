@@ -891,6 +891,23 @@ ctx 취소로 끝나면 그 회수는 행을 아예 남기지 않는다** `[실�
   dedup하는 안을 버린 근거 셋** ②가 **같은 기제**를 `missed_artifacts` 쪽에서 이미 논증한다 —
   공유하는 것은 id 재사용이라는 기제이지 그것이 판정에 미치는 방향이 아니다. 방향은 그 칸이
   어느 문턱에 어느 부호로 들어가느냐로 갈리므로 자리마다 따로 읽는다).
+
+  ★★ **닫혔다**(세션 59, 2026-08-12). `Register`가 id를 SQLite에 맡기지 않고 워터마크
+  (`id_watermark` 한 행)에서 발급한다 — `AUTOINCREMENT`가 `sqlite_sequence`로 하는 일을 우리
+  표로 직접 한다. `artifacts` 스키마를 재생성하지 않은 이유는 대가가 다르기 때문이다:
+  `AUTOINCREMENT`는 `ALTER TABLE`로 붙일 수 없어 그 표를 통째로 다시 만들어야 하는데
+  `sources`가 그 id를 FK로 참조하고 `chunks`는 FTS5 외부 콘텐츠와 트리거 셋으로 묶여 있다.
+  워터마크 표가 없으면 발급이 `max(id)+1`로 되돌아간다 — 이 릴리스 이전과 같은 상태이고,
+  저장 자체를 막는 것보다 낫다(`ensureIndexes`와 같은 fail-open 판단).
+
+  ★ **그런데 재현이 이 문단보다 심각했다** `[실측 — 2026-08-12]`. 여기는 영향을 "distinct 계수
+  과소 계상"으로만 적었는데, 실제 결과는 **회수가 무관한 내용을 오류 없이 돌려주는 것**이다:
+  퍼지 뒤 재발급된 id로 `ReadRange`를 부르면 `line`·`byte`·`chunk` **셋 다** 새 아티팩트의
+  내용을 반환했다. `chunk` 선택자가 소속 검증에 걸릴 것이라는 예상도 틀렸다 — `chunks.id`가
+  함께 재발급되어 옛 chunk id가 새 artifact의 chunk를 정확히 가리킨다. **고치는 자리가
+  `artifacts.id` 발급 한 곳인 이유**는 `ReadRange`의 첫 조회가 `WHERE id=?`이기 때문이다:
+  그 id가 없으면 chunk 경로에 도달하지 못한다. 회귀는 `TestArtifactIDNotReusedAfterPurge`가,
+  워터마크 부재 폴백은 `TestRegisterSurvivesMissingIDWatermark`가 잠근다.
 - ★ **"해소 30건"은 `shadow_artifacts`를 읽는다 — 행 수도, 전체 해소도 아니다**(마감 소견
   F5). `ctr_fetch`는 기본 16 KiB까지만 돌려주므로 `[실측 — 위 ★★와 같은 예산]` **아티팩트
   하나를 읽는 것이 여러 호출**이고,

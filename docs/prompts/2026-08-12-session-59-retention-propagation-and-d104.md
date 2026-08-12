@@ -201,6 +201,42 @@ CHANGELOG 한 곳 말고 **코드 주석 다섯 곳**에도 남아 있었다(`st
 `file_path`(Read/Edit/Write) · `command`(Bash)만 적용되고 `limit` · `head_limit`은 **조용히
 버려진다.** 스펙 §6이 적은 그 부분은 맞다.
 
+### 3.7 F10 — 문서보다 심각했고, 워터마크로 닫았다
+
+세션 57·58이 *"퍼지 뒤 id 재발급으로 `ctr_fetch`가 무관한 내용을 오류 없이 돌려주는 선재
+결함"*으로 이월해 둔 것이다. **재현부터 했다** `[실측 — `internal/store` 임시 테스트]`:
+
+    퍼지: sources=1 artifacts=1
+    idA=1 idB=1  재사용=true
+      line               → 통과, "SECOND-artifact-body-completely-unrelated\n"
+      byte               → 통과, "SECON"
+      chunk(옛 chunk id) → 통과, "SECOND-artifact-body-completely-unrelated\n"
+
+★ **세 선택자 전부 뚫렸다 — 설계서가 적은 것보다 심각하다.** D104의 그 ★는 영향을 "distinct
+계수 과소 계상"으로만 적었는데, 실제 결과는 **회수가 무관한 내용을 오류 없이 돌려주는 것**이다.
+그리고 내 예상("chunk 선택자는 소속 검증에 걸린다")도 **틀렸다** — `chunks.id`가 함께 재발급되어
+옛 chunk id가 새 artifact의 chunk를 정확히 가리킨다. 같은 날 (A) 검증의 ④가 NOT_FOUND를 낸 것은
+chunk `999999`가 **아예 없어서**였지 소속 검증 때문이 아니었다.
+
+★★ **그래도 고치는 자리는 한 곳이다.** `ReadRange`의 첫 조회가 `SELECT … FROM artifacts WHERE
+id=?`이므로 **`artifacts.id` 재사용만 막으면 chunk 경로까지 닫힌다**(없는 id는 그 앞에서
+NOT_FOUND가 된다). 계측의 두 distinct 계수도 같은 축이다.
+
+**처방**(소유자 판정): 워터마크. `AUTOINCREMENT`가 `sqlite_sequence`로 하는 일을 `id_watermark`
+한 행으로 직접 한다. `AUTOINCREMENT`를 붙이려면 `ALTER TABLE`이 안 돼 `artifacts`를 통째로
+재생성해야 하는데 `sources`가 FK로, `chunks`가 FTS5 외부 콘텐츠와 트리거 셋으로 묶여 있다 —
+사용자 스토어에 아티팩트 678개가 있는 상태에서 감당할 위험이 아니었다.
+
+- 표 생성은 **버전 스위치 밖**이다(D73 색인과 같은 이유) — 이미 v1인 저장소가 첫 Open에서 닿는다.
+- **마이그레이션 단계가 없다**: 워터마크가 없던 DB는 `max(id)`에서 이어 발급한다(lazy 초기화).
+- **fail-open**: 표가 없으면 `max(id)+1`로 되돌아가고 저장은 계속된다 — 경고만 남는다. 그
+  폴백을 실제로 관측했다(테스트가 표를 지우고 등록에 성공한다).
+- 회귀 둘: `TestArtifactIDNotReusedAfterPurge`(재사용 금지 **+ 옛 참조 셋 다 NOT_FOUND**) ·
+  `TestRegisterSurvivesMissingIDWatermark`(폴백).
+
+**이번 측정 구간에는 영향이 없다** — t0의 distinct 계수가 전부 0이라 오염될 과거분이 없다.
+이미 재사용된 id를 되돌리지는 않는다.
+
 ## 4. 저장소 현재 상태
 
 - **`main`**: 세션 시작 시 `eda87ac`(v0.20.0). 이 세션의 작업은 **PR #44로 머지**했다 —
@@ -250,8 +286,9 @@ a source"라고 적는 이유가 이것이다(Claude Code는 설정 변경·플�
 
 - ~~다음 릴리스 후보 1순위: 훅이 `updatedToolOutput`으로 큰 출력을 요약+참조로 대체~~ —
   **실측으로 기각됐다(§3.6).** 다음 후보는 D100이 열거한 셋 안에서 찾는다.
-- **F10 `AUTOINCREMENT`** — 퍼지 뒤 id 재발급. 채택 레버가 언젠가 참조를 뿌리게 되면 선행
-  조건이 된다(세션 59가 hash 기반 참조를 그 우회로 검토했다).
+- ~~F10 `AUTOINCREMENT` — 퍼지 뒤 id 재발급~~ — **닫혔다**(§3.7). 워터마크 발급으로 막았고,
+  재현이 문서보다 심각했다(세 선택자 전부 뚫렸다). **이번 측정 구간에는 영향이 없다** — t0의
+  distinct 계수가 전부 0이라 오염될 과거분이 없다.
 - 세션 57의 F12·F13, 트라이그램 축, 워크트리 `v0.20-d103-fetch-instrumentation` 정리.
 
 ## 6. 상시 프로토콜 (이번 세션이 낸 것)
@@ -319,7 +356,8 @@ docs/prompts/2026-08-12-session-59-retention-propagation-and-d104.md 를 읽고 
   ★를 먼저 읽어라. 다음 후보는 D100 이 열거한 셋 안에서 찾는다: (a) 가시성 (b) 훅의 좁은
   강제(쓸 수 있는 것은 거부와 PreToolUse updatedInput 화이트리스트뿐) (c) 수동 포착.
 - D104 결정표 결함 열둘은 **전부 닫혔다** — 남은 항목 없음.
-- F10 AUTOINCREMENT — 퍼지 뒤 id 재발급으로 ctr_fetch 가 무관한 내용을 오류 없이 반환한다.
+- F10 AUTOINCREMENT 는 닫혔다(워터마크 발급). 남은 코드 항목은 세션 57의 F12·F13 과
+  트라이그램 축 유지 여부다.
 - Codex 호스트의 창은 settings.json 처방이 닿지 않는다 — 열린 구멍이다.
 
 ## 밟으면 안 되는 자리
