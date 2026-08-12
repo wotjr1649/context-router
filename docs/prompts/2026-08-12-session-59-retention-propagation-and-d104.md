@@ -288,7 +288,8 @@ docs/prompts/2026-08-12-session-59-retention-propagation-and-d104.md 를 읽고 
 - **336h가 호스트 환경에 발효돼 있다.** 세션 59가 ~/.claude/settings.json 의 env 에
   "CTR_SHADOW_RETENTION": "336h" 를 넣었고(git 밖), 재시작 없이 자식 프로세스에 반영됐다.
   실효 창이 336h가 되는 것은 **다음 서버 기동**부터다.
-- 브랜치 docs/session-58-measurement-kickoff 에 커밋 일곱, main = eda87ac.
+- 세션 58·59의 작업은 PR #44 로 main 에 머지됐다(main = 1736947, 브랜치 삭제됨).
+  워킹트리 clean.
 
 ## 첫 일 — 확인 셋을 그대로 다시. 특히 2번.
 
