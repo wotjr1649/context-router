@@ -243,6 +243,9 @@ NOT_FOUND가 된다). 계측의 두 distinct 계수도 같은 축이다.
   브랜치 `docs/session-58-measurement-kickoff`, **커밋 열**(세션 58의 여섯 + `8b3e269` D104 ·
   `5fd0046` 핸드오프 · `73be9de` 전파 정정 · `7169e58` D100 기각). windows CI는 재실행에서
   **두 run 모두 pass**해 `internal/exec` flake 판정이 확정됐다.
+  그 뒤 `main`에 직접 둘(핸드오프 상태 정정 · D104 "측정 출처 누락 3"), 그리고 **PR #45**로
+  F10 수정(§3.7)까지 들어갔다 — **`main` = `639049c`**. 이 세션이 남긴 코드 변경은 F10 하나이고
+  나머지는 전부 문서다.
 - **설치본**: 0.20.0. `.old`는 0.19.1(롤백은 **편도**다).
 - **`CTR_SHADOW_RETENTION`**: User 스코프 `336h` + `~/.claude/settings.json`의 `env`에 `336h`
   (**이 세션이 추가, git 밖**). **호스트 환경 블록에 발효됨** `[실측 — 자식 셸 둘이 읽는다]`.
@@ -331,8 +334,8 @@ docs/prompts/2026-08-12-session-59-retention-propagation-and-d104.md 를 읽고 
 - **336h가 호스트 환경에 발효돼 있다.** 세션 59가 ~/.claude/settings.json 의 env 에
   "CTR_SHADOW_RETENTION": "336h" 를 넣었고(git 밖), 재시작 없이 자식 프로세스에 반영됐다.
   실효 창이 336h가 되는 것은 **다음 서버 기동**부터다.
-- 세션 58·59의 작업은 PR #44 로 main 에 머지됐다(main = 1736947, 브랜치 삭제됨).
-  워킹트리 clean.
+- 세션 58·59의 작업은 전부 main 에 들어갔다 — PR #44(문서), PR #45(F10 수정), 그리고 main
+  직접 커밋 둘. main = 639049c, 브랜치 정리됨, 워킹트리 clean.
 
 ## 첫 일 — 확인 셋을 그대로 다시. 특히 2번.
 
@@ -349,8 +352,9 @@ docs/prompts/2026-08-12-session-59-retention-propagation-and-d104.md 를 읽고 
 
 ## 그다음
 
-- PR #44 는 머지됐다. windows CI 실패는 internal/exec flake였고 재실행에서 두 run 모두
-  pass해 확정됐다(그 패키지에 이 변경의 파일이 0개, main 도 같은 워크플로에서 이미 빨갰다).
+- PR #44·#45 둘 다 머지됐다. windows CI 는 #44 에서 한 번 빨갰는데 internal/exec flake였고
+  재실행 두 run 모두 pass로 확정됐다(그 패키지에 그 변경의 파일이 0개, main 도 같은 워크플로에서
+  이미 빨갰다). #45 는 windows 를 포함해 처음부터 전부 green이었다.
 - 주 1회 회수 줄 스냅샷을 남긴다(stats 는 read-only라 비용이 없다).
 - **채택 레버 1순위(updatedToolOutput)는 실측으로 기각됐다** — v0.19 설계서 D100 결정문 뒤
   ★를 먼저 읽어라. 다음 후보는 D100 이 열거한 셋 안에서 찾는다: (a) 가시성 (b) 훅의 좁은
