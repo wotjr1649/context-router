@@ -165,6 +165,36 @@ CHANGELOG 한 곳 말고 **코드 주석 다섯 곳**에도 남아 있었다(`st
 그 밖 B2·B4·B7·표기 둘. **닫지 못한 것: "측정 출처 누락 3"** — 스펙이 위치를 적지 않았고
 특정하지 못했다.
 
+### 3.6 ★★★ 다음 릴리스 1순위가 실측으로 기각됐다
+
+채택 레버 브레인스토밍을 시작하자마자 전제가 무너졌다. 세션 58이 1순위로 올린 *"훅이
+`updatedToolOutput`으로 큰 출력을 요약+참조로 대체한다"*의 근거는 **이슈
+`anthropics/claude-code#32105`가 COMPLETED로 닫혔다**는 사실 하나였다.
+
+**증거 셋이 반대를 가리켰다**:
+
+1. hooks reference와 hooks-guide **두 문서 모두** 그 필드가 없다. `PostToolUse`의 결정 제어는
+   top-level `decision: "block"`뿐이고, `hookSpecificOutput`에 문서화된 것은
+   `additionalContext` · `permissionDecision` · `updatedInput`(PreToolUse 전용)이다.
+2. 그 이슈는 제목부터 **요청**이다 — `allow updatedToolOutput for built-in tools`.
+3. 잠기기 직전 코멘트가 *"`updatedToolOutput` in PostToolUse **remains the only viable path**"* ·
+   *"**+1 for extending** `updatedToolOutput` to built-in tools"* — 아직 없다는 뜻이다.
+
+**그리고 직접 쟀다** `[실측 — 프로젝트 스코프 PostToolUse 훅]`: 고정 마커를 `updatedToolOutput`
+으로 출력하는 훅을 `Glob`에 걸고 그 도구를 불렀다. **훅은 발화했는데**(sentinel 파일에
+타임스탬프) **결과는 원본 그대로** 왔다. 발화와 무시가 함께 관측되므로 "훅이 안 떴다"는 대안
+설명이 배제된다. 프로브는 즉시 걷었다(`.claude/settings.local.json`, gitignore 안, sentinel이
+그 뒤로 안 늘어난 것으로 확인).
+
+★ **계약에 박았다** — v0.19 설계서 D100 결정문 뒤 ★. 이 자리는 두 번 뒤집혔으므로(초안이
+"호스트 스펙상 불가능"으로 기각 → 세션 58이 문서·이슈로 "그것은 틀렸다"고 뒤집음 → 이 실측이
+원래 기각을 복원), **세 번째로 뒤집으려면 문서나 이슈 상태가 아니라 같은 형태의 실측을 가져와야
+한다**고 함께 적었다.
+
+★ **부수 소득**: 같은 이슈 코멘트가 `PreToolUse` `updatedInput`의 화이트리스트를 실측해 뒀다 —
+`file_path`(Read/Edit/Write) · `command`(Bash)만 적용되고 `limit` · `head_limit`은 **조용히
+버려진다.** 스펙 §6이 적은 그 부분은 맞다.
+
 ## 4. 저장소 현재 상태
 
 - **`main`**: `eda87ac` (v0.20.0). 브랜치 `docs/session-58-measurement-kickoff`에
@@ -210,8 +240,10 @@ a source"라고 적는 이유가 이것이다(Claude Code는 설정 변경·플�
 
 ### 5.5 그 밖 (세션 58에서 이월, 그대로 열림)
 
-- **다음 릴리스 후보 1순위**: 훅이 `updatedToolOutput`으로 큰 출력을 요약+참조로 대체.
-- **F10 `AUTOINCREMENT`** — 퍼지 뒤 id 재발급.
+- ~~다음 릴리스 후보 1순위: 훅이 `updatedToolOutput`으로 큰 출력을 요약+참조로 대체~~ —
+  **실측으로 기각됐다(§3.6).** 다음 후보는 D100이 열거한 셋 안에서 찾는다.
+- **F10 `AUTOINCREMENT`** — 퍼지 뒤 id 재발급. 채택 레버가 언젠가 참조를 뿌리게 되면 선행
+  조건이 된다(세션 59가 hash 기반 참조를 그 우회로 검토했다).
 - 세션 57의 F12·F13, 트라이그램 축, 워크트리 `v0.20-d103-fetch-instrumentation` 정리.
 
 ## 6. 상시 프로토콜 (이번 세션이 낸 것)
@@ -223,6 +255,11 @@ a source"라고 적는 이유가 이것이다(Claude Code는 설정 변경·플�
   새 부모를 요구했는데 호스트 설정 파일의 `env`는 재시작 없이 그다음 자식부터 반영됐다
   `[실측]`. 어느 쪽이든 **그 자리에서 읽어 보는 것** 말고 아는 방법이 없다 — 이 세션은 처방을
   넣은 뒤 "재시작해야 발효된다"고 적었다가 확인 한 번에 그 진술을 정정했다.
+- **★★★ 이슈가 COMPLETED로 닫혔다는 것은 그 기능이 존재한다는 뜻이 아니다.** 세션 58이 그 한
+  걸음으로 다음 릴리스 1순위를 세웠는데, 문서 두 곳과 **그 이슈의 코멘트 자체**가 모두 반대를
+  가리켰고 15분짜리 실측이 확정했다. **기능의 존재는 그것을 써 보는 것으로만 확정된다** — 훅이면
+  훅을 걸고 도구를 부르는 것이다. 그리고 그 실측에는 **"안 떴다"와 "떴는데 무시됐다"를 가르는
+  sentinel이 반드시 함께 있어야 한다**; 없으면 음성 결과가 무효다.
 - **★★ 처방을 넣기 전에 그 처방의 기제를 실증하라.** `settings.json`의 `env`가 자식에게
   전파되는지를 **그 블록의 기존 값 셋으로** 먼저 확인했다. 확인 비용은 한 번의 셸 호출이었다.
 - **★★ 되돌릴 수 없는 손실을 다룰 때는 "이미 난 손실"과 "앞으로 날 손실"을 먼저 가르라.**
@@ -266,9 +303,15 @@ docs/prompts/2026-08-12-session-59-retention-propagation-and-d104.md 를 읽고 
 
 ## 그다음
 
-- 브랜치를 푸시하고 PR을 연다(커밋 일곱, 코드 변경은 주석 다섯 곳뿐).
+- PR #44 가 열려 있다. windows CI 실패는 internal/exec flake로 판정됐다 — 이 변경은 그
+  패키지에 파일이 0개이고, 같은 커밋의 다른 run에서는 windows가 pass했으며, main 도 같은
+  워크플로에서 이미 빨갛다.
 - 주 1회 회수 줄 스냅샷을 남긴다(stats 는 read-only라 비용이 없다).
+- **채택 레버 1순위(updatedToolOutput)는 실측으로 기각됐다** — v0.19 설계서 D100 결정문 뒤
+  ★를 먼저 읽어라. 다음 후보는 D100 이 열거한 셋 안에서 찾는다: (a) 가시성 (b) 훅의 좁은
+  강제(쓸 수 있는 것은 거부와 PreToolUse updatedInput 화이트리스트뿐) (c) 수동 포착.
 - 남은 D104 항목: "측정 출처 누락 3"(위치 미특정).
+- F10 AUTOINCREMENT — 퍼지 뒤 id 재발급으로 ctr_fetch 가 무관한 내용을 오류 없이 반환한다.
 - Codex 호스트의 창은 settings.json 처방이 닿지 않는다 — 열린 구멍이다.
 
 ## 밟으면 안 되는 자리

@@ -393,6 +393,29 @@ Search가 우리 도구 전체에 대해 무력화된다. 이것은 비용이 �
 
 **근거**: B③·B④·B⑤.
 
+★ **(b)의 범위를 정하는 것은 실측이다 — "훅이 도구 출력을 대체한다"는 경로는 이 호스트에
+없다** (세션 59, 2026-08-12). 세션 58이 *"PostToolUse 훅은 `hookSpecificOutput.
+updatedToolOutput`으로 도구 결과를 대체할 수 있고 내장 도구 전부에 적용된다"*를 채택 레버
+1순위로 올렸는데, 그 근거는 **이슈 `anthropics/claude-code#32105`가 COMPLETED로 닫혔다**는
+사실 하나였다. 그 추론이 틀렸다: 그 이슈는 제목부터 *요청*(`allow updatedToolOutput for
+built-in tools`)이고, 잠기기 직전 코멘트가 *"`updatedToolOutput` in PostToolUse **remains the
+only viable path**"* · *"**+1 for extending** `updatedToolOutput` to built-in tools"*로 **아직
+없음**을 말한다. 현재 hooks reference와 hooks-guide 어디에도 그 필드가 없다 `[문서 —
+code.claude.com/docs/en/hooks · /hooks-guide, 2026-08-12 확인]`.
+
+**직접 쟀다** `[실측 — 프로젝트 스코프 PostToolUse 훅]`: 고정 JSON
+`{"hookSpecificOutput":{"hookEventName":"PostToolUse","updatedToolOutput":"<마커>"}}`만 출력하는
+훅을 `Glob`에 걸고 그 도구를 불렀다. **훅은 발화했고**(sentinel 파일에 타임스탬프가 남았다)
+**도구 결과는 원본 그대로 왔다** — 마커가 호출자에게 닿지 않았다. 발화와 무시가 함께
+관측되므로 "훅이 안 떴다"는 대안 설명이 배제된다.
+
+**이 자리는 두 번 뒤집혔다** — 초안이 "호스트 스펙상 불가능"으로 기각 → 세션 58이 문서·이슈를
+근거로 "그것은 틀렸다"고 뒤집음 → 이 실측이 원래 기각을 복원. **세 번째로 뒤집으려면 문서나
+이슈 상태가 아니라 같은 형태의 실측을 가져와야 한다.** 그때까지 (b)가 실제로 쥔 것은 거부
+(exit 2 / `permissionDecision`)와 `PreToolUse`의 `updatedInput`뿐이고, 후자는 화이트리스트
+(`file_path`·`command`)만 적용된다 `[문서 — 위 이슈의 PoC 표: `limit`·`head_limit`은 조용히
+버려진다]`.
+
 **계약 다섯**:
 
 1. **스킬은 하나, 짧게.** 프론트매터 `description`만 상시 비용이다 `[실측: 우리 프로브 159자]`.
