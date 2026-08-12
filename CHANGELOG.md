@@ -10,6 +10,25 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- **퍼지 뒤 artifact id 재사용** (D104 F10). `artifacts.id`는 rowid 별칭이고 스키마에
+  `AUTOINCREMENT`가 없어, 퍼지가 최고 rowid를 지우면 SQLite가 그 id를 다음 등록에 재발급했다.
+  그러면 **옛 `artifact_id` 참조가 오류 없이 무관한 내용을 돌려준다** — `ctr_fetch`의 조회가
+  `WHERE id=?` 하나로 시작하고, `chunk` 선택자도 `chunks.id`가 함께 재발급되어 막지 못한다
+  (재현에서 `line`·`byte`·`chunk` **셋 다** 새 아티팩트의 내용을 반환했다). D104 착수 조건이
+  읽는 두 distinct 계수도 같은 이유로 과소 계상됐다.
+
+  이제 등록이 id를 SQLite에 맡기지 않고 워터마크(`id_watermark` 한 행)에서 발급한다 —
+  `AUTOINCREMENT`가 `sqlite_sequence`로 하는 일과 같다. **기존 저장소는 마이그레이션 단계가
+  없다**: 그 표는 처음 여는 순간 만들어지고 현재 최대 id에서 이어 발급한다. `artifacts` 스키마
+  자체는 그대로다 — `AUTOINCREMENT`는 `ALTER TABLE`로 붙일 수 없어 표를 통째로 재생성해야
+  하는데 `sources`가 FK로, `chunks`가 FTS5 외부 콘텐츠와 트리거로 묶여 있다. 워터마크 표를
+  만들지 못하면 발급이 이전 동작으로 되돌아갈 뿐 저장은 계속된다.
+
+  **이미 재사용된 id는 되돌리지 않는다** — 이 변경은 앞으로의 발급만 바꾸고, 그 전에 쌓인
+  원장 행의 distinct 계수도 그대로다.
+
 ## [0.20.0] — 2026-08-10
 
 `ctr_fetch`의 회수 성공·실패가 지금까지 원장에 남지 않아 72시간 보존 창을 늘릴지 줄일지

@@ -223,6 +223,9 @@ func (s *Store) migrate() error {
 	// D73: 색인은 버전 스위치 **밖**에서 적용한다 — 신규(v==0→v1)와 기존(v==1)이 같은 한 번의
 	// Open에서 색인까지 도달해야 하고, 버전을 올리지 않아 구 바이너리도 이 DB를 계속 연다.
 	s.ensureIndexes()
+	// F10(D104): id 워터마크도 같은 이유로 버전 스위치 밖이다 — 이미 v1인 저장소가 이 릴리스
+	// 이후 첫 Open에서 이 테이블에 닿아야 한다.
+	s.ensureIDWatermark()
 	return nil
 }
 
@@ -301,6 +304,44 @@ func (s *Store) ensureIndexes() {
 			slog.Warn("store: 색인 생성 실패 — 술어는 정확하나 스캔 경계가 넓어진다", "index", ix.name, "error", err)
 		}
 	}
+}
+
+// idWatermarkDDL — F10(D104): 발급한 최대 artifact id를 기억하는 한 행짜리 표.
+// `AUTOINCREMENT`가 `sqlite_sequence`로 하는 일을 우리 표로 직접 한다. 스키마를 재생성하지
+// 않는 이유는 대가가 다르기 때문이다: `AUTOINCREMENT`는 `ALTER TABLE`로 붙일 수 없어
+// artifacts를 통째로 다시 만들어야 하는데, `sources`가 그 id를 FK로 참조하고 `chunks`는
+// FTS5 외부 콘텐츠와 트리거 셋으로 묶여 있다. 이 표는 `CREATE TABLE IF NOT EXISTS` 한 줄이고
+// 기존 데이터를 건드리지 않는다.
+const idWatermarkDDL = `CREATE TABLE IF NOT EXISTS id_watermark(name TEXT PRIMARY KEY, next INTEGER NOT NULL)`
+
+// ensureIDWatermark — 실패해도 Open을 막지 않는다(ensureIndexes와 같은 판단). 이 표가 없으면
+// nextArtifactID가 `max(id)+1`로 되돌아가 **이 릴리스 이전과 같이** 동작할 뿐이고, 저장 자체를
+// 못 하게 만드는 것이 더 나쁜 결과다. 그 폴백은 TestRegisterSurvivesMissingIDWatermark가 잠근다.
+func (s *Store) ensureIDWatermark() {
+	if _, err := s.writer.Exec(idWatermarkDDL); err != nil {
+		slog.Warn("store: id 워터마크 표 생성 실패 — 퍼지 뒤 artifact id가 재사용될 수 있다(F10)", "error", err)
+	}
+}
+
+// nextArtifactID — F10(D104). `artifacts.id`는 rowid 별칭이고 스키마에 `AUTOINCREMENT`가 없어,
+// 퍼지가 최고 rowid를 지우면 SQLite가 그 id를 다음 INSERT에 **재발급한다.** 그러면 옛
+// artifact_id 참조가 오류 없이 무관한 내용을 가리키고 — ReadRange의 첫 조회가 `WHERE id=?`
+// 하나이며, chunk 선택자도 `chunks.id`가 함께 재발급되어 막지 못한다 — D104 착수 조건의 두
+// distinct 계수도 과소 계상된다 `[실측 — 2026-08-12 재현: line·byte·chunk 셋 다 새 아티팩트의
+// 내용을 반환했다]`.
+//
+// **워터마크 읽기 실패를 0으로 흡수하는 것이 계약이다**: 표가 없으면(생성이 fail-open이라
+// 도달 가능) `max(id)+1`로 되돌아간다. 그 실패는 statement 단위라 이 트랜잭션을 무르지 않는다.
+// `max(id)`를 함께 보는 이유는 **기존 저장소의 lazy 초기화**다 — 워터마크가 없던 DB는 현재
+// 최대 id에서 이어 발급하므로 별도 마이그레이션 단계가 필요 없다.
+func nextArtifactID(tx *sql.Tx) (int64, error) {
+	var watermark int64
+	_ = tx.QueryRow(`SELECT next FROM id_watermark WHERE name='artifacts'`).Scan(&watermark)
+	var maxID int64
+	if err := tx.QueryRow(`SELECT COALESCE(MAX(id),0) FROM artifacts`).Scan(&maxID); err != nil {
+		return 0, err
+	}
+	return max(watermark, maxID) + 1, nil
 }
 
 func (s *Store) Reader() *sql.DB { return s.reader }
@@ -491,12 +532,25 @@ func (s *Store) Register(ctx context.Context, reg Registration) (int64, error) {
 	var artID int64
 	err := s.txRetry(ctx, func(tx *sql.Tx) error {
 		if err := tx.QueryRow("SELECT id FROM artifacts WHERE content_hash=? AND media_type=?", contentHash, reg.MediaType).Scan(&artID); err == sql.ErrNoRows {
-			res, err := tx.Exec("INSERT INTO artifacts(content_hash,media_type,byte_length,redaction,created_at) VALUES(?,?,?,?,?)",
-				contentHash, reg.MediaType, len(reg.StoredBytes), reg.Redaction, time.Now().Unix())
+			// F10: id를 SQLite가 고르게 두지 않고 워터마크에서 발급한다(nextArtifactID).
+			id, err := nextArtifactID(tx)
 			if err != nil {
 				return err
 			}
-			artID, _ = res.LastInsertId()
+			if _, err := tx.Exec("INSERT INTO artifacts(id,content_hash,media_type,byte_length,redaction,created_at) VALUES(?,?,?,?,?,?)",
+				id, contentHash, reg.MediaType, len(reg.StoredBytes), reg.Redaction, time.Now().Unix()); err != nil {
+				return err
+			}
+			artID = id
+			// 워터마크 갱신 실패는 이 등록을 무르지 않는다 — 다음 발급이 max(id)로 되돌아갈
+			// 뿐이고, 그것은 이 릴리스 이전과 같은 상태다(ensureIDWatermark와 같은 판단).
+			// `MAX`로 쓰는 이유는 이 수의 불변식이 **단조 증가**이기 때문이다: nextArtifactID가
+			// 늘 더 큰 값을 내므로 지금은 뒤로 갈 경로가 없지만, 불변식을 SQL에 박아 두면 발급
+			// 규칙이 바뀌어도 워터마크가 내려가지 않는다 — 내려가면 재사용이 되살아난다.
+			if _, err := tx.Exec(`INSERT INTO id_watermark(name,next) VALUES('artifacts',?)
+				ON CONFLICT(name) DO UPDATE SET next=MAX(next, excluded.next)`, id); err != nil {
+				slog.Warn("store: id 워터마크 갱신 실패 — 다음 발급이 max(id)로 되돌아간다(F10)", "error", err)
+			}
 			for _, c := range reg.Chunks {
 				if _, err := tx.Exec(`INSERT INTO chunks(artifact_id,ordinal,byte_start,byte_end,line_start,line_end,title,text)
 					VALUES(?,?,?,?,?,?,?,?)`, artID, c.Ordinal, c.ByteStart, c.ByteEnd, c.LineStart, c.LineEnd, c.Title, c.Text); err != nil {
