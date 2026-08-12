@@ -197,8 +197,10 @@ CHANGELOG 한 곳 말고 **코드 주석 다섯 곳**에도 남아 있었다(`st
 
 ## 4. 저장소 현재 상태
 
-- **`main`**: `eda87ac` (v0.20.0). 브랜치 `docs/session-58-measurement-kickoff`에
-  **커밋 일곱**(앞 여섯 + `8b3e269`).
+- **`main`**: 세션 시작 시 `eda87ac`(v0.20.0). 이 세션의 작업은 **PR #44로 머지**했다 —
+  브랜치 `docs/session-58-measurement-kickoff`, **커밋 열**(세션 58의 여섯 + `8b3e269` D104 ·
+  `5fd0046` 핸드오프 · `73be9de` 전파 정정 · `7169e58` D100 기각). windows CI는 재실행에서
+  **두 run 모두 pass**해 `internal/exec` flake 판정이 확정됐다.
 - **설치본**: 0.20.0. `.old`는 0.19.1(롤백은 **편도**다).
 - **`CTR_SHADOW_RETENTION`**: User 스코프 `336h` + `~/.claude/settings.json`의 `env`에 `336h`
   (**이 세션이 추가, git 밖**). **호스트 환경 블록에 발효됨** `[실측 — 자식 셸 둘이 읽는다]`.
@@ -303,9 +305,8 @@ docs/prompts/2026-08-12-session-59-retention-propagation-and-d104.md 를 읽고 
 
 ## 그다음
 
-- PR #44 가 열려 있다. windows CI 실패는 internal/exec flake로 판정됐다 — 이 변경은 그
-  패키지에 파일이 0개이고, 같은 커밋의 다른 run에서는 windows가 pass했으며, main 도 같은
-  워크플로에서 이미 빨갛다.
+- PR #44 는 머지됐다. windows CI 실패는 internal/exec flake였고 재실행에서 두 run 모두
+  pass해 확정됐다(그 패키지에 이 변경의 파일이 0개, main 도 같은 워크플로에서 이미 빨갰다).
 - 주 1회 회수 줄 스냅샷을 남긴다(stats 는 read-only라 비용이 없다).
 - **채택 레버 1순위(updatedToolOutput)는 실측으로 기각됐다** — v0.19 설계서 D100 결정문 뒤
   ★를 먼저 읽어라. 다음 후보는 D100 이 열거한 셋 안에서 찾는다: (a) 가시성 (b) 훅의 좁은
