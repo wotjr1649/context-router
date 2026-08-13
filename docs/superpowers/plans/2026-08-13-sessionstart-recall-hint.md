@@ -19,6 +19,12 @@
 - **문면 문자열은 D100 계약 2에 묶인다**: `MANDATORY`·`BLOCKED`·`Do NOT`·`Never`·`PREFER X OVER Y`·✅/❌ 금지. 사실과 대체 목적지만 적는다.
 - **주입 문면은 호스트가 준 문자열을 담지 않는다.** 도구 이름·파일 경로·제목을 넣지 않는다.
 - **머지는 지금 해도 되나 설치는 D104 판정(2026-08-26) 뒤다.** 이 플랜은 머지까지만 다룬다.
+  훅 매니페스트의 `command`가 `context-router`, 즉 **PATH의 설치본**이므로 머지 자체는 훅이
+  부르는 바이너리를 바꾸지 못한다 `[확인 — hooks/hooks.json]`. 판정 전 오염 경로는 둘뿐이다:
+  (1) 창 안에 새로 설치하는 것 — 사람의 행동이지 자동이 아니다. (2) **머지된 이 문서들 자체.**
+  판정 대상 원장이 될 수 있는 프로젝트에서 이 계획·스펙을 읽으면 그 문면이 `ctr_fetch`를
+  권하고, 그 회수가 `resolved_artifacts`에 들어간다. 세션 59의 "검증 회수를 판정 원장에서 하지
+  마라"를 문서 읽기에도 그대로 적용한다.
 - **★ Task 3(문서)을 가장 먼저 실행한다.** 번호가 3인 것은 문서 순서일 뿐이다. 뒤로 미루면 Task 2 커밋과 Task 3 커밋 사이의 `main`에 **배송된 코드와 모순되는 스펙**이 남는다.
 
 ## File Structure
@@ -28,7 +34,7 @@
 | `internal/store/store.go` | 존재 여부 조회 하나를 `shadowOwnedHashQuery` 상수 위에 세운다 | 함수 1개 추가 |
 | `internal/store/store_test.go` | 그 조회의 귀속 판정을 케이스 테이블로 고정 | 테스트 1개 추가 |
 | `internal/hook/hook.go` | `SessionStart` 분기에서 주입을 호출하고, stdout 계약 주석을 넓힌다 | 함수 1개 + 상수 1개 추가, 기존 분기 1줄 추가, 주석 2곳 수정 |
-| `internal/hook/hook_test.go` | host·source·재고 세 축의 골든 + 실패 경로 + 문면 계약 | 헬퍼 2개(일반화 1 · 신규 1), 시드 헬퍼 1개, 테스트 7개 추가 |
+| `internal/hook/hook_test.go` | host·source·재고 세 축의 반사실 골든 + 실패 경로 + 문면 계약 | 헬퍼 3개(일반화 1 · 신규 2), 시드 헬퍼 1개, 테스트 7개 추가 |
 | `docs/superpowers/specs/2026-08-13-sessionstart-recall-hint-design.md` | 불변 공정 기록이라 **본문을 고치지 않고** "구현 중 정정" 절을 덧붙인다 | 절 1개 append |
 | `docs/context-router-design-v0.20-ko.md` | D104 결정표에 나이 편향을 기록 | 1곳 추가 |
 
@@ -170,9 +176,16 @@ func runHookCaptureStdoutHost(t *testing.T, host Host, storeRoot string, in []by
 }
 ```
 
-- [ ] **Step 2: 실패하는 테스트 여섯을 쓴다**
+- [ ] **Step 2: 실패하는 테스트 일곱을 쓴다**
 
 같은 파일에 넣는다. `guardSetup`·`fixtureWith`·`bigStdout`·`runHook`은 이미 그 파일에 있다.
+**새 import는 없다** — `errors`·`os`·`filepath`·`strings`는 이미 그 파일의 import 블록에 있다.
+(④가 `filepath.WalkDir` 대신 `filepath.Walk`를 쓰는 이유가 그것이다. `io/fs`는 없다.)
+
+**②~⑤의 침묵 단정은 반드시 반사실이어야 한다.** `stdout == ""` 하나만 보는 테스트는 훅이
+무슨 이유로든 조용히 끝나기만 하면 통과한다 — 이벤트 파싱이 통째로 깨져도 넷이 다 초록이 된다.
+그래서 넷 모두 **①과 같은 픽스처에서 한 축만 바꾸고**, 빈 stdout에 더해 *부작용 축*을 하나씩
+본다: ②③은 사유가 남지 않은 것(= 저장소를 열지 않았다), ④는 파일이 생기지 않은 것.
 
 ```go
 // seedOneCapture — PostToolUse 포착 1건으로 shadow 재고를 만든다(주입 조건의 전제).
@@ -196,6 +209,23 @@ func assertHintReason(t *testing.T, sdir, want string) {
 	}
 	if !strings.Contains(string(b), "\t"+want+"\t") {
 		t.Fatalf("drops에 %q 사유가 없다:\n%s", want, b)
+	}
+}
+
+// assertNoHintReason — hint- 사유가 한 줄도 없음을 고정한다. 게이트(source·host) 앞에서
+// 끝나는 경로는 **저장소를 열지 않았다**는 증거가 이것뿐이다. 빈 stdout만 보는 단정은
+// 훅이 어떤 이유로든 조용히 끝나기만 하면 통과하므로 그 축을 못 잡는다.
+func assertNoHintReason(t *testing.T, sdir string) {
+	t.Helper()
+	b, err := os.ReadFile(filepath.Join(sdir, "session.drops.log"))
+	if errors.Is(err, os.ErrNotExist) {
+		return
+	}
+	if err != nil {
+		t.Fatalf("drops 읽기: %v", err)
+	}
+	if strings.Contains(string(b), "\thint-") {
+		t.Fatalf("게이트 앞에서 끝나야 하는데 hint- 사유가 남았다:\n%s", b)
 	}
 }
 
@@ -243,7 +273,7 @@ func TestRecallHintObeysWordingContract(t *testing.T) {
 
 // ② startup + Claude + 재고 있음 → 빈 stdout(압축 직후가 아니면 주입하지 않는다).
 func TestSessionStartStartupDoesNotInject(t *testing.T) {
-	storeRoot, cwd, _, _ := guardSetup(t)
+	storeRoot, cwd, _, sdir := guardSetup(t)
 	env := map[string]string{"CTR_HOOK_DEADLINE_MS": "60000"}
 	seedOneCapture(t, storeRoot, cwd, env)
 
@@ -251,11 +281,14 @@ func TestSessionStartStartupDoesNotInject(t *testing.T) {
 	if out := runHookCaptureStdoutHost(t, HostClaude, storeRoot, start, env); out != "" {
 		t.Fatalf("stdout=%q want empty (source=startup은 주입 대상 아님)", out)
 	}
+	// ①과 **source 한 축만** 다른 반사실이다. 빈 stdout에 더해 사유가 없어야 "게이트 앞에서
+	// 끝났다"가 서고, 그래야 훅이 그냥 죽어도 통과하는 공허한 단정이 되지 않는다.
+	assertNoHintReason(t, sdir)
 }
 
 // ③ compact + Codex + 재고 있음 → 빈 stdout(Claude 형식을 다른 호스트에 쓰지 않는다).
 func TestSessionStartCompactCodexDoesNotInject(t *testing.T) {
-	storeRoot, cwd, _, _ := guardSetup(t)
+	storeRoot, cwd, _, sdir := guardSetup(t)
 	env := map[string]string{"CTR_HOOK_DEADLINE_MS": "60000"}
 	seedOneCapture(t, storeRoot, cwd, env)
 
@@ -263,6 +296,8 @@ func TestSessionStartCompactCodexDoesNotInject(t *testing.T) {
 	if out := runHookCaptureStdoutHost(t, HostCodex, storeRoot, start, env); out != "" {
 		t.Fatalf("stdout=%q want empty (Codex 호스트는 주입 대상 아님)", out)
 	}
+	// ①과 **host 한 축만** 다른 반사실이다. ②와 같은 이유로 사유 부재까지 본다.
+	assertNoHintReason(t, sdir)
 }
 
 // ④ compact + Claude + content.db 부재 → 빈 stdout + hint-empty 한 줄.
@@ -278,6 +313,22 @@ func TestSessionStartCompactNoStoreLeavesEmptyReason(t *testing.T) {
 		t.Fatalf("stdout=%q want empty (재고 없음)", out)
 	}
 	assertHintReason(t, sessDir(t, storeRoot, cwd), "hint-empty")
+
+	// 부재 경로가 **아무것도 만들지 않는 것**까지 본다. stdout만 보는 단정은 opener가 빈 DB나
+	// 저널을 만들어도 통과하고, 그러면 "부재"라는 이 테스트의 전제 자체가 다음 실행에서 무너진다.
+	// 경로 조립 헬퍼에 기대지 않도록 storeRoot 전체를 훑는다.
+	var made []string
+	if err := filepath.Walk(storeRoot, func(p string, info os.FileInfo, err error) error {
+		if err == nil && !info.IsDir() && strings.HasPrefix(info.Name(), "content.db") {
+			made = append(made, p)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("storeRoot 훑기: %v", err)
+	}
+	if len(made) != 0 {
+		t.Fatalf("부재 경로가 content.db 계열을 만들었다: %v", made)
+	}
 }
 
 // ⑤ compact + Claude + content.db는 있으나 shadow 귀속 0 → 빈 stdout.
@@ -524,7 +575,7 @@ Claude 게이트를 지난 뒤에는 어느 경로로 끝나든 한 줄을 남�
 감싸는 코드는 **이미 있다**(`lastIndexedAtByHashQuery`). 새 질의는 최소 다섯째 소비자이고 베낄
 형태가 그 함수에 있다. 결론(상수 재사용)은 그대로 옳다.
 
-**⑥ 알려진 한계 넷** — 설계로 없애지 않고 적어 둔다.
+**⑥ 알려진 한계 다섯** — 설계로 없애지 않고 적어 둔다.
 
 - **재고 0에서 전(全)스캔이다.** `EXISTS`는 적격 행을 **찾았을 때** 멈추므로 조용해야 할
   경로(귀속 0)가 가장 비싸다. ctx 예산이 상한을 걸고 초과는 `hint-unavailable`로 남는다.
@@ -535,6 +586,35 @@ Claude 게이트를 지난 뒤에는 어느 경로로 끝나든 한 줄을 남�
   사례다(다른 호스트의 서버가 낮에 72h 퍼지를 돌렸다). 비용은 헛걸음 한 번이다.
 - **`source` 열거의 출처가 갈린다.** 이 문서는 다섯(`fork` 포함 — 호스트 문서 확인)으로 적었고
   저장소가 보관한 인용은 넷이다. `compact`가 그 안에 있다는 것만은 양쪽이 일치한다.
+- **★ 문장의 프로젝트와 검색의 프로젝트가 서로 다른 프로세스에서 정해진다.** 훅은 stdin
+  payload의 `cwd`로 `contentDir`을 조립하고, `ctr_search`는 **서버 프로세스**가 자기
+  `--root`/cwd로 연 store에 묶인다. storeRoot 해석(`--store-root` → `CTR_STORE_ROOT` → OS
+  기본)도 둘이 따로 한다. `--profile global-search`는 한술 더 떠 **현재 프로젝트 store를 아예
+  열지 않고** `--projects` allowlist만 연다. 두 축이 어긋나면 문장은 참인데 검색은 다른 곳을
+  본다. 훅에서 서버의 설정을 볼 방법이 없으므로 설계로 없앨 수 없다. 가설이 아니다 — 세션 60
+  §3.10이 같은 계열(두 프로세스가 env를 따로 받아 한쪽만 336h를 못 받았다)을 실측했다.
+
+**⑦ 외부 검토가 제기하고 코드가 답한 것 셋** — 되묻히기 쉬운 자리라 답을 남긴다
+`[검증 — 2026-08-14, 코드 대조]`.
+
+- **"재고는 있는데 아직 검색이 안 되는 구간" 은 없다.** `schemaV1`의 `chunks_ai` AFTER INSERT
+  트리거가 `chunks` 삽입마다 `fts_porter`·`fts_trigram`에 같이 넣고, `Store.Register`가
+  artifacts→chunks→sources를 `txRetry` **한 트랜잭션**에서 처리한다. 가시성 경계가 곧 커밋이다.
+  `MergeFTS`가 거는 것은 FTS5 `'optimize'`(세그먼트 압축, D102)이지 색인 등록이 아니므로
+  **병합을 한 번도 안 돌려도 검색된다.** 다만 존재 ≠ 임의 질의 히트는 남는다 —
+  `normalizeQuery`가 토큰을 AND로 묶으므로 "있다"가 참이어도 특정 질의는 0건일 수 있다.
+- **다른 프로젝트의 hook 행이 이 문장을 띄우는 경로는 없다.** `shadowOwnedHashQuery`에 프로젝트
+  열이 없는 것은 결함이 아니라 **연 파일이 곧 범위**이기 때문이다(`<storeRoot>/projects/<ProjectID>`).
+  worktree·하위 디렉터리·심링크는 `findGitProjectRoot`와 `ident.RealPath`가 한 ID로 모은다.
+  비-git 디렉터리는 갈라지는(누락) 방향이지 섞이는 방향이 아니다.
+- **회수 경로의 신뢰 경계는 셋 중 둘이 이미 문서에 있다.** 이 레버는 `ctr_search`/`ctr_fetch`
+  경로를 새로 만들지 않고 **더 쓰이게** 만들 뿐이지만, 그 경로가 컨텍스트로 들여오는 것은
+  포착된 명령 출력이라 공격자가 심을 수 있는 텍스트다. 검색·회수 결과의 untrusted 취급은
+  v0.0.1 §4.0(구조적 펜싱 + `untrusted: true`, 다만 "모델 자문 라벨이며 강제 경계가 아님"으로
+  스스로 등급을 낮춘다)과 `CONTEXT_ROUTER_HANDOFF.md` §8.2·§8.4에, 프로젝트 격리는 같은 문서
+  §6("우발적 혼선 방지이지 보안 경계가 아니다")에 있다. **없는 것은 artifact id 접근 범위**다 —
+  id 추측·열거를 보안 속성으로 논한 절이 문서 전역에 없다. 이 레버는 문면에 id를 싣지 않으므로
+  그 구멍을 넓히지 않는다. 착수 문턱이 아니라 별건으로 남긴다.
 ```
 
 - [ ] **Step 2: 그 절 끝에 `compact` 실측 결과를 적는다**
@@ -542,7 +622,7 @@ Claude 게이트를 지난 뒤에는 어느 경로로 끝나든 한 줄을 남�
 T0(§3.1)는 헤드리스 신규 세션이라 `source=startup`에서 났다. `compact`에서 발화하는지, 그리고 그 주입이 압축 **후** 컨텍스트에 들어가는지는 별도 실측이었다. 세션 60이 쟀고 통과했다. 아래를 그대로 적는다:
 
 ```markdown
-**⑦ `compact` 실측 — 통과.** 세션 60이 실제 `/compact`로 쟀다. 프로브 훅이 stdin의 `source`를
+**⑧ `compact` 실측 — 통과.** 세션 60이 실제 `/compact`로 쟀다. 프로브 훅이 stdin의 `source`를
 파일에 적고 같은 값을 `additionalContext` 마커에 실었다. 결과: 사이드카에 `source=compact` **한
 줄**(startup 발화가 섞이지 않았다), 그리고 **같은 마커가 압축 후 컨텍스트에 도착했다** — 압축이
 주입을 삼키지 않는다. §4.1의 자리 선택과 §4.2의 `source == "compact"` 게이트가 둘 다 실측으로
