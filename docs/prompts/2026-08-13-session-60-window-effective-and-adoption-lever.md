@@ -423,8 +423,11 @@ blocker가 아닌 hardening으로 분류했다.
 
 - **`main`**: 시작 시 `077b4ac` → 마감 시 **`eabad8f`**. main에 들어간 것은 **문서뿐**이다 —
   설계서 둘(D100 ★ 둘 · F12 실측 · 트라이그램 기여도), 스펙 1건, 계획 1건.
-- **★ 열린 PR: [#46](https://github.com/wotjr1649/context-router/pull/46)** — 브랜치
-  `v0.21-sessionstart-recall-hint`, `eabad8f`에서 분기, 커밋 넷:
+- **★ PR [#46](https://github.com/wotjr1649/context-router/pull/46) 은 머지됐다** —
+  스쿼시 머지 `a6d4659`, `2026-08-14T03:19:36Z`. 브랜치는 원격·로컬 모두 삭제됐고 트리
+  대조로 내용이 전부 `main`에 들어간 것을 확인했다. **마감 `main` HEAD 는 그 뒤의 문서
+  커밋들이다 — `git log` 로 본다.**
+  머지 전 브랜치는 `v0.21-sessionstart-recall-hint`, `eabad8f`에서 분기, 커밋 넷:
   `c138010`(문서) · `d560695`(`store.ShadowOwnedExists`) · `ad5062c`(훅 주입 + 테스트 7) ·
   `a626586`(readOnly `Close` 체크포인트 — §3.13). **6파일 +520/-13.**
   리뷰 전부 통과(태스크 셋 · 전체 브랜치 · 수정 웨이브 재리뷰 · cross-model 1패스).
@@ -530,8 +533,11 @@ blocker가 아닌 hardening으로 분류했다.
 - **Codex 호스트의 창** — `settings.json` 처방이 닿지 않는다. 이 세션에는 Codex 유래 프로세스가
   하나도 없었지만 **닫힌 구멍은 아니다.**
 - 워크트리 `v0.20-d103-fetch-instrumentation` 정리.
-- **★ PR #46** — CI 확인 후 머지. 머지되면 SDD 워크스페이스
-  `.superpowers/sdd/2026-08-13-sessionstart-recall-hint/` 를 지워도 된다.
+- ~~PR #46~~ → **머지 완료**(`a6d4659`). 브랜치는 원격·로컬 다 삭제됐다.
+  **SDD 워크스페이스는 남아 있다** — `.superpowers/sdd/2026-08-13-sessionstart-recall-hint/`.
+  재귀 삭제를 셸 가드가 막았고 우회하지 않았다(소유자가 `!` 로 직접 실행하는 경로다).
+  gitignore라 어차피 리포에는 안 들어가고, 남아야 할 내용은 이 기록 §3.11~3.13에 있다.
+  지워도 되고 둬도 된다.
 - **★ ctx를 무시하고 블록할 수 있는 호출들**(§3.13 말미) — 이번에 `Close`의 체크포인트 하나를
   근원에서 없앴으나 **형제 목록이 나왔다.** 가장 값진 확인거리는 **첫 질의가 촉발하는 드라이버
   오픈과 DSN pragma 적용(`journal_mode(WAL)` 포함)에 호출자 ctx가 전달되는가** `[미확인]`.
@@ -605,26 +611,25 @@ docs/prompts/2026-08-13-session-60-window-effective-and-adoption-lever.md 를 �
   퍼지 대상이 0개였고 72h였다면 100개가 사라졌어야 하는데 blob 분포가 그대로였다).
 - **설치본은 이제 F10 수정본이다** — 0.20.0 @ 077b4acc8fa1. 다만 세션 60의 서버는 구
   바이너리로 계속 돌았으므로, id_watermark 를 실제로 만드는 것은 **그다음 기동**이다.
-- main 은 eabad8f 이고 **열린 PR 이 하나 있다 — #46** (브랜치 v0.21-sessionstart-recall-hint,
-  커밋 넷). 채택 레버 1단계(압축 직후 SessionStart 회수 힌트)이고 리뷰는 전부 통과했다.
-  **머지해도 설치본은 안 바뀐다** — 훅은 PATH 의 설치본을 부른다.
+- **채택 레버 1단계는 main 에 들어갔다** — PR #46 머지(a6d4659). 압축 직후 SessionStart 가
+  "보관된 도구 출력이 있다" 한 줄을 주입한다. **설치본은 아직 그 코드가 아니다** — 훅은
+  PATH 의 설치본을 부르므로 머지만으로는 안 뜬다. **판정일(08-26) 전에 설치하지 마라.**
+- 세션 60 마감의 열린 PR 은 없다. main HEAD 는 git log 로 본다.
 
-## 첫 일 — 확인 셋. 이번에는 다섯이다.
+## 첫 일 — 확인 셋. 이번에는 넷이다.
 
 1. Get-CimInstance Win32_Process -Filter "Name='context-router.exe'"  — 서버와 그 부모
 2. "[$env:CTR_SHADOW_RETENTION]"  — 이 호스트 안에서 336h 인가 (게이트)
 3. context-router stats  — 회수 줄 여덟 칸이 t0 와 같은가 (주 1회 스냅샷도 겸한다)
 4. **context-router doctor 의 [17] commit** — 077b4acc8fa1 이상인가.
    그렇다면 새 설치본이 떴다는 뜻이고 그 기동이 id_watermark 를 만든다.
-5. **gh pr checks 46** — 세션 60 마감 시점에 test-node-leg 만 초록이고 나머지는 pending
-   이었다. 빨간 것이 있으면 **그 패키지를 이 브랜치가 건드렸는지로** 회귀 여부를 가른다
-   (건드린 것: internal/store, internal/hook, docs).
 
 ## 그다음
 
-- **PR #46 을 CI 확인 후 머지한다.** 머지되면 SDD 워크스페이스
-  .superpowers/sdd/2026-08-13-sessionstart-recall-hint/ 를 지워도 된다.
 - **설치는 하지 마라.** 판정일(2026-08-26) 전에 이 레버가 살아나면 판정 지표가 오염된다.
+- **windows CI 가 빨가면 먼저 실패 테스트 이름을 봐라.** TestRunShellPS51ProviderWriteReturns
+  (internal/exec, 10초 타임아웃) 는 코드 변경 없이도 나는 간헐 실패다 — main 의 문서 전용
+  커밋 14f76c6 이 같은 테스트로 죽었고 같은 창의 fe98eda 는 통과했다(세션 60 §4).
 - **퍼지 손실을 blob 파일 mtime 으로 추정하지 마라** — 퍼지 술어는 sources.indexed_at 을
   본다. 세션 60 §3.2 가 그 축 혼동을 정정했다. 재려면 internal/store 에 일회성 테스트를
   붙여 shadowOwnedFilter 를 그대로 불러라(세션 60 이 쓴 방법, 판정 뒤 삭제).
