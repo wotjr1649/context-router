@@ -428,8 +428,17 @@ blocker가 아닌 hardening으로 분류했다.
   `c138010`(문서) · `d560695`(`store.ShadowOwnedExists`) · `ad5062c`(훅 주입 + 테스트 7) ·
   `a626586`(readOnly `Close` 체크포인트 — §3.13). **6파일 +520/-13.**
   리뷰 전부 통과(태스크 셋 · 전체 브랜치 · 수정 웨이브 재리뷰 · cross-model 1패스).
-  **머지 시점의 CI는 다음 세션이 확인해야 한다** — 마감 시점에 `test-node-leg`만 초록이고
-  나머지(`crossbuild`·`lint`·`test` 3플랫폼)는 pending이었다.
+- **★ CI 판정: windows 빨강은 회귀가 아니다.** `crossbuild`·`lint`·`macOS`·`ubuntu`·
+  `test-node-leg` 전부 초록. `test (windows-latest)`만 두 런 다 실패했고 실패는 **한 테스트**다:
+  `internal/exec`의 `TestRunShellPS51ProviderWriteReturns`, 10초 타임아웃.
+  근거 셋 — (1) **`main`의 `14f76c6`(Go 파일 0개, 문서 한 줄)이 같은 테스트·같은 10초로
+  실패했다.** 코드 변경 없이 나는 실패다. (2) 이 브랜치는 `internal/exec`에서 **파일 0개**를
+  건드린다. (3) `go test ./...`는 경로 순으로 돌고 `-p 1`이 순차를 강제하는데 `internal/exec`는
+  `internal/hook`·`internal/store`보다 **먼저** 돈다 — 이 브랜치가 더한 테스트가 그 뒤에 오므로
+  앞선 패키지의 타이밍에 영향을 줄 수 없다.
+  시각 상관 가설은 기각됐다: 같은 창에 돈 `fe98eda`(문서 전용)의 windows는 통과했다.
+  ★ **이 테스트는 두 환경에서 서로 다른 이유로 죽는다** — CI는 10초 타임아웃, 이 머신은
+  PowerShell 실행 정책. 그만큼 windows 레그가 `internal/exec`에 대해 주는 신호가 약하다.
 - **★ 이 PR을 머지해도 설치본은 안 바뀐다.** 훅 매니페스트의 `command`가 `context-router`,
   즉 **PATH의 설치본**이다 `[확인 — hooks/hooks.json]`. 코드는 머지돼도 판정일까지 안 뜬다.
 - **설치본**: **0.20.0 @ `077b4acc8fa1`**(= `main` HEAD, F10 수정 포함). `.old`는
