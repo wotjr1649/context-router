@@ -42,6 +42,15 @@ type Store struct {
 	// 함께 풀린다). 그때 이 Store는 한 계단 아래 형태로 계속 적고, 그 행들은 레거시로 읽힌다 —
 	// 편향이지 유실이 아니다. 매 INSERT마다 PRAGMA를 다시 도는 값은 하지 않는다.
 	ledgerCols map[string]bool
+	// readOnly — DSN에 mode=ro&query_only(ON)을 붙여 연 핸들이라는 표식(OpenContext의 readOnly
+	// 분기가 세운다). Close가 이것을 보고 wal_checkpoint(TRUNCATE)를 **건너뛴다**: 그 커넥션에서
+	// 체크포인트는 성공할 수 없는데 실패하기 전에 busy_timeout(5000)을 물고, 그 Exec에는 ctx가
+	// 없어 호출자의 deadline으로 끊지도 못한다. `[실측 — 이 저장소의 DSN 상수 재현: WAL이 비고
+	// 라이터가 없으면 즉시 무오류, 라이브 라이터 + 더러운 WAL이면 1.38 s 뒤 disk I/O error(778),
+	// 쓰기 트랜잭션 보유 중이면 6.41 s 뒤 같은 오류]` 가운데 조건이 MCP 서버가 떠 있는 평상시고,
+	// 세션 시작 훅(internal/hook의 injectRecallHint)이 그 대기를 세션 시작 경로에 처음 올려놓았다.
+	// **writable 경로는 그대로다** — 체크포인트는 D50 계약이다.
+	readOnly bool
 }
 
 // journalSizeLimit — D102 계약 5·6·9: 병합(`optimize`)이 훑고 지나가며 남기는 WAL 고수위를
@@ -171,7 +180,7 @@ func OpenContext(ctx context.Context, dir string, readOnly bool) (*Store, error)
 		return nil, fmt.Errorf("store open: %w", err)
 	}
 	r.SetMaxOpenConns(4)
-	s := &Store{dir: dir, writer: w, reader: r}
+	s := &Store{dir: dir, writer: w, reader: r, readOnly: readOnly}
 	if !readOnly {
 		if err := s.migrate(); err != nil {
 			w.Close()
@@ -350,7 +359,10 @@ func (s *Store) Close() error {
 	if s.ledger != nil {
 		s.ledger.Close() // best-effort: 보조 DB, Store 계약에 미포함
 	}
-	_, checkpointErr := s.writer.Exec("PRAGMA wal_checkpoint(TRUNCATE)")
+	var checkpointErr error
+	if !s.readOnly { // readOnly 핸들은 걸지 않는다 — 근거는 Store.readOnly 주석
+		_, checkpointErr = s.writer.Exec("PRAGMA wal_checkpoint(TRUNCATE)")
+	}
 	readerErr := s.reader.Close()
 	writerErr := s.writer.Close()
 	return errors.Join(checkpointErr, readerErr, writerErr)
@@ -772,6 +784,25 @@ func (s *Store) ArtifactHashByID(ctx context.Context, id int64) (string, error) 
 		return "", fmt.Errorf("store ArtifactHashByID: %w", err)
 	}
 	return hash, nil
+}
+
+// ShadowOwnedExists — shadow 귀속 아티팩트가 하나라도 있는가(설계 spec 2026-08-13 §4.3).
+// **수가 아니라 존재 여부만 반환하는 것이 계약이다**: 부르는 쪽(훅의 SessionStart 주입)이
+// 싣는 것이 존재 여부뿐이고, EXISTS는 적격 행을 찾는 즉시 멈춘다 — 재고가 있는 흔한 경우에
+// shadow 색인 셋의 선두 컬럼이 source_kind가 아닌 데서 오는 전(全)스캔을 피한다. **재고가 0이면
+// 그 이득이 없다**(끝까지 훑는다): 조용해야 할 경로가 가장 비싸다는 뜻이고, 상한은 호출부가
+// 넘기는 ctx 예산이 건다. 술어는 shadowOwnedHashQuery를 그대로 쓴다 — SizeStats·purge와 같은
+// 정의를 공유해야 doctor가 렌더하는 수와 갈리지 않는다(D13). 같은 상수를 EXISTS로 감싸는 선례가
+// 이미 있다(lastIndexedAtByHashQuery). 나이 예산을 붙이지 않는 이유: DB에 있으면 회수 가능하고
+// 퍼지가 지운 것은 이미 없다 — 다만 그것은 이 순간에만 참이라, 다른 호스트의 서버가 곧 퍼지를
+// 돌리면 헛걸음이 한 번 난다.
+func (s *Store) ShadowOwnedExists(ctx context.Context) (bool, error) {
+	var found int
+	err := s.reader.QueryRowContext(ctx, `SELECT EXISTS(`+shadowOwnedHashQuery+`)`).Scan(&found)
+	if err != nil {
+		return false, fmt.Errorf("store ShadowOwnedExists: %w", err)
+	}
+	return found == 1, nil
 }
 
 // ReadRange: Selector.Kind 하나로 chunk 저장 좌표, blob 라인 스캔, blob UTF-8 스냅 바이트

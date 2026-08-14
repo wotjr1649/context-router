@@ -56,14 +56,215 @@ func runHookHost(t *testing.T, host Host, storeRoot string, in []byte, env map[s
 	return Run(context.Background(), bytes.NewReader(in), io.Discard, storeRoot, "test", host, func(k string) string { return env[k] })
 }
 
-// runHookCaptureStdout — runHook 동형이되 stdout(=guard deny JSON 또는 빈 문자열)을 캡처해 반환한다.
+// runHookCaptureStdout — runHook 동형이되 stdout(=guard deny JSON, SessionStart 주입 JSON,
+// 또는 빈 문자열)을 캡처해 반환한다.
 func runHookCaptureStdout(t *testing.T, storeRoot string, in []byte) string {
 	t.Helper()
+	return runHookCaptureStdoutHost(t, HostClaude, storeRoot, in, nil)
+}
+
+// runHookCaptureStdoutHost — 위의 호스트·env 주입 변형(D35 경계와 deadline 주입용).
+func runHookCaptureStdoutHost(t *testing.T, host Host, storeRoot string, in []byte, env map[string]string) string {
+	t.Helper()
 	var out bytes.Buffer
-	if rc := Run(context.Background(), bytes.NewReader(in), &out, storeRoot, "test", HostClaude, func(string) string { return "" }); rc != 0 {
+	if rc := Run(context.Background(), bytes.NewReader(in), &out, storeRoot, "test", host, func(k string) string { return env[k] }); rc != 0 {
 		t.Fatalf("hook rc=%d want 0", rc)
 	}
 	return out.String()
+}
+
+// seedOneCapture — PostToolUse 포착 1건으로 shadow 재고를 만든다(주입 조건의 전제).
+func seedOneCapture(t *testing.T, storeRoot, cwd string, env map[string]string) {
+	t.Helper()
+	post := fixtureWith(t, "posttooluse-bash.json", map[string]any{
+		"cwd": cwd, "tool_response": bigStdout(20000),
+	})
+	if rc := runHook(t, storeRoot, post, env); rc != 0 {
+		t.Fatalf("포착 rc=%d want 0", rc)
+	}
+}
+
+// assertHintReason — session.drops.log에서 want 사유 줄을 찾는다. appendDrop의 형식이
+// "<ts>\t<reason>\t<sid8>\t<hook_event>\t<tool>"이므로 탭으로 감싸 정확히 대조한다.
+func assertHintReason(t *testing.T, sdir, want string) {
+	t.Helper()
+	b, err := os.ReadFile(filepath.Join(sdir, "session.drops.log"))
+	if err != nil {
+		t.Fatalf("drops 읽기: %v", err)
+	}
+	if !strings.Contains(string(b), "\t"+want+"\t") {
+		t.Fatalf("drops에 %q 사유가 없다:\n%s", want, b)
+	}
+}
+
+// assertNoHintReason — hint- 사유가 한 줄도 없음을 고정한다. 게이트(source·host) 앞에서
+// 끝나는 경로는 **저장소를 열지 않았다**는 증거가 이것뿐이다. 빈 stdout만 보는 단정은
+// 훅이 어떤 이유로든 조용히 끝나기만 하면 통과하므로 그 축을 못 잡는다.
+func assertNoHintReason(t *testing.T, sdir string) {
+	t.Helper()
+	b, err := os.ReadFile(filepath.Join(sdir, "session.drops.log"))
+	if errors.Is(err, os.ErrNotExist) {
+		return
+	}
+	if err != nil {
+		t.Fatalf("drops 읽기: %v", err)
+	}
+	if strings.Contains(string(b), "\thint-") {
+		t.Fatalf("게이트 앞에서 끝나야 하는데 hint- 사유가 남았다:\n%s", b)
+	}
+}
+
+// ① compact + Claude + 재고 있음 → 주입 JSON + hint-ok 한 줄.
+func TestSessionStartCompactInjectsHint(t *testing.T) {
+	storeRoot, cwd, _, sdir := guardSetup(t)
+	env := map[string]string{"CTR_HOOK_DEADLINE_MS": "60000"}
+	seedOneCapture(t, storeRoot, cwd, env)
+
+	start := fixtureWith(t, "sessionstart.json", map[string]any{"cwd": cwd, "source": "compact"})
+	out := runHookCaptureStdoutHost(t, HostClaude, storeRoot, start, env)
+
+	var got map[string]map[string]string
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatalf("주입 stdout이 유효 JSON 아님: %v (out=%q)", err, out)
+	}
+	hso := got["hookSpecificOutput"]
+	if hso["hookEventName"] != "SessionStart" {
+		t.Fatalf("hookEventName=%q want SessionStart", hso["hookEventName"])
+	}
+	// 문면은 상수와 **정확히** 대조한다. 부분 단정(Contains)으로는 계약을 못 고정한다 —
+	// recallHint가 보간 없는 const라 "호스트 도구 이름이 안 실렸다" 류는 구조적으로 항상 통과한다.
+	if hso["additionalContext"] != recallHint {
+		t.Fatalf("additionalContext=%q want %q", hso["additionalContext"], recallHint)
+	}
+	assertHintReason(t, sdir, "hint-ok")
+}
+
+// ①-b D100 계약 2 — 훈계 어휘 금지. 문면이 바뀌어도 이 축은 남는다. 주입 경로와 독립이라
+// 별도 테스트로 둔다(문면 상수만 본다).
+func TestRecallHintObeysWordingContract(t *testing.T) {
+	for _, banned := range []string{"MANDATORY", "BLOCKED", "Do NOT", "Never", "PREFER", "✅", "❌"} {
+		if strings.Contains(recallHint, banned) {
+			t.Fatalf("recallHint에 금지 어휘 %q가 있다: %q", banned, recallHint)
+		}
+	}
+	// 착수 문턱을 움직이는 도구를 가리켜야 한다 — 검색만으로는 resolved_artifacts·missed가
+	// 안 움직인다(그 칸을 쓰는 것은 ctr_fetch 경로의 LedgerAppendFetch뿐이다).
+	for _, want := range []string{"ctr_search", "ctr_fetch"} {
+		if !strings.Contains(recallHint, want) {
+			t.Fatalf("recallHint에 %q가 없다: %q", want, recallHint)
+		}
+	}
+}
+
+// ② startup + Claude + 재고 있음 → 빈 stdout(압축 직후가 아니면 주입하지 않는다).
+func TestSessionStartStartupDoesNotInject(t *testing.T) {
+	storeRoot, cwd, _, sdir := guardSetup(t)
+	env := map[string]string{"CTR_HOOK_DEADLINE_MS": "60000"}
+	seedOneCapture(t, storeRoot, cwd, env)
+
+	start := fixtureWith(t, "sessionstart.json", map[string]any{"cwd": cwd, "source": "startup"})
+	if out := runHookCaptureStdoutHost(t, HostClaude, storeRoot, start, env); out != "" {
+		t.Fatalf("stdout=%q want empty (source=startup은 주입 대상 아님)", out)
+	}
+	// ①과 **source 한 축만** 다른 반사실이다. 빈 stdout에 더해 사유가 없어야 "게이트 앞에서
+	// 끝났다"가 서고, 그래야 훅이 그냥 죽어도 통과하는 공허한 단정이 되지 않는다.
+	assertNoHintReason(t, sdir)
+}
+
+// ③ compact + Codex + 재고 있음 → 빈 stdout(Claude 형식을 다른 호스트에 쓰지 않는다).
+func TestSessionStartCompactCodexDoesNotInject(t *testing.T) {
+	storeRoot, cwd, _, sdir := guardSetup(t)
+	env := map[string]string{"CTR_HOOK_DEADLINE_MS": "60000"}
+	seedOneCapture(t, storeRoot, cwd, env)
+
+	start := fixtureWith(t, "sessionstart.json", map[string]any{"cwd": cwd, "source": "compact"})
+	if out := runHookCaptureStdoutHost(t, HostCodex, storeRoot, start, env); out != "" {
+		t.Fatalf("stdout=%q want empty (Codex 호스트는 주입 대상 아님)", out)
+	}
+	// ①과 **host 한 축만** 다른 반사실이다. ②와 같은 이유로 사유 부재까지 본다.
+	assertNoHintReason(t, sdir)
+}
+
+// ④ compact + Claude + content.db 부재 → 빈 stdout + hint-empty 한 줄.
+// **게이트 둘을 지난 뒤에는 어느 경로로 끝나든 한 줄을 남긴다** — 그래야 "압축이 안 일어났다"와
+// "일어났는데 재고가 없었다"가 갈린다.
+func TestSessionStartCompactNoStoreLeavesEmptyReason(t *testing.T) {
+	storeRoot := t.TempDir()
+	cwd := evalLong(t, t.TempDir())
+	env := map[string]string{"CTR_HOOK_DEADLINE_MS": "60000"}
+
+	start := fixtureWith(t, "sessionstart.json", map[string]any{"cwd": cwd, "source": "compact"})
+	if out := runHookCaptureStdoutHost(t, HostClaude, storeRoot, start, env); out != "" {
+		t.Fatalf("stdout=%q want empty (재고 없음)", out)
+	}
+	assertHintReason(t, sessDir(t, storeRoot, cwd), "hint-empty")
+
+	// 부재 경로가 **아무것도 만들지 않는 것**까지 본다. stdout만 보는 단정은 opener가 빈 DB나
+	// 저널을 만들어도 통과하고, 그러면 "부재"라는 이 테스트의 전제 자체가 다음 실행에서 무너진다.
+	// 경로 조립 헬퍼에 기대지 않도록 storeRoot 전체를 훑는다.
+	var made []string
+	if err := filepath.Walk(storeRoot, func(p string, info os.FileInfo, err error) error {
+		if err == nil && !info.IsDir() && strings.HasPrefix(info.Name(), "content.db") {
+			made = append(made, p)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("storeRoot 훑기: %v", err)
+	}
+	if len(made) != 0 {
+		t.Fatalf("부재 경로가 content.db 계열을 만들었다: %v", made)
+	}
+}
+
+// ⑤ compact + Claude + content.db는 있으나 shadow 귀속 0 → 빈 stdout.
+// ④와 다른 축이다: 저장소가 **있는데** 귀속 술어가 비는 경우를 고정한다.
+func TestSessionStartCompactNoShadowIsSilent(t *testing.T) {
+	storeRoot, cwd, contentDir, sdir := guardSetup(t)
+	env := map[string]string{"CTR_HOOK_DEADLINE_MS": "60000"}
+	// 비-hook 소스만 담은 store를 만든다 → 귀속 술어가 비운다.
+	st, err := store.Open(contentDir, false)
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	if _, err := st.Register(t.Context(), store.Registration{
+		StoredBytes: []byte("explicit-only"), MediaType: "text/plain",
+		Source: store.SourceMeta{URI: "file:x", Kind: "file", SrcHash: "sh-x"},
+	}); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	start := fixtureWith(t, "sessionstart.json", map[string]any{"cwd": cwd, "source": "compact"})
+	if out := runHookCaptureStdoutHost(t, HostClaude, storeRoot, start, env); out != "" {
+		t.Fatalf("stdout=%q want empty (shadow 귀속 0)", out)
+	}
+	assertHintReason(t, sdir, "hint-empty")
+}
+
+// ⑥ compact + Claude + 저장소 불용 → 빈 stdout + hint- 사유 1줄.
+// 조용한 스킵만 두면 "주입을 안 했다"와 "했는데 안 닿았다"가 같은 음성이 된다.
+func TestSessionStartCompactStoreErrorLeavesReason(t *testing.T) {
+	storeRoot, cwd, contentDir, sdir := guardSetup(t)
+	env := map[string]string{"CTR_HOOK_DEADLINE_MS": "60000"}
+	seedOneCapture(t, storeRoot, cwd, env)
+
+	// family 셋을 지우고 비-DB 바이트로 대체 → os.Stat은 통과하고 열기/조회가 실패한다.
+	for _, suffix := range []string{"", "-wal", "-shm"} {
+		_ = os.Remove(filepath.Join(contentDir, "content.db"+suffix))
+	}
+	if err := os.WriteFile(filepath.Join(contentDir, "content.db"), []byte("not a database"), 0o600); err != nil {
+		t.Fatalf("손상 주입: %v", err)
+	}
+
+	start := fixtureWith(t, "sessionstart.json", map[string]any{"cwd": cwd, "source": "compact"})
+	if out := runHookCaptureStdoutHost(t, HostClaude, storeRoot, start, env); out != "" {
+		t.Fatalf("stdout=%q want empty (저장소 불용)", out)
+	}
+	// 사유가 하나뿐이라 정확히 대조한다. database/sql.Open은 연결하지 않으므로 열기·조회 실패가
+	// 전부 같은 자리로 떨어지고, 그것을 두 이름으로 가르면 이름이 거짓이 된다.
+	assertHintReason(t, sdir, "hint-unavailable")
 }
 
 // D35×D51 — 동일 UUID의 cc/cx 격리: cc SessionStart 후 같은 UUID의 cx 이벤트는 (drop이 아니라)

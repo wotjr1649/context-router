@@ -3185,6 +3185,35 @@ func TestShadowOwnedAttribution(t *testing.T) {
 	}
 }
 
+// TestShadowOwnedExists — ShadowOwnedExists는 TestShadowOwnedAttribution과 같은 귀속 술어를
+// 공유한다(같은 상수). 그 표가 hash 수를 보는 자리에서 이쪽은 존재 여부만 본다.
+func TestShadowOwnedExists(t *testing.T) {
+	cases := []struct {
+		name string
+		seed func(t *testing.T, st *Store)
+		want bool
+	}{
+		{"빈 store → false", func(t *testing.T, st *Store) {}, false},
+		{"hook만 참조 → true", seedHookOnly, true},
+		{"hook+explicit 공유 → false", seedHookPlusFile, false},
+		{"source 0개 → false", seedNoSource, false},
+		{"hook 2개(동일 hash) → true", seedTwoHooks, true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			st := openAt(t, t.TempDir())
+			c.seed(t, st)
+			got, err := st.ShadowOwnedExists(t.Context())
+			if err != nil {
+				t.Fatalf("ShadowOwnedExists: %v", err)
+			}
+			if got != c.want {
+				t.Fatalf("ShadowOwnedExists=%v want %v", got, c.want)
+			}
+		})
+	}
+}
+
 // TestShadowOwnedBytesPhysical — D40 §2: 물리 CAS 파일 기저 정확 단정 — 동일 hash의 hook-only
 // cross-media artifact 2행이어도 ShadowOwnedBytes는 물리 파일 1개의 os.Stat 크기와 정확히 같다
 // (논리 byte_length 2배 합산이면 오구현).
@@ -4002,6 +4031,49 @@ func TestOpen_JournalSizeLimit(t *testing.T) {
 	}
 	if gotRO != journalSizeLimit {
 		t.Fatalf("read-only journal_size_limit=%q want %q", gotRO, journalSizeLimit)
+	}
+}
+
+// TestClose_ReadOnlySkipsCheckpoint — readOnly로 연 Store의 Close는 wal_checkpoint(TRUNCATE)를
+// 걸지 않는다. 그 커넥션은 DSN에 mode=ro&query_only(ON)이 붙어 체크포인트가 성공할 수 없는데,
+// 실패하기 전에 busy_timeout(5000)을 문다 — 라이브 라이터가 content.db를 열고 있고 WAL이 더러운
+// 평상시(MCP 서버 구동 중)가 그 조건이고, 그 Exec에는 ctx가 없어 호출자의 deadline으로 끊지도
+// 못한다. 픽스처가 바로 그 평상시다: writable Store를 연 채로 두고 read-only로 또 연다.
+// 고치기 전에는 체크포인트 오류가 errors.Join을 타고 나오므로 이 nil 단언이 실패한다.
+func TestClose_ReadOnlySkipsCheckpoint(t *testing.T) {
+	dir := t.TempDir()
+	w := openAt(t, dir) // 라이브 라이터 — 닫지 않고 둔다(t.Cleanup이 마지막에 닫는다)
+	seedHookOnly(t, w)  // WAL을 더럽힌다: 커밋된 프레임이 있어야 TRUNCATE가 라이터와 실제로 경합한다
+
+	ro, err := Open(dir, true)
+	if err != nil {
+		t.Fatalf("open read-only: %v", err)
+	}
+	if err := ro.Close(); err != nil {
+		t.Fatalf("read-only Close: %v — 체크포인트를 걸었다", err)
+	}
+}
+
+// TestClose_WritableStillCheckpoints — 위 분기의 반대편(D50): writable Close는 그대로
+// wal_checkpoint(TRUNCATE)를 걸어 WAL을 0으로 절단한다. 분기 조건이 뒤집혀도 위 테스트는
+// 통과하므로(readOnly Close는 어느 쪽이든 nil) 이것이 없으면 그 회귀를 아무도 못 잡는다.
+func TestClose_WritableStillCheckpoints(t *testing.T) {
+	dir := t.TempDir()
+	w, err := Open(dir, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seedHookOnly(t, w)
+	walPath := filepath.Join(dir, "content.db-wal")
+	// 사전 가드: 픽스처가 WAL을 실제로 채웠는가. 원래 0이면 아래 절단 판정이 공허 통과한다.
+	if sz := fileSizeOrZero(t, walPath); sz == 0 {
+		t.Fatal("사전 가드: Close 전 WAL이 0B — 절단 판정이 공허해진다")
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("writable Close: %v", err)
+	}
+	if sz := fileSizeOrZero(t, walPath); sz != 0 {
+		t.Fatalf("Close 후 WAL=%dB want 0 — 체크포인트(D50)가 안 걸렸다", sz)
 	}
 }
 
