@@ -68,9 +68,11 @@ const (
 // Run — 훅 이벤트 1건을 처리한다(설계 §2). **항상 0을 반환한다**(fail-open §2.3): 어떤 실패도
 // exit 0 + drops 1줄로 흡수하고 호스트에 오류를 전파하지 않는다. 순서: CTR_HOOKS_OFF → host 검증 →
 // stdin 드레인 → 파싱 → session_id canonical 검증 → 호스트 접두(cc:/cx:) 조립 → cwd로 session dir
-// 도출 → deadline ctx → SessionStart=EnsureSession / 그 외=SessionExists 판정. host는 명시적 발신
-// 호스트(D35) — 세션 네임스페이스 접두라 미지 값은 오귀속 대신 drop한다. stdout은 guard(T7)의
-// permissionDecision JSON 전용이라 골격에서는 미사용. getenv는 테스트 주입점.
+// 도출 → deadline ctx → SessionStart=EnsureSession + 압축 직후 회수 안내 주입(injectRecallHint) /
+// 그 외=SessionExists 판정. host는 명시적 발신 호스트(D35) — 세션 네임스페이스 접두라 미지 값은
+// 오귀속 대신 drop한다. stdout은 두 이벤트가 배타적으로 쓴다: PreToolUse는 guard(T7)의
+// permissionDecision JSON, SessionStart는 injectRecallHint의 additionalContext JSON. 한 훅
+// 실행은 한 이벤트만 처리하므로 두 스키마가 한 스트림에 섞이지 않는다. getenv는 테스트 주입점.
 func Run(ctx context.Context, stdin io.Reader, stdout io.Writer, storeRoot, version string, host Host, getenv func(string) string) int {
 	if getenv("CTR_HOOKS_OFF") == "1" {
 		_, _ = io.Copy(io.Discard, stdin) // 소비 후 exit — broken pipe 방지(설계 §2.3)
@@ -139,6 +141,7 @@ func dispatch(ctx context.Context, in hookInput, dir, contentDir, worktreeRoot s
 		if _, err := ad.EnsureSession(ctx, src, worktreeRoot); err != nil {
 			appendDrop(dir, "ensure-failed", external, in.HookEventName, in.ToolName)
 		}
+		injectRecallHint(ctx, in, dir, contentDir, host, src, stdout)
 		return
 	}
 
@@ -349,8 +352,10 @@ const (
 // denyTool — 가드 조건 성립 시 deny 출력 헬퍼(설계 §4). stdout에 permissionDecision JSON(T0 검증
 // 스키마)을 **먼저** 쓰고 그다음 warning 이벤트(호출자 조립 detail — 상대 경로·크기 등)를
 // best-effort로 append한다 — 이벤트 기록 실패는 deny 판정에 영향 없다(fail-open은 기록 경로에만;
-// 가드 판정은 DB 없이 성립, §4). reason은 가드별 안내 문구(D54 — 색인형/Grep 분리). stdout은
-// deny JSON 전용이라(Claude Code가 exit 0 stdout을 파싱) 그 외 바이트는 쓰지 않는다.
+// 가드 판정은 DB 없이 성립, §4). reason은 가드별 안내 문구(D54 — 색인형/Grep 분리). PreToolUse
+// 경로의 stdout은 이 deny JSON 전용이라(Claude Code가 exit 0 stdout을 파싱) 그 외 바이트를 쓰지
+// 않는다 — 같은 스트림에 쓰는 다른 자리는 SessionStart의 injectRecallHint뿐이고 두 이벤트는
+// 배타적이다.
 func denyTool(ctx context.Context, ad *session.AppendDB, in hookInput, dir, toolName, detail, reason string, stdout io.Writer) {
 	out := map[string]any{"hookSpecificOutput": map[string]any{
 		"hookEventName":            "PreToolUse",
@@ -370,6 +375,69 @@ func denyTool(ctx context.Context, ad *session.AppendDB, in hookInput, dir, tool
 	if _, _, _, err := ad.Append(ctx, session.Event{Type: "warning", Summary: summary}); err != nil {
 		appendDrop(dir, "guard-append", "", in.HookEventName, in.ToolName) // 기록 실패 — deny는 이미 확정, drops 1줄만
 	}
+}
+
+// recallHint — SessionStart 압축 직후 주입 문면(설계 spec 2026-08-13 §4.2 + 그 문서의 "구현 중
+// 정정"). D100 계약 2에 묶인다: 훈계 어휘 없이 사실과 대체 목적지만 적는다. 형태는 같은 파일의
+// denyReasonIndexed를 그대로 따른다 — 그쪽이 이미 배송된 준수 선례이고, 목적지를 명사구로
+// 나열하는 꼴이 "리다이렉트는 대체 목적지만 말한다"에 가장 가깝다.
+// **두 도구를 다 적는 것이 계약이다**: D104의 착수 문턱은 resolved_artifacts + missed이고 그
+// 두 칸을 쓰는 것은 LedgerAppendFetch 하나뿐이며 그 프로덕션 호출부는 ctr_fetch 경로뿐이다
+// (ctr_search는 LedgerAppend의 일반 행만 남긴다). 검색만 적으면 이 레버가 성공할수록 판정
+// 지표가 조용해진다 — 스니펫으로 해결되면 원문을 안 가져오기 때문이다. 검색이 히트마다
+// artifact_id를 실어 주므로 두 단계는 실제로 이어진다.
+// **호스트가 준 문자열은 담지 않는다** — 도구 이름은 검증 없이 sources.uri로 흐르는 값이다.
+const recallHint = "context-router: 이 프로젝트에 보관된 도구 출력 — ctr_search로 검색, ctr_fetch로 바이트 정확 조회"
+
+// injectRecallHint — 압축 직후(source=compact)에, Claude 호스트에서, 재고가 있을 때만 stdout에
+// additionalContext JSON 한 줄을 쓴다(설계 spec §4.1·§4.3). 어떤 실패도 훅 종료 코드를 바꾸지
+// 않는다(§2.3 fail-open) — 잃는 것은 안내 한 줄뿐이다.
+//
+// ★ **두 게이트를 지난 뒤에는 어느 경로로 끝나든 반드시 진단 한 줄을 남긴다.** 게이트 뒤에서
+// 조용히 반환하면 "압축이 한 번도 안 일어났다"와 "일어났는데 주입이 안 됐다"가 같은 음성이
+// 된다 — 이 경로는 원장에도 세션 이벤트에도 흔적을 안 남기고(EnsureSession은 재호출 시
+// session_start를 재발행하지 않는다), 그러면 다음 구간이 0을 채택 부진으로 오독한다.
+// 그래서 **이 줄의 수가 곧 압축 발화 횟수이고 첫 줄의 타임스탬프가 곧 주입 발효 시각이다.**
+// 원장에 쓰지 않는 이유는 계측 중립이 아니라 구조다: readOnly Open은 ledger를 개설하지 않고
+// (s.ledger가 nil) writable Open은 lockStoreCtx·migrate를 타서 세션 시작의 락 경합에 걸린다.
+func injectRecallHint(ctx context.Context, in hookInput, dir, contentDir string, host Host, source string, stdout io.Writer) {
+	if source != "compact" || host != HostClaude {
+		return // 이 훅의 대상이 아니다 — 진단도 남기지 않는다
+	}
+	if _, err := os.Stat(filepath.Join(contentDir, "content.db")); err != nil {
+		appendDrop(dir, "hint-empty", "", in.HookEventName, "")
+		return
+	}
+	st, err := store.OpenContext(ctx, contentDir, true)
+	if err != nil {
+		appendDrop(dir, "hint-unavailable", "", in.HookEventName, "")
+		return
+	}
+	defer func() { _ = st.Close() }() // ro 커넥션의 체크포인트 오류는 무시한다
+	// ctx를 반드시 넘긴다: OpenContext의 readOnly 경로는 ctx를 쓰지 않고 busy_timeout이
+	// 훅 총예산보다 커서, ctx 없이 물으면 예산 밖에서 블록된다(D103 계약 8과 같은 함정).
+	// 사유를 하나로 둔 이유: database/sql.Open은 연결하지 않으므로 부재·경합·손상이 전부
+	// 이 질의까지 와서 실패한다 — 열기 실패와 조회 실패를 가르는 사유 이름은 거짓이 된다.
+	ok, err := st.ShadowOwnedExists(ctx)
+	if err != nil {
+		appendDrop(dir, "hint-unavailable", "", in.HookEventName, "")
+		return
+	}
+	if !ok {
+		appendDrop(dir, "hint-empty", "", in.HookEventName, "")
+		return
+	}
+	out := map[string]any{"hookSpecificOutput": map[string]any{
+		"hookEventName":     "SessionStart",
+		"additionalContext": recallHint,
+	}}
+	b, err := json.Marshal(out)
+	if err != nil {
+		appendDrop(dir, "hint-unavailable", "", in.HookEventName, "")
+		return
+	}
+	_, _ = stdout.Write(b)
+	appendDrop(dir, "hint-ok", "", in.HookEventName, "")
 }
 
 // guardReadMax — 가드 임계(설계 §4, CTR_GUARD_READ_MAX 기본 256KiB). 양수만 채택(deadline과 동형).
