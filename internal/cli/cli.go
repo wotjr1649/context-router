@@ -1700,6 +1700,33 @@ func heldGroupHint(n int) string {
 	return fmt.Sprintf("사용자 항목과 함께 있는 우리 항목 %d그룹 — 호스트의 /hooks에서 그 항목을 지우세요(플러그인 훅과 겹쳐 같은 포착이 두 번 일어납니다)", n)
 }
 
+// manualGroupHint — [9]·[16]이 **마커 없는 수동 그룹**(우리 훅 명령이 들었는데 소유 마커가 없는
+// 형태)을 발견했을 때 내는 다음 걸음. 목적지는 heldGroupHint와 같고(사용자가 직접 지운다) 이유가
+// 다르다: 이쪽은 소유 판정이 마커를 첫 관문으로 쓰기 때문에 `hook uninstall`이 보존한다
+// (isOurHookGroup — 마커 없는 그룹을 지우면 사용자가 손으로 넣은 설정이 파괴된다). **그 사실을
+// 문면에 적는 이유**는, 적지 않으면 사용자가 uninstall을 돌려 보고 "제거할 항목 없음"만 읽은 뒤
+// 그룹이 그대로 남아 doctor가 같은 안내를 되풀이하기 때문이다(F3이 스코프에서 겪은 것과 같은 형태).
+//
+// **중복 발화는 조건형이고 지시가 그 조건에 걸린다(리뷰 I2).** 이 절이 읽는 것은 settings.json
+// 뿐이고 doctor에는 플러그인 훅 탐지기가 아예 없다 — 플러그인 쪽 등록은 매니페스트에 있다. 그래서
+// **겹치는지를 볼 수 없다.** 플러그인 없이 손으로만 등록해 쓰는 사용자에게 단정형으로 "지우세요"를
+// 내면, 지운 뒤 포착이 조용히 멎고 [9]는 다시 `옛 그룹 없음`으로 초록이 된다 — 이 절이 없애려던
+// 무성 실패의 거울상이다.
+//
+// **heldGroupHint는 단정형 그대로 두는데, 근거가 "마커가 겹침을 증명한다"는 아니다**(재리뷰 정정).
+// 마커가 증명하는 것은 그 그룹이 우리 옛 설치기의 산물이라는 것뿐이고, 지금 플러그인이 있는지는
+// 그쪽도 모른다 — **잔여 실패 모양이 이 절과 같다.** 그대로 두는 실제 근거는 둘이다: 그 문면이
+// CHANGELOG와 설계 v0.19 문서에 축자 인용돼 있어 고치는 것이 문서화된 계약 편집이라는 것, 그리고
+// 코호트가 우리 설치 경로를 밟은 쪽이라 훨씬 작고 오래됐다는 것. **미룬 선택이지 없는 문제가 아니다.**
+//
+// **"손으로 넣은"이라 부르는 근거**: 재검토 리뷰 7이 MCP 등록물([16]·[20])에 그 어휘를 금한 것은
+// 우리 옛 설치기가 마커 없이 쓴 적이 있어 출처가 갈리기 때문이다. 훅은 다르다 — __ctrManaged는
+// hook install이 존재한 첫 커밋부터 있었고(1623a1f), 출시된 어떤 설치기도 마커 없는 훅 그룹을 쓴
+// 적이 없다. 그래서 이 자리에서만 출처 단정이 성립한다.
+func manualGroupHint(n int) string {
+	return fmt.Sprintf("마커 없이 손으로 넣은 우리 항목 %d그룹 — 플러그인 훅과 함께 있으면 같은 포착이 두 번 일어납니다(hook uninstall은 마커 없는 그룹을 보존합니다 — 지우려면 호스트의 /hooks나 편집기로)", n)
+}
+
 // ctrToolPrefix — 플러그인이 등록한 서버의 도구 이름 접두(D98). 조각 둘이 매니페스트에서 온다:
 // 플러그인 이름(`.claude-plugin/plugin.json`의 `name`)과 MCP 서버 키(`plugin/mcp.json`의
 // `mcpServers` 유일 키). 호스트가 조합하는 형태는 `mcp__plugin_<플러그인>_<서버>__`다. 어느 쪽
@@ -2011,7 +2038,7 @@ func runDoctor(ctx context.Context, w io.Writer, storeRoot, projectRoot, version
 		if pathErr != nil {
 			return "확인불가"
 		}
-		n, held, marker, err := scanRegisteredHooks(path)
+		n, held, manual, marker, err := scanRegisteredHooks(path)
 		var base string
 		switch {
 		case err != nil:
@@ -2035,6 +2062,10 @@ func runDoctor(ctx context.Context, w io.Writer, storeRoot, projectRoot, version
 			// 동거 그룹은 "지울 수 있는 옛 그룹"과 부류가 다르므로 그 수에 섞지 않고 병기한다
 			// (릴리스 리뷰 F4) — 섞으면 uninstall로 사라지지 않을 것을 uninstall 대상이라 말한다.
 			base += ", " + heldGroupHint(held)
+		}
+		if manual > 0 {
+			// 마커 없는 수동 그룹도 같은 이유로 n에 섞지 않는다 — uninstall이 보존하는 부류다.
+			base += ", " + manualGroupHint(manual)
 		}
 		return base
 	}
@@ -2244,7 +2275,7 @@ func runDoctor(ctx context.Context, w io.Writer, storeRoot, projectRoot, version
 		if pathErr != nil {
 			return "확인불가", false
 		}
-		n, held, marker, scanErr := scanCodexRegisteredHooks(path)
+		n, held, manual, marker, scanErr := scanCodexRegisteredHooks(path)
 		var base string
 		switch {
 		case scanErr != nil:
@@ -2261,6 +2292,9 @@ func runDoctor(ctx context.Context, w io.Writer, storeRoot, projectRoot, version
 		}
 		if held > 0 {
 			base += ", " + heldGroupHint(held)
+		}
+		if manual > 0 {
+			base += ", " + manualGroupHint(manual) // [9]와 같은 근거
 		}
 		return base, n > 0
 	}

@@ -139,6 +139,34 @@ func heldHookGroup(raw json.RawMessage) bool {
 	return ours > 0 && foreign > 0
 }
 
+// manualHookGroup — 마커 없이 우리 훅 명령이 든 그룹인가(Claude). isOurHookGroup도 heldHookGroup도
+// 첫 관문이 isOurMarkerValue(Managed)라, 손으로 넣은 그룹은 **어느 부류로도 세어지지 않았다** —
+// doctor [9]가 `옛 그룹 없음`인 채로 우리 훅 여섯이 플러그인 훅과 함께 두 번씩 돌 수 있었고, 그
+// 구간 세 세션의 포착 수치가 전부 2배였다 `[실측 2026-08-14]`.
+//
+// 삭제 술어는 여기서도 되돌리지 않는다: 마커 없는 그룹은 사용자가 손으로 넣은 것일 수 있고 그것을
+// 지우면 사용자 설정이 파괴된다. heldHookGroup이 세운 거래를 그대로 따른다 — **술어는 보수적으로
+// 두고 세는 방식만 늘린다**. 그래서 이 그룹은 uninstall이 보존하고 doctor가 자리와 정리 경로를 낸다.
+//
+// isOurHookGroup·heldHookGroup과 구조적으로 배타적이다: 저 둘은 마커가 소유 값일 때만 참이고 이
+// 술어는 그 반대에서만 참이다. 항목은 하나라도 우리 명령이면 참으로 본다 — 마커가 없으므로 전건을
+// 요구할 근거가 없고(우리가 만든 그룹이 아니다), 우리 명령이 하나라도 있으면 그것이 발화한다.
+func manualHookGroup(raw json.RawMessage) bool {
+	var p hookGroupProbe
+	if json.Unmarshal(raw, &p) != nil {
+		return false
+	}
+	if isOurMarkerValue(p.Managed) {
+		return false // 마커 있음 → isOurHookGroup·heldHookGroup의 몫
+	}
+	for _, h := range p.Hooks {
+		if isHookCommandToken(h.Command) {
+			return true
+		}
+	}
+	return false
+}
+
 // heldCodexGroup — heldHookGroup의 Codex 형제. hooks.json은 미지 필드 금지라 그룹 레벨 마커가
 // 없고 소유는 항목 레벨 추론(command 토큰 + statusMessage 마커)뿐이므로, "우리 항목"의 기준이
 // isOurCodexGroup의 전건 조건 그대로다.
@@ -156,6 +184,26 @@ func heldCodexGroup(raw json.RawMessage) bool {
 		foreign++
 	}
 	return ours > 0 && foreign > 0
+}
+
+// manualCodexGroup — manualHookGroup의 Codex 형제. Codex hooks.json은 미지 필드 금지라 그룹 레벨
+// 마커가 없고 소유 표식이 항목 레벨 statusMessage뿐이므로, "마커 없는 우리 항목"도 항목 레벨로 본다.
+//
+// isOurCodexGroup(전건 — 모든 항목이 명령+표식)과는 배타적이다: 전건이 참이면 표식 없는 우리 항목이
+// 0이라 이 술어가 거짓이다. heldCodexGroup과는 겹칠 수 있다 — 그쪽의 foreign에는 "표식 없는 우리
+// 명령"도 들어가기 때문이다. 그래서 scanCodexRegisteredHooks의 switch는 held를 먼저 본다: 그 형태의
+// 정리 경로가 동거 부류와 같고(사용자가 /hooks에서 우리 항목만 지운다) 한 그룹을 두 번 세지 않는다.
+func manualCodexGroup(raw json.RawMessage) bool {
+	var p codexGroupProbe
+	if json.Unmarshal(raw, &p) != nil {
+		return false
+	}
+	for _, h := range p.Hooks {
+		if isCodexHookCommandToken(h.Command) && !isOurMarkerValue(h.StatusMessage) {
+			return true
+		}
+	}
+	return false
 }
 
 // isHookCommandToken — 명령을 공백 토큰화해 `context-router hook`과 정확 일치하는지(접두사
@@ -578,28 +626,33 @@ func runHookUninstallCodex(user bool, projectRoot string, stdout io.Writer) erro
 // heldHookGroup). count와 배타적이고, 나뉘어 있는 이유는 다음 걸음이 다르기 때문이다:
 // count는 `hook uninstall`이 지우고 held는 호스트의 `/hooks`에서 사용자가 지운다. 한 수로
 // 합치면 doctor가 uninstall로 사라지지 않을 것을 uninstall 대상이라 말한다.
-func scanRegisteredHooks(path string) (count, held int, marker string, err error) {
+//
+// 셋째 반환값 manual은 **마커 없는 수동 그룹 수**다(manualHookGroup). 앞의 둘은 마커를 첫 관문으로
+// 요구하므로 이 부류를 하나도 세지 못했고, 그래서 여섯 그룹이 플러그인 훅과 겹쳐 도는 동안 이 줄이
+// `옛 그룹 없음`이었다 `[실측 2026-08-14]`. 정리 경로는 held와 같지만(사용자가 직접) 원인이 달라
+// (마커 부재 vs 사용자 항목 동거) 안내 문면이 다르므로 수를 따로 센다.
+func scanRegisteredHooks(path string) (count, held, manual int, marker string, err error) {
 	data, rerr := os.ReadFile(path)
 	if rerr != nil {
 		if errors.Is(rerr, os.ErrNotExist) {
-			return 0, 0, "", nil
+			return 0, 0, 0, "", nil
 		}
-		return 0, 0, "", errors.New("hook: 설정 파일 읽기 실패")
+		return 0, 0, 0, "", errors.New("hook: 설정 파일 읽기 실패")
 	}
 	if len(bytes.TrimSpace(data)) == 0 {
-		return 0, 0, "", nil
+		return 0, 0, 0, "", nil
 	}
 	var settings map[string]json.RawMessage
 	if err := json.Unmarshal(data, &settings); err != nil {
-		return 0, 0, "", err
+		return 0, 0, 0, "", err
 	}
 	raw, ok := settings["hooks"]
 	if !ok {
-		return 0, 0, "", nil
+		return 0, 0, 0, "", nil
 	}
 	var hooks map[string]json.RawMessage
 	if err := json.Unmarshal(raw, &hooks); err != nil {
-		return 0, 0, "", err
+		return 0, 0, 0, "", err
 	}
 	for _, arr := range hooks {
 		var groups []json.RawMessage
@@ -618,10 +671,12 @@ func scanRegisteredHooks(path string) (count, held int, marker string, err error
 				}
 			case heldHookGroup(g):
 				held++
+			case manualHookGroup(g):
+				manual++
 			}
 		}
 	}
-	return count, held, marker, nil
+	return count, held, manual, marker, nil
 }
 
 // scanCodexRegisteredHooks — scanRegisteredHooks의 Codex 형제(D52, 스펙 v0.9 §0): hooks.json
@@ -630,28 +685,28 @@ func scanRegisteredHooks(path string) (count, held int, marker string, err error
 // 파일 부재·hooks 부재는 (0,0,"",nil) — 미등록 정보 분기. isOurCodexGroup(전건 판정)과
 // heldCodexGroup(동거)을 그대로 재사용하며 held의 계약은 형제와 같다. 읽기 실패 오류에는
 // 절대경로를 담지 않는다(§12 canary — *PathError는 경로 포함).
-func scanCodexRegisteredHooks(path string) (count, held int, marker string, err error) {
+func scanCodexRegisteredHooks(path string) (count, held, manual int, marker string, err error) {
 	data, rerr := os.ReadFile(path)
 	if rerr != nil {
 		if errors.Is(rerr, os.ErrNotExist) {
-			return 0, 0, "", nil
+			return 0, 0, 0, "", nil
 		}
-		return 0, 0, "", errors.New("hook: 설정 파일 읽기 실패")
+		return 0, 0, 0, "", errors.New("hook: 설정 파일 읽기 실패")
 	}
 	if len(bytes.TrimSpace(data)) == 0 {
-		return 0, 0, "", nil
+		return 0, 0, 0, "", nil
 	}
 	var settings map[string]json.RawMessage
 	if err := json.Unmarshal(data, &settings); err != nil {
-		return 0, 0, "", err
+		return 0, 0, 0, "", err
 	}
 	raw, ok := settings["hooks"]
 	if !ok {
-		return 0, 0, "", nil
+		return 0, 0, 0, "", nil
 	}
 	var hooks map[string]json.RawMessage
 	if err := json.Unmarshal(raw, &hooks); err != nil {
-		return 0, 0, "", err
+		return 0, 0, 0, "", err
 	}
 	for _, arr := range hooks {
 		var groups []json.RawMessage
@@ -670,15 +725,23 @@ func scanCodexRegisteredHooks(path string) (count, held int, marker string, err 
 				}
 			case heldCodexGroup(g):
 				held++
+			// held를 먼저 본다 — 표식 없는 우리 항목은 heldCodexGroup의 foreign에도 들어가므로
+			// 두 술어가 겹칠 수 있다(manualCodexGroup 주석). 사용자 항목까지 섞인 그룹은 정리
+			// 경로가 동거 부류와 같으니 그쪽으로 세고, 한 그룹을 두 번 세지 않는다.
+			// **이 순서는 TestScanCodexRegisteredHooks ④가 잠근다** — 뒤집으면 그 단정이 빨개진다
+			// `[실측: 뒤집은 상태에서 h=0 manual=1]`. 계수는 어느 순서든 1이라 문면만 갈리고,
+			// 그래서 테스트 없이는 교체가 조용히 통과한다.
+			case manualCodexGroup(g):
+				manual++
 			}
 		}
 	}
-	return count, held, marker, nil
+	return count, held, manual, marker, nil
 }
 
 // countRegisteredHooks — scanRegisteredHooks의 개수 부분만(기존 호출부·테스트 호환 얇은 래퍼).
 func countRegisteredHooks(path string) (int, error) {
-	n, _, _, err := scanRegisteredHooks(path)
+	n, _, _, _, err := scanRegisteredHooks(path)
 	return n, err
 }
 
