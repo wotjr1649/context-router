@@ -67,17 +67,26 @@ append-only · 탭 구분 · UTF-8 · LF. **9필드 고정:**
 적지 않으면, 읽는 쪽이 `cli-older-than` 의 `-` 를 "0바이트 회수"로 읽는다.** 그래서 계약을 표로
 못 박는다.
 
-| 필드 | `startup-shadow` · `cli-hook-only` | `cli-older-than` | `cli-gc` |
-|---|---|---|---|
-| `cutoff` | `ShadowCutoff` 결과 | 사용자가 지정한 경계 | `-` (개념 없음) |
-| `count` | 행 삭제된 **hash 수** (`Hashes`) | 삭제된 **artifact 수** | 제거된 **고아 blob 파일 수** |
-| `bytes` | `ReclaimedB` | `-` (함수가 안 낸다) | `-` (함수가 안 낸다) |
-| `deferred` | `DeferredFiles` | `-` | `-` |
-| `failed` | `FailedFiles` | `-` | `-` |
+| 필드 | `startup-shadow` | `cli-hook-only` | `cli-older-than` | `cli-gc` |
+|---|---|---|---|---|
+| `policy` | `<실효 보존값>/<출처>` | **`-`** (전량이라 보존이 안 걸린다) | `<사용자가 준 기간>/-` | `-` |
+| `cutoff` | `ShadowCutoff` 결과 | **`-`** (경계 인자가 없다) | 사용자가 지정한 경계 | `-` (개념 없음) |
+| `count` | 행 삭제된 **hash 수** (`Hashes`) | 〃 | 삭제된 **artifact 수** | 제거된 **고아 blob 파일 수** |
+| `bytes` | `ReclaimedB` | 〃 | `-` (함수가 안 낸다) | `-` (함수가 안 낸다) |
+| `deferred` | `DeferredFiles` | 〃 | `-` | `-` |
+| `failed` | `FailedFiles` | 〃 | `-` | `-` |
 
-근거: `PurgeHookOnlyOlderThan` 만 `HookPurgeReport` 네 값을 낸다. `PurgeOlderThan` 은
+근거: `HookPurgeReport` 네 값을 내는 것은 두 함수 — **기동 경로의 `PurgeHookOnlyOlderThan`
+(경계 인자를 받는다)과 CLI 경로의 `PurgeHookOnly`(안 받는다)** 다. `PurgeOlderThan` 은
 `(sources, artifacts int64)` 로 **바이트도 유예/실패도 내지 않고**, `GCOrphanBlobs` 는
 `removed int64` 하나뿐이다.
+
+**★ `startup-shadow` 와 `cli-hook-only` 는 같은 함수가 아니다** `[실측 — `runPurgeHookOnly` 는
+`st.PurgeHookOnly(ctx)` 를 부른다]`. 이 문서의 초안이 둘을 `PurgeHookOnlyOlderThan` 하나로
+적었는데 틀렸다. **차이가 앞 두 칸에 그대로 나온다**: CLI 쪽은 사용자가 *"hook 귀속을 전부
+지운다"* 를 명시로 요청한 자리라 보존 창도 경계도 개입하지 않는다 — 그 두 칸에 `336h0m0s/…`
+같은 값을 적으면 **일어나지 않은 정책 판정을 기록하는 것**이고, 이 로그가 막으려던 바로 그
+종류의 거짓 기록이다. 뒤 네 칸은 같은 리포트 타입이라 기동 경로와 동일하다.
 
 `PurgeOlderThan` 의 `sources` 는 버린다 — §1 의 세 질문에 필요하지 않고, 이 저장소의 관측상
 `sources` 는 `artifacts` 와 고정 차로 함께 움직인다(`sources = hashes + 2`). **다만 그 고정 차는
@@ -93,8 +102,8 @@ append-only · 탭 구분 · UTF-8 · LF. **9필드 고정:**
 
 | 라벨 | 트리거 | 호출 함수 |
 |---|---|---|
-| `startup-shadow` | 서버 기동 시 1회 | `PurgeHookOnlyOlderThan` |
-| `cli-hook-only` | `purge --hook-only` | 〃 |
+| `startup-shadow` | 서버 기동 시 1회 | `PurgeHookOnlyOlderThan`(경계 인자를 받는다) |
+| `cli-hook-only` | `purge --hook-only` | **`PurgeHookOnly`**(안 받는다 — 전량) |
 | `cli-older-than` | `purge --older-than` | `PurgeOlderThan` |
 | `cli-gc` | `purge --gc` | `GCOrphanBlobs` |
 
@@ -132,9 +141,13 @@ append-only · 탭 구분 · UTF-8 · LF. **9필드 고정:**
 
 | 경로 | 형식 | 예 |
 |---|---|---|
-| `startup-shadow` · `cli-hook-only` | `<실효 보존값>/<출처>` | `336h0m0s/pwsh-profile` |
+| `startup-shadow` | `<실효 보존값>/<출처>` | `336h0m0s/pwsh-profile` |
 | `cli-older-than` | `<사용자가 준 기간>/-` | `720h0m0s/-` |
-| `cli-gc` | `-` | `-` |
+| `cli-hook-only` · `cli-gc` | `-` | `-` |
+
+**`cli-hook-only` 가 여기 없는 이유**는 §2.0 의 ★ 항목 그대로다 — 그 경로는 보존 창을 보지
+않으므로 적을 정책값이 없다. **이 칸이 실질을 갖는 경로는 `startup-shadow` 하나뿐이고, 그것이
+바로 200개가 사라진 그 경로다.**
 
 **실효 보존값은 `store.ShadowRetention(os.Getenv)` 의 *반환값*이지 환경변수 원문이 아니다.**
 그 함수는 `time.ParseDuration` 실패·비양수를 기본값 72h 로 흡수한다 — 즉 `CTR_SHADOW_RETENTION=14d`
@@ -226,6 +239,13 @@ func purgeLogTail(path string, n int) (entries []purgeEntry, total int, unparsed
   섞이고, 그 순간 옛 파서가 새 줄을 **전부** 버린다. 이 완화가 내주는 것은 *"필드가 하나 더 낀 깨진
   줄"* 을 거르는 능력인데, §2.4 의 위생이 **쓰는 쪽에서** 탭을 공백으로 바꾸므로 사람이 파일을
   손대지 않는 한 그런 줄은 생기지 않는다.
+
+  **★ `dropsByReason` 이 `== 2 || == 5` 인 것과 어긋나지 않는다** — 그 술어의 *"느슨 수용
+  금지(설계 §5)"* 가 막는 것은 **중간 필드 수**(3·4)이고, 그것이 필요한 이유는 그 로그에 구형
+  2필드와 신형 5필드가 **한 파일에 혼재**하기 때문이다. 퍼지 로그에는 그런 구형이 없고, append 가
+  잘린 줄은 9필드보다 **적게** 나오므로 `>= 9` 가 이미 거른다. 남는 위험은 *"필드가 더 많은 줄"*
+  뿐인데 그것은 크래시로 생기지 않는다 — 잘린 append 는 줄을 짧게 만들지 길게 만들지 않는다.
+  **선례를 어긴 것이 아니라 같은 규칙이 다른 형상에서 다른 답을 낸 것이다.**
 - `total` 은 줄 수 계약이다(빈 줄 포함) — 같은 관례.
 
 ## 5. 오류 처리
