@@ -728,6 +728,9 @@ func scanCodexRegisteredHooks(path string) (count, held, manual int, marker stri
 			// held를 먼저 본다 — 표식 없는 우리 항목은 heldCodexGroup의 foreign에도 들어가므로
 			// 두 술어가 겹칠 수 있다(manualCodexGroup 주석). 사용자 항목까지 섞인 그룹은 정리
 			// 경로가 동거 부류와 같으니 그쪽으로 세고, 한 그룹을 두 번 세지 않는다.
+			// **이 순서는 TestScanCodexRegisteredHooks ④가 잠근다** — 뒤집으면 그 단정이 빨개진다
+			// `[실측: 뒤집은 상태에서 h=0 manual=1]`. 계수는 어느 순서든 1이라 문면만 갈리고,
+			// 그래서 테스트 없이는 교체가 조용히 통과한다.
 			case manualCodexGroup(g):
 				manual++
 			}

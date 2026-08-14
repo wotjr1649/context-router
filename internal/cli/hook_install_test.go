@@ -736,6 +736,23 @@ func TestScanCodexRegisteredHooks(t *testing.T) {
 	if n, h, mn, m, err := scanCodexRegisteredHooks(foreignPath); n != 0 || h != 0 || mn != 0 || m != "" || err != nil {
 		t.Fatalf("타인 그룹: n=%d h=%d manual=%d m=%q err=%v want 0/0/0/\"\"/nil", n, h, mn, m, err)
 	}
+	// ④ 표식 있는 우리 항목 + 표식 없는 우리 항목이 한 그룹에 — heldCodexGroup과 manualCodexGroup이
+	// **둘 다 참**인 유일한 형태다(전자의 foreign에 "표식 없는 우리 명령"이 들어가므로 겹친다).
+	// 이 단정이 scanCodexRegisteredHooks의 switch 순서를 잠근다: 계수는 어느 순서든 정확히 1이라
+	// (switch는 첫 매치에서 끝난다) 이 축이 없으면 두 case를 바꿔 써도 전 스위트가 초록이고, 바뀌는
+	// 것은 사용자가 읽는 문면이다 — held로 세면 "사용자 항목과 함께 있다", manual로 세면 "마커 없이
+	// 손으로 넣었다"이고 이 그룹은 둘 다 절반만 참이다. 동거 쪽을 고른 근거는 정리 경로가 같다는
+	// 것이고(호스트 /hooks에서 우리 항목을 지운다), 그 선택을 여기서 든다.
+	overlap := []byte(`{"hooks":{"PostToolUse":[{"matcher":"","hooks":[` +
+		`{"type":"command","command":"context-router codex-hook","timeout":10,"statusMessage":"context-router"},` +
+		`{"type":"command","command":"context-router codex-hook","timeout":10}]}]}}`)
+	overlapPath := filepath.Join(t.TempDir(), "hooks.json")
+	if err := os.WriteFile(overlapPath, overlap, 0o600); err != nil {
+		t.Fatalf("overlap write: %v", err)
+	}
+	if n, h, mn, _, err := scanCodexRegisteredHooks(overlapPath); n != 0 || h != 1 || mn != 0 || err != nil {
+		t.Fatalf("겹침 그룹: n=%d h=%d manual=%d err=%v want 0/1/0 — switch가 held를 manual보다 먼저 본다", n, h, mn, err)
+	}
 }
 
 // 제거가 타 그룹·미지 최상위 키를 보존하고 우리 세 이벤트만 비운다.
@@ -1260,8 +1277,11 @@ func TestDoctor_MixedGroupReportedAsHeld(t *testing.T) {
 		if want := "[16] codex hooks: project=옛 그룹 없음, " + heldHint; !strings.Contains(out, want) {
 			t.Fatalf("[16]이 동거 그룹을 짚지 않는다 — want %q:\n%s", want, out)
 		}
-		if n, held, _, _, err := scanCodexRegisteredHooks(path); err != nil || n != 0 || held != 1 {
-			t.Fatalf("소유=%d 동거=%d err=%v want 0/1(전건 판정 유지)", n, held, err)
+		// manual도 0이다 — Claude 형제가 재는 축을 Codex에서도 든다. 이 그룹의 우리 항목은 표식을
+		// 갖췄으므로 동거 부류이지 수동 부류가 아니고, 그 사실을 여기서 안 재면 마커 있는 형태가
+		// 수동으로 새는 회귀를 Codex 쪽에서는 아무도 못 잡는다.
+		if n, held, manual, _, err := scanCodexRegisteredHooks(path); err != nil || n != 0 || held != 1 || manual != 0 {
+			t.Fatalf("소유=%d 동거=%d 수동=%d err=%v want 0/1/0(전건 판정 유지)", n, held, manual, err)
 		}
 	})
 }
@@ -1278,9 +1298,11 @@ func TestDoctor_MixedGroupReportedAsHeld(t *testing.T) {
 // 방식만 늘린다). 그래서 count는 0으로 남고 새 부류 manual이 1이 된다.
 //
 // seed는 실제로 발견된 파일의 형태 그대로다: 그룹 키가 matcher·hooks뿐이고(__ctrManaged 없음)
-// 항목 키가 type·command·timeout뿐이다.
+// 항목 키가 type·command·timeout뿐이다. Claude seed에는 **첫 두 토큰만 닮은 명령**의 그룹이 하나
+// 더 붙어 있다(리뷰 I4) — 양성과 한 축만 다른 음성이고, 그것 없이는 manualHookGroup이 정확 토큰
+// 일치 대신 접두 매칭으로 흔들려도 아무도 못 잡는다. Codex ③(남의 훅만)이 그 축의 형제다.
 func TestDoctor_UnmarkedGroupReportedAsManual(t *testing.T) {
-	const manualHint = "마커 없이 손으로 넣은 우리 항목 1그룹 — 호스트의 /hooks나 편집기로 지우세요(hook uninstall은 마커 없는 그룹을 보존합니다 — 플러그인 훅과 겹쳐 같은 포착이 두 번 일어납니다)"
+	const manualHint = "마커 없이 손으로 넣은 우리 항목 1그룹 — 플러그인 훅과 함께 있으면 같은 포착이 두 번 일어납니다(hook uninstall은 마커 없는 그룹을 보존합니다 — 지우려면 호스트의 /hooks나 편집기로)"
 
 	t.Run("claude", func(t *testing.T) {
 		isolateCodexHome(t)
@@ -1289,8 +1311,11 @@ func TestDoctor_UnmarkedGroupReportedAsManual(t *testing.T) {
 		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 			t.Fatal(err)
 		}
-		seed := `{"hooks":{"PostToolUse":[{"matcher":"","hooks":[` +
-			`{"type":"command","command":"context-router hook","timeout":10}]}]}}`
+		// 둘째 그룹은 `context-router hook-wrapper` — 첫 토큰이 같고 둘째가 다르다. manual은 1이어야
+		// 하고, 2가 나오면 술어가 접두로 새고 있다는 뜻이다(isHookCommandToken의 계약).
+		seed := `{"hooks":{"PostToolUse":[` +
+			`{"matcher":"","hooks":[{"type":"command","command":"context-router hook","timeout":10}]},` +
+			`{"matcher":"","hooks":[{"type":"command","command":"context-router hook-wrapper","timeout":10}]}]}}`
 		if err := os.WriteFile(path, []byte(seed), 0o600); err != nil {
 			t.Fatal(err)
 		}
@@ -1300,13 +1325,14 @@ func TestDoctor_UnmarkedGroupReportedAsManual(t *testing.T) {
 		}
 		n, held, manual, _, err := scanRegisteredHooks(path)
 		if err != nil || n != 0 || held != 0 || manual != 1 {
-			t.Fatalf("소유=%d 동거=%d 수동=%d err=%v want 0/0/1", n, held, manual, err)
+			t.Fatalf("소유=%d 동거=%d 수동=%d err=%v want 0/0/1(닮은 명령 그룹은 안 센다)", n, held, manual, err)
 		}
 		after, err := os.ReadFile(path)
 		if err != nil {
 			t.Fatalf("read: %v", err)
 		}
-		if !strings.Contains(string(after), "context-router hook") {
+		// 값 전체로 찾는다 — 부분 문자열로 찾으면 hook-wrapper 그룹이 이 단정을 대신 만족시킨다.
+		if !strings.Contains(string(after), `"command":"context-router hook"`) {
 			t.Fatalf("우리 명령이 파일에서 사라졌다 — 이 테스트가 재려던 상태가 아니다:\n%s", after)
 		}
 	})
@@ -1334,6 +1360,15 @@ func TestDoctor_UnmarkedGroupReportedAsManual(t *testing.T) {
 		n, held, manual, _, err := scanCodexRegisteredHooks(path)
 		if err != nil || n != 0 || held != 0 || manual != 1 {
 			t.Fatalf("소유=%d 동거=%d 수동=%d err=%v want 0/0/1", n, held, manual, err)
+		}
+		// 부작용 축 — Claude 형제와 같은 축을 든다. 진단이 파일을 건드리지 않는다는 것을 여기서도
+		// 재지 않으면 "doctor가 지우고 나서 짚었다"와 "짚기만 했다"가 같은 초록으로 보인다.
+		after, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("read: %v", err)
+		}
+		if !strings.Contains(string(after), `"command":"context-router codex-hook"`) {
+			t.Fatalf("우리 명령이 파일에서 사라졌다 — 이 테스트가 재려던 상태가 아니다:\n%s", after)
 		}
 	})
 }
