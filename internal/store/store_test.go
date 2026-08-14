@@ -4034,6 +4034,49 @@ func TestOpen_JournalSizeLimit(t *testing.T) {
 	}
 }
 
+// TestClose_ReadOnlySkipsCheckpoint — readOnly로 연 Store의 Close는 wal_checkpoint(TRUNCATE)를
+// 걸지 않는다. 그 커넥션은 DSN에 mode=ro&query_only(ON)이 붙어 체크포인트가 성공할 수 없는데,
+// 실패하기 전에 busy_timeout(5000)을 문다 — 라이브 라이터가 content.db를 열고 있고 WAL이 더러운
+// 평상시(MCP 서버 구동 중)가 그 조건이고, 그 Exec에는 ctx가 없어 호출자의 deadline으로 끊지도
+// 못한다. 픽스처가 바로 그 평상시다: writable Store를 연 채로 두고 read-only로 또 연다.
+// 고치기 전에는 체크포인트 오류가 errors.Join을 타고 나오므로 이 nil 단언이 실패한다.
+func TestClose_ReadOnlySkipsCheckpoint(t *testing.T) {
+	dir := t.TempDir()
+	w := openAt(t, dir) // 라이브 라이터 — 닫지 않고 둔다(t.Cleanup이 마지막에 닫는다)
+	seedHookOnly(t, w)  // WAL을 더럽힌다: 커밋된 프레임이 있어야 TRUNCATE가 라이터와 실제로 경합한다
+
+	ro, err := Open(dir, true)
+	if err != nil {
+		t.Fatalf("open read-only: %v", err)
+	}
+	if err := ro.Close(); err != nil {
+		t.Fatalf("read-only Close: %v — 체크포인트를 걸었다", err)
+	}
+}
+
+// TestClose_WritableStillCheckpoints — 위 분기의 반대편(D50): writable Close는 그대로
+// wal_checkpoint(TRUNCATE)를 걸어 WAL을 0으로 절단한다. 분기 조건이 뒤집혀도 위 테스트는
+// 통과하므로(readOnly Close는 어느 쪽이든 nil) 이것이 없으면 그 회귀를 아무도 못 잡는다.
+func TestClose_WritableStillCheckpoints(t *testing.T) {
+	dir := t.TempDir()
+	w, err := Open(dir, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seedHookOnly(t, w)
+	walPath := filepath.Join(dir, "content.db-wal")
+	// 사전 가드: 픽스처가 WAL을 실제로 채웠는가. 원래 0이면 아래 절단 판정이 공허 통과한다.
+	if sz := fileSizeOrZero(t, walPath); sz == 0 {
+		t.Fatal("사전 가드: Close 전 WAL이 0B — 절단 판정이 공허해진다")
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("writable Close: %v", err)
+	}
+	if sz := fileSizeOrZero(t, walPath); sz != 0 {
+		t.Fatalf("Close 후 WAL=%dB want 0 — 체크포인트(D50)가 안 걸렸다", sz)
+	}
+}
+
 // TestErrPredicates — 공개 술어의 비-sqlite 오류 음성 판정(양성은 실 BUSY 경로가 간접 커버).
 func TestErrPredicates(t *testing.T) {
 	if IsBusyErr(nil) || IsBusyErr(errors.New("x")) {

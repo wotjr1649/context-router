@@ -397,7 +397,13 @@ const recallHint = "context-router: 이 프로젝트에 보관된 도구 출력 
 // 조용히 반환하면 "압축이 한 번도 안 일어났다"와 "일어났는데 주입이 안 됐다"가 같은 음성이
 // 된다 — 이 경로는 원장에도 세션 이벤트에도 흔적을 안 남기고(EnsureSession은 재호출 시
 // session_start를 재발행하지 않는다), 그러면 다음 구간이 0을 채택 부진으로 오독한다.
-// 그래서 **이 줄의 수가 곧 압축 발화 횟수이고 첫 줄의 타임스탬프가 곧 주입 발효 시각이다.**
+// 그래서 **첫 줄의 타임스탬프가 곧 주입 발효 시각이고, 이 줄의 수는 압축 발화 횟수의 하한이다.**
+// **등식이 아니다**: Run이 dispatch 이전에 반려하는 경로(bad-session-id·bad-cwd)는 drop을
+// storeRoot 레벨 사이드카에 쓰고 여기 dir에는 아무것도 안 남기며, session.OpenAppend 실패와
+// 호스트의 10초 킬, appendDrop 자체의 best-effort 실패(mkdir/open/write가 경고만 남긴다)도 같다.
+// 반대 방향으로는 stdout.Write 오류를 삼킨 뒤 hint-ok를 적으므로 과대 계상도 가능하다.
+// **발효 시각은 이 어느 것에도 영향받지 않는다** — 첫 줄이 남았다는 것 자체가 그 시점에 이
+// 경로가 실제로 돌았다는 뜻이다.
 // 원장에 쓰지 않는 이유는 계측 중립이 아니라 구조다: readOnly Open은 ledger를 개설하지 않고
 // (s.ledger가 nil) writable Open은 lockStoreCtx·migrate를 타서 세션 시작의 락 경합에 걸린다.
 func injectRecallHint(ctx context.Context, in hookInput, dir, contentDir string, host Host, source string, stdout io.Writer) {
@@ -413,7 +419,7 @@ func injectRecallHint(ctx context.Context, in hookInput, dir, contentDir string,
 		appendDrop(dir, "hint-unavailable", "", in.HookEventName, "")
 		return
 	}
-	defer func() { _ = st.Close() }() // ro 커넥션의 체크포인트 오류는 무시한다
+	defer func() { _ = st.Close() }() // readOnly Close는 체크포인트를 건너뛴다(store.Store.readOnly)
 	// ctx를 반드시 넘긴다: OpenContext의 readOnly 경로는 ctx를 쓰지 않고 busy_timeout이
 	// 훅 총예산보다 커서, ctx 없이 물으면 예산 밖에서 블록된다(D103 계약 8과 같은 함정).
 	// 사유를 하나로 둔 이유: database/sql.Open은 연결하지 않으므로 부재·경합·손상이 전부

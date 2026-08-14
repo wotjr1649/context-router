@@ -206,9 +206,22 @@ Claude 게이트를 지난 뒤에는 어느 경로로 끝나든 한 줄을 남�
 이벤트에도 흔적이 없다(`EnsureSession`은 재호출 시 `session_start`를 재발행하지 않는다).
 
 **④ §8.2의 "발효 시각을 손으로 적는다"가 기계화된다.** ③의 결과로 **첫 `hint-` 줄의
-타임스탬프가 곧 발효 시각이고 그 줄의 수가 곧 압축 발화 횟수**다. 원장에 쓰지 않는 것은 선택이
-아니라 구조다 — readOnly Open은 ledger를 개설하지 않고(`s.ledger`가 nil), writable Open은
+타임스탬프가 곧 발효 시각이고, 그 줄의 수는 압축 발화 횟수의 하한**이다. 원장에 쓰지 않는 것은
+선택이 아니라 구조다 — readOnly Open은 ledger를 개설하지 않고(`s.ledger`가 nil), writable Open은
 `lockStoreCtx`·`migrate`를 타서 세션 시작의 락 경합에 걸린다.
+
+**수는 등식이 아니라 하한이다** `[정정 — 2026-08-14, 최종 전체 브랜치 리뷰]`. 아래가 그 줄을
+누락시키는 경로다. 셋 다 `injectRecallHint`에 **닿기 전에** 끝나므로 이 절의 사후 계수는 압축이
+실제로 몇 번 일어났는지를 아래에서 센다.
+
+- `Run`이 `dispatch` **이전에** 반려하는 경로(`bad-session-id`·`bad-cwd`)는 drop을 `storeRoot`
+  레벨 사이드카에 쓰고 이 훅의 `dir`에는 아무것도 안 남긴다.
+- `session.OpenAppend` 실패와 호스트의 10초 킬도 같다.
+- `appendDrop` 자체가 best-effort다 — mkdir/open/write 실패가 `slog.Warn` 한 줄만 남긴다.
+
+반대 방향으로는 **과대 계상**도 가능하다: `stdout.Write` 오류를 삼킨 뒤 `hint-ok`를 적는다.
+**발효 시각(첫 줄의 타임스탬프)은 이 어느 것에도 영향받지 않는다** — 첫 줄이 남았다는 것 자체가
+그 시점에 이 경로가 실제로 돌았다는 뜻이므로, §8.2를 기계화한다는 ④의 결론은 그대로 선다.
 
 **⑤ D13 셈 정정.** §4.3이 새 질의를 "넷째 구현"이라 했으나 `shadowOwnedHashQuery`를 `EXISTS`로
 감싸는 코드는 **이미 있다**(`lastIndexedAtByHashQuery`). 새 질의는 최소 다섯째 소비자이고 베낄
@@ -262,3 +275,28 @@ Claude 게이트를 지난 뒤에는 어느 경로로 끝나든 한 줄을 남�
 선다. ⑥의 넷째 항목("`source` 열거의 출처가 갈린다")도 이만큼 좁혀진다: 열거의 길이는 여전히
 미확정이나 `compact`가 **호스트가 실제로 내보내는 값**이라는 것은 이제 문서 인용이 아니라 실측이다.
 `[실측 — 2026-08-14]`
+
+**⑨ §4.3의 "그 오류는 무시한다"가 오류만 보고 대기 시간을 못 봤다** `[정정 — 2026-08-14, 최종
+전체 브랜치 리뷰]`. §4.3 마지막 문단은 *"`Store.Close()`가 ro 커넥션에 체크포인트를 거는 성질이
+있으므로 그 오류는 무시한다"*고 적었다. 오류를 무시하는 것은 맞다. **그 오류가 나오기까지 무는
+시간이 빠졌다**: `Close`는 무조건 `PRAGMA wal_checkpoint(TRUNCATE)`를 거는데 readOnly 핸들의 DSN에는
+`mode=ro`·`query_only(ON)`이 붙어 성공할 수 없고, 실패하기 전에 `busy_timeout(5000)`을 문다. 게다가
+그 `Exec`에는 **ctx가 없어** 훅 deadline으로 끊지 못한다 — 이 경로의 나머지는 전부 ctx로 묶여 있다.
+리뷰어가 이 저장소의 실제 DSN 상수를 그대로 재현해 잰 값 `[실측 — 2026-08-13]`:
+
+| 조건 | 결과 |
+|---|---|
+| WAL이 비어 있고 라이터 없음 | 즉시, 오류 없음 |
+| **라이브 라이터가 `content.db`를 열고 있고 WAL이 더러움** | **1.38 s** 뒤 `disk I/O error (778)` |
+| 쓰기 트랜잭션 보유 중 | **6.41 s** 뒤 같은 오류 |
+
+가운데 줄이 MCP 서버가 떠 있는 **평상시**이고, `injectRecallHint`의 `defer st.Close()`가 그 대기를
+세션 시작 경로에 처음 올려놓았다. **고친 자리는 `(*Store).Close` 하나다** — 같은 낭비가
+`internal/cli`의 readOnly 오픈 경로에도 이미 있었으므로 훅에서 우회하지 않고 근원에서 고쳤다.
+`Store`에 `readOnly` 표식을 두고(`OpenContext`의 readOnly 분기가 세운다) `Close`가 그것을 보면
+체크포인트를 건너뛴다. **writable Close는 그대로다**(체크포인트는 D50 계약) —
+`TestClose_ReadOnlySkipsCheckpoint`가 ro 쪽을, `TestClose_WritableStillCheckpoints`가 그 반대편을
+잠근다. 앞의 것은 고치기 전 이 저장소에서 `1.41 s` 뒤 `disk I/O error (778)`로 실패했다
+`[실측 — 2026-08-14]`.
+
+§4.3 본문은 이 브랜치가 쓴 것이 아닌 불변 기록이라 고치지 않는다.
