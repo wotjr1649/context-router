@@ -3185,6 +3185,35 @@ func TestShadowOwnedAttribution(t *testing.T) {
 	}
 }
 
+// TestShadowOwnedExists — ShadowOwnedExists는 TestShadowOwnedAttribution과 같은 귀속 술어를
+// 공유한다(같은 상수). 그 표가 hash 수를 보는 자리에서 이쪽은 존재 여부만 본다.
+func TestShadowOwnedExists(t *testing.T) {
+	cases := []struct {
+		name string
+		seed func(t *testing.T, st *Store)
+		want bool
+	}{
+		{"빈 store → false", func(t *testing.T, st *Store) {}, false},
+		{"hook만 참조 → true", seedHookOnly, true},
+		{"hook+explicit 공유 → false", seedHookPlusFile, false},
+		{"source 0개 → false", seedNoSource, false},
+		{"hook 2개(동일 hash) → true", seedTwoHooks, true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			st := openAt(t, t.TempDir())
+			c.seed(t, st)
+			got, err := st.ShadowOwnedExists(t.Context())
+			if err != nil {
+				t.Fatalf("ShadowOwnedExists: %v", err)
+			}
+			if got != c.want {
+				t.Fatalf("ShadowOwnedExists=%v want %v", got, c.want)
+			}
+		})
+	}
+}
+
 // TestShadowOwnedBytesPhysical — D40 §2: 물리 CAS 파일 기저 정확 단정 — 동일 hash의 hook-only
 // cross-media artifact 2행이어도 ShadowOwnedBytes는 물리 파일 1개의 os.Stat 크기와 정확히 같다
 // (논리 byte_length 2배 합산이면 오구현).

@@ -774,6 +774,25 @@ func (s *Store) ArtifactHashByID(ctx context.Context, id int64) (string, error) 
 	return hash, nil
 }
 
+// ShadowOwnedExists — shadow 귀속 아티팩트가 하나라도 있는가(설계 spec 2026-08-13 §4.3).
+// **수가 아니라 존재 여부만 반환하는 것이 계약이다**: 부르는 쪽(훅의 SessionStart 주입)이
+// 싣는 것이 존재 여부뿐이고, EXISTS는 적격 행을 찾는 즉시 멈춘다 — 재고가 있는 흔한 경우에
+// shadow 색인 셋의 선두 컬럼이 source_kind가 아닌 데서 오는 전(全)스캔을 피한다. **재고가 0이면
+// 그 이득이 없다**(끝까지 훑는다): 조용해야 할 경로가 가장 비싸다는 뜻이고, 상한은 호출부가
+// 넘기는 ctx 예산이 건다. 술어는 shadowOwnedHashQuery를 그대로 쓴다 — SizeStats·purge와 같은
+// 정의를 공유해야 doctor가 렌더하는 수와 갈리지 않는다(D13). 같은 상수를 EXISTS로 감싸는 선례가
+// 이미 있다(lastIndexedAtByHashQuery). 나이 예산을 붙이지 않는 이유: DB에 있으면 회수 가능하고
+// 퍼지가 지운 것은 이미 없다 — 다만 그것은 이 순간에만 참이라, 다른 호스트의 서버가 곧 퍼지를
+// 돌리면 헛걸음이 한 번 난다.
+func (s *Store) ShadowOwnedExists(ctx context.Context) (bool, error) {
+	var found int
+	err := s.reader.QueryRowContext(ctx, `SELECT EXISTS(`+shadowOwnedHashQuery+`)`).Scan(&found)
+	if err != nil {
+		return false, fmt.Errorf("store ShadowOwnedExists: %w", err)
+	}
+	return found == 1, nil
+}
+
 // ReadRange: Selector.Kind 하나로 chunk 저장 좌표, blob 라인 스캔, blob UTF-8 스냅 바이트
 // 구간 중 하나를 읽는다 (설계 §3.5).
 func (s *Store) ReadRange(ctx context.Context, artifactID int64, sel Selector) (RangeResult, error) {
