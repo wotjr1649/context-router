@@ -305,16 +305,22 @@ PID 976 @ `2026-08-14T04:23:58Z`. 계보는 `codex.exe ← bash.exe ← bash.exe
 
 ### 5.1 ★★★ 미완 하나 — 프로필 검증과 원인 확정이 같은 한 줄이다
 
-**새 탭을 하나 열어** 이 한 줄을 돌리면 처방 검증과 §3.4의 (a)/(b) 판정이 동시에 끝난다:
+**새 탭을 하나 열어** 이 한 줄을 돌리면 처방 검증과 §3.4의 (a)/(b) 판정이 동시에 끝난다.
+**새 탭은 pwsh만 띄운다 — `claude`를 부르지 않으면 서버가 뜨지 않으므로 퍼지 위험이 없다.**
 
 ```powershell
-"RET=[$env:CTR_SHADOW_RETENTION] SRC=[$env:CTR_RETENTION_SOURCE]"
+"INH=$env:CTR_RETENTION_INHERITED RET=[$env:CTR_SHADOW_RETENTION] SRC=[$env:CTR_RETENTION_SOURCE]"
 ```
 
-- `SRC=[pwsh-profile]` → **처방 유효**
-- `RET=[336h] SRC=[]` → 프로필 미실행인데 값은 옴 = 원인 **(b)**(설정 파일 `env`가 MCP 서버에
-  안 감). 그러면 그 경로는 앞으로 신뢰하지 않는다.
-- `RET=[] SRC=[]` → 둘 다 안 옴 = **즉시 재처방**
+`INH`는 프로필이 덮기 **전**의 상속값이다 — 프로필 첫 줄이 그것을 먼저 기록하도록 한 줄을
+더했다(세션 61 마감 직전). 이 칸이 없으면 프로필이 값을 덮어써서 상속 여부를 못 본다.
+
+| 출력 | 뜻 |
+|---|---|
+| `INH=[] … SRC=[pwsh-profile]` | 처방 유효, **그리고 원인 (a) 확정** — 조상 터미널이 336h를 못 받았다 |
+| `INH=[336h] … SRC=[pwsh-profile]` | 처방 유효, 조상 경로도 살아 있음 → 원인은 **(b)** 쪽(설정 파일 `env`가 MCP 서버에 안 감) |
+| `SRC=[]` | **프로필이 안 돌았다** — 경로(`$PROFILE.CurrentUserAllHosts`)와 실행 정책을 본다 |
+| `RET=[]` | 둘 다 실패 — **즉시 재처방** |
 
 이 세션의 PowerShell 도구로는 못 잰다 — 프로필을 로드하지 않는다(§3.5).
 
@@ -421,9 +427,10 @@ docs/prompts/2026-08-14-session-61-silent-72h-fallback-and-profile-fix.md 를 �
 1. Get-CimInstance Win32_Process -Filter "Name='context-router.exe'"  — 서버와 그 부모.
    codex 계통이면 계보를 끝까지 봐라 — ChatGPT.exe 계통이 지운 전력이 있고 bash.exe
    계통은 두 세션 연속 무사했다.
-2. "[$env:CTR_SHADOW_RETENTION] [$env:CTR_RETENTION_SOURCE]"  — 게이트. SOURCE 가
-   pwsh-profile 이면 처방이 실제로 걸린 것이다(이 세션의 도구 셸은 프로필을 안 읽으니
-   비어 있어도 실패가 아니다 — §5.1 의 새 탭 한 줄이 그것을 가른다).
+2. "INH=$env:CTR_RETENTION_INHERITED RET=[$env:CTR_SHADOW_RETENTION] SRC=[$env:CTR_RETENTION_SOURCE]"
+   — 게이트. RET 이 336h 여야 한다. SRC 가 pwsh-profile 이면 프로필 처방이 실제로
+   걸린 것이고, INH 는 프로필이 덮기 전의 상속값이다(§5.1 의 판정표). 이 세션의 도구
+   셸은 프로필을 안 읽으니 SRC 가 비어 있어도 실패가 아니다 — 새 탭에서만 갈린다.
 3. context-router stats  — 회수 줄 여덟 칸이 t0 와 같은가 (오염 감시 + 주 1회 스냅샷)
 4. **context-router doctor 의 [15] hashes 와 blob 08-08/08-09/08-10 칸** — 손실 감시.
    기준선은 hashes 523, blob 639 (07-21 116 고아 · 08-08 20 · 08-09 113 · 08-10 172 ·
