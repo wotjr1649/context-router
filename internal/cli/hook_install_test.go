@@ -602,7 +602,7 @@ func TestLegacyVersionedMarkerStillOwned(t *testing.T) {
 	for _, marker := range []string{"context-router/0.14.0", "context-router"} {
 		proj := t.TempDir()
 		path := writeSeedClaudeHooks(t, false, proj, marker)
-		n, _, _, err := scanRegisteredHooks(path)
+		n, _, _, _, err := scanRegisteredHooks(path)
 		if err != nil || n != len(hookRegistrations) {
 			t.Fatalf("marker %q: 소유 그룹 %d개 (err=%v) want %d", marker, n, err, len(hookRegistrations))
 		}
@@ -711,8 +711,8 @@ func TestRunHook_NoShadowRunningBranch(t *testing.T) {
 // 반환하므로 신설(적대 검수 P1). 파일 부재는 (0,"",nil) — 미등록 정보 분기.
 func TestScanCodexRegisteredHooks(t *testing.T) {
 	// ① 부재: count=0 marker="" err=nil
-	if n, h, m, err := scanCodexRegisteredHooks(filepath.Join(t.TempDir(), "hooks.json")); n != 0 || h != 0 || m != "" || err != nil {
-		t.Fatalf("부재: n=%d h=%d m=%q err=%v want 0/0/\"\"/nil", n, h, m, err)
+	if n, h, mn, m, err := scanCodexRegisteredHooks(filepath.Join(t.TempDir(), "hooks.json")); n != 0 || h != 0 || mn != 0 || m != "" || err != nil {
+		t.Fatalf("부재: n=%d h=%d manual=%d m=%q err=%v want 0/0/0/\"\"/nil", n, h, mn, m, err)
 	}
 	// ② 자기 그룹 존재(가드 포함 3그룹) → count>0, marker 추출.
 	const wantMarker = "0.9.0"
@@ -721,8 +721,9 @@ func TestScanCodexRegisteredHooks(t *testing.T) {
 	if err := os.WriteFile(selfPath, self, 0o600); err != nil {
 		t.Fatalf("self write: %v", err)
 	}
-	if n, h, m, err := scanCodexRegisteredHooks(selfPath); n <= 0 || h != 0 || m != wantMarker || err != nil {
-		t.Fatalf("자기 그룹: n=%d h=%d m=%q err=%v want >0/0/%q/nil", n, h, m, err, wantMarker)
+	// manual도 0이다 — 이 그룹들은 표식을 갖췄으므로 수동 부류가 아니다(부류 배타성).
+	if n, h, mn, m, err := scanCodexRegisteredHooks(selfPath); n <= 0 || h != 0 || mn != 0 || m != wantMarker || err != nil {
+		t.Fatalf("자기 그룹: n=%d h=%d manual=%d m=%q err=%v want >0/0/0/%q/nil", n, h, mn, m, err, wantMarker)
 	}
 	// ③ 타인 그룹만: statusMessage 마커 접두 없는 그룹 → count=0, marker=""(isOurCodexGroup 전건 탈락).
 	foreign := []byte(`{"hooks":{"PostToolUse":[{"matcher":"","hooks":[{"type":"command","command":"pwsh -File user.ps1","timeout":10,"statusMessage":"user"}]}]}}`)
@@ -730,9 +731,10 @@ func TestScanCodexRegisteredHooks(t *testing.T) {
 	if err := os.WriteFile(foreignPath, foreign, 0o600); err != nil {
 		t.Fatalf("foreign write: %v", err)
 	}
-	// 동거 부류도 0이다 — 이 그룹에는 우리 항목이 하나도 없다(전건 탈락의 사유가 "혼합"이 아니다).
-	if n, h, m, err := scanCodexRegisteredHooks(foreignPath); n != 0 || h != 0 || m != "" || err != nil {
-		t.Fatalf("타인 그룹: n=%d h=%d m=%q err=%v want 0/0/\"\"/nil", n, h, m, err)
+	// 동거 부류도 수동 부류도 0이다 — 이 그룹에는 우리 항목이 하나도 없다(전건 탈락의 사유가
+	// "혼합"도 "마커 부재"도 아니다). 수동 부류가 남의 훅을 집으면 그것이 오보의 시작이다.
+	if n, h, mn, m, err := scanCodexRegisteredHooks(foreignPath); n != 0 || h != 0 || mn != 0 || m != "" || err != nil {
+		t.Fatalf("타인 그룹: n=%d h=%d manual=%d m=%q err=%v want 0/0/0/\"\"/nil", n, h, mn, m, err)
 	}
 }
 
@@ -1225,8 +1227,9 @@ func TestDoctor_MixedGroupReportedAsHeld(t *testing.T) {
 			t.Fatalf("[9]가 동거 그룹을 짚지 않는다 — want %q:\n%s", want, out)
 		}
 		// 소유 판정은 건드리지 않았다 — 제거 가능 부류는 여전히 0이고 파일도 그대로다.
-		if n, held, _, err := scanRegisteredHooks(path); err != nil || n != 0 || held != 1 {
-			t.Fatalf("소유=%d 동거=%d err=%v want 0/1(전건 판정 유지)", n, held, err)
+		// manual은 0이다 — 이 그룹은 마커를 갖췄으므로 동거 부류이지 수동 부류가 아니다.
+		if n, held, manual, _, err := scanRegisteredHooks(path); err != nil || n != 0 || held != 1 || manual != 0 {
+			t.Fatalf("소유=%d 동거=%d 수동=%d err=%v want 0/1/0(전건 판정 유지)", n, held, manual, err)
 		}
 		after, err := os.ReadFile(path)
 		if err != nil {
@@ -1257,8 +1260,80 @@ func TestDoctor_MixedGroupReportedAsHeld(t *testing.T) {
 		if want := "[16] codex hooks: project=옛 그룹 없음, " + heldHint; !strings.Contains(out, want) {
 			t.Fatalf("[16]이 동거 그룹을 짚지 않는다 — want %q:\n%s", want, out)
 		}
-		if n, held, _, err := scanCodexRegisteredHooks(path); err != nil || n != 0 || held != 1 {
+		if n, held, _, _, err := scanCodexRegisteredHooks(path); err != nil || n != 0 || held != 1 {
 			t.Fatalf("소유=%d 동거=%d err=%v want 0/1(전건 판정 유지)", n, held, err)
+		}
+	})
+}
+
+// TestDoctor_UnmarkedGroupReportedAsManual — 마커 없이 손으로 넣은 우리 훅 그룹을 [9]·[16]이
+// 짚는가. **이 형태가 실제로 사람을 물었다** `[실측 2026-08-14]`: 여섯 이벤트에 마커 없는
+// `context-router hook` 그룹이 들어 있는 채로 플러그인 훅도 함께 돌아, 도구 출력 1건이 원장에
+// 2행으로 올랐다 — 그 구간(세 세션)의 포착 수치가 전부 2배였는데 doctor는 `옛 그룹 없음`으로
+// 초록이었다. 원인은 isOurHookGroup·heldHookGroup이 **둘 다** __ctrManaged 마커를 첫 관문으로
+// 요구해 마커 없는 그룹을 어느 부류로도 세지 않은 것이다.
+//
+// 소유 판정(=삭제 대상 판정)은 여기서도 건드리지 않는다 — 마커 없는 그룹을 지우면 사용자가 손으로
+// 넣은 것을 파괴한다(TestDoctor_MixedGroupReportedAsHeld와 같은 거래: 술어는 보수적으로 두고 세는
+// 방식만 늘린다). 그래서 count는 0으로 남고 새 부류 manual이 1이 된다.
+//
+// seed는 실제로 발견된 파일의 형태 그대로다: 그룹 키가 matcher·hooks뿐이고(__ctrManaged 없음)
+// 항목 키가 type·command·timeout뿐이다.
+func TestDoctor_UnmarkedGroupReportedAsManual(t *testing.T) {
+	const manualHint = "마커 없이 손으로 넣은 우리 항목 1그룹 — 호스트의 /hooks나 편집기로 지우세요(hook uninstall은 마커 없는 그룹을 보존합니다 — 플러그인 훅과 겹쳐 같은 포착이 두 번 일어납니다)"
+
+	t.Run("claude", func(t *testing.T) {
+		isolateCodexHome(t)
+		projectRoot := t.TempDir()
+		path := filepath.Join(projectRoot, ".claude", "settings.json")
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		seed := `{"hooks":{"PostToolUse":[{"matcher":"","hooks":[` +
+			`{"type":"command","command":"context-router hook","timeout":10}]}]}}`
+		if err := os.WriteFile(path, []byte(seed), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		out, _ := doctorOut(t, projectRoot)
+		if want := "[9] hooks: project=옛 그룹 없음, " + manualHint; !strings.Contains(out, want) {
+			t.Fatalf("[9]가 마커 없는 수동 그룹을 짚지 않는다 — want %q:\n%s", want, out)
+		}
+		n, held, manual, _, err := scanRegisteredHooks(path)
+		if err != nil || n != 0 || held != 0 || manual != 1 {
+			t.Fatalf("소유=%d 동거=%d 수동=%d err=%v want 0/0/1", n, held, manual, err)
+		}
+		after, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("read: %v", err)
+		}
+		if !strings.Contains(string(after), "context-router hook") {
+			t.Fatalf("우리 명령이 파일에서 사라졌다 — 이 테스트가 재려던 상태가 아니다:\n%s", after)
+		}
+	})
+
+	t.Run("codex", func(t *testing.T) {
+		isolateCodexHome(t)
+		projectRoot := t.TempDir()
+		path, err := codexHooksPath(false, projectRoot)
+		if err != nil {
+			t.Fatalf("codexHooksPath: %v", err)
+		}
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		// Codex는 그룹 레벨 마커가 없고 항목 레벨 statusMessage가 소유 표식이다 — 그것이 없는 형태.
+		seed := `{"hooks":{"PostToolUse":[{"matcher":"","hooks":[` +
+			`{"type":"command","command":"context-router codex-hook","timeout":10}]}]}}`
+		if err := os.WriteFile(path, []byte(seed), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		out, _ := doctorOut(t, projectRoot)
+		if want := "[16] codex hooks: project=옛 그룹 없음, " + manualHint; !strings.Contains(out, want) {
+			t.Fatalf("[16]이 마커 없는 수동 그룹을 짚지 않는다 — want %q:\n%s", want, out)
+		}
+		n, held, manual, _, err := scanCodexRegisteredHooks(path)
+		if err != nil || n != 0 || held != 0 || manual != 1 {
+			t.Fatalf("소유=%d 동거=%d 수동=%d err=%v want 0/0/1", n, held, manual, err)
 		}
 	})
 }

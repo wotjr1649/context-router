@@ -1700,6 +1700,16 @@ func heldGroupHint(n int) string {
 	return fmt.Sprintf("사용자 항목과 함께 있는 우리 항목 %d그룹 — 호스트의 /hooks에서 그 항목을 지우세요(플러그인 훅과 겹쳐 같은 포착이 두 번 일어납니다)", n)
 }
 
+// manualGroupHint — [9]·[16]이 **마커 없는 수동 그룹**(우리 훅 명령이 들었는데 소유 마커가 없는
+// 형태)을 발견했을 때 내는 다음 걸음. 목적지는 heldGroupHint와 같고(사용자가 직접 지운다) 이유가
+// 다르다: 이쪽은 소유 판정이 마커를 첫 관문으로 쓰기 때문에 `hook uninstall`이 보존한다
+// (isOurHookGroup — 마커 없는 그룹을 지우면 사용자가 손으로 넣은 설정이 파괴된다). **그 사실을
+// 문면에 적는 이유**는, 적지 않으면 사용자가 uninstall을 돌려 보고 "제거할 항목 없음"만 읽은 뒤
+// 그룹이 그대로 남아 doctor가 같은 안내를 되풀이하기 때문이다(F3이 스코프에서 겪은 것과 같은 형태).
+func manualGroupHint(n int) string {
+	return fmt.Sprintf("마커 없이 손으로 넣은 우리 항목 %d그룹 — 호스트의 /hooks나 편집기로 지우세요(hook uninstall은 마커 없는 그룹을 보존합니다 — 플러그인 훅과 겹쳐 같은 포착이 두 번 일어납니다)", n)
+}
+
 // ctrToolPrefix — 플러그인이 등록한 서버의 도구 이름 접두(D98). 조각 둘이 매니페스트에서 온다:
 // 플러그인 이름(`.claude-plugin/plugin.json`의 `name`)과 MCP 서버 키(`plugin/mcp.json`의
 // `mcpServers` 유일 키). 호스트가 조합하는 형태는 `mcp__plugin_<플러그인>_<서버>__`다. 어느 쪽
@@ -2011,7 +2021,7 @@ func runDoctor(ctx context.Context, w io.Writer, storeRoot, projectRoot, version
 		if pathErr != nil {
 			return "확인불가"
 		}
-		n, held, marker, err := scanRegisteredHooks(path)
+		n, held, manual, marker, err := scanRegisteredHooks(path)
 		var base string
 		switch {
 		case err != nil:
@@ -2035,6 +2045,10 @@ func runDoctor(ctx context.Context, w io.Writer, storeRoot, projectRoot, version
 			// 동거 그룹은 "지울 수 있는 옛 그룹"과 부류가 다르므로 그 수에 섞지 않고 병기한다
 			// (릴리스 리뷰 F4) — 섞으면 uninstall로 사라지지 않을 것을 uninstall 대상이라 말한다.
 			base += ", " + heldGroupHint(held)
+		}
+		if manual > 0 {
+			// 마커 없는 수동 그룹도 같은 이유로 n에 섞지 않는다 — uninstall이 보존하는 부류다.
+			base += ", " + manualGroupHint(manual)
 		}
 		return base
 	}
@@ -2244,7 +2258,7 @@ func runDoctor(ctx context.Context, w io.Writer, storeRoot, projectRoot, version
 		if pathErr != nil {
 			return "확인불가", false
 		}
-		n, held, marker, scanErr := scanCodexRegisteredHooks(path)
+		n, held, manual, marker, scanErr := scanCodexRegisteredHooks(path)
 		var base string
 		switch {
 		case scanErr != nil:
@@ -2261,6 +2275,9 @@ func runDoctor(ctx context.Context, w io.Writer, storeRoot, projectRoot, version
 		}
 		if held > 0 {
 			base += ", " + heldGroupHint(held)
+		}
+		if manual > 0 {
+			base += ", " + manualGroupHint(manual) // [9]와 같은 근거
 		}
 		return base, n > 0
 	}
