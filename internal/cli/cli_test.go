@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -46,13 +47,21 @@ func writeCodexConfig(t *testing.T, home, src string) {
 	}
 }
 
-// doctorOut — doctor를 돌려 출력과 오류를 돌려준다. runDoctor의 시그니처를 한 자리에만 두어
-// 뒤 태스크가 인자 순서를 되풀이하지 않게 한다.
-func doctorOut(t *testing.T, projectRoot string) (string, error) {
+// doctorOutIn — doctorOut의 storeRoot 지정 판. purge.log처럼 storeRoot 아래에 픽스처를
+// 놓아야 하는 테스트가 그 경로를 알아야 해서 갈랐다.
+func doctorOutIn(t *testing.T, storeRoot, projectRoot string) (string, error) {
 	t.Helper()
 	var buf bytes.Buffer
-	err := runDoctor(context.Background(), &buf, t.TempDir(), projectRoot, "0.17.0")
+	err := runDoctor(context.Background(), &buf, storeRoot, projectRoot, "0.17.0")
 	return buf.String(), err
+}
+
+// doctorOut — doctor를 돌려 출력과 오류를 돌려준다. runDoctor의 시그니처를 한 자리에만 두어
+// 뒤 태스크가 인자 순서를 되풀이하지 않게 한다. storeRoot는 매번 새 t.TempDir()다 —
+// 그 자리를 알아야 하는 테스트만 doctorOutIn을 직접 부른다.
+func doctorOut(t *testing.T, projectRoot string) (string, error) {
+	t.Helper()
+	return doctorOutIn(t, t.TempDir(), projectRoot)
 }
 
 // TestIsolateCodexHome — 격리 헬퍼가 실제로 doctorCodexConfigPath를 돌리는가. 이 파일의
@@ -1500,6 +1509,220 @@ func TestRunPurge_E2E_GCOnlyNoConfirm(t *testing.T) {
 	}
 	if n != 1 {
 		t.Fatalf("sources=%d want 1(gc-only는 DB 행을 지우지 않음)", n)
+	}
+}
+
+// purgeLogOf — 대상 프로젝트의 감사 로그를 최신 순으로 읽고 total/unparsed를 함께 단정한다.
+// 네 개의 감사 로그 테스트가 같은 세 줄을 반복하지 않게 한다.
+func purgeLogOf(t *testing.T, projDir string, wantRows int) []purgeEntry {
+	t.Helper()
+	entries, total, unparsed, aborted := purgeLogTail(filepath.Join(projDir, store.PurgeLogName), 5)
+	if total != wantRows || unparsed != 0 || len(entries) != wantRows || aborted {
+		t.Fatalf("total=%d unparsed=%d entries=%d aborted=%v want %d/0/%d/false",
+			total, unparsed, len(entries), aborted, wantRows, wantRows)
+	}
+	return entries
+}
+
+// TestRunPurgeLogsOlderThan — --older-than 경로가 감사 행을 남기고, **미측정 칸이 0이 아니라
+// `-`로 나오는가**. PurgeOlderThan의 반환은 sources·artifacts 둘뿐이라 바이트도 유예도 실패도
+// 내지 않는다 — 그 셋을 0으로 적으면 읽는 쪽이 "회수 바이트가 0이었다"는, 아무도 하지 않은
+// 측정을 읽는다.
+func TestRunPurgeLogsOlderThan(t *testing.T) {
+	pid, projDir, _ := seedHookOnlyProject(t)
+	var out bytes.Buffer
+	args := []string{"--project", pid, "--older-than", "720h", "--force"}
+	if err := runPurge(context.Background(), failReader{}, &out, io.Discard, storeRootOf(projDir), args, false); err != nil {
+		t.Fatalf("runPurge err=%v out=%s", err, out.String())
+	}
+	e := purgeLogOf(t, projDir, 1)[0]
+	if e.Path != "cli-older-than" || e.Status != "ok" {
+		t.Errorf("path=%q status=%q want cli-older-than/ok", e.Path, e.Status)
+	}
+	if e.Bytes != "-" || e.Deferred != "-" || e.Failed != "-" {
+		t.Errorf("미측정 칸이 %q/%q/%q want -/-/- — 이 경로는 그 셋을 재지 않는다",
+			e.Bytes, e.Deferred, e.Failed)
+	}
+	// **값 전체를 단정한다.** 접미만 보면 원시 플래그 문자열("720h")을 그대로 실어도 통과해
+	// Duration.String() 정규화가 깨진 것을 못 잡는다.
+	if e.Policy != "720h0m0s/-" {
+		t.Errorf("policy=%q want %q — 원시 플래그가 아니라 파싱된 기간의 String()이다",
+			e.Policy, "720h0m0s/-")
+	}
+	if e.Cutoff == 0 {
+		t.Error("cutoff=0(`-`) — 이 경로는 사용자가 지정한 경계로 지우므로 그 경계가 적혀야 한다")
+	}
+	// 지울 것이 없던 실행이다 — 행이 남았다는 사실이 "돌았다"를, count 0이 "지울 것이 없었다"를
+	// 말한다. 실제로 지운 실행의 count는 TestRunPurgeLogsSelectiveGC가 잠근다.
+	if e.Count != 0 {
+		t.Errorf("count=%d want 0 — 720h보다 오래된 행이 없다", e.Count)
+	}
+}
+
+// TestRunPurgeLogsGC — --gc 단독(gcOnly)은 runGCOrphan을 탄다. GC에는 보존 창도 경계도 없고
+// count는 제거된 고아 blob **파일 수**다 — 세 축 정합(blob − 고아 = hashes)이 깨진 채 발견되면
+// 이 행이 원인을 즉시 답한다.
+func TestRunPurgeLogsGC(t *testing.T) {
+	pid, projDir, _ := seedHookOnlyProject(t)
+	var out bytes.Buffer
+	args := []string{"--project", pid, "--gc", "--force"}
+	if err := runPurge(context.Background(), failReader{}, &out, io.Discard, storeRootOf(projDir), args, false); err != nil {
+		t.Fatalf("runPurge --gc err=%v out=%s", err, out.String())
+	}
+	e := purgeLogOf(t, projDir, 1)[0]
+	if e.Path != "cli-gc" || e.Status != "ok" {
+		t.Errorf("path=%q status=%q want cli-gc/ok", e.Path, e.Status)
+	}
+	if e.Policy != "-" {
+		t.Errorf("policy=%q want %q — GC에는 보존 정책 개념이 없다", e.Policy, "-")
+	}
+	if e.Cutoff != 0 {
+		t.Errorf("cutoff=%d want 0(`-`) — GC에는 경계 개념이 없다", e.Cutoff)
+	}
+	if e.Bytes != "-" || e.Deferred != "-" || e.Failed != "-" {
+		t.Errorf("미측정 칸이 %q/%q/%q want -/-/- — GCOrphanBlobs는 제거 건수만 낸다",
+			e.Bytes, e.Deferred, e.Failed)
+	}
+	// 시드에 고아 blob이 없다 — 실제로 제거한 실행의 count는 TestRunPurgeLogsSelectiveGC가 잠근다.
+	if e.Count != 0 {
+		t.Errorf("count=%d want 0 — 참조된 blob뿐이라 제거할 고아가 없다", e.Count)
+	}
+}
+
+// backdateForPurge — 프로젝트를 "오래된" 상태로 만든다: sources.indexed_at을 1000시간 전으로
+// 내려 --older-than 720h가 실제로 행을 지우게 하고, CAS 파일 mtime을 2시간 전으로 돌려
+// store.gcOrphanMinAge(1h) age gate를 통과시킨다(갓 만든 파일은 등록 진행 중일 수 있어 유예된다
+// — TestRunPurge_E2E_GCOnlyNoConfirm과 같은 관용구). **삭제 건수를 실제로 재려면 둘 다 필요하다.**
+//
+// **`--older-than 1ns` + sleep 관용구를 쓰지 않는 이유**: indexed_at은 unix 초라 같은 초에 쓰인
+// 픽스처 행에는 1ns 경계가 걸리지 않는다. 초 단위 대기로 우회하는 대신 경계를 결정적으로 만든다.
+func backdateForPurge(t *testing.T, projDir string) {
+	t.Helper()
+	dbPath := filepath.ToSlash(filepath.Join(projDir, "content.db"))
+	db, err := sql.Open("sqlite", "file:"+dbPath+"?_pragma=busy_timeout(5000)")
+	if err != nil {
+		t.Fatalf("open content.db rw: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+	if _, err := db.Exec("UPDATE sources SET indexed_at = ?", time.Now().Add(-1000*time.Hour).Unix()); err != nil {
+		t.Fatalf("backdate indexed_at: %v", err)
+	}
+	old := time.Now().Add(-2 * time.Hour)
+	if err := filepath.WalkDir(filepath.Join(projDir, "artifacts"),
+		func(p string, d fs.DirEntry, walkErr error) error {
+			if walkErr != nil || d.IsDir() {
+				return walkErr
+			}
+			return os.Chtimes(p, old, old)
+		}); err != nil {
+		t.Fatalf("age CAS files: %v", err)
+	}
+}
+
+// TestRunPurgeLogsSelectiveGC — **cli-gc 라벨을 내는 자리가 둘**이라는 것을 잠근다: --gc 단독은
+// runGCOrphan을 타고, --older-than과 함께면 살아 있는 writable store에서 인라인으로 돈다(그
+// 자리는 purgeErr에 대입해야 뒤따르는 vacuum/MergeFTS 블록이 그것을 읽는다). 한 자리만
+// 배선하면 이 조합이 행을 하나만 남긴다.
+//
+// **그리고 두 행의 count를 실측으로 잠그는 유일한 테스트다.** 나머지 감사 로그 테스트는 아무것도
+// 지우지 않는 실행이라 count가 전부 0이고, 0은 잘못 배선된 칸과 구별되지 않는다.
+func TestRunPurgeLogsSelectiveGC(t *testing.T) {
+	pid, projDir, _ := seedHookOnlyProject(t)
+	st, err := store.Open(projDir, false)
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	// 같은 바이트를 다른 URI로 한 번 더 등록한다 — Register의 아티팩트 조회 키가
+	// (content_hash, media_type)이라 artifacts 행은 재사용되고 sources 행만 는다.
+	// **sources와 artifacts를 어긋나게 하는 것이 요점이다**: 둘이 같으면 PurgeOlderThan의
+	// 첫째 반환값(sources)을 실어도 아래 count 단정이 통과해 버린다.
+	if _, err := st.Register(t.Context(), store.Registration{
+		StoredBytes: []byte("explicit-file-content"), MediaType: "text/plain",
+		Source: store.SourceMeta{URI: "/tmp/g.txt", Kind: "file", SrcHash: "sh-file2"},
+	}); err != nil {
+		t.Fatalf("register dup: %v", err)
+	}
+	var nSources, nArtifacts int
+	if err := st.Reader().QueryRow("SELECT count(*) FROM sources").Scan(&nSources); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Reader().QueryRow("SELECT count(*) FROM artifacts").Scan(&nArtifacts); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	// 전제를 명시로 확인한다 — 시드가 바뀌어 두 수가 같아지면 이 테스트는 조용히 힘을 잃는다.
+	if nSources != 3 || nArtifacts != 2 {
+		t.Fatalf("전제 불성립: sources=%d artifacts=%d want 3/2 — 두 수가 같으면 sources를 실은 "+
+			"행과 artifacts를 실은 행이 구별되지 않는다", nSources, nArtifacts)
+	}
+	backdateForPurge(t, projDir)
+
+	var out bytes.Buffer
+	args := []string{"--project", pid, "--older-than", "720h", "--gc", "--force"}
+	if err := runPurge(context.Background(), failReader{}, &out, io.Discard, storeRootOf(projDir), args, false); err != nil {
+		t.Fatalf("runPurge --older-than --gc err=%v out=%s", err, out.String())
+	}
+	entries := purgeLogOf(t, projDir, 2)
+	// 최신 순 — GC가 선택 삭제 뒤에 돈다.
+	if entries[0].Path != "cli-gc" || entries[1].Path != "cli-older-than" {
+		t.Fatalf("경로 순서 %q,%q want cli-gc,cli-older-than", entries[0].Path, entries[1].Path)
+	}
+	if entries[0].Policy != "-" || entries[1].Policy != "720h0m0s/-" {
+		t.Errorf("policy %q,%q want -,720h0m0s/- — 같은 실행이어도 GC 행에는 정책이 없다",
+			entries[0].Policy, entries[1].Policy)
+	}
+	// **count 칸.** 세 소스가 두 아티팩트를 가리키므로 두 수가 갈린다 — 이 칸은 지워진
+	// 아티팩트 수(2)이지 소스 수(3)가 아니다(스펙 §2.0 의미표).
+	if entries[1].Count != int64(nArtifacts) {
+		t.Errorf("cli-older-than count=%d want %d — PurgeOlderThan의 **둘째** 반환값(artifacts)이다. "+
+			"%d이면 첫째 반환값(sources)을 싣고 있다", entries[1].Count, nArtifacts, nSources)
+	}
+	// GC 행의 count는 제거된 고아 blob 파일 수다. 행이 전부 사라졌으니 CAS 파일이 모두 고아이고,
+	// 이 시드는 media_type이 하나뿐이라 CAS 파일 수 = 서로 다른 content_hash 수 = nArtifacts다.
+	// 이 행에서 실측인 칸은 이것 하나뿐이라, 0으로 새면 행이 존재 이유를 잃는다.
+	if entries[0].Count != int64(nArtifacts) {
+		t.Errorf("cli-gc count=%d want %d(고아가 된 CAS 파일 수)", entries[0].Count, nArtifacts)
+	}
+}
+
+// TestRunPurgeHookOnlyLogsNoPolicy — 이 경로는 **보존 창을 보지 않는다**: PurgeHookOnly는
+// PurgeHookOnlyOlderThan(ctx, 0, 0)이고 shadowOwnedFilter는 cutoff<=0을 "나이 필터 없음",
+// maxHashes<=0을 "건수 상한 없음"으로 읽는다 — 사용자가 명시로 요청한 전량 삭제다. 그래서
+// policy·cutoff가 `-`여야 한다. 환경변수가 설정돼 있다는 이유로 값을 적으면 **일어나지 않은
+// 정책 판정**을 기록하는 것이고, 이 로그가 막으려던 바로 그 종류의 거짓 기록이다.
+//
+// 뒤 세 칸은 반대다 — HookPurgeReport가 실제로 재는 값이라 `-`가 아니어야 한다. 시드의 CAS
+// 파일은 갓 만든 것이라 age-gate에 걸려 유예되므로 **회수 바이트는 재서 0**이다: 그 자리가
+// `-`가 아니라 `0`으로 나오는 것이 이 설계의 요점이다.
+func TestRunPurgeHookOnlyLogsNoPolicy(t *testing.T) {
+	pid, projDir, _ := seedHookOnlyProject(t)
+	t.Setenv("CTR_SHADOW_RETENTION", "336h") // 설정돼 있어도 이 경로는 보지 않는다
+	t.Setenv("CTR_RETENTION_SOURCE", "pwsh-profile")
+	var out bytes.Buffer
+	if err := runPurgeHookOnly(context.Background(), failReader{}, &out, io.Discard,
+		storeRootOf(projDir), pid, true, false); err != nil {
+		t.Fatalf("runPurgeHookOnly err=%v out=%s", err, out.String())
+	}
+	e := purgeLogOf(t, projDir, 1)[0]
+	if e.Path != "cli-hook-only" || e.Status != "ok" {
+		t.Errorf("path=%q status=%q want cli-hook-only/ok", e.Path, e.Status)
+	}
+	if e.Policy != "-" {
+		t.Errorf("policy=%q want %q — 이 경로는 보존 창을 보지 않는다. 환경변수가 설정돼 있다는 "+
+			"이유로 값을 적으면 일어나지 않은 판정을 기록하는 것이다", e.Policy, "-")
+	}
+	if e.Cutoff != 0 {
+		t.Errorf("cutoff=%d want 0(`-`) — PurgeHookOnly는 경계 인자를 받지 않는다", e.Cutoff)
+	}
+	if e.Count != 1 {
+		t.Errorf("count=%d want 1 — 시드의 hook 귀속 hash 하나가 지워진다", e.Count)
+	}
+	// **미측정(`-`)과 실측 0을 가른다.** 유예된 파일은 회수 바이트가 0이지만 그것은 잰 값이다.
+	if e.Bytes != "0" || e.Deferred != "1" || e.Failed != "0" {
+		t.Errorf("뒤 세 칸이 %q/%q/%q want 0/1/0 — HookPurgeReport의 실측값이고, 못 잰 `-`가 아니다",
+			e.Bytes, e.Deferred, e.Failed)
 	}
 }
 
@@ -3993,4 +4216,209 @@ func TestDoctorEnabledScopeUnjudgeable(t *testing.T) {
 			t.Fatalf("같은 파일을 [9]는 깨끗함으로, [20]은 파싱 실패로 읽었다:\n%s", out)
 		}
 	})
+}
+
+// purgeSectionLine — doctor 출력에서 [21] 줄을 뽑는다. 단정을 그 줄 **안으로** 좁히려고
+// 둔다: 출력 전체를 Contains하면 아래 부재 테스트의 부작용 축이 성립하지 않는다(검토 소견
+// F10) — 정확 문면 단정이 통과하는 순간 "[21] purges: 삭제 없음" 같은 접두 Contains는 절대
+// 매치하지 않아, 그 단정이 자기가 주장하는 성질과 무관한 이유로 통과한다.
+func purgeSectionLine(t *testing.T, out string) string {
+	t.Helper()
+	for _, ln := range strings.Split(out, "\n") {
+		if strings.HasPrefix(ln, "[21] purges:") {
+			return ln
+		}
+	}
+	t.Fatalf("[21] 줄이 없다:\n%s", out)
+	return ""
+}
+
+// TestDoctorPurgeSectionAbsent — 파일이 없을 때의 문면이 **"삭제 없음"으로 읽히지 않는가**.
+// 이 절이 닫으려는 결함이 바로 그 부류다 — 침묵을 초록으로 읽는 것. 축이 둘이고 서로 독립이다:
+// 요구 문면은 HasPrefix가 잠그고(뒤를 열어 둔다), 금지 어휘는 그 열린 뒤까지 훑는다. 요구
+// 문면을 완전 일치로 잠그면 금지 어휘 루프가 죽은 단정이 된다.
+func TestDoctorPurgeSectionAbsent(t *testing.T) {
+	isolateCodexHome(t)
+	out, _ := doctorOut(t, t.TempDir())
+	line := purgeSectionLine(t, out)
+	const want = "[21] purges: 기록 없음 (이 릴리스 이전 기동이거나 삭제 경로가 아직 안 돌았다)"
+	if !strings.HasPrefix(line, want) {
+		t.Fatalf("[21] 부재 문면이 다르다 —\n got %q\nwant %q", line, want)
+	}
+	for _, banned := range []string{"삭제 없음", "0건", "없습니다"} {
+		if strings.Contains(line, banned) {
+			t.Errorf("[21] 줄에 %q 가 있다 — 부재와 0건은 다른 사실이다: %s", banned, line)
+		}
+	}
+}
+
+// doctorPurgeLine — 대상 프로젝트의 purge.log 자리에 seed를 심고 doctor를 돌려 [21] 줄을
+// 돌려준다. **프로젝트 ID를 doctor 자신에게서 얻는다** — 지어내면 doctor가 다른 디렉터리를
+// 본다. [2] 줄이 `ProjectID=<값>`을 내므로 한 번 먼저 돌려 그 값을 읽는다.
+func doctorPurgeLine(t *testing.T, seed string) string {
+	t.Helper()
+	storeRoot, projectRoot := t.TempDir(), t.TempDir()
+	first, _ := doctorOutIn(t, storeRoot, projectRoot)
+	pid := ""
+	for _, ln := range strings.Split(first, "\n") {
+		if _, rest, ok := strings.Cut(ln, "ProjectID="); ok {
+			pid, _, _ = strings.Cut(rest, " ")
+			break
+		}
+	}
+	if pid == "" {
+		t.Fatalf("[2]에서 ProjectID를 못 읽었다:\n%s", first)
+	}
+	projDir := filepath.Join(storeRoot, "projects", pid)
+	if err := os.MkdirAll(projDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	write(t, filepath.Join(projDir, store.PurgeLogName), []byte(seed))
+	out, _ := doctorOutIn(t, storeRoot, projectRoot)
+	return purgeSectionLine(t, out)
+}
+
+// TestDoctorPurgeSectionLists — 기록이 있으면 총계와 최근 건을 짚는다.
+func TestDoctorPurgeSectionLists(t *testing.T) {
+	isolateCodexHome(t)
+	line := doctorPurgeLine(t, strings.Join([]string{
+		"1755180000\tstartup-shadow\t336h0m0s/pwsh-profile\t1753971299\tok\t0\t0\t0\t0",
+		"1755180899\tstartup-shadow\t72h0m0s/-\t1753971299\tok\t200\t1024\t0\t0",
+		"찢어진 조각",
+		"1755181000\tcli-older-than\t168h0m0s/-\t1755000000\tfailed\t37\t-\t-\t-",
+	}, "\n")+"\n")
+	// 총계는 파스 못 한 줄까지 센 줄 수이고, 짚는 것은 그중 최근 3건이다 — 둘이 갈린다.
+	if !strings.HasPrefix(line, "[21] purges: 4행 (최근 3건) — ") {
+		t.Errorf("[21]이 총계·건수를 안 낸다: %s", line)
+	}
+	// **회귀 잠금**: 조용한 72h 강등이 이 줄에서 눈에 보여야 한다. policy 칸이 이 설계의 존재
+	// 이유다 — 200개가 사라진 그 기동의 행에 `72h0m0s/-`가 적혀 있었다면 규명이 한 줄 조회였다.
+	//
+	// **시각 칸을 함께 잠근다**: 픽스처가 고정 epoch이라 이 단정이 없으면 `.UTC()`를 빼거나
+	// 레이아웃을 바꿔도 UTC 밖 머신에서만 빨개진다 — 여기서는 초록으로 나간다.
+	// 1755180899 → 08-14T14:14:59Z(UTC).
+	if !strings.Contains(line, "08-14T14:14:59Z startup-shadow 72h0m0s/- ok 200개 1024B") {
+		t.Errorf("[21]이 시각·policy·건수를 안 짚는다: %s", line)
+	}
+	// **status 옆에 count가 붙어야 한다.** PurgeOlderThan은 커밋 뒤(checkFTSIntegrity)에
+	// 실패할 수 있어 `failed`인데 이미 지워진 건수가 있다 — count가 없으면 읽는 사람이
+	// `failed`만 보고 "아무것도 안 지워졌다"로 읽는다.
+	if !strings.Contains(line, "cli-older-than 168h0m0s/- failed 37개") {
+		t.Errorf("[21]이 failed 옆에 건수를 안 붙인다: %s", line)
+	}
+	// 파스 못 한 줄을 조용히 넘기지 않는다 — 이 절이 닫으려는 부류 그대로다.
+	if !strings.Contains(line, "파싱 실패 1줄") {
+		t.Errorf("[21]이 파싱 실패 줄을 안 짚는다: %s", line)
+	}
+}
+
+// TestDoctorPurgeSectionAbortedRead — 스캔이 중단된 파일은 **깨진 줄 하나와 다른 문면**으로
+// 나온다. 1 MiB를 넘는 줄에서 Scanner가 멎으면 그 뒤는 아예 안 읽혀 total도 "최근 N건"도
+// 사실이 아닌데, 그것을 `파싱 실패 1줄`로 내면 운영자가 오타 한 줄로 읽고 넘긴다 — **감사
+// 로그를 읽는 표면이 감사 로그가 없애려던 침묵을 다시 만드는 자리다.**
+func TestDoctorPurgeSectionAbortedRead(t *testing.T) {
+	isolateCodexHome(t)
+	line := doctorPurgeLine(t, strings.Join([]string{
+		"1755180899\tcli-gc\t-\t-\tok\t1\t-\t-\t-",
+		strings.Repeat("x", 1<<20+1), // Scanner 상한 초과 — 여기서 멎는다
+		"1755181000\tcli-gc\t-\t-\tok\t2\t-\t-\t-",
+	}, "\n")+"\n")
+	if !strings.Contains(line, "읽다 중단 — 총계·최근 건이 불완전하다") {
+		t.Fatalf("[21]이 중단을 안 짚는다: %s", line)
+	}
+	if strings.Contains(line, "파싱 실패") {
+		t.Errorf("[21]이 중단을 깨진 줄로 둔갑시켰다 — 둘은 다른 사실이다: %s", line)
+	}
+	// 중단 전까지 읽은 것은 그대로 나온다(fail-soft). 그리고 총계가 3이 아니라 1인 것이
+	// 위 절이 필요한 이유 자체다.
+	if !strings.HasPrefix(line, "[21] purges: 1행 (최근 1건) — 08-14T14:14:59Z cli-gc") {
+		t.Errorf("[21]이 중단 전 행을 안 낸다: %s", line)
+	}
+}
+
+// TestDoctorPurgeSectionAbortedFirstLine — **첫 줄부터 멎으면 `total == 0` 이다.** 그 값만 보면
+// 부재와 구별되지 않아, 존재하지만 읽을 수 없는 로그가 `기록 없음` 으로 나간다 — 관측의 부재와
+// 부재의 관측을 가르는 것이 이 절의 전부인데 바로 그 자리에서 거짓말을 한다. 위 중단 테스트
+// 둘은 유효한 행을 먼저 두어 `total == 1` 이라 이 갈래를 밟지 않는다.
+func TestDoctorPurgeSectionAbortedFirstLine(t *testing.T) {
+	isolateCodexHome(t)
+	line := doctorPurgeLine(t, strings.Repeat("x", 1<<20+1)+"\n"+
+		"1755180899\tcli-gc\t-\t-\tok\t1\t-\t-\t-\n")
+	if strings.Contains(line, "기록 없음") {
+		t.Fatalf("읽을 수 없는 로그를 부재로 보고했다: %s", line)
+	}
+	const want = "[21] purges: 0행 (읽을 수 있는 행 없음) · 읽다 중단 — 총계·최근 건이 불완전하다"
+	if line != want {
+		t.Fatalf("[21] 첫 줄 중단 문면이 다르다 —\n got %q\nwant %q", line, want)
+	}
+}
+
+// TestDoctorPurgeSectionAllUnparsable — 모든 줄이 검증에 걸리면 짚을 것이 없는데, 옛 문면은
+// `— ` 를 무조건 붙여 뒤가 허공인 줄을 냈다(`4행 (최근 0건) —  · 파싱 실패 4줄`). 가정이 아니다:
+// 다음 버전이 path 라벨 하나를 바꾸면 옛 바이너리가 모든 행에서 이 자리를 밟는다.
+//
+// 대체 문면에 `0건`을 쓰지 않는다 — 부재 테스트가 그 어휘를 막는 이유("지운 게 없다"로 읽힌다)가
+// 여기서도 그대로다. 완전 일치로 잠근다: 금지 어휘 루프를 따로 두면 일치 단정이 통과하는 순간
+// 그 루프가 죽은 단정이 된다(검토 소견 F10).
+func TestDoctorPurgeSectionAllUnparsable(t *testing.T) {
+	isolateCodexHome(t)
+	line := doctorPurgeLine(t, "찢어진 조각\n또 다른 조각\n")
+	const want = "[21] purges: 2행 (읽을 수 있는 행 없음) · 파싱 실패 2줄"
+	if line != want {
+		t.Fatalf("[21] 전부 파스 실패 문면이 다르다 —\n got %q\nwant %q", line, want)
+	}
+}
+
+// TestDoctorPurgeSectionStripsControlBytes — `policy`는 렌더되는 칸 중 **검증도 이스케이프도
+// 없는 유일한 칸**이다. 쓰는 쪽 위생은 탭·개행·CR만 벗기므로 ESC·BEL·DEL이 파일에 남고, 그
+// 파일에 append할 수 있는 주체는 나머지 여덟 칸을 유효하게 맞춘 줄로 doctor의 터미널 출력에
+// ANSI를 실어 보낼 수 있다 — 주변 진단 줄을 덮거나 지운다. 하필 그 표면이 **증거로 신뢰받는
+// 것이 존재 이유**인 자리다. 거부가 아니라 렌더에서 벗기는 이유는 실재한 삭제 기록을 버리지
+// 않기 위해서다.
+func TestDoctorPurgeSectionStripsControlBytes(t *testing.T) {
+	isolateCodexHome(t)
+	line := doctorPurgeLine(t,
+		"1755180899\tstartup-shadow\t72h\x1b[2K\x07\x7f/pwsh\t-\tok\t1\t-\t-\t-\n")
+	if strings.ContainsAny(line, "\x1b\x07\x7f") {
+		t.Fatalf("[21]에 제어 바이트가 그대로 나갔다: %q", line)
+	}
+	// 위 단정만 두면 policy 칸을 통째로 버리는 구현도 통과한다 — 남은 글자가 그대로인지 함께 본다.
+	if !strings.Contains(line, "startup-shadow 72h[2K/pwsh ok 1개") {
+		t.Errorf("[21]이 정상 문자까지 지웠다: %q", line)
+	}
+}
+
+// TestDoctorSectionOrderStillAscending — [21]이 끝에 붙어 오름차순이 유지되는가.
+func TestDoctorSectionOrderStillAscending(t *testing.T) {
+	isolateCodexHome(t)
+	out, _ := doctorOut(t, t.TempDir())
+	assertDoctorAscending(t, out)
+	if !strings.Contains(out, "[21] purges:") {
+		t.Fatalf("[21]이 없다:\n%s", out)
+	}
+}
+
+// TestDoctorPurgeSectionUnidentifiedProject — 프로젝트 식별이 실패하면 [21]은 판정을 내지
+// 않는다. 그 경로에서 projDir은 `<storeRoot>/projects`로 뭉개져 **프로젝트의 자리가 아닌
+// 곳**을 읽는다. 픽스처를 바로 그 자리에 두어 그 오독을 재현한다 — 분기가 없으면 [21]이
+// 남의 파일을 이 프로젝트의 삭제 이력으로 보고한다.
+func TestDoctorPurgeSectionUnidentifiedProject(t *testing.T) {
+	isolateCodexHome(t)
+	storeRoot := t.TempDir()
+	missing := filepath.Join(t.TempDir(), "no-such-dir") // Canonicalize의 RealPath가 실패한다
+	if err := os.MkdirAll(filepath.Join(storeRoot, "projects"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	write(t, filepath.Join(storeRoot, "projects", store.PurgeLogName),
+		[]byte("1755180000\tstartup-shadow\t72h0m0s/-\t1753971299\tok\t200\t1024\t0\t0\n"))
+
+	out, _ := doctorOutIn(t, storeRoot, missing)
+	if !strings.Contains(out, "[2] project: 식별 실패") {
+		t.Fatalf("전제가 안 섰다 — [2]가 식별 실패가 아니다:\n%s", out)
+	}
+	line := purgeSectionLine(t, out)
+	const want = "[21] purges: 판정 불가 (프로젝트 식별 실패 — [2] 참조)"
+	if line != want {
+		t.Fatalf("[21] 식별 실패 문면이 다르다 —\n got %q\nwant %q", line, want)
+	}
 }

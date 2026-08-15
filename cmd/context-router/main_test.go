@@ -2540,3 +2540,153 @@ func TestFTSMergeIntervalIsDaily(t *testing.T) {
 			defaultFTSMergeInterval)
 	}
 }
+
+// startupPurgeRow — 서버를 한 번 **정상 종료**로 띄웠다 내리고, 그 프로젝트의 purge.log가 가진
+// 유일한 행을 탭으로 쪼개 돌려준다. 아래 세 기동 테스트가 공유한다.
+//
+// **종료를 서두르면 status가 뒤집힌다.** run()의 종료 defer는 `cancelPurge(); <-purgeDone`
+// 순서라 퍼지 ctx를 기다리기 전에 먼저 취소한다. 취소가 퍼지 **뒤**에 닿는 것은 무해하다 —
+// purgeErr가 nil이고 store.PurgeStatus의 ok 아닌 네 갈래는 전부 purgeErr != nil을 요구하므로
+// 분류는 그대로 ok다. 문제는 취소가 퍼지 **도중**에 닿는 경우이고, handshake 왕복은 그것을
+// 막지 못한다 — 그것은 장벽이 아니라 흘러간 시간일 뿐이고, 고루틴의 선행은 MCP 셋업과 파이프
+// 왕복 한 번뿐인데 그 사이 갓 만든 WAL DB에 첫 쓰기 tx를 해야 한다.
+//
+// 그래서 흘러간 시간 대신 **정확한 완료 신호**를 기다린다: store.AppendPurgeLog은 두 경로
+// (조기 반환·switch 뒤) 모두에서 퍼지 고루틴의 마지막 문장이라, 그 파일이 보이는 시점에는
+// 분류가 이미 확정돼 있다. 검사가 sleep보다 앞이라 행이 이미 있으면 대기 없이 빠져나간다.
+//
+// 행을 정확히 1줄로 단정하는 것도 판정이다: 기동 하나가 두 자리에서 기록하면(조기 반환과
+// switch 뒤가 함께 도는 배선 실수) 그 중복이 여기서 잡힌다.
+func startupPurgeRow(t *testing.T, storeRoot, proj string) []string {
+	t.Helper()
+	bin := buildCtrBinary(t)
+	cmd, c, stderrBuf, err := spawnCtr(t, bin, "--root", proj, "--store-root", storeRoot, "--enable", "ingest")
+	if err != nil {
+		t.Fatalf("spawn: %v", err)
+	}
+	if err := handshake(c, "ctr-purge-log-test"); err != nil {
+		t.Fatalf("handshake: %v", err)
+	}
+
+	logPath := filepath.Join(hookContentDir(t, storeRoot, proj), store.PurgeLogName)
+	for deadline := time.Now().Add(5 * time.Second); ; {
+		if _, err := os.Stat(logPath); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("5초 안에 감사 행이 안 나타났다: %s — 여기서 종료하면 아직 도는 퍼지가 "+
+				"취소돼 status가 배선 결과가 아니라 종료 타이밍을 재게 된다", logPath)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if err := closeAndWait(cmd, c); err != nil {
+		t.Fatalf("process exit: %v (stderr=%s)", err, stderrBuf.String())
+	}
+
+	// 읽기는 프로세스 종료 뒤다 — <-purgeDone이 AppendPurgeLog의 Close()가 끝난 것을 보장한다.
+	data, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("기동이 행을 안 남겼다: %v", err)
+	}
+	lines := strings.Split(strings.TrimRight(string(data), "\n"), "\n")
+	if len(lines) != 1 {
+		t.Fatalf("행 %d개 want 1: %q", len(lines), data)
+	}
+	f := strings.Split(lines[0], "\t")
+	if len(f) < 9 {
+		t.Fatalf("필드 %d개 want >=9: %q", len(f), lines[0])
+	}
+	return f
+}
+
+// TestStartupPurgeLogsZeroCount — 삭제 0인 기동이 **행 하나를 남기는가**.
+// 이 배선 전의 그 분기는 아무것도 하지 않았다 — 이 테스트가 그 침묵을 잠근다.
+// "퍼지가 안 돌았다"와 "돌았는데 0건"이 갈리지 않으면, 200개가 사라진 그 기동을
+// 사후에 재구성할 수단이 다시 없어진다.
+func TestStartupPurgeLogsZeroCount(t *testing.T) {
+	if testing.Short() {
+		t.Skip("느린 E2E — short 모드 skip")
+	}
+	t.Setenv("CTR_SHADOW_RETENTION", "336h") // 지울 대상이 없다(빈 스토어) — 0건 기동
+	t.Setenv("CTR_RETENTION_SOURCE", "test")
+	storeRoot, proj := t.TempDir(), t.TempDir()
+
+	f := startupPurgeRow(t, storeRoot, proj)
+	if f[1] != "startup-shadow" {
+		t.Errorf("path=%q want startup-shadow", f[1])
+	}
+	if f[4] != "ok" {
+		t.Errorf("status=%q want ok", f[4])
+	}
+	if f[5] != "0" {
+		t.Errorf("count=%q want 0", f[5])
+	}
+	// **회귀 잠금의 핵심**: 실효 정책값이 행에 박혀 있는가.
+	if !strings.HasPrefix(f[2], "336h0m0s/") {
+		t.Errorf("policy=%q want 336h0m0s/ 접두 — 이 칸이 이 설계의 존재 이유다", f[2])
+	}
+	// 회수를 **돌렸으므로** 뒤 세 칸(bytes·deferred·failed)은 "-"가 아니라 잰 값이다(전부 0).
+	// 이 단정이 없으면 아래 건너뛴 기동과 이 기동이 같은 행 모양을 내도 아무것도 빨개지지 않는다.
+	for i, name := range []string{"bytes", "deferred", "failed"} {
+		if got := f[6+i]; got != "0" {
+			t.Errorf("%s=%q want 0 — 회수가 돌았으니 미측정(-)이 아니다", name, got)
+		}
+	}
+}
+
+// TestStartupPurgeLogsSilentDowngrade — **이 테스트가 이 설계의 존재 이유다**(스펙 §6 항목 4).
+// `14d`는 ParseDuration에 `d`가 없어 조용히 기본 72h로 떨어진다 — 세션 58~62가 세 세션 걸려
+// 찾은 함정이다. 그 상태로 돈 기동의 행에 `72h0m0s`가 적혀 있어야 하고, **환경변수 원문이
+// 아니라 store.ShadowRetention의 실효 반환값**이어야 한다. 200개가 사라진 그 기동의 행에
+// `72h0m0s/-`가 있었다면 그 규명은 세 세션이 아니라 한 줄 조회였다.
+func TestStartupPurgeLogsSilentDowngrade(t *testing.T) {
+	if testing.Short() {
+		t.Skip("느린 E2E — short 모드 skip")
+	}
+	t.Setenv("CTR_SHADOW_RETENTION", "14d") // ParseDuration이 못 읽는다 → 실효 72h
+	t.Setenv("CTR_RETENTION_SOURCE", "")    // 출처 없음 → `-`
+	storeRoot, proj := t.TempDir(), t.TempDir()
+
+	f := startupPurgeRow(t, storeRoot, proj)
+	if f[2] != "72h0m0s/-" {
+		t.Fatalf("policy=%q want %q — 환경변수 원문(`14d`)이 아니라 **실효 반환값**을 적어야 한다. "+
+			"이 칸이 아니면 조용한 72h 강등을 사후에 알 방법이 없다", f[2], "72h0m0s/-")
+	}
+}
+
+// TestStartupPurgeLogsSkippedReclaim — 보존값이 epoch 경과분보다 커서 **회수를 아예 건너뛴**
+// 기동도 행을 남긴다. 그 조기 반환이 그냥 return하면 회수가 안 돌았다는 사실이 아무 데도 안 남고,
+// 그것이 `14d`가 조용히 72h가 되는 함정의 거울상이다(보존을 늘리려는 설정이 회수를 통째로 멎게
+// 한다). 그리고 뒤 세 칸은 `-`여야 한다 — 회수를 돌리지 않았으므로 0으로 적으면 "쟀더니 0"이라는
+// 거짓 측정이 되고, 그러면 위 0건 기동과 이 기동이 구별되지 않는다.
+func TestStartupPurgeLogsSkippedReclaim(t *testing.T) {
+	if testing.Short() {
+		t.Skip("느린 E2E — short 모드 skip")
+	}
+	t.Setenv("CTR_SHADOW_RETENTION", "1000000h") // 약 114년 → cutoff <= 0
+	t.Setenv("CTR_RETENTION_SOURCE", "test")
+	storeRoot, proj := t.TempDir(), t.TempDir()
+
+	f := startupPurgeRow(t, storeRoot, proj)
+	// **라벨을 단정한다**: 이 행의 존재 이유가 "아예 안 돌았다"는 침묵을 깨는 것인데, 라벨이
+	// 어긋나면 파서의 닫힌 집합이 그 행을 unparsed로 세어 doctor에서 사라진다 — 침묵이 그대로
+	// 돌아온다. 네 라벨을 묶는 공유 상수가 없어(두 패키지의 리터럴 다섯 대 제3의 파일에 박힌
+	// 지도) 이런 단정이 유일한 결속이다.
+	if f[1] != "startup-shadow" {
+		t.Errorf("path=%q want startup-shadow", f[1])
+	}
+	if f[2] != "1000000h0m0s/test" {
+		t.Errorf("policy=%q want 1000000h0m0s/test", f[2])
+	}
+	if f[3] != "-" {
+		t.Errorf("cutoff=%q want - — 경계로 쓰인 값이 없다", f[3])
+	}
+	if f[4] != "ok" || f[5] != "0" {
+		t.Errorf("status=%q count=%q want ok/0", f[4], f[5])
+	}
+	for i, name := range []string{"bytes", "deferred", "failed"} {
+		if got := f[6+i]; got != "-" {
+			t.Errorf("%s=%q want - — 회수를 안 돌렸으니 0은 거짓 측정이다", name, got)
+		}
+	}
+}

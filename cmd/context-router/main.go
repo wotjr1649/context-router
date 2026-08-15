@@ -700,7 +700,11 @@ func run(ctx context.Context, args []string, stderr io.Writer) error {
 	// 실패하면 색인을 포기해 가드를 조용히 통과시킨다(internal/hook guardRead의 guard-store drop).
 	// 그래서 이 배치의 잠금·쓰기 락 보유 시간은 그 예산의 일부만 쓰도록 건수로 묶는다
 	// (startupPurgeMaxHashes 주석의 실측 근거).
-	cutoff := store.ShadowCutoff(time.Now(), store.ShadowRetention(os.Getenv))
+	// 보존값을 변수로 받는 이유: 아래 감사 행의 policy 칸은 **이 cutoff를 고른 바로 그 값**이어야
+	// 한다. 기록 자리에서 store.ShadowRetention을 다시 부르면 그것은 별개의 측정이고, 로그가 실제
+	// 적용된 정책과 다른 값을 적을 여지가 생긴다.
+	retention := store.ShadowRetention(os.Getenv)
+	cutoff := store.ShadowCutoff(time.Now(), retention)
 	purgeCtx, cancelPurge := context.WithTimeout(ctx, startupPurgeBudget)
 	purgeDone := make(chan struct{})
 	go func() {
@@ -711,6 +715,22 @@ func run(ctx context.Context, args []string, stderr io.Writer) error {
 			// 삭제로 반전된다. 클램프하면 그 반전은 막아도 무의미한 배치를 한 번 돌리므로(쓰기 락을
 			// 잡는다) 회수 자체를 건너뛴다. 그 설정의 의도된 결과와도 같다 — 적격 대상이 없다.
 			// 경계 자체는 store.ShadowCutoff의 표 테스트(TestShadowCutoffBoundary, internal/store)가 고정한다.
+			//
+			// **건너뛴 기동도 행을 남긴다.** 그냥 return하면 회수가 아예 안 돌았다는 사실이 아무
+			// 데도 안 남아, 뒤늦게 보면 "퍼지가 안 돌았다"와 "돌았는데 지울 것이 없었다"가 다시
+			// 구별되지 않는다 — 이 감사 로그가 닫으려는 바로 그 침묵이다. 보존을 늘리려는 설정이
+			// 회수를 통째로 멎게 하는 이 경로는 `14d`가 조용히 72h가 되는 함정의 거울상이고,
+			// 그 실효 보존값은 policy 칸에 그대로 적힌다.
+			store.AppendPurgeLog(st.ProjectDir(), store.PurgeRecord{
+				Path:   "startup-shadow",
+				Policy: store.PurgePolicy(retention, os.Getenv("CTR_RETENTION_SOURCE")),
+				Status: "ok",
+				Cutoff: 0, // cutoff는 <=0이라 경계로 쓰이지 않았다 → "-"
+				Count:  0,
+				// 뒤 세 칸은 nil — 회수 단계를 **아예 안 돌렸다**. 0으로 쓰면 "쟀더니 0"이라는
+				// 거짓 측정이 되고, 그러면 0건 회수한 기동과 이 행이 구별되지 않는다: 위 두
+				// 갈래를 가르는 표시가 바로 이 세 칸이다(store.PurgeRecord의 포인터 규칙).
+			})
 			return
 		}
 		rep, purgeErr := st.PurgeHookOnlyOlderThan(purgeCtx, cutoff, startupPurgeMaxHashes)
@@ -724,6 +744,18 @@ func run(ctx context.Context, args []string, stderr io.Writer) error {
 		// 종료 경로만 의미한다(시그널 또는 아래 defer의 cancelPurge).
 		purgeCtxErr := purgeCtx.Err()
 		budgetSpent := errors.Is(purgeCtxErr, context.DeadlineExceeded)
+		// **감사 행의 status는 store.PurgeStatus 하나가 정한다** — 아래 switch에 남은 유일한
+		// 출력은 slog 문면이다. 두 곳이 각자 판정하면 로그와 기록이 갈리므로, **오류 네 갈래**
+		// (partial·cancelled·budget·failed)는 PurgeStatus가 같은 술어를 같은 순서로 들고 있다
+		// (internal/store): 그 넷의 순서를 여기서 바꾸는 변경은 그쪽도 함께 바꿔야 한다. 근거는
+		// 아래 case 주석들에 있다.
+		//
+		// **오류 없는 쪽은 둘이 일부러 갈린다**: 아래 마지막 case는 slog 소음을 줄이려고
+		// rep.Hashes>0만 거르고 끝나지만, PurgeStatus는 거기서 capped와 ok를 마저 가르고
+		// 0건 기동이 그 ok로 들어온다 — 아래 switch에는 그 자리가 아예 없다.
+		capped := rep.Hashes == startupPurgeMaxHashes
+		cancelled := errors.Is(purgeCtxErr, context.Canceled)
+		purgeStatus := store.PurgeStatus(purgeErr, rep.Hashes, cancelled, budgetSpent, capped)
 		switch {
 		case purgeErr != nil && rep.Hashes > 0:
 			// F1 확장(G2 — 최종 게이트 리뷰): rep.Hashes>0이면 행 삭제 tx는 이미 커밋되었고
@@ -738,8 +770,8 @@ func run(ctx context.Context, args []string, stderr io.Writer) error {
 			// 배타적이다).
 			slog.Warn("기동 shadow 회수 중단 — 행 삭제 완료, 파일 회수 잔여분은 purge --gc",
 				"hashes", rep.Hashes, "bytes", rep.ReclaimedB, "deferred", rep.DeferredFiles,
-				"capped", rep.Hashes == startupPurgeMaxHashes, "budget_spent", budgetSpent)
-		case purgeErr != nil && errors.Is(purgeCtxErr, context.Canceled):
+				"capped", capped, "budget_spent", budgetSpent)
+		case purgeErr != nil && cancelled:
 			// 종료로 중단된 것은 실패가 아니다 — 위 case가 커밋된 사례(rep.Hashes>0)를 먼저
 			// 가져가므로 이 분기는 행 삭제 tx 자체가 커밋 전에 취소된 rep.Hashes==0 사례만
 			// 남는다(그래서 "남은 배치는 다음 기동이 그대로 다시 집는다"가 참이다). stdio
@@ -761,9 +793,25 @@ func run(ctx context.Context, args []string, stderr io.Writer) error {
 		case rep.Hashes > 0:
 			// capped·budget_spent: 어느 예산이 이번 배치를 끊었는지 관측용(D67 임계값 재설정 입력).
 			slog.Info("기동 shadow 회수", "hashes", rep.Hashes, "bytes", rep.ReclaimedB,
-				"deferred", rep.DeferredFiles, "capped", rep.Hashes == startupPurgeMaxHashes,
+				"deferred", rep.DeferredFiles, "capped", capped,
 				"budget_spent", budgetSpent)
+			// **0건 기동은 slog를 내지 않는다** — 정상 기동마다 INFO를 내면 소음이다. 그런데
+			// 지금까지는 **아무 자국도** 안 남았고, 그래서 "퍼지가 안 돌았다"와 "돌았는데 지울
+			// 것이 없었다"가 구별되지 않았다. 아래 기록이 그 구멍을 닫는다 — 그것이 이 감사
+			// 행이 switch 밖에 있는 이유다.
 		}
+		// rep의 세 값을 지역 변수로 복사해 그 주소를 넘긴다 — 구조체 안으로의 주소를 건네지 않는
+		// 관례이고(CLI 경로도 같은 형태다), AppendPurgeLog은 포인터를 보관하지 않으므로 그 이상의
+		// 근거는 없다.
+		reclaimed, deferred, failed := rep.ReclaimedB, rep.DeferredFiles, rep.FailedFiles
+		store.AppendPurgeLog(st.ProjectDir(), store.PurgeRecord{
+			Path:   "startup-shadow",
+			Policy: store.PurgePolicy(retention, os.Getenv("CTR_RETENTION_SOURCE")),
+			Status: purgeStatus,
+			Cutoff: cutoff,
+			Count:  int64(rep.Hashes), // HookPurgeReport.Hashes는 int, PurgeRecord.Count는 int64
+			Bytes:  &reclaimed, Deferred: &deferred, Failed: &failed,
+		})
 	}()
 	// 회수를 st.Close()·sessDB.Close()보다 먼저 끝낸다(defer LIFO — 이 defer가 그 둘보다 나중에
 	// 등록되어 먼저 돈다): 닫힌 DB 접근과 rename 격리 중간 상태(*.purging)로 프로세스가 끝나는 것을
