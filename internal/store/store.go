@@ -355,6 +355,10 @@ func nextArtifactID(tx *sql.Tx) (int64, error) {
 
 func (s *Store) Reader() *sql.DB { return s.reader }
 
+// ProjectDir — 이 Store가 연 프로젝트 디렉터리(projects/<id>). 퍼지 감사 로그
+// (AppendPurgeLog)가 사이드카를 쓸 위치를 찾는 데 쓴다 — content.db와 같은 디렉터리다.
+func (s *Store) ProjectDir() string { return s.dir }
+
 func (s *Store) Close() error {
 	if s.ledger != nil {
 		s.ledger.Close() // best-effort: 보조 DB, Store 계약에 미포함
