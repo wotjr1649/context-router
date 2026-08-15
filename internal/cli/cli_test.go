@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -1542,6 +1543,11 @@ func TestRunPurgeLogsOlderThan(t *testing.T) {
 	if e.Cutoff == 0 {
 		t.Error("cutoff=0(`-`) — 이 경로는 사용자가 지정한 경계로 지우므로 그 경계가 적혀야 한다")
 	}
+	// 지울 것이 없던 실행이다 — 행이 남았다는 사실이 "돌았다"를, count 0이 "지울 것이 없었다"를
+	// 말한다. 실제로 지운 실행의 count는 TestRunPurgeLogsSelectiveGC가 잠근다.
+	if e.Count != 0 {
+		t.Errorf("count=%d want 0 — 720h보다 오래된 행이 없다", e.Count)
+	}
 }
 
 // TestRunPurgeLogsGC — --gc 단독(gcOnly)은 runGCOrphan을 탄다. GC에는 보존 창도 경계도 없고
@@ -1568,14 +1574,82 @@ func TestRunPurgeLogsGC(t *testing.T) {
 		t.Errorf("미측정 칸이 %q/%q/%q want -/-/- — GCOrphanBlobs는 제거 건수만 낸다",
 			e.Bytes, e.Deferred, e.Failed)
 	}
+	// 시드에 고아 blob이 없다 — 실제로 제거한 실행의 count는 TestRunPurgeLogsSelectiveGC가 잠근다.
+	if e.Count != 0 {
+		t.Errorf("count=%d want 0 — 참조된 blob뿐이라 제거할 고아가 없다", e.Count)
+	}
+}
+
+// backdateForPurge — 프로젝트를 "오래된" 상태로 만든다: sources.indexed_at을 1000시간 전으로
+// 내려 --older-than 720h가 실제로 행을 지우게 하고, CAS 파일 mtime을 2시간 전으로 돌려
+// store.gcOrphanMinAge(1h) age gate를 통과시킨다(갓 만든 파일은 등록 진행 중일 수 있어 유예된다
+// — TestRunPurge_E2E_GCOnlyNoConfirm과 같은 관용구). **삭제 건수를 실제로 재려면 둘 다 필요하다.**
+//
+// **`--older-than 1ns` + sleep 관용구를 쓰지 않는 이유**: indexed_at은 unix 초라 같은 초에 쓰인
+// 픽스처 행에는 1ns 경계가 걸리지 않는다. 초 단위 대기로 우회하는 대신 경계를 결정적으로 만든다.
+func backdateForPurge(t *testing.T, projDir string) {
+	t.Helper()
+	dbPath := filepath.ToSlash(filepath.Join(projDir, "content.db"))
+	db, err := sql.Open("sqlite", "file:"+dbPath+"?_pragma=busy_timeout(5000)")
+	if err != nil {
+		t.Fatalf("open content.db rw: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+	if _, err := db.Exec("UPDATE sources SET indexed_at = ?", time.Now().Add(-1000*time.Hour).Unix()); err != nil {
+		t.Fatalf("backdate indexed_at: %v", err)
+	}
+	old := time.Now().Add(-2 * time.Hour)
+	if err := filepath.WalkDir(filepath.Join(projDir, "artifacts"),
+		func(p string, d fs.DirEntry, walkErr error) error {
+			if walkErr != nil || d.IsDir() {
+				return walkErr
+			}
+			return os.Chtimes(p, old, old)
+		}); err != nil {
+		t.Fatalf("age CAS files: %v", err)
+	}
 }
 
 // TestRunPurgeLogsSelectiveGC — **cli-gc 라벨을 내는 자리가 둘**이라는 것을 잠근다: --gc 단독은
 // runGCOrphan을 타고, --older-than과 함께면 살아 있는 writable store에서 인라인으로 돈다(그
 // 자리는 purgeErr에 대입해야 뒤따르는 vacuum/MergeFTS 블록이 그것을 읽는다). 한 자리만
 // 배선하면 이 조합이 행을 하나만 남긴다.
+//
+// **그리고 두 행의 count를 실측으로 잠그는 유일한 테스트다.** 나머지 감사 로그 테스트는 아무것도
+// 지우지 않는 실행이라 count가 전부 0이고, 0은 잘못 배선된 칸과 구별되지 않는다.
 func TestRunPurgeLogsSelectiveGC(t *testing.T) {
 	pid, projDir, _ := seedHookOnlyProject(t)
+	st, err := store.Open(projDir, false)
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	// 같은 바이트를 다른 URI로 한 번 더 등록한다 — Register의 아티팩트 조회 키가
+	// (content_hash, media_type)이라 artifacts 행은 재사용되고 sources 행만 는다.
+	// **sources와 artifacts를 어긋나게 하는 것이 요점이다**: 둘이 같으면 PurgeOlderThan의
+	// 첫째 반환값(sources)을 실어도 아래 count 단정이 통과해 버린다.
+	if _, err := st.Register(t.Context(), store.Registration{
+		StoredBytes: []byte("explicit-file-content"), MediaType: "text/plain",
+		Source: store.SourceMeta{URI: "/tmp/g.txt", Kind: "file", SrcHash: "sh-file2"},
+	}); err != nil {
+		t.Fatalf("register dup: %v", err)
+	}
+	var nSources, nArtifacts int
+	if err := st.Reader().QueryRow("SELECT count(*) FROM sources").Scan(&nSources); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Reader().QueryRow("SELECT count(*) FROM artifacts").Scan(&nArtifacts); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	// 전제를 명시로 확인한다 — 시드가 바뀌어 두 수가 같아지면 이 테스트는 조용히 힘을 잃는다.
+	if nSources != 3 || nArtifacts != 2 {
+		t.Fatalf("전제 불성립: sources=%d artifacts=%d want 3/2 — 두 수가 같으면 sources를 실은 "+
+			"행과 artifacts를 실은 행이 구별되지 않는다", nSources, nArtifacts)
+	}
+	backdateForPurge(t, projDir)
+
 	var out bytes.Buffer
 	args := []string{"--project", pid, "--older-than", "720h", "--gc", "--force"}
 	if err := runPurge(context.Background(), failReader{}, &out, io.Discard, storeRootOf(projDir), args, false); err != nil {
@@ -1584,11 +1658,23 @@ func TestRunPurgeLogsSelectiveGC(t *testing.T) {
 	entries := purgeLogOf(t, projDir, 2)
 	// 최신 순 — GC가 선택 삭제 뒤에 돈다.
 	if entries[0].Path != "cli-gc" || entries[1].Path != "cli-older-than" {
-		t.Errorf("경로 순서 %q,%q want cli-gc,cli-older-than", entries[0].Path, entries[1].Path)
+		t.Fatalf("경로 순서 %q,%q want cli-gc,cli-older-than", entries[0].Path, entries[1].Path)
 	}
 	if entries[0].Policy != "-" || entries[1].Policy != "720h0m0s/-" {
 		t.Errorf("policy %q,%q want -,720h0m0s/- — 같은 실행이어도 GC 행에는 정책이 없다",
 			entries[0].Policy, entries[1].Policy)
+	}
+	// **count 칸.** 세 소스가 두 아티팩트를 가리키므로 두 수가 갈린다 — 이 칸은 지워진
+	// 아티팩트 수(2)이지 소스 수(3)가 아니다(스펙 §2.0 의미표).
+	if entries[1].Count != int64(nArtifacts) {
+		t.Errorf("cli-older-than count=%d want %d — PurgeOlderThan의 **둘째** 반환값(artifacts)이다. "+
+			"%d이면 첫째 반환값(sources)을 싣고 있다", entries[1].Count, nArtifacts, nSources)
+	}
+	// GC 행의 count는 제거된 고아 blob 파일 수다. 행이 전부 사라졌으니 CAS 파일이 모두 고아이고,
+	// 이 시드는 media_type이 하나뿐이라 CAS 파일 수 = 서로 다른 content_hash 수 = nArtifacts다.
+	// 이 행에서 실측인 칸은 이것 하나뿐이라, 0으로 새면 행이 존재 이유를 잃는다.
+	if entries[0].Count != int64(nArtifacts) {
+		t.Errorf("cli-gc count=%d want %d(고아가 된 CAS 파일 수)", entries[0].Count, nArtifacts)
 	}
 }
 

@@ -1240,8 +1240,8 @@ func runPurgeHookOnly(ctx context.Context, in io.Reader, w, stderr io.Writer, st
 	}
 	beforeB := contentFootprint(projDir) // D55: open 후·PurgeHookOnly 전 — 삭제+병합+VACUUM 효과 격리(스펙 §0)
 	rep, purgeErr := st.PurgeHookOnly(ctx)
-	// rep의 세 값을 지역 변수로 복사해 그 주소를 넘긴다 — 아래 보고 문면이 rep을 계속 읽으므로
-	// 기록에 rep 안으로의 별칭을 남기지 않는다(기동 경로와 같은 관례).
+	// 세 값을 지역 변수로 복사해 그 주소를 넘긴다 — 구조체 안으로의 주소를 건네지 않는 관례이고
+	// (기동 경로와 같은 형태), AppendPurgeLog은 포인터를 보관하지 않으므로 그 이상의 근거는 없다.
 	reclaimed, deferred, failed := rep.ReclaimedB, rep.DeferredFiles, rep.FailedFiles
 	store.AppendPurgeLog(projDir, store.PurgeRecord{
 		Path: "cli-hook-only",
