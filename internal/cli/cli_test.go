@@ -47,13 +47,21 @@ func writeCodexConfig(t *testing.T, home, src string) {
 	}
 }
 
-// doctorOut — doctor를 돌려 출력과 오류를 돌려준다. runDoctor의 시그니처를 한 자리에만 두어
-// 뒤 태스크가 인자 순서를 되풀이하지 않게 한다.
-func doctorOut(t *testing.T, projectRoot string) (string, error) {
+// doctorOutIn — doctorOut의 storeRoot 지정 판. purge.log처럼 storeRoot 아래에 픽스처를
+// 놓아야 하는 테스트가 그 경로를 알아야 해서 갈랐다.
+func doctorOutIn(t *testing.T, storeRoot, projectRoot string) (string, error) {
 	t.Helper()
 	var buf bytes.Buffer
-	err := runDoctor(context.Background(), &buf, t.TempDir(), projectRoot, "0.17.0")
+	err := runDoctor(context.Background(), &buf, storeRoot, projectRoot, "0.17.0")
 	return buf.String(), err
+}
+
+// doctorOut — doctor를 돌려 출력과 오류를 돌려준다. runDoctor의 시그니처를 한 자리에만 두어
+// 뒤 태스크가 인자 순서를 되풀이하지 않게 한다. storeRoot는 매번 새 t.TempDir()다 —
+// 그 자리를 알아야 하는 테스트만 doctorOutIn을 직접 부른다.
+func doctorOut(t *testing.T, projectRoot string) (string, error) {
+	t.Helper()
+	return doctorOutIn(t, t.TempDir(), projectRoot)
 }
 
 // TestIsolateCodexHome — 격리 헬퍼가 실제로 doctorCodexConfigPath를 돌리는가. 이 파일의
@@ -4207,4 +4215,125 @@ func TestDoctorEnabledScopeUnjudgeable(t *testing.T) {
 			t.Fatalf("같은 파일을 [9]는 깨끗함으로, [20]은 파싱 실패로 읽었다:\n%s", out)
 		}
 	})
+}
+
+// purgeSectionLine — doctor 출력에서 [21] 줄을 뽑는다. 단정을 그 줄 **안으로** 좁히려고
+// 둔다: 출력 전체를 Contains하면 아래 부재 테스트의 부작용 축이 성립하지 않는다(검토 소견
+// F10) — 정확 문면 단정이 통과하는 순간 "[21] purges: 삭제 없음" 같은 접두 Contains는 절대
+// 매치하지 않아, 그 단정이 자기가 주장하는 성질과 무관한 이유로 통과한다.
+func purgeSectionLine(t *testing.T, out string) string {
+	t.Helper()
+	for _, ln := range strings.Split(out, "\n") {
+		if strings.HasPrefix(ln, "[21] purges:") {
+			return ln
+		}
+	}
+	t.Fatalf("[21] 줄이 없다:\n%s", out)
+	return ""
+}
+
+// TestDoctorPurgeSectionAbsent — 파일이 없을 때의 문면이 **"삭제 없음"으로 읽히지 않는가**.
+// 이 절이 닫으려는 결함이 바로 그 부류다 — 침묵을 초록으로 읽는 것. 축이 둘이고 서로 독립이다:
+// 요구 문면은 HasPrefix가 잠그고(뒤를 열어 둔다), 금지 어휘는 그 열린 뒤까지 훑는다. 요구
+// 문면을 완전 일치로 잠그면 금지 어휘 루프가 죽은 단정이 된다.
+func TestDoctorPurgeSectionAbsent(t *testing.T) {
+	isolateCodexHome(t)
+	out, _ := doctorOut(t, t.TempDir())
+	line := purgeSectionLine(t, out)
+	const want = "[21] purges: 기록 없음 (이 릴리스 이전 기동이거나 삭제 경로가 아직 안 돌았다)"
+	if !strings.HasPrefix(line, want) {
+		t.Fatalf("[21] 부재 문면이 다르다 —\n got %q\nwant %q", line, want)
+	}
+	for _, banned := range []string{"삭제 없음", "0건", "없습니다"} {
+		if strings.Contains(line, banned) {
+			t.Errorf("[21] 줄에 %q 가 있다 — 부재와 0건은 다른 사실이다: %s", banned, line)
+		}
+	}
+}
+
+// TestDoctorPurgeSectionLists — 기록이 있으면 총계와 최근 건을 짚는다.
+func TestDoctorPurgeSectionLists(t *testing.T) {
+	isolateCodexHome(t)
+	storeRoot, projectRoot := t.TempDir(), t.TempDir()
+	// **프로젝트 ID를 doctor 자신에게서 얻는다** — 지어내면 doctor가 다른 디렉터리를 본다.
+	// [2] 줄이 `ProjectID=<값>`을 내므로 한 번 돌려 그 값을 읽는다.
+	first, _ := doctorOutIn(t, storeRoot, projectRoot)
+	pid := ""
+	for _, ln := range strings.Split(first, "\n") {
+		if _, rest, ok := strings.Cut(ln, "ProjectID="); ok {
+			pid, _, _ = strings.Cut(rest, " ")
+			break
+		}
+	}
+	if pid == "" {
+		t.Fatalf("[2]에서 ProjectID를 못 읽었다:\n%s", first)
+	}
+	projDir := filepath.Join(storeRoot, "projects", pid)
+	if err := os.MkdirAll(projDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	seed := strings.Join([]string{
+		"1755180000\tstartup-shadow\t336h0m0s/pwsh-profile\t1753971299\tok\t0\t0\t0\t0",
+		"1755180899\tstartup-shadow\t72h0m0s/-\t1753971299\tok\t200\t1024\t0\t0",
+		"찢어진 조각",
+		"1755181000\tcli-older-than\t168h0m0s/-\t1755000000\tfailed\t37\t-\t-\t-",
+	}, "\n") + "\n"
+	write(t, filepath.Join(projDir, store.PurgeLogName), []byte(seed))
+
+	out, _ := doctorOutIn(t, storeRoot, projectRoot)
+	line := purgeSectionLine(t, out)
+	// 총계는 파스 못 한 줄까지 센 줄 수이고, 짚는 것은 그중 최근 3건이다 — 둘이 갈린다.
+	if !strings.HasPrefix(line, "[21] purges: 4행 (최근 3건) — ") {
+		t.Errorf("[21]이 총계·건수를 안 낸다: %s", line)
+	}
+	// **회귀 잠금**: 조용한 72h 강등이 이 줄에서 눈에 보여야 한다. policy 칸이 이 설계의 존재
+	// 이유다 — 200개가 사라진 그 기동의 행에 `72h0m0s/-`가 적혀 있었다면 규명이 한 줄 조회였다.
+	if !strings.Contains(line, "startup-shadow 72h0m0s/- ok 200개 1024B") {
+		t.Errorf("[21]이 policy·건수를 안 짚는다: %s", line)
+	}
+	// **status 옆에 count가 붙어야 한다.** PurgeOlderThan은 커밋 뒤(checkFTSIntegrity)에
+	// 실패할 수 있어 `failed`인데 이미 지워진 건수가 있다 — count가 없으면 읽는 사람이
+	// `failed`만 보고 "아무것도 안 지워졌다"로 읽는다.
+	if !strings.Contains(line, "cli-older-than 168h0m0s/- failed 37개") {
+		t.Errorf("[21]이 failed 옆에 건수를 안 붙인다: %s", line)
+	}
+	// 파스 못 한 줄을 조용히 넘기지 않는다 — 이 절이 닫으려는 부류 그대로다.
+	if !strings.Contains(line, "파싱 실패 1줄") {
+		t.Errorf("[21]이 파싱 실패 줄을 안 짚는다: %s", line)
+	}
+}
+
+// TestDoctorSectionOrderStillAscending — [21]이 끝에 붙어 오름차순이 유지되는가.
+func TestDoctorSectionOrderStillAscending(t *testing.T) {
+	isolateCodexHome(t)
+	out, _ := doctorOut(t, t.TempDir())
+	assertDoctorAscending(t, out)
+	if !strings.Contains(out, "[21] purges:") {
+		t.Fatalf("[21]이 없다:\n%s", out)
+	}
+}
+
+// TestDoctorPurgeSectionUnidentifiedProject — 프로젝트 식별이 실패하면 [21]은 판정을 내지
+// 않는다. 그 경로에서 projDir은 `<storeRoot>/projects`로 뭉개져 **프로젝트의 자리가 아닌
+// 곳**을 읽는다. 픽스처를 바로 그 자리에 두어 그 오독을 재현한다 — 분기가 없으면 [21]이
+// 남의 파일을 이 프로젝트의 삭제 이력으로 보고한다.
+func TestDoctorPurgeSectionUnidentifiedProject(t *testing.T) {
+	isolateCodexHome(t)
+	storeRoot := t.TempDir()
+	missing := filepath.Join(t.TempDir(), "no-such-dir") // Canonicalize의 RealPath가 실패한다
+	if err := os.MkdirAll(filepath.Join(storeRoot, "projects"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	write(t, filepath.Join(storeRoot, "projects", store.PurgeLogName),
+		[]byte("1755180000\tstartup-shadow\t72h0m0s/-\t1753971299\tok\t200\t1024\t0\t0\n"))
+
+	out, _ := doctorOutIn(t, storeRoot, missing)
+	if !strings.Contains(out, "[2] project: 식별 실패") {
+		t.Fatalf("전제가 안 섰다 — [2]가 식별 실패가 아니다:\n%s", out)
+	}
+	line := purgeSectionLine(t, out)
+	const want = "[21] purges: 판정 불가 (프로젝트 식별 실패 — [2] 참조)"
+	if line != want {
+		t.Fatalf("[21] 식별 실패 문면이 다르다 —\n got %q\nwant %q", line, want)
+	}
 }
