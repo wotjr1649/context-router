@@ -1503,6 +1503,134 @@ func TestRunPurge_E2E_GCOnlyNoConfirm(t *testing.T) {
 	}
 }
 
+// purgeLogOf — 대상 프로젝트의 감사 로그를 최신 순으로 읽고 total/unparsed를 함께 단정한다.
+// 네 개의 감사 로그 테스트가 같은 세 줄을 반복하지 않게 한다.
+func purgeLogOf(t *testing.T, projDir string, wantRows int) []purgeEntry {
+	t.Helper()
+	entries, total, unparsed := purgeLogTail(filepath.Join(projDir, store.PurgeLogName), 5)
+	if total != wantRows || unparsed != 0 || len(entries) != wantRows {
+		t.Fatalf("total=%d unparsed=%d entries=%d want %d/0/%d", total, unparsed, len(entries), wantRows, wantRows)
+	}
+	return entries
+}
+
+// TestRunPurgeLogsOlderThan — --older-than 경로가 감사 행을 남기고, **미측정 칸이 0이 아니라
+// `-`로 나오는가**. PurgeOlderThan의 반환은 sources·artifacts 둘뿐이라 바이트도 유예도 실패도
+// 내지 않는다 — 그 셋을 0으로 적으면 읽는 쪽이 "회수 바이트가 0이었다"는, 아무도 하지 않은
+// 측정을 읽는다.
+func TestRunPurgeLogsOlderThan(t *testing.T) {
+	pid, projDir, _ := seedHookOnlyProject(t)
+	var out bytes.Buffer
+	args := []string{"--project", pid, "--older-than", "720h", "--force"}
+	if err := runPurge(context.Background(), failReader{}, &out, io.Discard, storeRootOf(projDir), args, false); err != nil {
+		t.Fatalf("runPurge err=%v out=%s", err, out.String())
+	}
+	e := purgeLogOf(t, projDir, 1)[0]
+	if e.Path != "cli-older-than" || e.Status != "ok" {
+		t.Errorf("path=%q status=%q want cli-older-than/ok", e.Path, e.Status)
+	}
+	if e.Bytes != "-" || e.Deferred != "-" || e.Failed != "-" {
+		t.Errorf("미측정 칸이 %q/%q/%q want -/-/- — 이 경로는 그 셋을 재지 않는다",
+			e.Bytes, e.Deferred, e.Failed)
+	}
+	// **값 전체를 단정한다.** 접미만 보면 원시 플래그 문자열("720h")을 그대로 실어도 통과해
+	// Duration.String() 정규화가 깨진 것을 못 잡는다.
+	if e.Policy != "720h0m0s/-" {
+		t.Errorf("policy=%q want %q — 원시 플래그가 아니라 파싱된 기간의 String()이다",
+			e.Policy, "720h0m0s/-")
+	}
+	if e.Cutoff == 0 {
+		t.Error("cutoff=0(`-`) — 이 경로는 사용자가 지정한 경계로 지우므로 그 경계가 적혀야 한다")
+	}
+}
+
+// TestRunPurgeLogsGC — --gc 단독(gcOnly)은 runGCOrphan을 탄다. GC에는 보존 창도 경계도 없고
+// count는 제거된 고아 blob **파일 수**다 — 세 축 정합(blob − 고아 = hashes)이 깨진 채 발견되면
+// 이 행이 원인을 즉시 답한다.
+func TestRunPurgeLogsGC(t *testing.T) {
+	pid, projDir, _ := seedHookOnlyProject(t)
+	var out bytes.Buffer
+	args := []string{"--project", pid, "--gc", "--force"}
+	if err := runPurge(context.Background(), failReader{}, &out, io.Discard, storeRootOf(projDir), args, false); err != nil {
+		t.Fatalf("runPurge --gc err=%v out=%s", err, out.String())
+	}
+	e := purgeLogOf(t, projDir, 1)[0]
+	if e.Path != "cli-gc" || e.Status != "ok" {
+		t.Errorf("path=%q status=%q want cli-gc/ok", e.Path, e.Status)
+	}
+	if e.Policy != "-" {
+		t.Errorf("policy=%q want %q — GC에는 보존 정책 개념이 없다", e.Policy, "-")
+	}
+	if e.Cutoff != 0 {
+		t.Errorf("cutoff=%d want 0(`-`) — GC에는 경계 개념이 없다", e.Cutoff)
+	}
+	if e.Bytes != "-" || e.Deferred != "-" || e.Failed != "-" {
+		t.Errorf("미측정 칸이 %q/%q/%q want -/-/- — GCOrphanBlobs는 제거 건수만 낸다",
+			e.Bytes, e.Deferred, e.Failed)
+	}
+}
+
+// TestRunPurgeLogsSelectiveGC — **cli-gc 라벨을 내는 자리가 둘**이라는 것을 잠근다: --gc 단독은
+// runGCOrphan을 타고, --older-than과 함께면 살아 있는 writable store에서 인라인으로 돈다(그
+// 자리는 purgeErr에 대입해야 뒤따르는 vacuum/MergeFTS 블록이 그것을 읽는다). 한 자리만
+// 배선하면 이 조합이 행을 하나만 남긴다.
+func TestRunPurgeLogsSelectiveGC(t *testing.T) {
+	pid, projDir, _ := seedHookOnlyProject(t)
+	var out bytes.Buffer
+	args := []string{"--project", pid, "--older-than", "720h", "--gc", "--force"}
+	if err := runPurge(context.Background(), failReader{}, &out, io.Discard, storeRootOf(projDir), args, false); err != nil {
+		t.Fatalf("runPurge --older-than --gc err=%v out=%s", err, out.String())
+	}
+	entries := purgeLogOf(t, projDir, 2)
+	// 최신 순 — GC가 선택 삭제 뒤에 돈다.
+	if entries[0].Path != "cli-gc" || entries[1].Path != "cli-older-than" {
+		t.Errorf("경로 순서 %q,%q want cli-gc,cli-older-than", entries[0].Path, entries[1].Path)
+	}
+	if entries[0].Policy != "-" || entries[1].Policy != "720h0m0s/-" {
+		t.Errorf("policy %q,%q want -,720h0m0s/- — 같은 실행이어도 GC 행에는 정책이 없다",
+			entries[0].Policy, entries[1].Policy)
+	}
+}
+
+// TestRunPurgeHookOnlyLogsNoPolicy — 이 경로는 **보존 창을 보지 않는다**: PurgeHookOnly는
+// PurgeHookOnlyOlderThan(ctx, 0, 0)이고 shadowOwnedFilter는 cutoff<=0을 "나이 필터 없음",
+// maxHashes<=0을 "건수 상한 없음"으로 읽는다 — 사용자가 명시로 요청한 전량 삭제다. 그래서
+// policy·cutoff가 `-`여야 한다. 환경변수가 설정돼 있다는 이유로 값을 적으면 **일어나지 않은
+// 정책 판정**을 기록하는 것이고, 이 로그가 막으려던 바로 그 종류의 거짓 기록이다.
+//
+// 뒤 세 칸은 반대다 — HookPurgeReport가 실제로 재는 값이라 `-`가 아니어야 한다. 시드의 CAS
+// 파일은 갓 만든 것이라 age-gate에 걸려 유예되므로 **회수 바이트는 재서 0**이다: 그 자리가
+// `-`가 아니라 `0`으로 나오는 것이 이 설계의 요점이다.
+func TestRunPurgeHookOnlyLogsNoPolicy(t *testing.T) {
+	pid, projDir, _ := seedHookOnlyProject(t)
+	t.Setenv("CTR_SHADOW_RETENTION", "336h") // 설정돼 있어도 이 경로는 보지 않는다
+	t.Setenv("CTR_RETENTION_SOURCE", "pwsh-profile")
+	var out bytes.Buffer
+	if err := runPurgeHookOnly(context.Background(), failReader{}, &out, io.Discard,
+		storeRootOf(projDir), pid, true, false); err != nil {
+		t.Fatalf("runPurgeHookOnly err=%v out=%s", err, out.String())
+	}
+	e := purgeLogOf(t, projDir, 1)[0]
+	if e.Path != "cli-hook-only" || e.Status != "ok" {
+		t.Errorf("path=%q status=%q want cli-hook-only/ok", e.Path, e.Status)
+	}
+	if e.Policy != "-" {
+		t.Errorf("policy=%q want %q — 이 경로는 보존 창을 보지 않는다. 환경변수가 설정돼 있다는 "+
+			"이유로 값을 적으면 일어나지 않은 판정을 기록하는 것이다", e.Policy, "-")
+	}
+	if e.Cutoff != 0 {
+		t.Errorf("cutoff=%d want 0(`-`) — PurgeHookOnly는 경계 인자를 받지 않는다", e.Cutoff)
+	}
+	if e.Count != 1 {
+		t.Errorf("count=%d want 1 — 시드의 hook 귀속 hash 하나가 지워진다", e.Count)
+	}
+	// **미측정(`-`)과 실측 0을 가른다.** 유예된 파일은 회수 바이트가 0이지만 그것은 잰 값이다.
+	if e.Bytes != "0" || e.Deferred != "1" || e.Failed != "0" {
+		t.Errorf("뒤 세 칸이 %q/%q/%q want 0/1/0 — HookPurgeReport의 실측값이고, 못 잰 `-`가 아니다",
+			e.Bytes, e.Deferred, e.Failed)
+	}
+}
+
 // TestRunPurge_SessionsTarget_StandaloneKeepsContentAndBackups: 브리프 Step1 ⑤ — --sessions
 // 단독(--older-than 없음)은 session.db 파일 계열(-wal/-shm 포함)만 지우고, content.db
 // 데이터·`.bak-<ts>` 파일·session.recover-pending 마커는 건드리지 않는다(설계 §5 명문 계약,

@@ -985,14 +985,20 @@ func runPurge(ctx context.Context, in io.Reader, w, stderr io.Writer, storeRoot 
 	// 주어지면 selective 여부와 무관하게 항상 confirmPurge를 거친다.
 	gcOnly := *gc && !selective && !*sessions
 	var cutoffUnix int64
+	// olderThan을 블록 밖에 두는 이유: 아래 감사 행의 policy 칸은 **cutoffUnix를 고른 바로 그
+	// 측정**이어야 한다. 기록 자리에서 *olderThanFlag를 다시 파싱하면 그것은 별개의 측정이고,
+	// 둘이 어긋나면 로그가 실제 적용된 경계와 다른 정책을 적는다(기동 경로가 retention을 변수로
+	// 받아 두는 것과 같은 규율).
+	var olderThan time.Duration
 	if selective {
 		// 리뷰 P2-1: 파싱 실패 오류는 사용자 입력(*olderThanFlag)을 담은 err를 %w로 감싸지
-		// 않는다(정적 메시지만) — 원문 에코 금지. d<=0(음수·0)도 유효한 기간이 아니므로 거부.
-		d, err := time.ParseDuration(*olderThanFlag)
-		if err != nil || d <= 0 {
+		// 않는다(정적 메시지만) — 원문 에코 금지. olderThan<=0(음수·0)도 유효한 기간이 아니므로 거부.
+		var err error
+		olderThan, err = time.ParseDuration(*olderThanFlag)
+		if err != nil || olderThan <= 0 {
 			return errors.New("purge: --older-than 값이 유효한 기간이 아님")
 		}
-		cutoffUnix = time.Now().Add(-d).Unix()
+		cutoffUnix = time.Now().Add(-olderThan).Unix()
 	}
 
 	if !gcOnly { // GC 단독은 데이터 삭제가 아니므로 확인 생략(설계 §7)
@@ -1073,12 +1079,27 @@ func runPurge(ctx context.Context, in io.Reader, w, stderr io.Writer, storeRoot 
 		if err != nil {
 			return err
 		}
-		_, _, purgeErr := st.PurgeOlderThan(ctx, cutoffUnix)
+		_, artifacts, purgeErr := st.PurgeOlderThan(ctx, cutoffUnix)
+		store.AppendPurgeLog(projDir, store.PurgeRecord{
+			Path:   "cli-older-than",
+			Policy: store.PurgePolicy(olderThan, ""), // 사용자가 직접 준 기간이라 출처가 없다
+			// hashes에 0을 넘긴다: partial은 "행은 지워졌는데 파일이 남아 purge --gc가 유일한 회수
+			// 경로"라는 뜻인데(store.PurgeStatus), PurgeOlderThan은 파일을 하나도 unlink하지 않아
+			// 그런 상태가 아예 없다. 커밋 뒤 실패(checkFTSIntegrity)로 오류가 나도 그때 지워진
+			// 건수는 아래 Count가 그대로 나른다.
+			Status: store.PurgeStatus(purgeErr, 0, errors.Is(ctx.Err(), context.Canceled), false, false),
+			Cutoff: cutoffUnix,
+			Count:  artifacts,
+			// Bytes·Deferred·Failed는 nil — PurgeOlderThan은 그 셋을 내지 않는다. 0으로 적으면
+			// 아무도 하지 않은 측정을 기록하는 것이다(store.PurgeRecord의 포인터 규칙).
+		})
 		if purgeErr == nil && *sessions {
 			purgeErr = purgeSessionFiles(projDir, stderr)
 		}
 		if purgeErr == nil && *gc {
-			_, purgeErr = st.GCOrphanBlobs(ctx)
+			var removed int64
+			removed, purgeErr = st.GCOrphanBlobs(ctx)
+			appendGCPurgeLog(ctx, projDir, removed, purgeErr)
 		}
 		if purgeErr == nil && *vacuum && !vacuumDiskAbort {
 			// D102 계약 4 — runPurgeHookOnly와 같은 이유·같은 순서(VACUUM 앞, 실패해도 진행,
@@ -1219,6 +1240,26 @@ func runPurgeHookOnly(ctx context.Context, in io.Reader, w, stderr io.Writer, st
 	}
 	beforeB := contentFootprint(projDir) // D55: open 후·PurgeHookOnly 전 — 삭제+병합+VACUUM 효과 격리(스펙 §0)
 	rep, purgeErr := st.PurgeHookOnly(ctx)
+	// rep의 세 값을 지역 변수로 복사해 그 주소를 넘긴다 — 아래 보고 문면이 rep을 계속 읽으므로
+	// 기록에 rep 안으로의 별칭을 남기지 않는다(기동 경로와 같은 관례).
+	reclaimed, deferred, failed := rep.ReclaimedB, rep.DeferredFiles, rep.FailedFiles
+	store.AppendPurgeLog(projDir, store.PurgeRecord{
+		Path: "cli-hook-only",
+		// **앞 두 칸이 기동 경로와 다르다.** PurgeHookOnly는 PurgeHookOnlyOlderThan(ctx, 0, 0)이고
+		// shadowOwnedFilter는 cutoff<=0을 "나이 필터 없음", maxHashes<=0을 "건수 상한 없음"으로
+		// 읽는다 — 보존 창도 경계도 개입하지 않는 전량 삭제이고, 사용자가 그것을 명시로 요청한
+		// 자리다. CTR_SHADOW_RETENTION이 설정돼 있다는 이유로 그 값을 적으면 **일어나지 않은 정책
+		// 판정**을 기록하는 것이고, 이 로그가 막으려던 바로 그 종류의 거짓 기록이다.
+		Policy: "-",
+		Cutoff: 0,
+		// rep.Hashes를 넘겨 partial을 살린다 — 행 삭제 tx가 커밋된 뒤 파일 회수가 실패하면
+		// (rep.Hashes>0 + err) 행이 이미 없어 남은 파일의 유일한 회수 경로가 purge --gc다.
+		// failed로 뭉개면 "다음 기동이 같은 배치를 다시 집는다"가 거짓 안내가 된다.
+		Status: store.PurgeStatus(purgeErr, rep.Hashes, errors.Is(ctx.Err(), context.Canceled), false, false),
+		Count:  int64(rep.Hashes), // HookPurgeReport.Hashes는 int, PurgeRecord.Count는 int64
+		// 뒤 세 칸은 반대로 **실측이다** — HookPurgeReport가 그 셋을 직접 낸다.
+		Bytes: &reclaimed, Deferred: &deferred, Failed: &failed,
+	})
 	var mergeErr, vacErr error
 	if purgeErr == nil {
 		// ④ 실회수 보고 먼저(스펙 §3 순서) — VACUUM 성패와 무관하게 부분 성공을 즉시 노출한다.
@@ -1257,14 +1298,35 @@ func runPurgeHookOnly(ctx context.Context, in io.Reader, w, stderr io.Writer, st
 	return closeErr
 }
 
+// appendGCPurgeLog — cli-gc 감사 행 하나. 이 라벨을 내는 **자리가 둘**이라(runGCOrphan · 선택
+// 삭제 뒤 후행 GC) 조립을 여기 한 곳에 둔다(D13). 후자를 runGCOrphan으로 합치지 않는 이유는
+// 그쪽이 자기 store를 새로 열고(살아 있는 writable st 옆에 두 번째 핸들) 오류를 반환값으로
+// 내보내기 때문이다 — 인라인 형태는 purgeErr에 대입해야 뒤따르는 vacuum/MergeFTS 블록이 그것을
+// 읽고 --all 순회가 그 자리에서 끊기지 않는다.
+//
+// GC에는 보존 창도 경계도 없어 policy는 "-", cutoff는 0(=`-`)이다. GCOrphanBlobs는 제거 건수
+// 하나만 내므로 뒤 세 칸은 nil이다 — 0으로 적으면 하지 않은 측정이 된다. hashes에 0을 넘기는
+// 것도 같은 이유다: partial은 "행은 지워졌는데 파일이 남았다"는 뜻인데 GC는 행을 지우지 않는다.
+func appendGCPurgeLog(ctx context.Context, projDir string, removed int64, gcErr error) {
+	store.AppendPurgeLog(projDir, store.PurgeRecord{
+		Path:   "cli-gc",
+		Policy: "-",
+		Cutoff: 0,
+		Status: store.PurgeStatus(gcErr, 0, errors.Is(ctx.Err(), context.Canceled), false, false),
+		Count:  removed,
+	})
+}
+
 // runGCOrphan: read-only store로 orphan blob GC만 수행한다(gcOnly·세션 단독+--gc 두 경로
-// 공용 — 둘 다 DB 쓰기가 없는 조회 기반 삭제라 read-only로 충분하다).
+// 공용 — 둘 다 DB 쓰기가 없는 조회 기반 삭제라 read-only로 충분하다). 두 경로가 여기로 모이므로
+// 감사 행도 한 번만 쓴다.
 func runGCOrphan(ctx context.Context, projDir string) error {
 	st, err := store.Open(projDir, true)
 	if err != nil {
 		return err
 	}
-	_, gcErr := st.GCOrphanBlobs(ctx)
+	removed, gcErr := st.GCOrphanBlobs(ctx)
+	appendGCPurgeLog(ctx, projDir, removed, gcErr)
 	closeErr := st.Close()
 	if gcErr != nil {
 		return gcErr
