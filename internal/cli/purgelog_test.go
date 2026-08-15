@@ -110,15 +110,17 @@ func TestPurgeLogTailLimit(t *testing.T) {
 
 // TestPurgeLogTailRejectsSplicedLine — **이 테스트가 형식 검증의 존재 이유다**(검토 소견 F3).
 // append-only 파일에서 찢어진 조각 뒤에 다음 레코드가 이어붙으면 합쳐진 줄이 정확히 9필드가
-// 될 수 있고, 필드 수와 ts·path·count만 보는 파서는 그것을 수용한다 — doctor가 **일어나지
-// 않은 삭제 사건**을 보고하게 되고, 그것이 이 로그가 막으려던 바로 그것이다.
+// 될 수 있고, ts·path·count만 보는 파서는 그것을 수용한다 — doctor가 **일어나지 않은 삭제
+// 사건**을 보고하게 되고, 그것이 이 로그가 막으려던 바로 그것이다.
 //
-// 아래 픽스처는 앞 레코드가 policy 중간에서 잘리고 뒤 레코드의 앞부분이 붙은 모양이다:
-// 필드 수는 9이고 ts도 숫자이며 path도 닫힌 집합에 있지만, status 칸에 타임스탬프 조각이 온다.
+// 아래 픽스처는 ts·path·count와 cutoff·bytes·deferred·failed(전부 `-`)를 유효하게 두고
+// status 칸 하나만 다음 레코드의 ts 조각(`1755180899`)으로 어긋나게 만든다 — 절단이 status
+// 필드 위치에서 일어난 모양이다. 그래서 이 줄을 거르는 것은 **`purgeStatusSet[fields[4]]`
+// 검사 단독**이다: 나머지 여덟 칸은 전부 유효한데 status만 닫힌 집합 밖이라 거부된다.
 func TestPurgeLogTailRejectsSplicedLine(t *testing.T) {
 	p := writePurgeLog(
 		t,
-		"1755180000\tstartup-shadow\t336h0m0\t-\t1755180899\tcli-gc\t-\t-\tok",
+		"1755180000\tstartup-shadow\t336h0m0s/pwsh\t-\t1755180899\t1\t-\t-\t-",
 	)
 	entries, total, unparsed := purgeLogTail(p, 5)
 	if total != 1 || unparsed != 1 || len(entries) != 0 {
