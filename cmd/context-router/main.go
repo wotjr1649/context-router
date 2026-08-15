@@ -745,9 +745,14 @@ func run(ctx context.Context, args []string, stderr io.Writer) error {
 		purgeCtxErr := purgeCtx.Err()
 		budgetSpent := errors.Is(purgeCtxErr, context.DeadlineExceeded)
 		// **감사 행의 status는 store.PurgeStatus 하나가 정한다** — 아래 switch에 남은 유일한
-		// 출력은 slog 문면이다. 두 곳이 각자 판정하면 로그와 기록이 갈리므로 PurgeStatus는 이
-		// switch와 **같은 술어를 같은 순서로** 들고 있다(internal/store): 여기 case 순서를 바꾸는
-		// 변경은 그쪽도 함께 바꿔야 한다. 각 갈래를 그렇게 나눈 근거는 아래 case 주석들에 있다.
+		// 출력은 slog 문면이다. 두 곳이 각자 판정하면 로그와 기록이 갈리므로, **오류 네 갈래**
+		// (partial·cancelled·budget·failed)는 PurgeStatus가 같은 술어를 같은 순서로 들고 있다
+		// (internal/store): 그 넷의 순서를 여기서 바꾸는 변경은 그쪽도 함께 바꿔야 한다. 근거는
+		// 아래 case 주석들에 있다.
+		//
+		// **오류 없는 쪽은 둘이 일부러 갈린다**: 아래 마지막 case는 slog 소음을 줄이려고
+		// rep.Hashes>0만 거르고 끝나지만, PurgeStatus는 거기서 capped와 ok를 마저 가르고
+		// 0건 기동이 그 ok로 들어온다 — 아래 switch에는 그 자리가 아예 없다.
 		capped := rep.Hashes == startupPurgeMaxHashes
 		cancelled := errors.Is(purgeCtxErr, context.Canceled)
 		purgeStatus := store.PurgeStatus(purgeErr, rep.Hashes, cancelled, budgetSpent, capped)

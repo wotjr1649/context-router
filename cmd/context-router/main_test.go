@@ -2544,12 +2544,16 @@ func TestFTSMergeIntervalIsDaily(t *testing.T) {
 // startupPurgeRow — 서버를 한 번 **정상 종료**로 띄웠다 내리고, 그 프로젝트의 purge.log가 가진
 // 유일한 행을 탭으로 쪼개 돌려준다. 아래 세 기동 테스트가 공유한다.
 //
-// 종료 전에 handshake를 한 왕복 돌리는 이유: run()의 종료 defer가 `cancelPurge(); <-purgeDone`
-// 순서라 퍼지 ctx를 **기다리기 전에 먼저 취소한다.** 띄우자마자 stdin을 닫으면 퍼지가 도중에
-// 취소돼 status가 기동 결과가 아니라 종료 타이밍을 재게 된다. 왕복 하나면 충분한 근거: 빈
-// 스토어의 퍼지는 빈 테이블 위 tx 하나로 끝나고 파일 회수 단계는 hash가 0이면 잠금도 잡지 않고
-// 즉시 반환한다(store.reclaimHookBlobs 선두 가드) — 그 사이 이 왕복은 하위 프로세스와 파이프
-// 왕복을 한다. 그리고 취소가 퍼지 반환 뒤에 닿으면 purgeErr가 nil이라 분류는 그대로 ok다.
+// **종료를 서두르면 status가 뒤집힌다.** run()의 종료 defer는 `cancelPurge(); <-purgeDone`
+// 순서라 퍼지 ctx를 기다리기 전에 먼저 취소한다. 취소가 퍼지 **뒤**에 닿는 것은 무해하다 —
+// purgeErr가 nil이고 store.PurgeStatus의 ok 아닌 네 갈래는 전부 purgeErr != nil을 요구하므로
+// 분류는 그대로 ok다. 문제는 취소가 퍼지 **도중**에 닿는 경우이고, handshake 왕복은 그것을
+// 막지 못한다 — 그것은 장벽이 아니라 흘러간 시간일 뿐이고, 고루틴의 선행은 MCP 셋업과 파이프
+// 왕복 한 번뿐인데 그 사이 갓 만든 WAL DB에 첫 쓰기 tx를 해야 한다.
+//
+// 그래서 흘러간 시간 대신 **정확한 완료 신호**를 기다린다: store.AppendPurgeLog은 두 경로
+// (조기 반환·switch 뒤) 모두에서 퍼지 고루틴의 마지막 문장이라, 그 파일이 보이는 시점에는
+// 분류가 이미 확정돼 있다. 검사가 sleep보다 앞이라 행이 이미 있으면 대기 없이 빠져나간다.
 //
 // 행을 정확히 1줄로 단정하는 것도 판정이다: 기동 하나가 두 자리에서 기록하면(조기 반환과
 // switch 뒤가 함께 도는 배선 실수) 그 중복이 여기서 잡힌다.
@@ -2563,11 +2567,24 @@ func startupPurgeRow(t *testing.T, storeRoot, proj string) []string {
 	if err := handshake(c, "ctr-purge-log-test"); err != nil {
 		t.Fatalf("handshake: %v", err)
 	}
+
+	logPath := filepath.Join(hookContentDir(t, storeRoot, proj), store.PurgeLogName)
+	for deadline := time.Now().Add(5 * time.Second); ; {
+		if _, err := os.Stat(logPath); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("5초 안에 감사 행이 안 나타났다: %s — 여기서 종료하면 아직 도는 퍼지가 "+
+				"취소돼 status가 배선 결과가 아니라 종료 타이밍을 재게 된다", logPath)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 	if err := closeAndWait(cmd, c); err != nil {
 		t.Fatalf("process exit: %v (stderr=%s)", err, stderrBuf.String())
 	}
 
-	data, err := os.ReadFile(filepath.Join(hookContentDir(t, storeRoot, proj), store.PurgeLogName))
+	// 읽기는 프로세스 종료 뒤다 — <-purgeDone이 AppendPurgeLog의 Close()가 끝난 것을 보장한다.
+	data, err := os.ReadFile(logPath)
 	if err != nil {
 		t.Fatalf("기동이 행을 안 남겼다: %v", err)
 	}
