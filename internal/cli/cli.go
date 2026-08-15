@@ -2610,7 +2610,7 @@ func runDoctor(ctx context.Context, w io.Writer, storeRoot, projectRoot, version
 		// 프로젝트의 자리가 아닌 곳을 읽고, 그 부재가 진짜로 빈 로그와 똑같은 `기록 없음`으로
 		// 나온다 — 이 절의 문면이 막으려던 바로 그 혼동이다.
 		fmt.Fprintln(w, "[21] purges: 판정 불가 (프로젝트 식별 실패 — [2] 참조)")
-	} else if entries, total, unparsed := purgeLogTail(filepath.Join(projDir, store.PurgeLogName), 3); total == 0 {
+	} else if entries, total, unparsed, aborted := purgeLogTail(filepath.Join(projDir, store.PurgeLogName), 3); total == 0 && !aborted {
 		// **"삭제 없음"으로 읽히면 안 된다** — 침묵을 초록으로 읽는 것이 이 설계가 닫는 결함이다.
 		// 파일 부재는 삭제가 없었다는 관측이 아니라 관측 자체의 부재다.
 		fmt.Fprintln(w, "[21] purges: 기록 없음 (이 릴리스 이전 기동이거나 삭제 경로가 아직 안 돌았다)")
@@ -2621,14 +2621,31 @@ func runDoctor(ctx context.Context, w io.Writer, storeRoot, projectRoot, version
 			// 실패할 수 있어 `failed`인데 이미 지워진 건수가 있다 — 건수가 없으면 그 행이
 			// "아무것도 안 지워졌다"로 읽힌다. Bytes는 문자열 그대로 낸다: `-`(미측정)가 0으로
 			// 뭉개지면 "못 쟀다"와 "재서 0"이 같은 문면이 된다.
+			// **policy만 제어 문자를 벗긴다**(stripCtrl): 나머지 렌더 칸 중 path·status는 닫힌
+			// 집합이라 파서가 이미 걸렀고 ts·count는 정수이며 bytes는 `-`이거나 정수다 — policy가
+			// 검증도 이스케이프도 없이 터미널로 나가는 **유일한 칸**이다.
 			parts = append(parts, fmt.Sprintf("%s %s %s %s %d개 %sB",
 				time.Unix(e.TS, 0).UTC().Format("01-02T15:04:05Z"),
-				e.Path, e.Policy, e.Status, e.Count, e.Bytes))
+				e.Path, stripCtrl(e.Policy), e.Status, e.Count, e.Bytes))
 		}
 		// total은 파스 못 한 줄까지 센 줄 수다 — 짚는 건수와 갈라 적는다.
-		line := fmt.Sprintf("[21] purges: %d행 (최근 %d건) — %s", total, len(entries), strings.Join(parts, " · "))
+		// **꼬리를 조건부로 붙인다**: 모든 줄이 검증에 걸리면 parts가 비어 `— ` 뒤가 허공이었다.
+		// 대체 문면에 `0건`을 쓰지 않는 이유는 부재 문면과 같다 — 읽는 사람에게 "지운 게 없다"로
+		// 들린다.
+		line := fmt.Sprintf("[21] purges: %d행", total)
+		if len(parts) > 0 {
+			line += fmt.Sprintf(" (최근 %d건) — %s", len(parts), strings.Join(parts, " · "))
+		} else {
+			line += " (읽을 수 있는 행 없음)"
+		}
 		if unparsed > 0 {
 			line += fmt.Sprintf(" · 파싱 실패 %d줄", unparsed)
+		}
+		// **깨진 줄 하나와 같은 문면으로 뭉개지 않는다**: 스캔이 중단되면 뒤쪽 줄은 아예 안 읽혔고
+		// 그래서 total도 "최근"도 사실이 아니다. 그 상태를 조용히 넘기는 것이 이 절이 닫으려는
+		// 결함이므로, 별개 절로 그 불완전함을 명시한다.
+		if aborted {
+			line += " · 읽다 중단 — 총계·최근 건이 불완전하다"
 		}
 		fmt.Fprintln(w, line)
 	}

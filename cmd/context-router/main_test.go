@@ -2668,6 +2668,13 @@ func TestStartupPurgeLogsSkippedReclaim(t *testing.T) {
 	storeRoot, proj := t.TempDir(), t.TempDir()
 
 	f := startupPurgeRow(t, storeRoot, proj)
+	// **라벨을 단정한다**: 이 행의 존재 이유가 "아예 안 돌았다"는 침묵을 깨는 것인데, 라벨이
+	// 어긋나면 파서의 닫힌 집합이 그 행을 unparsed로 세어 doctor에서 사라진다 — 침묵이 그대로
+	// 돌아온다. 네 라벨을 묶는 공유 상수가 없어(두 패키지의 리터럴 다섯 대 제3의 파일에 박힌
+	// 지도) 이런 단정이 유일한 결속이다.
+	if f[1] != "startup-shadow" {
+		t.Errorf("path=%q want startup-shadow", f[1])
+	}
 	if f[2] != "1000000h0m0s/test" {
 		t.Errorf("policy=%q want 1000000h0m0s/test", f[2])
 	}

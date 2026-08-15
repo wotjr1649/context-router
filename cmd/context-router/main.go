@@ -800,8 +800,9 @@ func run(ctx context.Context, args []string, stderr io.Writer) error {
 			// 것이 없었다"가 구별되지 않았다. 아래 기록이 그 구멍을 닫는다 — 그것이 이 감사
 			// 행이 switch 밖에 있는 이유다.
 		}
-		// rep의 세 값을 지역 변수로 받고 나서 주소를 넘긴다 — 구조체 필드 주소를 직접 넘기면
-		// rep의 수명이 기록에 묶인다.
+		// rep의 세 값을 지역 변수로 복사해 그 주소를 넘긴다 — 구조체 안으로의 주소를 건네지 않는
+		// 관례이고(CLI 경로도 같은 형태다), AppendPurgeLog은 포인터를 보관하지 않으므로 그 이상의
+		// 근거는 없다.
 		reclaimed, deferred, failed := rep.ReclaimedB, rep.DeferredFiles, rep.FailedFiles
 		store.AppendPurgeLog(st.ProjectDir(), store.PurgeRecord{
 			Path:   "startup-shadow",

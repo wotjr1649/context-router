@@ -128,6 +128,13 @@ func optInt(p *int) string {
 // AppendPurgeLog — 기록 1행을 append한다. **best-effort**: 실패는 slog.Warn 한 줄이고
 // 퍼지 결과·종료 코드에 영향이 없다(appendDrop과 동형). 반환값이 없는 이유는 호출자가
 // 판정할 것이 없기 때문이다.
+//
+// **경고에 원인(err)을 싣는다**(전체 검토): 감사 기록이 실패한 이유를 설명하는 유일한 줄에서
+// 그 이유를 빼면 stage 하나만 남는다. *os.PathError가 스토어 절대경로를 물고 오지만 그것은
+// slog(stderr) 한정이고 이 저장소의 관례다 — 경로 금지(§5.5 canary)는 **반환 오류** 규칙이며
+// sanitizeIOErr가 그 자리를 맡는다. **키가 "path"가 아니라 "purge_path"인 이유**: rec.Path는
+// 파일 경로가 아니라 삭제 경로 라벨(startup-shadow 따위)이고, err가 진짜 경로를 나르는 옆에
+// 나란히 놓이면 그 오독이 확정된다.
 func AppendPurgeLog(projectDir string, rec PurgeRecord) {
 	cutoff := "-"
 	if rec.Cutoff != 0 {
@@ -148,7 +155,7 @@ func AppendPurgeLog(projectDir string, rec PurgeRecord) {
 	f, err := os.OpenFile(filepath.Join(projectDir, PurgeLogName),
 		os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
 	if err != nil {
-		slog.Warn("퍼지 기록 실패", "stage", "open", "path", rec.Path)
+		slog.Warn("퍼지 기록 실패", "stage", "open", "purge_path", rec.Path, "error", err)
 		return
 	}
 	// **닫기 실패도 보고한다**(검토 소견 F13). Windows에서는 지연된 쓰기 실패가 Close에서
@@ -157,10 +164,10 @@ func AppendPurgeLog(projectDir string, rec PurgeRecord) {
 	// 경고를 두 번 내지 않는다(호출당 한 줄).
 	wrote := true
 	if _, err := fmt.Fprint(f, line); err != nil {
-		slog.Warn("퍼지 기록 실패", "stage", "write", "path", rec.Path)
+		slog.Warn("퍼지 기록 실패", "stage", "write", "purge_path", rec.Path, "error", err)
 		wrote = false
 	}
 	if cerr := f.Close(); cerr != nil && wrote {
-		slog.Warn("퍼지 기록 실패", "stage", "close", "path", rec.Path)
+		slog.Warn("퍼지 기록 실패", "stage", "close", "purge_path", rec.Path, "error", cerr)
 	}
 }

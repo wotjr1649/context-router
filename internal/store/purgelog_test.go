@@ -4,6 +4,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -34,7 +35,7 @@ func TestAppendPurgeLogFields(t *testing.T) {
 		t.Fatalf("ts가 unix 초가 아니다: %q", f[0])
 	}
 	want := []string{"startup-shadow", "336h0m0s/pwsh-profile", "1753971299", "ok", "0", "0", "0", "0"}
-	if got := f[1:]; !equalSlice(got, want) {
+	if got := f[1:]; !slices.Equal(got, want) {
 		t.Fatalf("필드 = %q\nwant %q", got, want)
 	}
 }
@@ -147,16 +148,4 @@ func TestPurgeStatusPriority(t *testing.T) {
 			t.Errorf("%s: %q want %q", tc.name, got, tc.want)
 		}
 	}
-}
-
-func equalSlice(a, b []string) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-	return true
 }

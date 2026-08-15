@@ -25,7 +25,7 @@ func TestPurgeLogTailParses(t *testing.T) {
 		"1755180000\tstartup-shadow\t336h0m0s/pwsh-profile\t1753971299\tok\t0\t0\t0\t0",
 		"1755180899\tcli-older-than\t720h0m0s/-\t-\tok\t12\t-\t-\t-",
 	)
-	entries, total, unparsed := purgeLogTail(p, 5)
+	entries, total, unparsed, _ := purgeLogTail(p, 5)
 	if total != 2 || unparsed != 0 || len(entries) != 2 {
 		t.Fatalf("total=%d unparsed=%d entries=%d want 2/0/2", total, unparsed, len(entries))
 	}
@@ -51,7 +51,7 @@ func TestPurgeLogTailAcceptsWiderRows(t *testing.T) {
 		t,
 		"1755180000\tcli-older-than\t720h0m0s/-\t-\tok\t12\t-\t-\t-\t999",
 	)
-	entries, _, unparsed := purgeLogTail(p, 5)
+	entries, _, unparsed, _ := purgeLogTail(p, 5)
 	if unparsed != 0 || len(entries) != 1 {
 		t.Fatalf("10필드 줄이 unparsed=%d entries=%d — 수용해야 한다", unparsed, len(entries))
 	}
@@ -70,7 +70,7 @@ func TestPurgeLogTailUnparsed(t *testing.T) {
 		"",
 		"notanumber\tcli-gc\t-\t-\tok\t1\t-\t-\t-",
 	)
-	entries, total, unparsed := purgeLogTail(p, 5)
+	entries, total, unparsed, _ := purgeLogTail(p, 5)
 	if total != 4 {
 		t.Errorf("total=%d want 4 — 빈 줄도 센다(줄 수 계약)", total)
 	}
@@ -82,12 +82,14 @@ func TestPurgeLogTailUnparsed(t *testing.T) {
 	}
 }
 
-// TestPurgeLogTailAbsent — 파일 부재는 (nil, 0, 0)이고 오류가 아니다.
+// TestPurgeLogTailAbsent — 파일 부재는 (nil, 0, 0, false)이고 오류가 아니다. **중단도 아니다** —
+// 열지 못한 것과 읽다 멎은 것은 다른 사실이고, 그 둘이 같은 신호를 내면 부재가 `읽다 중단`으로
+// 나간다.
 // **"삭제가 없었다"와 구분하는 것은 doctor의 문면 몫이다**(Task 5).
 func TestPurgeLogTailAbsent(t *testing.T) {
-	entries, total, unparsed := purgeLogTail(filepath.Join(t.TempDir(), "nope.log"), 5)
-	if entries != nil || total != 0 || unparsed != 0 {
-		t.Fatalf("부재 = %v/%d/%d want nil/0/0", entries, total, unparsed)
+	entries, total, unparsed, aborted := purgeLogTail(filepath.Join(t.TempDir(), "nope.log"), 5)
+	if entries != nil || total != 0 || unparsed != 0 || aborted {
+		t.Fatalf("부재 = %v/%d/%d/%v want nil/0/0/false", entries, total, unparsed, aborted)
 	}
 }
 
@@ -99,7 +101,7 @@ func TestPurgeLogTailLimit(t *testing.T) {
 		"1755180002\tcli-gc\t-\t-\tok\t2\t-\t-\t-",
 		"1755180003\tcli-gc\t-\t-\tok\t3\t-\t-\t-",
 	)
-	entries, total, _ := purgeLogTail(p, 2)
+	entries, total, _, _ := purgeLogTail(p, 2)
 	if total != 3 || len(entries) != 2 {
 		t.Fatalf("total=%d entries=%d want 3/2", total, len(entries))
 	}
@@ -122,7 +124,7 @@ func TestPurgeLogTailRejectsSplicedLine(t *testing.T) {
 		t,
 		"1755180000\tstartup-shadow\t336h0m0s/pwsh\t-\t1755180899\t1\t-\t-\t-",
 	)
-	entries, total, unparsed := purgeLogTail(p, 5)
+	entries, total, unparsed, _ := purgeLogTail(p, 5)
 	if total != 1 || unparsed != 1 || len(entries) != 0 {
 		t.Fatalf("합성 행이 수용됐다 — total=%d unparsed=%d entries=%d want 1/1/0",
 			total, unparsed, len(entries))
@@ -133,16 +135,43 @@ func TestPurgeLogTailRejectsSplicedLine(t *testing.T) {
 // 각 줄이 한 축만 어긋난다 — 어느 검사가 잡았는지 실패 메시지로 갈린다.
 func TestPurgeLogTailRejectsBadFieldShapes(t *testing.T) {
 	for name, line := range map[string]string{
-		"path 밖":     "1755180000\tunknown-path\t-\t-\tok\t1\t-\t-\t-",
-		"status 밖":   "1755180000\tcli-gc\t-\t-\tdone\t1\t-\t-\t-",
-		"bytes 비정수":  "1755180000\tcli-gc\t-\t-\tok\t1\tmany\t-\t-",
-		"cutoff 비정수": "1755180000\tcli-gc\t-\tsoon\tok\t1\t-\t-\t-",
+		"path 밖":       "1755180000\tunknown-path\t-\t-\tok\t1\t-\t-\t-",
+		"status 밖":     "1755180000\tcli-gc\t-\t-\tdone\t1\t-\t-\t-",
+		"bytes 비정수":    "1755180000\tcli-gc\t-\t-\tok\t1\tmany\t-\t-",
+		"cutoff 비정수":   "1755180000\tcli-gc\t-\tsoon\tok\t1\t-\t-\t-",
+		"deferred 비정수": "1755180000\tcli-gc\t-\t-\tok\t1\t-\tsome\t-",
+		"failed 비정수":   "1755180000\tcli-gc\t-\t-\tok\t1\t-\t-\tsome",
 	} {
 		t.Run(name, func(t *testing.T) {
-			entries, _, unparsed := purgeLogTail(writePurgeLog(t, line), 5)
+			entries, _, unparsed, _ := purgeLogTail(writePurgeLog(t, line), 5)
 			if unparsed != 1 || len(entries) != 0 {
 				t.Fatalf("unparsed=%d entries=%d want 1/0", unparsed, len(entries))
 			}
 		})
+	}
+}
+
+// TestPurgeLogTailAbortedScanIsNotOneBadLine — 스캔 중단은 **깨진 줄 하나가 아니다**. 1 MiB를
+// 넘는 줄에서 Scanner가 멈추면 그 뒤 줄은 아예 안 읽히고, total도 "최근 N건"도 사실이 아니게
+// 된다. 그것을 unparsed에 더하면 수천 줄을 못 읽은 파일이 오타 한 줄과 같은 문면으로 나와,
+// **이 로그가 닫으려던 침묵이 그것을 읽는 쪽에서 되살아난다.** 그래서 별개 신호다.
+func TestPurgeLogTailAbortedScanIsNotOneBadLine(t *testing.T) {
+	p := writePurgeLog(
+		t,
+		"1755180000\tcli-gc\t-\t-\tok\t1\t-\t-\t-",
+		strings.Repeat("x", 1<<20+1), // Scanner 상한(1 MiB) 초과 — 여기서 멈춘다
+		"1755180002\tcli-gc\t-\t-\tok\t2\t-\t-\t-",
+	)
+	entries, total, unparsed, aborted := purgeLogTail(p, 5)
+	if !aborted {
+		t.Fatalf("중단을 안 냈다 — total=%d unparsed=%d", total, unparsed)
+	}
+	if unparsed != 0 {
+		t.Errorf("unparsed=%d want 0 — 중단은 깨진 줄로 세지 않는다", unparsed)
+	}
+	// 중단 전까지 읽은 것은 그대로 낸다(fail-soft) — 그리고 total이 3이 아닌 것 자체가
+	// 이 신호가 필요한 이유다.
+	if total != 1 || len(entries) != 1 {
+		t.Errorf("total=%d entries=%d want 1/1 — 중단 전까지는 읽어 낸다", total, len(entries))
 	}
 }

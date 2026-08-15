@@ -44,8 +44,25 @@ type purgeEntry struct {
 	Bytes, Deferred, Failed string
 }
 
+// stripCtrl — 렌더 직전에 제어 문자를 뺀다. **파스 단계가 아니라 여기다**: 이 문자를 이유로
+// 줄을 거부하면 실재한 삭제 기록 하나가 사라지고, 쓰는 쪽 sanPurgeField를 고치면 그쪽 주석이
+// 경고한 hook.appendDrop 사본과의 갈림이 더 벌어진다. 값이 정상이면 무동작이다.
+//
+// **막는 것**: purge.log에 append할 수 있는 주체는 policy 칸에 유효한 형식과 임의 제어
+// 바이트를 함께 실을 수 있고, doctor가 그것을 %s로 터미널에 그대로 낸다 — ANSI 이스케이프가
+// 주변 진단 줄을 덮거나 지운다. 하필 그 표면이 **증거로 신뢰받는 것이 존재 이유**인 자리다.
+func stripCtrl(s string) string {
+	return strings.Map(func(r rune) rune {
+		if r < 0x20 || r == 0x7f {
+			return -1
+		}
+		return r
+	}, s)
+}
+
 // purgeLogTail — 꼬리 n건을 **최신 순**으로 낸다. total은 빈 줄 포함 줄 수 계약이고
 // unparsed는 형식에 안 맞는 줄 수다(dropsByReason 관례 — 진단은 절대 중단하지 않는다).
+// aborted는 스캔이 끝까지 못 갔다는 별개 신호다 — 아래 sc.Err() 절이 그 이유를 든다.
 //
 // **9필드 이상을 수용하고 10번째부터 무시한다.** 스펙 §2.0이 열어 둔 확장이 append-only
 // 파일에서 무해하려면 옛 파서가 새 줄을 버리지 않아야 한다. dropsByReason이 `== 2 || == 5`
@@ -58,11 +75,11 @@ type purgeEntry struct {
 // 다음 writer의 레코드가 이어붙고, 절단점이 필드 경계에 떨어지면 합쳐진 줄도 9필드 이상으로
 // 나올 수 있다 — 그 방어는 아래 루프의 닫힌 집합·형식 검사가 맡는다(검토 소견 F3).
 //
-// 파일 부재·읽기 실패는 (nil, 0, 0) — dropsByReason과 동일 fail-soft다.
-func purgeLogTail(path string, n int) (entries []purgeEntry, total int, unparsed int) {
+// 파일 부재·열기 실패는 (nil, 0, 0, false) — dropsByReason과 동일 fail-soft다.
+func purgeLogTail(path string, n int) (entries []purgeEntry, total int, unparsed int, aborted bool) {
 	f, err := os.Open(path)
 	if err != nil {
-		return nil, 0, 0
+		return nil, 0, 0, false
 	}
 	defer func() { _ = f.Close() }()
 	sc := bufio.NewScanner(f)
@@ -98,11 +115,13 @@ func purgeLogTail(path string, n int) (entries []purgeEntry, total int, unparsed
 	// **스캔 중단을 침묵으로 넘기지 않는다**(검토 소견 F11). 1 MiB를 넘는 줄이 있으면 루프가
 	// 조용히 멈춰 total이 과소 계상되고 "최근 N건"이 잘린 앞부분을 최신으로 보고한다 — 이 절이
 	// 닫으려는 "침묵을 초록으로 읽는" 부류 그대로다.
-	if sc.Err() != nil {
-		unparsed++
-	}
+	//
+	// **unparsed로 세지 않는다**(전체 검토): 그러면 수천 줄을 못 읽고 멈춘 파일이 깨진 줄 하나와
+	// 같은 문면(`파싱 실패 1줄`)으로 나와, 완화가 스스로 침묵을 다시 만든다. 별개 신호로 내고
+	// doctor가 별개 절로 찍는다.
+	aborted = sc.Err() != nil
 	for i := len(all) - 1; i >= 0 && len(entries) < n; i-- {
 		entries = append(entries, all[i])
 	}
-	return entries, total, unparsed
+	return entries, total, unparsed, aborted
 }

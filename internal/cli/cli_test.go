@@ -1516,9 +1516,10 @@ func TestRunPurge_E2E_GCOnlyNoConfirm(t *testing.T) {
 // 네 개의 감사 로그 테스트가 같은 세 줄을 반복하지 않게 한다.
 func purgeLogOf(t *testing.T, projDir string, wantRows int) []purgeEntry {
 	t.Helper()
-	entries, total, unparsed := purgeLogTail(filepath.Join(projDir, store.PurgeLogName), 5)
-	if total != wantRows || unparsed != 0 || len(entries) != wantRows {
-		t.Fatalf("total=%d unparsed=%d entries=%d want %d/0/%d", total, unparsed, len(entries), wantRows, wantRows)
+	entries, total, unparsed, aborted := purgeLogTail(filepath.Join(projDir, store.PurgeLogName), 5)
+	if total != wantRows || unparsed != 0 || len(entries) != wantRows || aborted {
+		t.Fatalf("total=%d unparsed=%d entries=%d aborted=%v want %d/0/%d/false",
+			total, unparsed, len(entries), aborted, wantRows, wantRows)
 	}
 	return entries
 }
@@ -4251,12 +4252,12 @@ func TestDoctorPurgeSectionAbsent(t *testing.T) {
 	}
 }
 
-// TestDoctorPurgeSectionLists — 기록이 있으면 총계와 최근 건을 짚는다.
-func TestDoctorPurgeSectionLists(t *testing.T) {
-	isolateCodexHome(t)
+// doctorPurgeLine — 대상 프로젝트의 purge.log 자리에 seed를 심고 doctor를 돌려 [21] 줄을
+// 돌려준다. **프로젝트 ID를 doctor 자신에게서 얻는다** — 지어내면 doctor가 다른 디렉터리를
+// 본다. [2] 줄이 `ProjectID=<값>`을 내므로 한 번 먼저 돌려 그 값을 읽는다.
+func doctorPurgeLine(t *testing.T, seed string) string {
+	t.Helper()
 	storeRoot, projectRoot := t.TempDir(), t.TempDir()
-	// **프로젝트 ID를 doctor 자신에게서 얻는다** — 지어내면 doctor가 다른 디렉터리를 본다.
-	// [2] 줄이 `ProjectID=<값>`을 내므로 한 번 돌려 그 값을 읽는다.
 	first, _ := doctorOutIn(t, storeRoot, projectRoot)
 	pid := ""
 	for _, ln := range strings.Split(first, "\n") {
@@ -4272,24 +4273,32 @@ func TestDoctorPurgeSectionLists(t *testing.T) {
 	if err := os.MkdirAll(projDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	seed := strings.Join([]string{
+	write(t, filepath.Join(projDir, store.PurgeLogName), []byte(seed))
+	out, _ := doctorOutIn(t, storeRoot, projectRoot)
+	return purgeSectionLine(t, out)
+}
+
+// TestDoctorPurgeSectionLists — 기록이 있으면 총계와 최근 건을 짚는다.
+func TestDoctorPurgeSectionLists(t *testing.T) {
+	isolateCodexHome(t)
+	line := doctorPurgeLine(t, strings.Join([]string{
 		"1755180000\tstartup-shadow\t336h0m0s/pwsh-profile\t1753971299\tok\t0\t0\t0\t0",
 		"1755180899\tstartup-shadow\t72h0m0s/-\t1753971299\tok\t200\t1024\t0\t0",
 		"찢어진 조각",
 		"1755181000\tcli-older-than\t168h0m0s/-\t1755000000\tfailed\t37\t-\t-\t-",
-	}, "\n") + "\n"
-	write(t, filepath.Join(projDir, store.PurgeLogName), []byte(seed))
-
-	out, _ := doctorOutIn(t, storeRoot, projectRoot)
-	line := purgeSectionLine(t, out)
+	}, "\n")+"\n")
 	// 총계는 파스 못 한 줄까지 센 줄 수이고, 짚는 것은 그중 최근 3건이다 — 둘이 갈린다.
 	if !strings.HasPrefix(line, "[21] purges: 4행 (최근 3건) — ") {
 		t.Errorf("[21]이 총계·건수를 안 낸다: %s", line)
 	}
 	// **회귀 잠금**: 조용한 72h 강등이 이 줄에서 눈에 보여야 한다. policy 칸이 이 설계의 존재
 	// 이유다 — 200개가 사라진 그 기동의 행에 `72h0m0s/-`가 적혀 있었다면 규명이 한 줄 조회였다.
-	if !strings.Contains(line, "startup-shadow 72h0m0s/- ok 200개 1024B") {
-		t.Errorf("[21]이 policy·건수를 안 짚는다: %s", line)
+	//
+	// **시각 칸을 함께 잠근다**: 픽스처가 고정 epoch이라 이 단정이 없으면 `.UTC()`를 빼거나
+	// 레이아웃을 바꿔도 UTC 밖 머신에서만 빨개진다 — 여기서는 초록으로 나간다.
+	// 1755180899 → 08-14T14:14:59Z(UTC).
+	if !strings.Contains(line, "08-14T14:14:59Z startup-shadow 72h0m0s/- ok 200개 1024B") {
+		t.Errorf("[21]이 시각·policy·건수를 안 짚는다: %s", line)
 	}
 	// **status 옆에 count가 붙어야 한다.** PurgeOlderThan은 커밋 뒤(checkFTSIntegrity)에
 	// 실패할 수 있어 `failed`인데 이미 지워진 건수가 있다 — count가 없으면 읽는 사람이
@@ -4300,6 +4309,65 @@ func TestDoctorPurgeSectionLists(t *testing.T) {
 	// 파스 못 한 줄을 조용히 넘기지 않는다 — 이 절이 닫으려는 부류 그대로다.
 	if !strings.Contains(line, "파싱 실패 1줄") {
 		t.Errorf("[21]이 파싱 실패 줄을 안 짚는다: %s", line)
+	}
+}
+
+// TestDoctorPurgeSectionAbortedRead — 스캔이 중단된 파일은 **깨진 줄 하나와 다른 문면**으로
+// 나온다. 1 MiB를 넘는 줄에서 Scanner가 멎으면 그 뒤는 아예 안 읽혀 total도 "최근 N건"도
+// 사실이 아닌데, 그것을 `파싱 실패 1줄`로 내면 운영자가 오타 한 줄로 읽고 넘긴다 — **감사
+// 로그를 읽는 표면이 감사 로그가 없애려던 침묵을 다시 만드는 자리다.**
+func TestDoctorPurgeSectionAbortedRead(t *testing.T) {
+	isolateCodexHome(t)
+	line := doctorPurgeLine(t, strings.Join([]string{
+		"1755180899\tcli-gc\t-\t-\tok\t1\t-\t-\t-",
+		strings.Repeat("x", 1<<20+1), // Scanner 상한 초과 — 여기서 멎는다
+		"1755181000\tcli-gc\t-\t-\tok\t2\t-\t-\t-",
+	}, "\n")+"\n")
+	if !strings.Contains(line, "읽다 중단 — 총계·최근 건이 불완전하다") {
+		t.Fatalf("[21]이 중단을 안 짚는다: %s", line)
+	}
+	if strings.Contains(line, "파싱 실패") {
+		t.Errorf("[21]이 중단을 깨진 줄로 둔갑시켰다 — 둘은 다른 사실이다: %s", line)
+	}
+	// 중단 전까지 읽은 것은 그대로 나온다(fail-soft). 그리고 총계가 3이 아니라 1인 것이
+	// 위 절이 필요한 이유 자체다.
+	if !strings.HasPrefix(line, "[21] purges: 1행 (최근 1건) — 08-14T14:14:59Z cli-gc") {
+		t.Errorf("[21]이 중단 전 행을 안 낸다: %s", line)
+	}
+}
+
+// TestDoctorPurgeSectionAllUnparsable — 모든 줄이 검증에 걸리면 짚을 것이 없는데, 옛 문면은
+// `— ` 를 무조건 붙여 뒤가 허공인 줄을 냈다(`4행 (최근 0건) —  · 파싱 실패 4줄`). 가정이 아니다:
+// 다음 버전이 path 라벨 하나를 바꾸면 옛 바이너리가 모든 행에서 이 자리를 밟는다.
+//
+// 대체 문면에 `0건`을 쓰지 않는다 — 부재 테스트가 그 어휘를 막는 이유("지운 게 없다"로 읽힌다)가
+// 여기서도 그대로다. 완전 일치로 잠근다: 금지 어휘 루프를 따로 두면 일치 단정이 통과하는 순간
+// 그 루프가 죽은 단정이 된다(검토 소견 F10).
+func TestDoctorPurgeSectionAllUnparsable(t *testing.T) {
+	isolateCodexHome(t)
+	line := doctorPurgeLine(t, "찢어진 조각\n또 다른 조각\n")
+	const want = "[21] purges: 2행 (읽을 수 있는 행 없음) · 파싱 실패 2줄"
+	if line != want {
+		t.Fatalf("[21] 전부 파스 실패 문면이 다르다 —\n got %q\nwant %q", line, want)
+	}
+}
+
+// TestDoctorPurgeSectionStripsControlBytes — `policy`는 렌더되는 칸 중 **검증도 이스케이프도
+// 없는 유일한 칸**이다. 쓰는 쪽 위생은 탭·개행·CR만 벗기므로 ESC·BEL·DEL이 파일에 남고, 그
+// 파일에 append할 수 있는 주체는 나머지 여덟 칸을 유효하게 맞춘 줄로 doctor의 터미널 출력에
+// ANSI를 실어 보낼 수 있다 — 주변 진단 줄을 덮거나 지운다. 하필 그 표면이 **증거로 신뢰받는
+// 것이 존재 이유**인 자리다. 거부가 아니라 렌더에서 벗기는 이유는 실재한 삭제 기록을 버리지
+// 않기 위해서다.
+func TestDoctorPurgeSectionStripsControlBytes(t *testing.T) {
+	isolateCodexHome(t)
+	line := doctorPurgeLine(t,
+		"1755180899\tstartup-shadow\t72h\x1b[2K\x07\x7f/pwsh\t-\tok\t1\t-\t-\t-\n")
+	if strings.ContainsAny(line, "\x1b\x07\x7f") {
+		t.Fatalf("[21]에 제어 바이트가 그대로 나갔다: %q", line)
+	}
+	// 위 단정만 두면 policy 칸을 통째로 버리는 구현도 통과한다 — 남은 글자가 그대로인지 함께 본다.
+	if !strings.Contains(line, "startup-shadow 72h[2K/pwsh ok 1개") {
+		t.Errorf("[21]이 정상 문자까지 지웠다: %q", line)
 	}
 }
 
