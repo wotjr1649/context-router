@@ -4336,6 +4336,23 @@ func TestDoctorPurgeSectionAbortedRead(t *testing.T) {
 	}
 }
 
+// TestDoctorPurgeSectionAbortedFirstLine — **첫 줄부터 멎으면 `total == 0` 이다.** 그 값만 보면
+// 부재와 구별되지 않아, 존재하지만 읽을 수 없는 로그가 `기록 없음` 으로 나간다 — 관측의 부재와
+// 부재의 관측을 가르는 것이 이 절의 전부인데 바로 그 자리에서 거짓말을 한다. 위 중단 테스트
+// 둘은 유효한 행을 먼저 두어 `total == 1` 이라 이 갈래를 밟지 않는다.
+func TestDoctorPurgeSectionAbortedFirstLine(t *testing.T) {
+	isolateCodexHome(t)
+	line := doctorPurgeLine(t, strings.Repeat("x", 1<<20+1)+"\n"+
+		"1755180899\tcli-gc\t-\t-\tok\t1\t-\t-\t-\n")
+	if strings.Contains(line, "기록 없음") {
+		t.Fatalf("읽을 수 없는 로그를 부재로 보고했다: %s", line)
+	}
+	const want = "[21] purges: 0행 (읽을 수 있는 행 없음) · 읽다 중단 — 총계·최근 건이 불완전하다"
+	if line != want {
+		t.Fatalf("[21] 첫 줄 중단 문면이 다르다 —\n got %q\nwant %q", line, want)
+	}
+}
+
 // TestDoctorPurgeSectionAllUnparsable — 모든 줄이 검증에 걸리면 짚을 것이 없는데, 옛 문면은
 // `— ` 를 무조건 붙여 뒤가 허공인 줄을 냈다(`4행 (최근 0건) —  · 파싱 실패 4줄`). 가정이 아니다:
 // 다음 버전이 path 라벨 하나를 바꾸면 옛 바이너리가 모든 행에서 이 자리를 밟는다.

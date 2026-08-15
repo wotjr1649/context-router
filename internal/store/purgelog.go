@@ -129,12 +129,15 @@ func optInt(p *int) string {
 // 퍼지 결과·종료 코드에 영향이 없다(appendDrop과 동형). 반환값이 없는 이유는 호출자가
 // 판정할 것이 없기 때문이다.
 //
-// **경고에 원인(err)을 싣는다**(전체 검토): 감사 기록이 실패한 이유를 설명하는 유일한 줄에서
-// 그 이유를 빼면 stage 하나만 남는다. *os.PathError가 스토어 절대경로를 물고 오지만 그것은
-// slog(stderr) 한정이고 이 저장소의 관례다 — 경로 금지(§5.5 canary)는 **반환 오류** 규칙이며
-// sanitizeIOErr가 그 자리를 맡는다. **키가 "path"가 아니라 "purge_path"인 이유**: rec.Path는
-// 파일 경로가 아니라 삭제 경로 라벨(startup-shadow 따위)이고, err가 진짜 경로를 나르는 옆에
-// 나란히 놓이면 그 오독이 확정된다.
+// **경고에 원인을 싣되 경로는 떼고 낸다**: 감사 기록이 실패한 이유를 설명하는 유일한 줄에서
+// 그 이유를 빼면 stage 하나만 남는다. 그런데 이 셋의 오류는 전부 *os.PathError라 스토어
+// 절대경로(프로젝트 id 포함)를 물고 오고, **설계 v0.0.1 §5.5는 그 금지를 slog(stderr)에
+// 건다** — *"원문·쿼리 본문·절대경로·env 미기록"*. 그래서 sanitizeIOErr로 감싼다: syscall
+// 원인은 남고 경로만 빠진다. 같은 패키지의 MergeFTSIfDue가 같은 모양(best-effort 파일 조작의
+// 실패 경고)에서 이미 그렇게 한다.
+//
+// **키가 "path"가 아니라 "purge_path"인 이유**: rec.Path는 파일 경로가 아니라 삭제 경로
+// 라벨(startup-shadow 따위)이다.
 func AppendPurgeLog(projectDir string, rec PurgeRecord) {
 	cutoff := "-"
 	if rec.Cutoff != 0 {
@@ -155,7 +158,8 @@ func AppendPurgeLog(projectDir string, rec PurgeRecord) {
 	f, err := os.OpenFile(filepath.Join(projectDir, PurgeLogName),
 		os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
 	if err != nil {
-		slog.Warn("퍼지 기록 실패", "stage", "open", "purge_path", rec.Path, "error", err)
+		slog.Warn("퍼지 기록 실패", "stage", "open", "purge_path", rec.Path,
+			"error", sanitizeIOErr("purge log open", err))
 		return
 	}
 	// **닫기 실패도 보고한다**(검토 소견 F13). Windows에서는 지연된 쓰기 실패가 Close에서
@@ -164,10 +168,12 @@ func AppendPurgeLog(projectDir string, rec PurgeRecord) {
 	// 경고를 두 번 내지 않는다(호출당 한 줄).
 	wrote := true
 	if _, err := fmt.Fprint(f, line); err != nil {
-		slog.Warn("퍼지 기록 실패", "stage", "write", "purge_path", rec.Path, "error", err)
+		slog.Warn("퍼지 기록 실패", "stage", "write", "purge_path", rec.Path,
+			"error", sanitizeIOErr("purge log write", err))
 		wrote = false
 	}
 	if cerr := f.Close(); cerr != nil && wrote {
-		slog.Warn("퍼지 기록 실패", "stage", "close", "purge_path", rec.Path, "error", cerr)
+		slog.Warn("퍼지 기록 실패", "stage", "close", "purge_path", rec.Path,
+			"error", sanitizeIOErr("purge log close", cerr))
 	}
 }
