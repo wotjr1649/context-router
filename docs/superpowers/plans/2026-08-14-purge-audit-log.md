@@ -10,6 +10,19 @@
 
 **Spec:** `docs/superpowers/specs/2026-08-14-purge-audit-log-design.md` — 이 계획은 그 스펙에서 논증한다. 실행자는 **둘 다** 읽는다.
 
+## ★ 실행 중 정정 — 아래 태스크 본문을 그대로 믿지 마라
+
+**세션 66 이 이 계획을 실행하며 계획 자신의 결함 여덟을 잡았다.** 태스크 절은 *계획된 것*의 기록으로 그대로 두고(문면이 결함을 심었다는 사실 자체가 정보다), 무엇이 반증됐는지는 여기 모아 둔다. **코드가 이긴다** — 실제 형상은 커밋 `4df7763..175dc1d` 다.
+
+- **거짓 문장 하나가 코드까지 갔다.** Task 2 Step 3 의 `purgeLogTail` 주석이 *"잘린 append 는 9필드보다 짧게 나오므로 이 조건이 이미 거른다"* 를 담고 있다 — 세션 65 에서 Codex 가 반증하고 **스펙 §4 가 "거짓이다"라고 명시한 그 문장**이다. 스펙만 고쳐지고 계획의 코드 블록은 안 고쳐져 구현자가 축자 전사했고, 태스크 리뷰가 잡았다. 찢어진 조각 뒤에는 다음 writer 의 레코드가 이어붙어 합쳐진 줄이 9필드가 되거나 그보다 **길어진다**(경계 위치에 따라 9~17).
+- **"F3 의 잠금"이라 이름 붙은 픽스처가 아무것도 안 잠갔다.** Task 2 Step 4 의 스플라이스 줄은 count 칸에 `cli-gc` 가 와서 `ParseInt` 가 먼저 거른다 — 닫힌 집합 검사를 전부 지워도 통과한다. 뮤테이션으로 확인하고 status 검사 하나만이 거르는 픽스처로 교체했다.
+- **Task 4 의 테스트 셋이 전부 0건 퍼지를 기록해 `Count` 가 안 잠겼다.** 게다가 기본 픽스처가 2 sources / 2 artifacts 라 **`Count` 단정을 넣어도 sources/artifacts 를 뒤바꾼 배선이 통과**한다. 실측 삭제를 관측하게 하고 3/2 로 갈라 그 전제를 명시로 단정했다.
+- **`--gc` 의 "가장 싼 해소"가 틀렸다.** Task 4 Step 3 은 선택 분기를 `runGCOrphan` 으로 라우팅하라 하는데, 그러면 살아 있는 writable `st` 옆에 두 번째 store 핸들이 열리고 **`purgeErr` 흐름이 끊겨** 뒤따르는 `--vacuum`/`MergeFTS` 블록과 `--all` 순회가 깨진다. 계획이 적어 둔 fallback(두 자리 + 공유 헬퍼)이 옳다.
+- **중간 삽입이 `assertDoctorAscending` 을 깬다는 것은 거짓이다**(Task 5 Step 3 주석 · 스펙 §4 도 같은 혼동을 담고 있었다). 다시 매기면 출력은 오름차순 그대로다 — 깨지는 것은 절을 번호로 가리키는 **테스트 단정·문서·append-only 레코드**다. *찍는 자리*를 중간으로 옮기는 것만이 그 검사를 빨갛게 한다.
+- **"미러 상수" 문장 둘이 소유자 결정 F8 이전 초안의 잔재다** — Task 1 의 `PurgeLogName` 주석과 Task 2 의 Consumes 줄. `internal/cli` 는 `store.PurgeLogName` 을 직접 쓴다.
+- **Task 1 의 테스트 블록에 `errors` import 가 없고**(`TestPurgeStatusPriority` 가 `errors.New` 를 쓴다), **`PurgeStatus` 본문이 Task 1 코드 블록에서 빠져 있다**(Produces 와 그 표 테스트는 Task 1 소관인데 본문은 Task 3 에 "참고로" 실려 있다). Task 1 의 `-run 'PurgeLog|PurgePolicy'` 와 Task 4 의 `-run '…RunPurgeHookOnlyLogsPolicy'` 는 각자 이름 붙인 테스트를 못 잡는다.
+- **Task 3 Step 0 이 걱정한 것들이 이미 있었다** — 정상 종료 헬퍼(`closeAndWait`)와 프로젝트 디렉터리 헬퍼(`hookContentDir`) 둘 다 존재한다. 대신 **계획이 못 본 것**이 있다: 셧다운이 기다리기 *전에* 취소하므로 handshake 는 배리어가 아니라 경과 시간이고, 완료 신호는 행 파일의 등장이다.
+
 ## Global Constraints
 
 스펙의 프로젝트 전역 요구사항이다. **모든 태스크의 요구사항에 암묵적으로 포함된다.**
